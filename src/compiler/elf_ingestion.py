@@ -21,6 +21,10 @@ record rather than approximating any of them:
   ``.gnu.version_r`` entry assigns to the symbol's version, else ``*``
   (any loaded module, in the loader's search order).
 
+- Dynamic relocations are kept whole in ``relocation_records`` (type,
+  slot, addend, symbol) so a loader of these bytes can fill each slot the
+  way ``ld.so`` would.
+
 Nothing here loads or executes the image.
 """
 
@@ -112,6 +116,23 @@ class ELFImportSymbol:
 
 
 @dataclass(frozen=True, slots=True)
+class ELFDynamicRelocation:
+    """One ``Elf64_Rela`` record of the dynamic relocation tables.
+
+    ``symbol_value`` is the image address of the symbol when this image
+    defines it as data or a plain function, and None when the loader must
+    supply it: an undefined symbol, or an ``STT_GNU_IFUNC`` whose slot holds
+    what its resolver returns at load time.
+    """
+
+    type: int
+    offset: int
+    addend: int
+    symbol_name: str
+    symbol_value: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ELFImage:
     type: ELFType
     image_base: int
@@ -126,6 +147,7 @@ class ELFImage:
     lowest_load_address: int
     encoded: bytes
     delay_imports: tuple[()] = ()
+    relocation_records: tuple[ELFDynamicRelocation, ...] = ()
 
     @property
     def is_shared_library(self) -> bool:
@@ -441,6 +463,7 @@ def parse_elf_image(encoded: bytes) -> ELFImage:
 
     imports: list[ELFImportSymbol] = []
     dynamic_relocations: list[tuple[int, int]] = []
+    relocation_records: list[ELFDynamicRelocation] = []
     for relocations in sections:
         if relocations.type != _SHT_RELA or relocations.link != dynsym_index:
             continue
@@ -449,9 +472,17 @@ def parse_elf_image(encoded: bytes) -> ELFImage:
             relocations.raw_offset + relocations.raw_size,
             relocations.entry_size or 24,
         ):
-            offset, info, _addend = struct.unpack_from("<QQq", data, position)
+            offset, info, addend = struct.unpack_from("<QQq", data, position)
             kind, symbol = info & 0xFFFFFFFF, info >> 32
             dynamic_relocations.append((int(kind), int(offset)))
+            symbol_name, symbol_value = "", None
+            if symbol:
+                symbol_name, symbol_info, index, value, _size = symbols[symbol]
+                if index != _SHN_UNDEF and (symbol_info & 0x0F) != _STT_GNU_IFUNC:
+                    symbol_value = int(value)
+            relocation_records.append(ELFDynamicRelocation(
+                int(kind), int(offset), int(addend), symbol_name, symbol_value,
+            ))
             if kind not in {_R_X86_64_JUMP_SLOT, _R_X86_64_GLOB_DAT} or not symbol:
                 continue
             name, _info, index, _value, _size = symbols[symbol]
@@ -487,6 +518,7 @@ def parse_elf_image(encoded: bytes) -> ELFImage:
         ELFType(file_type), 0, int(entry), soname, tuple(needed), sections,
         runtime_functions, exports, tuple(imports),
         tuple(dynamic_relocations), min(load_addresses, default=0), data,
+        relocation_records=tuple(relocation_records),
     )
 
 

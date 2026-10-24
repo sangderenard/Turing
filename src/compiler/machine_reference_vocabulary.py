@@ -428,6 +428,10 @@ class X86InstructionToken(IntEnum):
     PUSH_RM64 = 332
     PUSH_IMM8 = 333
     AND_RM8_R8 = 334
+    BTS_RM64_IMM8 = 335
+    BTR_RM64_IMM8 = 336
+    TEST_RM64_IMM32 = 337
+    CMP_RM16_IMM16 = 338
 
 
 class MachineSemanticToken(IntEnum):
@@ -1824,6 +1828,34 @@ def _decode_sub_rm32_imm8_operands(region, offset, address, rex):
     return _decode_group_rm_imm(
         region, offset, address, rex,
         extension=5, operand_width=32, immediate_width=1, signed=True,
+    )
+
+
+def _decode_btr_rm64_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=6, operand_width=64, immediate_width=1, signed=False,
+    )
+
+
+def _decode_bts_rm64_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=5, operand_width=64, immediate_width=1, signed=False,
+    )
+
+
+def _decode_test_rm64_imm32_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=0, operand_width=64, immediate_width=4, signed=True,
+    )
+
+
+def _decode_cmp_rm16_imm16_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=7, operand_width=16, immediate_width=2, signed=False,
     )
 
 
@@ -3975,6 +4007,27 @@ _X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
     InstructionSpec(
         X86InstructionToken.AND_RM8_R8, MachineSemanticToken.BITWISE_AND,
         b"\x20", _decode_binary_rm8_r8_operands, allow_rex=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.BTS_RM64_IMM8, MachineSemanticToken.BIT_TEST,
+        b"\x0f\xba", _decode_bts_rm64_imm8_operands, modrm_extension=5,
+        allow_rex=True, allow_rex_w=True, require_rex_w=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.BTR_RM64_IMM8, MachineSemanticToken.BIT_TEST_RESET,
+        b"\x0f\xba", _decode_btr_rm64_imm8_operands, modrm_extension=6,
+        allow_rex=True, allow_rex_w=True, require_rex_w=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.TEST_RM64_IMM32, MachineSemanticToken.INTEGER_TEST,
+        b"\xf7", _decode_test_rm64_imm32_operands, modrm_extension=0,
+        allow_rex=True, allow_rex_w=True, require_rex_w=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.CMP_RM16_IMM16, MachineSemanticToken.INTEGER_COMPARE,
+        b"\x81", _decode_cmp_rm16_imm16_operands, modrm_extension=7,
+        allow_rex=True, allowed_legacy_prefixes=frozenset({0x66}),
+        required_legacy_prefixes=frozenset({0x66}),
     ),
     # CET's indirect-branch landing mark (F3 0F 1E FA), which GCC places at
     # every System V function entry and PLT stub.  It has no architectural

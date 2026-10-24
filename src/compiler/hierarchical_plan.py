@@ -104,6 +104,7 @@ TENSOR_OPERATION_SCALAR_SPELLING: dict[str, str] = {
     "less_equal": "Le", "greater": "Gt", "greater_equal": "Ge",
     "logical_and": "LAnd", "logical_or": "LOr",
     "logical_not": "LNot", "maximum": "Max", "minimum": "Min",
+    "emax": "Max", "emin": "Min",
     "bitand": "BitAnd", "bitor": "BitOr", "bitxor": "BitXor",
     "shl": "Shl", "shr": "Shr", "invert": "Invert",
     "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
@@ -150,7 +151,7 @@ REGION_SCALAR_CAST_DTYPES = {
 }
 REGION_DTYPE_PRESERVING_OPS = frozenset({
     "add", "sub", "mul", "floordiv", "mod", "pow", "neg", "abs",
-    "min", "max", "minimum", "maximum", "bitand", "bitor",
+    "min", "max", "minimum", "maximum", "emax", "emin", "bitand", "bitor",
     "bitxor", "shl", "shr", "invert",
 })
 

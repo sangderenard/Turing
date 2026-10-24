@@ -245,6 +245,7 @@ from .receiver_resolution_prepasses import (
     _resolve_bound_function_references as _resolve_bound_function_references,
     _resolve_grounded_method_references as _resolve_grounded_method_references,
     _resolve_grounded_tensor_operations as _resolve_grounded_tensor_operations,
+    _stamp_max_semantics as _stamp_max_semantics,
 )
 
 
@@ -2643,7 +2644,10 @@ def _planned_scalar_dtypes_from(
                 is_collection(node_id)
                 or attributes.get("sequence_element_class_ref")
                 or attributes.get("mapping_value_class_ref")
-            ) and not op.startswith("indexed"):
+            ) and (
+                not op.startswith("indexed")
+                or attributes.get("producer_kind") == "sequence_slice"
+            ):
                 # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
                 # record: an unrolled comprehension (``sequence_materialization``)
                 # holds its elements as ``arg0``..``argN``, not ``elts``, so its
@@ -2668,6 +2672,47 @@ def _planned_scalar_dtypes_from(
                 if attributes.get("producer_kind") == "sorted_materialization":
                     writers.extend(
                         element.get(source) for source in parents(data, "arg:0")
+                    )
+                # Lane D, D2.  Program: ``ys = xs[-2:]; ys[0] * 10`` (corpus
+                # c386, c291).  A slice is a new list of its base's rows.  It
+                # is an ``Indexed`` node, so the element-read rule took it and
+                # gave the slice itself the scalar class of one row; its own
+                # rows had no class, and every read of them took the float64
+                # domain default.  Rule: a slice is a collection holding its
+                # base's element class, joined with its own later writers.
+                if attributes.get("producer_kind") == "sequence_slice":
+                    writers.extend(
+                        element.get(base) for base in parents(data, "base")
+                    )
+                # Lane D, D2.  Program: ``rep = [1]`` then ``if k > 2: rep =
+                # [k, 1, 2]`` and ``sum(rep) + max(rep)`` (corpus c442).  A
+                # branch join that is itself a collection holds its arms'
+                # rows, with its own later writers (the Phi rule below never
+                # sees it, because this rule takes every collection first).
+                if op == "phi":
+                    writers.extend(
+                        element.get(arm)
+                        for arm in parents(data, "body", "orelse")
+                    )
+                # Lane D, D2.  Program: ``rep = list(xs)`` on a branch, then
+                # ``rep[0] * 10 + rep[-1]`` (corpus c441).  A copy of a
+                # sequence (``list(xs)``, ``tuple(xs)``, ``set(xs)``) holds
+                # its argument's rows; nobody read that, so the copy's rows
+                # took the float64 domain default.  Iterating a dict yields
+                # its keys, not its rows, so a dict argument proves nothing
+                # here.
+                if (
+                    attributes.get("producer_kind") == "aggregate_materialization"
+                    and str(attributes.get("static_python_reference") or "")
+                    in {"list", "tuple", "set", "frozenset"}
+                ):
+                    sources = parents(data, "arg:0")
+                    writers.extend(
+                        None if (
+                            G.nodes[source].get("attributes") or {}
+                        ).get("aggregate_kind") == "dict"
+                        else element.get(source)
+                        for source in sources
                     )
                 # Lane D, D2.  Program: ``def setfirst(xs: list[int], v:
                 # int): xs[0] = v`` (corpus c180).  The parameter's
@@ -7949,7 +7994,7 @@ def _executable_rules():
     return frozenset((
         MetadataRule.PRECISION_OPERATOR, MetadataRule.CATALOGUED_BUILTIN_CALL,
         MetadataRule.GROUNDED_TENSOR_PROPERTY, MetadataRule.SCALAR_INTRINSIC,
-        MetadataRule.NUMERICAL_WORK,
+        MetadataRule.HOST_CALLBACK, MetadataRule.NUMERICAL_WORK,
     ))
 
 
@@ -7988,6 +8033,8 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
     from .concordance_declarations import MetadataRule as Rule
 
     data = graph.G.nodes[node_id]
+    if str(data.get("type")) in {"HostCallback", "HostCallbackPresent"}:
+        return Rule.HOST_CALLBACK
     precision_operator = (data.get("attributes") or {}).get(
         "python_precision_operator"
     )
@@ -11413,6 +11460,67 @@ def _control_partition_keys(
         )
         for node_id in node_ids
     }
+
+
+def _host_callback_order_edges(graph: Any) -> frozenset[tuple[int, int]]:
+    """Order host callbacks as their source does.
+
+    Program: ``self.log(i); if self.score is not None: total +=
+    self.score(i, total); self.log(-i)`` in a loop body.  Wrong record: the
+    two ``log`` calls share no value with ``score``, so the region reducer
+    fused them into one region ahead of the branch and the host saw
+    ``log(0), log(0), score(0)`` for Python's ``log(0), score(0), log(0)``.
+    Rule: a host callback is an observable effect, so each one precedes the
+    next in source order (``turing-host-callback-v1`` promises the host its
+    calls in program order).
+    """
+
+    def span(data):
+        expression = data.get("expr_obj")
+        return (
+            int(getattr(expression, "lineno", 0) or 0),
+            int(getattr(expression, "col_offset", 0) or 0),
+            int(getattr(expression, "end_lineno", 0) or 0),
+            int(getattr(expression, "end_col_offset", 0) or 0),
+        )
+
+    callbacks = [
+        (span(data), int(node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) == "HostCallback"
+    ]
+    # A branch that holds a callback is itself one step of the order: the
+    # calls after it follow the whole branch, not just the call inside it.
+    branches = [
+        (span(data), int(node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.If)
+        and any(
+            span(data)[:2] <= position[:2] and position[2:] <= span(data)[2:]
+            for position, _callback in callbacks
+        )
+    ]
+
+    def contains(outer, inner):
+        return outer[:2] <= inner[:2] and inner[2:] <= outer[2:]
+
+    steps = sorted((*callbacks, *branches))
+    edges = {
+        (int(earlier[1]), int(later[1]))
+        for index, earlier in enumerate(steps)
+        for later in steps[index + 1:]
+        if not contains(earlier[0], later[0])
+    }
+    kept = _source_order_edges_within_value_order(graph.G, edges)
+    if kept != edges:
+        raise ValueError(
+            "host callbacks cannot keep their source order: "
+            f"{sorted(edges - set(kept))}"
+        )
+    # The region schedule and the SSA lowering order regions by this graph's
+    # ancestry; neither sees an edge that is passed only to the reducer.
+    graph.G.graph["host_callback_order_edges"] = tuple(sorted(kept))
+    return frozenset(kept)
 
 
 def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
@@ -15622,10 +15730,31 @@ def _coordinate_scheduled_capture_impl(
                             # semantics as an elementwise tensor operation;
                             # scalar and singleton arenas are its degenerate
                             # case and therefore retain a distinct SSA result.
+                            #
+                            # Program: ``max(x, y)`` over two (3,) tensors.
+                            # Python raises (a tensor's truth value is
+                            # ambiguous), but the plan compiled it as an
+                            # elementwise maximum.  Rule: more than one
+                            # element is refused as Python refuses it; the
+                            # elementwise meaning is spelled ``x.emax(y)``.
+                            many = next((
+                                value for value in args
+                                if isinstance(value, AbstractTensor)
+                                and int(value.numel()) != 1
+                            ), None)
+                            if many is not None:
+                                raise ValueError(
+                                    f"builtin {reference}() of a tensor with "
+                                    f"{int(many.numel())} elements raises in "
+                                    "Python (the truth value of a tensor with "
+                                    "more than one element is ambiguous); "
+                                    f"write x.e{reference}(y) for the "
+                                    "elementwise builtin rule, or "
+                                    f"x.{'maximum' if reference == 'max' else 'minimum'}(y) "
+                                    "for numpy's"
+                                )
                             result = args[0]
-                            method_name = (
-                                "maximum" if reference == "max" else "minimum"
-                            )
+                            method_name = "emax" if reference == "max" else "emin"
                             for operand in args[1:]:
                                 if not isinstance(result, AbstractTensor):
                                     result = AbstractTensor.tensor(result)
@@ -21601,7 +21730,7 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "add", "sub", "mul", "div", "truediv", "floordiv", "mod", "pow",
     "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
     "eq", "ne", "lt", "le", "gt", "ge",
-    "maximum", "minimum", "clamp_min", "clamp_max",
+    "maximum", "minimum", "emax", "emin", "clamp_min", "clamp_max",
     "logical_and", "logical_or", "logical_xor",
     "bitwise_and", "bitwise_or", "bitwise_xor",
 })
@@ -21663,12 +21792,18 @@ def _runtime_sized_descriptor(descriptor: Any) -> bool:
 
 
 def _elementwise_operands(data: Mapping) -> tuple[int, ...]:
+    # Program: ``x.maximum(y)`` over runtime-sized spans.  Wrong record: the
+    # method's argument arrives under role ``arg:0``, so only the receiver
+    # was an operand, the runtime-sized law never fired, and the result was
+    # one scalar -- element 0 on every backend.  Rule: a method call's
+    # positional arguments are operands too.
     return tuple(
         int(parent)
         for parent, role in data.get("parents") or ()
         if str(role).casefold() in {
             "lhs", "rhs", "left", "right", "operand", "value", "other",
         }
+        or str(role).casefold().startswith("arg:")
     )
 
 
@@ -23309,8 +23444,9 @@ def _tensor_descriptor_rule(
                         "lhs", "rhs", "left", "right", "operand", "value",
                         "other",
                     }
-                    or variadic_builtin_selector
-                    and str(role).casefold().startswith("arg:")
+                    # A method call's argument (``x.maximum(y)``) is an
+                    # operand under role ``arg:0``, as a builtin's are.
+                    or str(role).casefold().startswith("arg:")
                 )
                 and int(parent) in graph.G
             )
@@ -24188,7 +24324,10 @@ def _remove_dead_metadata_nodes(
         # method without it.  Rule: a call through a stored callable field
         # is an effect the class surface must lower or refuse, never dead
         # metadata.
-        if _stored_callable_field_call(graph.G, data) is not None:
+        if (
+            _stored_callable_field_call(graph.G, data) is not None
+            or str(data.get("type")) == "HostCallback"
+        ):
             return False
         attributes = data.get("attributes") or {}
         dead_pure_tensor_call = bool(
@@ -26376,7 +26515,7 @@ def _fold_callsite_structural_values(
             if (
                 operation in {
                     "add", "sub", "mult", "mul", "div", "truediv",
-                    "floordiv", "mod", "pow", "maximum", "minimum",
+                    "floordiv", "mod", "pow", "maximum", "minimum", "emax", "emin",
                     "max", "min",
                 } | comparison_operations
                 or semantic_operation in comparison_operations
@@ -26421,6 +26560,32 @@ def _fold_callsite_structural_values(
                         "dtype": parent_descriptors[0]["dtype"],
                     }
                     parent_descriptors = ()
+                # Program: ``max(x, y)`` over two (3,) tensors.  Wrong
+                # record: the operands broadcast to (3,) and the builtin
+                # compiled as an elementwise maximum, where Python raises (a
+                # tensor's truth value is ambiguous).  Rule: builtin
+                # ``max``/``min`` of operands holding more than one element,
+                # or a runtime count, is refused as Python refuses it; the
+                # elementwise builtin rule is spelled ``x.emax(y)``.
+                if (
+                    operation in {"max", "min"}
+                    and isinstance(data.get("expr_obj"), ast.Call)
+                    and isinstance(data["expr_obj"].func, ast.Name)
+                    and len(data["expr_obj"].args) >= 2
+                    and any(
+                        int(np.prod(tuple(descriptor["shape"]) or (1,))) != 1
+                        or int(descriptor.get("rank") or 0)
+                        > len(tuple(descriptor["shape"]))
+                        for descriptor in parent_descriptors
+                    )
+                ):
+                    raise ValueError(
+                        f"builtin {operation}() of tensors with more than one "
+                        "element (or a runtime count) raises in Python (the truth value of a "
+                        "tensor with more than one element is ambiguous); "
+                        f"write x.e{operation}(y) for the builtin rule per "
+                        f"element, or x.{operation}imum(y) for numpy's"
+                    )
                 if parent_descriptors:
                     try:
                         shape = tuple(np.broadcast_shapes(*(
@@ -32598,6 +32763,16 @@ def strategize_shell_deployment(
         "resolve-grounded-method-references-before-loops",
         lambda: _resolve_grounded_method_references(graph),
     )
+    # A call through a host-supplied callable slot is lowered before loops
+    # and control planning read it: as a statement it is an ordered host
+    # call, and its ``is None`` test reads the function pointer instead of
+    # becoming a separate caller-supplied predicate.
+    from .fortran_c_shell import _lower_host_callback_field_calls_graph
+
+    selection_phase(
+        "lower-host-callback-field-calls",
+        lambda: _lower_host_callback_field_calls_graph(graph.G),
+    )
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")
     )
@@ -32716,6 +32891,10 @@ def strategize_shell_deployment(
         "resolve-grounded-tensor-operations",
         lambda: _resolve_grounded_tensor_operations(graph),
     )
+    selection_phase(
+        "stamp-max-semantics",
+        lambda: _stamp_max_semantics(graph),
+    )
     reference_tables = selection_phase(
         "build-shell-reference-tables",
         lambda: build_shell_reference_tables(graph),
@@ -32806,6 +32985,7 @@ def strategize_shell_deployment(
             partition_keys=partition_keys,
             extra_dependency_edges=(
                 *closure_edges, *_sequence_effect_read_edges(graph),
+                *_host_callback_order_edges(graph),
             ),
             fusible_node_ids=_shader_fusible_node_ids(
                 graph, executable_nodes,
