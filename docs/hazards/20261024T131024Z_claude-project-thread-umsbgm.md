@@ -18,3 +18,21 @@ memory, so those parts were read against the baselines. The new names there
 were the record-table test (fixed) and
 test_project_unit_recognizes_exact_lowered_closure_formals, which fails on
 main too. Fuzz seed 101 at FUZZ_EXT=4: 55 PASS, 5 LOUD, 0 WRONG.
+
+2026-10-24 RE-GATE ON MAIN c8bf22db (MEASURED, Ubuntu24 WSL): Merged
+main into this PR without rewriting history. The full typed C/LLVM/Fortran
+corpus completed all 387 programs. Eleven nonpass program names remain,
+all established on fresh main: c22, c367, c398, c532, c536-c538,
+c547-c550. Eleven formerly nonpass names now pass: c397, c399,
+c422-c429, and c552. c550 still refuses by name; c547-c549 still crash
+the isolated Fortran child with exit -11, also reproduced directly on main.
+The focused record storage-refusal and constructor frame-ownership tests
+passed 2/2. Identity concordance audit: 26 rows, 2 functions, 0 findings,
+0 unsourced (CLOSED).
+
+FUZZ_EXT=4 seed 101 completed 60 programs: 57 PASS, 3 LOUD, 0 WRONG.
+The Linux gate ran on the merged PR and a fresh main worktree with
+requirements, llvmlite, ziglang, setuptools, and gfortran installed.
+Each of its four part logs ended in a pytest summary. Part aa/ab/ac/rec
+had 77/7/25/20 failing names on both trees, with exact name equality
+and no new failures. The PR is mergeable on GitHub at this receipt.
