@@ -17507,6 +17507,17 @@ class _ControlSSABuilder(TiledObject):
                         stage=CONTROL_SSA_CONDITIONAL,
                     ),
                     "initial_spelled_value_id": int(initial_value_id),
+                    # Each arm's SSA identity as lowered here.  A later
+                    # settlement that replaces an arm with a resident value
+                    # (a folded field read becoming the constructor argument)
+                    # leaves a different id at that position; the
+                    # continuation pass preserves such an arm when another
+                    # name binding in this scope owns the resident.
+                    "arm_lowered_value_ids": (
+                        int(true_value.id), int(false_value.id),
+                    ),
+                    "arm_lowered_binding_scope": self.lexical_read_scope,
+                    "arm_lowered_merge_id": int(merged_value_id),
                     "preserved_name_binding_value_ids": tuple(sorted(preserved_binding_sources)),
                     # The same receipt by Phi operand position: an arm's SSA
                     # value need not carry its graph id (a loop induction is

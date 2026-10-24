@@ -890,6 +890,27 @@ def reconcile_forwarded_record_results(module):
     return len(receipts)
 
 
+def _name_binding_owners(scope: object) -> dict[int, set[str]]:
+    """Graph value id -> the names its ``name_binding`` rows bind in
+    ``scope`` (the lowering's read scope), from the identity book."""
+
+    from .identity_concordance import current_identity_book
+
+    if scope is None:
+        return {}
+    book = current_identity_book()
+    if book is None or "name_binding" not in book.pages:
+        return {}
+    owners: dict[int, set[str]] = {}
+    with book.borrowed("name_binding") as names:
+        for row in names.scope_rows(tuple(scope) if isinstance(scope, list) else scope):
+            fact = names.latest(row)
+            value_id = getattr(fact, "value_id", None)
+            if value_id is not None:
+                owners.setdefault(int(value_id), set()).add(row[1])
+    return owners
+
+
 def reconcile_conditional_phi_continuations(module):
     """Carry settled conditional values into dominated continuation uses.
 
@@ -956,6 +977,52 @@ def reconcile_conditional_phi_continuations(module):
                 preserved_positions = frozenset(attributes.get(
                     "preserved_name_binding_arm_positions", (),
                 ))
+                # An arm a later settlement replaced with a resident value
+                # is that resident's identity, which this merge does not
+                # version.  Program: ``r1 = Rec(n, 3); if n > 7:
+                # r1.x = n + 6; return r1.x * 10 + n`` (corpus c550).  The
+                # else arm, field read GetAttr 11, settled to the constructor
+                # argument ``n``.  Wrong record: this pass rewrote the later
+                # read of ``n`` to the merge Phi12; n=9 returned 165, Python
+                # 159.  Rule: an arm whose id differs from the id the
+                # lowering gave it, and whose resident a name binding owns
+                # that this merge does not version, is preserved by
+                # position.  A resident no other name owns, or owned only by
+                # the merged field's receiver, is the field's own storage
+                # version (corpus c426: ``k``'s one-field slot read by a
+                # later ``k.mul(x)``), and continues.
+                lowered_arm_ids = tuple(attributes.get(
+                    "arm_lowered_value_ids", (),
+                ))
+                settled = {
+                    position: int(arm.id)
+                    for position, arm in enumerate(operation.args)
+                    if position < len(lowered_arm_ids)
+                    and int(arm.id) != int(lowered_arm_ids[position])
+                }
+                if settled:
+                    owners = _name_binding_owners(
+                        attributes.get("arm_lowered_binding_scope"),
+                    )
+                    merged_names = owners.get(
+                        attributes.get("arm_lowered_merge_id"), set(),
+                    )
+                    # The receiver of a merged field (``k`` for ``k.scale``)
+                    # is the record whose field this merge versions; a
+                    # one-field record's slot is the record's own value.
+                    receivers = {
+                        name.rsplit(".", 1)[0]
+                        for name in merged_names if "." in name
+                    }
+                    # Every name of that record (``j = k``) binds the same
+                    # value, so a resident the receiver owns is the record.
+                    preserved_positions |= {
+                        position
+                        for position, resident_id in settled.items()
+                        if merged_names
+                        and owners.get(resident_id, set()) - merged_names
+                        and not owners.get(resident_id, set()) & receivers
+                    }
                 for position, arm in enumerate(operation.args):
                     if arm is operation.res:
                         continue
