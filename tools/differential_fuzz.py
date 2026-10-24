@@ -77,6 +77,9 @@ EXTENDED = [
     # an early return beside a returned length of a list parameter (corpus
     # c372, plan C7)
     (["c{v} = neg_or_len([{a}, n, n - {b}])"], "c{v}"),
+    # an augmented store at a computed list index in a loop (corpus c373,
+    # plan C6)
+    (["xs{v} = [{a}, 0, {b}]", "for i{v} in range({c} + 2):", "    xs{v}[(i{v} + n) % 3] += i{v} + {a}"], "xs{v}[0] * 100 + xs{v}[1] * 10 + xs{v}[2]"),
     (["xs{v} = []", "k{v} = n % 5 + 2", "while k{v} > 0:", "    xs{v}.append(k{v})", "    k{v} -= 2"], "len(xs{v}) * 10 + xs{v}[0]"),
     (["xs{v} = [{a}, n, {b}]", "for j{v} in range(len(xs{v})):", "    xs{v}[j{v}] = xs{v}[j{v}] * 2"], "xs{v}[0] + xs{v}[1] + xs{v}[2]"),
     (["xs{v} = [n, {a}, {b}]", "m{v} = xs{v}[0]", "for x{v} in xs{v}:", "    if x{v} > m{v}:", "        m{v} = x{v}"], "m{v}"),
