@@ -152,6 +152,7 @@ from .resident_sequence_materialization import (
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
+    _list_rebound_on_one_branch as _list_rebound_on_one_branch,
     _loop_carried_initial_ids as _loop_carried_initial_ids,
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
     _loop_carried_storage_aliases as _loop_carried_storage_aliases,
@@ -25781,13 +25782,27 @@ def _class_surface_ssa_program(
         # the body list's aggregate attributes, but its arena is the initial
         # list the promotion carried it into: it names that storage and is
         # not a list of its own.
+        # Program: ``rep = [9]; if k > 2: rep = [k, 1, 2]`` then
+        # ``len(rep)`` (corpus c392).  Wrong record: the merge of a list
+        # rebound on one branch was promoted into the initial list's arena
+        # (the branch copies its list there), but it kept a declaration of
+        # its own, so its reads went to a never-written arena (the audit
+        # saw one column under two lists).  Rule: such a merge names its
+        # initial list's storage, as the loop port does
+        # (``_list_rebound_on_one_branch``).  Any other merge keeps its
+        # declaration, and is born or refused in ``_list_literal_mutations``.
         promoted_loop_ports = {
             int(value_id)
             for value_id, (resident_id, _kind)
             in conditional_sequence_aliases.items()
             if int(value_id) != int(resident_id)
-            and str(graph_node_by_value.get(int(value_id), {}).get("type"))
-            == "LoopResult"
+            and (
+                str(graph_node_by_value.get(int(value_id), {}).get("type"))
+                == "LoopResult"
+                or _list_rebound_on_one_branch(
+                    graph_obj, node_by_value.get(int(value_id), -1),
+                )
+            )
         }
         if promoted_loop_ports:
             sequence_declarations = tuple(

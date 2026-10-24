@@ -359,6 +359,73 @@ def test_item_while_test_reevaluated_by_the_latch_is_the_items_next_generation(
         assert got == [want]
 
 
+def test_list_rebound_on_one_branch_is_copied_into_its_initial_storage(
+    tmp_path,
+):
+    # The tire's ``metrics.unresolved_report = list(lines)`` on one branch
+    # of ``step_with_dt_control_used`` was refused ("bound to lists of
+    # different shapes on two branches").  The conditional copies the arm
+    # into the initial list's storage; the merge names that storage, the
+    # storage is sized for the copy, and reductions read it after the copy.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    source = (
+        "def root(k: int) -> int:\n"
+        "    rep = [1]\n"
+        "    if k > 2:\n"
+        "        rep = [k, 1, 2]\n"
+        "    return sum(rep) * 10 + len(rep) + max(rep)\n"
+    )
+    contract = str(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="list_rebound_on_one_branch",
+        extraction_contract=contract, progress=lambda _: None,
+    )
+    root = module.functions[exports[0]]
+    params = dict(root.metadata["parameter_names"])
+    (ret,) = [
+        instruction for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    ]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native")
+    for k in (0, 3, 5):
+        rep = [k, 1, 2] if k > 2 else [1]
+        execution = artifact.prepare_execution(
+            {params["k"]: np.array([k])},
+        ).run()
+        got = execution.buffers[ret.args[0].id].reshape(-1).tolist()
+        assert got == [sum(rep) * 10 + len(rep) + max(rep)]
+
+
+def test_list_rebound_on_a_branch_while_another_name_holds_it_is_refused():
+    # Copying the arm into the initial list would change ``keep`` too.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = (
+        "def root(k: int) -> int:\n"
+        "    rep = [9]\n"
+        "    keep = rep\n"
+        "    if k > 2:\n"
+        "        rep = [k, 1, 2]\n"
+        "    return len(rep) * 100 + len(keep) * 10 + keep[0]\n"
+    )
+    contract = str(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    with pytest.raises(ValueError, match="keep also holds it"):
+        lower_ast_source_to_ssa(
+            source, "root", name="list_rebound_while_shared",
+            extraction_contract=contract, progress=lambda _: None,
+        )
+
+
 def test_validation_only_plan_call_is_removed_by_exact_callsite_identity():
     from src.compiler.hierarchical_plan import PlanCall, PlanClosure
 

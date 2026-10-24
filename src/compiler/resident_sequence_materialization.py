@@ -934,6 +934,52 @@ def _promote_conditional_sequence_aliases(
     destination_ids: set[int] = set()
     rebirth_ports: dict[int, int] = {}
 
+    node_by_value = {
+        int(data.get("value_id", node_id)): int(node_id)
+        for node_id, data in graph_obj.nodes(data=True)
+    }
+
+    def refuse_shared_branch_rebinding(initial_id, arm_ids, merged_id):
+        merged = graph_obj.nodes.get(node_by_value.get(int(merged_id)), {})
+        name = (merged.get("attributes") or {}).get("binding_name")
+        if name is None:
+            return
+        identities = dict(graph_obj.graph.get("identity_table") or {})
+
+        def holders(value_id):
+            return sorted(
+                str(other) for other, history in identities.items()
+                if str(other) != str(name)
+                and int(value_id) in set(map(int, history))
+            ) + sorted(
+                f"node {int(reader)}"
+                for reader, reader_data in graph_obj.nodes(data=True)
+                for parent, role in reader_data.get("parents") or ()
+                if int(parent) == node_by_value.get(int(value_id))
+                and str(role).startswith("elts")
+            )
+
+        shared = holders(initial_id)
+        if not shared:
+            from .glsl_deployment_strategy import _mutated_sequence_node_ids
+
+            changed = _mutated_sequence_node_ids(
+                graph_obj, include_merge_aliases=False,
+            )
+            if node_by_value.get(int(merged_id)) in changed:
+                shared = [
+                    holder for arm_id in arm_ids
+                    if int(arm_id) != int(initial_id)
+                    for holder in holders(arm_id)
+                ]
+        if shared:
+            raise ValueError(
+                f"list {str(name)!r} is rebound on a branch while "
+                f"{', '.join(dict.fromkeys(shared))} also holds it; a list "
+                "rebound on a branch is carried by copying into its initial "
+                "storage, which only one name may own"
+            )
+
     def promote(block):
         if isinstance(block, ConditionalBlock):
             scalar = []
@@ -983,6 +1029,17 @@ def _promote_conditional_sequence_aliases(
                     scalar.append(carried)
                     scalar_field_cells.append(cells)
                     continue
+                # Program: ``rep = [9]; keep = rep; if k > 2: rep = [k, 1,
+                # 2]`` then ``len(keep)`` (scratch c12).  The copy overwrites
+                # the initial list, which is the binding's own storage only
+                # while no other name or container holds it (``keep`` must
+                # still read ``[9]``), as for a list rebound in a loop.  An
+                # arm another name holds is copied, not shared, so a later
+                # change through the merge would not reach that name.
+                if initial_kind in copyable_sequence_kinds:
+                    refuse_shared_branch_rebinding(
+                        initial_id, (true_id, false_id), merged_id,
+                    )
                 destination = int(initial_resident)
                 sequences.append((
                     int(true_resident), int(false_resident),
@@ -2245,6 +2302,53 @@ def _static_sequence_capacity_survey(
         parent for parent in _call_escaped_argument_ids(graph_obj)
         if parent in local_replications
     }
+    # Program: ``rep = [9]; if k > 2: rep = [k, 1, 2]`` then ``len(rep)``
+    # (corpus c392).  Wrong record: a list rebound on a branch is carried by
+    # copying the arm's list into the initial list's storage
+    # (``carried_sequence_aliases``), but that copy is no mutation this
+    # survey reads, so ``[]`` kept the bound of its own display, the copy
+    # found the arena full, and ``len(rep)`` read 0 (silently).  Rule: the
+    # storage holds at most the larger of its own rows and each copied
+    # arm's; a copied arm with no bound, or later growth of the storage,
+    # leaves it to the dynamic contract.
+    copies: dict[int, set[int]] = {}
+
+    def carried_copies(block):
+        if block is None:
+            return
+        for alias in getattr(block, "carried_sequence_aliases", ()) or ():
+            for source in (int(alias[0]), int(alias[1])):
+                if source != int(alias[2]):
+                    copies.setdefault(int(alias[2]), set()).add(source)
+        for child in getattr(block, "blocks", ()) or ():
+            carried_copies(child)
+        for arm in ("condition", "body", "orelse", "callee"):
+            carried_copies(getattr(block, arm, None))
+
+    if control is not None:
+        carried_copies(control.root)
+    grown = {
+        int(mutation.sequence_value_id)
+        for mutation in _sequence_append_call_mutations(graph_obj)
+        if mutation.operator != "clear"
+    }
+    copies_unbounded: set[int] = set()
+    settled = False
+    while not settled:
+        settled = True
+        for destination, sources in copies.items():
+            own = sequence_bound(destination)
+            if own is None:
+                continue
+            source_bounds = [sequence_bound(source) for source in sources]
+            if destination in grown or None in source_bounds:
+                bounds.pop(destination, None)
+                copies_unbounded.add(destination)
+                continue
+            widest = max(own, *source_bounds)
+            if widest != bounds.get(destination):
+                bounds[destination] = widest
+                settled = False
     unbounded = frozenset(
         key for key in local_lists if key not in bounds and key not in escaped
     ) | frozenset(
@@ -2254,6 +2358,9 @@ def _static_sequence_capacity_survey(
     ) | frozenset(
         key for key in local_dicts
         if key not in bounds and key not in escaped_dicts
+    ) | frozenset(
+        key for key in copies_unbounded
+        if key not in _call_escaped_argument_ids(graph_obj)
     )
     return bounds, unbounded
 
@@ -2667,6 +2774,51 @@ def _scalar_constant_member(row: Mapping[str, Any]) -> Any:
     return literal if isinstance(literal, (bool, int, float, str)) else None
 
 
+def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
+    """Whether a list merge is one branch rebinding its initial list.
+
+    Program: the tire's ``metrics.unresolved_report = list(lines)`` on one
+    branch of ``step_with_dt_control_used`` (corpus c392).  Such a merge
+    (an ``aggregate_phi`` whose other arm is its initial list) is carried
+    by the conditional, which copies the arm into the initial list's
+    storage (``carried_sequence_aliases``); the merge names that storage.
+    Both arms rebinding, or an initial empty display (whose rows have no
+    element type before the copy), is not this shape.
+    """
+
+    data = graph_obj.nodes.get(int(node_id)) or {}
+    attributes = data.get("attributes") or {}
+    initial = attributes.get("initial_value_id")
+    if (
+        attributes.get("producer_kind") != "aggregate_phi"
+        or attributes.get("aggregate_kind") != "list"
+        or initial is None
+    ):
+        return False
+    arms = tuple(
+        int(graph_obj.nodes[parent].get("value_id", parent))
+        for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and parent in graph_obj
+    )
+    if len(arms) != 2 or arms.count(int(initial)) != 1:
+        return False
+    initial_nodes = [
+        candidate for candidate, candidate_data in graph_obj.nodes(data=True)
+        if int(candidate_data.get("value_id", candidate)) == int(initial)
+    ]
+    if len(initial_nodes) != 1:
+        return False
+    initial_node = graph_obj.nodes[initial_nodes[0]]
+    literal = initial_node.get("constant")
+    if literal is None:
+        literal = (initial_node.get("attributes") or {}).get("value")
+    expression = initial_node.get("expr_obj")
+    return not (
+        isinstance(literal, list) and not literal
+        or isinstance(expression, ast.List) and not expression.elts
+    )
+
+
 def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tuple[Any, ...]:
     """Publish ordinary list rows at their exact authored construction site.
 
@@ -2844,7 +2996,21 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             # capacity and was refused at emission; its birth is the same,
             # under the unique ``add`` policy.
             if not layout_members_of(layout):
-                if attributes.get("aggregate_kind") == "list":
+                # Program: the tire's ``metrics.unresolved_report =
+                # list(lines)`` on one branch of
+                # ``step_with_dt_control_used`` (corpus c392).  A list
+                # rebound on one branch, the other keeping its initial
+                # list, is carried by the conditional: it copies the arm
+                # into the initial list's storage (``carried_sequence_
+                # aliases``), and the merge names that storage.  Both arms
+                # rebinding, or an initial empty display (whose rows have
+                # no element type before the copy), stay refused.
+                rebound_on_one_branch = _list_rebound_on_one_branch(
+                    graph_obj, int(node_id),
+                )
+                if attributes.get("aggregate_kind") == "list" and not (
+                    rebound_on_one_branch
+                ):
                     # Program: ``def pick(n): if n > 2: r = [n] else: r =
                     # []; return r`` (scratch c972).  Arms of different
                     # lengths publish no member layout, and nothing else
