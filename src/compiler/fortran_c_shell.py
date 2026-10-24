@@ -56857,6 +56857,41 @@ def _emit_class_surface_module(
             )
             + "; refusing to emit a library without them"
         )
+    # A call through a stored callable -- ``self.notify(n)`` where the class
+    # table lists ``notify`` as a FIELD, not a method -- has no lowering: no
+    # method_ref, no callee_ref, no indirect callable record.  As a
+    # statement its result has no consumer, so nothing downstream asked for
+    # it and the library shipped the method with the call removed (the
+    # callable's effects silently gone).  The public entry already refuses
+    # this through its unresolved call table; the class surface has no such
+    # table, so read the method graph's own class-table record here.
+    from .glsl_deployment_strategy import (
+        _stored_callable_field_call, _walk_planned_shells,
+    )
+
+    unlowered_field_calls = []
+    for planned in _walk_planned_shells(
+        deployment, include_function_registry=False,
+    ):
+        graph = getattr(getattr(planned, "process_graph", None), "G", None)
+        if graph is None:
+            continue
+        for node_id, data in graph.nodes(data=True):
+            field = _stored_callable_field_call(graph, data)
+            if field is None or any(
+                (data.get("attributes") or {}).get(key) is not None
+                for key in ("method_ref", "callee_ref", "indirect_callable_id")
+            ):
+                continue
+            unlowered_field_calls.append(
+                f"{field[0]}.{graph.graph.get('function_name')}: "
+                f"{ast.unparse(data['expr_obj'])} (node {int(node_id)})"
+            )
+    if unlowered_field_calls:
+        raise FortranEmissionError(
+            "class surface has a call through a stored callable field with "
+            "no lowered invocation: " + "; ".join(unlowered_field_calls)
+        )
     emitted = emit_module(
         ssa_module,
         name=f"{artifact_name}_fortran",
