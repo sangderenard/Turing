@@ -215,9 +215,8 @@ _NOCONTRACTION_SPELLINGS: frozenset[str] = frozenset(
 )
 
 # Whole-array-to-scalar reductions -- not in any op table above (they need
-# accumulation across elements, not a single instruction), so they would
-# otherwise fall through to the generic "no opcode registered" shortfall.
-# Naming them lets that case report what it actually is.
+# accumulation across elements, not a single instruction). Over a static
+# array they unroll in ``_FunctionEmitter._emit_reduction``.
 _REDUCTION_OPS: frozenset[str] = frozenset(
     {"sum", "prod", "max", "min", "mean", "all", "any"}
 )
@@ -836,6 +835,175 @@ class _FunctionEmitter:
         )
         body.append(f"    OpStore {access} {value_id}")
 
+    def _convert(
+        self, value_id: str, source: str, target: str, body: list[str]
+    ) -> str | None:
+        """``value_id`` of dtype ``source`` as dtype ``target``, or ``None``."""
+
+        source_kind, target_kind = _DTYPE_KIND.get(source), _DTYPE_KIND.get(target)
+        source_width, target_width = _DTYPE_WIDTH.get(source), _DTYPE_WIDTH.get(target)
+        if (source_kind, source_width) == (target_kind, target_width):
+            return value_id
+        if source_kind == "int" and target_kind == "float":
+            opcode = "OpConvertSToF"
+        elif source_kind == target_kind == "float":
+            opcode = "OpFConvert"
+        elif source_kind == target_kind == "int":
+            opcode = "OpSConvert"
+        else:
+            return None
+        converted = self.builder.fresh("v")
+        body.append(
+            f"    {converted} = {opcode} {self.builder.scalar_type(target)} {value_id}"
+        )
+        return converted
+
+    def _emit_reduction(
+        self, op: str, instr: Instr, block: BasicBlock, body: list[str]
+    ) -> None:
+        """Whole-array ``sum``/``prod``/``max``/``min``/``mean``/``all``/``any``.
+
+        Program: ``total = x.sum()`` over a static (2, 3) ``x`` in a shader.
+        The shape is static, so the reduction unrolls like every other array
+        op here: each element is loaded in row-major order and folded left to
+        right, as Python adds.  ``sum(xs, start)`` starts from ``start``;
+        ``max``/``min`` let a NaN in and never displace one (the numpy
+        reference, and the C backend's rule); ``all``/``any`` count NaN as
+        true.  An axis reduction, or ``max``/``min``/``mean`` of no elements,
+        is refused by name.
+        """
+
+        source = instr.args[0]
+        if (
+            len(instr.args) > (2 if op == "sum" else 1)
+            or any(a.shape for a in instr.args[1:])
+            or instr.attributes.get("axis") is not None
+        ):
+            self._shortfall(
+                op, block.name,
+                "only whole-array reductions (no axis) are supported by the "
+                "SPIR-V backend",
+            )
+            return
+        pointer = self._array_pointer.get(source.id)
+        if pointer is None:
+            self._shortfall(op, block.name, "array operand has no known storage")
+            return
+        source_dtype = source.dtype or self.dtype
+        result_dtype = instr.res.dtype or self.dtype
+        source_kind = _DTYPE_KIND.get(source_dtype)
+        result_kind = _DTYPE_KIND.get(result_dtype)
+        source_type = self.builder.scalar_type(source_dtype)
+        result_type = self.builder.scalar_type(result_dtype)
+        shape = tuple(int(size) for size in source.shape)
+        indices = list(itertools.product(*(range(size) for size in shape)))
+        name = self._name(instr.res)
+
+        if op in ("all", "any"):
+            bool_type = self.builder.scalar_type("bool")
+            truth = self.builder.constant("bool", op == "all")
+            for index in indices:
+                value = self._load_element(pointer, index, source_type, body)
+                if source_kind == "float":
+                    test = self.builder.fresh("v")
+                    zero = self.builder.constant(source_dtype, 0.0)
+                    body.append(f"    {test} = OpFUnordNotEqual {bool_type} {value} {zero}")
+                elif source_kind == "int":
+                    test = self.builder.fresh("v")
+                    zero = self.builder.constant(source_dtype, 0)
+                    body.append(f"    {test} = OpINotEqual {bool_type} {value} {zero}")
+                else:
+                    test = value
+                folded = self.builder.fresh("v")
+                logical = "OpLogicalAnd" if op == "all" else "OpLogicalOr"
+                body.append(f"    {folded} = {logical} {bool_type} {truth} {test}")
+                truth = folded
+            if result_kind == "bool":
+                body.append(f"    {name} = OpCopyObject {bool_type} {truth}")
+            else:
+                one = self.builder.constant(result_dtype, 1)
+                zero = self.builder.constant(result_dtype, 0)
+                body.append(f"    {name} = OpSelect {result_type} {truth} {one} {zero}")
+            return
+
+        if source_kind == "bool" or result_kind == "bool":
+            self._shortfall(
+                op, block.name,
+                f"a {op} reduction over or into bool is not supported by the "
+                "SPIR-V backend",
+            )
+            return
+        if op == "mean" and result_kind != "float":
+            self._shortfall(op, block.name, "mean needs a float result")
+            return
+        if not indices and op in ("max", "min", "mean"):
+            self._shortfall(
+                op, block.name, f"{op} of an empty array has no value",
+            )
+            return
+
+        elements: list[str] = []
+        for index in indices:
+            value = self._load_element(pointer, index, source_type, body)
+            converted = self._convert(value, source_dtype, result_dtype, body)
+            if converted is None:
+                self._shortfall(
+                    op, block.name,
+                    f"no conversion from {source_dtype} to {result_dtype}",
+                )
+                return
+            elements.append(converted)
+
+        if op in ("max", "min"):
+            bool_type = self.builder.scalar_type("bool")
+            if result_kind == "float":
+                compare = "OpFOrdGreaterThan" if op == "max" else "OpFOrdLessThan"
+            else:
+                compare = "OpSGreaterThan" if op == "max" else "OpSLessThan"
+            accumulator = elements[0]
+            for value in elements[1:]:
+                wins = self.builder.fresh("v")
+                body.append(f"    {wins} = {compare} {bool_type} {value} {accumulator}")
+                if result_kind == "float":
+                    nan = self.builder.fresh("v")
+                    body.append(f"    {nan} = OpIsNan {bool_type} {value}")
+                    either = self.builder.fresh("v")
+                    body.append(f"    {either} = OpLogicalOr {bool_type} {wins} {nan}")
+                    wins = either
+                chosen = self.builder.fresh("v")
+                body.append(
+                    f"    {chosen} = OpSelect {result_type} {wins} {value} {accumulator}"
+                )
+                accumulator = chosen
+            body.append(f"    {name} = OpCopyObject {result_type} {accumulator}")
+            return
+
+        fold = "mul" if op == "prod" else "add"
+        kind, payload = self._resolve(fold, result_dtype, 2)
+        if op == "sum" and len(instr.args) == 2:
+            start = instr.args[1]
+            accumulator = self._convert(
+                self._name(start), start.dtype or self.dtype, result_dtype, body
+            )
+            if accumulator is None:
+                self._shortfall(
+                    op, block.name,
+                    f"no conversion from {start.dtype} to {result_dtype}",
+                )
+                return
+        else:
+            accumulator = self.builder.constant(result_dtype, 1 if op == "prod" else 0)
+        for value in elements:
+            folded = self.builder.fresh("v")
+            self._apply(kind, payload, result_type, folded, [accumulator, value], instr, body)
+            accumulator = folded
+        if op == "mean":
+            count = self.builder.constant(result_dtype, len(elements))
+            kind, payload = self._resolve("Div", result_dtype, 2)
+            self._apply(kind, payload, result_type, name, [accumulator, count], instr, body)
+            return
+        body.append(f"    {name} = OpCopyObject {result_type} {accumulator}")
+
     def _emit_instr(self, instr: Instr, block: BasicBlock, body: list[str]) -> None:
         if instr.op in ("Br", "br", "CondBr", "condbr", "Phi", "phi"):
             self._shortfall(
@@ -950,11 +1118,7 @@ class _FunctionEmitter:
             return
 
         if not result_shape and any(a.shape for a in instr.args) and op in _REDUCTION_OPS:
-            self._shortfall(
-                op, block.name,
-                "reductions over arrays are not yet supported by the "
-                "SPIR-V backend",
-            )
+            self._emit_reduction(op, instr, block, body)
             return
 
         operand_dtype = instr.args[0].dtype if instr.args else result_dtype

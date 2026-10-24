@@ -347,3 +347,57 @@ def test_rank_only_region_deploys_as_elementwise_spirv(tmp_path):
             capture_output=True, text=True,
         )
         assert validated.returncode == 0, validated.stderr
+
+
+def test_static_reductions_deploy_and_runtime_ones_are_refused(tmp_path):
+    """``x.mean() - y.prod()`` lowers to one region per reduction.  With a
+    static shape each reduction region deploys; over runtime-sized spans it
+    is refused by name rather than read as an elementwise op."""
+
+    import shutil
+    import subprocess
+
+    from src.compiler.ssa_spirv_backend import emit_deployable_compute_shader
+
+    source = "def f(x, y):\n    return x.mean() - y.prod()\n"
+
+    def regions(name, shape):
+        module, entry, _parameters, _result = _lower(tmp_path, source, name, 1, shape)
+        for region_name, region in module.functions.items():
+            if region_name == entry:
+                continue
+            outputs = [
+                argument for block in region.blocks.values()
+                for instruction in block.instrs if instruction.op == "Ret"
+                for argument in instruction.args
+            ]
+            ops = {
+                instruction.op for block in region.blocks.values()
+                for instruction in block.instrs
+            }
+            yield ops, emit_deployable_compute_shader(region, outputs=outputs)
+
+    static = list(regions("red_static", (5,)))
+    assert {"mean", "prod"} <= set().union(*(ops for ops, _ in static))
+    for index, (_ops, shader) in enumerate(static):
+        assert shader.complete, shader.shortfalls
+        if not (shutil.which("spirv-as") and shutil.which("spirv-val")):
+            continue
+        text = tmp_path / f"region{index}.spvasm"
+        text.write_text(shader.source)
+        binary = tmp_path / f"region{index}.spv"
+        assembled = subprocess.run(
+            ["spirv-as", "--target-env", "vulkan1.1", str(text), "-o", str(binary)],
+            capture_output=True, text=True,
+        )
+        assert assembled.returncode == 0, assembled.stderr
+        validated = subprocess.run(
+            ["spirv-val", "--target-env", "vulkan1.1", str(binary)],
+            capture_output=True, text=True,
+        )
+        assert validated.returncode == 0, validated.stderr
+
+    for ops, shader in regions("red_runtime", None):
+        if ops & {"mean", "prod"}:
+            assert not shader.complete
+            assert "one element per invocation" in shader.shortfalls[0].reason

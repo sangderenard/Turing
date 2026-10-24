@@ -527,6 +527,71 @@ def test_instanced_deployable_spirv_matches_python_on_vulkan(tmp_path):
         assert (got[count * 6:] == 12345).all()
 
 
+def _reducing():
+    """``sum``, ``prod``, ``max``, ``min`` and ``mean`` of one (2, 3) instance."""
+
+    x = SSAValue(0, "float32", (2, 3))
+    results = [SSAValue(1 + i, "float32", ()) for i in range(5)]
+    ops = ("sum", "prod", "max", "min", "mean")
+    function = Function("reducing", [x], {"entry": BasicBlock("entry", [
+        *(Instr(op, [x], value) for op, value in zip(ops, results)),
+        Instr("Ret", [], None),
+    ])})
+    return function, results
+
+
+def test_reductions_over_instances_match_python_on_vulkan(tmp_path):
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _reducing()
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    product = publish_spirv_product(tmp_path / "product", shader)
+    record = product.deployment
+    count = 200
+    rng = np.random.default_rng(5)
+    x = rng.standard_normal((count, 2, 3)).astype(np.float32)
+    # A NaN enters max/min and is never displaced, as numpy reports it.
+    x[7, 1, 2] = np.nan
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = x
+        else:
+            assert view["instance_shape"] == []
+            buffers[resource["binding"]] = np.full(count + 64, 12345, dtype=np.float32)
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    group = record["launch"]["group_count"]["invocations_per_group"]
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(math.ceil(count / group) + 1),
+         "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    got = {
+        item["name"]: np.fromfile(paths[item["binding"]], dtype=np.float32)
+        for item in record["resources"] if item["access"] == "read_write"
+    }
+    flat = x.reshape(count, 6)
+    expected = {
+        "output_0": flat.sum(axis=1), "output_1": flat.prod(axis=1),
+        "output_2": flat.max(axis=1), "output_3": flat.min(axis=1),
+        "output_4": flat.mean(axis=1),
+    }
+    for name, want in expected.items():
+        np.testing.assert_allclose(got[name][:count], want, rtol=1e-5, atol=1e-6)
+        assert np.isnan(got[name][7])
+        assert (got[name][count:] == 12345).all()
+
+
 @pytest.mark.parametrize("dtype", ["float32", "int32"])
 def test_glsl_arena_product_runs_on_vulkan_from_its_record(tmp_path, dtype):
     """The same GLSL arena source, compiled for Vulkan, launched only from
