@@ -45,8 +45,9 @@ machine's CRT import surface) needs design decisions and is not in this pack.
 
 ## Non-negotiable ground rules (each one has destroyed work before)
 
-1. **Read `../TEST_BASELINE_AND_HAZARDS.md` before running any test.**
-   Its manifest says which failures are pre-existing. A failure listed
+1. **Read the hazards log before running any test**
+   (`python tools/hazards_log.py`: the newest files in `../docs/hazards/`, then
+   `../TEST_BASELINE_AND_HAZARDS.md`). Its manifest says which failures are pre-existing. A failure listed
    there is NOT yours — do not re-derive it.
 2. **NEVER run the whole pytest suite** (`pytest tests`). It does not
    finish. Run single files with an external timeout:
