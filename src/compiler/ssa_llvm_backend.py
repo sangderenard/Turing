@@ -4697,7 +4697,12 @@ def _emit_repository_call_module(
                     count = str(int(accounting["sequence_static_length"]))
                 elif static_shape and all(
                     isinstance(item, int) for item in static_shape
-                ) and accounting.get("program_abi_storage") != "sequence":
+                ) and accounting.get("program_abi_storage") != "sequence" and (
+                    # Program: ``ys = [5] * (n % 4); ys.append(n);
+                    # sum(ys)`` (c407, E22a).  A heap cell's (1,) shape is
+                    # the cell, not its rows; they are its live length.
+                    heap_layout is None
+                ):
                     # A span declared with a static shape has exactly that
                     # many elements (``y.max()`` over a (5,) span, as C
                     # reads it); a sequence's shape is its arena bound.
