@@ -2871,6 +2871,20 @@ def _planned_scalar_dtypes_from(
             # as for a conditional expression.
             if isinstance(expression, ast.IfExp) or op == "phi":
                 arms = parents(data, "body", "orelse")
+                # Lane D, D2.  Program: ``if n > 0: d[4] = n * 3`` then
+                # ``d[3] = d[3] + 1`` (corpus c389).  A join of two versions
+                # of a collection is that collection: its rows are the join
+                # of its arms' rows.  Nobody read that, so every read of the
+                # joined table, and every store fed by one, took the
+                # float64 domain default.  An arm still unproven leaves the
+                # join unproven.
+                if arms and all(
+                    is_collection(o) or o in element for o in arms
+                ) and not any(o in scalar for o in arms):
+                    settle(element, node_id, join(
+                        [element.get(o) for o in arms]
+                    ))
+                    continue
                 settle(scalar, node_id, join([scalar.get(o) for o in arms]))
                 continue
             # Lane D, D2.  Program: ``if a > 0 and b < n: ...``, ``x = p or
