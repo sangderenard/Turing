@@ -1,4 +1,4 @@
-2026-10-24 TITLE (MEASURED, where): 
+2026-10-24 TITLE (MEASURED, where):
 2026-10-24 FORTRAN RETURNED LIST HEAP VIEW (MEASURED, Ubuntu24 WSL):
 
 Observed on fresh main 79b86a3d through the canonical
