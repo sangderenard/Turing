@@ -22,17 +22,22 @@ from src.compiler.ssa_reference_evaluator import (
 from src.transmogrifier.ssa import IRModule
 
 
-def _lift(encoded, registers=("rdi", "rsi")):
+def _lift_function(encoded, registers=("rdi", "rsi"), *, base=0x1000, name="subject"):
     lifting = raise_binary_region_to_ssa(
         encoded, maximum_file_size=len(encoded), size=len(encoded),
-        base_address=0x1000, name="subject",
+        base_address=base, name=name,
         full_vocabulary_report=True, cfg_decode=True,
         argument_registers=registers,
         argument_names=tuple(f"arg{index}" for index in range(len(registers))),
+        calling_convention="sysv-amd64",
     )
     assert lifting.failed_vocabulary == ()
     assert lifting.function.metadata.get("machine_state_model")
-    return IRModule({"subject": lifting.function})
+    return lifting.function
+
+
+def _lift(encoded, registers=("rdi", "rsi")):
+    return IRModule({"subject": _lift_function(encoded, registers)})
 
 
 _STACK_TOP = 0x7FFF0000
@@ -140,6 +145,53 @@ def test_transfer_out_of_the_lifted_function_is_refused_by_name():
     module = IRModule({"subject": lifting.function})
     with pytest.raises(SSAEvaluationError, match="machine address linking"):
         _run(module, arg0=1)
+
+
+# The callee at 0x2000 is lea rax, [rdi + rsi]; ret.
+_CALLEE = b"\x48\x8d\x04\x37\xc3"
+
+
+def _call_module(caller):
+    return IRModule({
+        "subject": _lift_function(caller),
+        "callee": _lift_function(_CALLEE, base=0x2000, name="callee"),
+    })
+
+
+def _call_rel32(at, target):
+    return b"\xe8" + (target - (at + 5)).to_bytes(4, "little", signed=True)
+
+
+def test_lifted_call_runs_the_module_function_at_its_target():
+    # push rbx; mov rbx, rdi; add rdi, rdi; call 0x2000; add rax, rbx;
+    # pop rbx; ret.  RBX is callee-saved, so the caller keeps it.
+    head = b"\x53\x48\x89\xfb\x48\x01\xff"
+    caller = head + _call_rel32(0x1000 + len(head), 0x2000) + b"\x48\x01\xd8\x5b\xc3"
+    module = _call_module(caller)
+    call = next(
+        item for block in module.functions["subject"].blocks.values()
+        for item in block.instrs if item.op == "Call"
+    )
+    assert call.attributes["calling_convention"] == "sysv-amd64"
+    assert call.attributes["state_layout"][:2] == ("target", "memory")
+    for left, right in ((1, 2), (5, 1 << 40), ((1 << 63) + 3, 7)):
+        returned = _run(module, arg0=left, arg1=right)[0]
+        assert returned == (2 * left + right + left) % (1 << 64)
+
+
+def test_a_caller_saved_register_after_a_call_is_refused():
+    # call 0x2000; mov rax, rsi; ret.  System V lets the callee change RSI.
+    caller = _call_rel32(0x1000, 0x2000) + b"\x48\x89\xf0\xc3"
+    module = _call_module(caller)
+    with pytest.raises(SSAEvaluationError, match="RSI is undefined across the call"):
+        _run(module, arg0=1, arg1=2)
+
+
+def test_a_call_to_an_address_no_lifted_function_enters_is_refused():
+    caller = _call_rel32(0x1000, 0x3000) + b"\xc3"
+    module = _call_module(caller)
+    with pytest.raises(SSAEvaluationError, match="0x3000, which no lifted function"):
+        _run(module, arg0=1, arg1=2)
 
 
 def _shared_libpython():
@@ -251,3 +303,47 @@ def test_lifted_pytime_as_microseconds_matches_the_native_export(libpython):
             )[0]
             signed = returned - (1 << 64) if returned >> 63 else returned
             assert signed == native(time, mode), (time, mode)
+
+
+def _code_objects():
+    namespace = {}
+    exec(compile(
+        "def straight(x):\n    y = x + 1\n\n    return y * 2\n"
+        "def branches(x):\n    if x:\n        return [i for i in range(x)]\n"
+        "    while x < 3:\n        x += 1\n\n\n    return x\n",
+        "<lifted>", "exec",
+    ), namespace)
+    return namespace["straight"].__code__, namespace["branches"].__code__
+
+
+@_LINUX_LIBPYTHON
+def test_lifted_code_addr2line_and_its_callee_match_the_native_export(libpython):
+    from src.compiler.cpython_compile_ssa import lift_elf_export_to_ssa
+
+    path, _image, memory, _external, native = libpython
+    function = native.PyCode_Addr2Line
+    function.restype = ctypes.c_int
+    function.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lifted = lift_elf_export_to_ssa(path, root_symbol="PyCode_Addr2Line")
+    assert lifted.blockers == ()
+    # Its call to _PyCode_CheckLineNumber runs that lifted function.
+    assert any(
+        item.op == "Call"
+        for block in lifted.module.functions[lifted.root_function].blocks.values()
+        for item in block.instrs
+    )
+    for code in _code_objects():
+        # The objects are this interpreter's own; their bytes are mapped at
+        # their live addresses, which the image (based at zero) never uses.
+        mapped = memory
+        for item in (code, code.co_linetable):
+            mapped = mapped.map_bytes(
+                id(item), ctypes.string_at(id(item), sys.getsizeof(item)),
+            )
+        for offset in range(-1, len(code.co_code) + 6):
+            returned = _run(
+                lifted.module, lifted.root_function, memory=mapped,
+                arg0=id(code), arg1=offset & ((1 << 64) - 1),
+            )[0] & 0xFFFFFFFF
+            signed = returned - (1 << 32) if returned >> 31 else returned
+            assert signed == function(id(code), offset), offset

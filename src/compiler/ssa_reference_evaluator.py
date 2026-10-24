@@ -219,6 +219,13 @@ if _INVENTED:
 # that names a ``machine_state`` reads or writes ``width`` bits little-endian
 # at its pointer; each ``Store`` yields a new memory value, as the SSA
 # threads it.  An unmapped address is refused by name.
+#
+# A lifted ``Call`` carries the caller's complete register state
+# (``state_layout``).  It runs the module function whose
+# ``machine_entry_address`` is the target: the return address is pushed,
+# the callee's formals are bound by name from that state, and its ``Ret``
+# yields RAX and the memory.  Every other caller-saved register the
+# convention lets the callee change is clobbered: using one raises.
 _MACHINE_INTEGER_OPERATIONS = frozenset({
     "Const", "Cast", "Trunc", "ZExt", "SExt",
     "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "AShr",
@@ -226,6 +233,7 @@ _MACHINE_INTEGER_OPERATIONS = frozenset({
     "SMulLow", "SMulHigh", "SMulOverflow", "UMulLow", "UMulHigh",
 })
 _MACHINE_MEMORY_OPERATIONS = frozenset({"Load", "Store"})
+_MACHINE_CALL_OPERATIONS = frozenset({"Call"})
 _MACHINE_MEMORY_STATES = frozenset({"memory", "stack-push", "stack-pop"})
 
 
@@ -234,6 +242,7 @@ def _audit_machine_vocabulary() -> None:
 
     unknown = (
         _MACHINE_INTEGER_OPERATIONS | _MACHINE_MEMORY_OPERATIONS
+        | _MACHINE_CALL_OPERATIONS
     ) - {item.value for item in Handler}
     if unknown:
         raise ImportError(
@@ -367,6 +376,39 @@ def _machine_memory_value(
             f"(machine address {attributes.get('machine_address')!r}) "
             "touches unmapped memory"
         ) from error
+
+
+class _MachineClobbered:
+    """A caller-saved register after a call: no record gives its value."""
+
+    __slots__ = ("register", "address")
+
+    def __init__(self, register: str, address: Any) -> None:
+        self.register = register
+        self.address = address
+
+    def _refuse(self, *_args: Any) -> Any:
+        raise SSAEvaluationError(
+            f"{self.register} is undefined across the call at machine "
+            f"address {self.address!r}; the calling convention gives it no "
+            "value"
+        )
+
+    __int__ = __index__ = __bool__ = _refuse
+
+
+@dataclass(frozen=True, slots=True)
+class _MachineCallState:
+    rax: int
+    memory: Any
+    address: Any
+
+
+# Incoming flags a callee may rely on by convention: DF is clear.
+_MACHINE_CALL_ENTRY_FLAGS = {"__machine_df": False}
+_MACHINE_FLAG_FORMALS = frozenset(
+    f"__machine_{flag}" for flag in ("cf", "pf", "af", "zf", "sf", "of")
+)
 
 
 def _declared_formal_names(function: Any) -> dict[str, int]:
@@ -690,6 +732,103 @@ class SSAReferenceEvaluator:
             operation.casefold(), operation,
         )
 
+    def _machine_function_at(self, address: int) -> Any:
+        entries = getattr(self, "_machine_entries", None)
+        if entries is None:
+            entries = self._machine_entries = {
+                int(item.metadata["machine_entry_address"]): item
+                for item in self.functions.values()
+                if (getattr(item, "metadata", None) or {}).get(
+                    "machine_entry_address",
+                ) is not None
+            }
+        return entries.get(int(address) & ((1 << 64) - 1))
+
+    def _machine_call(
+        self, function: Any, instruction: Any, values: dict[int, Any],
+    ) -> _MachineCallState:
+        attributes = instruction.attributes or {}
+        address = attributes.get("machine_address")
+        layout = attributes.get("state_layout")
+        if not layout:
+            raise SSAEvaluationError(
+                f"{function.name}: call at machine address {address!r} "
+                "carries no register state"
+            )
+        state = {
+            name: values[int(argument.id)]
+            for name, argument in zip(layout, instruction.args)
+        }
+        target = int(state["target"]) & ((1 << 64) - 1)
+        callee = self._machine_function_at(target)
+        if callee is None:
+            raise SSAEvaluationError(
+                f"{function.name}: call at machine address {address!r} to "
+                f"{target:#x}, which no lifted function in the module enters "
+                "(needs machine address linking)"
+            )
+        if callee.metadata.get("calling_convention") != attributes.get(
+            "calling_convention",
+        ):
+            raise SSAEvaluationError(
+                f"{function.name}: call at {address!r} uses "
+                f"{attributes.get('calling_convention')!r} but {callee.name} "
+                f"was lifted for {callee.metadata.get('calling_convention')!r}"
+            )
+        stack = (int(state["register.rsp"]) - 8) & ((1 << 64) - 1)
+        try:
+            for offset in range(8):
+                state["memory"][stack + offset]  # a push maps no new memory
+        except KeyError as error:
+            raise SSAEvaluationError(
+                f"{function.name}: call at {address!r} pushes its return "
+                f"address to unmapped memory at {stack:#x}"
+            ) from error
+        memory = state["memory"].write_unsigned(
+            stack, 64, int(attributes["return_address"]),
+        )
+        names = tuple(callee.metadata["argument_names"])
+        registers = tuple(callee.metadata["argument_registers"])
+        frame: dict[int, Any] = {}
+        for index, (name, formal) in enumerate(zip(names, callee.args)):
+            if name == "__machine_memory":
+                bound = memory
+            elif name == "__machine_rsp":
+                bound = stack
+            elif name in _MACHINE_CALL_ENTRY_FLAGS:
+                bound = _MACHINE_CALL_ENTRY_FLAGS[name]
+            elif name in _MACHINE_FLAG_FORMALS:
+                # A lifted body names every flag it may merge; the caller's
+                # flags do not cross a call, so one that is used is refused.
+                bound = _MachineClobbered(
+                    f"flag {name[len('__machine_'):].upper()} on entry to "
+                    f"{callee.name}", address,
+                )
+            elif name == "__machine_mxcsr":
+                bound = state["system.amd64.mxcsr"]
+            elif name.startswith("__machine_"):
+                register = name[len("__machine_"):]
+                key = (
+                    f"vector-register.{register}"
+                    if register.startswith(("xmm", "ymm"))
+                    else f"register.{register}"
+                )
+                if key not in state:
+                    raise SSAEvaluationError(
+                        f"{callee.name} reads {name} on entry, which the "
+                        f"call at {address!r} does not carry"
+                    )
+                bound = state[key]
+            else:
+                bound = state[f"register.{registers[index]}"]
+            frame[int(formal.id)] = bound
+        returned = self._execute(callee, frame)
+        if len(returned) != 2:
+            raise SSAEvaluationError(
+                f"{callee.name} returns no machine memory to its caller"
+            )
+        return _MachineCallState(returned[0], returned[1], address)
+
     def _step(
         self,
         function: Any,
@@ -707,6 +846,25 @@ class SSAReferenceEvaluator:
                 values[int(result.id)] = _machine_integer_value(
                     function, instruction, values,
                 )
+                return
+            if operation in _MACHINE_CALL_OPERATIONS:
+                values[int(result.id)] = self._machine_call(
+                    function, instruction, values,
+                )
+                return
+            projection = (instruction.attributes or {}).get(
+                "machine_call_projection",
+            )
+            if operation == "Load" and projection is not None:
+                state = values[int(instruction.args[0].id)]
+                if projection == "RAX":
+                    values[int(result.id)] = state.rax
+                elif projection == "MEMORY":
+                    values[int(result.id)] = state.memory
+                else:
+                    values[int(result.id)] = _MachineClobbered(
+                        str(projection), state.address,
+                    )
                 return
             if (
                 operation in _MACHINE_MEMORY_OPERATIONS
