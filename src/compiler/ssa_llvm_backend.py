@@ -50,7 +50,8 @@ _BINARY: dict[str, str] = {
         "{out} = call double @llvm.floor.f64(double {out}.q)"
     ),
     "Eq": "{out} = fcmp oeq double {0}, {1}",
-    "Ne": "{out} = fcmp one double {0}, {1}",
+    # Python: a NaN is unequal to everything, itself included (unordered).
+    "Ne": "{out} = fcmp une double {0}, {1}",
     "Lt": "{out} = fcmp olt double {0}, {1}",
     "Le": "{out} = fcmp ole double {0}, {1}",
     "Gt": "{out} = fcmp ogt double {0}, {1}",
@@ -675,8 +676,33 @@ _UNARY_FOLDED: dict[str, str] = {
 }
 
 
+def _max_template(rule: str, greatest: bool) -> str:
+    """``Max``/``Min`` under a stamped ``max_semantics`` rule.
+
+    ``llvm.maxnum`` drops a NaN on either side, which neither Python's
+    builtin nor numpy does (see ``max_semantics``).  ``{0}`` is the running
+    value, ``{1}`` the next one.
+    """
+
+    better = "ogt" if greatest else "olt"
+    if rule == PYTHON:
+        return (
+            f"{{out}}.wins = fcmp {better} double {{1}}, {{0}}\n"
+            "{out} = select i1 {out}.wins, double {1}, double {0}"
+        )
+    return (
+        "{out}.nan0 = fcmp uno double {0}, {0}\n"
+        "{out}.nan1 = fcmp uno double {1}, {1}\n"
+        f"{{out}}.keeps = fcmp {better} double {{0}}, {{1}}\n"
+        "{out}.pick = select i1 {out}.keeps, double {0}, double {1}\n"
+        "{out}.next = select i1 {out}.nan1, double {1}, double {out}.pick\n"
+        "{out} = select i1 {out}.nan0, double {0}, double {out}.next"
+    )
+
+
 def scalar_likeness(
     operation: str, *, precision_section: bool = False,
+    max_rule: str | None = None,
 ) -> str | None:
     """The LLVM spelling of one scalar operation.
 
@@ -703,6 +729,8 @@ def scalar_likeness(
     # exists but is spelled differently is indistinguishable from a
     # missing one" -- and it kept range reduction, and with it every
     # full-domain transcendental, from compiling at all.
+    if max_rule is not None and str(operation).casefold() in {"max", "min"}:
+        return _max_template(max_rule, str(operation).casefold() == "max")
     template = _BINARY.get(operation) or _UNARY.get(operation)
     if template is None:
         folded = str(operation).casefold()
@@ -893,6 +921,7 @@ from ..transmogrifier.ssa import IRModule as _IRModule, SSAValue as _SSAValue
 # number.  The ranges were never disjoint; nothing enforced the gap the
 # comment claimed.  A flag bit cannot overlap another group's numbering by
 # construction, so the property is now structural instead of hoped for.
+from .max_semantics import NUMPY, PYTHON, max_step_rule
 from .id_space import (
     HISTORY as _HISTORY_FLAG,
     HISTORY_COUNT as _HISTORY_COUNT_FLAG,
@@ -2282,7 +2311,7 @@ def _emit_repository_call_module(
                 return converted
             if wanted == "i1":
                 zero = "0.0" if source_type == "double" else "0"
-                comparison = "fcmp one" if source_type == "double" else "icmp ne"
+                comparison = "fcmp une" if source_type == "double" else "icmp ne"
                 body.append(
                     f"  {converted} = {comparison} {source_type} {loaded}, {zero}"
                 )
@@ -4455,6 +4484,7 @@ def _emit_repository_call_module(
                 precision_section=bool(
                     instruction.attributes.get("precision_section")
                 ),
+                max_rule=max_step_rule(instruction),
             )
             if (
                 template is not None
@@ -4858,7 +4888,15 @@ def _emit_repository_call_module(
                     body.append(f"  {acc_next} = and i1 {acc}, {item}")
                 else:
                     keep = f"%red.take.{tag}"
-                    if floating:
+                    if floating and max_step_rule(instruction) == PYTHON:
+                        # Builtin ``max(xs)``: CPython's scan, where only a
+                        # strictly greater row replaces the running value,
+                        # so a leading NaN stays and a later one never wins.
+                        body.append(
+                            f"  {keep} = fcmp {'ogt' if operation == 'max' else 'olt'} "
+                            f"double {item}, {acc}"
+                        )
+                    elif floating:
                         # NaN propagates, as in the C lane: once NaN no
                         # comparison displaces it, and a NaN row enters.
                         body.append(
@@ -6801,7 +6839,7 @@ def emit_ssa_function_to_llvm(
             return register
         if wanted == "i1" and kind != "ptr":
             zero = "0.0" if kind == "double" else "0"
-            comparison = "fcmp one" if kind == "double" else "icmp ne"
+            comparison = "fcmp une" if kind == "double" else "icmp ne"
             register = f"%conv.{tag}"
             lines.append(
                 f"  {register} = {comparison} {kind} {rendering}, {zero}"
@@ -7455,6 +7493,7 @@ def emit_ssa_function_to_llvm(
                 precision_section=bool(
                     instruction.attributes.get("precision_section")
                 ),
+                max_rule=max_step_rule(instruction),
             )
             if template is not None:
                 # The declared result type is the authority on the evaluation

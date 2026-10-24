@@ -374,3 +374,60 @@ Albert's choice, at low priority, behind the bootstrap and the tire. Thread:
 - A set merged from branch displays (c274): PR #789, merge `4567cb65`.
 - D2 step 1: PR #794, merge `c0614a20`.
 - A0, A3: PR #786, merge `57709b54`, doc 35.
+
+## Queued rows, 2026-10-24 12:37 to 13:40 UTC
+
+Rows lanes sent after #890 merged, recorded as received. The workers are parked; the next planner run ranks them into the lane tables. The strings rows (TOK0 to TOK10) are in `42_strings_token_library_plan_2026_10_24.md`, with corpus c610-c619 reserved. The next free corpus block is c620.
+
+
+### 2026-10-24 12:51Z Field stores thread (umsbgm)
+- Corpus: c530-c539 full; c550-c553 used.
+- FS4 row SUPERSEDED at 12:55Z (see below): no new class unit kind.
+- Open gap: per-method catalogue unit Toy.twice (calls self.bump twice) fails ConcordanceRefusal "physical structure lacks SSA identity" only as a per-method catalogue unit (self as a parameter); the program form passes. Covered by a catalogue pytest in FS4, no corpus number.
+- MAIN BREAKAGE: main 8fb85e7 broke LLVM on Linux via the Windows build-target default (Albert's 31e0fdf7 target selection). Lane E owns the fix. Until it lands, LLVM-side gate/corpus results on main are not comparable.
+
+### 2026-10-24 12:52Z Lane D, PR #895
+- Two rules: list/tuple/set copies hold their argument's rows (dict excluded, iteration yields keys); a collection branch join joins its arms. Emitted-plan fallbacks over 347 programs (cc62e7e8 + #875): 914 -> 611. c430 52 -> 0, c441 28 -> 0, c442 39 -> 6. Gate on 8fb85e7b same names; fuzz seed 30 30/30; corpus 380/381.
+- SILENT WRONG ON MAIN: c428_class_keyword_construct, `Q(b=x, a=y)` with crossed field stores returns 5 vs 310 (keyword args likely bound by position, inferred). Routed to the Field stores thread, ahead of FS4.
+- Lane D next: re-inventory the 611 by program and node kind, then take the largest source.
+- 12:53Z correction: c428's cause is a regression from #879 (Lane C), not keyword binding. Plan callsites are placed at their call's end, but the `+` region still completed at its start, so it pulled `get()` ahead of itself and left `Q.__init__` behind. Fix (in the Field stores thread's Fortran PR): a region member that reads a call's result completes after that call ends, the same rule as for display operands. c428 and c377 pass.
+- 12:55Z FS4 (Field stores thread), final text. Albert: no new class unit kind; the SSA already has OOP. `compile_class_to_dll` stays on the existing class product (`_class_surface_ssa_program`, one library, one shared self record), gets a loud DeprecationWarning, and redirects to `lower_class_surface_to_ssa`. A SILENT-WRONG fix comes first: receiver field stores in methods (`self.n = 0; if c: self.n = n`) are placed after their value's producer and outside their arm, and every field cell is float64. These move to the control-placed field-write path with typed cells.
+- NEW, unassigned (candidates: the SSA interpreter thread or the AbstractTensor init thread, which both use the catalogue): the catalogue's cross-unit link loses region identity on intra-class calls. Per-method unit Toy.twice (calls self.bump twice) fails ConcordanceRefusal "physical structure lacks SSA identity: ('Toy_bump__bump@control:0', ...)". It links fine inside the class product.
+
+### 2026-10-24 12:59Z Lane J
+- J8 merged #889; J9 ready #898 (break/continue as hidden flags), corpus c563-c567. J10 approved by the planner (return inside a loop body: an early exit carried like the break flag plus a carried result), corpus c568-c569.
+- 13:04Z Lane J: J10 committed locally (carried return flag and result, check after loop), corpus c568-c569; PR after #898. c560-c569 full. NEW block c580-c599 (c570-c579 goes to the tensor lowering thread, which used c570-c571 in #900). Next free c600.
+  - Queue: J11 labeled break/continue; J12 `var` (function-scoped, hoisted); J13 `return` inside nested if arms below the top-level list; J16 do...while, switch, for...of.
+  - J14 strings: HOLD; shares a Turing string representation with Python Lane C's C10. Question for Albert: one string representation for both frontends (design).
+  - J15 arrays and typed arrays: wait on runtime-sized spans in the JS ABI (Nodus span work).
+
+### 2026-10-24 13:05Z NEW Lane X "Prove extra frontends and backends" (Albert approved 12:36; branch ucglka; thread cmsg_01AQC63QBS7X97E7C2FuYZDA2SWxdLs9UJ5zexLZhUbWEe). Low priority.
+- X1 mobile reference products proved bit-exact (#892, merged).
+- X2 Wasm core in the typed check; int64 never i32 (in progress). SILENT WRONG: the independent Wasm core wraps Python int formals >= 2**31 to i32.
+- X3 WebGL/WebGPU/SPIR-V and HTML shells (next).
+- Corpus c600-c609. Next free c610.
+
+### 2026-10-24 13:06Z SSA interpreter thread
+- #891 (record binding) and #901 (host callbacks, turing-host-callback-v1, doc 41) merged.
+- Next blocker: callback signature `trace: Callable[[str, Any, dict[int, Any]], None] | None` refuses on `str`. Row: extend turing-host-callback-v1 argument kinds: `str` as (const char* utf8, int64 length) [claimed, SSA thread]; `Any` as opaque_ref (declared); `dict[int, Any]` as an opaque handle to the resident table plus a host read hook [HOLD: design question for Albert, bundled with the string-representation question for C10/J14].
+- 13:09Z SSA thread: str callback depends on the string representation (a class-route `name: str` passes only a length cell). Folded into the Albert decision card on strings. Per-method catalogue on fresh main: _value complete; _operand partial (Any); _operation_name missing param `instruction`; _step f-string on opaque attribute; _call/_external_call loop over instruction.args opaque-state-effect; run keyed field capacity; _execute the trace str. Interpreter lane parked until strings/Any. SSA thread now takes (1) the catalogue cross-unit link losing region identity on intra-class calls (Toy.twice), then (2) G1. Corpus c473-c479.
+
+### 2026-10-24 13:15Z Nodus spans thread (9jvd1m): axis reductions + a Fortran silent wrong
+- Took next item: axis reductions (y.sum/prod/mean/max/min(axis=k)) over static shapes on C, LLVM, Fortran, SPIR-V. Pushed onto PR #900 (same branch). Runtime-sized axis reductions are still refused.
+- NEW SILENT (Fortran, on main 32de07f, not fixed): a rank-2 span dummy is declared with Python's extents over row-major storage (`real(c_double), intent(in) :: t0(extent_2, extent_3)`), so logical t0(i, j) is not y[i-1][j-1]. `def f(y): return y[0, 1]` with y (2, 3) = [[1,7,3],[4,2,9]] returns 3.0 on Fortran (C: 7.0). Elementwise ops are unaffected (layout-agnostic); every index-dependent rank>=2 op is suspect (subscripts, transpose, matmul, the reshape code's own comment assumes logical == Python). Fix belongs to a Fortran owner (Lane E or the silent lane): either declare dummies with reversed extents and reverse subscripts, or state the convention once. The axis-reduction code in #900 reads through `reshape(src, [reversed extents])` so it is correct under today's layout and must be revisited if the convention changes.
+
+### 2026-10-24 13:14Z (via coordinator)
+- NEW SILENT WRONG, Lane E (E28): Fortran rank-2 span uses Python extents over row-major storage. Corpus c411, c412. E26 uses c413. c410 = negative >> probe. Lane E c414-c419 free.
+- NEW SILENT WRONG, shader/precision thread (PR3): the microprecision sin core never writes y on C or LLVM, yet the benchmark reports a pass. record_return_layouts maps y to Precision's limbs count field. Related to PR1 and E26.
+- 13:18Z SSA thread: catalogue intra-class link already fixed on main by #891; #905 pins it with a catalogue pytest. G1 minimized: refuses whenever the f-string operand is a runtime-built or runtime-selected str (repros /mnt/project-files/ssa_interpreter/g1_repros/ a/b/d '|'.join, c names[0], e IfExp of str). `len("a" if n > 2 else "bcd")` returns no value on main (c474x). G1 + c474x fold into the string-representation decision. SSA thread now takes A2b (tuple-or-None returns; control finish output resolution in precompile_to_ssa), corpus c473-c479.
+- 13:19Z: `len("a" if n > 2 else "bcd")` returning no value (c474x) is routed to the silent lane: make it refuse by name until strings land. NOT YET SENT to the silent lane (thread message limit until 13:34Z); send then.
+
+### 2026-10-24 13:21Z DECIDED (Albert): strings are tokenized
+- Basic tokens compose token sequences, and each sequence is interned as its own token in a live, managed system, in every product. Not UTF-8 and not UTF-16. Existing pieces: string_table.py (FNV-1a 64-bit content-addressed tokens, a persisted reverse table), glyph_sequence_format.py (a str as list[int] of per-glyph tokens), ir_string_interning.py (constants only; runtime building explicitly unsupported).
+- New item TOK1: a design note for the live runtime intern (sequence -> token, token -> sequence, ownership and lifetime, cross-backend ABI), then lowering. It unblocks C10, J14, G1 (12 bootstrap units), callback str arguments, the SSA interpreter, and c474x.
+
+### 2026-10-24 13:24Z PARKED (Albert: park all workers, no timers)
+- Daily planner routine disabled by the coordinator; the len() reminder deleted, NOT sent to the silent lane.
+- Unsent: the c474x routing to the silent lane; a coordinator note on Albert's tokenized-strings decision (it is in memory: albert-decisions-2026-10-24.md).
+- Open question to Albert in the planner thread: interned sequence token content-addressed (hash of member tokens) or a live-table-assigned ID?
+- Everything since 12:37Z is still queued here for the next plan PR.

@@ -51,6 +51,7 @@ from ..transmogrifier.ssa import (
     SSASequenceTable,
     SSATensorTable,
 )
+from .max_semantics import fortran_reduction, fortran_step, is_max, max_step_rule
 from .string_table import NONE_TOKEN as _NONE_TOKEN, string_token as _string_token
 
 
@@ -134,6 +135,8 @@ _BINARY: dict[str, str] = {
     "pow": "({0} ** {1})",
     "maximum": "max({0}, {1})",
     "minimum": "min({0}, {1})",
+    "emax": "max({0}, {1})",
+    "emin": "min({0}, {1})",
     "matmul": "matmul({0}, {1})",
     "mod": "modulo({0}, {1})",
     "floordiv": "floor({0} / {1})",
@@ -4516,9 +4519,24 @@ class _FunctionEmitter:
                     return _REDUCTION[op].format(f"({args[0]} /= 0)")
                 return _REDUCTION[op].format(args[0])
             args = self._numeric(instr, args)
+            rule = max_step_rule(instr)
+            if (
+                rule is not None and op in ("max", "min")
+                and len(tuple(instr.args[0].shape or ())) == 1
+            ):
+                return fortran_reduction(rule, op == "max", args[0])
             return _REDUCTION[op].format(*args)
         if op in _TERNARY and len(args) == 3:
             return _TERNARY[op].format(*self._numeric(instr, args))
+        if op in ("max", "min") and len(args) == 2 and max_step_rule(instr):
+            # Builtin ``max(a, b)`` of one-element tensors: kept out of
+            # ``_BINARY``, whose membership other sites read as "elementwise
+            # with two operands" for the one-operand reduction too.
+            conformed = self._conform(instr, args)
+            if conformed is None:
+                return None
+            a, b = self._numeric(instr, conformed)
+            return fortran_step(max_step_rule(instr), op == "max", a, b)
         if op in _BINARY and len(args) == 2:
             template = _BINARY[op]
             # Shape first, then type. Conforming subscripts an operand to
@@ -4534,6 +4552,9 @@ class _FunctionEmitter:
                 args = conformed
             if op not in _LOGICAL_BINARY:
                 args = self._numeric(instr, args)
+            rule = max_step_rule(instr)
+            if rule is not None and is_max(op) is not None:
+                return fortran_step(rule, bool(is_max(op)), args[0], args[1])
             if op in {"FloorDiv", "floordiv"} and str(
                 instr.res.dtype or self.dtype
             ) in _INTEGER_DTYPES:

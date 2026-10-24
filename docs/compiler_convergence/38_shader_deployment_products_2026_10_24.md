@@ -124,11 +124,15 @@ words past the element count are untouched with an extra group dispatched.
 - The installed control shell (`compose_control_shader`) compiles for
   Vulkan now (section "Vulkan-ready control shell"), but it is not a
   published product yet.
-- The precision-core compute lane cannot compile today's lowered precision
-  cores: the wrapper's bound is now a `Cast` of the count and its body calls
-  three planned regions, while the emitter reads one (section "Precision
-  compute product"). Its product is proven on hand-built kernels of the shape
-  it reads.
+- The C lane drops a lowered pack core's Precision-typed formals from its
+  public buffer ABI (its run corrupts the heap), so the precision lane's two
+  C-comparison tests fail loudly by name. The GPU result is checked against
+  a reference evaluation of the lowered module instead (section "Precision
+  lane reads today's lowering").
+- A lowered pack core loads one double per element with a 0.0 low limb and
+  stores only the leading limb. Albert decided this is a bug for limbed
+  `Precision[k]` inputs: they must load and store every limb. It is the
+  next follow-up.
 - Deployable SPIR-V for a matmul, an axis reduction, or any function that
   mixes a reduction with other work over runtime-sized spans. Elementwise
   functions deploy in element mode, and a lone whole-span reduction deploys
@@ -356,3 +360,32 @@ limb arrays, a count and coefficients), which `lower_ast_source_to_ssa`
 requires. The lane's own tests still fail after that, on the wrapper shape
 above.
 
+## Precision lane reads today's lowering (follow-up, 2026-10-24)
+
+The precision-core GLSL lane compiles the lowered microprecision pack cores
+again (sin, width 2, the `fma` and `split` flavours), with no shortfalls.
+
+Rule:
+
+- the trip count is the loop bound followed through `Cast`s, so a wrapper
+  whose bound is `Cast(n)` still bakes or feeds `n`;
+- a loop body that calls several planned regions is fused into one body
+  (`_fuse_loop_body`): each call is inlined in body order with formals
+  replaced by actuals, a call's result maps to its region's `Ret` operands,
+  and `GetElementPtr(result, Const k)` + `Load` reads operand `k`. A callee
+  called twice, a multi-block region, or any other use of a call result is
+  refused by name;
+- `tools/benchmark_precision_cores._roles` picks the count as the int formal
+  that is the loop bound; other int formals (limb extents) are extras.
+
+Evidence (`tests/test_ssa_glsl_compute_backend.py`):
+
+- both flavours emit and compute sin on llvmpipe;
+- `test_gpu_matches_reference_evaluation_of_the_lowered_core` runs a Python
+  interpreter of the original (unfused) module over the same feeds: the
+  split flavour is bit-identical; the fma flavour equals the once-rounded
+  or twice-rounded reference per element (Mesa, see above); both are within
+  1e-13 of `np.sin`;
+- the two C-comparison tests now fail by name before running (every wrapper
+  formal must be in the C artifact's `buffer_order`), instead of aborting
+  the pytest process with `free(): invalid next size`.

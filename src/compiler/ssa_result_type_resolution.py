@@ -414,5 +414,15 @@ def settle_call_result_types(functions, emit_outputs, function_values):
         callee=callee.name, callee_value_id=int(source.id),
         proposed=_type(source)[:3], proposed_storage=_storage_type(source))
         for caller, target, callee, source in bindings()
-        if source.dtype not in {None, '', 'unknown'} and not equivalent_physical_layout(_storage_type(source), _storage_type(target)))
+        if source.dtype not in {None, '', 'unknown'}
+        and not equivalent_physical_layout(_storage_type(source), _storage_type(target))
+        # The ledger's absence-of-claim rule, for storage: a pointer whose
+        # row posts no element type (the callee's list handle in A6 probe
+        # c985) does not contradict the same pointer whose typed loads
+        # posted int64 (the caller's arena).  Only two recorded element
+        # types can disagree.
+        and not (
+            _type(source)[:3] == _type(target)[:3]
+            and _recorded_type(callee, source)[3] is None
+        ))
     return exact_values, ledger.events, conflicts, rounds

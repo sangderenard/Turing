@@ -13403,13 +13403,17 @@ def _member_completion_position(
     # display ``[n, 1]``, whose birth is placed at the display; the fill
     # copied that operand before it was born (``xs0[2]`` read 0; silent).
     # Rule: a member reading a display operand completes after that
-    # display ends, where the display's birth has already run.
+    # display ends, where the display's birth has already run.  A call
+    # operand is the same: a call completes where it ends (as a plan
+    # callsite is placed), so ``Q(b=x, a=y).get() + Q(x, y).a`` (corpus
+    # c428) placed its ``+`` region at its start, ahead of both calls, and
+    # pulled ``get()`` before the ``__init__`` that writes what it reads.
     for parent, _role in data.get("parents") or ():
         if int(parent) not in graph_obj:
             continue
         display = graph_obj.nodes[int(parent)].get("expr_obj")
         if (
-            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict))
+            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Call))
             and getattr(display, "end_lineno", None) is not None
         ):
             position = max(position, (
@@ -24057,6 +24061,7 @@ def _class_surface_ssa_program(
                     note_shape(wrapper.G, value_id, ('native object graph producer', (), 'opaque_ref', 'reference'))
                     changed = True
             _fold_callsite_structural_values(wrapper)
+        round_list_elements: dict[int, dict[int, str]] = {}
         for caller_graph, caller_id, callee_graph, callee_id in compile_iter(
             linked_value_edges, "abi-edges", label="abi settlement: call edges",
         ):
@@ -24130,6 +24135,45 @@ def _class_surface_ssa_program(
                     # case, and leaving shape unset lets the truth land.
                     if extents:
                         source["shape"] = extents
+            if (
+                not str((source or {}).get("dtype") or "")
+                and (caller_graph.nodes.get(int(caller_id), {}).get(
+                    "attributes"
+                ) or {}).get("aggregate_kind") == "list"
+            ):
+                # Program: ``def evens(n): out = []; for ...:
+                # out.append(i * 3); return out`` (no annotation), then
+                # ``t = evens(n)`` (A6 probe c988).  Wrong record: the
+                # returned list's contract carried only its Python class,
+                # so the caller's view of the one arena took the float64
+                # default while the callee appended int64 (refused:
+                # "native heap context projection conflicts").  Rule: the
+                # element type the source proves for a list
+                # (``_planned_scalar_dtypes``: the join of its writers) is
+                # its span contract across the call edge, as an
+                # annotation's would be.
+                elements = round_list_elements.get(id(caller_graph))
+                if elements is None:
+                    from types import SimpleNamespace as _ElementGraph
+                    from .glsl_deployment_strategy import (
+                        _planned_scalar_dtypes as _list_element_dtypes,
+                    )
+
+                    elements = _list_element_dtypes(
+                        _ElementGraph(G=caller_graph)
+                    )
+                    round_list_elements[id(caller_graph)] = elements
+                element = elements.get(int(caller_id))
+                if element in {"int64", "float64", "bool"}:
+                    source = {
+                        **dict(source or {}),
+                        "storage": "span", "rank": 1, "dtype": element,
+                        "mutable": True, "aggregate_kind": "list",
+                    }
+                    linked_value_abi_by_graph.setdefault(
+                        id(caller_graph), {},
+                    )[int(caller_id)] = source
+                    changed = True
             if source is None:
                 continue
             source_arms = _physical_type_arms(
@@ -45901,6 +45945,7 @@ def _class_surface_ssa_program(
                         # splice, so the relocation paths below move the
                         # already-rebound sequence.
                         placeholder_results: dict[int, Any] = {}
+                        placeholder_sources: dict[int, int] = {}
                         retained_instrs = []
                         for candidate in block.instrs[index + 1:]:
                             candidate_attributes = candidate.attributes or {}
@@ -45919,6 +45964,11 @@ def _class_surface_ssa_program(
                                     placeholder_results[
                                         int(candidate.res.id)
                                     ] = candidate.res
+                                    placeholder_sources[
+                                        int(candidate.res.id)
+                                    ] = int(candidate_attributes.get(
+                                        "source_output_id", -1
+                                    ))
                                 continue
                             retained_instrs.append(candidate)
                         if placeholder_results:
@@ -45934,6 +45984,47 @@ def _class_surface_ssa_program(
                                         spliced.res,
                                     )
                                     values[int(spliced.res.id)] = spliced.res
+                            rebound = {
+                                int(spliced.res.id)
+                                for spliced in sequence
+                                if spliced.res is not None
+                            }
+                            arena_members = {
+                                placeholder_id: values[source_id]
+                                for placeholder_id, source_id
+                                in placeholder_sources.items()
+                                if placeholder_id not in rebound
+                                and source_id in values
+                                and any(
+                                    argument is values[source_id]
+                                    for spliced in sequence
+                                    if spliced.op in {"Call", "call"}
+                                    for argument in spliced.args
+                                )
+                            }
+                            if arena_members:
+                                # Program: ``t, big = compact(n)`` where
+                                # ``compact`` returns ``out, flag`` (A6
+                                # probe c985).  Wrong record: the list
+                                # member's placeholder projection was
+                                # retired with no producer, so ``t[0]``
+                                # read a dangling cell.  Rule: a returned
+                                # list is one storage the callee fills in
+                                # place; its member IS the caller arena the
+                                # linked call passes, so the placeholder's
+                                # consumers read that arena.
+                                for consumer_block in caller.blocks.values():
+                                    for consumer in consumer_block.instrs:
+                                        consumer.args = [
+                                            arena_members.get(
+                                                int(argument.id), argument,
+                                            )
+                                            if argument is placeholder_results.get(
+                                                int(argument.id)
+                                            )
+                                            else argument
+                                            for argument in consumer.args
+                                        ]
                         aggregate_sequence = any(
                             spliced.op in {"Call", "call"}
                             and spliced.attributes.get("result_convention")
@@ -49715,6 +49806,33 @@ def _class_surface_ssa_program(
                             )
                             caller_tensor = caller_node.get("tensor") or {}
                             caller_id = int(caller_id)
+                            if (
+                                callee_result_sequences is not None
+                                and callee_result_sequences.by_id(
+                                    int(callee_id)
+                                ) is not None
+                                and any(
+                                    int(argument.id) == caller_id
+                                    for argument in native_call.args
+                                )
+                            ):
+                                # Program: ``return out, flag`` then ``t, big
+                                # = compact(n)`` (A6 probe c985).  Wrong
+                                # record: the list member was passed as the
+                                # caller's result arena AND loaded back out
+                                # of the aggregate into the same id, so its
+                                # one value had two producers (an
+                                # ``ssa.aggregate`` placeholder and the
+                                # arena ``ptr``; TransformationConflict).
+                                # Rule: a returned list is one storage the
+                                # callee fills in place (rule 3); its member
+                                # of the aggregate is that argument, never a
+                                # projection.
+                                values[caller_id] = next(
+                                    argument for argument in native_call.args
+                                    if int(argument.id) == caller_id
+                                )
+                                continue
                             output = values.get(caller_id)
                             if output is None or int(output.id) != caller_id:
                                 # ``values`` also carries proven frame aliases:

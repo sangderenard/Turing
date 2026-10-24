@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
+import bisect
 import re
 import struct
 
@@ -1611,6 +1612,109 @@ def map_pe_image(
         original = memory.read_unsigned(address, width)
         memory = memory.write_unsigned(address, width, original + load_bias)
     return memory, runtime_base, len(relocations) if load_bias else 0
+
+
+# Section types only the dynamic loader reads (notes, symbol hashes and
+# tables, versions, relocations).  Leaving them unmapped keeps the image's
+# low page empty, so a null-pointer read faults rather than reading a note.
+_ELF_LOADER_ONLY_SECTION_TYPES = frozenset({
+    3, 4, 5, 7, 9, 11, 0x6FFFFFF6, 0x6FFFFFFD, 0x6FFFFFFE, 0x6FFFFFFF,
+})
+_ELF_SHF_ALLOC = 0x2
+_ELF_SHF_TLS = 0x400
+_ELF_SHT_NOBITS = 8
+_R_X86_64_64 = 1
+_R_X86_64_GLOB_DAT = 6
+_R_X86_64_JUMP_SLOT = 7
+_R_X86_64_RELATIVE = 8
+
+
+@dataclass(frozen=True, slots=True)
+class ELFExternalSlot:
+    """A relocated slot the loader fills from outside this image."""
+
+    offset: int
+    relocation_type: int
+    symbol_name: str
+    target_address: int
+
+
+def map_elf_image(
+    memory: PagedByteMemory,
+    image,
+    *,
+    load_address: int = 0,
+) -> tuple[PagedByteMemory, tuple[ELFExternalSlot, ...]]:
+    """Map an ELF64 image's program sections and fill its relocated slots.
+
+    Each slot gets what ``ld.so`` writes when its value is a fact of this
+    image: ``RELATIVE`` is bias plus addend, and ``64``/``GLOB_DAT``/
+    ``JUMP_SLOT`` against a symbol the image defines are bias plus the
+    symbol (plus the addend for ``64``).  Every other slot (an undefined
+    symbol, an IFUNC, a TLS module id) is filled with its own unmapped
+    ``EXTERNAL_TARGET_BASE`` address and returned, so using one as a
+    pointer faults by address instead of reading a value no record gave.
+    Thread-local template sections, and the relocations inside them, are
+    not mapped: they describe per-thread blocks, not memory at their
+    addresses.
+    """
+
+    bias = int(load_address)
+    encoded = bytes(image.encoded)
+    # Relocate into per-section buffers, then map each buffer once.
+    buffers: list[tuple[int, bytearray]] = []
+    templates = tuple(
+        (int(section.virtual_address), int(section.virtual_address) + int(section.raw_size))
+        for section in image.sections if section.flags & _ELF_SHF_TLS
+    )
+    for section in image.sections:
+        if (
+            not section.flags & _ELF_SHF_ALLOC
+            or section.flags & _ELF_SHF_TLS
+            or section.type in _ELF_LOADER_ONLY_SECTION_TYPES
+            or not section.raw_size
+        ):
+            continue
+        buffers.append((int(section.virtual_address), (
+            bytearray(int(section.raw_size))
+            if section.type == _ELF_SHT_NOBITS
+            else bytearray(encoded[
+                section.raw_offset:section.raw_offset + section.raw_size
+            ])
+        )))
+    buffers.sort(key=lambda item: item[0])
+    starts = [start for start, _ in buffers]
+    external: list[ELFExternalSlot] = []
+    for record in image.relocation_records:
+        if any(low <= int(record.offset) < high for low, high in templates):
+            continue  # relocates the unmapped per-thread template
+        if record.type == _R_X86_64_RELATIVE:
+            value = bias + int(record.addend)
+        elif (
+            record.type in {_R_X86_64_64, _R_X86_64_GLOB_DAT, _R_X86_64_JUMP_SLOT}
+            and record.symbol_value is not None
+        ):
+            value = bias + int(record.symbol_value)
+            if record.type == _R_X86_64_64:
+                value += int(record.addend)
+        else:
+            value = EXTERNAL_TARGET_BASE + len(external) * 16
+            external.append(ELFExternalSlot(
+                int(record.offset), int(record.type),
+                str(record.symbol_name), value,
+            ))
+        index = bisect.bisect_right(starts, int(record.offset)) - 1
+        start, buffer = buffers[index] if index >= 0 else (0, bytearray())
+        position = int(record.offset) - start
+        if not 0 <= position <= len(buffer) - 8:
+            raise ValueError(
+                f"ELF relocation slot {int(record.offset):#x} lies outside "
+                "every mapped section"
+            )
+        buffer[position:position + 8] = (value & MASK64).to_bytes(8, "little")
+    for start, buffer in buffers:
+        memory = memory.map_bytes(bias + start, buffer)
+    return memory, tuple(external)
 
 
 def _pe_reserved_span(image, runtime_base: int) -> tuple[int, int]:
