@@ -120,6 +120,62 @@ def _callee_spelling(callee: Mapping[str, Any] | None) -> str:
     return ".".join(_callee_parts(callee))
 
 
+#: Nodes whose ``break``/``continue`` do not leave an enclosing loop.
+_OPAQUE_TO_LOOP_EXITS = frozenset({
+    "ForStatement", "WhileStatement", "DoWhileStatement", "ForInStatement",
+    "ForOfStatement", "SwitchStatement", "FunctionDeclaration",
+    "FunctionExpression", "ArrowFunctionExpression",
+})
+
+
+def _at(source: Mapping[str, Any]) -> dict[str, Any]:
+    return {"start": source.get("start"), "end": source.get("end")}
+
+
+def _flag_assignment(name: str, source: Mapping[str, Any]) -> dict[str, Any]:
+    """``name = true;`` standing for a ``break``/``continue``."""
+
+    return {
+        "type": "ExpressionStatement", **_at(source),
+        "expression": {
+            "type": "AssignmentExpression", "operator": "=", **_at(source),
+            "left": {"type": "Identifier", "name": name, **_at(source)},
+            "right": {"type": "Literal", "value": True, **_at(source)},
+        },
+    }
+
+
+def _flag_declaration(name: str, source: Mapping[str, Any]) -> dict[str, Any]:
+    """``let name = false;`` opening each iteration's body."""
+
+    return {
+        "type": "VariableDeclaration", "kind": "let", **_at(source),
+        "declarations": [{
+            "type": "VariableDeclarator", **_at(source),
+            "id": {"type": "Identifier", "name": name, **_at(source)},
+            "init": {"type": "Literal", "value": False, **_at(source)},
+        }],
+    }
+
+
+def _flags_clear(names: Any, source: Mapping[str, Any]) -> dict[str, Any]:
+    """``!a && !b ...`` over the hidden exit flags."""
+
+    test: dict[str, Any] | None = None
+    for name in names:
+        clear = {
+            "type": "UnaryExpression", "operator": "!", "prefix": True,
+            **_at(source),
+            "argument": {"type": "Identifier", "name": name, **_at(source)},
+        }
+        test = clear if test is None else {
+            "type": "LogicalExpression", "operator": "&&", **_at(source),
+            "left": test, "right": clear,
+        }
+    assert test is not None
+    return test
+
+
 class _JavaScriptProcessInterpreter:
     def __init__(
         self, graph: Any, *, owner: str, assumptions: Sequence[str] = (),
@@ -422,6 +478,13 @@ class _JavaScriptProcessInterpreter:
             "Call", Handler.Call.name, operation, ((operand, "arg0"),),
             attributes={"callee": operation, "tensor_operation": operation},
             source=source, value_kind=kind,
+        )
+
+    def _boolean(self, value: bool, source: Mapping[str, Any]) -> int:
+        return self.make_node(
+            "Constant", Handler.Const.name, repr(bool(value)), (),
+            attributes={"value": bool(value)}, constant=bool(value),
+            source=source, output_roles=("value",), value_kind="boolean",
         )
 
     def _number(self, value: float, source: Mapping[str, Any]) -> int:
@@ -1167,6 +1230,90 @@ class _JavaScriptProcessInterpreter:
 
         return visit(node)
 
+    @staticmethod
+    def _own_exits(node: Any) -> set[str]:
+        """``break``/``continue`` kinds that leave THIS loop's iteration.
+
+        Nested loops own their own exits and functions are opaque.  A
+        labeled exit is reported as ``LabeledExit``.
+        """
+
+        kinds: set[str] = set()
+
+        def visit(item: Any) -> None:
+            if isinstance(item, Mapping):
+                kind = item.get("type")
+                if kind in _OPAQUE_TO_LOOP_EXITS:
+                    return
+                if kind in {"BreakStatement", "ContinueStatement"}:
+                    kinds.add("LabeledExit" if item.get("label") else str(kind))
+                    return
+                for key, child in item.items():
+                    if key not in {"type", "start", "end"}:
+                        visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+
+        visit(node)
+        return kinds
+
+    def _exit_flags(
+        self,
+        statements: Sequence[Mapping[str, Any]],
+        flags: Mapping[str, str],
+    ) -> list[Mapping[str, Any]]:
+        """Rewrite ``break``/``continue`` as assignments to hidden flags.
+
+        ``break`` sets ``flags["BreakStatement"]``, ``continue`` sets
+        ``flags["ContinueStatement"]``; the rest of every statement list
+        after a statement that may set one runs only while neither is set
+        (an ``if`` on the flags around it, in its own block: the names it
+        declares end with the list anyway).  Nested loops keep theirs.
+        """
+
+        lowered: list[Mapping[str, Any]] = []
+        for index, statement in enumerate(statements):
+            kind = statement.get("type")
+            if kind in flags:
+                lowered.append(_flag_assignment(flags[kind], statement))
+            elif kind == "IfStatement":
+                lowered.append({
+                    **statement,
+                    "consequent": {
+                        "type": "BlockStatement",
+                        "body": self._exit_flags(
+                            self._statement_body(statement.get("consequent")),
+                            flags,
+                        ),
+                    },
+                    "alternate": None if statement.get("alternate") is None else {
+                        "type": "BlockStatement",
+                        "body": self._exit_flags(
+                            self._statement_body(statement.get("alternate")),
+                            flags,
+                        ),
+                    },
+                })
+            elif kind == "BlockStatement":
+                lowered.append({
+                    **statement,
+                    "body": self._exit_flags(list(statement.get("body", ())), flags),
+                })
+            else:
+                lowered.append(statement)
+            if kind in flags or self._own_exits(statement):
+                rest = self._exit_flags(statements[index + 1:], flags)
+                if rest:
+                    lowered.append({
+                        "type": "IfStatement",
+                        "test": _flags_clear(flags.values(), statement),
+                        "consequent": {"type": "BlockStatement", "body": rest},
+                        "alternate": None,
+                    })
+                break
+        return lowered
+
     def loop(self, statement: Mapping[str, Any]) -> None:
         """``for``/``while`` as a loop region with one Phi per carried name.
 
@@ -1177,16 +1324,27 @@ class _JavaScriptProcessInterpreter:
         the graph itself stays acyclic -- with the id ranges the header and
         body occupy (node ids are creation order).  After the loop each
         outer name reads its Phi: the loop leaves through the header.
+
+        ``break`` and ``continue`` become hidden boolean flags: a carried
+        break flag (the header's condition is ``!broken && test``) and a
+        per-iteration continue flag; the statements after an exit run only
+        while both are clear, and a ``for`` update only while not broken.
+        So the iteration that breaks carries its values at the break to the
+        header, which then exits with them.  ``return`` and labeled exits
+        stay refusals.
         """
 
         kind = statement.get("type")
+        own = self._own_exits(statement.get("body"))
         exit_kind = self._loop_exit(statement.get("body"))
-        if exit_kind is not None or statement.get("test") is None:
+        if exit_kind not in {None, "BreakStatement", "ContinueStatement"} or (
+            "LabeledExit" in own
+        ) or (statement.get("test") is None and "BreakStatement" not in own):
             self.unsupported(
                 str(kind),
                 "unsupported-loop-exit",
-                f"{exit_kind or 'a loop without a condition'} leaves the loop "
-                "other than through its condition",
+                f"{'a labeled exit' if 'LabeledExit' in own else exit_kind or 'a loop without a condition or break'} "
+                "leaves the loop other than through its condition",
                 source=statement,
             )
             return
@@ -1198,16 +1356,39 @@ class _JavaScriptProcessInterpreter:
                 initializer if initializer.get("type") == "VariableDeclaration"
                 else {"type": "ExpressionStatement", "expression": initializer},
             ])
+        loop_id = self.loop_count
+        flags = {
+            exit: f"%{label}{loop_id}"
+            for exit, label in (
+                ("BreakStatement", "break"), ("ContinueStatement", "continue"),
+            )
+            if exit in own
+        }
+        broken = flags.get("BreakStatement")
+        if broken is not None:
+            self.bind(
+                broken, self._boolean(False, statement), statement, kind="let",
+            )
         body = self._statement_body(statement.get("body"))
+        if flags:
+            body = self._exit_flags(body, flags)
+        if "ContinueStatement" in flags:
+            body = [_flag_declaration(flags["ContinueStatement"], statement), *body]
         update = statement.get("update")
         if update is not None:
-            body = [*body, {"type": "ExpressionStatement", "expression": update}]
+            step = {"type": "ExpressionStatement", "expression": update}
+            if broken is not None:
+                step = {
+                    "type": "IfStatement",
+                    "test": _flags_clear((broken,), update),
+                    "consequent": step, "alternate": None,
+                }
+            body = [*body, step]
         carried = sorted(
             self._assigned_names([statement.get("test"), body])
             & set(self.bindings)
         )
         # Numbered on entry: an inner loop finishes (and is recorded) first.
-        loop_id = self.loop_count
         self.loop_count += 1
         header_start = self.next_id
         phis: dict[str, int] = {}
@@ -1224,8 +1405,20 @@ class _JavaScriptProcessInterpreter:
                 return
             phis[name] = phi
             phi_records[name] = self.bindings[name]
-        condition_value = self.expression(statement["test"])
-        condition = self.truthy(condition_value, statement["test"])
+        test = statement.get("test")
+        condition = None
+        if test is not None:
+            condition = self.truthy(self.expression(test), test)
+        if broken is not None:
+            running = self._node(
+                Handler.LNot, ((self.read_identifier(
+                    {"type": "Identifier", "name": broken},
+                ), "operand"),), statement, "boolean",
+            )
+            condition = running if condition is None else self._node(
+                Handler.LAnd, ((running, "left"), (condition, "right")),
+                statement, "boolean",
+            )
         condition_end = self.next_id
         _value, _returned, visible = self._branch(body, dict(self.bindings))
         carried_next = {
