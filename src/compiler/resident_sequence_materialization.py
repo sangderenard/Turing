@@ -3092,6 +3092,23 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             parent, row = exact[0]
             value_id = int(row.get("value_id", parent))
             row_attributes = row.get("attributes") or {}
+            # Program: ``g = [[0, 0], [0, 0]]; g[1][0] = n`` (corpus c375,
+            # plan C6).  Wrong record: the inner display's member birth is
+            # owned by the inner display's node, which also owns that
+            # display's own ``clear``; the two facts met on one control
+            # block row and the program was refused with an uncaused
+            # revision naming neither.  A resident row is a scalar or a
+            # tuple's leaves; a list, set or dict row has no birth here.
+            # Rule: refuse it by name, as the comprehension birth does.
+            if row_attributes.get("aggregate_kind") in {
+                "list", "set", "frozenset", "dict",
+            }:
+                raise ValueError(
+                    f"{'Set' if is_set else 'List'} {sequence_id} member "
+                    f"{ordinal} is a {row_attributes['aggregate_kind']} "
+                    "display; a sequence whose rows are collections has no "
+                    "resident birth (nested collections are not lowered)"
+                )
             leaves = tuple(map(int, row_attributes.get(
                 "aggregate_leaf_value_ids", ())))
             is_tuple = (
