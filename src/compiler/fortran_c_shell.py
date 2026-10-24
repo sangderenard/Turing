@@ -4919,6 +4919,411 @@ def _exact_structural_value_origin(graph_obj: Any, value_id: int) -> int:
     return current
 
 
+from .runtime_abi import HOST_CALLBACK_SCHEMA
+
+_HOST_CALLBACK_DTYPES = {
+    "int": "int64", "float": "float64", "bool": "bool",
+    "Any": "opaque_ref", "object": "opaque_ref",
+}
+
+
+def host_callback_signature(annotation: str) -> dict[str, Any]:
+    """The native signature of a ``Callable[[...], R]`` field annotation.
+
+    Arguments and the result are scalars (``int``, ``float``, ``bool``) or
+    opaque host handles (``Any``/``object``); a ``None`` result is a call with
+    no result.  ``Optional[...]``/``| None`` makes the slot absent-able: the
+    host passes a null function pointer for ``None``.  Anything else raises,
+    naming the annotation, so a call through it stays refused.
+    """
+
+    expression = ast.parse(str(annotation), mode="eval").body
+    optional = False
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.BitOr):
+        members = (expression.left, expression.right)
+        payload = [
+            member for member in members
+            if not (isinstance(member, ast.Constant) and member.value is None)
+        ]
+        if len(payload) != 1:
+            raise ValueError(f"callable field annotation is a union: {annotation}")
+        expression, optional = payload[0], True
+    if (
+        isinstance(expression, ast.Subscript)
+        and (expression.value.id if isinstance(expression.value, ast.Name)
+             else getattr(expression.value, "attr", None)) == "Optional"
+    ):
+        expression, optional = expression.slice, True
+    callee = expression.value if isinstance(expression, ast.Subscript) else None
+    if not (
+        callee is not None
+        and (callee.id if isinstance(callee, ast.Name)
+             else getattr(callee, "attr", None)) == "Callable"
+        and isinstance(expression.slice, ast.Tuple)
+        and len(expression.slice.elts) == 2
+        and isinstance(expression.slice.elts[0], ast.List)
+    ):
+        raise ValueError(
+            f"callable field annotation states no argument list: {annotation}"
+        )
+    parameters, result = expression.slice.elts
+
+    def dtype(node: ast.AST, *, result_position: bool) -> str | None:
+        if result_position and isinstance(node, ast.Constant) and node.value is None:
+            return None
+        name = node.id if isinstance(node, ast.Name) else getattr(node, "attr", None)
+        if name not in _HOST_CALLBACK_DTYPES:
+            raise ValueError(
+                "callable field annotation has a type with no native callback "
+                f"representation: {ast.unparse(node)} in {annotation}"
+            )
+        return _HOST_CALLBACK_DTYPES[name]
+
+    return {
+        "schema": HOST_CALLBACK_SCHEMA,
+        "annotation": str(annotation),
+        "optional": optional,
+        "arguments": [
+            dtype(node, result_position=False) for node in parameters.elts
+        ],
+        "result": dtype(result, result_position=True),
+    }
+
+
+def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
+    """Lower calls through a host-supplied callable field to a native call.
+
+    ``self.trace(n)`` where the class table names ``trace`` a callable slot
+    (``field_callables``) is a call to code the host owns.  Its native form
+    is a call through a function pointer the host supplies, given an opaque
+    context the host also supplies (``turing-host-callback-v1``).  Each such
+    field becomes two entry inputs of the method -- the function pointer and
+    the context, both pointer-sized integers -- the call becomes a
+    ``HostCallback`` over them, and ``self.trace is None`` /
+    ``is not None`` becomes a test of the function pointer
+    (``HostCallbackPresent``).  Any other use of the field (passing it on,
+    storing it outside ``__init__``) is left alone, so the class surface keeps
+    refusing it.
+    """
+
+    from types import SimpleNamespace as _Namespace
+
+    from ..common.tensors.topological_reducer import (
+        _set_operands, node_identity_cell, post_derived_node_identity,
+    )
+    from .concordance_declarations import PLANNER_STRUCTURAL_FOLD
+    from .glsl_deployment_strategy import _stored_callable_field_call
+    from .process_graph_value_ids import next_process_value_id
+
+    graph = graph_obj
+    if graph.graph.get("method_binding") != "instance":
+        return 0
+    owner = str(graph.graph.get("method_owner") or "")
+    callables = dict(
+        dict((graph.graph.get("class_table") or {}).get(owner) or {}).get(
+            "field_callables"
+        ) or {}
+    )
+    positional = tuple(graph.graph.get("positional_parameters") or ())
+    if not callables or not positional:
+        return 0
+    view = _Namespace(G=graph)
+    receivers = {
+        node_id for node_id, data in graph.nodes(data=True)
+        if str(data.get("type")) == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == positional[0]
+    }
+    lowered = 0
+    if graph.graph.get("function_name") == "__init__":
+        # ``self.trace = trace`` binds the field to the callable the host
+        # passed in.  The host keeps that callable and hands it to every
+        # method call as its pointer and context; a native slot cannot hold
+        # a Python callable, so the store is the host's, not the record's.
+        bindings = list(graph.graph.get("host_callback_bindings") or ())
+        for node_id, data in tuple(graph.nodes(data=True)):
+            if str(data.get("type")) != "SetAttr":
+                continue
+            field = (data.get("attributes") or {}).get("attribute")
+            if field not in callables:
+                continue
+            parents = dict(
+                (str(role), parent)
+                for parent, role in data.get("parents") or ()
+            )
+            if not any(
+                int(receiver) == int(parents.get("object", -1))
+                for receiver in receivers
+            ):
+                continue
+            value = graph.nodes[parents["value"]] if parents.get("value") in graph else {}
+            value_attributes = value.get("attributes") or {}
+            if str(value.get("type")) == "Input" and (
+                value_attributes.get("binding_kind") == "parameter"
+            ):
+                bound = {"parameter": str(value_attributes["binding_name"])}
+            elif str(value.get("type")) in {"Constant", "Const"} and (
+                getattr(value.get("expr_obj"), "value", 0) is None
+            ):
+                bound = {"parameter": None}
+            else:
+                continue
+            if any(graph.successors(node_id)):
+                continue
+            _set_operands(view, node_id, [], cause="host_callback_binding")
+            graph.remove_node(node_id)
+            bindings.append({
+                "schema": HOST_CALLBACK_SCHEMA, "owner": owner,
+                "field": str(field), **bound,
+                "signature": host_callback_signature(callables[field]),
+            })
+            lowered += 1
+        if bindings:
+            graph.graph["host_callback_bindings"] = bindings
+    calls: dict[str, list[Any]] = {}
+    presence: dict[str, list[tuple[Any, Any, bool]]] = {}
+    for node_id, data in tuple(graph.nodes(data=True)):
+        field = _stored_callable_field_call(graph, data)
+        if field is not None and field[1] in callables:
+            calls.setdefault(field[1], []).append(node_id)
+            continue
+        read = _record_field_read(graph, node_id, data)
+        if read is None or read[2] not in callables:
+            continue
+        if not any(int(receiver) == int(read[1]) for receiver in receivers):
+            continue
+        compares = []
+        for compare_id in tuple(graph.successors(node_id)):
+            expression = graph.nodes[compare_id].get("expr_obj")
+            if not (
+                isinstance(expression, ast.Compare)
+                and len(expression.ops) == 1
+                and isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+                and any(
+                    isinstance(side, ast.Constant) and side.value is None
+                    for side in (expression.left, *expression.comparators)
+                )
+            ):
+                compares = None
+                break
+            compares.append((
+                compare_id, node_id, isinstance(expression.ops[0], ast.IsNot),
+            ))
+        if compares:
+            presence.setdefault(read[2], []).extend(compares)
+    records = list(graph.graph.get("host_callback_inputs") or ())
+    for name in sorted(set(calls) | set(presence)):
+        signature = host_callback_signature(callables[name])
+        if presence.get(name) and not signature["optional"]:
+            raise ValueError(
+                f"{owner}.{name} is tested against None but its annotation "
+                f"is not optional: {callables[name]}"
+            )
+        receiver_cells = tuple(
+            node_identity_cell(view, receiver) for receiver in sorted(receivers)
+        )
+        use_cells = tuple(
+            node_identity_cell(view, node_id)
+            for node_id in (
+                *calls.get(name, ()),
+                *(compare for compare, _read, _when in presence.get(name, ())),
+            )
+        )
+        parts = {}
+        for part in ("function", "context"):
+            new = next_process_value_id(graph)
+            graph.add_node(
+                new, label=f"{positional[0]}.{name}.__callback_{part}",
+                type="Input", op="input", expr_obj=None, parents=[],
+                children=[], attributes={}, value_id=new,
+                tensor={"shape": (), "dtype": "int64"},
+            )
+            post_derived_node_identity(
+                view, new, (*receiver_cells, *use_cells),
+                stage=PLANNER_STRUCTURAL_FOLD,
+            )
+            _set_operands(view, new, [], cause="host_callback_input")
+            graph.nodes[new]["attributes"] = {
+                "binding_kind": "parameter",
+                "binding_name": f"{positional[0]}.{name}.__callback_{part}",
+                "host_callback_field": (owner, name),
+                "host_callback_part": part,
+            }
+            parts[part] = new
+        for node_id in calls.get(name, ()):
+            data = graph.nodes[node_id]
+            arguments = [
+                (parent, role) for parent, role in data.get("parents") or ()
+                if parent not in receivers
+            ]
+            if len(arguments) != len(signature["arguments"]):
+                raise ValueError(
+                    f"{owner}.{name} is called with {len(arguments)} "
+                    f"argument(s) but its annotation takes "
+                    f"{len(signature['arguments'])}: {callables[name]}"
+                )
+            if signature["result"] is None and any(
+                str(role) not in {"body", "orelse"}
+                for child in graph.successors(node_id)
+                for parent, role in graph.nodes[child].get("parents") or ()
+                if parent == node_id
+            ):
+                raise ValueError(
+                    f"{owner}.{name} returns None but its result is used"
+                )
+            _set_operands(view, node_id, [
+                (parts["function"], "callback_function"),
+                (parts["context"], "callback_context"),
+                *arguments,
+            ], cause="host_callback_call")
+            data["type"] = data["op"] = "HostCallback"
+            # The field's name can spell a tensor operator (``trace``,
+            # ``log``); a host call is not one, so it carries no candidate.
+            data.setdefault("attributes", {}).pop("tensor_candidate", None)
+            data["tensor"] = {
+                "shape": (),
+                "dtype": signature["result"] or "int64",
+            }
+            data.setdefault("attributes", {}).update({
+                "host_callback_field": (owner, name),
+                "host_callback_signature": signature,
+            })
+            lowered += 1
+        for compare_id, read_id, present_when in presence.get(name, ()):
+            data = graph.nodes[compare_id]
+            _set_operands(view, compare_id, [
+                (parts["function"], "callback_function"),
+            ], cause="host_callback_presence")
+            data["type"] = data["op"] = "HostCallbackPresent"
+            data["tensor"] = {"shape": (), "dtype": "bool"}
+            data.setdefault("attributes", {}).update({
+                "host_callback_field": (owner, name),
+                "host_callback_present_when": bool(present_when),
+            })
+            if read_id in graph and not any(
+                True for _child in graph.successors(read_id)
+            ):
+                _set_operands(view, read_id, [], cause="host_callback_presence")
+                graph.remove_node(read_id)
+            lowered += 1
+        records.append({
+            "schema": HOST_CALLBACK_SCHEMA,
+            "owner": owner,
+            "field": name,
+            "function_value_id": int(parts["function"]),
+            "context_value_id": int(parts["context"]),
+            "signature": signature,
+        })
+    if records:
+        graph.graph["host_callback_inputs"] = records
+    # Program: ``f = self.log; f(n)``.  Wrong record: the read was no call
+    # or presence test, so it stayed a value, the call through the local was
+    # pruned as a dead void call, and the method compiled without calling
+    # the host.  Rule: a callable field is a host pointer and context; any
+    # other use of it cannot cross, so it refuses.
+    for node_id, data in tuple(graph.nodes(data=True)):
+        read = _record_field_read(graph, node_id, data)
+        if read is None or read[2] not in callables:
+            continue
+        if not any(int(receiver) == int(read[1]) for receiver in receivers):
+            continue
+        expression = data.get("expr_obj")
+        raise ValueError(
+            f"{owner}.{read[2]} is a host callback field; only a direct call "
+            f"or an `is None` test of it lowers, not this use at line "
+            f"{getattr(expression, 'lineno', '?')}"
+        )
+    return lowered
+
+
+def _publish_host_callback_formals(
+    graph_obj: Any, module_ir: Any, control: Any, function_name: str,
+) -> None:
+    """Name each host callback formal of a lowered method entry.
+
+    ``_lower_host_callback_field_calls_graph`` gives every stored callable
+    field a function pointer and a context handle as method inputs.  The
+    host fills them on each call, so the entry must say which formals they
+    are and what signature the pointer has (``turing-host-callback-v1``).
+    A callback the graph holds and the lowered module does not call, or a
+    function pointer that is no formal of the entry, would run the method
+    without the host's call: refuse it.
+    """
+
+    bindings = tuple(graph_obj.graph.get("host_callback_bindings") or ())
+    if bindings:
+        if control is None:
+            raise FortranEmissionError(
+                f"{function_name!r} binds host callback fields but has no "
+                "lowered entry"
+            )
+        # The constructor parameter that named the callable is the host's;
+        # it is no native input any more.
+        control.metadata["host_callback_bindings"] = tuple(
+            {
+                "owner": str(binding["owner"]),
+                "field": str(binding["field"]),
+                "parameter": binding["parameter"],
+                "signature": dict(binding["signature"]),
+            }
+            for binding in bindings
+        )
+    records = tuple(graph_obj.graph.get("host_callback_inputs") or ())
+    if not records:
+        return
+    graph_calls = sum(
+        1 for _node, data in graph_obj.nodes(data=True)
+        if str(data.get("type")) == "HostCallback"
+    )
+    lowered_calls = sum(
+        1
+        for function in module_ir.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op) == "HostCallback"
+    )
+    if lowered_calls < graph_calls:
+        raise FortranEmissionError(
+            f"{function_name!r} holds {graph_calls} host callback call(s) but "
+            f"its lowered program calls {lowered_calls}"
+        )
+    if control is None:
+        raise FortranEmissionError(
+            f"{function_name!r} has host callback fields but no lowered entry"
+        )
+    formals = {int(formal.id): formal for formal in control.args}
+    published = []
+    names = list(control.metadata.get("parameter_names", ()))
+    for record in records:
+        entry = {
+            "owner": str(record["owner"]),
+            "field": str(record["field"]),
+            "signature": dict(record["signature"]),
+        }
+        for part in ("function", "context"):
+            value_id = int(record[f"{part}_value_id"])
+            source_name = f"{record['field']}.__callback_{part}"
+            if value_id not in formals:
+                if part == "function":
+                    raise FortranEmissionError(
+                        f"host callback {record['owner']}.{record['field']} "
+                        f"of {function_name!r} has no function pointer formal"
+                    )
+                # Only presence is tested: the context is never read.
+                entry[f"{part}_parameter"] = None
+                continue
+            formal = formals[value_id]
+            formal.accounting = {
+                **dict(formal.accounting or {}),
+                "host_callback_field": str(record["field"]),
+                "host_callback_part": part,
+            }
+            names.append((source_name, value_id))
+            entry[f"{part}_parameter"] = source_name
+        published.append(entry)
+    control.metadata["parameter_names"] = tuple(names)
+    control.metadata["host_callbacks"] = tuple(published)
+
+
 def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
     """Give each optional record field one explicit presence identity.
 
@@ -5193,6 +5598,7 @@ def _lower_optional_record_presence_catalogue(graph: Any) -> int:
             continue
         seen.add(id(graph_obj))
         lowered += _lower_optional_record_presence_graph(graph_obj)
+        lowered += _lower_host_callback_field_calls_graph(graph_obj)
     return lowered
 
 
@@ -21693,6 +22099,7 @@ def _class_surface_ssa_program(
                     **incumbent_records, **selected,
                 }
         _lower_optional_record_presence_graph(planned_graph)
+        _lower_host_callback_field_calls_graph(planned_graph)
         if program_abi and not planned_graph.graph.get("parameter_value_abi"):
             value_bindings = _contract_input_binding_names(planned_graph)
             selected_values = {
@@ -28233,6 +28640,9 @@ def _class_surface_ssa_program(
         )
         all_functions.update(module_ir.functions)
         lowered_control = module_ir.functions.get(symbol)
+        _publish_host_callback_formals(
+            graph_obj, module_ir, lowered_control, str(function_name),
+        )
         if lowered_control is not None:
             linked_contracts = dict(
                 graph_obj.graph.get("linked_value_abi") or {}

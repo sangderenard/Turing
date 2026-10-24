@@ -21,6 +21,40 @@ from typing import Any, Iterable, Mapping
 
 SCHEMA = "turing-runtime-abi-v1"
 
+#: A stored callable field crosses the native boundary as two method inputs,
+#: a C function pointer and an opaque context handle, which the host supplies
+#: on every call (docs/compiler_convergence/41_host_callback_abi_2026_10_24.md).
+HOST_CALLBACK_SCHEMA = "turing-host-callback-v1"
+HOST_CALLBACK_OPERATIONS = frozenset({"HostCallback", "HostCallbackPresent"})
+
+
+def refuse_host_callbacks(module: Any, function_name: str, backend: str) -> None:
+    """Refuse a host callback in a lane whose entry ABI cannot carry one.
+
+    Only the Fortran class surface passes the callback's function pointer
+    and context as entry inputs.  The buffer-vector entry of the C and LLVM
+    lanes has no such slot, and an unknown operation there would be dropped
+    rather than called.
+    """
+
+    pending, seen = [str(function_name)], set()
+    while pending:
+        name = pending.pop()
+        if name in seen or name not in module.functions:
+            continue
+        seen.add(name)
+        for block in module.functions[name].blocks.values():
+            for instruction in block.instrs:
+                if str(instruction.op) in HOST_CALLBACK_OPERATIONS:
+                    field = instruction.attributes.get("host_callback_field")
+                    raise ValueError(
+                        f"{backend} emission cannot call host callback "
+                        f"{field!r} in {name!r}: only the Fortran class "
+                        f"surface carries {HOST_CALLBACK_SCHEMA} inputs"
+                    )
+                if str(instruction.op) == "Call":
+                    pending.append(str(instruction.attributes.get("callee")))
+
 
 def runtime_abi_description(
     *,
