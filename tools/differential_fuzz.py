@@ -445,7 +445,23 @@ EXTENDED4 = [
     (["s{v} = {a}", "for i{v} in range(n % 5 + {c}):", "    if i{v} > {b} % 3:", "        s{v} = i{v}"], "s{v}"),
     # Corpus c390-c395: the parameter n rebound in a loop arm that never reads it.
     (["for j{v} in range({c} % 4 + 1):", "    if j{v} > 1:", "        n = j{v} * {a}"], "n"),
+    # fields of a record this function constructs, written after the
+    # constructor and read back (corpus c396-c399: the read was folded to
+    # the constructor argument past every later write)
+    (["r{v} = Rec(n, {a})", "if n > {b}:", "    r{v}.x = n + {c}"], "r{v}.x * 10 + r{v}.y"),
+    (["r{v} = Rec({a}, n)", "r{v}.y = r{v}.x + n", "if n % 2 == 0:", "    r{v}.x = {b}", "else:", "    r{v}.x = r{v}.y - {c}"], "r{v}.x * 100 + r{v}.y"),
+    (["r{v} = Rec(n, n)", "f{v} = r{v}.x", "r{v}.x = f{v} * {a}"], "f{v} * 10 + r{v}.x"),
 ]
+EXT4_HELPERS = """from dataclasses import dataclass
+
+
+@dataclass
+class Rec:
+    x: int
+    y: int
+
+
+"""
 
 
 def make_program(rng):
@@ -462,7 +478,8 @@ def make_program(rng):
         exprs.append(expr.format(**values))
     text = HELPERS + (EXT_HELPERS if os.environ.get("FUZZ_EXT") else "") + (
         EXT2_HELPERS if os.environ.get("FUZZ_EXT") in {"2", "3", "4"} else "") + (
-        EXT3_HELPERS if os.environ.get("FUZZ_EXT") in {"3", "4"} else "") + "def root(n: int) -> int:\n" + "\n".join(body) + "\n    return " + " + ".join(f"({e})" for e in exprs) + "\n"
+        EXT3_HELPERS if os.environ.get("FUZZ_EXT") in {"3", "4"} else "") + (
+        EXT4_HELPERS if os.environ.get("FUZZ_EXT") == "4" else "") + "def root(n: int) -> int:\n" + "\n".join(body) + "\n    return " + " + ".join(f"({e})" for e in exprs) + "\n"
     return text, tuple(picks)
 
 
@@ -477,7 +494,9 @@ def run_one(text):
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.ssa_c_backend import emit_ssa_to_c
     from src.compiler.identity_concordance import concordance_report
-    ns = {}
+    # A class with no __name__ gets __module__ "builtins" (see the typed
+    # corpus check).
+    ns = {"__name__": "fuzz_program"}
     exec(compile(text, "<fuzz>", "exec"), ns)
     inputs = [-3, 0, 2, 5, 9, 12]
     expected = {}

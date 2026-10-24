@@ -1,3 +1,16 @@
+2026-10-24 RECORD FIELD WRITES (MEASURED, cloud): a field read of a record
+the function constructed was folded to the constructor argument past every
+later write, so `s = S(0); if c: s.n = 1; return s.n` returned 0. c396-c399
+were all WRONG at main ef49715. The read now takes its field-state version.
+A field rewritten in a loop is refused by name. The corpus had no class
+programs because the typed check, the corpus test and the fuzzer exec'd
+programs with no __name__ (RecursionError); that is fixed. Catalogue class
+units: annotated-parameter fields, `__init__` kept in unit slices, int64 slot
+index. At 48607a8 on caf2e77: corpus 327/327 (main 323/323); gate names
+identical to caf2e77. Fuzz seed 97 FUZZ_EXT=4: 0 WRONG / 0 TYPE. NOT GREEN:
+compile_class_to_dll (deprecated) still mis-lowers fields; Linux shared
+objects cannot link static libgfortran (58 AbstractTensor units). See doc 40.
+
 2026-10-24 GLSL ARENA CONTROLS (MEASURED, cloud): composed GLSL shaders read
 u_count/u_extent/u_slot from two read-only std430 storage blocks (set 0,
 bindings 1 and 2) instead of default-block uniforms, so the same source

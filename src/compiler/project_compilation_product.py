@@ -2768,6 +2768,17 @@ def partition_authored_source(
             if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         selected.update((id(item), item) for item in class_support)
+        # ``__init__`` declares the field layout as surely as the class-level
+        # annotations above do (``self.track_time = track_time`` with an
+        # annotated parameter).  Dropping it gave a method's unit a receiver
+        # record view missing those fields, which then disagreed with the
+        # declared module's view of the same class.
+        selected.update(
+            (id(member), member)
+            for member in class_owner.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name == "__init__"
+        )
         linked_method_names = {
             name.split(".", 1)[1]
             for name in linked_dependencies

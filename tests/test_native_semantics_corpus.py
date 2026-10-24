@@ -59,8 +59,12 @@ def test_native_program_matches_python(program, tmp_path):
     from src.compiler.ssa_c_backend import emit_ssa_to_c
 
     source = program.read_text()
-    namespace: dict = {}
-    exec(compile(source, str(program), "exec"), namespace)
+    # A class defined with no __name__ gets __module__ "builtins", which
+    # sends the static-binding walk through the builtins module itself.
+    # ``dont_inherit``: this file's ``from __future__ import annotations``
+    # must not turn the program's annotations into strings.
+    namespace: dict = {"__name__": f"corpus_{program.stem}"}
+    exec(compile(source, str(program), "exec", dont_inherit=True), namespace)
     cases = []
     for feeds in _inputs(source):
         expected = namespace["root"](**feeds)
