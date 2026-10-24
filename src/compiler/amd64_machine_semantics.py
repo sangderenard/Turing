@@ -383,8 +383,11 @@ def _subtract_with_borrow(state: MachineExecutionState, instruction) -> MachineE
     borrowed = int(bool(state.flags & (1 << CF)))
     effective_right = right + borrowed
     raw = left - effective_right
+    # OF and AF are defined on the authored source and the final result,
+    # as the lifter states: right + CF can carry into the sign bit
+    # (0x7fffffff + 1), which flips OF for 0x7fffffff - 0x7fffffff - 1.
     flags = _arithmetic_flags(
-        state.flags, left, effective_right, raw, width, subtract=True,
+        state.flags, left, right, raw, width, subtract=True,
     )
     flags = _set_flag(flags, CF, left < effective_right)
     return write_operand(
@@ -424,6 +427,15 @@ def _pop(state: MachineExecutionState, instruction) -> MachineExecutionState:
     registers = list(result.registers)
     registers[4] = (rsp + 8) & MASK64
     return replace(result, registers=tuple(registers))
+
+
+def _leave(state: MachineExecutionState, instruction) -> MachineExecutionState:
+    frame = state.registers[5]
+    saved = _as_memory(state.memory).read_unsigned(frame, 64)
+    registers = list(state.registers)
+    registers[5] = saved
+    registers[4] = (frame + 8) & MASK64
+    return replace(state, registers=tuple(registers))
 
 
 def _incdec(delta: int):
@@ -1418,6 +1430,7 @@ def default_effect_handlers() -> Mapping[int, object]:
         MachineSemanticToken.BITWISE_XOR: _binary_handler("xor"),
         MachineSemanticToken.STACK_PUSH: _push,
         MachineSemanticToken.STACK_POP: _pop,
+        MachineSemanticToken.STACK_FRAME_LEAVE: _leave,
         MachineSemanticToken.INTEGER_INCREMENT: _incdec(1),
         MachineSemanticToken.INTEGER_DECREMENT: _incdec(-1),
         MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW: _subtract_with_borrow,

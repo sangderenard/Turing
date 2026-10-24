@@ -4358,6 +4358,18 @@ class _FunctionEmitter:
         elif left is not None and len(args) == 1:
             args = [_literal(left), args[0]]
 
+        if (
+            op in ("max", "min")
+            and len(instr.args) == 1
+            and instr.res is not None
+            and tuple(instr.res.shape or ())
+        ):
+            # Program: ``max(y)`` over a (2, 3) span.  Wrong record:
+            # ``maxval(y)`` was assigned to a (2, 3) result, so every element
+            # read 5.0, where Python raises (a row's truth is ambiguous).
+            # Rule: one operand reduced into an array is not a whole-array
+            # reduction; it has no registered expression.
+            return None
         if op in _REDUCTION and len(args) == 1:
             if op == "sum" and self._is_logical(instr.args[0]):
                 # Summing a mask counts its true elements, which Fortran

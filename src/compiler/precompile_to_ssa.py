@@ -2745,12 +2745,27 @@ class _ControlSSABuilder(TiledObject):
             for region in program.recursion_regions
         }
         self.ssa_recursion_table: dict[int, dict[str, Any]] = {}
+        declared_sequence_ids = {
+            int(declaration[0]) for declaration in sequence_declarations
+        }
         for uniform in program.uniforms:
             value = SSAValue(
                 int(uniform.value_id),
                 dtype=str(uniform.dtype),
             )
             self.uniform_values[str(uniform.name)] = value
+            # Program: ``def f(xs: list[int]): k = len(xs); for i in
+            # range(k): ...`` (corpus c376, plan C19).  Wrong record: the
+            # loop bound ``len(xs)`` was declared a uniform and bound as a
+            # function input, so its first use never loaded the length; the
+            # input had no caller value and was pruned, leaving the bound
+            # undefined.  Rule: a uniform that is the recorded length of a
+            # declared sequence is that sequence's length, loaded at its
+            # first use (``external_value``), not an input.
+            if int((sequence_length_values or {}).get(
+                int(uniform.value_id), -1,
+            )) in declared_sequence_ids:
+                continue
             # UNIFORM: the control program's declared dtype for the uniform
             # (``control_uniform_dtype``, posted at entry) is the cause.
             self._bind(

@@ -71,8 +71,8 @@ def test_every_authoritative_token_legalizes_to_repository_ssa():
     # intentionally excluded from the legacy-prefix tensor write head until
     # that head carries explicit VEX fields.  ENDBR64 is excluded too: its
     # ModRM byte is part of the opcode, which a head row cannot pin.
-    assert len(profile.rows) == 308
-    assert len(X86InstructionToken) == 314
+    assert len(profile.rows) == 314
+    assert len(X86InstructionToken) == 320
     assert failures == []
 
 
@@ -1876,6 +1876,13 @@ def test_comiss_lowers_encoded_binary32_ordered_comparison_and_flags():
     (b"\xf2\x0f\x2c\xc7\xc3", "CVTTSD2SI_R32_XMMM64", "Float64ToSInt32TruncBits"),
     (b"\xf3\x0f\xe6\xc0\xc3", "CVTDQ2PD_XMM_XMMM64", "VectorSInt32ToFloat64Bits"),
     (b"\x66\x0f\x7e\xf0\xc3", "MOVD_RM32_XMM", "And"),
+    # GCC-built CPython (System V images).
+    (b"\x48\x09\xf0\xc3", "OR_RM64_R64", "Or"),
+    (b"\x08\xd0\xc3", "OR_RM8_R8", "Or"),
+    (b"\x19\xc0\xc3", "SBB_RM32_R32", "Sub"),
+    (b"\x48\x19\xf6\xc3", "SBB_RM64_R64", "Sub"),
+    (b"\x66\x0f\xef\xc0\xc3", "PXOR_XMM_XMMM128", "Xor"),
+    (b"\x55\x48\x89\xe5\xc9\xc3", "PUSH_R64", "Load"),
 ))
 def test_new_sre_frontier_families_lower_to_repository_ssa(
     encoded, token, required_op,

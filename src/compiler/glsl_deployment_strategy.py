@@ -2047,6 +2047,25 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
         )
         if joined is not None:
             hypotheses[node_id] = joined
+    # The same cycle through an annotated formal (``def bump(d: dict[int,
+    # int], n): d[0] += n``): the annotation states the rows' class, the
+    # store's value reads a row, and the join waits on itself.  Rule: a
+    # value stamped with a declared element (or mapping value) class
+    # assumes it, accepted only under the same check.
+    declared_classes = {"int": "int64", "float": "float64", "bool": "bool"}
+    for node_id, data in G.nodes(data=True):
+        node_id = int(node_id)
+        if node_id in proven or node_id in hypotheses:
+            continue
+        attributes = data.get("attributes") or {}
+        declared = (
+            attributes.get("mapping_value_class_ref")
+            if attributes.get("aggregate_kind") == "dict"
+            else attributes.get("sequence_element_class_ref")
+        )
+        dtype = declared_classes.get(str(declared or "").removeprefix("builtins."))
+        if dtype is not None:
+            hypotheses[node_id] = dtype
     hypotheses = {key: value for key, value in hypotheses.items() if value}
     if not hypotheses:
         return proven
@@ -2273,7 +2292,10 @@ def _planned_scalar_dtypes_from(
                     # annotation with its writers, in the collection rule.
                     if (
                         attributes.get("aggregate_kind") in collection_kinds
-                        and attributes.get("sequence_element_class_ref")
+                        and (
+                            attributes.get("sequence_element_class_ref")
+                            or attributes.get("mapping_value_class_ref")
+                        )
                     ):
                         pass
                     else:
@@ -2588,7 +2610,11 @@ def _planned_scalar_dtypes_from(
                 if len(held) == 1:
                     settle(element, node_id, held[0])
                 continue
-            if is_collection(node_id) and not op.startswith("indexed"):
+            if (
+                is_collection(node_id)
+                or attributes.get("sequence_element_class_ref")
+                or attributes.get("mapping_value_class_ref")
+            ) and not op.startswith("indexed"):
                 # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
                 # record: an unrolled comprehension (``sequence_materialization``)
                 # holds its elements as ``arg0``..``argN``, not ``elts``, so its
@@ -2623,11 +2649,18 @@ def _planned_scalar_dtypes_from(
                 # caller's linked ABI arrived.  Rule: an annotated
                 # collection parameter's element class is its annotation's,
                 # joined with its writers.
-                if (
-                    op == "input"
-                    and attributes.get("binding_kind") == "parameter"
-                    and attributes.get("sequence_element_class_ref")
+                # The same holds for every value stamped with a declared
+                # element class: an annotated call result (its callee's
+                # ``function_return_annotation``), an annotated local, a
+                # record field.
+                # A mapping's rows are its values: ``dict[K, V]`` states V.
+                if attributes.get("aggregate_kind") == "dict" and attributes.get(
+                    "mapping_value_class_ref"
                 ):
+                    writers.append(classes.get(str(
+                        attributes["mapping_value_class_ref"]
+                    ).removeprefix("builtins.")))
+                elif attributes.get("sequence_element_class_ref"):
                     writers.append(classes.get(str(
                         attributes["sequence_element_class_ref"]
                     ).removeprefix("builtins.")))
@@ -2824,6 +2857,16 @@ def _planned_scalar_dtypes_from(
             if isinstance(expression, ast.IfExp) or op == "phi":
                 arms = parents(data, "body", "orelse")
                 settle(scalar, node_id, join([scalar.get(o) for o in arms]))
+                continue
+            # Lane D, D2.  Program: ``if a > 0 and b < n: ...``, ``x = p or
+            # q`` (corpus c07, c155).  Python's ``and``/``or`` returns one of
+            # its operands, so its class is their join, as a branch join's
+            # is.  Nobody read that, so every ``BoolOp`` (and what it fed)
+            # took the float64 domain default.  An operand still unproven
+            # leaves it unproven.
+            if isinstance(expression, ast.BoolOp):
+                operands = parents(data, "value")
+                settle(scalar, node_id, join([scalar.get(o) for o in operands]))
         if not changed:
             if get_default_phase:
                 break
@@ -23978,6 +24021,49 @@ def _tensor_descriptor_rule(
     }
 
 
+def _stored_callable_field_call(graph: Any, data: Mapping[str, Any]):
+    """``(class, field)`` when a node calls a callable stored on ``self``.
+
+    ``self.notify(n)`` where the method graph's class-table record lists
+    ``notify`` as a field and not a method is a call through a stored
+    callable, not a method call and not an operator: its spelling can
+    coincide with a tensor operator (``trace``) without being one.  Reads
+    only the graph's own records: ``method_binding``, ``method_owner``,
+    ``class_table`` and the receiver Input's binding to the first positional
+    parameter.
+    """
+
+    if graph.graph.get("method_binding") != "instance":
+        return None
+    expression = data.get("expr_obj")
+    if not (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+    ):
+        return None
+    owner = str(graph.graph.get("method_owner") or "")
+    record = dict((graph.graph.get("class_table") or {}).get(owner) or {})
+    positional = tuple(graph.graph.get("positional_parameters") or ())
+    if not record or not positional:
+        return None
+    name = str(expression.func.attr)
+    if name not in set(map(str, record.get("fields") or ())) or name in set(
+        map(str, dict(record.get("methods") or {}))
+    ):
+        return None
+    for parent, role in data.get("parents") or ():
+        if str(role) not in {"operand", "receiver"} or parent not in graph:
+            continue
+        receiver = graph.nodes[parent]
+        if (
+            str(receiver.get("type")) == "Input"
+            and (receiver.get("attributes") or {}).get("binding_name")
+            == positional[0]
+        ):
+            return owner, name
+    return None
+
+
 def _remove_dead_metadata_nodes(
     graph: Any,
     protected_values: Any,
@@ -24014,6 +24100,15 @@ def _remove_dead_metadata_nodes(
 
     def is_candidate(node_id: int, data: Mapping[str, Any]) -> bool:
         if int(node_id) in effect_ids:
+            return False
+        # Program: ``self.trace(i)`` with ``trace`` a stored callable field
+        # (SSAReferenceEvaluator._execute).  Wrong record: the spelling reads
+        # as the tensor operator ``trace``, so the unconsumed call was pruned
+        # here as a dead pure tensor call and the class route shipped the
+        # method without it.  Rule: a call through a stored callable field
+        # is an effect the class surface must lower or refuse, never dead
+        # metadata.
+        if _stored_callable_field_call(graph.G, data) is not None:
             return False
         attributes = data.get("attributes") or {}
         dead_pure_tensor_call = bool(
@@ -26211,6 +26306,24 @@ def _fold_callsite_structural_values(
                     ) is not None
                 )
                 if len(parent_descriptors) != len(numerical_parents):
+                    parent_descriptors = ()
+                # Program: ``max(y)`` over a static (5,) ``y``.  Wrong
+                # record: the lone operand "broadcast" to (5,), so the
+                # builtin read as an elementwise Max (C refused it, LLVM
+                # raised).  Rule: builtin ``max``/``min`` of ONE rank-1
+                # iterable returns one of its elements -- a scalar.
+                if (
+                    operation in {"max", "min"}
+                    and isinstance(data.get("expr_obj"), ast.Call)
+                    and isinstance(data["expr_obj"].func, ast.Name)
+                    and len(data["expr_obj"].args) == 1
+                    and len(parent_descriptors) == 1
+                    and len(tuple(parent_descriptors[0]["shape"])) == 1
+                ):
+                    data["tensor"] = {
+                        "shape": (),
+                        "dtype": parent_descriptors[0]["dtype"],
+                    }
                     parent_descriptors = ()
                 if parent_descriptors:
                     try:

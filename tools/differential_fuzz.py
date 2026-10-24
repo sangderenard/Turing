@@ -80,6 +80,11 @@ EXTENDED = [
     # an augmented store at a computed list index in a loop (corpus c373,
     # plan C6)
     (["xs{v} = [{a}, 0, {b}]", "for i{v} in range({c} + 2):", "    xs{v}[(i{v} + n) % 3] += i{v} + {a}"], "xs{v}[0] * 100 + xs{v}[1] * 10 + xs{v}[2]"),
+    # an augmented store at a computed index of a list formal, read back by
+    # the caller (corpus c375, plan C6)
+    (["xs{v} = [{a}, {b}]", "bump_alt(xs{v}, n)"], "xs{v}[0] * 10 + xs{v}[1]"),
+    # a loop bounded by len() of a list formal (corpus c376, plan C19)
+    (["c{v} = weigh([{a}, n, {b}])"], "c{v}"),
     # a dict row stored from its own read (corpus c374, plan C6)
     (["d{v} = {{0: {a}, 1: {b}}}", "d{v}[n % 2] += n * {c}", "d{v}[1] = d{v}[0] + d{v}[1]"], "d{v}[0] * 10 + d{v}[1]"),
     (["xs{v} = []", "k{v} = n % 5 + 2", "while k{v} > 0:", "    xs{v}.append(k{v})", "    k{v} -= 2"], "len(xs{v}) * 10 + xs{v}[0]"),
@@ -192,6 +197,18 @@ def first_over(x: int, y: int) -> int:
     return -1
 
 
+def bump_alt(xs: list[int], n: int) -> None:
+    for i in range(3):
+        xs[i % 2] += n
+
+
+def weigh(xs: list[int]) -> int:
+    t = 0
+    for i in range(len(xs)):
+        t += xs[i] * (i + 1)
+    return t
+
+
 def neg_or_len(xs: list[int]) -> int:
     for x in xs:
         if x < 0:
@@ -292,6 +309,8 @@ EXTENDED3 = [
     (["t{v} = 0", "for k{v}, x{v} in enumerate([{a}, n, {b}], n % 4 + {c}):", "    t{v} = t{v} * 10 + k{v} * x{v}"], "t{v}"),
     # a callee filters a list literal in its loop, so it keeps live flags (c197)
     ([], "positives([{a}, -{b}, {c}]) * 10 + n"),
+    # a keyed delete, then a store and lookups (E24; lane E)
+    (["d{v} = {{1: n, 2: {a}, 5: {b}}}", "del d{v}[2]", "d{v}[8] = n + {c}"], "len(d{v}) * 100 + d{v}[8] + d{v}[5] * 10 + d{v}[1]"),
     # a tuple target over dict items holding a large int (E23; lane E)
     (["d{v} = {{{a}: n + 36028797018963969, {b}: {c}}}", "t{v} = 0", "for k{v}, w{v} in d{v}.items():", "    t{v} += k{v} * 10 + w{v}"], "t{v}"),
     # a list grown at run time, then sorted (Fortran list growth; lane E)

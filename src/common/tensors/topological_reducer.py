@@ -44,6 +44,7 @@ from ...compiler.concordance_declarations import (
     CLASS_FIELD_DECLARATION as _CLASS_FIELD_DECLARATION,
     CLASS_METHOD_DECLARATION as _CLASS_METHOD_DECLARATION,
     FUNCTION_ADDRESS as _FUNCTION_ADDRESS,
+    FUNCTION_RETURN_ANNOTATION as _FUNCTION_RETURN_ANNOTATION,
     FUNCTION_SUBGRAPH as _FUNCTION_SUBGRAPH,
     HELPER_CALLER_UNROUTED as _HELPER_CALLER_UNROUTED,
     IDENTITY_TRANSITION as _IDENTITY_TRANSITION,
@@ -1695,6 +1696,29 @@ def _indexed_store_source(graph: Any, value_id: Any) -> Any:
             None,
         )
     return value_id
+
+
+def _is_row_collection(graph: Any, value_id: Any) -> bool:
+    """Whether a subscript base is a list or dict, which takes no array mask.
+
+    Program: ``def bump(xs: list[int], n): for i in range(4): xs[i % 2] +=
+    n`` with the caller reading its own list (corpus c375).  Wrong record:
+    the annotated formal has no concorded class during reduction, so the
+    masked-update rule rebound ``xs`` to a ``where`` value and the caller's
+    list never changed (13 for -53, silently).  Rule: besides the concorded
+    class, the formal's ``aggregate_kind`` (from its annotation) says it is
+    a list.
+    """
+
+    target = getattr(graph, "G", graph)
+    if _resolved_source_value_class(graph, value_id)[0] in {
+        "builtins.list", "builtins.dict",
+    }:
+        return True
+    if not isinstance(value_id, int) or value_id not in target:
+        return False
+    attributes = target.nodes[value_id].get("attributes") or {}
+    return attributes.get("aggregate_kind") in {"list", "dict"}
 
 
 def _concorded_numeric_descriptor(
@@ -5453,6 +5477,7 @@ def _normalize_lexical_values(
     parameter_aggregate_kinds: dict[str, str] = {}
     parameter_sequence_record_widths: dict[str, int] = {}
     parameter_sequence_element_classes: dict[str, str] = {}
+    parameter_mapping_value_classes: dict[str, str] = {}
     known_class_identities = {
         record.identity for record in navigation_table.classes
     }
@@ -5667,6 +5692,23 @@ def _normalize_lexical_values(
         aggregate_kind = annotation_aggregate_kind(annotation)
         if aggregate_kind is not None:
             parameter_aggregate_kinds[argument.arg] = aggregate_kind
+        # Lane D, D2.  Program: ``def bump(d: dict[int, int], n): d[0] +=
+        # n``.  A mapping annotation names its value class second; nothing
+        # recorded it, so the formal's rows took the float64 domain default
+        # and the int64 store disagreed with them.  Rule: ``dict[K, V]``
+        # with a primitive ``V`` declares the mapping's value class (kept
+        # apart from the sequence element class: iterating a dict yields
+        # its keys).
+        if (
+            isinstance(annotation, ast.Subscript) and aggregate_kind == "dict"
+            and isinstance(annotation.slice, ast.Tuple)
+            and len(annotation.slice.elts) == 2
+            and isinstance(annotation.slice.elts[1], ast.Name)
+            and annotation.slice.elts[1].id in primitive_class_identities
+        ):
+            parameter_mapping_value_classes[argument.arg] = (
+                primitive_class_identities[annotation.slice.elts[1].id]
+            )
         if isinstance(annotation, ast.Subscript) and aggregate_kind in {
             "list", "set", "frozenset", "tuple",
         }:
@@ -5674,6 +5716,34 @@ def _normalize_lexical_values(
             element_identity = (
                 element.id if isinstance(element, ast.Name) else None
             )
+            # Lane D, D2.  Program: ``def first(xs: tuple[int, int]): return
+            # xs[0]`` (corpus c184).  A tuple annotation spells one class per
+            # position, so its slice is a Tuple, not a Name, and nothing was
+            # recorded: the callee's rows took the float64 domain default.
+            # Rule: a tuple annotation whose positions all name one class
+            # (``tuple[int, int]``, or ``tuple[int, ...]``) declares that
+            # element class; positions of different classes declare none.
+            if (
+                aggregate_kind == "tuple"
+                and isinstance(element, ast.Tuple)
+                and element.elts
+            ):
+                positions = [
+                    item for item in element.elts
+                    if not (
+                        isinstance(item, ast.Constant)
+                        and item.value is Ellipsis
+                    )
+                ]
+                names = {
+                    item.id if isinstance(item, ast.Name) else None
+                    for item in positions
+                }
+                if len(names) == 1 and None not in names and (
+                    len(positions) == len(element.elts)
+                    or (len(positions) == 1 and len(element.elts) == 2)
+                ):
+                    element_identity = next(iter(names))
             if element_identity in primitive_class_identities:
                 parameter_sequence_element_classes[argument.arg] = (
                     primitive_class_identities[element_identity]
@@ -6362,6 +6432,12 @@ def _normalize_lexical_values(
                     "sequence_element_class_ref": str(element_class),
                     "sequence_element_annotation_cell": annotation_cell,
                 })
+            value_class = parameter_mapping_value_classes.get(name)
+            if value_class is not None and annotation_cell is not None:
+                attributes.update({
+                    "mapping_value_class_ref": str(value_class),
+                    "mapping_value_annotation_cell": annotation_cell,
+                })
         scalar_parameters = tuple(
             graph.G.graph.get("scalar_parameters") or ()
         )
@@ -6781,8 +6857,25 @@ def _normalize_lexical_values(
                     defaults[field.name] = copy.deepcopy(field.default)
             class_descriptor["field_defaults"] = defaults
         function_reference = (
-            function_table.reference(target_name) if target_name else None
+            function_table.lexical_reference(target_name) if target_name else None
         )
+        target_identity = (
+            str(getattr(target, "__module__", "") or ""),
+            str(getattr(target, "__qualname__", "") or ""),
+        )
+        if all(target_identity):
+            # A static reference names its exact object: its definition is
+            # the entry declared with that (module, qualname), never the
+            # last function that happened to share its bare name (``re``'s
+            # ``_compile`` versus ``re._compiler._compile``).  A builtin
+            # has no source definition at all.
+            exact = function_table.reference_by_source_identity(
+                target_identity,
+            )
+            if exact is not None:
+                function_reference = exact
+            elif target_identity[0] == "builtins":
+                function_reference = None
         if getattr(target, "__self__", None) is not None:
             # A bound runtime/builtin method is identified by both callable
             # and receiver.  Linking it to an unrelated source method by the
@@ -8009,7 +8102,7 @@ def _normalize_lexical_values(
                 static_value = static_bindings.get(expression.id)
                 function_reference = (
                     (lexical_function_bindings or {}).get(expression.id)
-                    or function_table.reference(expression.id)
+                    or function_table.lexical_reference(expression.id)
                 )
                 if (
                     producer_id is None
@@ -13242,15 +13335,24 @@ def _normalize_lexical_values(
                 # dict takes no array mask, so its subscript is one row.  A
                 # base already stored into is read through the stores'
                 # ``base`` edges to the sequence that carries the class.
-                and _resolved_source_value_class(
-                    graph,
-                    _indexed_store_source(
-                        graph,
-                        environment.get(body_statement.target.value.id),
+                # A formal not yet read has no Input; its annotation's
+                # aggregate kind (the record its Input is built from) says.
+                and not (
+                    isinstance(body_statement.target.value, ast.Name)
+                    and (
+                        _is_row_collection(graph, _indexed_store_source(
+                            graph,
+                            environment.get(body_statement.target.value.id),
+                        ))
+                        or (
+                            environment.get(body_statement.target.value.id)
+                            is None
+                            and parameter_aggregate_kinds.get(
+                                body_statement.target.value.id
+                            ) in {"list", "dict"}
+                        )
                     )
-                    if isinstance(body_statement.target.value, ast.Name)
-                    else None,
-                )[0] not in {"builtins.list", "builtins.dict"}
+                )
                 and not all(
                     isinstance(item, ast.Slice)
                     or (
@@ -18521,6 +18623,31 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             metadata={
                 "source_type": type(statement).__name__,
                 "source_node": node_id,
+                # A method is never a bare name's lexical callee
+                # (``FunctionTable.lexical_reference``).
+                **(
+                    {"method_owner": str(method_owners[node_id])}
+                    if method_owners.get(node_id) is not None
+                    else {}
+                ),
+                # The authored (module, qualname) of a discovered
+                # definition: two modules' same-named functions never share
+                # it (``FunctionTable.reference_by_source_identity``).
+                **(
+                    {"source_identity": tuple(map(str, getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity",
+                    )))}
+                    if isinstance(getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity", None,
+                    ), tuple)
+                    and len(getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity",
+                    )) == 2
+                    else {}
+                ),
                 **(
                     {
                         "process_graph_boundary": getattr(
@@ -20179,11 +20306,83 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         )
         return None if inferred_class is None else str(inferred_class)
 
+    # Lane D, D2.  Program: ``def single(n) -> list[int]: return [n]``;
+    # ``t = single(n); t[0]`` (corpus c215).  The call's result was stamped
+    # only as a list, so ``t[0]`` took the float64 domain default until the
+    # callee's linked ABI arrived.  Rule: a declared sequence return whose
+    # element is one primitive class (``list[int]``, ``tuple[int, int]``,
+    # ``tuple[int, ...]``) states the call result's element class, with its
+    # ``function_return_annotation`` cell, as a parameter annotation does.
+    primitive_element_classes = {
+        "int": "builtins.int", "float": "builtins.float",
+        "bool": "builtins.bool",
+    }
+    returned_element_by_reference: dict[int, tuple[str, Any]] = {}
+
+    def returned_element(definition: Any) -> tuple[str, Any] | None:
+        if isinstance(definition, int) and definition in graph.G:
+            definition = graph.G.nodes[definition].get("expr_obj")
+        if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        annotation = definition.returns
+        if isinstance(annotation, ast.Constant) and isinstance(
+            annotation.value, str
+        ):
+            try:
+                annotation = ast.parse(annotation.value, mode="eval").body
+            except SyntaxError:
+                return None
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        container = (
+            annotation.value.id if isinstance(annotation.value, ast.Name)
+            else ""
+        )
+        if container not in {
+            "list", "List", "set", "Set", "frozenset", "tuple", "Tuple",
+        }:
+            return None
+        element = annotation.slice
+        if container in {"tuple", "Tuple"} and isinstance(element, ast.Tuple):
+            positions = [
+                item for item in element.elts
+                if not (
+                    isinstance(item, ast.Constant) and item.value is Ellipsis
+                )
+            ]
+            if not positions or (
+                len(positions) != len(element.elts)
+                and not (len(positions) == 1 and len(element.elts) == 2)
+            ):
+                return None
+            names = {
+                item.id if isinstance(item, ast.Name) else None
+                for item in positions
+            }
+            if len(names) != 1:
+                return None
+            element = positions[0]
+        if not isinstance(element, ast.Name):
+            return None
+        element_class = primitive_element_classes.get(element.id)
+        row = getattr(definition, "_turing_source_span_row", None)
+        if element_class is None or not isinstance(row, tuple) or len(row) < 2:
+            return None
+        cell = current_identity_book().latest_ref(
+            _FUNCTION_RETURN_ANNOTATION, (row[0], str(row[1])),
+        )
+        return None if cell is None else (element_class, cell)
+
     for function_node_id, reference in function_nodes.items():
         definition = graph.G.nodes.get(function_node_id, {}).get("expr_obj")
         inferred_class = returned_class(definition)
         if inferred_class is not None:
             returned_class_by_reference[int(reference.address)] = inferred_class
+        declared_element = returned_element(definition)
+        if declared_element is not None:
+            returned_element_by_reference[int(reference.address)] = (
+                declared_element
+            )
     for entry in function_table:
         inferred_class = returned_class(
             entry.metadata.get("source_node")
@@ -20191,6 +20390,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         if inferred_class is not None:
             returned_class_by_reference[int(entry.reference.address)] = (
                 inferred_class
+            )
+        declared_element = returned_element(entry.metadata.get("source_node"))
+        if declared_element is not None:
+            returned_element_by_reference.setdefault(
+                int(entry.reference.address), declared_element,
             )
 
     def propagate_returned_receiver_types(target_graph: Any) -> None:
@@ -20217,6 +20421,18 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 None if callee_reference is None
                 else returned_class_by_reference.get(int(callee_reference))
             )
+            declared_element = (
+                None if callee_reference is None
+                else returned_element_by_reference.get(int(callee_reference))
+            )
+            if (
+                declared_element is not None
+                and "sequence_element_class_ref" not in attributes
+            ):
+                attributes.update({
+                    "sequence_element_class_ref": declared_element[0],
+                    "sequence_element_annotation_cell": declared_element[1],
+                })
             if (
                 returned_class is None
                 and isinstance(expression.func, ast.Attribute)
@@ -22028,7 +22244,19 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     )
                     reference = None
                 else:
-                    reference = function_table.reference(callee_name)
+                    owner_identity = (
+                        None if owner is None
+                        else function_table.entry(owner).metadata.get(
+                            "source_identity"
+                        )
+                    )
+                    reference = function_table.lexical_reference(
+                        callee_name,
+                        module=(
+                            None if not owner_identity
+                            else str(owner_identity[0])
+                        ),
+                    )
                 if (
                     not callee_is_parameter
                     and reference is None

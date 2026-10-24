@@ -244,6 +244,9 @@ def symbolic_effect_for_instruction(instruction) -> MachineSymbolicEffect:
         reads.extend(("register.rsp", "memory"))
         write(0)
         writes.append("register.rsp")
+    elif semantic is MachineSemanticToken.STACK_FRAME_LEAVE:
+        reads.extend(("register.rbp", "memory"))
+        writes.extend(("register.rsp", "register.rbp"))
     elif semantic is MachineSemanticToken.INTEGER_MULTIPLY:
         if len(instruction.operands) == 1:
             read(0)
