@@ -217,3 +217,43 @@ ac 26 / rec 20 (exactly the baselines).
 Pinned by `tests/test_any_valued_local_mapping_row.py`.  Corpus 329/329
 PASS, fuzz seed 56 30/30 PASS, cloud gate aa 89 / ab 7 / ac 26 / rec 20
 (exactly the baselines).
+
+## Follow-up: SSA dataclass parameters reach their contract records
+
+The interpreter's helpers take `Function`, `Instr` and `SSAValue` objects
+from `src.transmogrifier.ssa`, but the parameters were annotated `Any`.
+Annotating them with the real classes changed nothing on its own.  A
+per-method unit declares only its own file's classes, so a dataclass from
+another module is not a source record there.  The extraction contract
+already declares those classes (`CompilerSSAValue` and its siblings), so
+the route is a contract binding.  That exposed four gaps, all fixed, and one left open:
+
+- A binding spelled `SSAReferenceEvaluator._value` never matched, because
+  bindings were compared with the bare method name only.  A binding now
+  names a method bare or qualified by its class (`binding_names_function`).
+  `id` is declared on `CompilerSSAValue`.
+- An identity-cast result forward in
+  `reconcile_nondominating_identity_cast_results` rewrote a call operand
+  without posting its cause, so the block geometry refused a REVISE with no
+  changed source.  It now posts a `LOOP_RESULT_USE_REBINDING`.
+- The receiver's class record was filled in only when no parameter had a
+  record yet, so binding `value` cost `self` its record.  The class route now
+  fills each parameter that no earlier view holds.
+- A caller that links a completed method unit (here `_operand` linking
+  `_value`) re-posted that body's facts in its own identity book.  This
+  failed on main for any linked method with an f-string.  A linked body now
+  carries its owning book, as SSA composition already does, and projected
+  iterable layouts are not re-published for it.
+
+Left open: every `x: int` parameter in a program compiled with this
+contract matches the `CompilerSSAExtent` row record, whose identity is
+`builtins.int`.  Refusing that match broke corpus c463
+(`make(n)(3) + make(1)(n)`): it passes on main only through that record.
+The same program with `float` fails on main ("value 5 has no value",
+closure handle from `make(1.0)` never bound).  Both went to the planner as
+one row; this change leaves the match alone.
+
+`_value` now compiles complete.  `_operand` stops only at the real
+frontier: `isinstance(stored, _Pointer)` and `stored.read()` on the untyped
+object read back from `values`.  Pinned by
+`tests/test_method_contract_bindings.py`.
