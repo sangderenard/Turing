@@ -669,6 +669,10 @@ def test_c621_precision_span_limbs_cross_regions_and_write_output(tmp_path):
     from src.compiler.extraction_contract import ExtractionContract
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm,
+        prepare_artifact_execution,
+    )
     from tools.benchmark_precision_cores import _feeds, _roles
 
     source = (
@@ -691,13 +695,19 @@ def test_c621_precision_span_limbs_cross_regions_and_write_output(tmp_path):
     assert {roles["input"].id, roles["output"].id} <= set(artifact.buffer_order)
     x = np.array([1.0, 2.0 ** -54, 2.0, 2.0 ** -53])
     y = np.zeros(4)
+    feeds = _feeds(roles, 2, [], x, y, 2)
     native = artifact.compile(tmp_path)
-    execution = native.prepare_execution(_feeds(roles, 2, [], x, y, 2))
-    execution.run()
-    np.testing.assert_array_equal(
-        np.asarray(execution.buffers[roles["output"].id]),
-        np.array([1.0, 2.0 ** -53, 4.0, 2.0 ** -51]),
-    )
+    c_result = native.prepare_execution(feeds).run()
+    llvm_artifact = emit_ssa_function_to_llvm(module, wrapper)
+    assert not llvm_artifact.shortfalls, llvm_artifact.shortfalls
+    llvm_result = prepare_artifact_execution(
+        compile_artifact(llvm_artifact), feeds,
+    ).run()
+    expected = np.array([1.0, 2.0 ** -53, 4.0, 2.0 ** -51])
+    for execution in (c_result, llvm_result):
+        np.testing.assert_array_equal(
+            np.asarray(execution.buffers[roles["output"].id]), expected,
+        )
 
 
 def test_split_two_product_flavour_matches_fma_bit_for_bit_and_frees_wasm():
