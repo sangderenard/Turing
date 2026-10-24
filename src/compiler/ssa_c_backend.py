@@ -4085,6 +4085,15 @@ def emit_ssa_module_to_c(
                         and descriptor.static_element_count
                     ):
                         count = int(descriptor.static_element_count)
+                    elif heap_element(source) is not None:
+                        # Program: ``ys = [5] * (n % 4); ys.append(n);
+                        # sum(ys)`` (E22a; lane E).  Wrong record: a heap
+                        # sequence's operand is its pointer CELL, shape
+                        # (1,), so the cell's extent was read as one row and
+                        # the reduction added the arena ADDRESS (silently
+                        # wrong for ints, a compile error for floats).  Rule:
+                        # a heap cell's rows are its live length, below.
+                        pass
                     else:
                         source_shape = tuple(source.shape or ())
                         if source_shape and all(

@@ -818,3 +818,33 @@ unchanged (static, which is what Windows uses).
   above), 0 WRONG and 0 TYPE.
 - Gate at `376f1f19` and at main `11944336`, each on a clean worktree: aa 89 /
   ab 7 / ac 26 / rec 20 on both, with the same failure names in every part.
+
+## E22a: a heap sequence reduces over its live length
+
+- **Program:** `ys = [5] * (n % 4); ys.append(n); sum(ys)` (c407), and
+  its float form (c408, and E22's `sum` finding).
+- **Wrong record:** a runtime-count replication grows on the heap, so the
+  reduction's operand is the sequence's pointer cell. Its (1,) shape is the
+  cell itself. C read the shape as one row and added the arena ADDRESS to
+  the sum: silently wrong for ints (c407 WRONG at main `dd340a1b`) and a
+  compile error for floats. Fortran handed the `c_ptr` cell to the `sum`
+  intrinsic, which failed to compile. The identity concordance reported
+  the cell's shape as a static extent that disagreed with the appends.
+- **Rule:** a heap cell's rows are its live length, reached through the
+  arena: in C (`ssa_c_backend` flat reduction), in Fortran
+  (`_sequence_reduction` through the cell's view), and in the concordance,
+  which no longer treats a heap cell's shape as a static extent.
+- **Separate finding (loud, same at main):** `max(ys)` or `min(ys)` over
+  such a list is refused as "elementwise Max over a span has no C loop
+  spelling".
+
+### Receipts for E22a
+
+- Corpus at `73eb8a36` on main `dd340a1b` plus #854 (331 programs): C 331/331,
+  LLVM 330/331 (c367, same at main), Fortran 330 PASS, 1 WRONG (c22, by
+  design).
+- Fuzz seed 65 (`FUZZ_EXT=3`, `llvm,fortran`, 30 programs): 29 PASS,
+  1 LOUD, 0 WRONG and 0 TYPE. The new snippet was not drawn; c407 is its
+  program.
+- Gate at `73eb8a36` and at main `dd340a1b`, each on a clean worktree: aa 89 /
+  ab 7 / ac 26 / rec 20 on both, with the same failure names in every part.

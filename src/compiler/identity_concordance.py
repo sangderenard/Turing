@@ -3724,7 +3724,11 @@ class CorrelationTable:
                     source = instruction.args[0] if instruction.args else None
                     accounting = getattr(source, "accounting", None) or {}
                     shape = tuple(getattr(source, "shape", None) or ())
+                    # A heap sequence's operand is its pointer cell: its (1,)
+                    # shape is the cell, and every writer reduces over the
+                    # live length (E22a), so it states no static extent.
                     if (accounting.get("sequence_id") is not None
+                            and accounting.get("heap_element_dtype") is None
                             and len(shape) == 1
                             and isinstance(shape[0], int)):
                         reductions.append((
