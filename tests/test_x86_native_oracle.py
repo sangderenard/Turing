@@ -2,7 +2,7 @@
 
 Each case runs one instruction natively, from a register file and CF the
 test chooses, and through ``default_effect_handlers``; registers, the
-CF/PF/ZF/SF/OF flags and XMM0-1 must agree.  This is the oracle the
+CF/PF/AF/ZF/SF/OF flags and XMM0-1 must agree.  This is the oracle the
 hand-written semantics never had: the SBB overflow flag was wrong for
 every form until this compared it with hardware.
 """
@@ -93,7 +93,7 @@ def model(instr, regs, cf, xmm, memory):
     out = default_effect_handlers()[int(ins.semantic)](state, ins)
     return list(out.registers), out.flags, list(out.vector_registers[:2]), ins.token.name
 
-FLAGS = 0x1 | 0x4 | 0x40 | 0x80 | 0x800
+FLAGS = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x800
 def check(buf, base, instr, n=200, frame=False):
     rng = random.Random(7); bad = 0; tok = None
     for _ in range(n):
