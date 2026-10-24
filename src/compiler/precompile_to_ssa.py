@@ -1001,6 +1001,7 @@ def lower_fused_integral_to_repository_ssa(
             table_epilogue_operations=tuple(
                 ("store", store) for store in table_stores
             ),
+            host_reads_table_status=True,
         )
         identity_tokens = dict(
             (getattr(program, "extras", None) or {}).get(
@@ -2121,6 +2122,7 @@ class _ControlSSABuilder(TiledObject):
         table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
         table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+        host_reads_table_status: bool = False,
         consumer_row_loads: Mapping[int, tuple[Any, ...]] | None = None,
         effect_preceding_row_reads: Mapping[int, tuple[int, ...]] | None = None,
         resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
@@ -2548,6 +2550,12 @@ class _ControlSSABuilder(TiledObject):
             ).items()
         }
         self.table_epilogue_operations = tuple(table_epilogue_operations)
+        # A table store reports a full fixed-capacity table as status 2
+        # in its status arena.  Only the structural resident table
+        # integral publishes that arena to its host, whose verifier probes
+        # the capacity-exhausted outcome; every other caller is compiled
+        # code that never reads it, so the store must check it itself.
+        self.host_reads_table_status = bool(host_reads_table_status)
         # A structural type predicate can be emitted before the numerical
         # region which owns its subject's sequence-row payload load. Keep the
         # exact scheduled projection addressable by result identity so the
@@ -4389,6 +4397,7 @@ class _ControlSSABuilder(TiledObject):
                     ),
                 },
             )
+            self._require_table_store_room(int(sequence_id), int(_effect_id))
             return
         actual_dtypes = tuple(
             str(_canonical_sequence_dtype(value.dtype) or "unknown")
@@ -4469,6 +4478,64 @@ class _ControlSSABuilder(TiledObject):
                 "sequence_id": int(sequence_id),
             },
         )
+        self._require_table_store_room(int(sequence_id), int(_effect_id))
+
+    def _require_table_store_room(self, sequence_id: int, effect_id: int) -> None:
+        """Raise when the keyed store just emitted found no free row.
+
+        Program: a store past a FIXED table's proven capacity (scratch
+        s42/t2 before its capacity bound counted deleted rows).  Wrong
+        record: the store helper reports "full" as status 2 into the
+        table's status cell (the ABI the structural resident-table verifier
+        probes), and no caller read it, so the row was dropped and
+        ``len(d)`` was 1 for 2 (clean audit).  Rule (takeover rule 10, as a
+        fixed append raises): the caller reads the status and a full store
+        raises validation error 75.
+        """
+
+        if self.host_reads_table_status:
+            return
+        attributes = {
+            "binding": "ssa_table_store_status",
+            "sequence_id": int(sequence_id),
+            "source_effect_node_id": int(effect_id),
+        }
+        status_arena = self.sequence_status_values[int(sequence_id)]
+        zero = self.constant_value(0, status_arena)
+        address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(status_arena, zero),
+        )
+        self.emit(
+            Handler.GetElementPtr, [status_arena, zero], address,
+            attributes=attributes,
+        )
+        status = self.fresh_value(
+            dtype="int", transform=LOAD, operands=(address,),
+        )
+        self.emit(Handler.Load, [address], status, attributes=attributes)
+        full = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE, operands=(status,),
+        )
+        self.emit(
+            Handler.Eq, [status, self.constant_value(2, status)], full,
+            attributes=attributes,
+        )
+        exhausted = self.new_block("validation_fail")
+        stored = self.new_block("validation_pass")
+        self.conditional_branch(full, exhausted, stored)
+        self.current = exhausted
+        self.emit(
+            Handler.Call,
+            [],
+            attributes={
+                "callee": "turing_validation_error",
+                "error_code": 75,
+                "failure": "fixed_capacity_exhausted",
+                **attributes,
+            },
+        )
+        self.branch(stored)
+        self.current = stored
 
     def _sequence_row_index(
         self, sequence_id: int, index_id: int, literal: int | None,
@@ -21865,6 +21932,7 @@ def lower_control_program_to_ssa(
     table_region_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_region_post_operations: Mapping[int, tuple[tuple[str, tuple[Any, ...]], ...]] | None = None,
     table_epilogue_operations: tuple[tuple[str, tuple[Any, ...]], ...] = (),
+    host_reads_table_status: bool = False,
     consumer_row_loads: Mapping[int, tuple[Any, ...]] | None = None,
     effect_preceding_row_reads: Mapping[int, tuple[int, ...]] | None = None,
     resolved_sequence_schemas: Mapping[int, ResolvedSequenceSchema] | None = None,
@@ -21927,6 +21995,7 @@ def lower_control_program_to_ssa(
         table_region_operations=table_region_operations,
         table_region_post_operations=table_region_post_operations,
         table_epilogue_operations=table_epilogue_operations,
+        host_reads_table_status=host_reads_table_status,
         consumer_row_loads=consumer_row_loads,
         effect_preceding_row_reads=effect_preceding_row_reads,
         resolved_sequence_schemas=resolved_sequence_schemas,
