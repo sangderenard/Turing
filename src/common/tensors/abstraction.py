@@ -1354,11 +1354,6 @@ class AbstractTensor:
         result.data = self.select_by_indices_(indices_dim0, indices_dim1)
         return result
 
-    def log_softmax(self, dim: int = -1) -> "AbstractTensor":
-        result = type(self)(track_time=self.track_time, tape=getattr(self, "_tape", None))
-        result.data = self.log_softmax_(dim)
-        return result
-
     def pad(
         self,
         pad: Tuple[int, ...] = (0, 0),
