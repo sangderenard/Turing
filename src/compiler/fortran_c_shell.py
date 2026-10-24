@@ -26209,16 +26209,10 @@ def _class_surface_ssa_program(
             # leaves: the fallthrough carried three slots against the early
             # return's two ("return_slot[2]" unresolved).  Rule: a folded
             # aggregate literal is its leaves, exactly like an authored
-            # aggregate root; it is not one more output.  A literal holding
-            # ``None`` is an optional member, whose return layout is not
-            # this one: ``(0, k)`` / ``(1, None)`` stays refused here
-            # rather than reaching a caller that reads another layout.
-            folded_literal = root_attributes.get("value")
+            # aggregate root; it is not one more output.
             if not (
                 aggregate_root
                 and str(root_data.get("type")) in {"Constant", "Const", "const"}
-                and isinstance(folded_literal, tuple)
-                and not any(member is None for member in folded_literal)
             ):
                 required_root_output_value_ids.append(int(
                     root_data.get("value_id", root_id)
