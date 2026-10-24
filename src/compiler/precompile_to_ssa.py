@@ -2135,6 +2135,7 @@ class _ControlSSABuilder(TiledObject):
         region_signatures: dict[
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None,
+        region_writing_indices: frozenset[int] = frozenset(),
         region_feed_meta: Mapping[int, tuple[Meta, ...]] | None = None,
         region_value_meta: Mapping[int, Meta] | None = None,
         region_value_ranks: Mapping[int, int] | None = None,
@@ -2349,6 +2350,9 @@ class _ControlSSABuilder(TiledObject):
                 int(signature_index), f"numerical_region_{int(signature_index)}"
             )
         self.region_signatures = dict(region_signatures or {})
+        # Regions whose body stores into memory (a sequence cell): never
+        # output-less no-ops.
+        self.region_writing_indices = frozenset(map(int, region_writing_indices))
         self.region_feed_meta = {
             int(region): tuple(metadata)
             for region, metadata in (region_feed_meta or {}).items()
@@ -5474,9 +5478,18 @@ class _ControlSSABuilder(TiledObject):
         # to replace the output-less region, so the call -- and the store
         # emitted after it -- never ran (``len(d)`` 1 for 2; clean audit).
         # Rule: a region with post-operations is not replaced either.
+        # Program: ``d = {1: 2, 2: n, 3: 2}; del d[2]; xs = [4, n, 7];
+        # xs[1] = 0`` (coverage march, fuzz p0_132).  Wrong record: the
+        # delete rode region 0 -- the ``xs[1] = 0`` store -- as its
+        # pre-operation, and replaced that output-less region, so the store
+        # never ran (``xs[1]`` stayed ``n``; clean audit).  Rule: a region
+        # whose body stores into memory has work without outputs and is
+        # never replaced.
         return replaces_region and not tuple(
             self.region_signatures.get(int(region_index), ((), ()))[1]
-        ) and not self.table_region_post_operations.get(int(region_index))
+        ) and not self.table_region_post_operations.get(
+            int(region_index)
+        ) and int(region_index) not in self.region_writing_indices
 
     def _register_sequence_lowering(self, lowering) -> None:
         """Install helpers through ``register_sequence_lowering``, caused by
@@ -21995,6 +22008,7 @@ def lower_control_program_to_ssa(
     region_signatures: dict[
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
+    region_writing_indices: frozenset[int] = frozenset(),
     region_feed_meta: Mapping[int, tuple[Meta, ...]] | None = None,
     region_value_meta: Mapping[int, Meta] | None = None,
     region_value_ranks: Mapping[int, int] | None = None,
@@ -22071,6 +22085,7 @@ def lower_control_program_to_ssa(
         first_value_id=first_value_id,
         region_callees=region_callees,
         region_signatures=region_signatures,
+        region_writing_indices=region_writing_indices,
         region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
         region_value_ranks=region_value_ranks,
@@ -25596,6 +25611,7 @@ def lower_control_sections_to_ssa(
     SSA values of each region function, which the target must declare as that
     function's ``intent(out)`` dummies (a region has no explicit return).
     """
+    region_writing_indices: set[int] = set()
 
     def report(message: str) -> None:
         if progress is not None:
@@ -27904,6 +27920,11 @@ def lower_control_sections_to_ssa(
                 tuple(int(vid) for vid in effective_captures),
                 outputs,
             )
+            if any(
+                str(instruction.op).casefold() in {"store", "indexedstore"}
+                for instruction in instructions
+            ):
+                region_writing_indices.add(int(region_index))
             signature_cell = _post_region_signature(
                 _book(), str(tensor_shape_concordance_scope), lexical_read_scope,
                 region_index, region_signatures[region_index],
@@ -28442,6 +28463,7 @@ def lower_control_sections_to_ssa(
         first_value_id=max(graph_value_ids) + 1,
         region_callees=region_callees,
         region_signatures=region_signatures,
+        region_writing_indices=frozenset(region_writing_indices),
         region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
         region_value_ranks=region_value_ranks,
