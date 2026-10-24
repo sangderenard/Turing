@@ -822,7 +822,7 @@ def test_numerical_lowering_routes_scatter_through_real_llvm_algorithm():
         "Ret"
     ]
     assert function.blocks["entry"].instrs[0].attributes["callee"] == (
-        "index_assign_double"
+        "scatter_sum_double"
     )
 
 

@@ -1,0 +1,10 @@
+2026-10-24 TITLE (MEASURED, where): 
+2026-10-24 Scatter translation identity (MEASURED, Windows; Linux gate pending):
+
+Observed: On untouched main f8c74d8d, `tests/test_precompile_to_ssa.py::test_numerical_lowering_routes_scatter_through_real_llvm_algorithm` fails because a bare `scatter` step lowers to `scatter_sum_double` while its assertion expects `index_assign_double`. `tests/test_precompile_ssa_validator.py::test_scan_reports_sign_and_scatter_as_real_llvm_algorithm_calls` also fails: it sees both `scatter_sum_double|index_assign_double` for scatter and `unary_double|sign_double` for sign. The authored `AbstractTensor.scatter` docstring, `BACKWARD_RULES`, and `tests/test_scatter_reduction.py` state repeated-destination accumulation; `index_assign_double` overwrites selected slots. The C/LLVM translation table incorrectly claimed the same AbstractTensor `scatter` identity for both kernels, and the fused-program lowerer selected the first table entry. The canonical `lower_ast_source_to_ssa` Token Orchard target test already proves a non-sum policy is refused by name.
+
+Observed: Mapping `index_assign_double` to the existing SSA `IndexedStore` operation leaves `scatter_sum_double` as the sole translation for authored scatter. The new corpus `c623_repeated_scatter_sum.py` lowers through `lower_ast_source_to_ssa`; C and LLVM both execute `[1,1,1,5]` at indices `[0,0,0,1]` as `[3,5,0]` exactly. Focused translation, validator, lowering, canonical execution, and policy-refusal tests pass (6 tests). The sign assertion was updated to name its two existing, unchanged implementations exactly.
+
+Inferred: The stale gate failure came from an old assignment interpretation of scatter, while the newer source semantics and current lowerer selected accumulation. The table's duplicate semantic claim would have allowed a future table-order change to silently choose overwrite, so the fix belongs at that claim.
+
+Unknown: Full typed corpus, FUZZ_EXT differential seed, and authoritative Linux gate on this branch are pending. No baseline entry is added.

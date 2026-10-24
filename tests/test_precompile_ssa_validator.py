@@ -74,8 +74,8 @@ def test_scan_reports_sign_and_scatter_as_real_llvm_algorithm_calls():
         for item in result.compatible_operations
     }
     assert compatibility == {
-        "scatter": "Call[index_assign_double]",
-        "sign": "Call[sign_double]",
+        "scatter": "Call[scatter_sum_double]",
+        "sign": "Call[unary_double|sign_double]",
     }
     assert require_precompile_ssa_compatible(program) is program
 

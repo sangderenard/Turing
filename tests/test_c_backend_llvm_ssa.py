@@ -134,6 +134,12 @@ def test_translation_operations_are_real_abstract_tensor_names():
         "matmul_double",
         "batched_matmul_indexed_double",
     ]
+    assert [entry.c_symbol for entry in translations_for_operation("scatter")] == [
+        "scatter_sum_double",
+    ]
+    assert [entry.c_symbol for entry in translations_for_operation("IndexedStore")] == [
+        "index_assign_double",
+    ]
 
 
 def test_handwritten_fill_ssa_matches_real_c_kernel(llvm_engine):

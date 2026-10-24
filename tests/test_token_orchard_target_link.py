@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -112,6 +114,66 @@ def test_scatter_reduction_policy_survives_capture_and_refuses_wrong_kernel():
         _lower_target_graph(
             SOURCE.replace('reduce="sum"', 'reduce="mean"', 1)
         )
+
+
+@pytest.mark.parametrize("backend", ("c", "llvm"))
+def test_c623_repeated_scatter_uses_accumulation_kernel(tmp_path, backend):
+    source = (
+        Path(__file__).parent
+        / "compiler_scatter_corpus"
+        / "c623_repeated_scatter_sum.py"
+    ).read_text(encoding="utf-8")
+    contract = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {},
+        "bindings": [],
+        "values": [
+            {
+                "function": "root", "parameter": name,
+                "storage": "span", "dtype": dtype, "rank": 1,
+                "shape": [4],
+                "python_type": "src.common.tensors.abstraction.AbstractTensor",
+            }
+            for name, dtype in (("values", "float64"), ("indices", "int64"))
+        ],
+    })
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="c623_repeated_scatter_sum",
+        extraction_contract=contract,
+        python_bindings={"AbstractTensor": AbstractTensor},
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _message: None,
+        progress_bars=False,
+    )
+    entry = exports[0]
+    function = module.functions[entry]
+    parameters = dict(function.metadata["parameter_names"])
+    returned = next(
+        instruction.args[0]
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    )
+    kernels = {
+        instruction.attributes.get("callee")
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Call"
+    }
+    assert "scatter_sum_double" in kernels
+    assert "index_assign_double" not in kernels
+    _artifact, execution = _run(
+        backend, module, entry,
+        {
+            parameters["values"]: np.asarray([1., 1., 1., 5.]),
+            parameters["indices"]: np.asarray([0, 0, 0, 1], dtype=np.int64),
+        },
+        tmp_path,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(execution.buffers[int(returned.id)]),
+        np.asarray([3., 5., 0.]),
+    )
 
 
 def _reference(child_tokens, parent_index, ordinal, parent_length):

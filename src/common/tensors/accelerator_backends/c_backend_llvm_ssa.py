@@ -48,7 +48,7 @@ _C_BACKEND_PATH = Path(__file__).with_name("c_backend.py")
 # ``slice`` is emitted by the numerical precompiler after Python indexing has
 # already been normalized.  It is intentionally not a public AbstractTensor
 # method name, but it still needs the same real C -> LLVM algorithm registry.
-PRECOMPILE_INTERNAL_OPERATORS = frozenset({"slice", "index_set"})
+PRECOMPILE_INTERNAL_OPERATORS = frozenset({"slice", "index_set", "IndexedStore"})
 
 # Explicit output-buffer positions in the authored low-level SSA signatures.
 # Scalar-returning helpers (binary_value, sum_double, count_true_double) carry
@@ -3125,7 +3125,11 @@ TRANSLATIONS = (
     CBackendLLVMSSA(
         "index_assign_double",
         "index_assign_double",
-        ("scatter",),
+        # The Token Orchard repeated-parent scatter sums contributions.
+        # IndexedStore is the SSA operation that mutates selected slots;
+        # claiming AbstractTensor.scatter here made its translation table
+        # offer overwrite and accumulation under one semantic identity.
+        ("IndexedStore",),
         "arbitrary-rank indexed mutation",
     ),
     CBackendLLVMSSA(
