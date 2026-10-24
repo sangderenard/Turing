@@ -815,6 +815,177 @@ def _normalize_builtin_divmod(
     return tuple(receipts)
 
 
+_MAPPING_ANNOTATIONS = frozenset({
+    "dict", "Dict", "Mapping", "MutableMapping", "defaultdict",
+    "OrderedDict",
+})
+
+
+def _normalize_mapping_get(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Spell ``d.get(k)`` and ``d.get(k, e)`` as ``d[k] if k in d else e``.
+
+    Program: ``d = {1: n, 2: 5}; v = d.get(n)`` then ``-1 if v is None
+    else v`` (silent lane, scratch s45/b; WRONG at ``main``).  Wrong
+    record: the keyed lookup's absent branch yielded 0 -- for a missing
+    default and for a non-literal one alike (``d.get(n, m)`` gave 0 for
+    ``m``) -- so ``v is None`` was false (clean audit).  Rule: for a
+    mapping Python defines ``get`` as exactly this selection, which the
+    compiler already lowers (the membership query, the keyed read and the
+    optional ``None`` arm).  Only a receiver every binding of which in its
+    function is a dict display, a dict comprehension, ``dict(...)``, or a
+    mapping annotation is rewritten, with a pure key and a name or constant
+    default (each evaluated once either way).  A numeric literal default
+    keeps the lookup-or-default helper, which is exact.
+    """
+
+    receipts: list[dict[str, Any]] = []
+
+    def annotation_is_mapping(annotation: ast.AST | None) -> bool:
+        if annotation is None:
+            return False
+        base = annotation.value if isinstance(annotation, ast.Subscript) else annotation
+        if isinstance(base, ast.Attribute):
+            return base.attr in _MAPPING_ANNOTATIONS
+        return isinstance(base, ast.Name) and base.id in _MAPPING_ANNOTATIONS
+
+    def mapping_value(value: ast.AST | None) -> bool:
+        return isinstance(value, (ast.Dict, ast.DictComp)) or (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "dict"
+        )
+
+    def mapping_names(function: ast.AST) -> frozenset[str]:
+        verdict: dict[str, bool] = {}
+
+        def bind(name: str, is_mapping: bool) -> None:
+            verdict[name] = verdict.get(name, True) and is_mapping
+
+        arguments = function.args
+        for argument in (
+            *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+        ):
+            bind(argument.arg, annotation_is_mapping(argument.annotation))
+        for extra in (arguments.vararg, arguments.kwarg):
+            if extra is not None:
+                bind(extra.arg, False)
+        for node in ast.walk(function):
+            if node is not function and isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                       ast.ClassDef),
+            ):
+                # A nested scope may rebind the name; refuse it there too.
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Name) and isinstance(
+                        inner.ctx, ast.Store
+                    ):
+                        bind(inner.id, False)
+                continue
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        bind(target.id, mapping_value(node.value))
+            elif isinstance(node, ast.AnnAssign) and isinstance(
+                node.target, ast.Name
+            ):
+                bind(
+                    node.target.id,
+                    annotation_is_mapping(node.annotation)
+                    and (node.value is None or mapping_value(node.value)),
+                )
+        plain_targets = {
+            id(target)
+            for node in ast.walk(function)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        } | {
+            id(node.target)
+            for node in ast.walk(function)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+        }
+        # Any other store (a loop target, ``with ... as``, an augmented
+        # assignment, a tuple target, a walrus, a ``del``) is not a proven
+        # mapping binding.
+        for node in ast.walk(function):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and id(node) not in plain_targets
+            ):
+                bind(node.id, False)
+        return frozenset(name for name, ok in verdict.items() if ok)
+
+    class Rewriter(ast.NodeTransformer):
+        def __init__(self, mappings: frozenset[str]) -> None:
+            self.mappings = mappings
+
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            func = node.func
+            if (
+                not isinstance(func, ast.Attribute)
+                or func.attr != "get"
+                or not isinstance(func.value, ast.Name)
+                or func.value.id not in self.mappings
+                or node.keywords
+                or len(node.args) not in (1, 2)
+                or any(isinstance(arg, ast.Starred) for arg in node.args)
+                or not _pure_operand(node.args[0])
+            ):
+                return node
+            if len(node.args) == 2:
+                default = node.args[1]
+                if not isinstance(default, (ast.Name, ast.Constant)):
+                    return node
+                if isinstance(default, ast.Constant) and isinstance(
+                    default.value, (int, float)
+                ) and not isinstance(default.value, bool):
+                    return node
+                default = copy.deepcopy(default)
+            else:
+                default = ast.copy_location(ast.Constant(value=None), node)
+            key = node.args[0]
+            receiver = func.value
+            selection = ast.IfExp(
+                test=ast.copy_location(ast.Compare(
+                    left=copy.deepcopy(key), ops=[ast.In()],
+                    comparators=[ast.copy_location(ast.Name(
+                        id=receiver.id, ctx=ast.Load(),
+                    ), receiver)],
+                ), node),
+                body=ast.copy_location(ast.Subscript(
+                    value=ast.copy_location(ast.Name(
+                        id=receiver.id, ctx=ast.Load(),
+                    ), receiver),
+                    slice=key, ctx=ast.Load(),
+                ), node),
+                orelse=default,
+            )
+            receipts.append({
+                "line": int(getattr(node, "lineno", -1)),
+                "column": int(getattr(node, "col_offset", -1)),
+                "receiver": receiver.id,
+            })
+            return ast.copy_location(selection, node)
+
+    for function in [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]:
+        mappings = mapping_names(function)
+        if not mappings:
+            continue
+        rewriter = Rewriter(mappings)
+        function.body = [rewriter.visit(statement) for statement in function.body]
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 def _normalize_binary_short_circuit(
     tree: ast.Module,
 ) -> tuple[dict[str, Any], ...]:
