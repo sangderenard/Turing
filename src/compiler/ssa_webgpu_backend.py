@@ -195,12 +195,24 @@ class WGSLModule:
     component_abi: Any = None
     backend_identity_decisions: tuple[Any, ...] = ()
 
+    def deployment(self):
+        from .shader_deployment import wgsl_deployment
+        return wgsl_deployment(self)
+
     def write(self, directory: str | Path) -> Path:
-        path = Path(directory) / f"{self.name}.wgsl"
-        path.write_text(self.source, encoding="utf-8", newline="\n")
-        if self.api is not None:
-            self.api.write(path.with_suffix(".api.yaml"))
-        return path
+        """Publish source, API sidecar, request manifest and digests."""
+
+        if self.api is None or self.component_abi is None:
+            path = Path(directory) / f"{self.name}.wgsl"
+            path.write_text(self.source, encoding="utf-8", newline="\n")
+            if self.api is not None:
+                self.api.write(path.with_suffix(".api.yaml"))
+            return path
+        from .shader_deployment import publish_shader_source
+        return publish_shader_source(
+            directory, name=self.name, source=self.source, suffix=".wgsl",
+            api=self.api, deployment=self.deployment(),
+        ).source_path
 
 
 def _op(instr: Instr) -> str:

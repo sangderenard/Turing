@@ -74,6 +74,20 @@ class WebGLFragmentModule:
     def complete(self) -> bool:
         return not self.shortfalls
 
+    def deployment(self):
+        from .shader_deployment import webgl_fragment_deployment
+        return webgl_fragment_deployment(self)
+
+    def write(self, directory):
+        """Publish the fragment source with its companion vertex stage."""
+
+        from .shader_deployment import publish_shader_source
+        return publish_shader_source(
+            directory, name=self.name, source=self.source, suffix=".frag",
+            api=self.api, deployment=self.deployment(),
+            companions={".vert": self.vertex_source},
+        ).source_path
+
 
 def supported_operations() -> frozenset[str]:
     """The float scalar vocabulary inherited from the desktop GLSL table."""
