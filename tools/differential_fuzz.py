@@ -85,6 +85,9 @@ EXTENDED = [
     (["xs{v} = [{a}, {b}]", "bump_alt(xs{v}, n)"], "xs{v}[0] * 10 + xs{v}[1]"),
     # a loop bounded by len() of a list formal (corpus c376, plan C19)
     (["c{v} = weigh([{a}, n, {b}])"], "c{v}"),
+    # a call whose argument is a dict display runs after the display's
+    # member stores (corpus c377, dict formal)
+    (["c{v} = bump_key({{0: {a}, 1: {b}}}, n)"], "c{v}"),
     # a dict row stored from its own read (corpus c374, plan C6)
     (["d{v} = {{0: {a}, 1: {b}}}", "d{v}[n % 2] += n * {c}", "d{v}[1] = d{v}[0] + d{v}[1]"], "d{v}[0] * 10 + d{v}[1]"),
     (["xs{v} = []", "k{v} = n % 5 + 2", "while k{v} > 0:", "    xs{v}.append(k{v})", "    k{v} -= 2"], "len(xs{v}) * 10 + xs{v}[0]"),
@@ -215,6 +218,11 @@ def first_over(x: int, y: int) -> int:
 def bump_alt(xs: list[int], n: int) -> None:
     for i in range(3):
         xs[i % 2] += n
+
+
+def bump_key(d: dict[int, int], n: int) -> int:
+    d[0] += n
+    return d[0] * 10 + d[1]
 
 
 def weigh(xs: list[int]) -> int:
