@@ -398,6 +398,8 @@ def build(m: int) -> list[int]:
 # replication, aliasing and sets.  Seeds 80-83 found the families of corpus
 # c333-c338.
 EXTENDED4 = [
+    (["o{v} = maybe_pick(n + 1, {a})", "d{v} = {{1: {b}, 2: n, 3: {c}}}", "del d{v}[2]"], "(-3 if o{v} is None else o{v} + 1) + len(d{v}) * 10"),
+    (["d{v} = {{1: {a}, 2: n}}", "del d{v}[1]", "d{v}[1] = {b}"], "len(d{v}) * 10 + d{v}[1]"),
     (["s{v} = {{n, {a}}}", "s{v}.add({b})", "xs{v} = [{c}, n, {a}]", "ys{v} = xs{v}[-2:]"], "len(s{v}) * 100 + sum(s{v}) + ys{v}[0] * 10 + len(ys{v})"),
     (["xs{v} = [n, {a}]", "r{v} = xs{v}[0]", "swap(xs{v})"], "r{v} * 100 + head(xs{v}) * 10 + xs{v}[1]"),
     (["d{v} = {{0: n}}", "d{v}[1] = d{v}.get(0, -1) + {a}", "t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{b}, 0]]:", "    t{v} += y{v}", "xs{v} = [n, {c}]", "h{v} = head(xs{v})", "swap(xs{v})"], "d{v}[1] * 10 + len(d{v}) + t{v} + h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),

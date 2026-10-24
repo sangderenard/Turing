@@ -912,6 +912,7 @@ class _FunctionEmitter:
         callee_native_symbols: Mapping[str, str] | None = None,
         extent_namespace: str = "",
         release_heap_owners: bool = False,
+        dynamic_extent_aliases: Mapping[int, int] | None = None,
     ):
         if str(trig_solver) not in {"lut", "continuous"}:
             raise ValueError(
@@ -1213,6 +1214,13 @@ class _FunctionEmitter:
             )
         }
         self._propagate_phi_dynamic_ranks()
+        self.runtime_sized_ids = {
+            int(value_id) for value_id, rank in dict(
+                dynamic_array_ranks or {}
+            ).items()
+            if int(rank) > 0
+        }
+        self._adopt_runtime_extent_aliases(dict(dynamic_extent_aliases or {}))
         self.shortfalls: list[FortranShortfall] = []
         # Dangling operands (consumed, never produced, not a formal) emit as
         # undeclared symbols gfortran rejects late and cryptically -- the
@@ -1282,6 +1290,65 @@ class _FunctionEmitter:
         self._producers: dict[int, Instr] = {}
         # Collection value id -> the induction that indexes it.
         self._collections: dict[int, SSAValue] = {}
+
+    def _adopt_runtime_extent_aliases(self, aliases: Mapping[int, int]) -> None:
+        """A runtime-sized value takes the extents of the value it aliases.
+
+        ``aliases`` (``_runtime_extent_aliases``) maps an elementwise result
+        to its extent operand and a call result to the caller actual whose
+        extents the callee's result takes.  The value becomes an array of
+        that source's rank whose dimensions ARE the source's extent symbols:
+        no new extent crosses the ABI, and the declaration is never scalar.
+        """
+
+        changed = True
+        while changed:
+            changed = False
+            for value_id, source_id in aliases.items():
+                value_id, source_id = int(value_id), int(source_id)
+                if value_id in self.dynamic_array_ranks:
+                    continue
+                extents = self.dynamic_array_leading_extents.get(source_id)
+                if source_id not in self.dynamic_array_ranks or not extents:
+                    continue
+                self.dynamic_array_ranks[value_id] = (
+                    self.dynamic_array_ranks[source_id]
+                )
+                self.dynamic_array_leading_extents[value_id] = extents
+                self.array_base_ids.add(value_id)
+                changed = True
+
+    def _emit_runtime_extent_checks(self, instr: Instr, body: list[str]) -> None:
+        """Refuse disagreeing runtime extents before an elementwise result.
+
+        Fortran's whole-array assignment does not check conformance; two
+        runtime-sized operands of different lengths would read past the
+        shorter one.  Python raises a broadcast error there, and the planner
+        states no runtime broadcast, so a mismatch stops with code 77."""
+
+        from .ssa_llvm_backend import _elementwise_extent_operand
+
+        source = _elementwise_extent_operand(instr)
+        if source is None:
+            return
+        expected = self.dynamic_array_leading_extents.get(int(source.id))
+        if not expected:
+            return
+        conditions = []
+        for argument in instr.args:
+            extents = self.dynamic_array_leading_extents.get(int(argument.id))
+            if argument is source or not extents:
+                continue
+            conditions.extend(
+                f"{have} /= {want}"
+                for have, want in zip(extents, expected)
+                if have != want
+            )
+        if conditions:
+            body.append(
+                f"    if ({' .or. '.join(dict.fromkeys(conditions))}) "
+                "error stop 77"
+            )
 
     def _propagate_phi_dynamic_ranks(self) -> None:
         """Carry dynamic-array rank through Phi chains, to a fixed point.
@@ -4408,6 +4475,7 @@ class _FunctionEmitter:
                 error_code = int(instr.attributes.get("error_code", 1))
                 body.append(f"    error stop {error_code}")
                 continue
+            self._emit_runtime_extent_checks(instr, body)
             if (
                 instr.op == "NoneValue"
                 and instr.res is not None
@@ -5155,6 +5223,7 @@ def emit_function(
     callee_native_symbols: Mapping[str, str] | None = None,
     extent_namespace: str = "",
     release_heap_owners: bool = False,
+    dynamic_extent_aliases: Mapping[int, int] | None = None,
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -5210,7 +5279,70 @@ def emit_function(
         callee_native_symbols=callee_native_symbols,
         extent_namespace=extent_namespace,
         release_heap_owners=release_heap_owners,
+        dynamic_extent_aliases=dynamic_extent_aliases,
     ).emit()
+
+
+def _runtime_extent_aliases(
+    functions: Mapping[str, Function],
+) -> dict[str, dict[int, int]]:
+    """Which same-function value a runtime-sized value takes extents from.
+
+    Two exact edges, as in the C and LLVM lanes' origin walks: an elementwise
+    result takes its extent operand's (``_elementwise_extent_operand``), and
+    a caller's call result (``ssa_call_result_from``) takes the extents of
+    the caller actual bound to the callee formal its callee-side result
+    resolves to.  A value with neither edge has no entry, and is refused
+    where it would otherwise be declared scalar.
+    """
+
+    from .ssa_llvm_backend import _elementwise_extent_operand
+
+    aliases: dict[str, dict[int, int]] = {name: {} for name in functions}
+    for name, function in functions.items():
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                operand = _elementwise_extent_operand(instruction)
+                if operand is not None:
+                    aliases[name][int(instruction.res.id)] = int(operand.id)
+
+    def formal_position(name: str, value_id: int) -> int | None:
+        function = functions.get(name)
+        if function is None:
+            return None
+        seen: set[int] = set()
+        current = int(value_id)
+        while current not in seen:
+            seen.add(current)
+            for position, formal in enumerate(function.args):
+                if int(formal.id) == current:
+                    return position
+            nxt = aliases[name].get(current)
+            if nxt is None:
+                return None
+            current = int(nxt)
+        return None
+
+    for name, function in functions.items():
+        calls: dict[str, list[Instr]] = {}
+        results: list[SSAValue] = []
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op in {"Call", "call"}:
+                    callee = str(instruction.attributes.get("callee") or "")
+                    calls.setdefault(callee, []).append(instruction)
+                if instruction.res is not None:
+                    results.append(instruction.res)
+        for value in results:
+            hop = (value.accounting or {}).get("ssa_call_result_from")
+            if not hop or len(calls.get(str(hop[0]), ())) != 1:
+                continue
+            position = formal_position(str(hop[0]), int(hop[1]))
+            call = calls[str(hop[0])][0]
+            if position is None or position >= len(call.args):
+                continue
+            aliases[name].setdefault(int(value.id), int(call.args[position].id))
+    return aliases
 
 
 @dataclass
@@ -6628,6 +6760,8 @@ def emit_module(
         }
         for function_name in functions
     }
+    extent_aliases = _runtime_extent_aliases(functions)
+
     def extent_signature(
         function_name: str,
         signatures: Mapping[str, Sequence[str]],
@@ -6670,6 +6804,7 @@ def emit_module(
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,
                 extent_namespace=extent_namespaces[function_name],
+                dynamic_extent_aliases=extent_aliases.get(function_name, {}),
             ).extent_names
 
     # Extents are a finite call-signature dataflow problem, but dynamic names
@@ -6741,6 +6876,7 @@ def emit_module(
                 callee_native_symbols=native_symbols,
                 extent_namespace=extent_namespaces[function_name],
                 release_heap_owners=function_name not in called_functions,
+                dynamic_extent_aliases=extent_aliases.get(function_name, {}),
             )
             for function_name, function in functions.items()
         )
