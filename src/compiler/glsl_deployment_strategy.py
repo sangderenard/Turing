@@ -2588,7 +2588,10 @@ def _planned_scalar_dtypes_from(
                 if len(held) == 1:
                     settle(element, node_id, held[0])
                 continue
-            if is_collection(node_id) and not op.startswith("indexed"):
+            if (
+                is_collection(node_id)
+                or attributes.get("sequence_element_class_ref")
+            ) and not op.startswith("indexed"):
                 # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
                 # record: an unrolled comprehension (``sequence_materialization``)
                 # holds its elements as ``arg0``..``argN``, not ``elts``, so its
@@ -2623,11 +2626,11 @@ def _planned_scalar_dtypes_from(
                 # caller's linked ABI arrived.  Rule: an annotated
                 # collection parameter's element class is its annotation's,
                 # joined with its writers.
-                if (
-                    op == "input"
-                    and attributes.get("binding_kind") == "parameter"
-                    and attributes.get("sequence_element_class_ref")
-                ):
+                # The same holds for every value stamped with a declared
+                # element class: an annotated call result (its callee's
+                # ``function_return_annotation``), an annotated local, a
+                # record field.
+                if attributes.get("sequence_element_class_ref"):
                     writers.append(classes.get(str(
                         attributes["sequence_element_class_ref"]
                     ).removeprefix("builtins.")))

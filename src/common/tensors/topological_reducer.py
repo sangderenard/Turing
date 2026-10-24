@@ -44,6 +44,7 @@ from ...compiler.concordance_declarations import (
     CLASS_FIELD_DECLARATION as _CLASS_FIELD_DECLARATION,
     CLASS_METHOD_DECLARATION as _CLASS_METHOD_DECLARATION,
     FUNCTION_ADDRESS as _FUNCTION_ADDRESS,
+    FUNCTION_RETURN_ANNOTATION as _FUNCTION_RETURN_ANNOTATION,
     FUNCTION_SUBGRAPH as _FUNCTION_SUBGRAPH,
     HELPER_CALLER_UNROUTED as _HELPER_CALLER_UNROUTED,
     IDENTITY_TRANSITION as _IDENTITY_TRANSITION,
@@ -20110,11 +20111,83 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         )
         return None if inferred_class is None else str(inferred_class)
 
+    # Lane D, D2.  Program: ``def single(n) -> list[int]: return [n]``;
+    # ``t = single(n); t[0]`` (corpus c215).  The call's result was stamped
+    # only as a list, so ``t[0]`` took the float64 domain default until the
+    # callee's linked ABI arrived.  Rule: a declared sequence return whose
+    # element is one primitive class (``list[int]``, ``tuple[int, int]``,
+    # ``tuple[int, ...]``) states the call result's element class, with its
+    # ``function_return_annotation`` cell, as a parameter annotation does.
+    primitive_element_classes = {
+        "int": "builtins.int", "float": "builtins.float",
+        "bool": "builtins.bool",
+    }
+    returned_element_by_reference: dict[int, tuple[str, Any]] = {}
+
+    def returned_element(definition: Any) -> tuple[str, Any] | None:
+        if isinstance(definition, int) and definition in graph.G:
+            definition = graph.G.nodes[definition].get("expr_obj")
+        if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        annotation = definition.returns
+        if isinstance(annotation, ast.Constant) and isinstance(
+            annotation.value, str
+        ):
+            try:
+                annotation = ast.parse(annotation.value, mode="eval").body
+            except SyntaxError:
+                return None
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        container = (
+            annotation.value.id if isinstance(annotation.value, ast.Name)
+            else ""
+        )
+        if container not in {
+            "list", "List", "set", "Set", "frozenset", "tuple", "Tuple",
+        }:
+            return None
+        element = annotation.slice
+        if container in {"tuple", "Tuple"} and isinstance(element, ast.Tuple):
+            positions = [
+                item for item in element.elts
+                if not (
+                    isinstance(item, ast.Constant) and item.value is Ellipsis
+                )
+            ]
+            if not positions or (
+                len(positions) != len(element.elts)
+                and not (len(positions) == 1 and len(element.elts) == 2)
+            ):
+                return None
+            names = {
+                item.id if isinstance(item, ast.Name) else None
+                for item in positions
+            }
+            if len(names) != 1:
+                return None
+            element = positions[0]
+        if not isinstance(element, ast.Name):
+            return None
+        element_class = primitive_element_classes.get(element.id)
+        row = getattr(definition, "_turing_source_span_row", None)
+        if element_class is None or not isinstance(row, tuple) or len(row) < 2:
+            return None
+        cell = current_identity_book().latest_ref(
+            _FUNCTION_RETURN_ANNOTATION, (row[0], str(row[1])),
+        )
+        return None if cell is None else (element_class, cell)
+
     for function_node_id, reference in function_nodes.items():
         definition = graph.G.nodes.get(function_node_id, {}).get("expr_obj")
         inferred_class = returned_class(definition)
         if inferred_class is not None:
             returned_class_by_reference[int(reference.address)] = inferred_class
+        declared_element = returned_element(definition)
+        if declared_element is not None:
+            returned_element_by_reference[int(reference.address)] = (
+                declared_element
+            )
     for entry in function_table:
         inferred_class = returned_class(
             entry.metadata.get("source_node")
@@ -20122,6 +20195,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         if inferred_class is not None:
             returned_class_by_reference[int(entry.reference.address)] = (
                 inferred_class
+            )
+        declared_element = returned_element(entry.metadata.get("source_node"))
+        if declared_element is not None:
+            returned_element_by_reference.setdefault(
+                int(entry.reference.address), declared_element,
             )
 
     def propagate_returned_receiver_types(target_graph: Any) -> None:
@@ -20148,6 +20226,18 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 None if callee_reference is None
                 else returned_class_by_reference.get(int(callee_reference))
             )
+            declared_element = (
+                None if callee_reference is None
+                else returned_element_by_reference.get(int(callee_reference))
+            )
+            if (
+                declared_element is not None
+                and "sequence_element_class_ref" not in attributes
+            ):
+                attributes.update({
+                    "sequence_element_class_ref": declared_element[0],
+                    "sequence_element_annotation_cell": declared_element[1],
+                })
             if (
                 returned_class is None
                 and isinstance(expression.func, ast.Attribute)

@@ -6426,7 +6426,8 @@ class ProcessGraph(TiledObject):
         # Each is a ``parameter_annotation`` row DERIVED from the ``arg``
         # span (plan 60, section 3.4); the dict is materialized from the page.
         from ...compiler.concordance_declarations import (
-            CLASS_DECLARATION, PARAMETER_ANNOTATION,
+            CLASS_DECLARATION, FUNCTION_RETURN_ANNOTATION,
+            PARAMETER_ANNOTATION,
         )
 
         annotation_rows = []
@@ -6460,6 +6461,35 @@ class ProcessGraph(TiledObject):
                 # owns the full qualified identity. Rebuilding that identity
                 # from the lifted name conflated stage: Any with Stage | None.
                 annotation_rows.append(((module_name, identity), ()))
+                # Lane D, D2.  ``def single(n) -> list[int]`` (corpus c215):
+                # the return annotation is authored ABI exactly as the
+                # parameters' are, but no page held it, so a caller's
+                # ``single(n)[0]`` had no element class until the callee's
+                # linked ABI arrived.  Post it beside the parameters, from
+                # its own span and the classes it names.
+                if function.returns is not None:
+                    returns_span = post_source_span(function, function.returns)
+                    if returns_span is not None:
+                        return_sources = [returns_span]
+                        for name in dict.fromkeys(
+                            node.id for node in ast.walk(function.returns)
+                            if isinstance(node, ast.Name)
+                        ):
+                            declared_class = book.latest_ref(
+                                CLASS_DECLARATION, (module_name, str(name)),
+                            )
+                            if declared_class is not None:
+                                return_sources.append(declared_class)
+                        book.post(
+                            FUNCTION_RETURN_ANNOTATION,
+                            (module_name, str(identity)),
+                            ast.unparse(function.returns),
+                            stage=INGESTION,
+                            provenance=Derived(tuple(dict.fromkeys(
+                                return_sources
+                            ))),
+                            mode=Mode.CONCORD,
+                        )
                 for parameter in parameters:
                     if parameter.annotation is None:
                         continue
