@@ -24540,6 +24540,23 @@ def _schedule_loop_callsites(
                                 for value_id in length_signature[0]
                                 if int(value_id) in sequence_length_values
                             )
+                    # Program: ``xs0[i] += 1`` in a loop, then ``s2 = {n, 6};
+                    # addto(s2, 4)`` and ``sum(s2)`` (fuzz p7_59).  Wrong
+                    # record: the region summing ``s2`` takes the arena itself
+                    # as a feed, which counted as no read of it, so nothing
+                    # ordered it after the call that adds to ``s2`` and the
+                    # hierarchy put it first (the sum missed 4; clean audit).
+                    # Rule: a region fed a sequence arena of this run reads
+                    # that arena.
+                    if isinstance(candidate, StatementBlock) and scheduled_region(candidate) is not None:
+                        arena_signature = dependency_signature(candidate)
+                        if arena_signature is not None:
+                            reads.update(
+                                int(value_id)
+                                for value_id in arena_signature[0]
+                                if int(value_id) in mutated_arenas
+                                or int(value_id) in run_arenas
+                            )
                     # PROGRAM SHAPE: a region ``StatementBlock`` whose effects
                     # (append/extend/store/pack_bits/lookup ...) are recorded
                     # in table_region_operations / _post_operations.  WRONG
