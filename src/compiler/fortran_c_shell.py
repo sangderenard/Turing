@@ -40058,6 +40058,31 @@ def _class_surface_ssa_program(
                         revised_fields.append(record_field)
                         continue
                     roles = dict(decomposition)
+                    # Program: ``SSAReferenceEvaluator.run``:
+                    # ``values: dict[int, Any] = {}``,
+                    # ``self._root_frame = values``, then ``values[key] = ...``
+                    # in a loop.  Wrong record: the keyed field's published
+                    # view is the caller-supplied, exactly full one (length
+                    # and capacity are one part), and advancing the frame's
+                    # DYNAMIC arena onto it died in the descriptor invariant
+                    # with no name.  Rule: a field view with no capacity part
+                    # cannot hold a mapping this frame grows; refuse by field.
+                    if (
+                        str(getattr(
+                            old_sequence.capacity_policy, "value",
+                            old_sequence.capacity_policy,
+                        )) == "dynamic"
+                        and int(roles[("length_address_id",)])
+                        == int(roles[("capacity_value_id",)])
+                    ):
+                        raise FortranEmissionError(
+                            "keyed field "
+                            f"{record_field.storage_identity} is assigned a "
+                            f"mapping this frame grows (sequence "
+                            f"{int(old_sequence_id)} in {symbol}); the "
+                            "field's caller-supplied view is exactly full "
+                            "and has no capacity part to hold it"
+                        )
                     columns = tuple(
                         int(roles[("column", position)])
                         for position in range(len(old_sequence.column_value_ids))

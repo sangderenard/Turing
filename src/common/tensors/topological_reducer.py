@@ -17579,6 +17579,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             return {}
         key = _annotation_storage(columns[0])
         value = _annotation_storage(columns[1])
+        # Program: ``values: dict[int, Any] = {}`` then
+        # ``values[key] = arguments[key]`` (SSAReferenceEvaluator.run).
+        # Wrong record: an ``Any`` value fell to the record branch of
+        # ``_annotation_storage``, so the row declared an int64 handle of a
+        # record named 'Any' and the store of the opaque value refused as a
+        # row dtype disagreement.  Rule: a mapping's arbitrary-object VALUE
+        # is the fixed-width opaque handle, as in the keyed-value receipt
+        # (``_authored_annotation_field_receipt``).  An ``Any`` key and an
+        # ``Any`` inside a nested aggregate keep their integer row handle.
+        if (
+            isinstance(columns[1], ast.Name)
+            and columns[1].id in {"Any", "object"}
+        ) or (
+            isinstance(columns[1], ast.Attribute)
+            and columns[1].attr == "Any"
+        ):
+            value = {"dtype": "opaque_ref"}
         if key.get("dtype") is None or value.get("dtype") is None:
             return {}
         return {
