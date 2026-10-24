@@ -251,13 +251,24 @@ class SPIRVFunction:
         return not self.shortfalls
 
 
+#: Product kinds a SPIR-V manifest names (docs/NODUS_SHADER_DEPLOYMENT_REQUEST.md).
+#: A consumer must never reinterpret a library as an executable shader.
+LINKABLE_SPIRV_LIBRARY = "linkable-spirv-library"
+DEPLOYABLE_SHADER = "deployable-shader"
+
+
 @dataclass
 class SPIRVModule:
-    """A complete, assembled SPIR-V text module (consumable by ``spirv-as``)."""
+    """A complete, assembled SPIR-V text module (consumable by ``spirv-as``).
+
+    This is the linkable library product: exported functions, no entry
+    point, no execution mode, no descriptor interface.
+    """
 
     name: str
     source: str
     functions: tuple[SPIRVFunction, ...] = ()
+    product_kind = LINKABLE_SPIRV_LIBRARY
 
     @property
     def shortfalls(self) -> tuple[SPIRVShortfall, ...]:
@@ -282,9 +293,13 @@ class _ModuleBuilder:
     never redeclare the same type or collide on an id.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, linkage: bool = True) -> None:
         self._next_id = 0
-        self.capabilities: set[str] = {"Shader", "Linkage"}
+        # A library exports its functions through Linkage. A deployable
+        # shader must not: Vulkan forbids the Linkage capability, and its
+        # functions are reached from the entry point instead.
+        self.linkage = bool(linkage)
+        self.capabilities: set[str] = {"Shader", "Linkage"} if linkage else {"Shader"}
         self.needs_glsl_ext = False
         self.type_ids: dict[str, str] = {}
         self.const_ids: dict[tuple[str, Any], str] = {}
@@ -933,7 +948,7 @@ def _assemble(name: str, builder: _ModuleBuilder, functions: tuple[SPIRVFunction
     if builder.needs_glsl_ext:
         lines.append('%glsl = OpExtInstImport "GLSL.std.450"')
     lines.append("OpMemoryModel Logical GLSL450")
-    for exported_name in builder.exported:
+    for exported_name in (builder.exported if builder.linkage else ()):
         lines.append(f'OpDecorate %{exported_name} LinkageAttributes "{exported_name}" Export')
     # Decorations parked by the function emitters (NoContraction on
     # precision-section results) belong in the same annotations section as
@@ -1042,6 +1057,312 @@ def emit_module(
     return _assemble(name, builder, fns)
 
 
+#: Element spelling and byte stride of a storage-buffer element, by SSA dtype.
+#: The spelling is the logical-port vocabulary the WGSL and GLSL components
+#: already publish, so ports compare across backends.
+_STORAGE_ELEMENT: dict[str, tuple[str, int]] = {
+    "float32": ("f32", 4),
+    "float": ("f32", 4),
+    "float64": ("f64", 8),
+    "double": ("f64", 8),
+    "int32": ("i32", 4),
+    "int64": ("i64", 8),
+}
+
+
+@dataclass(frozen=True)
+class SPIRVStorageBinding:
+    """One descriptor of a deployable shader, as the module declares it."""
+
+    binding: int
+    name: str
+    role: str  # "feed" | "output" | "control"
+    dtype: str
+    element_bytes: int
+    access: str  # "read" | "read_write"
+    value_id: int | None = None
+
+
+@dataclass
+class SPIRVDeployableShader:
+    """A GLCompute SPIR-V module with an entry point and a descriptor ABI.
+
+    A separate product from :class:`SPIRVModule`: the library function is
+    called once per invocation by ``main``, which reads one element of each
+    feed buffer at ``GlobalInvocationId.x``, writes one element of the output
+    buffer, and guards on the control buffer's ``element_count`` word. Every
+    resource is a storage buffer in descriptor set 0 at a contiguous binding
+    (feeds in argument order, then the output, then the control buffer).
+    """
+
+    name: str
+    source: str
+    function: str
+    local_size: tuple[int, int, int]
+    bindings: tuple[SPIRVStorageBinding, ...]
+    shortfalls: tuple[SPIRVShortfall, ...] = ()
+    target_env: str = "vulkan1.1"
+    spirv_version: str = "1.3"
+    entrypoint: str = "main"
+    capabilities: tuple[str, ...] = ()
+    #: The logical ``turing.shader-component.v1`` record and the API sidecar
+    #: that carries it; ``None`` when the function was refused.
+    component_abi: Any = None
+    api: Any = None
+    product_kind = DEPLOYABLE_SHADER
+
+    @property
+    def complete(self) -> bool:
+        return not self.shortfalls and bool(self.source)
+
+    def write(self, directory: str | Path) -> Path:
+        path = Path(directory) / f"{self.name}.spvasm"
+        path.write_text(self.source, encoding="utf-8", newline="\n")
+        return path
+
+
+def emit_deployable_compute_shader(
+    function: Function,
+    *,
+    outputs: Sequence[SSAValue],
+    dtype: str = DEFAULT_DTYPE,
+    local_size: int = 64,
+    name: str | None = None,
+    module: IRModule | None = None,
+) -> SPIRVDeployableShader:
+    """Wrap one scalar SSA function in a GLCompute entry point.
+
+    The function body is the same translation the library product uses;
+    only the interface differs. A function the per-invocation contract
+    cannot carry (an array formal or result, a boolean element, more than
+    one result) is a shortfall, never a guessed layout.
+    """
+
+    name = str(name or function.name)
+    local = (int(local_size), 1, 1)
+    if local[0] <= 0:
+        raise SPIRVEmissionError("local size must be positive")
+    shortfalls: list[SPIRVShortfall] = []
+
+    def refused() -> SPIRVDeployableShader:
+        return SPIRVDeployableShader(
+            name, "", function.name, local, (), tuple(shortfalls),
+        )
+
+    outputs = tuple(outputs)
+    if len(outputs) != 1:
+        shortfalls.append(SPIRVShortfall(
+            "<entry>", "*",
+            f"a deployable compute entry writes exactly one result per "
+            f"invocation; {function.name} names {len(outputs)}",
+        ))
+        return refused()
+    for value in (*function.args, outputs[0]):
+        if value.shape:
+            shortfalls.append(SPIRVShortfall(
+                "<entry>", "*",
+                f"%t{value.id} has shape {tuple(value.shape)}; a deployable "
+                "entry reads one storage-buffer element per value and "
+                "invocation, so array-shaped values need their own layout",
+            ))
+        if _STORAGE_ELEMENT.get(str(value.dtype or dtype)) is None:
+            shortfalls.append(SPIRVShortfall(
+                "<entry>", "*",
+                f"%t{value.id} has dtype {value.dtype or dtype!r}, which has "
+                "no storage-buffer element spelling",
+            ))
+    if shortfalls:
+        return refused()
+
+    from .machine_dialect_ssa import (
+        format_machine_dialect_occurrences,
+        module_machine_dialect_occurrences,
+    )
+    machine_residuals = module_machine_dialect_occurrences({
+        function.name: function,
+    })
+    if machine_residuals:
+        raise SPIRVEmissionError(
+            "SPIR-V emission requires legalized repository SSA; retained "
+            "machine-state SSA remains: "
+            + format_machine_dialect_occurrences(machine_residuals)
+        )
+    precision = _precision_shortfalls(
+        module if module is not None else function, (function.name,)
+    )
+    builder = _ModuleBuilder(linkage=False)
+    library = _emit_function(
+        function, builder, dtype=dtype, outputs=outputs,
+        carried_shortfalls=precision.get(function.name, ()),
+    )
+    if library.shortfalls:
+        shortfalls.extend(library.shortfalls)
+        return refused()
+
+    uint = builder.uint_type()
+    boolean = builder.scalar_type("bool")
+    void = builder.void_type()
+    zero = builder.uint_constant(0)
+    lines: list[str] = []
+    decorations: list[str] = []
+
+    def declare(line: str) -> None:
+        builder.type_lines.append(line)
+
+    v3uint = "%v3uint"
+    declare(f"{v3uint} = OpTypeVector {uint} 3")
+    gid_pointer = builder.pointer_type("Input", v3uint)
+    declare(f"%gid = OpVariable {gid_pointer} Input")
+    decorations.append("OpDecorate %gid BuiltIn GlobalInvocationId")
+
+    block_types: dict[str, tuple[str, str]] = {}
+
+    def block_for(element_type: str, stride: int) -> tuple[str, str]:
+        """The Block struct over a runtime array of ``element_type``."""
+
+        if element_type not in block_types:
+            runtime = builder.fresh("rtarr")
+            block = builder.fresh("blk")
+            declare(f"{runtime} = OpTypeRuntimeArray {element_type}")
+            declare(f"{block} = OpTypeStruct {runtime}")
+            decorations.append(f"OpDecorate {runtime} ArrayStride {stride}")
+            decorations.append(f"OpDecorate {block} Block")
+            decorations.append(f"OpMemberDecorate {block} 0 Offset 0")
+            block_types[element_type] = (
+                block, builder.pointer_type("StorageBuffer", element_type),
+            )
+        return block_types[element_type]
+
+    bindings: list[SPIRVStorageBinding] = []
+    variables: list[tuple[str, str, str]] = []  # (variable, element type, pointer)
+    roles = [("feed", value) for value in function.args] + [("output", outputs[0])]
+    for binding, (role, value) in enumerate(roles):
+        value_dtype = str(value.dtype or dtype)
+        spelling, stride = _STORAGE_ELEMENT[value_dtype]
+        element_type = builder.scalar_type(value_dtype)
+        block, element_pointer = block_for(element_type, stride)
+        variable = f"%{role}_{binding}"
+        declare(
+            f"{variable} = OpVariable "
+            f"{builder.pointer_type('StorageBuffer', block)} StorageBuffer"
+        )
+        decorations.append(f"OpDecorate {variable} DescriptorSet 0")
+        decorations.append(f"OpDecorate {variable} Binding {binding}")
+        if role == "feed":
+            decorations.append(f"OpDecorate {variable} NonWritable")
+        variables.append((variable, element_type, element_pointer))
+        bindings.append(SPIRVStorageBinding(
+            binding,
+            f"feed_{value.id}" if role == "feed" else "output_0",
+            role, spelling, stride,
+            "read" if role == "feed" else "read_write",
+            int(value.id),
+        ))
+
+    control_binding = len(roles)
+    control_block = builder.fresh("ctl")
+    declare(f"{control_block} = OpTypeStruct {uint}")
+    decorations.append(f"OpDecorate {control_block} Block")
+    decorations.append(f"OpMemberDecorate {control_block} 0 Offset 0")
+    declare(
+        f"%control = OpVariable "
+        f"{builder.pointer_type('StorageBuffer', control_block)} StorageBuffer"
+    )
+    decorations.append("OpDecorate %control DescriptorSet 0")
+    decorations.append(f"OpDecorate %control Binding {control_binding}")
+    decorations.append("OpDecorate %control NonWritable")
+    bindings.append(SPIRVStorageBinding(
+        control_binding, "control", "control", "u32", 4, "read",
+    ))
+    uint_pointer = builder.pointer_type("StorageBuffer", uint)
+    main_type = builder.function_type(void, ())
+    result_type = builder.scalar_type(str(outputs[0].dtype or dtype))
+
+    body = [
+        f"%main = OpFunction {void} None {main_type}",
+        "%main_entry = OpLabel",
+        f"%gid_v = OpLoad {v3uint} %gid",
+        f"%index = OpCompositeExtract {uint} %gid_v 0",
+        f"%count_ptr = OpAccessChain {uint_pointer} %control {zero}",
+        f"%count = OpLoad {uint} %count_ptr",
+        f"%inside = OpULessThan {boolean} %index %count",
+        "OpSelectionMerge %main_merge None",
+        "OpBranchConditional %inside %main_body %main_merge",
+        "%main_body = OpLabel",
+    ]
+    loaded: list[str] = []
+    for position, (variable, element_type, element_pointer) in enumerate(variables[:-1]):
+        body.append(
+            f"%feed_ptr_{position} = OpAccessChain {element_pointer} "
+            f"{variable} {zero} %index"
+        )
+        body.append(f"%feed_val_{position} = OpLoad {element_type} %feed_ptr_{position}")
+        loaded.append(f"%feed_val_{position}")
+    output_variable, _output_type, output_pointer = variables[-1]
+    body.extend([
+        f"%result = OpFunctionCall {result_type} %{function.name}"
+        + "".join(f" {item}" for item in loaded),
+        f"%output_ptr = OpAccessChain {output_pointer} {output_variable} {zero} %index",
+        "OpStore %output_ptr %result",
+        "OpBranch %main_merge",
+        "%main_merge = OpLabel",
+        "OpReturn",
+        "OpFunctionEnd",
+    ])
+
+    for capability in sorted(builder.capabilities):
+        lines.append(f"OpCapability {capability}")
+    if builder.needs_glsl_ext:
+        lines.append('%glsl = OpExtInstImport "GLSL.std.450"')
+    lines.append("OpMemoryModel Logical GLSL450")
+    # SPIR-V 1.3 lists only Input/Output variables on the entry point.
+    lines.append('OpEntryPoint GLCompute %main "main" %gid')
+    lines.append(f"OpExecutionMode %main LocalSize {local[0]} {local[1]} {local[2]}")
+    lines.extend(decorations)
+    lines.extend(builder.decorations)
+    lines.extend(builder.type_lines)
+    lines.append("")
+    lines.extend(body)
+    lines.append("")
+    lines.extend(library.body)
+    from .compiled_program_api import CompiledProgramAPI, EntryPoint
+    from .shader_component_abi import component_abi_from_layout
+    from .shader_stages import COMPUTE, BufferBinding, ShaderIOLayout
+
+    def port(item: SPIRVStorageBinding) -> BufferBinding:
+        return BufferBinding(item.name, item.role, item.dtype, item.binding, item.value_id)
+
+    layout = ShaderIOLayout(
+        COMPUTE.name,
+        feeds=tuple(port(item) for item in bindings if item.role == "feed"),
+        outputs=tuple(port(item) for item in bindings if item.role == "output"),
+    )
+    component_abi = component_abi_from_layout(
+        name, "spirv", layout,
+        decorations={
+            "execution_model": "GLCompute",
+            "workgroup_size": local,
+            "sentinel_policy": "validate-before-dispatch/publish-after-dispatch",
+        },
+    )
+    api = CompiledProgramAPI(
+        module=name,
+        language="spirv",
+        entry="main",
+        entry_points=(EntryPoint("main", "main", "numerical"),),
+        metadata={
+            "stage": COMPUTE.name,
+            "io_layout": layout.to_mapping(),
+            "component_abi": component_abi.to_mapping(),
+        },
+    )
+    return SPIRVDeployableShader(
+        name, "\n".join(lines) + "\n", function.name, local, tuple(bindings),
+        capabilities=tuple(sorted(builder.capabilities)),
+        component_abi=component_abi, api=api,
+    )
+
+
 def spirv_assembler() -> str | None:
     """Return an available ``spirv-as`` binary, or ``None``.
 
@@ -1086,11 +1407,16 @@ def compile_module(module: SPIRVModule, *, directory: str | Path | None = None) 
 
 __all__ = [
     "DEFAULT_DTYPE",
+    "DEPLOYABLE_SHADER",
+    "LINKABLE_SPIRV_LIBRARY",
+    "SPIRVDeployableShader",
     "SPIRVEmissionError",
+    "SPIRVStorageBinding",
     "SPIRVFunction",
     "SPIRVModule",
     "SPIRVShortfall",
     "compile_module",
+    "emit_deployable_compute_shader",
     "emit_function",
     "emit_module",
     "spirv_assembler",
