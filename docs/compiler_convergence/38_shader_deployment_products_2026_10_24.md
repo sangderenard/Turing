@@ -130,8 +130,9 @@ words past the element count are untouched with an extra group dispatched.
   a reference evaluation of the lowered module instead (section "Precision
   lane reads today's lowering").
 - A lowered pack core loads one double per element with a 0.0 low limb and
-  stores only the leading limb; whether that is the intended pack semantics
-  is a lowering question, not a shader one.
+  stores only the leading limb. Albert decided this is a bug for limbed
+  `Precision[k]` inputs: they must load and store every limb. It is the
+  next follow-up.
 - Deployable SPIR-V for a matmul, an axis reduction, or any function that
   mixes a reduction with other work over runtime-sized spans. Elementwise
   functions deploy in element mode, and a lone whole-span reduction deploys
