@@ -44,7 +44,8 @@ def test_ios_host_has_real_metal_shell_and_unsigned_ipa_boundary():
     assert "MTKViewDelegate" in host
     assert "newLibraryWithSource" in host
     assert "mobile_main.o" in packager
-    assert "Sideloadly or AltStore" in packager
+    assert '"--sdk", "iphoneos", "clang++"' in packager
+    assert "Signing and device installation are separate" in packager
 
 
 def test_pwa_launches_public_compiler_entry_and_not_private_region():

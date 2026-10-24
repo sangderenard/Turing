@@ -68,10 +68,12 @@ py -3.11 examples/mobile_reference_app/ios/package_ios.py --sdk-root C:\path\to\
 ```
 
 This attempts the SDK link and assembles
-`build/mobile-reference/TuringMobile-unsigned.ipa`. Sideloadly or AltStore can
-then perform Apple-account signing and installation. They do not replace the
-SDK link. This Windows host has no iPhoneOS SDK, so the final link and physical
-iPhone launch are intentionally not claimed as verified.
+`build/mobile-reference/TuringMobile-unsigned.ipa`. On macOS, omit
+`--sdk-root`; the packager uses `xcrun` to select Xcode's iPhoneOS SDK and
+Apple linker. Signing and physical-device installation remain separate. The
+`ios-mobile-reference.yml` workflow performs this unsigned Xcode-SDK link on a
+GitHub-hosted macOS runner and publishes the IPA plus compiler receipts as a
+downloadable Actions artifact.
 
 MoltenVK 1.4.2 is hash-pinned and staged under
 `build/mobile-dependencies/MoltenVK-ios-1.4.2` for a Vulkan-over-Metal shell.
