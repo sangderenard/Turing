@@ -5669,6 +5669,34 @@ def _normalize_lexical_values(
             element_identity = (
                 element.id if isinstance(element, ast.Name) else None
             )
+            # Lane D, D2.  Program: ``def first(xs: tuple[int, int]): return
+            # xs[0]`` (corpus c184).  A tuple annotation spells one class per
+            # position, so its slice is a Tuple, not a Name, and nothing was
+            # recorded: the callee's rows took the float64 domain default.
+            # Rule: a tuple annotation whose positions all name one class
+            # (``tuple[int, int]``, or ``tuple[int, ...]``) declares that
+            # element class; positions of different classes declare none.
+            if (
+                aggregate_kind == "tuple"
+                and isinstance(element, ast.Tuple)
+                and element.elts
+            ):
+                positions = [
+                    item for item in element.elts
+                    if not (
+                        isinstance(item, ast.Constant)
+                        and item.value is Ellipsis
+                    )
+                ]
+                names = {
+                    item.id if isinstance(item, ast.Name) else None
+                    for item in positions
+                }
+                if len(names) == 1 and None not in names and (
+                    len(positions) == len(element.elts)
+                    or (len(positions) == 1 and len(element.elts) == 2)
+                ):
+                    element_identity = next(iter(names))
             if element_identity in primitive_class_identities:
                 parameter_sequence_element_classes[argument.arg] = (
                     primitive_class_identities[element_identity]
