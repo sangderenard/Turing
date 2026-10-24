@@ -206,6 +206,215 @@ if _INVENTED:
     )
 
 
+# -- lifted machine code ---------------------------------------------------
+#
+# A function that declares ``machine_state_model`` was lifted from machine
+# code (machine_code_lifting).  Its integer values are fixed-width bit
+# patterns read from each value's ``intN`` dtype, which is how the C and
+# Fortran backends already render these spellings on integers: ``And`` is a
+# bitwise AND modulo 2**N, ``Trunc`` keeps the low bits of the result width,
+# ``Shr`` is the logical shift the lifter emits for SHR (``AShr`` is SAR).
+# The Python frontend's meanings above (logical ``And``, float ``Trunc``) do
+# not apply to such a function, and its machine names are the IR registry's
+# own handlers, audited below.
+#
+# Its ``memory`` value is the machine semantics' own ``PagedByteMemory``
+# (``map_elf_image`` builds one from a loaded image).  A ``Load``/``Store``
+# that names a ``machine_state`` reads or writes ``width`` bits little-endian
+# at its pointer; each ``Store`` yields a new memory value, as the SSA
+# threads it.  An unmapped address is refused by name.
+#
+# A lifted ``Call`` carries the caller's complete register state
+# (``state_layout``).  It runs the module function whose
+# ``machine_entry_address`` is the target: the return address is pushed,
+# the callee's formals are bound by name from that state, and its ``Ret``
+# yields RAX and the memory.  Every other caller-saved register the
+# convention lets the callee change is clobbered: using one raises.
+_MACHINE_INTEGER_OPERATIONS = frozenset({
+    "Const", "Cast", "Trunc", "ZExt", "SExt",
+    "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "AShr",
+    "Eq", "Ne", "ULt", "ULe", "LNot", "LAnd", "LOr", "Select",
+    "SMulLow", "SMulHigh", "SMulOverflow", "UMulLow", "UMulHigh",
+})
+_MACHINE_MEMORY_OPERATIONS = frozenset({"Load", "Store"})
+_MACHINE_CALL_OPERATIONS = frozenset({"Call"})
+_MACHINE_MEMORY_STATES = frozenset({"memory", "stack-push", "stack-pop"})
+
+
+def _audit_machine_vocabulary() -> None:
+    from ..transmogrifier.ssa_registry import Handler
+
+    unknown = (
+        _MACHINE_INTEGER_OPERATIONS | _MACHINE_MEMORY_OPERATIONS
+        | _MACHINE_CALL_OPERATIONS
+    ) - {item.value for item in Handler}
+    if unknown:
+        raise ImportError(
+            "ssa_reference_evaluator gives machine semantics to names the IR "
+            f"registry does not define: {sorted(unknown)}"
+        )
+
+
+_audit_machine_vocabulary()
+
+
+def _machine_width(dtype: Any) -> int | None:
+    text = str(dtype)
+    if text == "bool":
+        return None
+    if text.startswith("int") and text[3:].isdigit():
+        return int(text[3:])
+    raise SSAEvaluationError(f"no machine integer width for dtype {text!r}")
+
+
+def _machine_typed(value: Any, dtype: Any) -> int | bool:
+    width = _machine_width(dtype)
+    if width is None:
+        return bool(value)
+    return int(value) & ((1 << width) - 1)
+
+
+def _machine_signed(value: int, width: int) -> int:
+    value &= (1 << width) - 1
+    return value - (1 << width) if value >> (width - 1) & 1 else value
+
+
+def _machine_integer_value(
+    function: Any, instruction: Any, values: Mapping[int, Any],
+) -> int | bool:
+    op = str(instruction.op)
+    attributes = instruction.attributes or {}
+    result = instruction.res
+    args = [values[int(item.id)] for item in instruction.args]
+    arg_dtypes = [str(item.dtype) for item in instruction.args]
+    width = _machine_width(result.dtype)
+    if op == "Const":
+        return _machine_typed(attributes["value"], result.dtype)
+    if op in {"Cast", "Trunc"}:
+        return _machine_typed(args[0], result.dtype)
+    if op in {"ZExt", "SExt"}:
+        source = int(attributes.get("from_width") or _machine_width(arg_dtypes[0]))
+        value = int(args[0]) & ((1 << source) - 1)
+        if op == "SExt":
+            value = _machine_signed(value, source)
+        return _machine_typed(value, result.dtype)
+    if op in {"And", "Or", "Xor"} and width is None:
+        left, right = bool(args[0]), bool(args[1])
+        return {"And": left and right, "Or": left or right, "Xor": left != right}[op]
+    if op in {"Add", "Sub", "Mul", "And", "Or", "Xor"}:
+        left, right = int(args[0]), int(args[1])
+        raw = {
+            "Add": left + right, "Sub": left - right, "Mul": left * right,
+            "And": left & right, "Or": left | right, "Xor": left ^ right,
+        }[op]
+        return raw & ((1 << width) - 1)
+    if op in {"Shl", "Shr", "AShr"}:
+        value, count = int(args[0]), int(args[1])
+        mask = (1 << width) - 1
+        if op == "Shl":
+            return (value << count) & mask
+        if op == "Shr":
+            return ((value & mask) >> count) & mask
+        return (_machine_signed(value, width) >> count) & mask
+    if op in {"Eq", "Ne"} and all(item == "bool" for item in arg_dtypes):
+        return (bool(args[0]) == bool(args[1])) is (op == "Eq")
+    if op in {"Eq", "Ne", "ULt", "ULe"}:
+        widths = [_machine_width(item) for item in arg_dtypes]
+        if None in widths:
+            raise SSAEvaluationError(
+                f"{function.name}: {op} compares a bool with an integer"
+            )
+        mask = (1 << max(widths)) - 1
+        left, right = int(args[0]) & mask, int(args[1]) & mask
+        return {"Eq": left == right, "Ne": left != right,
+                "ULt": left < right, "ULe": left <= right}[op]
+    if op == "LNot":
+        return not bool(args[0])
+    if op in {"LAnd", "LOr"}:
+        left, right = bool(args[0]), bool(args[1])
+        return (left and right) if op == "LAnd" else (left or right)
+    if op == "Select":
+        return _machine_typed(args[1] if bool(args[0]) else args[2], result.dtype)
+    # The fixed-width multiply halves: their ``width`` attribute is the
+    # operand width, independent of the result dtype.
+    bits = int(attributes["width"])
+    if op.startswith("S"):
+        product = _machine_signed(int(args[0]), bits) * _machine_signed(int(args[1]), bits)
+    else:
+        product = (int(args[0]) & ((1 << bits) - 1)) * (int(args[1]) & ((1 << bits) - 1))
+    low = product & ((1 << bits) - 1)
+    if op.endswith("Low"):
+        return _machine_typed(low, result.dtype)
+    if op.endswith("High"):
+        return _machine_typed(product >> bits, result.dtype)
+    return product != _machine_signed(low, bits)
+
+
+def _machine_memory_value(
+    function: Any, instruction: Any, values: Mapping[int, Any],
+) -> Any:
+    from .amd64_machine_semantics import PagedByteMemory
+
+    op = str(instruction.op)
+    attributes = instruction.attributes or {}
+    memory = values[int(instruction.args[0].id)]
+    if not isinstance(memory, PagedByteMemory):
+        raise SSAEvaluationError(
+            f"{function.name}: {op} at {attributes.get('machine_address')!r} "
+            f"needs a PagedByteMemory machine memory, got {type(memory).__name__}"
+        )
+    width = int(attributes["width"])
+    pointer = int(values[int(instruction.args[1].id)]) & ((1 << 64) - 1)
+    try:
+        if op == "Load":
+            return _machine_typed(
+                memory.read_unsigned(pointer, width), instruction.res.dtype,
+            )
+        stored = int(values[int(instruction.args[2].id)])
+        for offset in range(width // 8):
+            memory[pointer + offset]  # a store maps no new memory
+        return memory.write_unsigned(pointer, width, stored)
+    except KeyError as error:
+        raise SSAEvaluationError(
+            f"{function.name}: {op} of {width} bits at {pointer:#x} "
+            f"(machine address {attributes.get('machine_address')!r}) "
+            "touches unmapped memory"
+        ) from error
+
+
+class _MachineClobbered:
+    """A caller-saved register after a call: no record gives its value."""
+
+    __slots__ = ("register", "address")
+
+    def __init__(self, register: str, address: Any) -> None:
+        self.register = register
+        self.address = address
+
+    def _refuse(self, *_args: Any) -> Any:
+        raise SSAEvaluationError(
+            f"{self.register} is undefined across the call at machine "
+            f"address {self.address!r}; the calling convention gives it no "
+            "value"
+        )
+
+    __int__ = __index__ = __bool__ = _refuse
+
+
+@dataclass(frozen=True, slots=True)
+class _MachineCallState:
+    rax: int
+    memory: Any
+    address: Any
+
+
+# Incoming flags a callee may rely on by convention: DF is clear.
+_MACHINE_CALL_ENTRY_FLAGS = {"__machine_df": False}
+_MACHINE_FLAG_FORMALS = frozenset(
+    f"__machine_{flag}" for flag in ("cf", "pf", "af", "zf", "sf", "of")
+)
+
+
 def _declared_formal_names(function: Any) -> dict[str, int]:
     """Formal name -> position, from whichever record the function carries.
 
@@ -451,6 +660,15 @@ class SSAReferenceEvaluator:
                 operation = str(instruction.op)
 
                 if operation in {"Br", "br"}:
+                    if "target" not in instruction.attributes:
+                        # A lifted direct jump into another function hands
+                        # it the live machine state, which no Br carries.
+                        raise SSAEvaluationError(
+                            f"{function.name}: Br has no target block "
+                            f"(machine transfer to "
+                            f"{instruction.attributes.get('target_address')!r} "
+                            "needs machine address linking)"
+                        )
                     next_block = str(instruction.attributes.get("target"))
                     break
                 if operation in {"CondBr", "condbr"}:
@@ -518,6 +736,103 @@ class SSAReferenceEvaluator:
             operation.casefold(), operation,
         )
 
+    def _machine_function_at(self, address: int) -> Any:
+        entries = getattr(self, "_machine_entries", None)
+        if entries is None:
+            entries = self._machine_entries = {
+                int(item.metadata["machine_entry_address"]): item
+                for item in self.functions.values()
+                if (getattr(item, "metadata", None) or {}).get(
+                    "machine_entry_address",
+                ) is not None
+            }
+        return entries.get(int(address) & ((1 << 64) - 1))
+
+    def _machine_call(
+        self, function: Any, instruction: Any, values: dict[int, Any],
+    ) -> _MachineCallState:
+        attributes = instruction.attributes or {}
+        address = attributes.get("machine_address")
+        layout = attributes.get("state_layout")
+        if not layout:
+            raise SSAEvaluationError(
+                f"{function.name}: call at machine address {address!r} "
+                "carries no register state"
+            )
+        state = {
+            name: values[int(argument.id)]
+            for name, argument in zip(layout, instruction.args)
+        }
+        target = int(state["target"]) & ((1 << 64) - 1)
+        callee = self._machine_function_at(target)
+        if callee is None:
+            raise SSAEvaluationError(
+                f"{function.name}: call at machine address {address!r} to "
+                f"{target:#x}, which no lifted function in the module enters "
+                "(needs machine address linking)"
+            )
+        if callee.metadata.get("calling_convention") != attributes.get(
+            "calling_convention",
+        ):
+            raise SSAEvaluationError(
+                f"{function.name}: call at {address!r} uses "
+                f"{attributes.get('calling_convention')!r} but {callee.name} "
+                f"was lifted for {callee.metadata.get('calling_convention')!r}"
+            )
+        stack = (int(state["register.rsp"]) - 8) & ((1 << 64) - 1)
+        try:
+            for offset in range(8):
+                state["memory"][stack + offset]  # a push maps no new memory
+        except KeyError as error:
+            raise SSAEvaluationError(
+                f"{function.name}: call at {address!r} pushes its return "
+                f"address to unmapped memory at {stack:#x}"
+            ) from error
+        memory = state["memory"].write_unsigned(
+            stack, 64, int(attributes["return_address"]),
+        )
+        names = tuple(callee.metadata["argument_names"])
+        registers = tuple(callee.metadata["argument_registers"])
+        frame: dict[int, Any] = {}
+        for index, (name, formal) in enumerate(zip(names, callee.args)):
+            if name == "__machine_memory":
+                bound = memory
+            elif name == "__machine_rsp":
+                bound = stack
+            elif name in _MACHINE_CALL_ENTRY_FLAGS:
+                bound = _MACHINE_CALL_ENTRY_FLAGS[name]
+            elif name in _MACHINE_FLAG_FORMALS:
+                # A lifted body names every flag it may merge; the caller's
+                # flags do not cross a call, so one that is used is refused.
+                bound = _MachineClobbered(
+                    f"flag {name[len('__machine_'):].upper()} on entry to "
+                    f"{callee.name}", address,
+                )
+            elif name == "__machine_mxcsr":
+                bound = state["system.amd64.mxcsr"]
+            elif name.startswith("__machine_"):
+                register = name[len("__machine_"):]
+                key = (
+                    f"vector-register.{register}"
+                    if register.startswith(("xmm", "ymm"))
+                    else f"register.{register}"
+                )
+                if key not in state:
+                    raise SSAEvaluationError(
+                        f"{callee.name} reads {name} on entry, which the "
+                        f"call at {address!r} does not carry"
+                    )
+                bound = state[key]
+            else:
+                bound = state[f"register.{registers[index]}"]
+            frame[int(formal.id)] = bound
+        returned = self._execute(callee, frame)
+        if len(returned) != 2:
+            raise SSAEvaluationError(
+                f"{callee.name} returns no machine memory to its caller"
+            )
+        return _MachineCallState(returned[0], returned[1], address)
+
     def _step(
         self,
         function: Function,
@@ -527,6 +842,49 @@ class SSAReferenceEvaluator:
     ) -> None:
         operation = self._operation_name(instruction)
         result = instruction.res
+
+        if (getattr(function, "metadata", None) or {}).get(
+            "machine_state_model",
+        ) is not None:
+            if operation in _MACHINE_INTEGER_OPERATIONS:
+                values[int(result.id)] = _machine_integer_value(
+                    function, instruction, values,
+                )
+                return
+            if operation in _MACHINE_CALL_OPERATIONS:
+                values[int(result.id)] = self._machine_call(
+                    function, instruction, values,
+                )
+                return
+            projection = (instruction.attributes or {}).get(
+                "machine_call_projection",
+            )
+            if operation == "Load" and projection is not None:
+                state = values[int(instruction.args[0].id)]
+                if projection == "RAX":
+                    values[int(result.id)] = state.rax
+                elif projection == "MEMORY":
+                    values[int(result.id)] = state.memory
+                else:
+                    values[int(result.id)] = _MachineClobbered(
+                        str(projection), state.address,
+                    )
+                return
+            if (
+                operation in _MACHINE_MEMORY_OPERATIONS
+                and (instruction.attributes or {}).get("machine_state")
+                in _MACHINE_MEMORY_STATES
+            ):
+                values[int(result.id)] = _machine_memory_value(
+                    function, instruction, values,
+                )
+                return
+            if operation not in {"Phi", "phi"}:
+                raise SSAEvaluationError(
+                    f"{function.name}: no machine semantics for "
+                    f"{operation!r} in lifted code. Add it deliberately "
+                    "rather than letting the evaluator guess."
+                )
 
         if operation in {"Const", "const"}:
             attributes = instruction.attributes

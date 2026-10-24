@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..transmogrifier.dtype_layout import fortran_kind_table
+from .runtime_abi import HOST_CALLBACK_SCHEMA
 from ..transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -3086,6 +3087,106 @@ class _FunctionEmitter:
             f"    call {symbol}({', '.join((*operands, _name(instr.res)))})"
         ]
 
+    def _host_callback_instructions(self) -> list[Instr]:
+        return [
+            instr
+            for block in self.function.blocks.values()
+            for instr in block.instrs
+            if instr.op == "HostCallback"
+        ]
+
+    def _host_callback_interfaces(self) -> list[str]:
+        """One bind(C) abstract interface and procedure pointer per call.
+
+        ``turing-host-callback-v1``: the host supplies ``R (*)(void *context,
+        A0, ...)`` and the context.  Both cross the entry as pointer-sized
+        integers; the interface states the exact C signature the call uses.
+        """
+
+        lines = []
+        for instr in self._host_callback_instructions():
+            signature = dict(instr.attributes.get("host_callback_signature") or {})
+            arguments = tuple(signature.get("arguments") or ())
+            if len(instr.args) != len(arguments) + 2:
+                raise FortranEmissionError(
+                    "host callback call does not match its signature: "
+                    f"value={instr.res.id} signature={signature!r}"
+                )
+            kinds = []
+            for position, dtype in enumerate(arguments):
+                kind = _DTYPE_KIND.get(str(dtype))
+                actual = str(self._typed(instr.args[position + 2]).dtype)
+                if kind is None or _DTYPE_KIND.get(actual) != kind:
+                    raise FortranEmissionError(
+                        "host callback argument has no exact native type: "
+                        f"value={instr.res.id} position={position} "
+                        f"declared={dtype!r} actual={actual!r}"
+                    )
+                kinds.append(kind)
+            result = signature.get("result")
+            interface = f"turing_host_callback_{int(instr.res.id)}"
+            dummies = ", ".join(
+                ("context", *(f"a{index}" for index in range(len(kinds))))
+            )
+            header = (
+                f"subroutine {interface}({dummies}) bind(C)"
+                if result is None else
+                f"function {interface}({dummies}) bind(C)"
+            )
+            body = [
+                "        import :: c_bool, c_double, c_int64_t, c_intptr_t",
+                "        integer(c_intptr_t), value :: context",
+                *(
+                    f"        {kind}, value :: a{index}"
+                    for index, kind in enumerate(kinds)
+                ),
+            ]
+            if result is not None:
+                kind = _DTYPE_KIND.get(str(result))
+                if kind is None or kind != _DTYPE_KIND.get(
+                    str(self._typed(instr.res).dtype)
+                ):
+                    raise FortranEmissionError(
+                        "host callback result has no exact native type: "
+                        f"value={instr.res.id} declared={result!r}"
+                    )
+                body.append(f"        {kind} :: {interface}")
+            lines.extend((
+                "    abstract interface",
+                f"      {header}",
+                *body,
+                "      end " + (
+                    "subroutine" if result is None else "function"
+                ) + f" {interface}",
+                "    end interface",
+                f"    procedure({interface}), pointer :: {interface}_pointer",
+            ))
+        return lines
+
+    def _host_callback_call(self, instr: Instr) -> list[str] | None:
+        if instr.op != "HostCallback":
+            return None
+        interface = f"turing_host_callback_{int(instr.res.id)}"
+        function, context, *arguments = instr.args
+        lines = [
+            "    call c_f_procpointer(transfer(int("
+            f"{self._operand(function)}, c_intptr_t), c_null_funptr), "
+            f"{interface}_pointer)",
+        ]
+        operands = ", ".join((
+            f"int({self._operand(context)}, c_intptr_t)",
+            *(self._operand(argument) for argument in arguments),
+        ))
+        signature = dict(instr.attributes.get("host_callback_signature") or {})
+        if signature.get("result") is None:
+            lines.append(f"    call {interface}_pointer({operands})")
+        else:
+            self._locals[int(instr.res.id)] = self._typed(instr.res)
+            lines.append(
+                f"    {_name(instr.res)} = {interface}_pointer({operands})"
+            )
+        return lines
+
     def _external_reference_interfaces(self) -> list[str]:
         from .shell_external_references import external_reference_thunk_symbol
 
@@ -4035,6 +4136,17 @@ class _FunctionEmitter:
 
     def _expression(self, instr: Instr) -> str | None:
         op = instr.op
+        if op == "HostCallbackPresent" and len(instr.args) == 1:
+            # ``self.trace is not None``: the host passes a null function
+            # pointer for an absent callable (turing-host-callback-v1).
+            present = (
+                "c_associated(transfer(int("
+                f"{self._operand(instr.args[0])}, c_intptr_t), "
+                "c_null_funptr))"
+            )
+            if instr.attributes.get("host_callback_present_when", True):
+                return f"logical({present}, kind=c_bool)"
+            return f"logical(.not. {present}, kind=c_bool)"
         if op in ("Call", "call"):
             # precompile_to_ssa.lower_fused_program_to_ssa wraps almost
             # every tensor op in Handler.Call (it names the C/LLVM kernel
@@ -4632,6 +4744,11 @@ class _FunctionEmitter:
                 body.extend(cast)
                 continue
 
+            host_callback = self._host_callback_call(instr)
+            if host_callback is not None:
+                body.extend(host_callback)
+                continue
+
             call = self._ssa_call(instr)
             if call is not None:
                 body.extend(call)
@@ -4989,6 +5106,7 @@ class _FunctionEmitter:
             for extent in extent_names
         ]
         declarations.extend(self._external_reference_interfaces())
+        declarations.extend(self._host_callback_interfaces())
         # A referenced table must also be declared. Rendering the body sets
         # this flag, and the body is rendered before this point.
         if self.uses_sin_table:
@@ -7387,6 +7505,31 @@ def emit_module(
                     "turing.external-reference-c-thunk.v1"
                 ),
                 "external_reference_thunks": external_reference_thunks,
+                **({
+                    "host_callback_schema": HOST_CALLBACK_SCHEMA,
+                    "host_callbacks": {
+                        str(function_name): [
+                            dict(entry)
+                            for entry in function.metadata["host_callbacks"]
+                        ]
+                        for function_name, function in functions.items()
+                        if function.metadata.get("host_callbacks")
+                    },
+                    "host_callback_bindings": {
+                        str(function_name): [
+                            dict(entry)
+                            for entry in function.metadata[
+                                "host_callback_bindings"
+                            ]
+                        ]
+                        for function_name, function in functions.items()
+                        if function.metadata.get("host_callback_bindings")
+                    },
+                } if any(
+                    function.metadata.get("host_callbacks")
+                    or function.metadata.get("host_callback_bindings")
+                    for function in functions.values()
+                ) else {}),
                 **({
                     "host_linear_region_inlining": list(
                         host_linear_region_inlining

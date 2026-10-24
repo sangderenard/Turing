@@ -6586,6 +6586,8 @@ def emit_ssa_function_to_llvm(
     artifact_build_target = build_target_from_metadata(module.metadata)
     from .ssa_object_operations import validate_object_operations
     validate_object_operations(module, function_name)
+    from .runtime_abi import refuse_host_callbacks
+    refuse_host_callbacks(module, function_name, "LLVM")
     function = module.functions[function_name]
     if function.metadata.get("native_interface"):
         from .identity_concordance import CorrelationTable
