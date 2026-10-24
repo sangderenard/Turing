@@ -19,6 +19,15 @@ types, so every parameter needs a JSDoc ``@param {number}`` or
 ``@param {boolean}`` tag (or an explicit ``parameter_kinds`` entry).  A
 parameter without one is a named shortfall.  A JavaScript Number is an IEEE
 double, so number values are ``float64`` everywhere, literals included.
+
+The module carries its identity book (``module.metadata["identity_book"]``),
+the one the interpreter posted its ingestion cells and name bindings to.
+Every SSA value is its graph node (the value id IS the node id) and has an
+``ssa_value`` row DERIVED from that node's ingestion cell; every block has
+an ``ssa_block`` row.  So the backends post their emission rows onto the
+same book instead of recording ``no_book_at_emission`` gaps.  Inside an open
+compile the lowering posts to that compile's book; otherwise it opens its
+own.
 """
 
 from __future__ import annotations
@@ -137,6 +146,120 @@ def lower_javascript_source_to_ssa(
 ) -> JavaScriptSSALoweringResult:
     """Lower one JavaScript function (by name, or the unique one) to SSA."""
 
+    from .identity_concordance import (
+        _ACTIVE_IDENTITY_BOOK, begin_identity_book, end_identity_book,
+    )
+
+    book = _ACTIVE_IDENTITY_BOOK.get()
+    token = None
+    if book is None or getattr(book, "detached", False):
+        book, token = begin_identity_book()
+    try:
+        lowered = _lower_javascript_function(
+            source, function_name=function_name,
+            parameter_kinds=parameter_kinds, owner=owner, program=program,
+        )
+    finally:
+        if token is not None:
+            end_identity_book(token)
+    lowered.module.metadata["identity_book"] = book
+    return lowered
+
+
+def _block_kind(label: str) -> Any:
+    from .concordance_declarations import SSABlockKind
+
+    if label == "entry":
+        return SSABlockKind.ENTRY
+    return SSABlockKind(
+        "loop_" + label.rsplit("_", 1)[1]
+    )
+
+
+def _post_ssa_identities(
+    graph: Any,
+    function: Function,
+    nodes_of: Mapping[int, int],
+    block_nodes: Mapping[str, int],
+) -> None:
+    """``ssa_value`` and ``ssa_block`` rows for the lowered ``function``.
+
+    A value's row is DERIVED from the ingestion cell of the graph node it
+    is (``nodes_of``: value id -> node id; the ids are equal except for a
+    parameter the interpreter made no node for); a block's from the node
+    that owns it: the region's root for ``entry``, a loop's condition for
+    its header, body and exit.  The signature is on the book too: one
+    ``function_parameter`` row per parameter and one ``function_output``
+    row for the returned value, each DERIVED from that value's row.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        FUNCTION_OUTPUT, FUNCTION_PARAMETER, JAVASCRIPT_SSA_LOWERING,
+        SSA_BLOCK, SSA_VALUE, SSAValueFact, SSAValueOrigin,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import function_scope_of
+
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    values = list(function.args) + [
+        instruction.res
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    ]
+    cells = {}
+    for value in values:
+        node_id = nodes_of[int(value.id)]
+        cells[int(value.id)] = book.post(
+            SSA_VALUE, (scope, int(value.id)),
+            SSAValueFact(
+                value.dtype, tuple(value.shape or ()),
+                SSAValueOrigin.ADOPTED_GRAPH_ID
+                if node_id == int(value.id) else SSAValueOrigin.MINTED,
+            ),
+            stage=JAVASCRIPT_SSA_LOWERING,
+            provenance=Derived((node_identity_cell(graph, node_id),)),
+            mode=Mode.CONCORD,
+        )
+    for name, value_id in function.metadata.get("parameter_names", ()):
+        book.post(
+            FUNCTION_PARAMETER, (scope, str(name)), int(value_id),
+            stage=JAVASCRIPT_SSA_LOWERING,
+            provenance=Derived((cells[int(value_id)],)), mode=Mode.CONCORD,
+        )
+    returned = [
+        instruction.args
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == Handler.Ret.value
+    ]
+    for slot, value in enumerate(returned[0] if returned else ()):
+        book.post(
+            FUNCTION_OUTPUT, (scope, slot), (None, int(value.id)),
+            stage=JAVASCRIPT_SSA_LOWERING,
+            provenance=Derived((cells[int(value.id)],)), mode=Mode.CONCORD,
+        )
+    for label in function.blocks:
+        book.post(
+            SSA_BLOCK, (scope, str(function.name), str(label)),
+            _block_kind(str(label)), stage=JAVASCRIPT_SSA_LOWERING,
+            provenance=Derived((
+                node_identity_cell(graph, block_nodes[str(label)]),
+            )),
+            mode=Mode.CONCORD,
+        )
+
+
+def _lower_javascript_function(
+    source: str,
+    *,
+    function_name: str | None,
+    parameter_kinds: Mapping[str, str] | None,
+    owner: str,
+    program: Mapping[str, Any] | None,
+) -> JavaScriptSSALoweringResult:
     from ..transmogrifier.graph.graph_express2 import ProcessGraph
     from .dream_document import _run_javascript_ast_parser
 
@@ -187,13 +310,22 @@ def lower_javascript_source_to_ssa(
     nodes = graph.G.nodes
     values: dict[int, SSAValue] = {}
     arguments: list[SSAValue] = []
-    next_id = 0
+    # A value's id is its node's id, so the book's node cells name it.
+    nodes_of: dict[int, int] = {}
+    unbound_id = max(nodes, default=-1) + 1
+    root = int(lowering.root)
 
-    def fresh(dtype: str | None) -> SSAValue:
-        nonlocal next_id
-        value = SSAValue(next_id, dtype=dtype)
-        next_id += 1
-        return value
+    def fresh(dtype: str | None, node_id: int | None) -> SSAValue:
+        nonlocal unbound_id
+        if node_id is None:
+            # A parameter the interpreter made no node for stands on the
+            # region's root.
+            value_id, node_id = unbound_id, root
+            unbound_id += 1
+        else:
+            value_id = node_id
+        nodes_of[value_id] = node_id
+        return SSAValue(value_id, dtype=dtype)
 
     def kind_of(node_id: int) -> str:
         return str(
@@ -224,7 +356,9 @@ def lower_javascript_source_to_ssa(
     }
     for parameter_name in parameter_names:
         node_id = parameter_nodes.get(parameter_name)
-        value = fresh(JAVASCRIPT_KIND_DTYPES.get(kinds.get(parameter_name, "")))
+        value = fresh(
+            JAVASCRIPT_KIND_DTYPES.get(kinds.get(parameter_name, "")), node_id,
+        )
         arguments.append(value)
         if node_id is not None:
             values[node_id] = value
@@ -243,7 +377,6 @@ def lower_javascript_source_to_ssa(
         int(phi): loop for loop in loops for phi in loop["phis"].values()
     }
 
-    root = int(lowering.root)
     returned_nodes = _ordered_parents(nodes[root])
     # Every loop is emitted, used or not: a loop that never terminates in
     # JavaScript must not terminate here either.
@@ -269,6 +402,7 @@ def lower_javascript_source_to_ssa(
             pending.append(int(loop["condition"]))
 
     blocks: dict[str, BasicBlock] = {}
+    block_nodes: dict[str, int] = {"entry": root}
     current = BasicBlock("entry", [])
     blocks["entry"] = current
     phi_instructions: dict[int, Instr] = {}
@@ -286,7 +420,7 @@ def lower_javascript_source_to_ssa(
             if init is None:
                 failed = True
                 return
-            value = fresh(dtype_of(node_id))
+            value = fresh(dtype_of(node_id), node_id)
             instruction = Instr(
                 Handler.Phi.value, [init], value,
                 attributes={"binding_name": attributes.get("binding_name")},
@@ -314,7 +448,7 @@ def lower_javascript_source_to_ssa(
                 # Acorn hands integral literals over as Python ints; the
                 # JavaScript value is the double.
                 constant = float(constant)
-            value = fresh(dtype)
+            value = fresh(dtype, node_id)
             current.instrs.append(Instr(
                 Handler.Const.value, [], value,
                 attributes={"value": constant},
@@ -331,7 +465,7 @@ def lower_javascript_source_to_ssa(
                 ))
                 failed = True
                 return
-            value = fresh(dtype)
+            value = fresh(dtype, node_id)
             current.instrs.append(Instr(
                 operation, list(operands), value,
                 attributes=_carried(attributes),
@@ -346,7 +480,7 @@ def lower_javascript_source_to_ssa(
                 ))
                 failed = True
                 return
-            value = fresh(dtype)
+            value = fresh(dtype, node_id)
             current.instrs.append(Instr(
                 handler.value, list(operands), value,
                 attributes=_carried(attributes),
@@ -382,6 +516,8 @@ def lower_javascript_source_to_ssa(
             header = BasicBlock(f"{label}_header", [])
             body = BasicBlock(f"{label}_body", [])
             exit_block = BasicBlock(f"{label}_exit", [])
+            for block in (header, body, exit_block):
+                block_nodes[block.name] = int(loop["condition"])
             preheader = current
             branch(header)
             blocks[header.name] = header
@@ -442,6 +578,7 @@ def lower_javascript_source_to_ssa(
         (parameter_name, value.id)
         for parameter_name, value in zip(parameter_names, arguments)
     )
+    _post_ssa_identities(graph, function_ir, nodes_of, block_nodes)
     return JavaScriptSSALoweringResult(
         IRModule({name: function_ir}),
         name,

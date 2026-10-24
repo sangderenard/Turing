@@ -1688,15 +1688,56 @@ def _linked_frame_sequences(module: Any, function_name: str) -> tuple[Any, ...]:
     entry = functions.get(function_name)
     if entry is None:
         return ()
-    # (function, value id) -> entry value id, through exact call bindings.
-    aliases = {(function_name, int(value.id)): int(value.id) for value in entry.args}
-    pending = [function_name]
-    visited = set()
-    while pending:
-        name = pending.pop()
-        if name in visited or name not in functions:
+    # Program: ``f(n) * 1000 + f(n + 1)`` where ``f`` appends to its own
+    # list (A6 probe c983).  Wrong record: the bindings were one map keyed
+    # by (callee, formal), first call wins, so the second call's hoisted
+    # capacity cell was never published and its append reported full
+    # (validation 75).  Rule: each call is its own binding context; a
+    # callee's sequence is respelled once per call path that reaches it.
+    # (function, {value id -> entry value id}) per call path.
+    contexts = [(function_name, {int(value.id): int(value.id) for value in entry.args})]
+    seen = set()
+    linked = []
+    position = 0
+    while position < len(contexts):
+        name, aliases = contexts[position]
+        position += 1
+        key = (name, tuple(sorted(aliases.items())))
+        if key in seen or name not in functions:
             continue
-        visited.add(name)
+        seen.add(key)
+        if name != function_name:
+            table = tables.get(name)
+            for sequence in (table.sequences.values() if table is not None else ()):
+                capacity = aliases.get(int(sequence.capacity_value_id))
+                columns = tuple(
+                    aliases.get(int(value_id))
+                    for value_id in sequence.column_value_ids
+                )
+                if capacity is None or None in columns:
+                    continue
+                owner = sequence.heap_owner_value_id
+                # Length and status cells travel the same exact bindings; the
+                # Fortran runtime binding names all of them (lane E, c217).
+                length = aliases.get(int(sequence.length_address_id))
+                status = (
+                    None if sequence.status_address_id is None
+                    else aliases.get(int(sequence.status_address_id))
+                )
+                linked.append(_replace(
+                    sequence,
+                    column_value_ids=columns,
+                    capacity_value_id=capacity,
+                    length_address_id=(
+                        sequence.length_address_id if length is None else length
+                    ),
+                    status_address_id=(
+                        sequence.status_address_id if status is None else status
+                    ),
+                    heap_owner_value_id=(
+                        None if owner is None else aliases.get(int(owner))
+                    ),
+                ))
         for block in functions[name].blocks.values():
             for instruction in block.instrs:
                 attributes = getattr(instruction, "attributes", None) or {}
@@ -1708,46 +1749,13 @@ def _linked_frame_sequences(module: Any, function_name: str) -> tuple[Any, ...]:
                     or len(inputs) != len(instruction.args)
                 ):
                     continue
+                callee_aliases = {}
                 for argument, formal in zip(instruction.args, inputs):
-                    entry_id = aliases.get((name, int(argument.id)))
+                    entry_id = aliases.get(int(argument.id))
                     if entry_id is not None:
-                        aliases.setdefault((str(callee), int(formal)), entry_id)
-                pending.append(str(callee))
-    linked = []
-    for name in sorted(visited - {function_name}):
-        table = tables.get(name)
-        if table is None:
-            continue
-        for sequence in table.sequences.values():
-            capacity = aliases.get((name, int(sequence.capacity_value_id)))
-            columns = tuple(
-                aliases.get((name, int(value_id)))
-                for value_id in sequence.column_value_ids
-            )
-            if capacity is None or None in columns:
-                continue
-            owner = sequence.heap_owner_value_id
-            # Length and status cells travel the same exact bindings; the
-            # Fortran runtime binding names all of them (lane E, c217).
-            length = aliases.get((name, int(sequence.length_address_id)))
-            status = (
-                None if sequence.status_address_id is None
-                else aliases.get((name, int(sequence.status_address_id)))
-            )
-            linked.append(_replace(
-                sequence,
-                column_value_ids=columns,
-                capacity_value_id=capacity,
-                length_address_id=(
-                    sequence.length_address_id if length is None else length
-                ),
-                status_address_id=(
-                    sequence.status_address_id if status is None else status
-                ),
-                heap_owner_value_id=(
-                    None if owner is None else aliases.get((name, int(owner)))
-                ),
-            ))
+                        callee_aliases.setdefault(int(formal), entry_id)
+                if callee_aliases:
+                    contexts.append((str(callee), callee_aliases))
     return tuple(linked)
 
 

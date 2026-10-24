@@ -437,6 +437,146 @@ def glsl_compute_deployment(component: Any) -> ShaderDeployment:
     )
 
 
+def precision_compute_deployment(artifact: Any) -> ShaderDeployment:
+    """The SSBO launch contract of a precision-core compute shader.
+
+    ``ssa_glsl_compute_backend`` binds the array formals at bindings
+    ``0..n-1`` (``Buffer<slot> { double data[]; }``, ``readonly`` unless
+    stored into) and the scalars block at binding ``n``: ``uint
+    element_count`` at byte 0 and padding at byte 4, then ``double
+    scalars[]`` at byte 8, or ``scalars[]`` at byte 0 when the count is
+    baked. Invocation ``gl_GlobalInvocationID.x`` is element ``i``; nothing
+    reads y or z. The array extents are the host's (``prepare_execution``
+    sizes each buffer from its feed), so each is runtime-sized.
+    """
+
+    abi = artifact.component_abi
+    version, profile = glsl_version_directive(artifact.source)
+    extensions = tuple(re.findall(
+        r"^[ \t]*#[ \t]*extension[ \t]+(\w+)", artifact.source, re.M,
+    ))
+    by_value = {int(port.value_id): port for port in abi.ports}
+    written = {int(value_id) for value_id in artifact.written_buffers}
+    resources = [
+        PhysicalResource(
+            name=f"Buffer{slot}", kind="storage-buffer",
+            access="read_write" if int(value_id) in written else "read",
+            layout="std430", dtype="f64", element_bytes=8,
+            set=0, binding=slot,
+            realizes=(PortView(
+                by_value[int(value_id)].slot, 0, None, 1, None,
+                extents_from="fed", value_id=int(value_id),
+            ),),
+            extensions=extensions, capabilities=("Float64",),
+        )
+        for slot, value_id in enumerate(artifact.buffer_order)
+    ]
+    baked = artifact.baked_count
+    header = 0 if baked is not None else 8
+    coefficients = artifact.coefficient_order
+    scalar_binding = len(artifact.buffer_order)
+    members = (
+        () if baked is not None else (
+            {"name": "element_count", "glsl_type": "uint", "dtype": "u32",
+             "array": None, "byte_offset": 0},
+            {"name": "_pad0", "glsl_type": "uint", "dtype": "u32",
+             "array": None, "byte_offset": 4},
+        )
+    ) + ({"name": "scalars", "glsl_type": "double", "dtype": "f64",
+          "array": [None], "byte_offset": header},)
+    resources.append(PhysicalResource(
+        name="ScalarFeed", kind="storage-buffer", access="read",
+        layout="std430", dtype="f64", element_bytes=8,
+        set=0, binding=scalar_binding,
+        byte_extent=header + 8 * max(1, len(coefficients)),
+        realizes=tuple(
+            PortView(
+                by_value[int(value_id)].slot, header + 8 * index, 8, 0, (),
+                value_id=int(value_id),
+            )
+            for index, value_id in enumerate(coefficients)
+        ),
+        extensions=extensions, capabilities=("Float64",),
+        members=members,
+    ))
+    local = (int(artifact.local_size), 1, 1)
+    if baked is None:
+        controls = (LaunchControl(
+            "element_count", "storage-buffer", "u32",
+            ({"rule": "element_count", "value_id": int(artifact.scalar_order[0])},),
+            binding=scalar_binding, byte_offset=0,
+        ),)
+        group_count = {
+            "rule": "cover",
+            "work": "element_count",
+            "invocations_per_group": local[0],
+            "minimum_groups": "ceil(element_count / invocations_per_group)",
+            "linearization": "gl_GlobalInvocationID.x only; y and z groups must be 1",
+            "guard": "element_count",
+            "groups": None,
+        }
+        element_count = {
+            "source": "control", "control": "element_count",
+            "kind": "element_count", "rank": 1, "shape": None, "value": None,
+        }
+    else:
+        controls = ()
+        group_count = {
+            "rule": "exact",
+            "groups": [max(1, -(-int(baked) // local[0])), 1, 1],
+        }
+        element_count = {
+            "source": "baked", "kind": "element_count",
+            "rank": 1, "shape": [int(baked)], "value": int(baked),
+        }
+    launch = LaunchContract(
+        local_size=local, group_count=group_count,
+        element_count=element_count,
+        extents={"type": "uint32_t", "order": [{
+            "slot": None, "buffer": "ScalarFeed", "kind": "element_count", "axis": None,
+        }] if baked is None else []},
+        controls=controls,
+    )
+    return ShaderDeployment(
+        component_id=abi.component_id,
+        product_kind=SHADER_SOURCE,
+        language=abi.language,
+        version=version, profile=profile,
+        stage=abi.stage, entrypoint=abi.entrypoint,
+        target={
+            "client": "opengl", "environment": "opengl4.3", "spirv_version": None,
+            # Every resource is a storage block in set 0, so the source also
+            # compiles as GLSL for Vulkan (with shaderFloat64).
+            "clients": [
+                {"client": "opengl", "environment": "opengl4.3", "spirv_version": None},
+                {"client": "vulkan", "environment": "vulkan1.1", "spirv_version": "1.3"},
+            ],
+        },
+        resources=tuple(resources),
+        launch=launch,
+        provenance={
+            "emitter": "ssa_glsl_compute_backend.emit_ssa_module_to_glsl_compute",
+            "precision_sections": bool(artifact.precision_sections),
+        },
+        shortfalls=(
+            *(
+                Shortfall("emission", f"{item.operation}: {item.reason}")
+                for item in artifact.shortfalls
+            ),
+            *(
+                (Shortfall(
+                    "fma-rounding",
+                    "GLSL lets an fma() consumed by a precise variable round "
+                    "like a*b+c; it fixes only that every such fma() rounds "
+                    "the same way. The kernel's single-rounding obligation "
+                    "holds only on a driver whose double fma() rounds once.",
+                ),)
+                if re.search(r"\bfma\(", artifact.source) else ()
+            ),
+        ),
+    )
+
+
 def _broadcast(shapes: Iterable[Sequence[int]]) -> tuple[int, ...]:
     result: tuple[int, ...] = ()
     for shape in shapes:
@@ -1153,6 +1293,7 @@ __all__ = [
     "NODUS_REQUEST_SCHEMA", "PhysicalResource", "PortView", "PublishedShaderProduct",
     "SCHEMA", "SHADER_SOURCE", "SPIRV_PRODUCT_SCHEMA", "ShaderDeployment", "Shortfall",
     "control_ref", "extracted_shader_deployment", "glsl_compute_deployment",
+    "precision_compute_deployment",
     "glsl_version_directive", "publish_extracted_shader", "publish_shader_source",
     "publish_spirv_product", "spirv_deployment", "webgl_fragment_deployment",
     "wgsl_deployment",

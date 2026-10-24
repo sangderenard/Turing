@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.turingcompiler.mobile">
+  <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="37" />
+  <uses-feature android:name="android.hardware.vulkan.level" android:required="true" android:version="1" />
+  <uses-feature android:name="android.hardware.vulkan.version" android:required="true" android:version="0x00400000" />
+  <application
+      android:allowBackup="false"
+      android:extractNativeLibs="true"
+      android:hasCode="false"
+      android:label="Turing Mobile">
+    <activity
+        android:name="android.app.NativeActivity"
+        android:configChanges="orientation|screenSize|keyboardHidden"
+        android:exported="true"
+        android:screenOrientation="fullSensor">
+      <meta-data android:name="android.app.lib_name" android:value="turing_mobile" />
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>

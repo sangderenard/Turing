@@ -16624,6 +16624,13 @@ class _ControlSSABuilder(TiledObject):
                 self.sequence_descriptors[
                     int(destination.sequence_id)
                 ] = destination
+            # The source's layout may arrive with this concord too: a
+            # private ``[]`` copied into a function's result at its return
+            # site (A6 probe c996) is never written itself.
+            stated = self._heap_sequence_contract(source)
+            if stated is not source:
+                source = stated
+                self.sequence_descriptors[int(source.sequence_id)] = source
             destination_tags = self.sequence_native_type_tag_columns(
                 int(destination.sequence_id)
             )
@@ -17532,6 +17539,17 @@ class _ControlSSABuilder(TiledObject):
                         stage=CONTROL_SSA_CONDITIONAL,
                     ),
                     "initial_spelled_value_id": int(initial_value_id),
+                    # Each arm's SSA identity as lowered here.  A later
+                    # settlement that replaces an arm with a resident value
+                    # (a folded field read becoming the constructor argument)
+                    # leaves a different id at that position; the
+                    # continuation pass preserves such an arm when another
+                    # name binding in this scope owns the resident.
+                    "arm_lowered_value_ids": (
+                        int(true_value.id), int(false_value.id),
+                    ),
+                    "arm_lowered_binding_scope": self.lexical_read_scope,
+                    "arm_lowered_merge_id": int(merged_value_id),
                     "preserved_name_binding_value_ids": tuple(sorted(preserved_binding_sources)),
                     # The same receipt by Phi operand position: an arm's SSA
                     # value need not carry its graph id (a loop induction is
@@ -20298,6 +20316,67 @@ class _ControlSSABuilder(TiledObject):
                 return int(row[1]), fact
         return None
 
+    def _copy_divergent_sequence_returns(
+        self,
+        slot: int,
+        edges: list,
+        incoming_values: list[SSAValue],
+        incoming_blocks: list[str],
+        output_name: str | None,
+    ) -> list[SSAValue]:
+        """Copy each return edge's list into the one result list.
+
+        Program: ``if n > 2: return [n]`` / ``return []`` then ``t =
+        pick(n); len(t)`` (lanes plan A6).  Wrong record: the two return
+        sites build two lists (two arenas) and the exit joined them with a
+        bare pointer Phi, while the caller reads the result arena it passed
+        for the output (the last return's list), so ``[n]`` was lost.  The
+        planner refused it by name.  Rule: the output's list is the one
+        result storage.  An edge returning a different list replaces the
+        result's rows with its own (``replace``: clear and extend) before it
+        branches to the exit, and the merge is the result itself.  The
+        planner admits this only for lists born in the callee, which die at
+        the return, so the copy is unobservable.
+        """
+
+        history = tuple(map(int, (
+            self.named_output_histories.get(str(output_name)) or ()
+        ))) if output_name is not None else ()
+        if not history:
+            return incoming_values
+        identities = {int(value.id) for value in incoming_values}
+        if len(identities) < 2 or int(history[-1]) not in identities:
+            return incoming_values
+        destination = next(
+            value for value in incoming_values
+            if int(value.id) == int(history[-1])
+        )
+        if any(
+            self.sequence_descriptors.get(int(value.id)) is None
+            for value in incoming_values
+        ):
+            return incoming_values
+        copied = list(incoming_values)
+        for position, (block, values) in enumerate(edges):
+            value = incoming_values[position]
+            if int(value.id) == int(destination.id):
+                continue
+            self.current = block
+            terminator = block.instrs.pop()
+            self.lower_sequence_mutation(
+                ControlSequenceMutation(
+                    int(destination.id), "replace", (int(value.id),),
+                    int(destination.id), policy="duplicates",
+                    argument_kind="return_edge_sequence",
+                ),
+                path=f"{self.function_name}.return_slot[{slot}]",
+            )
+            self.current.instrs.append(terminator)
+            edges[position] = (self.current, values)
+            incoming_blocks[position] = self.current.name
+            copied[position] = destination
+        return copied
+
     def _return_merge_sequence_destination(
         self, merged: SSAValue, incoming_values: Iterable[SSAValue],
     ) -> SSAValue:
@@ -21156,6 +21235,12 @@ class _ControlSSABuilder(TiledObject):
                         ))
                     incoming_blocks.append(block.name)
                     incoming_values.append(value)
+                if record_kind is None:
+                    incoming_values = self._copy_divergent_sequence_returns(
+                        slot, edges, incoming_values, incoming_blocks,
+                        slot_names.get(slot),
+                    )
+                    self.current = exit_block
                 dtype = next(
                     (str(value.dtype) for value in incoming_values
                      if value.dtype not in {None, "unknown", "none"}),
