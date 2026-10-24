@@ -2643,7 +2643,10 @@ def _planned_scalar_dtypes_from(
                 is_collection(node_id)
                 or attributes.get("sequence_element_class_ref")
                 or attributes.get("mapping_value_class_ref")
-            ) and not op.startswith("indexed"):
+            ) and (
+                not op.startswith("indexed")
+                or attributes.get("producer_kind") == "sequence_slice"
+            ):
                 # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
                 # record: an unrolled comprehension (``sequence_materialization``)
                 # holds its elements as ``arg0``..``argN``, not ``elts``, so its
@@ -2668,6 +2671,47 @@ def _planned_scalar_dtypes_from(
                 if attributes.get("producer_kind") == "sorted_materialization":
                     writers.extend(
                         element.get(source) for source in parents(data, "arg:0")
+                    )
+                # Lane D, D2.  Program: ``ys = xs[-2:]; ys[0] * 10`` (corpus
+                # c386, c291).  A slice is a new list of its base's rows.  It
+                # is an ``Indexed`` node, so the element-read rule took it and
+                # gave the slice itself the scalar class of one row; its own
+                # rows had no class, and every read of them took the float64
+                # domain default.  Rule: a slice is a collection holding its
+                # base's element class, joined with its own later writers.
+                if attributes.get("producer_kind") == "sequence_slice":
+                    writers.extend(
+                        element.get(base) for base in parents(data, "base")
+                    )
+                # Lane D, D2.  Program: ``rep = [1]`` then ``if k > 2: rep =
+                # [k, 1, 2]`` and ``sum(rep) + max(rep)`` (corpus c442).  A
+                # branch join that is itself a collection holds its arms'
+                # rows, with its own later writers (the Phi rule below never
+                # sees it, because this rule takes every collection first).
+                if op == "phi":
+                    writers.extend(
+                        element.get(arm)
+                        for arm in parents(data, "body", "orelse")
+                    )
+                # Lane D, D2.  Program: ``rep = list(xs)`` on a branch, then
+                # ``rep[0] * 10 + rep[-1]`` (corpus c441).  A copy of a
+                # sequence (``list(xs)``, ``tuple(xs)``, ``set(xs)``) holds
+                # its argument's rows; nobody read that, so the copy's rows
+                # took the float64 domain default.  Iterating a dict yields
+                # its keys, not its rows, so a dict argument proves nothing
+                # here.
+                if (
+                    attributes.get("producer_kind") == "aggregate_materialization"
+                    and str(attributes.get("static_python_reference") or "")
+                    in {"list", "tuple", "set", "frozenset"}
+                ):
+                    sources = parents(data, "arg:0")
+                    writers.extend(
+                        None if (
+                            G.nodes[source].get("attributes") or {}
+                        ).get("aggregate_kind") == "dict"
+                        else element.get(source)
+                        for source in sources
                     )
                 # Lane D, D2.  Program: ``def setfirst(xs: list[int], v:
                 # int): xs[0] = v`` (corpus c180).  The parameter's
