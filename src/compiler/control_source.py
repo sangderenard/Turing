@@ -1257,6 +1257,18 @@ def _describe_control_block(
             )
         )
         extra = (str(block.mutation.operator),)
+        # Program: ``s0 = {n, 5}; s0.add(7); xs1 = [6, n, -3];
+        # xs1.append(1)`` (fuzz p105_7, the "lexical_reads ... fork" family).
+        # Wrong record: a display member's birth is owned by the member's
+        # producer (``n``), which is shared by both displays; the set's
+        # ``add`` and the list's ``append`` then posted two facts on one row
+        # and the second was refused as a revision with no new cause, so the
+        # whole program was refused.  Two list displays sharing ``n`` already
+        # posted one equal fact there.  Rule: a display member birth's fact
+        # is "a birth fed by this producer"; the display's own ``clear``
+        # (owned by the display node) says which sequence and kind.
+        if block.mutation.display_member is not None:
+            extra = ("display_member",)
     elif isinstance(block, ScalarFieldWriteBlock):
         owner = (
             block.field_state_cell
