@@ -450,6 +450,71 @@ def _runtime_sized(value: SSAValue) -> bool:
     return _declared_rank(value) > len(tuple(value.shape or ()))
 
 
+def _elementwise_runtime_rank(
+    function: Function, outputs: Sequence[SSAValue],
+) -> tuple[int | None, str | None]:
+    """The rank R when ``function`` is elementwise over runtime-sized spans.
+
+    Every value must be a runtime-sized span of one rank R or a rank-0
+    scalar; every instruction that reads or writes a span must be an
+    elementwise operation whose result is such a span; every output must
+    be one. Then element ``k`` of every result depends only on element
+    ``k`` of the span operands and on the scalars, and one invocation per
+    element computes the function exactly. Returns ``(R, None)``, or
+    ``(None, reason)``.
+    """
+
+    from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+    from .ssa_llvm_backend import scalar_likeness
+
+    if len(function.blocks) != 1:
+        return None, "multi-block control flow"
+    block = next(iter(function.blocks.values()))
+    values = (
+        *function.args, *outputs,
+        *(instr.res for instr in block.instrs if instr.res is not None),
+    )
+    ranks = {_declared_rank(value) for value in values if _runtime_sized(value)}
+    if len(ranks) != 1:
+        return None, (
+            "runtime-sized spans of ranks "
+            f"{sorted(ranks)}; element mode needs one rank"
+        )
+    rank = next(iter(ranks))
+    shaped = next((value for value in values if value.shape), None)
+    if shaped is not None:
+        return None, (
+            f"%t{shaped.id} has static shape {tuple(shaped.shape)} beside "
+            "runtime-sized spans"
+        )
+    scalar_output = next(
+        (value for value in outputs if not _runtime_sized(value)), None,
+    )
+    if scalar_output is not None:
+        return None, (
+            f"output %t{scalar_output.id} is a scalar beside runtime-sized "
+            "outputs; element mode writes one element per invocation"
+        )
+    for instr in block.instrs:
+        if instr.op in ("Ret", "ret", "Return", "return"):
+            continue
+        spans_in = any(_runtime_sized(argument) for argument in instr.args)
+        span_out = instr.res is not None and _runtime_sized(instr.res)
+        if not (spans_in or span_out):
+            continue
+        operation = str(
+            instr.attributes.get("tensor_operation") or instr.op
+        )
+        operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+            operation.casefold(), operation,
+        )
+        if not span_out or scalar_likeness(operation) is None:
+            return None, (
+                f"{instr.op} over a runtime-sized span is not elementwise"
+            )
+    return rank, None
+
+
 class _FunctionEmitter:
     """Translate one straight-line SSA ``Function`` into SPIR-V.
 
@@ -466,8 +531,13 @@ class _FunctionEmitter:
         dtype: str = DEFAULT_DTYPE,
         outputs: Sequence[SSAValue] = (),
         carried_shortfalls: Sequence[SPIRVShortfall] = (),
+        runtime_elements: bool = False,
     ):
         self.function = function
+        # The deployable entry's element mode: runtime-sized spans of an
+        # elementwise function arrive one element per invocation, so the
+        # body computes on scalars (``_elementwise_runtime_rank``).
+        self.runtime_elements = bool(runtime_elements)
         self.builder = builder
         self.dtype = dtype
         self.outputs = tuple(outputs)
@@ -514,7 +584,7 @@ class _FunctionEmitter:
             )
             if _runtime_sized(value)
         ), None)
-        if runtime_sized is not None:
+        if runtime_sized is not None and not self.runtime_elements:
             return self._bail(
                 "<function>", block.name,
                 f"%t{runtime_sized.id} is a runtime-sized span (rank "
@@ -1158,6 +1228,11 @@ class SPIRVStorageBinding:
     #: scalar): the buffer holds ``element_count`` instances back to back,
     #: each ``prod(instance_shape)`` elements, row-major.
     instance_shape: tuple[int, ...] = ()
+    #: Element mode: the rank of a runtime-sized span read or written one
+    #: element per invocation (0 otherwise).
+    runtime_rank: int = 0
+    #: Element mode: a rank-0 feed every invocation reads at element 0.
+    broadcast: bool = False
 
 
 @dataclass
@@ -1219,9 +1294,15 @@ def emit_deployable_compute_shader(
     buffer. A scalar value occupies one element per instance; a value of
     static shape ``S`` occupies ``prod(S)`` consecutive elements, row-major,
     so instance ``i`` starts at element ``i * prod(S)``. Several outputs are
-    several output buffers, in order. What the contract cannot carry (a
-    runtime-sized span, a boolean element, no result) is a shortfall, never
-    a guessed layout.
+    several output buffers, in order.
+
+    An elementwise function over runtime-sized spans of one rank (rank
+    stated, no static shape) runs in ELEMENT mode instead: invocation ``i``
+    computes element ``i`` of every span, rank-0 feeds broadcast (each
+    invocation reads their element 0), and ``element_count`` is the product
+    of the host's extents. What neither mode can carry (mixed span ranks, a
+    non-elementwise operation over a span, a boolean element, no result) is
+    a shortfall, never a guessed layout.
     """
 
     name = str(name or function.name)
@@ -1243,14 +1324,22 @@ def emit_deployable_compute_shader(
             f"invocation; {function.name} names none",
         ))
         return refused()
-    for value in (*function.args, *outputs):
-        if _runtime_sized(value):
+    # Element mode: an elementwise function over runtime-sized spans of one
+    # rank runs one ELEMENT per invocation instead of one instance; its
+    # rank-0 feeds broadcast (every invocation reads element 0).
+    element_rank = None
+    if any(_runtime_sized(value) for value in (*function.args, *outputs)):
+        element_rank, reason = _elementwise_runtime_rank(function, outputs)
+        if element_rank is None:
             shortfalls.append(SPIRVShortfall(
                 "<entry>", "*",
-                f"%t{value.id} is a runtime-sized span (rank "
-                f"{_declared_rank(value)}, no static shape); one instance "
-                "per invocation needs its static extents",
+                f"{function.name} reads or writes runtime-sized spans but "
+                f"cannot run one element per invocation: {reason}",
             ))
+            return refused()
+    for value in (*function.args, *outputs):
+        if element_rank is not None:
+            pass
         elif not all(
             isinstance(size, int) and size > 0
             for size in tuple(value.shape or ())
@@ -1289,6 +1378,7 @@ def emit_deployable_compute_shader(
     emitter = _FunctionEmitter(
         function, builder, dtype=dtype, outputs=outputs,
         carried_shortfalls=precision.get(function.name, ()),
+        runtime_elements=element_rank is not None,
     )
     library = emitter.emit()
     if library.shortfalls:
@@ -1359,6 +1449,11 @@ def emit_deployable_compute_shader(
             "read" if role == "feed" else "read_write",
             int(value.id),
             instance_shape=shape,
+            runtime_rank=(
+                _declared_rank(value)
+                if element_rank is not None and _runtime_sized(value) else 0
+            ),
+            broadcast=element_rank is not None and not _runtime_sized(value),
         ))
         if role == "output":
             output_position += 1
@@ -1426,9 +1521,10 @@ def emit_deployable_compute_shader(
     loaded: list[str] = []
     for position, (variable, element_type, element_pointer, value) in enumerate(feeds):
         if not value.shape:
+            broadcast = element_rank is not None and not _runtime_sized(value)
             body.append(
                 f"%feed_ptr_{position} = OpAccessChain {element_pointer} "
-                f"{variable} {zero} %index"
+                f"{variable} {zero} {zero if broadcast else '%index'}"
             )
             body.append(f"%feed_val_{position} = OpLoad {element_type} %feed_ptr_{position}")
             loaded.append(f"%feed_val_{position}")

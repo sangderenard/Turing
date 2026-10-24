@@ -79,3 +79,34 @@ def test_source_and_intrinsic_gemm_are_comparable_standalone_deployments(tmp_pat
         manifest = json.loads(files.manifest_path.read_text(encoding="utf-8"))
         assert manifest["recommended_dispatch"]["groups"]
         assert not manifest["standalone"]["python_runtime_dependency"]
+
+
+def test_standalone_shell_feeds_launch_controls_as_storage_blocks(tmp_path):
+    """The shell binds what the shader declares: no loose uniforms, the
+    slot table at binding 1 and the count/extent table at binding 2. It is
+    Windows C, so it is compiled for that target here when a cross compiler
+    is available; running it needs Windows."""
+
+    import importlib.util
+    import subprocess
+    import sys
+
+    import pytest
+
+    source, intrinsic = build_gemm_deployment_pair(32, 48, 16, limits=LIMITS)
+    for deployment in (source, intrinsic):
+        assert "uniform" not in deployment.shader_source
+        assert "glUniform" not in deployment.shell_source
+        assert "glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1u," in deployment.shell_source
+        assert "glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2u," in deployment.shell_source
+    if importlib.util.find_spec("ziglang") is None:
+        pytest.skip("no cross compiler (ziglang) for the Windows shell")
+    for deployment in (source, intrinsic):
+        files = deployment.write(tmp_path / deployment.variant)
+        compiled = subprocess.run(
+            [sys.executable, "-m", "ziglang", "cc", "-target", "x86_64-windows-gnu",
+             "-Wall", "-Werror", "-c", str(files.shell_path),
+             "-o", str(tmp_path / f"{deployment.variant}.o")],
+            capture_output=True, text=True,
+        )
+        assert compiled.returncode == 0, compiled.stderr

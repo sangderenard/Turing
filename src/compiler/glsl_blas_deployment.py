@@ -179,6 +179,7 @@ def _dispatch_shell(
 #define GL_LINK_STATUS 0x8B82u
 #define GL_SHADER_STORAGE_BUFFER 0x90D2u
 #define GL_DYNAMIC_DRAW 0x88E8u
+#define GL_STATIC_DRAW 0x88E4u
 #define GL_SHADER_STORAGE_BARRIER_BIT 0x2000u
 #define GL_BUFFER_UPDATE_BARRIER_BIT 0x0200u
 #define GL_VERSION 0x1F02u
@@ -221,9 +222,6 @@ typedef void (APIENTRY *PFN_glGenBuffers)(GLsizei, GLuint *);
 typedef void (APIENTRY *PFN_glBindBuffer)(GLenum, GLuint);
 typedef void (APIENTRY *PFN_glBufferData)(GLenum, GLsizeiptr, const void *, GLenum);
 typedef void (APIENTRY *PFN_glBindBufferBase)(GLenum, GLuint, GLuint);
-typedef GLint (APIENTRY *PFN_glGetUniformLocation)(GLuint, const GLchar *);
-typedef void (APIENTRY *PFN_glUniform1ui)(GLint, GLuint);
-typedef void (APIENTRY *PFN_glUniform1uiv)(GLint, GLsizei, const GLuint *);
 typedef void (APIENTRY *PFN_glDispatchCompute)(GLuint, GLuint, GLuint);
 typedef void (APIENTRY *PFN_glMemoryBarrier)(GLenum);
 typedef void (APIENTRY *PFN_glFinish)(void);
@@ -275,7 +273,7 @@ int main(int argc, char **argv) {
     void *window = NULL, *context = NULL;
     char *shader_source = NULL;
     float *arena = NULL;
-    GLuint shader = 0u, program = 0u, arena_buffer = 0u;
+    GLuint shader = 0u, program = 0u, arena_buffer = 0u, control_buffers[2] = {0u, 0u};
     int result = 1;
 
     PFN_SDL_InitSubSystem sdl_init = NULL;
@@ -306,9 +304,6 @@ int main(int argc, char **argv) {
     PFN_glBindBuffer glBindBuffer = NULL;
     PFN_glBufferData glBufferData = NULL;
     PFN_glBindBufferBase glBindBufferBase = NULL;
-    PFN_glGetUniformLocation glGetUniformLocation = NULL;
-    PFN_glUniform1ui glUniform1ui = NULL;
-    PFN_glUniform1uiv glUniform1uiv = NULL;
     PFN_glDispatchCompute glDispatchCompute = NULL;
     PFN_glMemoryBarrier glMemoryBarrier = NULL;
     PFN_glFinish glFinish = NULL;
@@ -361,9 +356,6 @@ int main(int argc, char **argv) {
     LOAD_GL(glBindBuffer, PFN_glBindBuffer, "glBindBuffer");
     LOAD_GL(glBufferData, PFN_glBufferData, "glBufferData");
     LOAD_GL(glBindBufferBase, PFN_glBindBufferBase, "glBindBufferBase");
-    LOAD_GL(glGetUniformLocation, PFN_glGetUniformLocation, "glGetUniformLocation");
-    LOAD_GL(glUniform1ui, PFN_glUniform1ui, "glUniform1ui");
-    LOAD_GL(glUniform1uiv, PFN_glUniform1uiv, "glUniform1uiv");
     LOAD_GL(glDispatchCompute, PFN_glDispatchCompute, "glDispatchCompute");
     LOAD_GL(glMemoryBarrier, PFN_glMemoryBarrier, "glMemoryBarrier");
     LOAD_GL(glFinish, PFN_glFinish, "glFinish");
@@ -406,11 +398,17 @@ int main(int argc, char **argv) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0u, arena_buffer);
     glUseProgram(program);
     {
-        const GLuint extents[1] = {@EXTENT@u};
+        /* Launch controls are storage blocks: u_slot[] at binding 1,
+           u_count then u_extent[] at binding 2. */
         const GLuint slots[3] = {@SLOT_A@u, @SLOT_B@u, @SLOT_C@u};
-        glUniform1ui(glGetUniformLocation(program, "u_count"), @COUNT@u);
-        glUniform1uiv(glGetUniformLocation(program, "u_extent"), 1, extents);
-        glUniform1uiv(glGetUniformLocation(program, "u_slot"), 3, slots);
+        const GLuint extents[2] = {@COUNT@u, @EXTENT@u};
+        glGenBuffers(2, control_buffers);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, control_buffers[0]);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)sizeof(slots), slots, GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1u, control_buffers[0]);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, control_buffers[1]);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)sizeof(extents), extents, GL_STATIC_DRAW);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2u, control_buffers[1]);
     }
     glFinish();
     for (uint32_t iteration = 0; iteration < @WARMUPS@u; ++iteration) {
@@ -453,6 +451,7 @@ int main(int argc, char **argv) {
 cleanup:
     if (glUseProgram) glUseProgram(0u);
     if (arena_buffer && glDeleteBuffers) glDeleteBuffers(1, &arena_buffer);
+    if (control_buffers[0] && glDeleteBuffers) glDeleteBuffers(2, control_buffers);
     if (program && glDeleteProgram) glDeleteProgram(program);
     if (shader && glDeleteShader) glDeleteShader(shader);
     free(arena); free(shader_source);

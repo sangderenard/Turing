@@ -1961,12 +1961,38 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
     ``get`` with a typed default, assume the default's type and accept the
     assumption only if, under it, the dict's writers join to exactly that
     type (a consistent typing of the cycle). Otherwise nothing is assumed.
+
+    Program: ``d = {1: 10}; d[1] += n`` (corpus c374, plan C6).  Wrong
+    record: the same cycle without ``get``: the store's value reads ``d[1]``,
+    whose class is the element type the store joins into, so the row read
+    entered the ``+ n`` region at the float64 default and the int table
+    refused the float store.  Rule: a dict display whose members all have a
+    proven class is a second source of the assumption (their join), accepted
+    by the same writers check.
     """
 
     proven = _planned_scalar_dtypes_from(graph)
     G = graph.G
     hypotheses: dict[int, str] = {}
     for node_id, data in G.nodes(data=True):
+        if (
+            isinstance(data.get("expr_obj"), ast.Dict)
+            and int(node_id) not in proven
+        ):
+            members = {
+                proven.get(int(parent))
+                for parent, role in data.get("parents") or ()
+                if str(role).startswith("values")
+            }
+            if members and None not in members:
+                dtype = (
+                    "int64" if members <= {"int64", "bool"} and len(members) > 1
+                    else next(iter(members)) if len(members) == 1 else ""
+                )
+                if dtype in {"int64", "float64", "bool"}:
+                    if hypotheses.setdefault(int(node_id), dtype) != dtype:
+                        hypotheses[int(node_id)] = ""
+            continue
         if str(data.get("op") or data.get("type") or "").casefold() != "get":
             continue
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
@@ -20086,9 +20112,26 @@ def _propagate_callsite_tensor_specializations(
     round_index = 0
     seen_round_states: dict[str, int] = {}
 
+    # Function-table graphs this loop has written planner descriptors to.
+    # Program: ``entry`` calls ``t.red(n > 1)`` and ``red`` is not one of
+    # ``graphs`` (corpus c469 shape).  Wrong record: the round published
+    # ``red``'s ``flag`` descriptor (``changed`` True) but the digest read
+    # only ``graphs``, so the state equalled the seed state: "repeated a
+    # completed state at round 1".  Rule: a graph the loop writes is part of
+    # the state the guard reads.
+    published_callee_graphs: dict[int, Any] = {}
+
     def specialization_state() -> tuple[str, int]:
         facts = []
         tensor_fact_count = 0
+        for item in published_callee_graphs.values():
+            if any(item.G is graph.G for graph in graphs):
+                continue
+            facts.append((
+                str(item.G.graph.get("function_name") or ""),
+                "callee-planner",
+                repr(item.G.graph.get("planner_tensor_descriptors") or {}),
+            ))
         for item in graphs:
             function_name = str(item.G.graph.get("function_name") or "")
             planner = item.G.graph.get("planner_tensor_descriptors") or {}
@@ -20828,6 +20871,7 @@ def _propagate_callsite_tensor_specializations(
             if not additions:
                 continue
             existing.update(copy.deepcopy(additions))
+            published_callee_graphs.setdefault(id(callee.G), callee)
             _apply_callsite_tensor_descriptors(callee, additions)
             # The catalogue graph is shared by every callsite.  A tensor
             # descriptor alone is not a complete structural specialization:
