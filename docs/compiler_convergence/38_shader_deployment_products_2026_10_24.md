@@ -115,9 +115,9 @@ words past the element count are untouched with an extra group dispatched.
 
 ## Open
 
-- The installed control shell (`compose_control_shader`) still declares
-  `uniform uint u_count` (and `u_debug_capacity`, `u_dispatch_iteration`);
-  it is not a published product yet.
+- The installed control shell (`compose_control_shader`) compiles for
+  Vulkan now (section "Vulkan-ready control shell"), but it is not a
+  published product yet.
 - A component ABI for extracted host shaders.
 - The precision-core compute lane (`ssa_glsl_compute_backend`) has no
   component ABI, so it has no product yet.
@@ -176,3 +176,40 @@ Evidence: `test_deployable_spirv_states_instance_shapes_and_every_output`,
 and `test_instanced_deployable_spirv_matches_python_on_vulkan`. On lavapipe,
 over 300 instances, both outputs match numpy and the words past the
 instance count are untouched.
+
+## Vulkan-ready control shell (follow-up, 2026-10-24)
+
+Wrong record: `compose_control_shader` declared `uniform uint u_count`,
+`uniform uint u_debug_capacity` (debug builds) and `uniform int
+u_dispatch_iteration` (C-planned dispatch loops) in the default block.
+`glslangValidator -V --target-env vulkan1.1` refused every emitted shell at
+main cbe2263 ("non-opaque uniforms outside a block").
+
+Rule: the three scalars ride in one std140 uniform block,
+`TuringShellControls { uint u_count; uint u_debug_capacity; int
+u_dispatch_iteration; }`, at binding 8 (`SHELL_CONTROL_BINDING`). Every field
+is always declared, so the layout does not change with debug or loop
+options. It is a uniform block rather than a ninth storage block because the
+shell's storage bindings 0..7 already reach the GL 4.3 minimum of eight
+storage blocks per compute shader; uniform blocks have their own GL binding
+space, and in a Vulkan set binding 8 follows the storage buffers. The GL
+host (`_ShellControlBuffer`, called from `_dispatch_composed_control`)
+uploads `[count, debug capacity or 0, dispatch iteration or 0]` per dispatch,
+re-specifying the store like the arena controls. The refusal "C-planned GLSL
+closure lacks u_dispatch_iteration" used to come from an inactive uniform
+location; it now comes from installing a C-planned artifact whose phase
+source never reads the field.
+
+Evidence (cloud: llvmpipe OpenGL 4.5):
+
+- `test_control_shell_scalars_ride_in_a_vulkan_ready_block` (with and
+  without instrumentation) checks the block and compiles the shell with
+  `-V --target-env vulkan1.1`; `test_c_dispatch_shell_without_the_iteration_read_is_refused`
+  keeps the refusal;
+- the installed-shell tests that read `u_count`, the debug capacity and the
+  dispatch iteration on a GL device pass (one-dispatch loop with debug
+  records and no overflow, stream publications, the C-planned loop's three
+  frames);
+- the 12-file GPU test set fails the same 27 names and errors the same 4 on
+  this branch and on main cbe2263.
+

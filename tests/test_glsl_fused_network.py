@@ -581,6 +581,101 @@ def test_c_dispatch_shell_computes_retained_loop_commands(gl):
         installed.release()
 
 
+@pytest.mark.parametrize("instrumentation", [False, True])
+def test_control_shell_scalars_ride_in_a_vulkan_ready_block(
+    instrumentation, tmp_path
+):
+    import shutil
+    import subprocess
+
+    program = _program(
+        [10],
+        [("add", 20, [10], {"right_scalar": 1.0})],
+        {"frame": 20},
+        [10, 20],
+    )
+    control = ControlProgram(
+        LoopBlock(
+            "iteration_9",
+            "1",
+            "7",
+            "2",
+            StatementBlock(("__scheduled_region_3__",)),
+            dispatch_shell="c",
+        ),
+        region_indices=(3,),
+        collection_bindings=((20, 30, "iteration_9", 1),),
+    )
+    artifact = build_control_shader_artifact(
+        control,
+        {3: CapturedFusedProgram(program, {})},
+        device_resident=True,
+        terminal_outputs={"frames": 30},
+        instrumentation=instrumentation,
+    )
+
+    source = artifact.source
+    assert (
+        "layout(std140, binding = 8) uniform TuringShellControls "
+        "{ uint u_count; uint u_debug_capacity; int u_dispatch_iteration; };"
+    ) in source
+    assert "uniform uint u_count;" not in source
+    assert "uniform uint u_debug_capacity;" not in source
+    assert "uniform int u_dispatch_iteration;" not in source
+    validator = shutil.which("glslangValidator")
+    if validator is None:
+        pytest.skip("glslangValidator is not installed")
+    path = tmp_path / "shell.comp"
+    path.write_text(source, encoding="utf-8")
+    result = subprocess.run(
+        [
+            validator, "-V", "--target-env", "vulkan1.1",
+            "-S", "comp", str(path), "-o", str(tmp_path / "shell.spv"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_c_dispatch_shell_without_the_iteration_read_is_refused():
+    program = _program(
+        [10],
+        [("add", 20, [10], {"right_scalar": 1.0})],
+        {"frame": 20},
+        [10, 20],
+    )
+    control = ControlProgram(
+        LoopBlock(
+            "iteration_9",
+            "1",
+            "7",
+            "2",
+            StatementBlock(("__scheduled_region_3__",)),
+            dispatch_shell="c",
+        ),
+        region_indices=(3,),
+        collection_bindings=((20, 30, "iteration_9", 1),),
+    )
+    artifact = build_control_shader_artifact(
+        control,
+        {3: CapturedFusedProgram(program, {})},
+        device_resident=True,
+        terminal_outputs={"frames": 30},
+    )
+    broken = replace(
+        artifact,
+        source=artifact.source.replace(
+            "int iteration_9 = u_dispatch_iteration;",
+            "int iteration_9 = 0;",
+        ),
+        phase_sources=(),
+    )
+
+    with pytest.raises(RuntimeError, match="lacks u_dispatch_iteration"):
+        InstalledGLSLControlShell(broken)
+
+
 def test_one_shader_dispatch_maps_frame_batch_to_workgroups(gl):
     program = _program(
         [10],

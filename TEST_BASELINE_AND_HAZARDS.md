@@ -1,3 +1,13 @@
+2026-10-24 GLSL CONTROL SHELL (MEASURED, cloud): compose_control_shader's
+u_count, u_debug_capacity and u_dispatch_iteration move from default-block
+uniforms into one std140 uniform block TuringShellControls at binding 8, so
+the control shell compiles with glslangValidator -V --target-env vulkan1.1
+(main cbe2263 refused it). The GL host uploads the block per dispatch; the
+"lacks u_dispatch_iteration" refusal now checks the installed source. GPU
+tests on llvmpipe: same 27 failures / 4 errors as main cbe2263. C corpus
+328/328. Fuzz seed 65 (40): 0 WRONG / 0 TYPE. Gate names identical to main
+cbe2263 in all four parts. See doc 38.
+
 2026-10-24 GLSL ARENA CONTROLS (MEASURED, cloud): composed GLSL shaders read
 u_count/u_extent/u_slot from two read-only std430 storage blocks (set 0,
 bindings 1 and 2) instead of default-block uniforms, so the same source

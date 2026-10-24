@@ -522,6 +522,18 @@ _LAUNCH_CONTROL_BLOCKS = (
     "TuringLaunchExtents { uint u_count; uint u_extent[]; };",
 )
 
+# The control shell's per-dispatch scalars ride in one std140 uniform block.
+# Storage bindings 0..7 already fill the GL 4.3 minimum of eight storage
+# blocks, while uniform blocks have their own GL binding space; in a Vulkan
+# set the block is binding 8, after the shell's storage buffers. Every field
+# is always present, so the layout does not depend on debug or loop options.
+SHELL_CONTROL_BINDING = 8
+_SHELL_CONTROL_BLOCK = (
+    f"layout(std140, binding = {SHELL_CONTROL_BINDING}) uniform "
+    "TuringShellControls { uint u_count; uint u_debug_capacity; "
+    "int u_dispatch_iteration; };"
+)
+
 
 class _GLStorage:
     """Shared physical storage for one or more differently shaped GL views."""
@@ -2778,7 +2790,6 @@ def compose_control_shader(
             (
                 "layout(std430, binding = 1) buffer TuringDebugLog "
                 "{ uint debug_words[]; };",
-                "uniform uint u_debug_capacity;",
             )
             if debug_enabled else ()
         ),
@@ -2811,13 +2822,8 @@ def compose_control_shader(
             "layout(std430, binding = 7) readonly buffer "
             "TuringControlValues { uint u_control[]; };"
         ),
+        _SHELL_CONTROL_BLOCK,
         "",
-        "uniform uint u_count;",
-        *(
-            ("uniform int u_dispatch_iteration;",)
-            if selected_c_dispatch_loop is not None
-            else ()
-        ),
         *(
             (
                 "bool turing_stream_publish(",
@@ -7100,6 +7106,38 @@ def _dispatch_many(
             )
 
 
+class _ShellControlBuffer:
+    """The uniform buffer behind a control shell's ``TuringShellControls``."""
+
+    __slots__ = ("buffer",)
+
+    def __init__(self) -> None:
+        self.buffer = None
+
+    def bind(self, count: int, debug_capacity: int, dispatch_iteration: int) -> None:
+        """Upload and bind ``u_count, u_debug_capacity, u_dispatch_iteration``.
+
+        As with the launch controls, each upload re-specifies the store so a
+        queued dispatch keeps the words it was launched with.
+        """
+
+        from OpenGL import GL
+
+        if self.buffer is None:
+            self.buffer = int(GL.glGenBuffers(1))
+        data = np.zeros(4, dtype=np.uint32)
+        data[0] = int(count)
+        data[1] = int(debug_capacity)
+        data[2:3] = np.asarray([int(dispatch_iteration)], dtype=np.int32).view(np.uint32)
+        GL.glBindBuffer(GL.GL_UNIFORM_BUFFER, self.buffer)
+        GL.glBufferData(GL.GL_UNIFORM_BUFFER, data.nbytes, data, GL.GL_STREAM_DRAW)
+        GL.glBindBuffer(GL.GL_UNIFORM_BUFFER, 0)
+        GL.glBindBufferBase(GL.GL_UNIFORM_BUFFER, SHELL_CONTROL_BINDING, self.buffer)
+
+
+_SHELL_CONTROLS = _ShellControlBuffer()
+
+
 def _dispatch_composed_control(
     program_id: int,
     slots: Sequence[GLChunk],
@@ -7128,11 +7166,6 @@ def _dispatch_composed_control(
         GL.glBindBufferBase(
             GL.GL_SHADER_STORAGE_BUFFER, 1, int(debug_buffer)
         )
-        location = int(
-            GL.glGetUniformLocation(program_id, "u_debug_capacity")
-        )
-        if location != -1:
-            GL.glUniform1ui(location, int(debug_capacity))
     if stream_state_buffer:
         GL.glBindBufferBase(
             GL.GL_SHADER_STORAGE_BUFFER, 2, int(stream_state_buffer)
@@ -7140,20 +7173,11 @@ def _dispatch_composed_control(
         GL.glBindBufferBase(
             GL.GL_SHADER_STORAGE_BUFFER, 3, int(stream_words_buffer)
         )
-    count_location = int(GL.glGetUniformLocation(program_id, "u_count"))
-    if count_location != -1:
-        GL.glUniform1ui(count_location, plan.count)
-    if dispatch_iteration is not None:
-        iteration_location = int(
-            GL.glGetUniformLocation(
-                program_id, "u_dispatch_iteration"
-            )
-        )
-        if iteration_location == -1:
-            raise RuntimeError(
-                "C-planned GLSL closure lacks u_dispatch_iteration"
-            )
-        GL.glUniform1i(iteration_location, int(dispatch_iteration))
+    _SHELL_CONTROLS.bind(
+        plan.count,
+        int(debug_capacity) if debug_buffer else 0,
+        0 if dispatch_iteration is None else int(dispatch_iteration),
+    )
     _bind_arena(program_id, slots, (), ())
     for binding, buffer_id in (
         (4, slot_table_buffer),
@@ -7185,6 +7209,7 @@ def _dispatch_composed_control(
     GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 5, 0)
     GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 6, 0)
     GL.glBindBufferBase(GL.GL_SHADER_STORAGE_BUFFER, 7, 0)
+    GL.glBindBufferBase(GL.GL_UNIFORM_BUFFER, SHELL_CONTROL_BINDING, 0)
     GL.glUseProgram(0)
     error = int(GL.glGetError())
     if error != int(GL.GL_NO_ERROR):
@@ -7249,6 +7274,14 @@ class InstalledGLSLControlShell:
                 + " | ".join(contract_errors)
             )
         sources = artifact.phase_sources or (artifact.source,)
+        if artifact.c_dispatch_loop_bounds is not None and any(
+            source.count("u_dispatch_iteration")
+            <= _SHELL_CONTROL_BLOCK.count("u_dispatch_iteration")
+            for source in sources
+        ):
+            raise RuntimeError(
+                "C-planned GLSL closure lacks u_dispatch_iteration"
+            )
         cache_identities = artifact.phase_cache_identities
         if cache_identities and len(cache_identities) != len(sources):
             raise ValueError(
