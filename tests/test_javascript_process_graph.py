@@ -351,3 +351,25 @@ def test_math_round_remains_a_named_shortfall_not_repository_round_even():
     assert not lowering.complete
     assert any(item.code == "unsupported-call" for item in lowering.shortfalls)
     assert all(data.get("op") != "round" for _, data in graph.G.nodes(data=True))
+
+
+@pytest.mark.parametrize("source", ["1 / 2", "2 ** 64", "!(n + 1)", "x ? 1 : 2"])
+def test_number_literals_are_doubles_not_python_ints(source):
+    # Acorn's JSON gives ``1`` as a Python int, which repository scalar
+    # typing reads as int64.  Every JavaScript Number is a double, so no
+    # numeric Constant may reach lowering as an int.
+    expression = _parse_expression(source)
+    graph = ProcessGraph(materialize_memory=False)
+    lowering = _ingest_expression(graph, expression)
+    assert lowering.complete, lowering.shortfalls
+
+    constants = [
+        data for _, data in graph.G.nodes(data=True)
+        if data.get("type") == "Constant"
+    ]
+    assert constants
+    for data in constants:
+        if isinstance(data["constant"], bool):
+            continue
+        assert type(data["constant"]) is float
+        assert type(data["attributes"]["value"]) is float

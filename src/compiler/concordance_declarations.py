@@ -455,6 +455,11 @@ PARAMETER_ANNOTATION = declare_page("parameter_annotation", (
     RowField("module", K.SCOPE), RowField("function_identity", K.NAME),
     RowField("parameter", K.NAME),
 ), str)
+# Lane D, D2.  A free function's authored return annotation, DERIVED from
+# its ``returns`` span (the method page above covers class members only).
+FUNCTION_RETURN_ANNOTATION = declare_page("function_return_annotation", (
+    RowField("module", K.SCOPE), RowField("function_identity", K.NAME),
+), str)
 METHOD_RETURN_ANNOTATION = declare_page("method_return_annotation", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
     RowField("method", K.NAME),
