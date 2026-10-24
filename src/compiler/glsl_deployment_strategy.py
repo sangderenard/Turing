@@ -2959,7 +2959,27 @@ def _planned_scalar_dtypes_from(
                         [element.get(o) for o in arms]
                     ))
                     continue
-                settle(scalar, node_id, join([scalar.get(o) for o in arms]))
+                # Lane D, D2.  Program: ``s = None if c else i`` then ``t =
+                # None if s is None else -s; acc += t`` under ``t is not
+                # None`` (corpus c367).  An optional scalar's payload -- the
+                # only value a region reads, and only when present (its
+                # presence is a separate value after optional lowering) --
+                # has the class of its non-None arms, as the linked ABI rule
+                # above states for an optional call result.  A ``None`` arm
+                # proved nothing, so every optional and what it fed took the
+                # float64 domain default.
+                def is_none_literal(arm):
+                    arm_data = G.nodes[arm]
+                    arm_expression = arm_data.get("expr_obj")
+                    return operation(arm_data) in {"const", "constant"} and (
+                        isinstance(arm_expression, ast.Constant)
+                        and arm_expression.value is None
+                    )
+
+                payload_arms = [o for o in arms if not is_none_literal(o)]
+                settle(scalar, node_id, join([
+                    scalar.get(o) for o in (payload_arms or arms)
+                ]))
                 continue
             # Lane D, D2.  Program: ``if a > 0 and b < n: ...``, ``x = p or
             # q`` (corpus c07, c155).  Python's ``and``/``or`` returns one of
