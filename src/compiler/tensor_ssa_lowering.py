@@ -3214,10 +3214,22 @@ def lower_tensor_calls_to_repository_ssa(
         kernel = module.functions.get(callee)
         kernel_owner = lowering_at[0]
         kernel_book = identity_book(module)
+        int64_buffer_positions = {
+            "binary_int64": frozenset({0, 1, 2}),
+            "binary_scalar_int64": frozenset({0, 2}),
+            "broadcast_int64": frozenset({0, 1}),
+            "create_arange_int64": frozenset({3}),
+        }.get(callee, frozenset())
         for position, value in enumerate((*arguments, result)):
+            typed_kernel_physical = (
+                "int64" if position in int64_buffer_positions else None
+            )
             if (
                 tuple(value.shape or ())
-                and str(value.dtype or "").casefold() in {"bool", "i1"}
+                and (
+                    typed_kernel_physical is not None
+                    or str(value.dtype or "").casefold() in {"bool", "i1"}
+                )
             ):
                 formal_position = (
                     position if position < len(arguments) else output_argument
@@ -3237,7 +3249,11 @@ def lower_tensor_calls_to_repository_ssa(
                             ),
                         ),
                         book=kernel_book,
-                        physical={"physical_dtype": "float64"},
+                        physical={
+                            "physical_dtype": (
+                                typed_kernel_physical or "float64"
+                            ),
+                        },
                     )
                 value.accounting = _accounting_view(kernel_owner, value, module)
         linked_roots.add(callee)
@@ -5135,19 +5151,33 @@ def lower_tensor_calls_to_repository_ssa(
                         "arange_step", 1.0,
                     )
                     if count_value is not None and int(count_value) > 0:
+                        arange_dtype = str(
+                            _attribute(instruction.attributes, "dtype")
+                            or result.dtype or "float64"
+                        ).casefold()
+                        integer_arange = arange_dtype in {
+                            "int64", "i64", "long",
+                        }
                         start, start_def = constant(
-                            float(start_value), "float64",
+                            int(start_value) if integer_arange else float(start_value),
+                            "int64" if integer_arange else "float64",
                         )
                         step, step_def = constant(
-                            float(step_value), "float64",
+                            int(step_value) if integer_arange else float(step_value),
+                            "int64" if integer_arange else "float64",
                         )
                         count, count_def = constant(
                             int(count_value), "int32",
                         )
                         result.shape = (int(count_value),)
+                        if integer_arange:
+                            result.dtype = "int64"
                         prefix.extend((start_def, step_def, count_def))
                         emitted.append(call(
-                            "create_arange",
+                            (
+                                "create_arange_int64"
+                                if integer_arange else "create_arange"
+                            ),
                             [start, step, count, result],
                             result,
                             instruction,
@@ -5193,6 +5223,89 @@ def lower_tensor_calls_to_repository_ssa(
                         [
                             source, result, source_shape, rank, axis_value,
                             indices, index_count,
+                        ],
+                        result, instruction, output_argument=1,
+                    ))
+                elif operation == "scatter" and len(data_args) >= 3:
+                    indices = data_args[1]
+                    values = data_args[2]
+                    reduction = _attribute(instruction.attributes, "reduce")
+                    # Graphs captured before scatter recorded its reduction
+                    # policy carry no attribute.  The AbstractTensor API's
+                    # declared default is sum, so absence has that one exact
+                    # meaning; an authored non-sum policy must never reach the
+                    # repository scatter-add kernel.
+                    reduction = "sum" if reduction is None else str(reduction)
+                    if reduction != "sum":
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name,
+                            block_name,
+                            operation,
+                            (
+                                f"scatter reduce={reduction!r} has no matching "
+                                "repository SSA kernel; only reduce='sum' is "
+                                "currently implemented"
+                            ),
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    source_shape = tuple(source.shape or ())
+                    index_count = _known_count(indices)
+                    if not source_shape or index_count is None:
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name,
+                            block_name,
+                            operation,
+                            (
+                                "scatter-add needs a declared destination "
+                                "shape and index extent; "
+                                f"source=%{source.id}, indices=%{indices.id}, "
+                                "argument_shapes="
+                                f"{tuple(tuple(arg.shape or ()) for arg in data_args)!r}"
+                            ),
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    raw_dim = _attribute(
+                        instruction.attributes, "axis", "dim"
+                    )
+                    if raw_dim is None:
+                        raw_dim = next((
+                            item for item in metadata
+                            if isinstance(item, (int, float))
+                        ), 0)
+                    axis = int(raw_dim) % len(source_shape)
+                    expected_values_shape = list(source_shape)
+                    expected_values_shape[axis] = int(index_count)
+                    if tuple(values.shape or ()) != tuple(expected_values_shape):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name,
+                            block_name,
+                            operation,
+                            (
+                                "scatter-add values must replace the indexed "
+                                f"axis with the index extent; values=%{values.id} "
+                                f"has {tuple(values.shape or ())!r}, expected "
+                                f"{tuple(expected_values_shape)!r}"
+                            ),
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    result.shape = source_shape
+                    shape_value, shape_def = int_vector(source_shape)
+                    rank, rank_def = constant(len(source_shape), "int32")
+                    axis_value, axis_def = constant(axis, "int32")
+                    index_count_value, index_count_def = constant(
+                        int(index_count), "int32"
+                    )
+                    prefix.extend((
+                        shape_def, rank_def, axis_def, index_count_def,
+                    ))
+                    emitted.append(call(
+                        "scatter_sum_double",
+                        [
+                            source, result, shape_value, rank, axis_value,
+                            indices, index_count_value, values,
                         ],
                         result, instruction, output_argument=1,
                     ))
@@ -5620,6 +5733,12 @@ def lower_tensor_calls_to_repository_ssa(
                             callee = "cast_double_to_double_values"
                         else:
                             callee = "cast_double_to_float_values"
+                    if (
+                        callee == "cast_double_to_double_values"
+                        and str(source.dtype or "").casefold()
+                        in {"int64", "i64", "long"}
+                    ):
+                        callee = "cast_int64_to_double_values"
                     if not tuple(source.shape or ()) and int(
                         (source.accounting or {}).get("program_abi_rank", 0)
                         or 0
@@ -6510,6 +6629,30 @@ def lower_tensor_calls_to_repository_ssa(
                     opcode = c_tensor_opcode(operation)
                     if opcode is not None and source is not None:
                         kind, opcode_value = opcode
+                        int64_binary = (
+                            kind == "binary"
+                            and operation in {"add", "sub", "mul", "mod"}
+                            and str(result.dtype or "").casefold()
+                            in {"int64", "i64", "long"}
+                            and all(
+                                str(operand.dtype or "").casefold()
+                                in {"int", "int32", "i32", "int64", "i64", "long"}
+                                for operand in data_args
+                            )
+                        )
+                        binary_kernel = (
+                            "binary_int64" if int64_binary
+                            else "binary_double"
+                        )
+                        scalar_kernel = (
+                            "binary_scalar_int64" if int64_binary
+                            else "binary_scalar_double"
+                        )
+                        broadcast_kernel = (
+                            "broadcast_int64" if int64_binary
+                            else "broadcast_double"
+                        )
+                        kernel_dtype = "int64" if int64_binary else "float64"
                         count_value = source_count if kind == "unary" else result_count
                         count = need_count(source if kind == "unary" else result, count_value)
                         opcode_ssa, opcode_instruction = constant(opcode_value, "int32")
@@ -6542,12 +6685,16 @@ def lower_tensor_calls_to_repository_ssa(
                                     # existing scalar kernel, exactly as the
                                     # right-literal path below already does.
                                     scalar, scalar_def = constant(
-                                        float(left_constant), "float64"
+                                        (
+                                            int(left_constant) if int64_binary
+                                            else float(left_constant)
+                                        ),
+                                        kernel_dtype,
                                     )
                                     reverse, reverse_def = constant(1, "int32")
                                     prefix.extend((scalar_def, reverse_def))
                                     emitted.append(call(
-                                        "binary_scalar_double",
+                                        scalar_kernel,
                                         [
                                             data_args[1], scalar, result,
                                             count, opcode_ssa, reverse,
@@ -6590,9 +6737,11 @@ def lower_tensor_calls_to_repository_ssa(
                                         (result, scalar),
                                     )
                                     array = data_args[1 - scalar_position]
-                                    if str(scalar.dtype or "").casefold() not in {
-                                        "double", "float64",
-                                    }:
+                                    if (
+                                        not int64_binary
+                                        and str(scalar.dtype or "").casefold()
+                                        not in {"double", "float64"}
+                                    ):
                                         promoted = fresh(shape=(), dtype="float64")
                                         prefix.append(Instr(
                                             "Cast", [scalar], promoted,
@@ -6620,7 +6769,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     )
                                     prefix.append(reverse_def)
                                     emitted.append(call(
-                                        "binary_scalar_double",
+                                        scalar_kernel,
                                         [array, scalar, result, count, opcode_ssa, reverse],
                                         result,
                                         instruction,
@@ -6634,6 +6783,8 @@ def lower_tensor_calls_to_repository_ssa(
                                             continue
                                         broadcast_source = operand
                                         if (
+                                            not int64_binary
+                                            and
                                             not tuple(operand.shape or ())
                                             and str(operand.dtype or "").casefold()
                                             in {
@@ -6725,10 +6876,10 @@ def lower_tensor_calls_to_repository_ssa(
                                             result_extents = ensure_dynamic(prefix, result)
                                             broadcasted = fresh(
                                                 shape=result.shape,
-                                                dtype="float64",
+                                                dtype=kernel_dtype,
                                             )
                                             emitted.append(call(
-                                                "broadcast_double",
+                                                broadcast_kernel,
                                                 [
                                                     broadcast_source,
                                                     broadcasted,
@@ -6750,7 +6901,7 @@ def lower_tensor_calls_to_repository_ssa(
                                             continue
                                         broadcasted = fresh(
                                             shape=result.shape,
-                                            dtype="float64",
+                                            dtype=kernel_dtype,
                                         )
                                         input_shape, input_shape_def = int_vector(
                                             operand.shape
@@ -6771,7 +6922,7 @@ def lower_tensor_calls_to_repository_ssa(
                                             output_rank_def,
                                         ))
                                         emitted.append(call(
-                                            "broadcast_double",
+                                            broadcast_kernel,
                                             [
                                                 broadcast_source,
                                                 broadcasted,
@@ -6789,18 +6940,24 @@ def lower_tensor_calls_to_repository_ssa(
                                         )
                                         conformed_args.append(broadcasted)
                                     emitted.append(call(
-                                        "binary_double", [conformed_args[0], conformed_args[1], result, count, opcode_ssa],
+                                        binary_kernel, [conformed_args[0], conformed_args[1], result, count, opcode_ssa],
                                         result, instruction, output_argument=2,
                                     ))
                             elif kind == "binary" and len(data_args) == 1:
                                 scalar_key = next((key for key in ("right_scalar", "left_scalar") if key in instruction.attributes), None)
                                 scalar_payload = instruction.attributes.get(scalar_key) if scalar_key else (metadata[-1] if metadata else None)
                                 if scalar_payload is not None and not isinstance(scalar_payload, (tuple, list)):
-                                    scalar, scalar_def = constant(float(scalar_payload), "float64")
+                                    scalar, scalar_def = constant(
+                                        (
+                                            int(scalar_payload) if int64_binary
+                                            else float(scalar_payload)
+                                        ),
+                                        kernel_dtype,
+                                    )
                                     reverse, reverse_def = constant(int(scalar_key == "left_scalar"), "int32")
                                     prefix.extend((scalar_def, reverse_def))
                                     emitted.append(call(
-                                        "binary_scalar_double", [source, scalar, result, count, opcode_ssa, reverse],
+                                        scalar_kernel, [source, scalar, result, count, opcode_ssa, reverse],
                                         result, instruction, output_argument=2,
                                     ))
 

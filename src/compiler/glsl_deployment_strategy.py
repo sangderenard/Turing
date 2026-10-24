@@ -8146,6 +8146,30 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
             and isinstance(_constant_value(parent_data), str)
         ):
             continue
+        # Tensor constructors carry their requested dtype as a string-valued
+        # keyword, just as casts do.  It is operation metadata, not a Python
+        # object dependency.  Classifying ``AbstractTensor.full((4, 1),
+        # 1.0, dtype="float64")`` as coordinator metadata removed its fill
+        # kernel from the linked program and left the compiler-owned result
+        # arena at its calloc value.  The exact parent role and the catalogued
+        # tensor operation are the proof; arbitrary string operands remain
+        # non-numerical dependencies.
+        if (
+            str(role) == "kw:dtype"
+            and str(data.get("op") or node_type) in abstract_tensor_funcs
+            and isinstance(_constant_value(parent_data), str)
+        ):
+            continue
+        # Scatter's reduction name is part of the numerical operator contract.
+        # It must stay attached to the executable region so tensor SSA lowering
+        # can select the matching kernel (or refuse it precisely); treating the
+        # string as a Python object dependency erased the whole scatter node.
+        if (
+            str(role) == "kw:reduce"
+            and str(data.get("op") or node_type) == "scatter"
+            and _constant_value(parent_data) in {"sum", "mean", "max", "min"}
+        ):
+            continue
         try:
             flatten_tensor_constant(parent_data.get("constant"))
         except (TypeError, ValueError):

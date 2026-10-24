@@ -57,11 +57,14 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "fill_double": 0,
     "binary_double": 2,
     "binary_scalar_double": 2,
+    "binary_int64": 2,
+    "binary_scalar_int64": 2,
     "unary_double": 1,
     "matmul_double": 2,
     "batched_matmul_indexed_double": 2,
     "where_double": 3,
     "broadcast_double": 1,
+    "broadcast_int64": 1,
     "reduce_dim_double": 1,
     "mean_dim": 1,
     "transpose_double": 1,
@@ -72,6 +75,7 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "slice_copy_double": 1,
     "index_select_double": 1,
     "gather_values_double": 1,
+    "scatter_sum_double": 1,
     "index_assign_double": 0,
     "index_set_double": 1,
     "unfold2d_double": 1,
@@ -82,8 +86,10 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "cast_double_to_int_values": 1,
     "cast_double_to_float_values": 1,
     "cast_double_to_double_values": 1,
+    "cast_int64_to_double_values": 1,
     "cast_double_to_bool_values": 1,
     "create_arange": 3,
+    "create_arange_int64": 3,
 }
 
 # LLVM opaque pointers erase pointee types.  Repository SSA and its Fortran
@@ -99,11 +105,22 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "index_set_double": (2, 4, 5),
     "cumsum_dim_double": (2,),
     "reduce_dim_double": (2,),
+    "scatter_sum_double": (2,),
     "mean_dim": (2,),
     "transpose_double": (2, 3),
     "broadcast_double": (2, 4),
+    "broadcast_int64": (2, 4),
     "stack_double": (2,),
     "cat_double": (1, 3),
+}
+
+C_SSA_I64_POINTER_ARGUMENTS = {
+    "binary_int64": (0, 1, 2),
+    "binary_scalar_int64": (0, 2),
+    "broadcast_int64": (0, 1),
+    "cast_int64_to_double_values": (0,),
+    "create_arange_int64": (3,),
+    "scatter_sum_double": (5,),
 }
 
 # Opaque LLVM ``ptr`` does not state whether one address names tensor values
@@ -195,8 +212,11 @@ _C_FUNCTION_ROLES = {
     "log_softmax_dim_callback": "private_callback",
     "fill_double": "tensor_kernel",
     "binary_value": "scalar_helper",
+    "binary_int64_value": "scalar_helper",
     "binary_double": "tensor_kernel",
     "binary_scalar_double": "tensor_kernel",
+    "binary_int64": "tensor_kernel",
+    "binary_scalar_int64": "tensor_kernel",
     "matmul_double": "tensor_kernel",
     "unary_double": "tensor_kernel",
     "batched_matmul_indexed_double": "tensor_kernel",
@@ -207,12 +227,14 @@ _C_FUNCTION_ROLES = {
     "transpose_double": "tensor_kernel",
     "where_double": "tensor_kernel",
     "broadcast_double": "tensor_kernel",
+    "broadcast_int64": "tensor_kernel",
     "cumsum_dim_double": "tensor_kernel",
     "argreduce_dim_double": "tensor_kernel",
     "repeat_interleave_double": "tensor_kernel",
     "tile_double": "tensor_kernel",
     "index_select_double": "tensor_kernel",
     "gather_values_double": "tensor_kernel",
+    "scatter_sum_double": "tensor_kernel",
     "slice_copy_double": "tensor_kernel",
     "index_assign_double": "tensor_kernel",
     "index_set_double": "tensor_kernel",
@@ -225,6 +247,7 @@ _C_FUNCTION_ROLES = {
     "cast_double_to_int_values": "tensor_kernel",
     "cast_double_to_float_values": "tensor_kernel",
     "cast_double_to_double_values": "tensor_kernel",
+    "cast_int64_to_double_values": "tensor_kernel",
     "cast_double_to_bool_values": "tensor_kernel",
     "log_softmax_1d": "tensor_kernel",
     "log_softmax_callback": "private_callback",
@@ -233,6 +256,7 @@ _C_FUNCTION_ROLES = {
     "gather_pairs_2d": "tensor_kernel",
     "sum_double": "tensor_kernel",
     "create_arange": "tensor_kernel",
+    "create_arange_int64": "tensor_kernel",
     "topk_double": "tensor_kernel",
     "topk_double_dim": "tensor_kernel",
     "log_softmax_dim": "tensor_kernel",
@@ -566,6 +590,91 @@ loop.body:
   %right = select i1 %is.reverse, double %a.value, double %b
   %result = call double @binary_value(double %left, double %right, i32 %op)
   store double %result, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
+define internal i64 @binary_int64_value(i64 %a, i64 %b, i32 %op) {
+entry:
+  switch i32 %op, label %invalid [
+    i32 0, label %add
+    i32 1, label %sub
+    i32 2, label %mul
+    i32 5, label %mod
+  ]
+
+add:
+  %add.value = add i64 %a, %b
+  ret i64 %add.value
+sub:
+  %sub.value = sub i64 %a, %b
+  ret i64 %sub.value
+mul:
+  %mul.value = mul i64 %a, %b
+  ret i64 %mul.value
+mod:
+  %mod.remainder = srem i64 %a, %b
+  %mod.nonzero = icmp ne i64 %mod.remainder, 0
+  %mod.remainder.negative = icmp slt i64 %mod.remainder, 0
+  %mod.divisor.negative = icmp slt i64 %b, 0
+  %mod.sign.differs = xor i1 %mod.remainder.negative, %mod.divisor.negative
+  %mod.adjust = and i1 %mod.nonzero, %mod.sign.differs
+  %mod.adjusted = add i64 %mod.remainder, %b
+  %mod.value = select i1 %mod.adjust, i64 %mod.adjusted, i64 %mod.remainder
+  ret i64 %mod.value
+invalid:
+  ret i64 0
+}
+
+define internal void @binary_int64(
+    ptr %a, ptr %b, ptr %out, i32 %n, i32 %op) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds i64, ptr %a, i64 %i64
+  %b.ptr = getelementptr inbounds i64, ptr %b, i64 %i64
+  %out.ptr = getelementptr inbounds i64, ptr %out, i64 %i64
+  %a.value = load i64, ptr %a.ptr, align 8
+  %b.value = load i64, ptr %b.ptr, align 8
+  %result = call i64 @binary_int64_value(i64 %a.value, i64 %b.value, i32 %op)
+  store i64 %result, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
+define internal void @binary_scalar_int64(
+    ptr %a, i64 %b, ptr %out, i32 %n, i32 %op, i32 %reverse) {
+entry:
+  %is.reverse = icmp ne i32 %reverse, 0
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds i64, ptr %a, i64 %i64
+  %out.ptr = getelementptr inbounds i64, ptr %out, i64 %i64
+  %a.value = load i64, ptr %a.ptr, align 8
+  %left = select i1 %is.reverse, i64 %b, i64 %a.value
+  %right = select i1 %is.reverse, i64 %a.value, i64 %b
+  %result = call i64 @binary_int64_value(i64 %left, i64 %right, i32 %op)
+  store i64 %result, ptr %out.ptr, align 8
   %i.next = add nsw i32 %i, 1
   br label %loop.header
 
@@ -909,6 +1018,119 @@ exit:
   ret void
 }
 
+define internal void @broadcast_int64(
+    ptr %input, ptr %output, ptr %input_shape, i32 %input_ndim,
+    ptr %output_shape, i32 %output_ndim) {
+entry:
+  br label %total.header
+
+total.header:
+  %total.axis = phi i32 [ 0, %entry ], [ %total.axis.next, %total.body ]
+  %total = phi i32 [ 1, %entry ], [ %total.next, %total.body ]
+  %total.continue = icmp slt i32 %total.axis, %output_ndim
+  br i1 %total.continue, label %total.body, label %flat.header
+
+total.body:
+  %total.axis64 = sext i32 %total.axis to i64
+  %total.extent.ptr = getelementptr inbounds i32, ptr %output_shape, i64 %total.axis64
+  %total.extent = load i32, ptr %total.extent.ptr, align 4
+  %total.next = mul nsw i32 %total, %total.extent
+  %total.axis.next = add nsw i32 %total.axis, 1
+  br label %total.header
+
+flat.header:
+  %flat = phi i32 [ 0, %total.header ], [ %flat.next, %flat.latch ]
+  %flat.continue = icmp slt i32 %flat, %total
+  br i1 %flat.continue, label %axis.header, label %exit
+
+axis.header:
+  %axis = phi i32 [ 0, %flat.header ], [ %axis.next, %axis.latch ]
+  %remaining = phi i32 [ %flat, %flat.header ], [ %remaining.next, %axis.latch ]
+  %input.flat = phi i32 [ 0, %flat.header ], [ %input.flat.next, %axis.latch ]
+  %axis.continue = icmp slt i32 %axis, %output_ndim
+  br i1 %axis.continue, label %output.stride.entry, label %store
+
+output.stride.entry:
+  %output.later.start = add nsw i32 %axis, 1
+  br label %output.stride.header
+
+output.stride.header:
+  %output.later = phi i32 [ %output.later.start, %output.stride.entry ], [ %output.later.next, %output.stride.body ]
+  %output.stride = phi i32 [ 1, %output.stride.entry ], [ %output.stride.next, %output.stride.body ]
+  %output.later.continue = icmp slt i32 %output.later, %output_ndim
+  br i1 %output.later.continue, label %output.stride.body, label %coordinate
+
+output.stride.body:
+  %output.later64 = sext i32 %output.later to i64
+  %output.extent.ptr = getelementptr inbounds i32, ptr %output_shape, i64 %output.later64
+  %output.extent = load i32, ptr %output.extent.ptr, align 4
+  %output.stride.next = mul nsw i32 %output.stride, %output.extent
+  %output.later.next = add nsw i32 %output.later, 1
+  br label %output.stride.header
+
+coordinate:
+  %coordinate.value = sdiv i32 %remaining, %output.stride
+  %remaining.next = srem i32 %remaining, %output.stride
+  %offset = sub nsw i32 %output_ndim, %input_ndim
+  %input.axis = sub nsw i32 %axis, %offset
+  %input.axis.valid = icmp sge i32 %input.axis, 0
+  br i1 %input.axis.valid, label %input.extent.block, label %axis.noinput
+
+input.extent.block:
+  %input.axis64 = sext i32 %input.axis to i64
+  %input.extent.ptr = getelementptr inbounds i32, ptr %input_shape, i64 %input.axis64
+  %input.extent = load i32, ptr %input.extent.ptr, align 4
+  %input.broadcast = icmp eq i32 %input.extent, 1
+  br i1 %input.broadcast, label %axis.noinput, label %input.stride.entry
+
+input.stride.entry:
+  %input.later.start = add nsw i32 %input.axis, 1
+  br label %input.stride.header
+
+input.stride.header:
+  %input.later = phi i32 [ %input.later.start, %input.stride.entry ], [ %input.later.next, %input.stride.body ]
+  %input.stride = phi i32 [ 1, %input.stride.entry ], [ %input.stride.next, %input.stride.body ]
+  %input.later.continue = icmp slt i32 %input.later, %input_ndim
+  br i1 %input.later.continue, label %input.stride.body, label %axis.input
+
+input.stride.body:
+  %input.later64 = sext i32 %input.later to i64
+  %input.later.extent.ptr = getelementptr inbounds i32, ptr %input_shape, i64 %input.later64
+  %input.later.extent = load i32, ptr %input.later.extent.ptr, align 4
+  %input.stride.next = mul nsw i32 %input.stride, %input.later.extent
+  %input.later.next = add nsw i32 %input.later, 1
+  br label %input.stride.header
+
+axis.input:
+  %input.contribution = mul nsw i32 %coordinate.value, %input.stride
+  %input.flat.with = add nsw i32 %input.flat, %input.contribution
+  br label %axis.latch
+
+axis.noinput:
+  br label %axis.latch
+
+axis.latch:
+  %input.flat.next = phi i32 [ %input.flat, %axis.noinput ], [ %input.flat.with, %axis.input ]
+  %axis.next = add nsw i32 %axis, 1
+  br label %axis.header
+
+store:
+  %input.flat64 = sext i32 %input.flat to i64
+  %flat64 = sext i32 %flat to i64
+  %input.ptr = getelementptr inbounds i64, ptr %input, i64 %input.flat64
+  %output.ptr = getelementptr inbounds i64, ptr %output, i64 %flat64
+  %value = load i64, ptr %input.ptr, align 8
+  store i64 %value, ptr %output.ptr, align 8
+  br label %flat.latch
+
+flat.latch:
+  %flat.next = add nsw i32 %flat, 1
+  br label %flat.header
+
+exit:
+  ret void
+}
+
 define internal void @slice_copy_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
     i32 %start, i32 %step, i32 %count) {
@@ -1176,6 +1398,112 @@ element.body:
   %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.index64
   %value = load double, ptr %source.ptr, align 8
   store double %value, ptr %output.ptr, align 8
+  %element.next = add nsw i32 %element, 1
+  br label %element.header
+
+item.latch:
+  %item.next = add nsw i32 %item, 1
+  br label %item.header
+
+batch.latch:
+  %batch.next = add nsw i32 %batch, 1
+  br label %batch.header
+
+exit:
+  ret void
+}
+
+define internal void @scatter_sum_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count, ptr %values) {
+entry:
+  br label %extent.header
+
+extent.header:
+  %extent.axis = phi i32 [ 0, %entry ], [ %extent.axis.next, %extent.body ]
+  %before = phi i32 [ 1, %entry ], [ %before.next, %extent.body ]
+  %after = phi i32 [ 1, %entry ], [ %after.next, %extent.body ]
+  %output.count = phi i32 [ 1, %entry ], [ %output.count.next, %extent.body ]
+  %extent.continue = icmp slt i32 %extent.axis, %ndim
+  br i1 %extent.continue, label %extent.body, label %copy.header
+
+extent.body:
+  %extent.axis64 = sext i32 %extent.axis to i64
+  %extent.ptr = getelementptr inbounds i32, ptr %shape, i64 %extent.axis64
+  %extent = load i32, ptr %extent.ptr, align 4
+  %is.before = icmp slt i32 %extent.axis, %dim
+  %is.after = icmp sgt i32 %extent.axis, %dim
+  %before.product = mul nsw i32 %before, %extent
+  %after.product = mul nsw i32 %after, %extent
+  %before.next = select i1 %is.before, i32 %before.product, i32 %before
+  %after.next = select i1 %is.after, i32 %after.product, i32 %after
+  %output.count.next = mul nsw i32 %output.count, %extent
+  %extent.axis.next = add nsw i32 %extent.axis, 1
+  br label %extent.header
+
+copy.header:
+  %copy.index = phi i32 [ 0, %extent.header ], [ %copy.index.next, %copy.body ]
+  %copy.continue = icmp slt i32 %copy.index, %output.count
+  br i1 %copy.continue, label %copy.body, label %destination.extent
+
+copy.body:
+  %copy.index64 = sext i32 %copy.index to i64
+  %copy.input.ptr = getelementptr inbounds double, ptr %input, i64 %copy.index64
+  %copy.output.ptr = getelementptr inbounds double, ptr %output, i64 %copy.index64
+  %copy.value = load double, ptr %copy.input.ptr, align 8
+  store double %copy.value, ptr %copy.output.ptr, align 8
+  %copy.index.next = add nsw i32 %copy.index, 1
+  br label %copy.header
+
+destination.extent:
+  %dim64 = sext i32 %dim to i64
+  %destination.extent.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
+  %destination.count = load i32, ptr %destination.extent.ptr, align 4
+  br label %batch.header
+
+batch.header:
+  %batch = phi i32 [ 0, %destination.extent ], [ %batch.next, %batch.latch ]
+  %batch.continue = icmp slt i32 %batch, %before
+  br i1 %batch.continue, label %item.header, label %exit
+
+item.header:
+  %item = phi i32 [ 0, %batch.header ], [ %item.next, %item.latch ]
+  %item.continue = icmp slt i32 %item, %index.count
+  br i1 %item.continue, label %item.load, label %batch.latch
+
+item.load:
+  %item64 = sext i32 %item to i64
+  %index.ptr = getelementptr inbounds i64, ptr %indices, i64 %item64
+  %destination64 = load i64, ptr %index.ptr, align 8
+  %destination.nonnegative = icmp sge i64 %destination64, 0
+  %destination.count64 = sext i32 %destination.count to i64
+  %destination.in.range = icmp slt i64 %destination64, %destination.count64
+  %destination.valid = and i1 %destination.nonnegative, %destination.in.range
+  br i1 %destination.valid, label %element.header, label %item.latch
+
+element.header:
+  %element = phi i32 [ 0, %item.load ], [ %element.next, %element.body ]
+  %element.continue = icmp slt i32 %element, %after
+  br i1 %element.continue, label %element.body, label %item.latch
+
+element.body:
+  %source.batch.base = mul nsw i32 %batch, %index.count
+  %source.item.base = add nsw i32 %source.batch.base, %item
+  %source.outer = mul nsw i32 %source.item.base, %after
+  %source.index = add nsw i32 %source.outer, %element
+  %destination = trunc i64 %destination64 to i32
+  %output.batch.base = mul nsw i32 %batch, %destination.count
+  %output.item.base = add nsw i32 %output.batch.base, %destination
+  %output.outer = mul nsw i32 %output.item.base, %after
+  %output.index = add nsw i32 %output.outer, %element
+  %source.index64 = sext i32 %source.index to i64
+  %output.index64 = sext i32 %output.index to i64
+  %value.ptr = getelementptr inbounds double, ptr %values, i64 %source.index64
+  %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.index64
+  %value = load double, ptr %value.ptr, align 8
+  %standing = load double, ptr %output.ptr, align 8
+  %accumulated = fadd double %standing, %value
+  store double %accumulated, ptr %output.ptr, align 8
   %element.next = add nsw i32 %element, 1
   br label %element.header
 
@@ -1710,6 +2038,29 @@ exit:
   ret void
 }
 
+define internal void @cast_int64_to_double_values(ptr %a, ptr %out, i32 %n) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %a.ptr = getelementptr inbounds i64, ptr %a, i64 %i64
+  %out.ptr = getelementptr inbounds double, ptr %out, i64 %i64
+  %value = load i64, ptr %a.ptr, align 8
+  %converted = sitofp i64 %value to double
+  store double %converted, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
 define internal void @cast_double_to_bool_values(ptr %a, ptr %out, i32 %n) {
 entry:
   br label %loop.header
@@ -1772,6 +2123,28 @@ loop.body:
   %i64 = sext i32 %i to i64
   %out.ptr = getelementptr inbounds double, ptr %out, i64 %i64
   store double %value, ptr %out.ptr, align 8
+  %i.next = add nsw i32 %i, 1
+  br label %loop.header
+
+exit:
+  ret void
+}
+
+define internal void @create_arange_int64(i64 %start, i64 %step, i32 %n, ptr %out) {
+entry:
+  br label %loop.header
+
+loop.header:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.body ]
+  %continue = icmp slt i32 %i, %n
+  br i1 %continue, label %loop.body, label %exit
+
+loop.body:
+  %i64 = sext i32 %i to i64
+  %offset = mul i64 %i64, %step
+  %value = add i64 %start, %offset
+  %out.ptr = getelementptr inbounds i64, ptr %out, i64 %i64
+  store i64 %value, ptr %out.ptr, align 8
   %i.next = add nsw i32 %i, 1
   br label %loop.header
 
@@ -2521,8 +2894,8 @@ TRANSLATIONS = (
         "fill_double",
         "fill_double",
         (
-            "fill", "full", "full_like", "zeros", "zeros_like",
-            "empty", "empty_like", "ones", "ones_like",
+            "full", "full_like", "zeros", "zeros_like",
+            "empty", "ones", "ones_like",
         ),
         "construction fill loop",
     ),
@@ -2554,6 +2927,12 @@ TRANSLATIONS = (
             "logical_or",
         ),
         "scalar binary semantics",
+    ),
+    CBackendLLVMSSA(
+        "binary_int64_value",
+        "binary_int64_value",
+        ("add", "sub", "mul", "mod"),
+        "signed-int64 scalar binary semantics",
     ),
     CBackendLLVMSSA(
         "binary_double",
@@ -2614,6 +2993,18 @@ TRANSLATIONS = (
         "elementwise tensor-scalar loop",
     ),
     CBackendLLVMSSA(
+        "binary_int64",
+        "binary_int64",
+        ("add", "sub", "mul", "mod"),
+        "signed-int64 elementwise binary loop",
+    ),
+    CBackendLLVMSSA(
+        "binary_scalar_int64",
+        "binary_scalar_int64",
+        ("add", "sub", "mul", "mod"),
+        "signed-int64 tensor-scalar loop",
+    ),
+    CBackendLLVMSSA(
         "unary_double",
         "unary_double",
         (
@@ -2658,6 +3049,12 @@ TRANSLATIONS = (
         "broadcast_double",
         ("broadcast_to", "expand"),
         "row-major singleton-axis broadcast materialization",
+    ),
+    CBackendLLVMSSA(
+        "broadcast_int64",
+        "broadcast_int64",
+        ("broadcast_to", "expand"),
+        "row-major signed-int64 singleton-axis broadcast materialization",
     ),
     CBackendLLVMSSA(
         "reduce_dim_double",
@@ -2718,6 +3115,12 @@ TRANSLATIONS = (
         "gather_values_double",
         ("gather",),
         "single-axis selection from numerical index values",
+    ),
+    CBackendLLVMSSA(
+        "scatter_sum_double",
+        "scatter_sum_double",
+        ("scatter",),
+        "single-axis scatter-add with repeated-destination accumulation",
     ),
     CBackendLLVMSSA(
         "index_assign_double",
@@ -2786,6 +3189,12 @@ TRANSLATIONS = (
         "double-storage double-value cast (copying identity)",
     ),
     CBackendLLVMSSA(
+        "cast_int64_to_double_values",
+        "cast_int64_to_double_values",
+        ("double", "to_dtype"),
+        "signed-int64 storage to double-value cast",
+    ),
+    CBackendLLVMSSA(
         "cast_double_to_bool_values",
         "cast_double_to_bool_values",
         ("bool", "to_dtype"),
@@ -2802,6 +3211,12 @@ TRANSLATIONS = (
         "create_arange",
         ("arange",),
         "arithmetic sequence construction",
+    ),
+    CBackendLLVMSSA(
+        "create_arange_int64",
+        "create_arange_int64",
+        ("arange",),
+        "signed-int64 arithmetic sequence construction",
     ),
     CBackendLLVMSSA(
         "matmul_double",
@@ -2841,7 +3256,7 @@ def extract_c_function(symbol: str) -> str:
     text = _C_SOURCE_PATH.read_text(encoding="utf-8")
     pattern = re.compile(
         rf"(?ms)^[ \t]*(?:static[ \t]+)?"
-        rf"(?:void|double|int)[ \t]+{re.escape(symbol)}[ \t]*"
+        rf"(?:void|double|int|int64_t)[ \t]+{re.escape(symbol)}[ \t]*"
         rf"\([^;]*?\)[ \t]*\{{"
     )
     match = pattern.search(text)
@@ -2856,7 +3271,7 @@ def discover_c_backend_functions() -> tuple[CBackendFunction, ...]:
     text = _C_SOURCE_PATH.read_text(encoding="utf-8")
     pattern = re.compile(
         r"(?ms)^[ \t]*(static[ \t]+)?"
-        r"(?:void|double|int)[ \t]+([A-Za-z_]\w*)[ \t]*"
+        r"(?:void|double|int|int64_t)[ \t]+([A-Za-z_]\w*)[ \t]*"
         r"\([^;]*?\)[ \t]*\{"
     )
     translated = {entry.c_symbol for entry in TRANSLATIONS}
@@ -3564,7 +3979,7 @@ def extract_llvm_function(symbol: str) -> str:
 
     pattern = re.compile(
         rf"(?ms)^define(?:[ \t]+internal)?[ \t]+"
-        rf"(?:void|double|i32)[ \t]+@{re.escape(symbol)}"
+        rf"(?:void|double|i32|i64)[ \t]+@{re.escape(symbol)}"
         rf"\([^{{]*\)[ \t]*\{{"
     )
     match = pattern.search(LLVM_SSA_MODULE)
@@ -3667,6 +4082,10 @@ def c_backend_repository_ssa_reference():
         function = imported.module.functions[symbol]
         for argument_index in argument_indices:
             function.args[int(argument_index)].dtype = "int32"
+    for symbol, argument_indices in C_SSA_I64_POINTER_ARGUMENTS.items():
+        function = imported.module.functions[symbol]
+        for argument_index in argument_indices:
+            function.args[int(argument_index)].dtype = "int64"
     for symbol, argument_indices in C_SSA_POINTER_ARRAY_ARGUMENTS.items():
         function = imported.module.functions[symbol]
         for argument_index in argument_indices:
@@ -3763,6 +4182,7 @@ __all__ = [
     "C_TENSOR_OPCODE_ORDER",
     "C_SSA_OUTPUT_ARGUMENTS",
     "C_SSA_I32_POINTER_ARGUMENTS",
+    "C_SSA_I64_POINTER_ARGUMENTS",
     "C_SSA_POINTER_ARRAY_ARGUMENTS",
     "C_SSA_EXTERNAL_PRIMITIVES",
     "LLVM_SSA_MODULE",

@@ -81,6 +81,11 @@ ffi.cdef("""
         const double* a, const double* b, double* out, int n, int op);
     void binary_scalar_double(
         const double* a, double b, double* out, int n, int op, int reverse);
+    void binary_int64(
+        const long long* a, const long long* b, long long* out, int n, int op);
+    void binary_scalar_int64(
+        const long long* a, long long b, long long* out, int n, int op,
+        int reverse);
     void matmul_double(const double* a, const double* b, double* out, int m, int n, int p);
     void batched_matmul_indexed_double(
         const double* a, const double* b, double* out,
@@ -118,6 +123,9 @@ ffi.cdef("""
     void broadcast_double(
         const double* input, double* output, const int* input_shape,
         int input_ndim, const int* output_shape, int output_ndim);
+    void broadcast_int64(
+        const long long* input, long long* output, const int* input_shape,
+        int input_ndim, const int* output_shape, int output_ndim);
     void cumsum_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim);
@@ -133,6 +141,10 @@ ffi.cdef("""
     void index_select_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, const int* indices, int index_count);
+    void scatter_sum_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const long long* indices, int index_count,
+        const double* values);
     void slice_copy_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, int start, int step, int count);
@@ -159,6 +171,8 @@ ffi.cdef("""
                          double* out, int n_pairs, int stride);
     double sum_double(const double* a, int n);
     void create_arange(double start, double step, int n, double* out);
+    void create_arange_int64(
+        long long start, long long step, int n, long long* out);
     void topk_double(const double* a, int n, int k, int* indices, double* out);
     void topk_double_dim(
         const double* a,
@@ -179,6 +193,8 @@ ffi.cdef("""
     void cast_double_to_int_values(const double* a, double* out, int n);
     void cast_double_to_float_values(const double* a, double* out, int n);
     void cast_double_to_double_values(const double* a, double* out, int n);
+    void cast_int64_to_double_values(
+        const long long* a, double* out, int n);
     void cast_double_to_bool_values(const double* a, double* out, int n);
     void stack_double(const double** tensors, int num_tensors, const int* shape, int ndim, int dim, double* out);
     void cat_double(const double** tensors, const int* dim_sizes, int num_tensors, const int* shape, int ndim, int dim, double* out);
