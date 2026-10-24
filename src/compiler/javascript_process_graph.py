@@ -651,6 +651,38 @@ class _JavaScriptProcessInterpreter:
             parents=((operand, "value"),),
         )
 
+    def _number_logical(
+        self, operator: str, left: int, right: int, expr: Mapping[str, Any],
+    ) -> int:
+        """``&&`` / ``||`` on two Numbers: one of the operands, not a bool.
+
+        ``a && b`` is ``a`` when ``a`` is falsy (``0``, ``-0``, ``NaN``),
+        else ``b``; ``a || b`` is ``a`` when truthy, else ``b``.  With pure
+        operands both are evaluated and Selected by ``a``'s truthiness, so
+        ``-0 && 5`` is ``-0`` and ``NaN || 0`` is ``0``.  An operand pair of
+        different kinds has no single result kind and stays refused.
+        """
+
+        parents = ((left, "left"), (right, "right"))
+        if not self.require(
+            ("number-operands", "number-truthiness", "pure-operands"),
+            spelling=operator, operands=(left, right),
+        ):
+            return self.unsupported(
+                operator,
+                "untranslated-binary-operator",
+                f"{operator!r} has unproved JavaScript semantics",
+                source=expr,
+                parents=parents,
+            )
+        truthy = self.truthy(left, expr)
+        chosen, other = (right, left) if operator == "&&" else (left, right)
+        return self._node(
+            Handler.Select,
+            ((truthy, "condition"), (chosen, "if_true"), (other, "if_false")),
+            expr, "number",
+        )
+
     def binary(
         self, operator: str, left: int, right: int,
         expr: Mapping[str, Any],
@@ -662,6 +694,10 @@ class _JavaScriptProcessInterpreter:
         """
 
         parents = ((left, "left"), (right, "right"))
+        if operator in {"&&", "||"} and (
+            self._kind(left) == self._kind(right) == "number"
+        ):
+            return self._number_logical(operator, left, right, expr)
         if operator == "%":
             if not self.require(
                 ("number-operands", "ecmascript-number-semantics"),
