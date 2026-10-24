@@ -1625,6 +1625,40 @@ def _static_mapping_capacity_bounds(
                 destination = int(aliases.get(parent, parent))
                 if destination in keys:
                     unknown.add(destination)
+    # Program: ``d = {1: 5, 2: n}; del d[1]; d[1] = 4`` (scratch s42/t2).
+    # Wrong record: a keyed delete only clears its row's live flag, so the
+    # later store of the same key appended a THIRD row, past the two-key
+    # universe bound; the store's capacity status was dropped and
+    # ``len(d)`` was 1 for 2 (clean audit).  Rule: each keyed delete that
+    # runs at most once may cost one more resident row; a delete a loop
+    # holds may run any number of times, so it unbounds the arena.
+    holders: dict[int, int] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        for parent, role in data.get("parents") or ():
+            if str(role) in {"body", "orelse"}:
+                holders[int(parent)] = int(node_id)
+    deleted_rows: dict[int, int] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("type") or data.get("op") or "").casefold() != "delitem":
+            continue
+        roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        destination = int(aliases.get(roles.get("base"), roles.get("base", -1)))
+        if destination not in keys:
+            continue
+        holder, seen, looped = holders.get(int(node_id)), set(), False
+        while holder is not None and holder not in seen:
+            seen.add(holder)
+            if isinstance(
+                graph_obj.nodes.get(holder, {}).get("expr_obj"),
+                (ast.For, ast.AsyncFor, ast.While),
+            ):
+                looped = True
+                break
+            holder = holders.get(holder)
+        if looped:
+            unknown.add(destination)
+        else:
+            deleted_rows[destination] = deleted_rows.get(destination, 0) + 1
     changed = True
     while changed:
         changed = False
@@ -1637,7 +1671,13 @@ def _static_mapping_capacity_bounds(
                 previous = len(keys[destination])
                 keys[destination].update(keys[source])
                 changed |= len(keys[destination]) != previous
-    return {node_id: len(universe) for node_id, universe in keys.items()
+    # A copy holds its source's rows, the deleted ones included.
+    for destination, source in copies.items():
+        deleted_rows[destination] = (
+            deleted_rows.get(destination, 0) + deleted_rows.get(source, 0)
+        )
+    return {node_id: len(universe) + deleted_rows.get(node_id, 0)
+            for node_id, universe in keys.items()
             if node_id not in unknown}
 
 

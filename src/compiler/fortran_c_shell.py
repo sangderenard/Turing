@@ -27804,6 +27804,17 @@ def _class_surface_ssa_program(
                     ), None),)
                     if base is not None
                 },
+                # Keyed deletes an ``if``/loop holds as a ``body``/``orelse``
+                # statement; every other delete runs unconditionally.
+                table_deletion_held_ids=frozenset(
+                    int(graph_obj.nodes[parent].get("value_id", parent))
+                    for _node_id, data in graph_obj.nodes(data=True)
+                    for parent, role in data.get("parents") or ()
+                    if str(role) in {"body", "orelse"}
+                    and int(parent) in graph_obj
+                    and str(graph_obj.nodes[parent].get("type") or "")
+                    == "DelItem"
+                ),
                 retained_sequence_ids=retained_sequence_ids,
                 nested_sequence_ids=nested_sequence_ids,
                 nested_tensor_sequence_ids=nested_tensor_sequence_ids,
