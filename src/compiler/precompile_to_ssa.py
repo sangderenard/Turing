@@ -22894,7 +22894,7 @@ def _inject_field_slot_access(
         SSA_VALUE, (_slot_scope, int(self_value_id)),
     )
 
-    def fresh(*causes: Any) -> int:
+    def fresh(*causes: Any, value_dtype: str | None = None) -> int:
         book = _slot_book()
         operand = (
             _receiver_cell if _receiver_cell is not None
@@ -22902,7 +22902,8 @@ def _inject_field_slot_access(
         )
         return _mint_ssa_id(
             book, _slot_scope, FIELD_SLOT_ACCESS, (operand, *causes),
-            dtype=dtype, stage=CONTROL_SSA_FINISH,
+            dtype=dtype if value_dtype is None else value_dtype,
+            stage=CONTROL_SSA_FINISH,
         )
 
     def publish_row(
@@ -23078,7 +23079,10 @@ def _inject_field_slot_access(
         slot: int, *causes: Any,
     ) -> tuple[list[Instr], SSAValue, str]:
         arena_id, offset, slot_dtype = field_locations[int(slot)]
-        index = SSAValue(fresh(*causes), dtype="int64")
+        # The offset is an int64 index whatever the receiver's dtype: minting
+        # it with the receiver dtype typed it ``bool`` on a bool-first
+        # receiver, and Fortran refused ``logical + 1`` as an index.
+        index = SSAValue(fresh(*causes, value_dtype="int64"), dtype="int64")
         address = SSAValue(fresh(*causes))
         return (
             [

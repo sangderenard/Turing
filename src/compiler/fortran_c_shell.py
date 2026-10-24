@@ -7147,6 +7147,36 @@ def _authored_dataclass_record_views(
                 methods[statement.name] = statement
         initializer = methods.get("__init__")
         if initializer is not None:
+            # ``self.scale = scale`` stores the parameter's authored
+            # annotation as surely as ``self.scale: int = scale`` does, while
+            # the initializer never rebinds that name.  Without it every
+            # method that read the field had no receiver record view and the
+            # unit was refused ("missing used parameter self").
+            initializer_arguments = (
+                *initializer.args.posonlyargs, *initializer.args.args,
+                *initializer.args.kwonlyargs,
+            )
+            rebound_names = {
+                name.id
+                for node in ast.walk(initializer)
+                for target in (
+                    node.targets if isinstance(node, ast.Assign)
+                    else (node.target,)
+                    if isinstance(node, (
+                        ast.AugAssign, ast.AnnAssign, ast.For,
+                        ast.AsyncFor, ast.NamedExpr,
+                    ))
+                    else ()
+                )
+                for name in ast.walk(target)
+                if isinstance(name, ast.Name)
+            }
+            annotated_parameters = {
+                argument.arg: argument.annotation
+                for argument in initializer_arguments
+                if argument.annotation is not None
+                and argument.arg not in rebound_names
+            }
             for node in ast.walk(initializer):
                 target = None
                 receipt = None
@@ -7155,7 +7185,12 @@ def _authored_dataclass_record_views(
                     receipt = field_receipt(node.annotation)
                 elif isinstance(node, ast.Assign) and len(node.targets) == 1:
                     target = node.targets[0]
-                    receipt = initialized_field_receipt(node.value)
+                    receipt = (
+                        field_receipt(annotated_parameters[node.value.id])
+                        if isinstance(node.value, ast.Name)
+                        and node.value.id in annotated_parameters
+                        else initialized_field_receipt(node.value)
+                    )
                 if not (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
@@ -10401,10 +10436,23 @@ def _field_slot_ops(
             # in this field is the record instance; consulting only the former
             # degraded a specialized ``Metrics`` write to an untyped scalar
             # receiver slot.
+            #
+            # A typed scalar parameter carries its annotation's class as
+            # ``result_class_ref`` too (``scale: int`` -> ``'int'``), beside
+            # ``value_kind='scalar'``, the read view of its
+            # ``scalar_parameter`` row.  Reading that class as a record
+            # instance made ``self.scale = scale`` a nested record field
+            # naming a record no table holds ("record 'K' field 'scale' names
+            # absent record 0").  A scalar is stored in a scalar slot.
             nested_class_identity = (
                 source_attributes.get("result_class_ref")
                 or source_attributes.get("class_ref")
             )
+            if (
+                source_attributes.get("value_kind") == "scalar"
+                and source_attributes.get("class_ref") is None
+            ):
+                nested_class_identity = None
             if nested_class_identity is not None:
                 nested_record_fields[slot_of[canonical_attribute]] = (
                     str(nested_class_identity), int(source_id)

@@ -5057,6 +5057,11 @@ def _normalize_lexical_values(
     # cursor is captured at a conditional's entry and reset at each arm's
     # boundary, and the merge names the arm cells by their captured Refs.
     field_state_cursor: dict[tuple[int, str], _Ref] = {}
+    #: ``(receiver name, field)`` pairs assigned anywhere in the body of each
+    #: loop being reduced, innermost last.  The reducer merges no field state
+    #: at a loop, so the first pass over a body sees no cursor for a field
+    #: the body itself rewrites later; that read is not the construction's.
+    loop_body_field_writes: list[frozenset[tuple[str, str]]] = []
     # The most recent node that mutated ``(receiver_node_id, attr)`` --
     # a whole-attribute ``SetAttr`` or an element-wise ``obj.field[i, j] =``
     # ``IndexedStore``.  A later bare read of the same field consults this so
@@ -8330,9 +8335,81 @@ def _normalize_lexical_values(
                         )
                     )
                 )
+                # The constructor argument is the field's value only while
+                # nothing has touched the field since construction.  The
+                # read's field-state cursor is that record: a write, merge or
+                # loop exit there means the argument is a stale value.
+                # Folding past it returned ``S(0)``'s 0 for ``if c > 0:
+                # s.n = 1; return s.n`` and dropped every later write.
+                constructed_state = field_state_at(
+                    field_state_cursor.get(
+                        (int(receiver), str(expression.attr))
+                    )
+                )
                 if (
                     isinstance(receiver_expression, ast.Call)
                     and len(matching_records) == 1
+                    and isinstance(constructed_state, _FieldState)
+                    and constructed_state.kind in {
+                        _FieldStateKind.WRITTEN,
+                        _FieldStateKind.MERGED,
+                        _FieldStateKind.ARM_SELECTED,
+                        _FieldStateKind.LOOP_EXIT,
+                    }
+                ):
+                    # The field of a record this function constructed has no
+                    # storage of its own: its current value IS the value the
+                    # cursor names (the last write, or the merge/loop-exit
+                    # version of the writes), exactly as a static receiver's
+                    # assigned field is read above.
+                    current_value = _cell_node_id(constructed_state.value)
+                    if current_value is not None and current_value in graph.G:
+                        _redirect_value(
+                            graph, int(attribute_id), int(current_value)
+                        )
+                        return int(current_value)
+                rewritten_by_enclosing_loop = (
+                    isinstance(expression.value, ast.Name)
+                    and any(
+                        (str(expression.value.id), str(expression.attr))
+                        in writes
+                        for writes in loop_body_field_writes
+                    )
+                )
+                if (
+                    isinstance(receiver_expression, ast.Call)
+                    and len(matching_records) == 1
+                    and (
+                        rewritten_by_enclosing_loop
+                        or (
+                            isinstance(constructed_state, _Unresolved)
+                            and constructed_state.reason
+                            == _LOOP_EXIT_FIELD_STATE_UNMERGED
+                        )
+                    )
+                ):
+                    # A record this function constructed has no field storage;
+                    # its field's value is the field-state cursor, and the
+                    # reducer merges no field state at a loop.  Say so rather
+                    # than read the constructor argument or nothing.
+                    raise ValueError(
+                        "local record field written in a loop has no merged "
+                        f"value: {getattr(expression.value, 'id', '?')}."
+                        f"{expression.attr} at line "
+                        f"{getattr(expression, 'lineno', '?')} "
+                        "(loop_exit_field_state_unmerged)"
+                    )
+                if (
+                    isinstance(receiver_expression, ast.Call)
+                    and len(matching_records) == 1
+                    and (
+                        constructed_state is None
+                        or (
+                            isinstance(constructed_state, _FieldState)
+                            and constructed_state.kind
+                            is _FieldStateKind.OBSERVED
+                        )
+                    )
                 ):
                     field_names = tuple(
                         map(
@@ -8351,7 +8428,11 @@ def _normalize_lexical_values(
                             field_expression = receiver_expression.args[position]
                     if field_expression is not None:
                         field_value = resolve_expression(field_expression)
-                        if isinstance(field_value, int):
+                        if isinstance(field_value, int) and (
+                            constructed_state is None
+                            or _cell_node_id(constructed_state.value)
+                            == int(field_value)
+                        ):
                             field_attributes = (
                                 graph.G.nodes.get(field_value, {}).get(
                                     "attributes"
@@ -14559,8 +14640,24 @@ def _normalize_lexical_values(
                 # body updates such as ``data = data[0] if data else []``.
                 before_loop = dict(environment)
             before_loop_field_cells = dict(field_state_cursor)
-            for nested in body_statement.body:
-                reduce_statement(nested)
+            loop_body_field_writes.append(frozenset(
+                (str(target.value.id), str(target.attr))
+                for nested in body_statement.body
+                for member in source_walk(nested)
+                for target in (
+                    member.targets if isinstance(member, ast.Assign)
+                    else (member.target,)
+                    if isinstance(member, (ast.AugAssign, ast.AnnAssign))
+                    else ()
+                )
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+            ))
+            try:
+                for nested in body_statement.body:
+                    reduce_statement(nested)
+            finally:
+                loop_body_field_writes.pop()
             for nested in body_statement.orelse:
                 reduce_statement(nested)
             loop_id = id(body_statement)

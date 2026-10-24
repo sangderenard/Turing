@@ -148,7 +148,9 @@ def main():
     for path in sorted(pathlib.Path(sys.argv[1]).glob("c*.py")):
         src = path.read_text()
         inputs = ast.literal_eval(src.split("# INPUTS", 1)[1].strip())
-        ns = {}
+        # A class defined with no __name__ gets __module__ "builtins", which
+        # sends the static-binding walk through the builtins module itself.
+        ns = {"__name__": "corpus_" + path.stem}
         exec(compile(src, str(path), "exec"), ns)
         expects = [ns["root"](**feeds) for feeds in inputs]
         try:
