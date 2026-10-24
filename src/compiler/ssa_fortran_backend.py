@@ -356,6 +356,92 @@ _LOGICAL_DTYPES = frozenset({"i1", "bool", "logical"})
 # Fortran vocabulary.
 _DTYPE_KIND: dict[str, str] = fortran_kind_table()
 
+#: The element count a heap arena's pointer view is declared over.  The view
+#: only names the arena's address and element type; the sequence's own
+#: length and capacity cells bound every index, as in C and LLVM.
+_HEAP_VIEW_EXTENT = "huge(0_c_int32_t)"
+
+#: Owned heap arenas (``ssa_heap_allocation``), the Fortran spelling of the C
+#: lane's ``Alloca`` and ``turing_heap_release``: every block is
+#: ``[previous block][elements...]`` linked into its owner cell, so one
+#: release walks the chain and resets the owner to null.  An invalid count
+#: or a failed allocation aborts; a wrapped size is never a small successful
+#: allocation.  libc is reached through bind(C) interfaces, so the module
+#: needs no C helper object.
+_HEAP_HELPERS = (
+    "  function turing_heap_allocate(owner, count, element_bytes, zero) result(arena)",
+    "    type(c_ptr), intent(inout) :: owner",
+    "    integer(c_int64_t), intent(in), value :: count",
+    "    integer(c_int64_t), intent(in), value :: element_bytes",
+    "    logical, intent(in), value :: zero",
+    "    type(c_ptr) :: arena",
+    "    type(c_ptr) :: cell",
+    "    type(c_ptr), pointer :: link",
+    "    integer(c_int8_t), pointer :: bytes(:)",
+    "    interface",
+    "      function turing_c_malloc(size) bind(C, name=\"malloc\")",
+    "        import :: c_ptr, c_size_t",
+    "        integer(c_size_t), value :: size",
+    "        type(c_ptr) :: turing_c_malloc",
+    "      end function turing_c_malloc",
+    "      subroutine turing_c_abort() bind(C, name=\"abort\")",
+    "      end subroutine turing_c_abort",
+    "    end interface",
+    "    if (count < 0_c_int64_t .or. count > (huge(count) - 8_c_int64_t) / element_bytes) &",
+    "      call turing_c_abort()",
+    "    cell = turing_c_malloc(int(count * element_bytes + 8_c_int64_t, c_size_t))",
+    "    if (.not. c_associated(cell)) call turing_c_abort()",
+    "    call c_f_pointer(cell, link)",
+    "    link = owner",
+    "    owner = cell",
+    "    arena = transfer(transfer(cell, 0_c_intptr_t) + 8_c_intptr_t, arena)",
+    "    if (zero .and. count > 0_c_int64_t) then",
+    "      call c_f_pointer(arena, bytes, [count * element_bytes])",
+    "      bytes = 0_c_int8_t",
+    "    end if",
+    "  end function turing_heap_allocate",
+    "",
+    "  subroutine turing_heap_copy(destination, source, byte_count)",
+    "    type(c_ptr), intent(in), value :: destination",
+    "    type(c_ptr), intent(in), value :: source",
+    "    integer(c_int64_t), intent(in), value :: byte_count",
+    "    type(c_ptr) :: ignored",
+    "    interface",
+    "      function turing_c_memmove(target, origin, size) bind(C, name=\"memmove\")",
+    "        import :: c_ptr, c_size_t",
+    "        type(c_ptr), value :: target",
+    "        type(c_ptr), value :: origin",
+    "        integer(c_size_t), value :: size",
+    "        type(c_ptr) :: turing_c_memmove",
+    "      end function turing_c_memmove",
+    "    end interface",
+    "    if (byte_count > 0_c_int64_t) &",
+    "      ignored = turing_c_memmove(destination, source, int(byte_count, c_size_t))",
+    "  end subroutine turing_heap_copy",
+    "",
+    "  subroutine turing_heap_release(owner)",
+    "    type(c_ptr), intent(inout) :: owner",
+    "    type(c_ptr) :: cell",
+    "    type(c_ptr) :: next",
+    "    type(c_ptr), pointer :: link",
+    "    interface",
+    "      subroutine turing_c_free(pointer) bind(C, name=\"free\")",
+    "        import :: c_ptr",
+    "        type(c_ptr), value :: pointer",
+    "      end subroutine turing_c_free",
+    "    end interface",
+    "    cell = owner",
+    "    owner = c_null_ptr",
+    "    do while (c_associated(cell))",
+    "      call c_f_pointer(cell, link)",
+    "      next = link",
+    "      call turing_c_free(cell)",
+    "      cell = next",
+    "    end do",
+    "  end subroutine turing_heap_release",
+    "",
+)
+
 DEFAULT_DTYPE = "float64"
 
 
@@ -740,6 +826,11 @@ def _literal(value: Any, dtype: str | None = None) -> str:
         and not isinstance(value, bool)
         and str(dtype) in {"int64", "i64", "opaque_ref"}
     ):
+        if value == -(2**63):
+            # A literal is a negated positive constant in Fortran, and 2**63
+            # does not fit int64 (gfortran: "Integer too big for its kind";
+            # the integer formatting helpers carry this bound, c57).
+            return "(-huge(0_c_int64_t) - 1_c_int64_t)"
         return f"{value}_c_int64_t"
     return _literal_payload(value)
 
@@ -820,6 +911,7 @@ class _FunctionEmitter:
         native_symbol: str | None = None,
         callee_native_symbols: Mapping[str, str] | None = None,
         extent_namespace: str = "",
+        release_heap_owners: bool = False,
     ):
         if str(trig_solver) not in {"lut", "continuous"}:
             raise ValueError(
@@ -992,6 +1084,53 @@ class _FunctionEmitter:
                     instr.res.id, kind, (len(payload),), instr.res.device,
                     dict(instr.res.accounting or {}),
                 )
+        # Program: ``xs = [5, n, 2]; xs.reverse()`` (c140) and every list
+        # that may grow (lane E, Fortran list growth).  Wrong record: an
+        # owned-heap sequence's column is a pointer CELL holding its arena's
+        # address (``ssa_heap_allocation``), but Fortran declared it as the
+        # arena itself, a real(c_double) array, so ``Alloca`` and the arena
+        # copy had no spelling and 86 corpus programs were refused.  Rule: a
+        # heap cell, an allocation result and an owner are ``type(c_ptr)``
+        # slots; elements are reached through a pointer view of the arena
+        # (``t<id>_v``) refreshed whenever the cell can change.
+        self._heap_elements: dict[int, str] = {}
+        self._heap_owner_ids: set[int] = set()
+        heap_occurrences: dict[int, SSAValue] = {}
+        for value in (
+            *function.args,
+            *(
+                candidate
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for candidate in (*instruction.args, instruction.res)
+                if candidate is not None
+            ),
+        ):
+            accounting = value.accounting or {}
+            if str(value.dtype or "").casefold() != "ptr":
+                continue
+            if accounting.get("heap_owner"):
+                self._heap_owner_ids.add(int(value.id))
+            elif accounting.get("heap_element_dtype") is not None:
+                self._heap_elements[int(value.id)] = str(
+                    accounting["heap_element_dtype"]
+                )
+            else:
+                continue
+            heap_occurrences.setdefault(int(value.id), value)
+        for value_id, occurrence in heap_occurrences.items():
+            self.array_base_ids.discard(value_id)
+            self._pointer_value_ids.discard(value_id)
+            self._value_types[value_id] = SSAValue(
+                value_id, "ptr", (), occurrence.device,
+                dict(occurrence.accounting or {}),
+            )
+        # Every heap arena value has a pointer view, refreshed wherever its
+        # cell can change; ``_heap_indexed`` are those an element access
+        # actually reads through.
+        self._heap_views: set[int] = set(self._heap_elements)
+        self._heap_indexed: set[int] = set()
+        self.release_heap_owners = bool(release_heap_owners)
         self.outputs = tuple(self._typed(value) for value in self.outputs)
         self.dynamic_array_extents = {
             int(instr.args[0].id): (
@@ -1382,7 +1521,7 @@ class _FunctionEmitter:
                     )
                     for position in positions
                 )
-                return f"{self._operand(collection)}({subscripts})"
+                return f"{self._indexed_base(collection)}({subscripts})"
         return self._operand(value)
 
     def _collect_use_sites(self) -> None:
@@ -2752,7 +2891,14 @@ class _FunctionEmitter:
         elif output_count != 0 or instr.res is not None:
             return None
         native_callee = self.callee_native_symbols.get(str(callee), str(callee))
-        return [f"    call {native_callee}({', '.join(arguments)})"]
+        # A callee may grow a heap sequence and publish a new arena into
+        # the cell passed here; this frame's view must follow it.
+        refreshed = []
+        for value in instr.args:
+            for line in self._heap_refresh(value):
+                if line not in refreshed:
+                    refreshed.append(line)
+        return [f"    call {native_callee}({', '.join(arguments)})", *refreshed]
 
     def _external_reference_call(self, instr: Instr) -> list[str] | None:
         """Emit one typed call to the C shell's external-reference thunk."""
@@ -3043,6 +3189,90 @@ class _FunctionEmitter:
         self._locals[instr.res.id] = self._typed(instr.res)
         return [f"    {_name(instr.res)} = {spelling.format(source)}"]
 
+    def _indexed_base(self, collection: SSAValue) -> str:
+        """The array an element address indexes: a heap arena's view."""
+
+        if int(collection.id) in self._heap_elements:
+            return f"{_name(collection)}_v"
+        return self._operand(collection)
+
+    def _element_target(self, collection: SSAValue) -> SSAValue:
+        """The value an element store converts to: the arena's element."""
+
+        element = self._heap_elements.get(int(collection.id))
+        if element is None:
+            return collection
+        # A fresh identity: the cell's own id is typed ``ptr``, and the
+        # conversion must read the element's dtype, not the cell's.
+        return SSAValue(-1, element, (), collection.device, {})
+
+    def _heap_refresh(self, value: SSAValue) -> list[str]:
+        """Point a heap value's view at the arena its cell now holds."""
+
+        if int(value.id) not in self._heap_views:
+            return []
+        return [
+            f"    call c_f_pointer({_name(value)}, {_name(value)}_v, "
+            f"[{_HEAP_VIEW_EXTENT}])"
+        ]
+
+    def _heap_statements(self, instr: Instr) -> list[str] | None:
+        """Owned-heap allocation, arena copy and owner release.
+
+        The C lane's spelling (``ssa_c_backend``, ``Alloca``) through the
+        module helpers ``turing_heap_allocate`` / ``turing_heap_copy`` /
+        ``turing_heap_release``: one block ``[previous][elements]`` linked
+        into the owner cell, the result is the element address, and an
+        invalid count or a failed allocation aborts.
+        """
+
+        from .ssa_heap_allocation import (
+            require_heap_owner, validate_heap_allocation, validate_heap_copy,
+        )
+
+        if instr.op == "Alloca":
+            try:
+                count, owner, layout = validate_heap_allocation(instr)
+            except (KeyError, ValueError) as error:
+                self.shortfalls.append(FortranShortfall("Alloca", "", str(error)))
+                return [f"    ! UNSUPPORTED {instr.op}"]
+            self._locals[instr.res.id] = self._typed(instr.res)
+            zero = ".true." if instr.attributes.get("zero_initialize") else ".false."
+            return [
+                f"    {_name(instr.res)} = turing_heap_allocate("
+                f"{_name(owner)}, int({self._operand(count)}, c_int64_t), "
+                f"{int(layout.byte_size)}_c_int64_t, {zero})",
+                *self._heap_refresh(instr.res),
+            ]
+        if instr.op not in ("Call", "call"):
+            return None
+        heap_abi = instr.attributes.get("native_heap_abi")
+        if heap_abi == "copy_elements":
+            try:
+                destination, source, count, layout = validate_heap_copy(instr)
+            except (KeyError, ValueError) as error:
+                self.shortfalls.append(FortranShortfall("Call", "", str(error)))
+                return [f"    ! UNSUPPORTED {instr.op}"]
+            if not {int(destination.id), int(source.id)} <= set(self._heap_elements):
+                self.shortfalls.append(FortranShortfall(
+                    "Call", "", "heap copy operands must be heap arenas",
+                ))
+                return [f"    ! UNSUPPORTED {instr.op}"]
+            return [
+                f"    call turing_heap_copy({_name(destination)}, "
+                f"{_name(source)}, int({self._operand(count)}, c_int64_t)"
+                f" * {int(layout.byte_size)}_c_int64_t)"
+            ]
+        if heap_abi == "release_owner":
+            if len(instr.args) != 1 or instr.res is not None:
+                self.shortfalls.append(FortranShortfall(
+                    "Call", "", "heap release requires one owner and no result",
+                ))
+                return [f"    ! UNSUPPORTED {instr.op}"]
+            require_heap_owner(instr.args[0])
+            return [f"    call turing_heap_release({_name(instr.args[0])})"]
+        return None
+
     def _indexed_store(self, instr: Instr) -> list[str] | None:
         """``collection[i] = value``, without materialising an address.
 
@@ -3082,6 +3312,12 @@ class _FunctionEmitter:
             return None
         source, address = instr.args
         producer = self._address_producers.get(address.id)
+        if producer is None and int(address.id) in self._heap_elements:
+            # A grown arena's address is published into the sequence's cell.
+            return [
+                f"    {_name(address)} = {self._operand(source)}",
+                *self._heap_refresh(address),
+            ]
         if producer is None:
             if int(address.id) not in self.array_base_ids:
                 # Authored ctrl.n += 1 in a retained while body lowers to
@@ -3118,7 +3354,8 @@ class _FunctionEmitter:
             for position in positions
         )
         source_expression = self._operand(source)
-        collection_dtype = str(self._typed(collection).dtype or self.dtype)
+        target = self._element_target(collection)
+        collection_dtype = str(self._typed(target).dtype or self.dtype)
         source_dtype = str(self._typed(source).dtype or self.dtype)
         if source_dtype == "opaque_ref" and collection_dtype not in _INTEGER_DTYPES:
             # Object scalar arenas are fixed-width f64 words. Preserve an
@@ -3127,10 +3364,10 @@ class _FunctionEmitter:
             source_expression = f"transfer({source_expression}, 0.0_c_double)"
         else:
             source_expression = self._coerce_value_to_target(
-                collection, source, source_expression
+                target, source, source_expression
             )
         return [
-            f"    {self._operand(collection)}({subscripts})"
+            f"    {self._indexed_base(collection)}({subscripts})"
             f" = {source_expression}"
         ]
 
@@ -3149,6 +3386,8 @@ class _FunctionEmitter:
                 collection = instr.args[0]
                 positions = tuple(instr.args[1:])
                 self._address_producers[instr.res.id] = (collection, positions)
+                if int(collection.id) in self._heap_elements:
+                    self._heap_indexed.add(int(collection.id))
                 if instr.attributes.get("binding") == "collection_publication":
                     # A collection is written once per iteration, so it holds
                     # one element per trip and its extent comes from the loop.
@@ -3426,12 +3665,15 @@ class _FunctionEmitter:
         if length is None:
             return None
         target = _name(instr.res)
-        rows = self._operand(source)
+        rows = self._indexed_base(source)
+        if int(source.id) in self._heap_elements:
+            self._heap_indexed.add(int(source.id))
+        row_dtype = str(self._element_target(source).dtype or self.dtype)
         index = f"turing_red_{instr.res.id}_i"
         accumulator = f"turing_red_{instr.res.id}"
         result_kind = _declaration(instr.res, elemental=True)
-        real_rows = str(source.dtype or self.dtype) not in _INTEGER_DTYPES
-        logical_rows = str(source.dtype or "") in _LOGICAL_DTYPES
+        real_rows = row_dtype not in _INTEGER_DTYPES
+        logical_rows = row_dtype in _LOGICAL_DTYPES
         if logical_rows and operation not in ("all", "any"):
             return None
         lines = [
@@ -4003,9 +4245,10 @@ class _FunctionEmitter:
                     )
                     for position in positions
                 )
-                loaded = f"{self._operand(collection)}({subscripts})"
+                loaded = f"{self._indexed_base(collection)}({subscripts})"
                 if str(instr.res.dtype or "") == "opaque_ref" and str(
-                    self._typed(collection).dtype or self.dtype
+                    self._typed(self._element_target(collection)).dtype
+                    or self.dtype
                 ) not in _INTEGER_DTYPES:
                     return f"transfer({loaded}, 0_c_int64_t)"
                 return loaded
@@ -4223,6 +4466,32 @@ class _FunctionEmitter:
                     body.append(
                         f"    {_name(return_value)} = {self._operand(instr.args[0])}"
                     )
+                elif len(instr.args) == len(self.outputs):
+                    # Program: ``ys = [7] * (n % 5); ys.append(n)`` (c202;
+                    # lane E).  Wrong record: the fill helper returns its
+                    # status from two ``Ret``s (inserted, capacity
+                    # exhausted), but only the first one's operand is the
+                    # named output, so the exhausted return left the output
+                    # at "inserted", no growth was attempted and the rows
+                    # were dropped.  Rule: each ``Ret`` writes its operands
+                    # into the output slots, position by position.
+                    for output, returned in zip(self.outputs, instr.args):
+                        if int(output.id) != int(returned.id):
+                            body.append(
+                                f"    {_name(output)} = "
+                                + self._coerce_value_to_target(
+                                    output, returned, self._operand(returned)
+                                )
+                            )
+                if self.release_heap_owners:
+                    # The entry owns its frame's heap, as the C and LLVM
+                    # wrappers do: every arena is released once the results
+                    # are written, and the owner cell is reset to null.
+                    body.extend(
+                        f"    call turing_heap_release({_name(argument)})"
+                        for argument in self.function.args
+                        if int(argument.id) in self._heap_owner_ids
+                    )
                 body.append("    return")
                 continue
 
@@ -4242,6 +4511,11 @@ class _FunctionEmitter:
             pointer_array = self._pointer_array_tensor_kernel(block, index)
             if pointer_array is not None:
                 body.extend(pointer_array)
+                continue
+
+            heap = self._heap_statements(instr)
+            if heap is not None:
+                body.extend(heap)
                 continue
 
             memcpy = self._memcpy_call(instr)
@@ -4450,6 +4724,71 @@ class _FunctionEmitter:
         body: list[str] = []
         for block in self.function.blocks.values():
             self._emit_block(block, body)
+        # A heap view is valid only once pointed at its cell's arena.  A
+        # formal cell arrives holding one (or null, before the first
+        # growth); an allocation result is pointed where it is made.
+        for argument in self.function.args:
+            body[:0] = self._heap_refresh(argument)
+        call_frame_cells = {
+            int(value.id)
+            for block in self.function.blocks.values()
+            for instruction in block.instrs
+            if instruction.op in ("Call", "call")
+            for value in instruction.args
+            if int(value.id) in self._heap_elements
+        } - {int(argument.id) for argument in self.function.args}
+        # Program: ``ys = make(n)`` where ``make`` appends to its own list
+        # (c56).  The caller's frame cell is a local the callee fills; as
+        # in C (calloc) it starts null, and the call refreshes its view.
+        body[:0] = [
+            line
+            for value_id in sorted(call_frame_cells)
+            for line in (f"    t{value_id} = c_null_ptr",)
+        ]
+        view_owners = {
+            *(int(argument.id) for argument in self.function.args),
+            *call_frame_cells,
+            *(
+                int(instruction.res.id)
+                for block in self.function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op == "Alloca" and instruction.res is not None
+            ),
+        }
+        for value_id in sorted(self._heap_indexed - view_owners):
+            self.shortfalls.append(FortranShortfall(
+                "GetElementPtr", "",
+                f"heap value {value_id} is indexed but is neither a formal "
+                "cell nor an allocation result, so its view has no point "
+                "at which to follow the arena",
+            ))
+        for value in self.outputs:
+            if int(value.id) in (*self._heap_elements, *self._heap_owner_ids) and (
+                int(value.id) not in {int(argument.id) for argument in self.function.args}
+            ):
+                self.shortfalls.append(FortranShortfall(
+                    "Ret", "",
+                    f"heap value {int(value.id)} leaves the subroutine as a "
+                    "new output; a heap sequence result has no Fortran ABI",
+                ))
+        if self.release_heap_owners and any(
+            int(value.id) in self._heap_elements for value in self.outputs
+        ):
+            self.shortfalls.append(FortranShortfall(
+                "Ret", "",
+                "the entry releases its heap on return, but a heap sequence "
+                "is one of its results",
+            ))
+        rendered = "\n".join(body)
+        for value_id in sorted((*self._heap_elements, *self._heap_owner_ids)):
+            if re.search(rf"\bt{value_id}\(", rendered):
+                # A heap cell holds an address, never elements; any other
+                # emission path that indexed it would read the cell itself.
+                self.shortfalls.append(FortranShortfall(
+                    "GetElementPtr", "",
+                    f"heap cell {value_id} is indexed directly; only its "
+                    "arena view may be indexed",
+                ))
 
         # A bind(C) procedure may not take assumed-shape (``x(:)``) dummies:
         # those need a descriptor the C caller has no way to build before
@@ -4561,6 +4900,8 @@ class _FunctionEmitter:
             if (
                 _is_array(argument)
                 or int(argument.id) in self.array_base_ids
+                or int(argument.id) in self._heap_elements
+                or int(argument.id) in self._heap_owner_ids
                 or int(argument.id) in output_ids
                 or int(argument.id) in assigned_ids
                 or int(argument.id) in self.mutated_base_ids
@@ -4582,6 +4923,14 @@ class _FunctionEmitter:
         for argument_occurrence in self.function.args:
             argument = self._typed(argument_occurrence)
             kind = _DTYPE_KIND.get(argument.dtype or self.dtype, "real(c_double)")
+            if (
+                int(argument.id) in self._heap_elements
+                or int(argument.id) in self._heap_owner_ids
+            ):
+                declarations.append(
+                    f"    type(c_ptr), intent(inout) :: {_name(argument)}"
+                )
+                continue
             if int(argument.id) in self.array_base_ids and not _is_array(argument):
                 mutated = (
                     int(argument.id) in self.mutated_base_ids
@@ -4683,6 +5032,12 @@ class _FunctionEmitter:
         for value in self._locals.values():
             if value.id in bound:
                 continue
+            if (
+                int(value.id) in self._heap_elements
+                or int(value.id) in self._heap_owner_ids
+            ):
+                declarations.append(f"    type(c_ptr) :: {_name(value)}")
+                continue
             kind = _DTYPE_KIND.get(value.dtype or self.dtype, "real(c_double)")
             dynamic_extents = self.dynamic_array_leading_extents.get(
                 int(value.id), ()
@@ -4713,6 +5068,16 @@ class _FunctionEmitter:
         declarations.extend(
             f"    integer(c_int) :: {index}" for index in self._loop_variables
         )
+        for value_id in sorted(self._heap_views):
+            element = self._heap_elements[value_id]
+            kind = _DTYPE_KIND.get(element)
+            if kind is None:
+                self.shortfalls.append(FortranShortfall(
+                    "GetElementPtr", "",
+                    f"no Fortran kind for heap element dtype {element!r}",
+                ))
+                continue
+            declarations.append(f"    {kind}, pointer :: t{value_id}_v(:)")
 
         name = self.function.name
         native_name = self.native_symbol
@@ -4789,6 +5154,7 @@ def emit_function(
     native_symbol: str | None = None,
     callee_native_symbols: Mapping[str, str] | None = None,
     extent_namespace: str = "",
+    release_heap_owners: bool = False,
 ) -> FortranSubroutine:
     """Translate one SSA function into a bind(C) Fortran subroutine.
 
@@ -4843,6 +5209,7 @@ def emit_function(
         native_symbol=native_symbol,
         callee_native_symbols=callee_native_symbols,
         extent_namespace=extent_namespace,
+        release_heap_owners=release_heap_owners,
     ).emit()
 
 
@@ -6135,6 +6502,25 @@ def emit_module(
                         if settled and callee_dtypes.get(callee_id) != settled:
                             callee_dtypes[callee_id] = settled
                             changed_dtypes = True
+    # Program: ``ys = sorted([5, n, 2, 9])`` (c127; lane E).  Wrong record:
+    # call-binding rank propagation gave a heap sequence's capacity cell
+    # rank one, so the entry exposed it as an array whose extent no feed
+    # can supply.  Rule: a heap sequence's capacity is one scalar cell (its
+    # arena is reached through the column's pointer cell).  The cell is
+    # minted once and bound through every helper, including helpers whose
+    # own table does not describe the sequence (a sort's scratch arenas).
+    heap_capacity_ids = {
+        int(descriptor.capacity_value_id)
+        for table in module_sequence_tables.values()
+        for descriptor in table.sequences.values()
+        if descriptor.heap_owner_value_id is not None
+    }
+    for function_name, ranks in function_value_ranks.items():
+        for capacity_id in heap_capacity_ids & set(ranks):
+            ranks[capacity_id] = 0
+        method_array_bases.get(function_name, set()).difference_update(
+            heap_capacity_ids
+        )
     for function_name, ranks in function_value_ranks.items():
         formal_ids = {
             int(argument.id) for argument in functions[function_name].args
@@ -6305,6 +6691,16 @@ def emit_module(
         callee_extents = updated_extents
     else:  # pragma: no cover - finite call signatures must converge.
         raise RuntimeError("Fortran call ABI extents did not reach a fixed point")
+    # A function no other function here calls is an entry: it owns the heap
+    # its frame's owner cells collect, and releases it on return.
+    called_functions = {
+        str(instruction.attributes.get("callee") or "")
+        for function in functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in {"Call", "call"}
+    }
+
     def emit_subroutines(
         signatures: Mapping[str, Sequence[str]],
         formal_dtypes: Mapping[str, Sequence[str]] | None = None,
@@ -6344,6 +6740,7 @@ def emit_module(
                 native_symbol=native_symbols[function_name],
                 callee_native_symbols=native_symbols,
                 extent_namespace=extent_namespaces[function_name],
+                release_heap_owners=function_name not in called_functions,
             )
             for function_name, function in functions.items()
         )
@@ -6413,6 +6810,11 @@ def emit_module(
         "    end if",
         "  end function turing_python_bit_length",
         "",
+        *(
+            _HEAP_HELPERS
+            if any("turing_heap_" in sub.source for sub in subroutines)
+            else ()
+        ),
         *[sub.source for sub in subroutines],
         "",
         f"end module {name}",
@@ -7178,6 +7580,8 @@ _FORTRAN_ABI_NUMPY_DTYPES = {
     for numpy_name in (shell_numpy_dtype(name),)
     if numpy_name is not None
 }
+# An owned-heap cell is one native address slot, handed in null.
+_FORTRAN_ABI_NUMPY_DTYPES["c_void_p"] = np.dtype(np.uintp)
 
 
 class FortranCoreExecution:
@@ -7288,7 +7692,20 @@ class FortranCoreNative:
         metadata = {} if self._api is None else dict(self._api.metadata)
         descriptors = {int(item["sequence_id"]): item for item in
             (metadata.get("sequence_tables") or {}).get(self._entry_record.name, ())}
+        pointer_parameters = {
+            str(parameter.name): str(parameter.dtype) == "ptr"
+            for parameter in parameters
+        }
         for binding in (metadata.get("sequence_runtime_bindings") or {}).get(self._entry_record.name, ()):
+            if any(
+                pointer_parameters.get(str(column))
+                for column in binding["column_parameters"]
+            ):
+                # A heap sequence's column is a null cell, not resident
+                # rows: its capacity stays 0, so the first append grows it.
+                # Read from the column's own ABI type: a callee's binding
+                # can carry a sequence id that names another root sequence.
+                continue
             if "column_shapes" in binding:
                 row_shapes = {
                     int(column.lstrip("t")): tuple(shape)

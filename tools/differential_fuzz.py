@@ -286,6 +286,8 @@ EXTENDED3 = [
     (["t{v} = 0", "for k{v}, x{v} in enumerate([{a}, n, {b}], n % 4 + {c}):", "    t{v} = t{v} * 10 + k{v} * x{v}"], "t{v}"),
     # a callee filters a list literal in its loop, so it keeps live flags (c197)
     ([], "positives([{a}, -{b}, {c}]) * 10 + n"),
+    # a list grown at run time, then sorted (Fortran list growth; lane E)
+    (["xs{v} = []", "for k{v} in range(n % 4 + {a} + 1):", "    xs{v}.append((k{v} * {b} + n) % 9)", "ys{v} = sorted(xs{v})"], "ys{v}[0] * 100 + ys{v}[-1] * 10 + len(xs{v})"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v

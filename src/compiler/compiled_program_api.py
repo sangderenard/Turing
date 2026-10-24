@@ -240,6 +240,25 @@ def describe_fortran_function(
                 or accounting.get("compiler_frame_storage") is not None
             )
         )
+        if str(value.dtype) == "ptr" and (
+            accounting.get("heap_owner")
+            or accounting.get("heap_element_dtype") is not None
+        ):
+            # An owned-heap cell (a sequence column or its owner) is one
+            # native address slot the emitter declares ``type(c_ptr)``; the
+            # caller hands it in null and the entry releases what it holds.
+            parameters.append(
+                Parameter(
+                    name=f"t{value.id}",
+                    role="workspace" if workspace else "inout",
+                    dtype="ptr",
+                    c_type="void *",
+                    ctypes_name="c_void_p",
+                    passing="reference",
+                    source_name=authored_source_name,
+                )
+            )
+            continue
         dimensions = dynamic_array_dimensions.get(int(value.id), ()) or tuple(
             f"extent_{int(size)}" for size in value.shape)
         parameters.append(
