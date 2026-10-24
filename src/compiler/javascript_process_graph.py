@@ -335,7 +335,7 @@ class _JavaScriptProcessInterpreter:
     ) -> int:
         zero = self.make_node(
             "Constant", Handler.Const.name, "0", (),
-            attributes={"value": 0}, constant=0, source=source,
+            attributes={"value": 0.0}, constant=0.0, source=source,
             output_roles=("value",), value_kind="number",
         )
         equals_zero = self.make_node(
@@ -585,6 +585,13 @@ class _JavaScriptProcessInterpreter:
                     source=expr,
                 )
             value_kind = "boolean" if isinstance(value, bool) else "number"
+            # A JavaScript Number is an IEEE double.  Acorn's JSON hands an
+            # integral literal over as a Python int, which the repository's
+            # scalar typing reads as int64: ``1 / 2`` and ``2 ** 64`` would
+            # then lower as integer arithmetic.  The literal's value is the
+            # double, so the constant carries the double.
+            if value_kind == "number":
+                value = float(value)
             return self.make_node(
                 "Constant", Handler.Const.name, repr(value), (),
                 attributes={"value": value}, constant=value, source=expr,
