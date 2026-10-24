@@ -53,3 +53,28 @@ def test_method_coverage_reads_source_qualified_names():
         "__init__": "present", "bump": "missing",
     }
     assert method_coverage("Toy", ["bump"], None) == {"bump": "unreached"}
+
+
+ACC = '''
+class Acc:
+    def __init__(self) -> None:
+        pass
+
+    def add(self, a: int, b: int) -> int:
+        return a + b
+'''
+
+
+def test_class_route_never_ships_a_library_without_a_planned_method(tmp_path):
+    source = tmp_path / "acc.py"
+    source.write_text(ACC, encoding="utf-8")
+    route = run_class_route(source, "Acc", tmp_path / "out")
+    assert route["planned_methods"] == ["__init__", "add"]
+    missing = route["false_acceptance_candidates"]
+    if route["refusal"] is None:
+        # A library was produced: it must hold every method.
+        assert missing == []
+    else:
+        # A dropped method is refused by name, never passed over.
+        for method in missing:
+            assert repr(method) in route["refusal"]["message"]
