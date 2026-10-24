@@ -33,6 +33,15 @@ class HostImplementationKind(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class NativeTargetContext:
+    """One explicit build/execution target shared by compiler consumers.
+
+    Architecture alone is not a native target: object format, operating
+    system, and ABI decide whether retained code can be linked or loaded.
+    ``name`` is the stable command/product identity (for example
+    ``ios-arm64``); the remaining fields are the facts backends and machine
+    executors consume rather than reconstructing them from that name.
+    """
+
     architecture: str
     operating_system: str
     abi: str
@@ -43,6 +52,48 @@ class NativeTargetContext:
     # Empty is deliberately the default: accepting repository SSA does not
     # imply accepting a whole guest-machine state transition.
     machine_state_ssa_dialects: frozenset[str] = frozenset()
+    name: str = ""
+    llvm_triple: str | None = None
+    toolchain_target: str | None = None
+    sdk: str | None = None
+    minimum_os_version: str | None = None
+    pointer_width_bits: int = 64
+    byte_order: str = "little"
+
+    def __post_init__(self) -> None:
+        if not self.architecture or not self.operating_system or not self.abi:
+            raise ValueError("build targets require architecture, OS, and ABI")
+        if self.pointer_width_bits not in {16, 32, 64, 128}:
+            raise ValueError("build-target pointer width must be explicit and supported")
+        if self.byte_order not in {"little", "big"}:
+            raise ValueError("build-target byte order must be 'little' or 'big'")
+
+    @property
+    def identity(self) -> str:
+        return self.name or (
+            f"{self.operating_system}-{self.architecture}-{self.abi}"
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": "turing.build-target.v1",
+            "identity": self.identity,
+            "architecture": self.architecture,
+            "operating_system": self.operating_system,
+            "abi": self.abi,
+            "object_formats": tuple(sorted(self.object_formats)),
+            "accepts_loadable_images": self.accepts_loadable_images,
+            "accepts_relocatable_objects": self.accepts_relocatable_objects,
+            "machine_state_ssa_dialects": tuple(sorted(
+                self.machine_state_ssa_dialects
+            )),
+            "llvm_triple": self.llvm_triple,
+            "toolchain_target": self.toolchain_target,
+            "sdk": self.sdk,
+            "minimum_os_version": self.minimum_os_version,
+            "pointer_width_bits": self.pointer_width_bits,
+            "byte_order": self.byte_order,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +133,10 @@ class RetainedNativeModule:
     def digest(self) -> str:
         return sha256(self.encoded).hexdigest()
 
-    def retention_mode(self, target: NativeTargetContext) -> NativeRetentionMode:
+    def retention_mode(
+        self, target: NativeTargetContext | str,
+    ) -> NativeRetentionMode:
+        target = resolve_build_target(target)
         if (
             target.architecture.casefold() != self.architecture.casefold()
             or target.operating_system.casefold() != self.operating_system.casefold()
@@ -101,7 +155,9 @@ class RetainedNativeModule:
             return NativeRetentionMode.RELOCATABLE_OBJECT
         return NativeRetentionMode.TRANSLATE
 
-    def require_compatible(self, target: NativeTargetContext) -> NativeRetentionMode:
+    def require_compatible(
+        self, target: NativeTargetContext | str,
+    ) -> NativeRetentionMode:
         mode = self.retention_mode(target)
         if mode is NativeRetentionMode.TRANSLATE:
             raise ValueError(
@@ -205,7 +261,7 @@ def select_host_implementation(
     machine_state_ssa_complete: bool = False,
     machine_state_ssa_dialect: str = "turing.machine-state-ssa.amd64.v1",
     retained_native_module: RetainedNativeModule | None,
-    target: NativeTargetContext,
+    target: NativeTargetContext | str,
     prefer_native: bool = True,
 ) -> HostImplementationDecision:
     """Choose a deployable implementation without disguising incompatibility.
@@ -216,6 +272,7 @@ def select_host_implementation(
     decision explicitly requires continued machine-SSA translation.
     """
 
+    target = resolve_build_target(target)
     native_mode = (
         retained_native_module.retention_mode(target)
         if retained_native_module is not None else None
@@ -278,11 +335,15 @@ def select_host_implementation(
     )
 WINDOWS_AMD64_NATIVE_LOADER = NativeTargetContext(
     "amd64", "windows", "windows-x64", frozenset({"pe-image", "coff-object"}),
-    accepts_loadable_images=True,
+    accepts_loadable_images=True, name="windows-amd64-loader",
+    llvm_triple="x86_64-windows-gnu", toolchain_target="x86_64-windows-gnu",
+    sdk="windows",
 )
 WINDOWS_AMD64_NATIVE_LINKER = NativeTargetContext(
     "amd64", "windows", "windows-x64", frozenset({"coff-object"}),
-    accepts_loadable_images=False,
+    accepts_loadable_images=False, name="windows-amd64",
+    llvm_triple="x86_64-windows-gnu", toolchain_target="x86_64-windows-gnu",
+    sdk="windows",
 )
 PORTABLE_AMD64_MACHINE_SSA_VM = NativeTargetContext(
     "portable-vm", "internal", "machine-state-v1", frozenset(),
@@ -290,13 +351,100 @@ PORTABLE_AMD64_MACHINE_SSA_VM = NativeTargetContext(
     machine_state_ssa_dialects=frozenset({
         "turing.machine-state-ssa.amd64.v1",
     }),
+    name="portable-amd64-machine-ssa-vm",
 )
+X86_64_PORTABLE_EXECUTOR = NativeTargetContext(
+    "x86-64", "portable", "machine-state-v1", frozenset(),
+    accepts_relocatable_objects=False,
+    machine_state_ssa_dialects=frozenset({
+        "turing.machine-state-ssa.amd64.v1",
+    }),
+    name="x86-64-portable",
+)
+IOS_ARM64_NATIVE_LINKER = NativeTargetContext(
+    "arm64", "ios", "darwin-arm64", frozenset({"macho-object"}),
+    accepts_loadable_images=False, name="ios-arm64",
+    llvm_triple="aarch64-apple-ios15.0", toolchain_target="aarch64-ios",
+    sdk="iphoneos",
+    minimum_os_version="15.0",
+)
+ANDROID_ARM64_NATIVE_LINKER = NativeTargetContext(
+    "arm64", "android", "aapcs64", frozenset({"elf-object"}),
+    accepts_loadable_images=False, name="android-arm64-v8a",
+    llvm_triple="aarch64-linux-android24",
+    toolchain_target="aarch64-linux-android", sdk="android-ndk",
+    minimum_os_version="24",
+)
+
+_BUILD_TARGETS = MappingProxyType({
+    target.identity: target
+    for target in (
+        WINDOWS_AMD64_NATIVE_LOADER,
+        WINDOWS_AMD64_NATIVE_LINKER,
+        PORTABLE_AMD64_MACHINE_SSA_VM,
+        X86_64_PORTABLE_EXECUTOR,
+        IOS_ARM64_NATIVE_LINKER,
+        ANDROID_ARM64_NATIVE_LINKER,
+    )
+})
+
+
+def build_targets() -> Mapping[str, NativeTargetContext]:
+    """Return the closed, named build/execution target registry."""
+
+    return _BUILD_TARGETS
+
+
+def resolve_build_target(
+    target: NativeTargetContext | str,
+) -> NativeTargetContext:
+    """Resolve one target once, before backend or executor selection."""
+
+    if isinstance(target, NativeTargetContext):
+        return target
+    try:
+        return _BUILD_TARGETS[str(target)]
+    except KeyError as error:
+        raise KeyError(
+            f"unknown build target {target!r}; one of {sorted(_BUILD_TARGETS)}"
+        ) from error
+
+
+def build_target_from_metadata(
+    metadata: Mapping[str, object],
+) -> NativeTargetContext | None:
+    """Read and verify the compiler-owned target passed to a backend.
+
+    Serialized module metadata is only a receipt.  The registry remains the
+    owning record, so a backend never trusts a hand-edited triple or ABI.
+    """
+
+    record = metadata.get("build_target")
+    if record is None:
+        return None
+    if not isinstance(record, Mapping):
+        raise ValueError("module build_target metadata must be a mapping")
+    if record.get("schema") != "turing.build-target.v1":
+        raise ValueError("module build_target metadata has an unknown schema")
+    target = resolve_build_target(str(record.get("identity") or ""))
+    canonical = target.to_mapping()
+    for key, expected in canonical.items():
+        actual = record.get(key)
+        if isinstance(expected, tuple):
+            actual = tuple(actual or ())
+        if actual != expected:
+            raise ValueError(
+                f"module build_target {target.identity!r} disagrees on {key}"
+            )
+    return target
 
 
 __all__ = [
     "HostImplementationDecision", "HostImplementationKind",
     "NativeRetentionMode", "NativeTargetContext", "RetainedNativeModule",
+    "ANDROID_ARM64_NATIVE_LINKER", "IOS_ARM64_NATIVE_LINKER",
     "PORTABLE_AMD64_MACHINE_SSA_VM", "WINDOWS_AMD64_NATIVE_LINKER",
-    "WINDOWS_AMD64_NATIVE_LOADER",
+    "WINDOWS_AMD64_NATIVE_LOADER", "X86_64_PORTABLE_EXECUTOR",
+    "build_target_from_metadata", "build_targets", "resolve_build_target",
     "retain_elf_image", "retain_pe_image", "select_host_implementation",
 ]

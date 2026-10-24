@@ -4,8 +4,9 @@
 
 Canonical source is C:/dev/Powershell/turing, its own main repository. Compiler
 repairs and profiling are installed in that repo and the native-fallback-link
-copied child plus build/n4-repair/turing. Read the CURRENT opening receipt in
-TEST_BASELINE_AND_HAZARDS.md; older unapplied/live-untouched claims are historical.
+copied child plus build/n4-repair/turing. Read the CURRENT opening receipt: the
+newest file in docs/hazards/ (`python tools/hazards_log.py` prints the log newest
+first); older unapplied/live-untouched claims are historical.
 Do not merge the parent coordination repo expecting it to carry ignored Turing
 sources. New Turing worktrees must come from Turing's own integrated history.
 
@@ -207,9 +208,16 @@ Run targeted `pytest` suites for the modules you touch before committing; new co
 
 ## Testing
 
-Before running tests, read [TEST_BASELINE_AND_HAZARDS.md](TEST_BASELINE_AND_HAZARDS.md).
-It lists the tests already failing at `af00599`, the ~40-second regression gate to
-prefer, and the measured hazards (the full suite does not finish; there is no
+Before running tests, read the hazards log newest first:
+`python tools/hazards_log.py` prints the entry files in
+[docs/hazards/](docs/hazards/) and then
+[TEST_BASELINE_AND_HAZARDS.md](TEST_BASELINE_AND_HAZARDS.md).
+Write a new log entry as its own file in docs/hazards/
+(`python tools/hazards_log.py new`), never by prepending to
+TEST_BASELINE_AND_HAZARDS.md; two PRs that prepend conflict. Where other
+instructions say "a top entry in TEST_BASELINE_AND_HAZARDS.md", this file is
+what they mean. The old file lists the tests already failing at `af00599`, the
+~40-second regression gate to prefer, and the measured hazards (the full suite does not finish; there is no
 per-test timeout; never baseline with stash or `checkout -- <path>`).
 
 ---

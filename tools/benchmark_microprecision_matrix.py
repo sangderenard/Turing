@@ -170,6 +170,23 @@ def _operation_histogram(module) -> dict[str, int]:
     return dict(sorted(histogram.items()))
 
 
+def _core_extraction_contract():
+    """The extraction contract of a pack core: no record crosses it.
+
+    A pack core's parameters are float64 limb arrays, a count and limb
+    coefficients; none is a record, so the program ABI declares no records
+    and no bindings. Lowering still runs with the machine-decompilation gate
+    on, which ``lower_ast_source_to_ssa`` requires.
+    """
+
+    from src.compiler.extraction_contract import ExtractionContract
+
+    return ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    ).with_program_abi({"records": {}, "bindings": [], "values": []})
+
+
 def _prepare_core(
     name: str, width: int, two_product_flavor: str = "fma",
 ) -> CompiledCore:
@@ -191,7 +208,9 @@ def _prepare_core(
     from src.compiler.ir_identities import two_product_flavor_scope
 
     with two_product_flavor_scope(two_product_flavor):
-        lowered = lower_ast_source_to_ssa(source, entry)
+        lowered = lower_ast_source_to_ssa(
+            source, entry, extraction_contract=_core_extraction_contract(),
+        )
     module = lowered if isinstance(lowered, IRModule) else lowered[0]
     apply_precision_pipeline(module, two_product_flavor=two_product_flavor)
     lower_ns = time.perf_counter_ns() - started

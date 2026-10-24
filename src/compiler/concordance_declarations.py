@@ -1095,6 +1095,9 @@ CONTROL_SSA_CONDITIONAL = declare_stage("control_ssa_conditional")
 CONTROL_SSA_LOOP = declare_stage("control_ssa_loop")
 CONTROL_SSA_REGION = declare_stage("control_ssa_region")
 CONTROL_SSA_FINISH = declare_stage("control_ssa_finish")
+#: ``javascript_source_ingestion``: the ``ssa_value``/``ssa_block`` rows of a
+#: JavaScript function lowered from its interpreter region.
+JAVASCRIPT_SSA_LOWERING = declare_stage("javascript_ssa_lowering")
 UNION_INJECTION = declare_stage("union_injection")
 UNION_PROJECTION = declare_stage("union_projection")
 REDUCER_READ = declare_stage("reducer_read")

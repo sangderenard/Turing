@@ -124,8 +124,11 @@ words past the element count are untouched with an extra group dispatched.
 - The installed control shell (`compose_control_shader`) compiles for
   Vulkan now (section "Vulkan-ready control shell"), but it is not a
   published product yet.
-- The precision-core compute lane (`ssa_glsl_compute_backend`) has no
-  component ABI, so it has no product yet.
+- The precision-core compute lane cannot compile today's lowered precision
+  cores: the wrapper's bound is now a `Cast` of the count and its body calls
+  three planned regions, while the emitter reads one (section "Precision
+  compute product"). Its product is proven on hand-built kernels of the shape
+  it reads.
 - Deployable SPIR-V for a matmul, an axis reduction, or any function that
   mixes a reduction with other work over runtime-sized spans. Elementwise
   functions deploy in element mode, and a lone whole-span reduction deploys
@@ -302,4 +305,54 @@ Evidence:
   (storage buffers bound at the record's bindings, uniforms set by the
   record's names, groups from its local size) and matches numpy over 1000
   elements, with the words past the count left untouched.
+
+## Precision compute product (follow-up, 2026-10-24)
+
+Wrong records found on the way:
+
+- **Baked trip count read every coefficient one slot off.** With the count
+  baked, `emit_ssa_module_to_glsl_compute` dropped `element_count` from the
+  scalars block but kept `uint _pad0`, so `scalars[]` sat at byte 8 while
+  `prepare_execution` packs the doubles from byte 0. On llvmpipe,
+  `y = fma(x, 3, 0.25)` computed `x * 0.25`. The block now has no header when
+  the count is baked (glslang reflection: `ScalarFeed.scalars` at offset 0).
+- **GLSL `fma()` is not single-rounding on Mesa.** A `precise double`
+  `fma()` on llvmpipe and on lavapipe rounds twice: 45 of 777 elements equal
+  `x*c + d` and differ from the once-rounded value. GLSL allows this (it
+  fixes only that every fma() consumed by a precise variable rounds the same
+  way). The record publishes an `fma-rounding` shortfall whenever the source
+  calls `fma()`.
+
+Rule: `GLSLComputeArtifact.component_abi`, `.deployment()`
+(`shader_deployment.precision_compute_deployment`) and `.write()` publish
+the layout the emitter already documented:
+
+- ports: read buffers, then each coefficient (a feed carried in the scalars
+  block), then written buffers; all `f64`, `value_id` the wrapper's SSA id;
+- resources: `Buffer<slot>` at set 0, binding `slot` (`read`, or
+  `read_write` when stored into), runtime-sized (`extents_from: "fed"`); and
+  `ScalarFeed` at binding `n` with one view per coefficient at byte
+  `8 + 8k` (or `8k` baked), its members listed with their offsets;
+- launch: local size 64; the `element_count` control (u32 at byte 0 of
+  `ScalarFeed`, derived from the count's value id) and a `cover` group rule
+  on x only, or, baked, `exact` groups and no control;
+- targets OpenGL 4.3 and Vulkan 1.1 (`Float64`), with the source's
+  `#extension` lines on each resource.
+
+Evidence (`tests/test_precision_compute_product.py`, kernels built by hand
+in the wrapper-plus-region shape, run and baked count each):
+
+- every block's binding and `ScalarFeed`'s member offsets match glslang
+  reflection, and the source compiles for OpenGL and `-V --target-env
+  vulkan1.1`;
+- driven only from the record (buffer bytes from views and control offsets,
+  groups from the rule), the shader matches the fma reference on llvmpipe
+  and on lavapipe over 777 elements, with words past the count untouched;
+  `prepare_execution` now feeds a baked kernel the coefficients it reads.
+
+Also: `tools/benchmark_microprecision_matrix._prepare_core` lowers with an
+extraction contract that declares no records (a pack core passes only
+limb arrays, a count and coefficients), which `lower_ast_source_to_ssa`
+requires. The lane's own tests still fail after that, on the wrapper shape
+above.
 

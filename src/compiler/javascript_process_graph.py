@@ -403,6 +403,166 @@ class _JavaScriptProcessInterpreter:
             value_kind="boolean",
         )
 
+    def _node(
+        self,
+        handler: Handler,
+        parents: Sequence[tuple[int, str]],
+        source: Mapping[str, Any],
+        kind: str,
+    ) -> int:
+        return self.make_node(
+            handler.name, handler.name, handler.name, parents,
+            source=source, value_kind=kind,
+        )
+
+    def _call(
+        self, operation: str, operand: int, source: Mapping[str, Any], kind: str,
+    ) -> int:
+        return self.make_node(
+            "Call", Handler.Call.name, operation, ((operand, "arg0"),),
+            attributes={"callee": operation, "tensor_operation": operation},
+            source=source, value_kind=kind,
+        )
+
+    def _number(self, value: float, source: Mapping[str, Any]) -> int:
+        return self.make_node(
+            "Constant", Handler.Const.name, repr(value), (),
+            attributes={"value": float(value)}, constant=float(value),
+            source=source, output_roles=("value",), value_kind="number",
+        )
+
+    def _negative_sign(self, value: int, source: Mapping[str, Any]) -> int:
+        """True for negative numbers and -0 (``1 / -0`` is -Infinity)."""
+
+        zero = self._number(0.0, source)
+        below = self._node(
+            Handler.Lt, ((value, "left"), (zero, "right")), source, "boolean",
+        )
+        is_zero = self._node(
+            Handler.Eq, ((value, "left"), (zero, "right")), source, "boolean",
+        )
+        reciprocal = self._node(
+            Handler.Div, ((self._number(1.0, source), "left"), (value, "right")),
+            source, "number",
+        )
+        negative_zero = self._node(
+            Handler.LAnd,
+            ((is_zero, "left"), (self._node(
+                Handler.Lt, ((reciprocal, "left"), (zero, "right")),
+                source, "boolean",
+            ), "right")),
+            source, "boolean",
+        )
+        return self._node(
+            Handler.LOr, ((below, "left"), (negative_zero, "right")),
+            source, "boolean",
+        )
+
+    def _remainder(
+        self, dividend: int, divisor: int, source: Mapping[str, Any],
+    ) -> int:
+        """ECMAScript Number::remainder: truncated, with the dividend's sign.
+
+        The repository Mod is floored (Python's ``%``).  On non-negative
+        operands floored and truncated agree, and the remainder of
+        magnitudes is exact, so ``|a| mod |b|`` carries the dividend's sign
+        back, -0 included.  NaN, an infinite dividend and a zero divisor
+        give NaN through Mod itself; an infinite divisor returns ``|a|``.
+        """
+
+        magnitude = self._node(
+            Handler.Mod,
+            ((self._call("abs", dividend, source, "number"), "left"),
+             (self._call("abs", divisor, source, "number"), "right")),
+            source, "number",
+        )
+        negated = self._node(
+            Handler.Neg, ((magnitude, "operand"),), source, "number",
+        )
+        return self._node(
+            Handler.Select,
+            ((self._negative_sign(dividend, source), "condition"),
+             (negated, "if_true"), (magnitude, "if_false")),
+            source, "number",
+        )
+
+    def _sign(self, value: int, source: Mapping[str, Any]) -> int:
+        """Math.sign: 1, -1, or the operand itself for +-0 and NaN."""
+
+        zero = self._number(0.0, source)
+        below = self._node(
+            Handler.Select,
+            ((self._node(Handler.Lt, ((value, "left"), (zero, "right")),
+                         source, "boolean"), "condition"),
+             (self._number(-1.0, source), "if_true"), (value, "if_false")),
+            source, "number",
+        )
+        return self._node(
+            Handler.Select,
+            ((self._node(Handler.Gt, ((value, "left"), (zero, "right")),
+                         source, "boolean"), "condition"),
+             (self._number(1.0, source), "if_true"), (below, "if_false")),
+            source, "number",
+        )
+
+    def _extremum(
+        self, left: int, right: int, source: Mapping[str, Any], *, largest: bool,
+    ) -> int:
+        """Math.max / Math.min of two Numbers.
+
+        Any NaN gives NaN, and among equal zeros max prefers +0 and min
+        -0 -- C's fmax/fmin promise neither.  Equal zeros are resolved by
+        addition (``-0 + -0`` is the only sum that is -0) for max, and by
+        its mirror ``-((-a) + (-b))`` for min.
+        """
+
+        order = Handler.Gt if largest else Handler.Lt
+        first = self._node(order, ((left, "left"), (right, "right")), source, "boolean")
+        second = self._node(order, ((right, "left"), (left, "right")), source, "boolean")
+        either_nan = self._node(
+            Handler.LOr,
+            ((self._call("isnan", left, source, "boolean"), "left"),
+             (self._call("isnan", right, source, "boolean"), "right")),
+            source, "boolean",
+        )
+        if largest:
+            zeros = self._node(
+                Handler.Add, ((left, "left"), (right, "right")), source, "number",
+            )
+        else:
+            mirrored = self._node(
+                Handler.Add,
+                ((self._node(Handler.Neg, ((left, "operand"),), source, "number"), "left"),
+                 (self._node(Handler.Neg, ((right, "operand"),), source, "number"), "right")),
+                source, "number",
+            )
+            zeros = self._node(
+                Handler.Neg, ((mirrored, "operand"),), source, "number",
+            )
+        equal = self._node(
+            Handler.Select,
+            ((self._node(Handler.Eq, ((left, "left"), (self._number(0.0, source), "right")),
+                         source, "boolean"), "condition"),
+             (zeros, "if_true"), (left, "if_false")),
+            source, "number",
+        )
+        unordered = self._node(
+            Handler.Select,
+            ((either_nan, "condition"), (self._number(float("nan"), source), "if_true"),
+             (equal, "if_false")),
+            source, "number",
+        )
+        inner = self._node(
+            Handler.Select,
+            ((second, "condition"), (right, "if_true"), (unordered, "if_false")),
+            source, "number",
+        )
+        return self._node(
+            Handler.Select,
+            ((first, "condition"), (left, "if_true"), (inner, "if_false")),
+            source, "number",
+        )
+
     def _exponentiate(
         self, base: int, exponent: int, source: Mapping[str, Any],
     ) -> int:
@@ -502,6 +662,19 @@ class _JavaScriptProcessInterpreter:
         """
 
         parents = ((left, "left"), (right, "right"))
+        if operator == "%":
+            if not self.require(
+                ("number-operands", "ecmascript-number-semantics"),
+                spelling=operator, operands=(left, right),
+            ):
+                return self.unsupported(
+                    operator,
+                    "untranslated-binary-operator",
+                    f"{operator!r} has unproved JavaScript semantics",
+                    source=expr,
+                    parents=parents,
+                )
+            return self._remainder(left, right, expr)
         handler = JAVASCRIPT_BINARY_TO_SSA.get(operator)
         if handler is None:
             reason = (
@@ -682,6 +855,13 @@ class _JavaScriptProcessInterpreter:
                 )
             if program.operator == "pow":
                 return self._exponentiate(arguments[0], arguments[1], expr)
+            if program.operator in {"maximum", "minimum"}:
+                return self._extremum(
+                    arguments[0], arguments[1], expr,
+                    largest=program.operator == "maximum",
+                )
+            if program.operator == "sign":
+                return self._sign(arguments[0], expr)
             attrs = {
                 "callee": program.operator,
                 "tensor_operation": program.operator,
@@ -817,7 +997,9 @@ class _JavaScriptProcessInterpreter:
             right = self.expression(expr.get("right") or {})
             if operator == "=":
                 value = right
-            elif operator.endswith("=") and operator[:-1] in JAVASCRIPT_BINARY_TO_SSA:
+            elif operator.endswith("=") and (
+                operator[:-1] in JAVASCRIPT_BINARY_TO_SSA or operator == "%="
+            ):
                 if operator[:-1] in {"&&", "||"}:
                     # x &&= y assigns only when x is truthy: a branch, not
                     # a binary operator.

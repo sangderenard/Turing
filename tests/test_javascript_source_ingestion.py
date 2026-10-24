@@ -176,3 +176,84 @@ def test_sibling_loops_may_declare_the_same_counter():
         "{ let t = 1; s += t; } { let t = 2; s += t; } return s; }"
     )
     assert check_program(source, "[[0], [3], [NaN]]") == "PASS"
+
+
+SPECIAL_PAIRS = (
+    "[[5, 3], [-5, 3], [5, -3], [-0, 3], [0, -3], [5, 0], [NaN, 1], [1, NaN], "
+    "[Infinity, 2], [2, Infinity], [-2, -Infinity], [-0, -0], [0, -0], [-0, 0]]"
+)
+
+
+@needs_node
+@pytest.mark.parametrize("expression", [
+    # Truncated remainder with the dividend's sign; Mod alone is floored.
+    "a % b",
+    # NaN wins and equal zeros order +0 above -0; a ternary or fmax does not.
+    "Math.max(a, b)", "Math.min(a, b)", "Math.min(b, a)",
+    # +-0 and NaN come back unchanged.
+    "Math.sign(a)",
+])
+def test_remainder_and_math_extrema_are_exact_against_node(expression):
+    source = (
+        "/** @param {number} a @param {number} b */ "
+        f"function root(a, b) {{ return {expression}; }}"
+    )
+    assert check_program(source, SPECIAL_PAIRS) == "PASS"
+
+
+@needs_node
+@pytest.mark.parametrize("source", [
+    "/** @param {boolean} p @param {number} b */ function root(p, b) { return p % b; }",
+    "/** @param {number} a */ function root(a) { return Math.max(a, a, 1); }",
+])
+def test_remainder_of_a_boolean_and_variadic_max_stay_loud_refusals(source):
+    assert not lower_javascript_source_to_ssa(source).complete
+
+
+@needs_node
+def test_module_carries_its_identity_book_through_emission():
+    from src.compiler.emission_concordance import ssa_block_cell, value_cell
+    from src.compiler.identity_concordance import concordance_report
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    lowered = lower_javascript_source_to_ssa(
+        "/** @param {number} n @param {boolean} p */ function root(n, p) "
+        "{ let s = 0; for (let i = 0; i < n; i++) "
+        "{ if (p) { s += i % 3; } else { s = Math.max(s, i); } } return s; }"
+    )
+    assert lowered.complete, lowered.shortfall_report()
+    module = lowered.module
+    book = module.metadata["identity_book"]
+    assert not getattr(book, "detached", False)
+    function = module.functions["root"]
+    values = list(function.args) + [
+        instruction.res
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    ]
+    # Every value and block is on the book the interpreter posted to.
+    assert all(value_cell(book, function, value) is not None for value in values)
+    assert all(ssa_block_cell(book, function, label) for label in function.blocks)
+    assert book.pages["name_binding"].row_count() > 0
+    assert emit_ssa_to_c(module, "root").complete
+    # Emission posted onto that book instead of recording gaps.
+    assert not module.metadata.get("emission_gaps")
+    assert book.pages["emission_function"].row_count() == 1
+    assert concordance_report(module).splitlines()[0].endswith(" 0 finding(s)")
+
+
+@needs_node
+def test_lowering_inside_an_open_compile_posts_to_that_book():
+    from src.compiler.identity_concordance import (
+        begin_identity_book, end_identity_book,
+    )
+
+    book, token = begin_identity_book()
+    try:
+        lowered = lower_javascript_source_to_ssa(
+            "/** @param {number} a */ function root(a) { return a % 2; }"
+        )
+    finally:
+        end_identity_book(token)
+    assert lowered.module.metadata["identity_book"] is book

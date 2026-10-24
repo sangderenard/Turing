@@ -1,10 +1,11 @@
-"""A function whose return sites return different lists is refused.
+"""Return sites that return different lists.
 
-``return [n]`` on one edge and ``return []`` on another are two arenas; the
-caller has one result.  Until the variadic sequence return is lowered (lanes
-plan A6) the planner refuses it by name.  It used to bind only the last
-return site and read the empty list on every path.  The single-display
-return is corpus c215.
+``return [n]`` on one edge and ``return []`` on another are two arenas;
+the caller has one result.  A list born in the function dies at its
+return, so each edge copies its list into the one result list (lanes plan
+A6; corpus c541-c544).  A parameter's list returned on one edge is the
+caller's own object: copying it would split one object in two, so that is
+still refused by name until the caller-side alias check exists.
 """
 
 from __future__ import annotations
@@ -19,20 +20,22 @@ CONTRACT = str(
 )
 
 
-def test_two_returned_lists_are_refused_by_name():
+def test_a_returned_parameter_list_beside_a_local_list_is_refused_by_name():
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
     source = (
-        "def pick(n: int) -> list[int]:\n"
+        "def pick(xs: list[int], n: int) -> list[int]:\n"
+        "    out = [n, n + 1]\n"
         "    if n > 2:\n"
-        "        return [n]\n"
-        "    return []\n"
+        "        return out\n"
+        "    return xs\n"
         "\n\n"
         "def root(n: int) -> int:\n"
-        "    t = pick(n)\n"
-        "    return len(t) * 10 + (t[0] if t else 0)\n"
+        "    base = [7, 8, 9]\n"
+        "    t = pick(base, n)\n"
+        "    return len(t) * 100 + t[0] * 10 + t[-1]\n"
     )
-    with pytest.raises(ValueError, match="returns different collections"):
+    with pytest.raises(ValueError, match="only lists born in the function"):
         lower_ast_source_to_ssa(
             source, "root", name="x", extraction_contract=CONTRACT,
             progress=lambda _: None,

@@ -15,10 +15,11 @@ FINDING (anything else: lowering/emission crash, run failure, SEGV).
 WRONG and TYPE are emergencies: stop and minimize.
 
 Programs using an implementation-approximated operation (``Math.sin``,
-``**``, ...) are judged within the oracle's ulp tier.  The grammar also
-includes spellings the frontend refuses today (``%``, ``Math.sign``,
-``Math.max``, ``&&`` on Numbers) so that each
-refusal stays visible as a LOUD cluster rather than silently vanishing.
+``**``, ...) are judged within the oracle's ulp tier.  ``%``,
+``Math.sign`` and ``Math.max``/``Math.min`` are exact programs, judged bit
+for bit.  The grammar also includes a spelling the frontend refuses today
+(``&&`` on Numbers) so that its refusal stays visible as a LOUD cluster
+rather than silently vanishing.
 
 Usage: python tools/javascript_differential_fuzz.py OUT SEED COUNT
 """
@@ -45,9 +46,6 @@ INPUT_ROWS = (
 NUMBER_LITERALS = ("0", "1", "2", "0.5", "3", "1e308", "1e-308", "10")
 # Implementation-approximated: the oracle judges them by an ulp tier.
 APPROXIMATED_CALLS = ("Math.sin", "Math.cos", "Math.exp", "Math.log", "Math.atan")
-# Refused today; kept so their refusals stay counted.
-LOUD_NUMBER_CALLS = ("Math.sign",)
-LOUD_NUMBER_BINARY = ("%",)
 
 
 class Generator:
@@ -62,7 +60,7 @@ class Generator:
             return rng.choice(self.numbers + list(NUMBER_LITERALS[:4]))
         choice = rng.random()
         if choice < 0.40:
-            op = rng.choice(("+", "-", "*", "/"))
+            op = rng.choice(("+", "-", "*", "/", "%"))
             return f"({self.number(depth - 1)} {op} {self.number(depth - 1)})"
         if choice < 0.50:
             return f"(-{self.number(depth - 1)})"
@@ -81,20 +79,16 @@ class Generator:
         if choice < 0.94:
             call = rng.choice(APPROXIMATED_CALLS)
             return f"{call}({self.number(depth - 1)})"
-        if choice < 0.97:
+        if choice < 0.96:
             return f"({self.number(depth - 1)} ** {self.number(depth - 1)})"
+        if choice < 0.975:
+            return f"Math.sign({self.number(depth - 1)})"
+        if choice < 0.99:
+            call = rng.choice(("Math.max", "Math.min"))
+            return f"{call}({self.number(depth - 1)}, {self.number(depth - 1)})"
         # Rare on purpose: one refused spelling sinks the whole program.
-        loud = rng.randrange(4)
-        if loud == 0:
-            call = rng.choice(LOUD_NUMBER_CALLS)
-            return f"{call}({self.number(depth - 1)})"
-        if loud == 1:
-            op = rng.choice(LOUD_NUMBER_BINARY)
-            return f"({self.number(depth - 1)} {op} {self.number(depth - 1)})"
-        if loud == 2:
-            # ``&&`` on Numbers returns an operand, not a boolean.
-            return f"({self.number(depth - 1)} && {self.number(depth - 1)})"
-        return f"Math.max({self.number(depth - 1)}, {self.number(depth - 1)})"
+        # ``&&`` on Numbers returns an operand, not a boolean.
+        return f"({self.number(depth - 1)} && {self.number(depth - 1)})"
 
     def boolean(self, depth: int) -> str:
         rng = self.rng
@@ -136,7 +130,7 @@ class Generator:
             if form < 0.15:
                 return f"{name}{rng.choice(('++', '--'))};"
             if form < 0.55:
-                op = rng.choice(("+=", "-=", "*=", "/="))
+                op = rng.choice(("+=", "-=", "*=", "/=", "%="))
                 return f"{name} {op} {self.number(depth)};"
             return f"{name} = {self.number(depth)};"
         name = rng.choice(self.mutable_booleans)
