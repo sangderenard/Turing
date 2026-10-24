@@ -48,7 +48,9 @@ _C_BACKEND_PATH = Path(__file__).with_name("c_backend.py")
 # ``slice`` is emitted by the numerical precompiler after Python indexing has
 # already been normalized.  It is intentionally not a public AbstractTensor
 # method name, but it still needs the same real C -> LLVM algorithm registry.
-PRECOMPILE_INTERNAL_OPERATORS = frozenset({"slice", "index_set", "IndexedStore"})
+PRECOMPILE_INTERNAL_OPERATORS = frozenset({
+    "slice", "index_set", "IndexedStore", "scatter_reduce",
+})
 
 # Explicit output-buffer positions in the authored low-level SSA signatures.
 # Scalar-returning helpers (binary_value, sum_double, count_true_double) carry
@@ -76,6 +78,10 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "index_select_double": 1,
     "gather_values_double": 1,
     "scatter_sum_double": 1,
+    "scatter_reduce_double": 1,
+    "scatter_mean_double": 1,
+    "scatter_max_double": 1,
+    "scatter_min_double": 1,
     "index_assign_double": 0,
     "index_set_double": 1,
     "unfold2d_double": 1,
@@ -106,6 +112,10 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "cumsum_dim_double": (2,),
     "reduce_dim_double": (2,),
     "scatter_sum_double": (2,),
+    "scatter_reduce_double": (2,),
+    "scatter_mean_double": (2,),
+    "scatter_max_double": (2,),
+    "scatter_min_double": (2,),
     "mean_dim": (2,),
     "transpose_double": (2, 3),
     "broadcast_double": (2, 4),
@@ -121,6 +131,10 @@ C_SSA_I64_POINTER_ARGUMENTS = {
     "cast_int64_to_double_values": (0,),
     "create_arange_int64": (3,),
     "scatter_sum_double": (5,),
+    "scatter_reduce_double": (5,),
+    "scatter_mean_double": (5,),
+    "scatter_max_double": (5,),
+    "scatter_min_double": (5,),
 }
 
 # Opaque LLVM ``ptr`` does not state whether one address names tensor values
@@ -235,6 +249,10 @@ _C_FUNCTION_ROLES = {
     "index_select_double": "tensor_kernel",
     "gather_values_double": "tensor_kernel",
     "scatter_sum_double": "tensor_kernel",
+    "scatter_reduce_double": "private_helper",
+    "scatter_mean_double": "tensor_kernel",
+    "scatter_max_double": "tensor_kernel",
+    "scatter_min_double": "tensor_kernel",
     "slice_copy_double": "tensor_kernel",
     "index_assign_double": "tensor_kernel",
     "index_set_double": "tensor_kernel",
@@ -1413,9 +1431,9 @@ exit:
   ret void
 }
 
-define internal void @scatter_sum_double(
+define internal void @scatter_reduce_double(
     ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
-    ptr %indices, i32 %index.count, ptr %values) {
+    ptr %indices, i32 %index.count, ptr %values, i32 %reduction) {
 entry:
   br label %extent.header
 
@@ -1459,12 +1477,13 @@ destination.extent:
   %dim64 = sext i32 %dim to i64
   %destination.extent.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
   %destination.count = load i32, ptr %destination.extent.ptr, align 4
+  %is.mean = icmp eq i32 %reduction, 1
   br label %batch.header
 
 batch.header:
   %batch = phi i32 [ 0, %destination.extent ], [ %batch.next, %batch.latch ]
   %batch.continue = icmp slt i32 %batch, %before
-  br i1 %batch.continue, label %item.header, label %exit
+  br i1 %batch.continue, label %item.header, label %reduce.exit
 
 item.header:
   %item = phi i32 [ 0, %batch.header ], [ %item.next, %item.latch ]
@@ -1502,7 +1521,20 @@ element.body:
   %output.ptr = getelementptr inbounds double, ptr %output, i64 %output.index64
   %value = load double, ptr %value.ptr, align 8
   %standing = load double, ptr %output.ptr, align 8
-  %accumulated = fadd double %standing, %value
+  %summed = fadd double %standing, %value
+  %is.max = icmp eq i32 %reduction, 2
+  %is.min = icmp eq i32 %reduction, 3
+  %value.nan = fcmp uno double %value, %value
+  %standing.nan = fcmp uno double %standing, %standing
+  %max.order = fcmp oge double %value, %standing
+  %min.order = fcmp ole double %value, %standing
+  %maximum.normal = select i1 %max.order, double %value, double %standing
+  %minimum.normal = select i1 %min.order, double %value, double %standing
+  %extreme.normal = select i1 %is.max, double %maximum.normal, double %minimum.normal
+  %extreme.standing.nan = select i1 %standing.nan, double %standing, double %extreme.normal
+  %extreme = select i1 %value.nan, double %value, double %extreme.standing.nan
+  %is.extreme = or i1 %is.max, %is.min
+  %accumulated = select i1 %is.extreme, double %extreme, double %summed
   store double %accumulated, ptr %output.ptr, align 8
   %element.next = add nsw i32 %element, 1
   br label %element.header
@@ -1515,7 +1547,84 @@ batch.latch:
   %batch.next = add nsw i32 %batch, 1
   br label %batch.header
 
+reduce.exit:
+  br i1 %is.mean, label %mean.header, label %exit
+
+mean.header:
+  %mean.index = phi i32 [ 0, %reduce.exit ], [ %mean.index.next, %mean.divide ]
+  %mean.continue = icmp slt i32 %mean.index, %output.count
+  br i1 %mean.continue, label %mean.count.header, label %exit
+
+mean.count.header:
+  %mean.item = phi i32 [ 0, %mean.header ], [ %mean.item.next, %mean.count.body ]
+  %mean.count = phi i32 [ 1, %mean.header ], [ %mean.count.next, %mean.count.body ]
+  %mean.count.continue = icmp slt i32 %mean.item, %index.count
+  br i1 %mean.count.continue, label %mean.count.body, label %mean.divide
+
+mean.count.body:
+  %mean.after.quotient = sdiv i32 %mean.index, %after
+  %mean.destination = srem i32 %mean.after.quotient, %destination.count
+  %mean.item64 = sext i32 %mean.item to i64
+  %mean.index.ptr = getelementptr inbounds i64, ptr %indices, i64 %mean.item64
+  %mean.index.value = load i64, ptr %mean.index.ptr, align 8
+  %mean.destination64 = sext i32 %mean.destination to i64
+  %mean.matches = icmp eq i64 %mean.index.value, %mean.destination64
+  %mean.count.incremented = add nsw i32 %mean.count, 1
+  %mean.count.next = select i1 %mean.matches, i32 %mean.count.incremented, i32 %mean.count
+  %mean.item.next = add nsw i32 %mean.item, 1
+  br label %mean.count.header
+
+mean.divide:
+  %mean.divisor = sitofp i32 %mean.count to double
+  %mean.index64 = sext i32 %mean.index to i64
+  %mean.output.ptr = getelementptr inbounds double, ptr %output, i64 %mean.index64
+  %mean.value = load double, ptr %mean.output.ptr, align 8
+  %mean.result = fdiv double %mean.value, %mean.divisor
+  store double %mean.result, ptr %mean.output.ptr, align 8
+  %mean.index.next = add nsw i32 %mean.index, 1
+  br label %mean.header
+
 exit:
+  ret void
+}
+
+define internal void @scatter_sum_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count, ptr %values) {
+entry:
+  call void @scatter_reduce_double(
+      ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+      ptr %indices, i32 %index.count, ptr %values, i32 0)
+  ret void
+}
+
+define internal void @scatter_mean_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count, ptr %values) {
+entry:
+  call void @scatter_reduce_double(
+      ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+      ptr %indices, i32 %index.count, ptr %values, i32 1)
+  ret void
+}
+
+define internal void @scatter_max_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count, ptr %values) {
+entry:
+  call void @scatter_reduce_double(
+      ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+      ptr %indices, i32 %index.count, ptr %values, i32 2)
+  ret void
+}
+
+define internal void @scatter_min_double(
+    ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+    ptr %indices, i32 %index.count, ptr %values) {
+entry:
+  call void @scatter_reduce_double(
+      ptr %input, ptr %output, ptr %shape, i32 %ndim, i32 %dim,
+      ptr %indices, i32 %index.count, ptr %values, i32 3)
   ret void
 }
 
@@ -3117,10 +3226,34 @@ TRANSLATIONS = (
         "single-axis selection from numerical index values",
     ),
     CBackendLLVMSSA(
+        "scatter_reduce_double",
+        "scatter_reduce_double",
+        ("scatter_reduce",),
+        "shared single-axis scatter reduction kernel",
+    ),
+    CBackendLLVMSSA(
         "scatter_sum_double",
         "scatter_sum_double",
         ("scatter",),
         "single-axis scatter-add with repeated-destination accumulation",
+    ),
+    CBackendLLVMSSA(
+        "scatter_mean_double",
+        "scatter_mean_double",
+        ("scatter",),
+        "single-axis scatter-mean including the standing destination value",
+    ),
+    CBackendLLVMSSA(
+        "scatter_max_double",
+        "scatter_max_double",
+        ("scatter",),
+        "single-axis scatter-maximum including the standing destination value",
+    ),
+    CBackendLLVMSSA(
+        "scatter_min_double",
+        "scatter_min_double",
+        ("scatter",),
+        "single-axis scatter-minimum including the standing destination value",
     ),
     CBackendLLVMSSA(
         "index_assign_double",

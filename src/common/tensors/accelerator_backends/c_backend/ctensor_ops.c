@@ -672,10 +672,10 @@
                     after * sizeof(double));
     }
 
-    void scatter_sum_double(
+    static void scatter_reduce_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, const int64_t* indices, int index_count,
-        const double* values) {
+        const double* values, int reduction) {
         int before = 1;
         int after = 1;
         int output_count = 1;
@@ -685,6 +685,19 @@
             if (axis > dim) after *= shape[axis];
         }
         memcpy(output, input, output_count * sizeof(double));
+        int* counts = NULL;
+        if (reduction == 1) {
+            counts = (int*)malloc(shape[dim] * sizeof(int));
+            if (counts != NULL) {
+                for (int destination = 0; destination < shape[dim]; ++destination)
+                    counts[destination] = 1;
+                for (int item = 0; item < index_count; ++item) {
+                    int64_t destination = indices[item];
+                    if (destination >= 0 && destination < shape[dim])
+                        counts[destination] += 1;
+                }
+            }
+        }
         for (int batch = 0; batch < before; ++batch)
             for (int item = 0; item < index_count; ++item)
                 for (int element = 0; element < after; ++element) {
@@ -698,8 +711,69 @@
                         (batch * shape[dim] + (int)destination) * after
                         + element
                     );
-                    output[output_index] += values[source_index];
+                    double value = values[source_index];
+                    if (reduction == 2)
+                        output[output_index] = (
+                            isnan(value) || value >= output[output_index]
+                            ? value : output[output_index]
+                        );
+                    else if (reduction == 3)
+                        output[output_index] = (
+                            isnan(value) || value <= output[output_index]
+                            ? value : output[output_index]
+                        );
+                    else
+                        output[output_index] += value;
                 }
+        if (reduction == 1) {
+            for (int batch = 0; batch < before; ++batch)
+                for (int destination = 0; destination < shape[dim]; ++destination) {
+                    int count = counts == NULL ? 1 : counts[destination];
+                    if (counts == NULL) {
+                        for (int item = 0; item < index_count; ++item)
+                            if (indices[item] == destination) count += 1;
+                    }
+                    for (int element = 0; element < after; ++element) {
+                        int output_index = (
+                            (batch * shape[dim] + destination) * after + element
+                        );
+                        output[output_index] /= (double)count;
+                    }
+                }
+            free(counts);
+        }
+    }
+
+    void scatter_sum_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values) {
+        scatter_reduce_double(
+            input, output, shape, ndim, dim, indices, index_count, values, 0);
+    }
+
+    void scatter_mean_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values) {
+        scatter_reduce_double(
+            input, output, shape, ndim, dim, indices, index_count, values, 1);
+    }
+
+    void scatter_max_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values) {
+        scatter_reduce_double(
+            input, output, shape, ndim, dim, indices, index_count, values, 2);
+    }
+
+    void scatter_min_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values) {
+        scatter_reduce_double(
+            input, output, shape, ndim, dim, indices, index_count, values, 3);
     }
 
     void index_assign_double(

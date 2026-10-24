@@ -3471,20 +3471,27 @@ def lower_tensor_calls_to_repository_ssa(
         _settle_operand_shapes(
             function, function.args, owner_tensor_descriptor,
         )
-        # In the generated bw_tanh VJP, planned-region formal %3 had no
-        # extent or scalar receipt during section lowering.  Treating that
-        # absence as rank zero froze tanh, square and subtraction at one
-        # element, although its exact call feed later proved (2, 2).  Keep
-        # semantic tensor operations intact until the call edge states the
-        # formal's shape or explicitly states scalar storage.  The keyed
-        # tensor property's dynamic shape/rank/count formals are metadata
-        # for its already-proven span, not unshaped tensor data inputs.
+        # In the generated bw_tanh VJP, planned-region formal %3 is the
+        # leading data operand of tanh and has neither extents nor a scalar
+        # receipt during section lowering.  Treating that absence as rank
+        # zero freezes tanh, square and subtraction at one element, although
+        # its exact call feed later proves (2, 2).
+        #
+        # Defer only when that unresolved formal is a tensor operation's
+        # leading data operand (or one of the three data operands of where or
+        # scatter).  Constructor shape/dtype/fill formals and operation
+        # metadata are scalars by contract; deferring the whole region for
+        # those structural formals prevents the same pass from settling its
+        # real tensor operands and leaves downstream shaped arithmetic scalar.
         if (function.metadata or {}).get("source_region_integral"):
             scalar_formals = set(map(int, (
                 (function.metadata or {}).get("scalar_variant_argument_ids")
                 or ()
             )))
-            if any(
+            unresolved_formals = {
+                int(formal.id)
+                for formal in function.args
+                if (
                 not tuple(formal.shape or ())
                 and (formal.accounting or {}).get("tensor_extent_for") is None
                 and int(formal.id) not in scalar_formals
@@ -3492,8 +3499,34 @@ def lower_tensor_calls_to_repository_ssa(
                 is None
                 and (formal.accounting or {}).get("exact_region_feed_source")
                 is None
-                for formal in function.args
-            ):
+                )
+            }
+            unresolved_data_formals = set()
+            constructor_operations = {
+                "arange", "empty", "fill", "full", "ones", "zeros",
+            }
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    operation = (
+                        instruction.attributes.get("tensor_operation")
+                        or instruction.attributes.get("tensor")
+                        or instruction.attributes.get("tensor_candidate")
+                        or _SHAPED_SSA_OPERATIONS.get(instruction.op)
+                    )
+                    if operation is None or str(operation) in constructor_operations:
+                        continue
+                    data_positions = (
+                        range(min(3, len(instruction.args)))
+                        if str(operation) in {"scatter", "where"}
+                        else range(min(1, len(instruction.args)))
+                    )
+                    unresolved_data_formals.update(
+                        int(instruction.args[position].id)
+                        for position in data_positions
+                        if int(instruction.args[position].id)
+                        in unresolved_formals
+                    )
+            if unresolved_data_formals:
                 continue
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
@@ -5275,18 +5308,17 @@ def lower_tensor_calls_to_repository_ssa(
                     # Graphs captured before scatter recorded its reduction
                     # policy carry no attribute.  The AbstractTensor API's
                     # declared default is sum, so absence has that one exact
-                    # meaning; an authored non-sum policy must never reach the
-                    # repository scatter-add kernel.
+                    # meaning.  Every declared policy selects its own wrapper
+                    # around the shared repository reduction kernel.
                     reduction = "sum" if reduction is None else str(reduction)
-                    if reduction != "sum":
+                    if reduction not in {"sum", "mean", "max", "min"}:
                         shortfalls.append(TensorSSALoweringShortfall(
                             function_name,
                             block_name,
                             operation,
                             (
-                                f"scatter reduce={reduction!r} has no matching "
-                                "repository SSA kernel; only reduce='sum' is "
-                                "currently implemented"
+                                f"scatter reduce={reduction!r} is not one of "
+                                "('sum', 'mean', 'max', 'min')"
                             ),
                         ))
                         rewritten.append(instruction)
@@ -5344,7 +5376,7 @@ def lower_tensor_calls_to_repository_ssa(
                         shape_def, rank_def, axis_def, index_count_def,
                     ))
                     emitted.append(call(
-                        "scatter_sum_double",
+                        f"scatter_{reduction}_double",
                         [
                             source, result, shape_value, rank, axis_value,
                             indices, index_count_value, values,
