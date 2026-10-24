@@ -7,4 +7,6 @@ the read order (newest file first, then the old file).
 `python tools/hazards_log.py` prints the log in that order; `new` creates this
 branch's entry file. AGENTS.md (Testing, opening note) and
 frontier_tasks/README.md name the new convention. Documentation and a tool
-only; no compiler code changed. GATE_RESULT_PLACEHOLDER
+only; no compiler code changed. Gate at 3ea17296 vs main b6fba18 (container
+without ziglang, so both trees show the same extra names): failure names
+identical in all four parts. tests/test_hazards_log_tool.py: 4 passed.
