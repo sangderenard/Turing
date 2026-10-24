@@ -152,7 +152,13 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             # rank-2 span, but its shape is still unresolved ().  Storage
             # alone cannot make that empty shape a complete rank-3 type
             # decision: the exact unbroadcast result later supplies (2, 2).
-            complete_shape = bool(recorded[1]) or physical_fields.get('rank') == 0
+            # An unstated rank does not contradict an exact scalar physical
+            # dtype (the bool incumbent test).  Only a POSTED positive rank
+            # proves that an empty shape is still missing extents.
+            complete_shape = (
+                bool(recorded[1])
+                or physical_fields.get('rank') in {None, 0}
+            )
             physical = (
                 bool(accounting.get('physical_dtype') or accounting.get('program_abi_storage'))
                 and recorded[0] not in {None, '', 'unknown'}
