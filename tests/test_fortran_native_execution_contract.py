@@ -1,4 +1,8 @@
 """The existing packed Fortran caller must obey emitted storage records."""
+import ctypes
+import os
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from src.compiler.compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
@@ -65,3 +69,48 @@ def test_fortran_capacity_is_the_minimum_actual_column_row_count():
     assert execution.buffers[3].item() == 3
     with pytest.raises(ValueError, match="capacity exceeds"):
         core.prepare_execution({3: 4})
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DLL search contract")
+def test_fortran_loader_uses_published_runtime_dependency_directory(
+    tmp_path, monkeypatch,
+):
+    toolchain = tmp_path / "toolchain" / "bin"
+    toolchain.mkdir(parents=True)
+    dependency = toolchain / "libgfortran-5.dll"
+    dependency.write_bytes(b"contract path only")
+    library_path = tmp_path / "compiled.dll"
+    library_path.write_bytes(b"loaded by monkeypatch")
+    entry = EntryPoint("root", "root", "control", ())
+    emitted_api = CompiledProgramAPI(
+        "probe", "fortran", "root", (entry,),
+    )
+    published_api = CompiledProgramAPI(
+        "probe", "fortran", "root", (entry,),
+        {"runtime_dependencies": ({
+            "name": dependency.name,
+            "path": dependency.as_posix(),
+        },)},
+    )
+    published_api.write(library_path.with_suffix(".api.yaml"))
+    directories = []
+    handle = object()
+
+    class Packed:
+        restype = None
+        argtypes = None
+
+    monkeypatch.setattr(
+        os, "add_dll_directory",
+        lambda path: directories.append(path) or handle,
+    )
+    monkeypatch.setattr(
+        ctypes, "CDLL", lambda _path: SimpleNamespace(root__packed=Packed()),
+    )
+    FortranCoreNative._LIBRARIES.pop(str(library_path.resolve()), None)
+    FortranCoreNative._DLL_DIRECTORIES.pop(str(toolchain.resolve()), None)
+
+    FortranCoreNative(library_path, entry, emitted_api)
+
+    assert directories == [str(toolchain.resolve())]
+    assert FortranCoreNative._DLL_DIRECTORIES[str(toolchain.resolve())] is handle
