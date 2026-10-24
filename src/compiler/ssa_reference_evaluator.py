@@ -226,7 +226,9 @@ if _INVENTED:
 # ``machine_entry_address`` is the target: the return address is pushed,
 # the callee's formals are bound by name from that state, and its ``Ret``
 # yields RAX and the memory.  Every other caller-saved register the
-# convention lets the callee change is clobbered: using one raises.
+# convention lets the callee change is clobbered: using one raises.  A jump
+# out of the function (``transfer_state_layout``) enters the destination
+# with the complete state, flags included, and its return is the jumper's.
 _MACHINE_INTEGER_OPERATIONS = frozenset({
     "Const", "Cast", "Trunc", "ZExt", "SExt",
     "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "AShr",
@@ -657,6 +659,16 @@ class SSAReferenceEvaluator:
                 operation = str(instruction.op)
 
                 if operation in {"Br", "br"}:
+                    if (
+                        "target" not in instruction.attributes
+                        and "transfer_state_layout" in instruction.attributes
+                    ):
+                        returned = self._machine_transfer(
+                            function, instruction, values,
+                            instruction.attributes.get("target_address"),
+                        )
+                        next_block = None
+                        break
                     if "target" not in instruction.attributes:
                         # A lifted direct jump into another function hands
                         # it the live machine state, which no Br carries.
@@ -670,11 +682,21 @@ class SSAReferenceEvaluator:
                     break
                 if operation in {"CondBr", "condbr"}:
                     predicate = self._operand(values, instruction.args[0])
-                    next_block = str(
-                        instruction.attributes["true_target"]
-                        if bool(np.asarray(predicate).reshape(-1)[0])
-                        else instruction.attributes["false_target"]
+                    side = (
+                        "true" if bool(np.asarray(predicate).reshape(-1)[0])
+                        else "false"
                     )
+                    if (
+                        instruction.attributes.get(f"{side}_target") is None
+                        and "transfer_state_layout" in instruction.attributes
+                    ):
+                        returned = self._machine_transfer(
+                            function, instruction, values,
+                            instruction.attributes.get(f"{side}_target_address"),
+                        )
+                        next_block = None
+                        break
+                    next_block = str(instruction.attributes[f"{side}_target"])
                     break
                 if operation in {"Ret", "ret", "Return", "return"}:
                     returned = tuple(
@@ -788,6 +810,22 @@ class SSAReferenceEvaluator:
         memory = state["memory"].write_unsigned(
             stack, 64, int(attributes["return_address"]),
         )
+        returned = self._machine_enter(
+            callee, state, memory=memory, stack=stack, address=address,
+            flags=None,
+        )
+        return _MachineCallState(returned[0], returned[1], address)
+
+    def _machine_enter(
+        self, callee: Any, state: Mapping[str, Any], *, memory: Any,
+        stack: int, address: Any, flags: Mapping[str, Any] | None,
+    ) -> tuple:
+        """Run ``callee`` from a carried machine state, bound by name.
+
+        ``flags`` is the carried flag state of a jump; a call carries none,
+        so a callee's flag formals are then undefined (DF clear aside).
+        """
+
         names = tuple(callee.metadata["argument_names"])
         registers = tuple(callee.metadata["argument_registers"])
         frame: dict[int, Any] = {}
@@ -796,6 +834,8 @@ class SSAReferenceEvaluator:
                 bound = memory
             elif name == "__machine_rsp":
                 bound = stack
+            elif flags is not None and name in flags:
+                bound = flags[name]
             elif name in _MACHINE_CALL_ENTRY_FLAGS:
                 bound = _MACHINE_CALL_ENTRY_FLAGS[name]
             elif name in _MACHINE_FLAG_FORMALS:
@@ -817,7 +857,7 @@ class SSAReferenceEvaluator:
                 if key not in state:
                     raise SSAEvaluationError(
                         f"{callee.name} reads {name} on entry, which the "
-                        f"call at {address!r} does not carry"
+                        f"transfer at {address!r} does not carry"
                     )
                 bound = state[key]
             else:
@@ -828,7 +868,44 @@ class SSAReferenceEvaluator:
             raise SSAEvaluationError(
                 f"{callee.name} returns no machine memory to its caller"
             )
-        return _MachineCallState(returned[0], returned[1], address)
+        return returned
+
+    def _machine_transfer(
+        self, function: Any, instruction: Any, values: dict[int, Any],
+        target: Any,
+    ) -> tuple:
+        """A jump out of a lifted function: the destination returns for it."""
+
+        attributes = instruction.attributes or {}
+        address = attributes.get("machine_address")
+        layout = attributes.get("transfer_state_layout")
+        if not layout or target is None:
+            raise SSAEvaluationError(
+                f"{function.name}: transfer at machine address {address!r} to "
+                f"{target!r} carries no machine state (needs machine address "
+                "linking)"
+            )
+        carried = instruction.args[len(instruction.args) - len(layout):]
+        state = {
+            name: values[int(argument.id)]
+            for name, argument in zip(layout, carried)
+        }
+        callee = self._machine_function_at(int(target))
+        if callee is None:
+            raise SSAEvaluationError(
+                f"{function.name}: transfer at machine address {address!r} to "
+                f"{int(target):#x}, which no lifted function in the module "
+                "enters (needs machine address linking)"
+            )
+        flags = {
+            f"__machine_{name[len('flag.'):]}": value
+            for name, value in state.items() if name.startswith("flag.")
+        }
+        return self._machine_enter(
+            callee, state, memory=state["memory"],
+            stack=int(state["register.rsp"]) & ((1 << 64) - 1),
+            address=address, flags=flags,
+        )
 
     def _step(
         self,
