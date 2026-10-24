@@ -177,7 +177,17 @@ class TransformationLedger:
             ):
                 refreshed = True
             if rank <= old_rank and not refreshed:
-                if self.concordant_ties and rank == old_rank and after != decision[2]:
+                # The converse of the refinement rule above (A6 probe c985:
+                # ``t, big = compact(n)`` with ``return out, flag``): the
+                # caller's list arena posted its int64 element, the callee's
+                # output records none.  A proposal that agrees on every
+                # field it records and records less states nothing new; the
+                # incumbent stands and the tie is an ordinary rejection.
+                if (
+                    self.concordant_ties and rank == old_rank
+                    and after != decision[2]
+                    and not _refines(after, decision[2])
+                ):
                     raise TransformationConflict(
                         f"incompatible equal-priority contracts for {identity!r}: "
                         f"{decision[2]!r} from {old_proof!r}; {after!r} from {proof!r}"
