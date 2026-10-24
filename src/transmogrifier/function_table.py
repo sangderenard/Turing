@@ -312,7 +312,26 @@ class FunctionTable(TiledObject):
 
         return self._bindings.get(str(name))
 
-    def lexical_reference(self, name: str) -> FunctionReference | None:
+    def reference_by_source_identity(
+        self, identity: tuple[str, str],
+    ) -> FunctionReference | None:
+        """Return the definition declared for ``(module, qualname)``.
+
+        ``metadata["source_identity"]`` is the authored identity a
+        discovered definition was declared with; two modules' ``_compile``
+        (``re`` and ``re._compiler``) never share it.
+        """
+
+        identity = tuple(map(str, identity))
+        matches = tuple(
+            reference for reference, entry in self._entries.items()
+            if tuple(entry.metadata.get("source_identity") or ()) == identity
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    def lexical_reference(
+        self, name: str, module: str | None = None,
+    ) -> FunctionReference | None:
         """Return the function a bare source NAME refers to, if any.
 
         Program: a module function calls builtin ``min(h, k + 1)`` while a
@@ -326,6 +345,24 @@ class FunctionTable(TiledObject):
         non-method definition of that name is its lexical function.
         """
 
+        # Program: ``re.compile`` calls ``_compile(pattern, flags)`` in
+        # ``re`` while ``re._compiler`` also defines ``_compile(code,
+        # pattern, flags)`` (AbstractTensor class compile, through
+        # autograd's ``re.compile``).  Wrong record: the last declared
+        # ``_compile`` answered, so ``code`` was classed ``str`` against
+        # its ``list`` actual and the source value class concordance
+        # refused.  Rule: a bare name in a module resolves to that
+        # module's own definition first.
+        if module is not None:
+            own = tuple(
+                candidate for candidate, entry in self._entries.items()
+                if entry.name == str(name)
+                and entry.metadata.get("method_owner") is None
+                and tuple(entry.metadata.get("source_identity") or ("",))[0]
+                == str(module)
+            )
+            if len(own) == 1:
+                return own[0]
         reference = self.reference(name)
         if reference is None or self._entries[reference].metadata.get(
             "method_owner"
