@@ -319,6 +319,12 @@ class _JavaScriptProcessInterpreter:
                 f"binding {name!r} is already declared in this JavaScript region",
             ))
             return self.bindings[name]
+        # One name may be declared in sibling scopes (each arm's ``let t``)
+        # or read free after a block's own declaration went out of scope;
+        # each is its own row on the book.  "if/else arms that both declare
+        # let t": the second re-posted version 0 and the book refused it.
+        version = self.last_version.get(name, -1) + 1
+        self.last_version[name] = version
         record = {
             "declaration_identity": (
                 f"{self.owner}#javascript-binding:{kind}:{name}:"
@@ -326,7 +332,7 @@ class _JavaScriptProcessInterpreter:
             ),
             "name": name,
             "kind": kind,
-            "version": 0,
+            "version": version,
             "value_node": int(value_node),
             "start": declaration.get("start"),
             "end": declaration.get("end"),

@@ -120,3 +120,15 @@ def test_javascript_corpus_matches_node(path):
     source, inputs = split_program(path.read_text(encoding="utf-8"))
     status = check_program(source, inputs)
     assert status == "PASS" or status.startswith("PASS (approximated"), status
+
+
+@needs_node
+def test_sibling_scopes_may_declare_the_same_name():
+    # Each arm's ``let t`` and each block's ``let u`` is its own binding;
+    # the second once re-posted version 0 and the identity book refused it.
+    source = (
+        "/** @param {boolean} p */ function root(p) { let s = 0; "
+        "if (p) { let t = 1; s = t; } else { let t = 2; s = t; } "
+        "{ let u = 3; s += u; } { let u = 4; s += u; } return s; }"
+    )
+    assert check_program(source, "[[true], [false]]") == "PASS"
