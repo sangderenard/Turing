@@ -135,3 +135,51 @@ def test_call_through_a_stored_callable_field_is_refused_by_name(
         "call through a stored callable field with no lowered invocation: "
         f"Walker.poke: self.{name}(n)"
     ) in refusal["message"]
+
+
+SLOTS = '''
+class Walker:
+    def __init__(self, k: int) -> None:
+        self.k = k
+        self.steps = 5
+
+    def poke(self, n: int) -> int:
+        return n * self.k + 1
+
+    def count(self, n: int) -> int:
+        return self.steps * 10 + n
+'''
+
+
+@pytest.mark.skipif(
+    fortran_compiler() is None, reason="the class route emits through Fortran",
+)
+def test_every_method_reads_the_class_table_slots(tmp_path):
+    # ``__init__`` stored ``k`` in slot 1 while ``poke`` read slot 0, and a
+    # method touching only ``steps`` renumbered it to slot 0: one object
+    # arena passes through every method, laid out as the class table says.
+    source = tmp_path / "walker.py"
+    source.write_text(SLOTS, encoding="utf-8")
+    route = run_class_route(source, "Walker", tmp_path / "out")
+    assert route["refusal"] is None, route["refusal"]
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(str(Path(fortran_compiler()).resolve().parent))
+    library = ctypes.CDLL(route["library"])
+    state = (ctypes.c_double * 2)()
+    init = library.Walker____init__
+    init.restype = None
+    init.argtypes = [
+        ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.c_int64,
+    ]
+    init(2, state, 7)
+    assert list(state) == [7.0, 5.0]
+    for method, expected in (("poke", 3 * 7 + 1), ("count", 5 * 10 + 3)):
+        function = getattr(library, f"Walker__{method}")
+        function.restype = None
+        function.argtypes = [
+            ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        result = ctypes.c_double()
+        function(2, state, 3, ctypes.byref(result))
+        assert result.value == expected

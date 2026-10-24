@@ -23008,9 +23008,14 @@ def _inject_field_slot_access(
     # arena form is the degenerate (and fastest) one-column case.  Slots keep a
     # logical index, while this table resolves that index to (arena, offset),
     # so mixed fields never need coercion or a tagged-object runtime.
+    # Every slot of the receiver has a location, touched here or not: one
+    # object arena passes through every method of its class.
     slot_dtypes = {
         int(slot): str((field_dtypes or {}).get(int(slot), dtype))
-        for _kind, _value_id, slot in field_ops
+        for slot in (
+            *range(int(field_count)),
+            *(int(slot) for _kind, _value_id, slot in field_ops),
+        )
     }
     column_keys = (
         tuple((slot_dtypes[slot], int(slot)) for slot in sorted(slot_dtypes))
@@ -28812,13 +28817,26 @@ def lower_control_sections_to_ssa(
             ),
         )
         nested_record_slots.add(int(slot))
+    # Program: ``Walker.__init__`` writes ``k`` and ``steps``; ``count``
+    # reads only ``steps`` (the SSA interpreter thread's class-route
+    # repro).  Wrong record: each method's receiver view kept only the
+    # slots it touched, renumbered from 0, so ``count`` read ``steps`` from
+    # slot 0, where ``__init__`` had stored ``k`` (one object arena passes
+    # through every method; the class table names one layout).  Rule: a
+    # receiver's scalar slots are every scalar field of its record, in the
+    # record's order, whichever ones this method touches.  A declared
+    # ProgramABI record binds across call edges by field name, so its view
+    # keeps only the fields this method touches.
     scalar_slots = tuple(sorted({
         int(slot)
-        for _kind, _value_id, slot in field_ops
+        for slot in (
+            *(() if declared_contracts else range(len(field_names))),
+            *(int(slot) for _kind, _value_id, slot in field_ops),
+        )
         if int(slot) not in sequence_field_slots
         and int(slot) not in span_slots
         and int(slot) not in nested_record_slots
-    }))
+    })) if field_ops else ()
     compact_slot = {slot: index for index, slot in enumerate(scalar_slots)}
     scalar_field_ops = tuple(
         (kind, value_id, compact_slot[slot])
