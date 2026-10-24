@@ -2878,6 +2878,12 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         nodes_by_value.setdefault(
             int(candidate.get("value_id", candidate_id)), []
         ).append(candidate_id)
+    mutated_ids = {
+        int(record["sequence_value_id"])
+        for record in (
+            graph_obj.graph.get("source_sequence_mutation_records") or {}
+        ).values()
+    }
     for node_id, data in graph_obj.nodes(data=True):
         sequence_id = int(data.get("value_id", node_id))
         expression = data.get("expr_obj")
@@ -2901,6 +2907,27 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         # appends would give one member producer several control blocks,
         # which the control book cannot own (as ``[n, n]`` is refused
         # below).  Rule: refuse such a replication by name.
+        # Program: the tire's ``vector_cross`` (``left[..., 1]``; corpus
+        # c500), whose indexing builds ``[slice(None)] * rank``.  Wrong
+        # record: structural specialization folded the replication, and
+        # its row display ``[slice(None)]``, to literal Constants that
+        # nothing reads (the index folded too).  The refusal below still
+        # asked the replication for a row operand, and the display was
+        # still born, appending a slice selector as a float64 row that C
+        # emission refused.  Rule: a folded collection that reads nothing,
+        # is read by nothing, and shares its identity with no other node
+        # or mutation has no birth to lower; one that is read is still
+        # born, or refused.
+        folded_unread = (
+            attributes.get("structural_specialization")
+            and not data.get("parents")
+            and not data.get("children")
+            and not any(True for _ in graph_obj.successors(node_id))
+            and nodes_by_value.get(sequence_id) == [node_id]
+            and sequence_id not in mutated_ids
+        )
+        if folded_unread:
+            continue
         if attributes.get("producer_kind") == "sequence_replication":
             operands = [
                 int(parent) for parent, role in data.get("parents") or ()
