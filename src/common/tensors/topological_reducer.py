@@ -2232,6 +2232,48 @@ def _source_read_names(node: Any) -> set[str]:
     }
 
 
+def _source_entry_names(node: Any) -> set[str]:
+    """Names whose entry version a control statement can observe: the names
+    it reads (``_source_read_names``) and the names it binds in its own
+    scope.  A name bound in one arm or iteration merges with its entry
+    version on the path that did not bind it."""
+    # Program: ``def root(n, t): if n > 0: t = n * 2; return t + n`` (corpus
+    # c390).  Wrong record: ``t`` is a parameter only rebound inside the arm,
+    # so no Input was minted before the snapshot; the merge found no entry
+    # version, built no Phi, dropped the arm's binding, and the return read
+    # a parameter Input minted afterwards: 4 for n=3, t=1 (Python 9).  Rule:
+    # a parameter a control statement binds exists from function entry, the
+    # same as one it reads.  Nested function, class and lambda bodies and
+    # comprehension targets bind their own scope, not this one.
+    bound: set[str] = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current is not node and isinstance(
+            current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        ):
+            bound.add(current.name)
+            continue
+        if isinstance(current, ast.Lambda):
+            continue
+        if isinstance(current, ast.Name) and isinstance(current.ctx, ast.Store):
+            bound.add(current.id)
+        elif isinstance(current, (ast.Import, ast.ImportFrom)):
+            bound.update(
+                (alias.asname or alias.name).split(".")[0]
+                for alias in current.names
+            )
+        elif isinstance(current, ast.ExceptHandler) and current.name:
+            bound.add(current.name)
+        children = source_child_nodes(current)
+        if isinstance(current, ast.comprehension):
+            children = tuple(
+                child for child in children if child is not current.target
+            )
+        stack.extend(children)
+    return _source_read_names(node) | bound
+
+
 def function_parameter_names(definition: Any) -> tuple[str, ...]:
     """A function definition's declared parameter names, in order.
 
@@ -12994,7 +13036,7 @@ def _normalize_lexical_values(
 
         # Parameters exist from function entry; mint every one this statement
         # reads before any arm does (the rule ``if`` and loops apply).
-        for read_name in _source_read_names(dispatch):
+        for read_name in _source_entry_names(dispatch):
             if (
                 read_name in parameter_names
                 and read_name not in environment
@@ -13436,7 +13478,7 @@ def _normalize_lexical_values(
             # in/out parameter whose storage the caller can no longer bind.
             # Mint every parameter this statement reads BEFORE the snapshot,
             # the rule loops already apply; ``input_value`` is idempotent.
-            for read_name in _source_read_names(body_statement):
+            for read_name in _source_entry_names(body_statement):
                 if (
                     read_name in parameter_names
                     and read_name not in environment
@@ -13969,7 +14011,7 @@ def _normalize_lexical_values(
             # in/out parameter whose storage the caller can no longer bind.
             # Mint every parameter this statement reads BEFORE the snapshot,
             # the rule loops already apply; ``input_value`` is idempotent.
-            for read_name in _source_read_names(body_statement):
+            for read_name in _source_entry_names(body_statement):
                 if (
                     read_name in parameter_names
                     and read_name not in environment
@@ -14122,7 +14164,7 @@ def _normalize_lexical_values(
             # every parameter the loop reads BEFORE the snapshot is strictly
             # more faithful, and ``input_value`` is idempotent, so this mints
             # exactly the Input node the body's own first read would have.
-            for read_name in _source_read_names(body_statement):
+            for read_name in _source_entry_names(body_statement):
                 if (
                     read_name in parameter_names
                     and read_name not in environment

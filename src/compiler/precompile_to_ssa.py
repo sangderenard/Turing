@@ -17241,6 +17241,17 @@ class _ControlSSABuilder(TiledObject):
                     ),
                     "initial_spelled_value_id": int(initial_value_id),
                     "preserved_name_binding_value_ids": tuple(sorted(preserved_binding_sources)),
+                    # The same receipt by Phi operand position: an arm's SSA
+                    # value need not carry its graph id (a loop induction is
+                    # a header Phi with a fresh id), so readers of the
+                    # operands match positions, never ids across the spaces.
+                    "preserved_name_binding_arm_positions": tuple(
+                        position
+                        for position, arm_id in enumerate(
+                            (true_value_id, false_value_id)
+                        )
+                        if int(arm_id) in preserved_binding_sources
+                    ),
                     **({"preserved_name_binding_scope": self.lexical_read_scope,
                         "preserved_name_binding_merge_id": int(merged_value_id)}
                     if preserved_binding_sources else {}),

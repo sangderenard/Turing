@@ -953,7 +953,10 @@ def reconcile_conditional_phi_continuations(module):
                 candidate = (
                     str(block_name), int(instruction_index), operation.res,
                 )
-                for arm in operation.args:
+                preserved_positions = frozenset(attributes.get(
+                    "preserved_name_binding_arm_positions", (),
+                ))
+                for position, arm in enumerate(operation.args):
                     if arm is operation.res:
                         continue
                     # Lowering already proved this source belongs to another
@@ -963,7 +966,16 @@ def reconcile_conditional_phi_continuations(module):
                     # correct Store/compare feeds 0 -> 18, making both names
                     # equal again. Dominance is availability, not rebinding.
                     # Honor the existing name_binding receipt on this Phi.
-                    if int(arm.id) in attributes.get('preserved_name_binding_value_ids', ()):
+                    # Program: ``s = 7; for i in range(n): if i > 1: s = i``
+                    # (corpus c393).  Wrong record: the arm ``i`` is the
+                    # induction's header Phi (a fresh SSA id), so its id never
+                    # matched the receipt's graph id 0; the latch increment
+                    # was continued to the ``s`` merge and the loop returned
+                    # 7 for n=4 (Python 3).  Rule: match the receipt by
+                    # operand position.
+                    if position in preserved_positions or int(arm.id) in attributes.get(
+                        'preserved_name_binding_value_ids', (),
+                    ):
                         continue
                     candidates.setdefault(id(arm), []).append(candidate)
 

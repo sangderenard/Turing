@@ -418,6 +418,10 @@ EXTENDED4 = [
     (["s{v} = {{n, {a}}}", "s{v}.discard(n)", "s{v}.add({b})"], "len(s{v}) * 10 + int(n in s{v})"),
     (["xs{v} = [n, {a}, {b}]", "xs{v}[0], xs{v}[2] = xs{v}[2], xs{v}[0]"], "xs{v}[0] * 100 + xs{v}[2]"),
     (["xs{v} = [n] * 3", "xs{v}[1] = {a}"], "sum(xs{v}) * 10 + xs{v}[1]"),
+    # Corpus c393: an arm binds the bare loop index (the merge is not the index).
+    (["s{v} = {a}", "for i{v} in range(n % 5 + {c}):", "    if i{v} > {b} % 3:", "        s{v} = i{v}"], "s{v}"),
+    # Corpus c390-c395: the parameter n rebound in a loop arm that never reads it.
+    (["for j{v} in range({c} % 4 + 1):", "    if j{v} > 1:", "        n = j{v} * {a}"], "n"),
 ]
 
 
