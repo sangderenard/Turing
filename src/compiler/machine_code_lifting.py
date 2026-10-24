@@ -1112,7 +1112,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
         parity = result
         for shift in (4, 2, 1):
             shifted = self.emit(
-                Handler.Shr,
+                Handler.LShr,
                 (parity, self.constant(shift, source, dtype="int64")),
                 source, dtype="int64",
             )
@@ -2149,7 +2149,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 result = self.constant(0, source, dtype="int128")
             else:
                 result = self.emit(
-                    Handler.Shr,
+                    Handler.LShr,
                     (
                         value,
                         self.constant(byte_count * 8, source, dtype="int64"),
@@ -3557,7 +3557,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                         source, dtype="int64", machine_bit_index_mask=True,
                     )
             shifted = self.emit(
-                Handler.Shr,
+                Handler.LShr,
                 (value, bit), source, dtype="int64",
                 machine_bit_test_index=True,
             )
@@ -3675,7 +3675,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                     dtype=f"int{width}", machine_rotate=direction,
                 )
                 right = self.emit(
-                    Handler.Shr, (value, right_count), source,
+                    Handler.LShr, (value, right_count), source,
                     dtype=f"int{width}", machine_rotate=direction,
                 )
                 combined = self.emit(
@@ -3692,7 +3692,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                     else width - 1
                 )
                 carry_source = self.emit(
-                    Handler.Shr,
+                    Handler.LShr,
                     (rotated, self.constant(carry_position, source, dtype="int64")),
                     source, dtype="int64", machine_rotate_carry=True,
                 )
@@ -3768,7 +3768,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 source, dtype=f"int{width}", machine_rotate=direction,
             )
             right = self.emit(
-                Handler.Shr,
+                Handler.LShr,
                 (value, self.constant(right_count, source, dtype="int64")),
                 source, dtype=f"int{width}", machine_rotate=direction,
             )
@@ -3783,7 +3783,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 else width - 1
             )
             carry_source = self.emit(
-                Handler.Shr,
+                Handler.LShr,
                 (
                     result,
                     self.constant(carry_position, source, dtype="int64"),
@@ -3883,7 +3883,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 handler = (
                     Handler.Shl if semantic is MachineSemanticToken.SHIFT_LEFT
                     else (
-                        Handler.Shr
+                        Handler.LShr
                         if semantic is MachineSemanticToken.SHIFT_RIGHT_LOGICAL
                         else Handler.AShr
                     )
@@ -3907,7 +3907,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                         Handler.Sub, (safe_count, one), source, dtype="int64",
                     )
                 carry_source = self.emit(
-                    Handler.Shr, (value, carry_position), source, dtype="int64",
+                    Handler.LShr, (value, carry_position), source, dtype="int64",
                 )
                 carry_bit = self.emit(
                     Handler.And, (carry_source, one), source, dtype="int64",
@@ -3986,7 +3986,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
             handler = (
                 Handler.Shl if semantic is MachineSemanticToken.SHIFT_LEFT
                 else (
-                    Handler.Shr
+                    Handler.LShr
                     if semantic is MachineSemanticToken.SHIFT_RIGHT_LOGICAL
                     else Handler.AShr
                 )
@@ -4000,7 +4000,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 else count - 1
             )
             carry_source = self.emit(
-                Handler.Shr,
+                Handler.LShr,
                 (value, self.constant(carry_shift, source, dtype="int64")),
                 source, dtype="int64",
             )

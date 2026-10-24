@@ -108,6 +108,8 @@ _BINARY_INT: dict[str, str] = {
     "Xor": "OpBitwiseXor",
     "Shl": "OpShiftLeftLogical",
     "Shr": "OpShiftRightArithmetic",
+    "AShr": "OpShiftRightArithmetic",
+    "LShr": "OpShiftRightLogical",
     "Eq": "OpIEqual", "equal": "OpIEqual",
     "Ne": "OpINotEqual", "not_equal": "OpINotEqual",
     "Lt": "OpSLessThan", "less": "OpSLessThan",

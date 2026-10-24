@@ -40,7 +40,7 @@ _DIRECT_HANDLERS = {
     "or": Handler.Or,
     "xor": Handler.Xor,
     "shl": Handler.Shl,
-    "lshr": Handler.Shr,
+    "lshr": Handler.LShr,
     "ashr": Handler.AShr,
     "load": Handler.Load,
     "store": Handler.Store,

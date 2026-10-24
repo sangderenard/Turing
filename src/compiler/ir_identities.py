@@ -219,7 +219,7 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
 _PURE_REGION_OPS = frozenset({
     "Const", "Neg", "Add", "Sub", "Mul", "Div", "Pow", "Sqrt", "Abs",
     "Max", "Min", "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "FloorDiv", "Mod",
-    "Shl", "Shr", "bitand", "bitor", "bitxor", "invert", "LAnd", "LOr",
+    "Shl", "Shr", "AShr", "LShr", "bitand", "bitor", "bitxor", "invert", "LAnd", "LOr",
     "LNot", "Select", "isfinite",
     "Cast", "range", "string_token", "Ret",
 })

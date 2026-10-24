@@ -68,7 +68,9 @@ _BINARY: dict[str, str] = {
     "BitOr": "{out} = or i64 {0}, {1}",
     "BitXor": "{out} = xor i64 {0}, {1}",
     "Shl": "{out} = shl i64 {0}, {1}",
-    "Shr": "{out} = lshr i64 {0}, {1}",
+    "Shr": "{out} = ashr i64 {0}, {1}",
+    "AShr": "{out} = ashr i64 {0}, {1}",
+    "LShr": "{out} = lshr i64 {0}, {1}",
     "Min": "{out} = call double @llvm.minnum.f64(double {0}, double {1})",
     "Max": "{out} = call double @llvm.maxnum.f64(double {0}, double {1})",
 }
@@ -727,7 +729,8 @@ _INTEGER_BINARY: dict[str, str] = {
     "And": "and", "Or": "or", "Xor": "xor",
     "LAnd": "and", "LOr": "or",
     "BitAnd": "and", "BitOr": "or", "BitXor": "xor",
-    "Shl": "shl", "Shr": "lshr",
+    # The source ``>>`` sign-fills (c410); only the machine ``LShr`` zero-fills.
+    "Shl": "shl", "Shr": "ashr", "AShr": "ashr", "LShr": "lshr",
 }
 _INTEGER_COMPARISON: dict[str, str] = {
     "Eq": "eq", "Ne": "ne", "Lt": "slt",

@@ -983,7 +983,7 @@ def test_random_feature_imports_as_real_bitwise_repository_ssa():
         Handler.Xor.value,
         Handler.Or.value,
         Handler.Shl.value,
-        Handler.Shr.value,
+        Handler.LShr.value,
     } <= operations
 
 

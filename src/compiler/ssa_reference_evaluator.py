@@ -146,6 +146,9 @@ _BINARY = {
     "BitXor": lambda a, b: np.bitwise_xor(np.int64(a), np.int64(b)),
     "Shl": lambda a, b: np.left_shift(np.int64(a), np.int64(b)),
     "Shr": lambda a, b: np.right_shift(np.int64(a), np.int64(b)),
+    "AShr": lambda a, b: np.right_shift(np.int64(a), np.int64(b)),
+    "LShr": lambda a, b: np.right_shift(
+        np.int64(a).astype(np.uint64), np.uint64(b)).astype(np.int64),
     # Floored, matching the likeness table's explicit note that Python's %
     # is floored for floats too and that a bare frem is C sign semantics.
     "Mod": lambda a, b: np.mod(a, b),
