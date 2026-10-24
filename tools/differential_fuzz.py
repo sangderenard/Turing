@@ -145,12 +145,27 @@ EXTENDED = [
     # c440-c443, the tire's ``metrics.unresolved_report = list(lines)``)
     (["r{v} = [{a}, {c}]", "if n > {a}:", "    r{v} = [n, {b}, {c}, 1]"], "sum(r{v}) * 10 + len(r{v}) + max(r{v})"),
     (["r{v} = [{c}]", "if n % 2 == 0:", "    w{v} = [n]", "    for i{v} in range({a}):", "        w{v}.append(i{v} + {b})", "    r{v} = list(w{v})"], "len(r{v}) * 10 + r{v}[-1]"),
+    # a copied name (``b = a``) rebound after the copy, in straight code,
+    # in one arm of an if/else, and as the seed of a loop that reads the
+    # copy (corpus c446-c449)
+    (["p{v}, q{v} = twin(n + {a})"], "p{v} * 10 + q{v}"),
+    (["a{v} = n + {a}", "b{v} = a{v}", "b{v} += {b}"], "a{v} * 100 + b{v}"),
+    (["a{v} = n * {a}", "b{v} = a{v}", "if n > {c}:", "    b{v} = b{v} - 1", "else:", "    a{v} = a{v} + {b}"], "a{v} * 100 + b{v}"),
+    (["b{v} = n % 5 + {a}", "c{v} = b{v}", "while c{v} < {c} + 20:", "    c{v} = c{v} + b{v}"], "c{v} * 10 + b{v}"),
+    (["b{v} = n + {a}", "c{v} = b{v}", "for i{v} in range({c} % 4):", "    c{v} = c{v} * 2 + b{v}"], "c{v} - b{v}"),
 ]
 EXT_HELPERS = """from src.common.tensors.abstraction import AbstractTensor
 
 
 def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
+
+
+def twin(x: int) -> tuple[int, int]:
+    p = x * 3
+    a = p
+    b = p
+    return a, b
 
 
 def maybe_inc(x: int, y: int):

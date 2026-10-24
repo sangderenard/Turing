@@ -12,18 +12,6 @@ tests/test_control_branch_compartments.py::test_conditional_without_reducer_phi_
 tests/test_control_branch_compartments.py::test_exact_field_state_phi_suppresses_later_flat_setattr_history
 tests/test_control_branch_compartments.py::test_try_body_membership_is_not_invented_as_a_predicate_guard
 tests/test_loop_carried_producers.py::test_a_carried_value_round_tripped_through_a_call_lowers_and_computes[identity-round-trip-\ndef passthrough(a):\n    return a\n\ndef train(w, epochs):\n    total = passthrough(w)\n    for _ in range(epochs):\n        next_w = passthrough(w)\n        w = next_w\n        total = w\n    return total\n-<lambda>]
-tests/test_loop_carried_producers.py::test_loop_carried_sources_match_authored_python_in_native_llvm[call-argument]
-tests/test_loop_carried_producers.py::test_loop_carried_sources_match_authored_python_in_native_llvm[call-two-operands]
-tests/test_loop_carried_producers.py::test_loop_carried_sources_match_authored_python_in_native_llvm[for-exit]
-tests/test_loop_carried_producers.py::test_loop_carried_sources_match_authored_python_in_native_llvm[predicate-direct]
-tests/test_loop_carried_producers.py::test_loop_carried_sources_match_authored_python_in_native_llvm[predicate-region]
-tests/test_loop_carried_producers.py::test_loop_carried_sources_match_authored_python_in_native_llvm[region-read]
-tests/test_loop_carried_producers.py::test_one_value_held_by_two_bindings_computes_the_authored_answer[call-argument]
-tests/test_loop_carried_producers.py::test_one_value_held_by_two_bindings_computes_the_authored_answer[call-two-operands]
-tests/test_loop_carried_producers.py::test_one_value_held_by_two_bindings_computes_the_authored_answer[for-exit]
-tests/test_loop_carried_producers.py::test_one_value_held_by_two_bindings_computes_the_authored_answer[predicate-direct]
-tests/test_loop_carried_producers.py::test_one_value_held_by_two_bindings_computes_the_authored_answer[predicate-region]
-tests/test_loop_carried_producers.py::test_one_value_held_by_two_bindings_computes_the_authored_answer[region-read]
 tests/test_process_graph_function_linking.py::test_alias_application_retains_value_when_resident_is_future_return_phi
 tests/test_process_graph_function_linking.py::test_bound_method_optional_field_presence_survives_default_rebind
 tests/test_process_graph_function_linking.py::test_bound_method_receiver_keeps_optional_field_presence

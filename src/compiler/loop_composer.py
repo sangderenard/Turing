@@ -1402,6 +1402,36 @@ def evaporate_unrolled_loops(
             int(initial): int(initial)
             for _name, initial, _updated in carried_bindings
         }
+        # Program: ``b = n + 5; c = b; for i in range(3): c = c * 2 + b``.
+        # Wrong record: every body read of the shared seed (``b``'s value)
+        # was threaded as ``c``'s carried value, so each copy computed
+        # ``c * 3`` (54 for 30).  Rule: a body operand the book attributes to
+        # a binding the loop does not carry under that seed reads the
+        # pre-loop value, as the retained-loop builder resolves it.
+        from ..common.tensors.topological_reducer import (
+            _operand_positions, lexical_read_binding,
+        )
+
+        carried_names_by_initial: dict[int, set[str]] = {}
+        for name, initial, _updated in carried_bindings:
+            carried_names_by_initial.setdefault(int(initial), set()).add(
+                str(name)
+            )
+        retained_reads: dict[tuple[int, Any, int], tuple[int, ...]] = {}
+        for source_id in body_order:
+            for role, ordinal, parent in _operand_positions(
+                graph.G.nodes[source_id].get("parents") or ()
+            ):
+                names = carried_names_by_initial.get(int(parent))
+                if not names:
+                    continue
+                read = lexical_read_binding(
+                    graph.G, int(source_id), role, ordinal,
+                )
+                if read is not None and str(read) not in names:
+                    retained_reads[(int(source_id), role, ordinal)] = (
+                        int(parent),
+                    )
         publications: dict[int, list[int]] = {
             int(
                 effect.state_input_id
@@ -1453,8 +1483,15 @@ def evaporate_unrolled_loops(
                 )
             for source_id in body_order:
                 parents = tuple(
-                    (int(mapping.get(int(parent), int(parent))), str(role))
-                    for parent, role in (
+                    (
+                        int(parent)
+                        if int(parent) in retained_reads.get(
+                            (int(source_id), role, ordinal), ()
+                        )
+                        else int(mapping.get(int(parent), int(parent))),
+                        str(role),
+                    )
+                    for role, ordinal, parent in _operand_positions(
                         graph.G.nodes[source_id].get("parents") or ()
                     )
                 )

@@ -2904,6 +2904,9 @@ class CorrelationTable:
                     "identities; bindings with simultaneous future updates "
                     "must retain distinct header residents",
                 ))
+            retained_outers = _loop_retained_outer_reads(
+                function, int(declaration["loop_node_id"]),
+            )
             for rebind in declaration["rebinds"]:
                 outer = rebind["outer"]
                 carried = rebind["carried"]
@@ -2911,8 +2914,10 @@ class CorrelationTable:
 
                 # Rule 1 -- inside the scope the outer generation is not
                 # in scope.  A use of it reads the value as it was before
-                # the first iteration, on every iteration.
-                for block_name in sorted(inside):
+                # the first iteration, on every iteration.  The exception is
+                # an outer value a non-carried binding reads in the loop
+                # (``c = b; while ...: c = c + b``): there it IS in scope.
+                for block_name in sorted(() if int(outer) in retained_outers else inside):
                     block = function.blocks.get(block_name)
                     if block is None:
                         continue
@@ -8563,6 +8568,21 @@ def loop_scope_declarations(book: Any, function: Any) -> list[dict]:
     return [record for record in scopes.values() if record["boundary"]]
 
 
+def _loop_retained_outer_reads(function: Any, loop_node_id: int) -> set[int]:
+    """The preheader values a non-carried binding reads inside loop
+    ``loop_node_id`` (the control builder's ``loop_retained_outer_reads``)."""
+
+    return {
+        int(value_id)
+        for retained_loop, value_id in (
+            (getattr(function, "metadata", None) or {}).get(
+                "loop_retained_outer_reads", ()
+            ) or ()
+        )
+        if int(retained_loop) == int(loop_node_id)
+    }
+
+
 def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
     """Concord the completed module with every declared loop generation.
 
@@ -8649,8 +8669,15 @@ def concord_loop_scope_latch_residents(module: Any) -> tuple[dict, ...]:
             # collapse finding.  A unique row, however, names the exact Phi
             # that owns every in-scope read of the outer generation.
             inside = _blocks_between(function, str(header), str(latch))
+            # Program: ``b = k + 2; c = b; while c < 40: c = c + b``.  Wrong
+            # record: ``b``'s read of the preheader value (3) inside the loop
+            # was rebound to ``c``'s header Phi, so the body added ``c + c``
+            # (64 for 40).  Rule: when the control builder resolved a
+            # non-carried binding's in-loop read to the outer value, that
+            # outer value is still read in scope and is not rebound.
+            retained_outers = _loop_retained_outer_reads(function, loop_node_id)
             for outer, matching_rebinds in rebinds_by_outer.items():
-                if len(matching_rebinds) != 1:
+                if len(matching_rebinds) != 1 or outer in retained_outers:
                     continue
                 rebind = matching_rebinds[0]
                 carried = int(rebind["carried"])
