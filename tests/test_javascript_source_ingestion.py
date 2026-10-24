@@ -70,13 +70,25 @@ def test_jsdoc_of_another_function_does_not_type_this_one():
 
 
 @needs_node
-@pytest.mark.parametrize("source", [
-    # JavaScript returns one of the Numbers; LAnd would return a bool.
-    "/** @param {number} x @param {number} y */ function f(x, y) { return x && y; }",
-    "/** @param {number} x @param {number} y */ function f(x, y) { return x || y; }",
-])
-def test_number_logical_operators_stay_loud_refusals(source):
-    lowered = lower_javascript_source_to_ssa(source)
+@pytest.mark.parametrize("expression", ["x && y", "x || y", "(x && y) || 7"])
+def test_number_logical_operators_return_an_operand_like_node(expression):
+    # JavaScript returns one of the Numbers (``-0 && 5`` is -0, ``NaN || 0``
+    # is 0); LAnd/LOr would return a bool.
+    source = (
+        "/** @param {number} x @param {number} y */ "
+        f"function root(x, y) {{ return {expression}; }}"
+    )
+    rows = "[[5, 3], [0, 3], [-0, 3], [NaN, 1], [1, NaN], [0, -0], [NaN, 0]]"
+    assert check_program(source, rows) == "PASS"
+
+
+@needs_node
+def test_logical_operator_on_mixed_kinds_stays_a_loud_refusal():
+    # ``x && p`` is a Number or a Boolean depending on x: no single kind.
+    lowered = lower_javascript_source_to_ssa(
+        "/** @param {number} x @param {boolean} p */ "
+        "function root(x, p) { return x && p; }"
+    )
     assert not lowered.complete
 
 
