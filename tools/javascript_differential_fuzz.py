@@ -4,7 +4,8 @@ The JavaScript counterpart of ``differential_fuzz.py``.  Each program is a
 random function over two Number parameters (``a``, ``b``) and two Boolean
 parameters (``p``, ``q``) built from ``const``/``let`` bindings,
 reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``
-and bounded ``for``/``while`` loops (with guarded ``break``/``continue``),
+and bounded ``for``/``while`` loops (with guarded ``break``/``continue``
+and early ``return``),
 an optional early-return ``if`` and typed expression snippets.  It is lowered with
 ``lower_javascript_source_to_ssa``, compiled through the C backend and run on
 rows of ordinary and special values (``NaN``, ``-0``, ``Infinity``), and
@@ -118,6 +119,11 @@ class Generator:
             f"{self.boolean(depth - 1)})"
         )
 
+    def result(self, depth: int) -> str:
+        """A returned value of the function's one result kind."""
+
+        return self.number(depth) if self.returns_number else self.boolean(depth)
+
     def condition(self, depth: int) -> str:
         # Conditions may be Numbers (JavaScript truthiness) or Booleans.
         if self.rng.random() < 0.35:
@@ -155,6 +161,8 @@ class Generator:
                 exit_ = "break" if self.loops[-1] == "while" or (
                     rng.random() < 0.5
                 ) else "continue"
+                if rng.random() < 0.3:
+                    exit_ = f"return {self.result(1)}"
                 lines.append(f"{indent}if ({self.condition(1)}) {{ {exit_}; }}")
             elif depth > 0 and choice < 0.25:
                 lines.extend(self.loop_statement(depth - 1, indent))
@@ -213,6 +221,7 @@ class Generator:
         self.mutable_booleans = []
         self.loop_index = 0
         self.loops: list[str] = []
+        self.returns_number = rng.random() < 0.7
         for index in range(rng.randint(0, 4)):
             binding = "let" if rng.random() < 0.5 else "const"
             if rng.random() < 0.7:
@@ -235,10 +244,7 @@ class Generator:
                     lines.extend(self.if_statement(1, "  "))
                 else:
                     lines.append(f"  {self.assignment(3)}")
-        returns_number = rng.random() < 0.7
-        value = (lambda: self.number(3)) if returns_number else (
-            lambda: self.boolean(3)
-        )
+        value = lambda: self.result(3)  # noqa: E731
         if rng.random() < 0.4:
             lines.append(f"  if ({self.condition(2)}) {{ return {value()}; }}")
         lines.append(f"  return {value()};")
