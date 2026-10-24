@@ -1,3 +1,10 @@
+2026-10-24 LANE E, E23 (MEASURED, cloud): `for k, w in d.items()` types k as
+a key and w as a row of d (it fell to float64: C WRONG on large ints at main
+da63b7dd, c404, c405; Fortran COMPILE-FAIL c337). At 086aac37 (325 programs):
+C 325/325, LLVM 313/325 (delete-family phi refusals and c367, same on main),
+Fortran 324 PASS (c22 by design). Fuzz seed 63: 0 WRONG / 0 TYPE. Gate names
+identical to main da63b7dd.
+
 2026-10-24 SHADER PRODUCTS (MEASURED, cloud): shader emitters publish source,
 API sidecar, nodus-turing-shader-artifact-v1 manifest and SHA256SUMS, with a
 turing.shader-deployment.v1 record (physical resources, launch controls,
