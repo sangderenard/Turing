@@ -594,8 +594,9 @@ class LiveTileArena:
                 items = compile_iter(
                     items, key, label=label, total=len(value),
                 )
-            for key, member in items:
-                result._set(key, self.manage(member, memo))
+            result._adopt_items(
+                [(key, self.manage(member, memo)) for key, member in items]
+            )
             return result
         if type(value) is tuple and len(value) <= self.bucket_rows:
             # Immutable small records need no mutable container header. Their
@@ -613,8 +614,7 @@ class LiveTileArena:
                 members = compile_iter(
                     members, key, label=label, total=len(value),
                 )
-            for member in members:
-                result._append(self.manage(member, memo))
+            result._adopt_members([self.manage(member, memo) for member in members])
             return view
         if type(value) is set:
             result = TiledSet(self)
@@ -1300,11 +1300,13 @@ class TiledDict(dict, MutableMapping):
         if bit == 64:
             tag, payload = self._arena.read(handle)
             following = payload[1] if tag == "collision" else None
-            entries = iter(items.items())
-            first = dict(next(entries) for _ in range(self._arena.bucket_rows))
-            rest = dict(entries)  # at most one newly inserted entry
-            tail = self._arena.allocate(("collision", (rest, following)))
-            self._arena.write(handle, ("collision", (first, tail)))
+            rows, entries = self._arena.bucket_rows, list(items.items())
+            # One newly inserted entry after ``_set``; any number after a
+            # bulk adoption: every segment stays bounded, built tail first.
+            for start in range(rows * ((len(entries) - 1) // rows), 0, -rows):
+                following = self._arena.allocate(("collision", (
+                    dict(entries[start:start + rows]), following)))
+            self._arena.write(handle, ("collision", (dict(entries[:rows]), following)))
             # _bucket cached the collision-chain HEAD before returning this
             # possibly later segment. Preserve that head for every equal full
             # hash; caching this local handle would skip earlier candidates.
@@ -1323,11 +1325,22 @@ class TiledDict(dict, MutableMapping):
         left, right = {}, {}
         for key, value in items.items():
             (right if (hash(key) >> bit) & 1 else left)[key] = value
-        a = self._arena.allocate(("leaf", {}))
-        b = self._arena.allocate(("leaf", {}))
-        self._split(a, left, bit + 1)
-        self._split(b, right, bit + 1)
+        a, b = self._child(left, bit + 1), self._child(right, bit + 1)
         self._arena.write(handle, ("branch", (bit, a, b)))
+
+    def _child(self, items, bit):
+        # A child that fits one bucket is born holding its entries: one
+        # allocation instead of an empty leaf rewritten (and re-measured).
+        if len(items) > self._arena.bucket_rows:
+            handle = self._arena.allocate(("leaf", {}))
+            self._split(handle, items, bit)
+            return handle
+        handle = self._arena.allocate(("leaf", items))
+        if bit < 64:
+            for key in items:
+                self._arena.remember_route(
+                    self._ref, hash(key) & ((1 << 64) - 1), handle)
+        return handle
 
     def _set(self, key, value):
         with self._arena._lock:
@@ -1350,6 +1363,39 @@ class TiledDict(dict, MutableMapping):
                     self._order._append((True, item))
                     fresh[item] = (fresh[item][0], position)
             self._split(handle, fresh, bit)
+            self._arena.save_header(self)
+
+    def _adopt_items(self, items):
+        """Fill this new, empty mapping from ``(key, managed value)`` pairs
+        with distinct keys, in order.
+
+        Adopting a 1.56M-entry identity page key by key routed every insert
+        to a random trie tile; once the tiles were cold each insert decoded,
+        re-measured and re-encoded a whole tile (about 20 ms per entry, the
+        managed tire's ``concordance_mint`` page ran for hours).  The trie a
+        sequence of ``_set`` calls builds is the one ``_split`` builds from
+        all the entries at once, so build it once: its buckets are allocated
+        depth first and fill tiles in order.  The insertion order and each
+        entry's ordinal are the ones ``_set`` would have recorded.
+        """
+        with self._arena._lock:
+            if self._count:
+                raise ValueError("bulk adoption needs an empty mapping")
+            if not items:
+                return
+            ordered = len(items) > self._arena.bucket_rows
+            if ordered:
+                self._order = TiledList(self._arena)
+                self._order._adopt_members([(True, key) for key, _value in items])
+            fresh = {
+                key: (value, position if ordered else -1)
+                for position, (key, value) in enumerate(items)
+            }
+            if len(fresh) != len(items):
+                raise ValueError("bulk adoption needs distinct keys")
+            self._count = len(fresh)
+            self._version += len(fresh)
+            self._split(self._root, fresh, 0)
             self._arena.save_header(self)
 
     def __setitem__(self, key, value):
@@ -1580,6 +1626,29 @@ class TiledList(list, MutableSequence):
         self._arena.write(handle, values)
         self._count += 1
         self._arena.save_header(self)
+
+    def _adopt_members(self, values):
+        """Fill this new, empty list from managed ``values``, one write per
+        chunk (``_append`` rewrites its chunk once per member).  The chunks
+        and their links are the ones the same ``_append`` calls make."""
+        if self._count:
+            raise ValueError("bulk adoption needs an empty list")
+        rows, links = self._arena.bucket_rows, []
+        with self._arena._lock:
+            for start in range(0, len(values), rows):
+                handle = self._arena.allocate(list(values[start:start + rows]))
+                if start == 0:
+                    self._first = handle
+                else:
+                    links.append((start // rows - 1, self._arena.manage(
+                        _StorageLink(handle))))
+                self._count += len(values[start:start + rows])
+            if links:
+                # The chunk index is itself adopted whole: a long list's
+                # links set one by one thrash the same cold trie tiles.
+                self._chunks = TiledDict(self._arena)
+                self._chunks._adopt_items(links)
+            self._arena.save_header(self)
 
     def append(self, value):
         self._append(self._arena.manage(value))
