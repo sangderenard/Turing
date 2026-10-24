@@ -6852,8 +6852,25 @@ def _normalize_lexical_values(
                     defaults[field.name] = copy.deepcopy(field.default)
             class_descriptor["field_defaults"] = defaults
         function_reference = (
-            function_table.reference(target_name) if target_name else None
+            function_table.lexical_reference(target_name) if target_name else None
         )
+        target_identity = (
+            str(getattr(target, "__module__", "") or ""),
+            str(getattr(target, "__qualname__", "") or ""),
+        )
+        if all(target_identity):
+            # A static reference names its exact object: its definition is
+            # the entry declared with that (module, qualname), never the
+            # last function that happened to share its bare name (``re``'s
+            # ``_compile`` versus ``re._compiler._compile``).  A builtin
+            # has no source definition at all.
+            exact = function_table.reference_by_source_identity(
+                target_identity,
+            )
+            if exact is not None:
+                function_reference = exact
+            elif target_identity[0] == "builtins":
+                function_reference = None
         if getattr(target, "__self__", None) is not None:
             # A bound runtime/builtin method is identified by both callable
             # and receiver.  Linking it to an unrelated source method by the
@@ -8080,7 +8097,7 @@ def _normalize_lexical_values(
                 static_value = static_bindings.get(expression.id)
                 function_reference = (
                     (lexical_function_bindings or {}).get(expression.id)
-                    or function_table.reference(expression.id)
+                    or function_table.lexical_reference(expression.id)
                 )
                 if (
                     producer_id is None
@@ -18509,6 +18526,31 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             metadata={
                 "source_type": type(statement).__name__,
                 "source_node": node_id,
+                # A method is never a bare name's lexical callee
+                # (``FunctionTable.lexical_reference``).
+                **(
+                    {"method_owner": str(method_owners[node_id])}
+                    if method_owners.get(node_id) is not None
+                    else {}
+                ),
+                # The authored (module, qualname) of a discovered
+                # definition: two modules' same-named functions never share
+                # it (``FunctionTable.reference_by_source_identity``).
+                **(
+                    {"source_identity": tuple(map(str, getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity",
+                    )))}
+                    if isinstance(getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity", None,
+                    ), tuple)
+                    and len(getattr(
+                        function_definitions[node_id],
+                        "_python_source_identity",
+                    )) == 2
+                    else {}
+                ),
                 **(
                     {
                         "process_graph_boundary": getattr(
@@ -22105,7 +22147,19 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     )
                     reference = None
                 else:
-                    reference = function_table.reference(callee_name)
+                    owner_identity = (
+                        None if owner is None
+                        else function_table.entry(owner).metadata.get(
+                            "source_identity"
+                        )
+                    )
+                    reference = function_table.lexical_reference(
+                        callee_name,
+                        module=(
+                            None if not owner_identity
+                            else str(owner_identity[0])
+                        ),
+                    )
                 if (
                     not callee_is_parameter
                     and reference is None
