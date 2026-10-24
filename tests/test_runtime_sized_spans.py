@@ -121,6 +121,85 @@ def _backends():
 BACKENDS = _backends()
 
 
+def _lower_integer_span(tmp_path, source, name, shape=None):
+    raw = yaml.safe_load(BASE_CONTRACT.read_text(encoding="utf-8"))
+    span = {"function": "f", "parameter": "x", "storage": "span",
+            "dtype": "int64", "rank": 1, "python_type": TENSOR_TYPE}
+    if shape is not None:
+        span["shape"] = list(shape)
+    raw["program_abi"] = {"records": {}, "bindings": [], "values": [
+        span,
+        {"function": "f", "parameter": "n", "storage": "scalar",
+         "dtype": "int64", "rank": 0, "shape": [],
+         "python_type": "builtins.int"},
+    ]}
+    path = tmp_path / f"{name}.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            source, "f", name=name,
+            extraction_contract=ExtractionContract(path),
+            progress=lambda _: None,
+        )
+    entry = exports[0]
+    root = module.functions[entry]
+    parameters = dict(root.metadata["parameter_names"])
+    returned = next(
+        instruction.args[0] for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    )
+    return module, entry, parameters, returned
+
+
+@pytest.mark.parametrize("expression,expected", [
+    ("x * n", [10, -15, 20, 25]),
+    ("x - n", [-3, -8, -1, 0]),
+    ("x % n", [2, 2, 4, 0]),
+])
+@pytest.mark.parametrize("shape", [None, (4,)])
+def test_integer_span_scalar_arithmetic_matches_c_and_llvm(
+    tmp_path, expression, expected, shape,
+):
+    module, entry, parameters, result = _lower_integer_span(
+        tmp_path, f"def f(x, n):\n    return {expression}\n",
+        "integer_span_arithmetic", shape,
+    )
+    assert result.dtype == "int64"
+    feeds = {parameters["x"]: np.array([2, -3, 4, 5], dtype=np.int64),
+             parameters["n"]: np.array([5], dtype=np.int64)}
+    for backend in ("c", "llvm"):
+        artifact, execution = _run(backend, module, entry, feeds, tmp_path)
+        assert np.asarray(execution.buffers[result.id]).reshape(-1).tolist() == expected
+        if backend == "llvm":
+            spelling = {"x * n": "mul i64", "x - n": "sub i64",
+                        "x % n": "srem i64"}[expression]
+            assert spelling in artifact.llvm_ir
+        abi = artifact.runtime_abi()
+        assert abi["schema"] == "turing-runtime-abi-v1"
+        buffers = {item["value_id"]: item for item in abi["buffers"]}
+        output = buffers[result.id]
+        assert (output["dtype"], output["rank"]) == ("int64", 1)
+        if shape is None:
+            assert output["shape"] is None
+            assert output["extents_from"] == buffers[parameters["x"]]["index"]
+
+
+def test_c620_integer_mask_arithmetic_uses_the_span_dtype(tmp_path):
+    source = (
+        REPO / "tests" / "integer_span_corpus" /
+        "c620_integer_mask_arithmetic.py"
+    ).read_text(encoding="utf-8")
+    module, entry, parameters, result = _lower_integer_span(
+        tmp_path, source, "c620_integer_mask_arithmetic",
+    )
+    feeds = {parameters["x"]: np.array([2, -3, 4, 5], dtype=np.int64),
+             parameters["n"]: np.array([5], dtype=np.int64)}
+    for backend in ("c", "llvm"):
+        _artifact, execution = _run(backend, module, entry, feeds, tmp_path)
+        assert np.asarray(execution.buffers[result.id]).reshape(-1).tolist() == [1, 0, 1, 2]
+
+
 @pytest.mark.parametrize(
     "program,expected",
     (("c411_rank_two_first_row.py", 7.0),
