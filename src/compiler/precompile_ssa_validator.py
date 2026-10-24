@@ -452,7 +452,11 @@ def validate_precompile_ssa_compatibility(
             ):
                 continue
             location = f"program:step[{index}]"
-            if step.op_name == "scatter" and step.attrs.get("reduce", "sum") != "sum":
+            if (
+                step.op_name == "scatter"
+                and isinstance(step.attrs, dict)
+                and step.attrs.get("reduce", "sum") != "sum"
+            ):
                 # The step's reduction policy selects its semantics.  The
                 # existing scatter kernel implements only sum.
                 reduction = step.attrs["reduce"]
