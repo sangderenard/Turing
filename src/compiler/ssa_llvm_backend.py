@@ -4675,6 +4675,22 @@ def _emit_repository_call_module(
                         f"{computed} = icmp {_INTEGER_COMPARISON[operation]} "
                         f"i64 {operands[0]}, {operands[1]}"
                     )
+                elif compute_type in {"i1", "i32", "i64"}:
+                    # token_kind_batch and c620: a rank-one integer span
+                    # times a scalar reached ``fmul double`` with i64
+                    # operands. The scalar emitter already owns the integer
+                    # law; span rank changes the sweep, not the declared dtype.
+                    integer = integer_scalar_lines(
+                        operation, compute_type, operands, computed,
+                    )
+                    if integer is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"integer elementwise {operation} has no "
+                            f"LLVM emission for {compute_type}",
+                        ))
+                        continue
+                    rendered = "\n".join(integer[0])
                 else:
                     rendered = template.format(*operands, out=computed)
                 for rendered_line in rendered.splitlines():

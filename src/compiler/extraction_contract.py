@@ -329,6 +329,21 @@ class ProgramABIField:
             raise ExtractionContractError(
                 f"{location}.dtype is required for {storage} storage"
             )
+        if dtype is not None:
+            from src.transmogrifier.dtype_layout import resolve as resolve_dtype
+
+            layout = resolve_dtype(dtype)
+            # Program c621: a uint64 span remainder kept uint64 in SSA, but
+            # C allocated double and LLVM emitted frem double.  The catalog
+            # declares unsigned layouts without a Fortran native kind; no
+            # signedness-preserving C/LLVM/Fortran program ABI exists yet.
+            # Refuse the authored physical type before any lane can silently
+            # replace it with its floating default.
+            if layout is not None and layout.kind == "uint" and layout.fortran_kind is None:
+                raise ExtractionContractError(
+                    f"{location}.dtype {dtype!r} has no exact native "
+                    "C/LLVM/Fortran unsigned lane"
+                )
         if storage == "reference" and dtype is None:
             # ``reference`` has one repository-level physical type.  Publish
             # it in the normalized contract so source-derived record fields
