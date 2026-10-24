@@ -2890,9 +2890,19 @@ class _FunctionEmitter:
             ),
         ]
         native_callee = self.callee_native_symbols.get(str(callee), str(callee))
+        # c547's compact(n) grows the returned list arena in the caller's
+        # heap cell. Without this refresh, the region call leaves t4_v at
+        # its pre-call null arena and the following t[0] read segfaults.
+        # Follow each exact heap input cell after the callee may replace it.
+        refreshed = []
+        for value in instr.args:
+            for line in self._heap_refresh(value):
+                if line not in refreshed:
+                    refreshed.append(line)
         return [
             *prelude,
             f"    call {native_callee}({', '.join(arguments)})",
+            *refreshed,
             *postlude,
         ]
 
