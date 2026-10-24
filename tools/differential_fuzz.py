@@ -404,6 +404,7 @@ def build(m: int) -> list[int]:
 EXTENDED4 = [
     (["o{v} = maybe_pick(n + 1, {a})", "d{v} = {{1: {b}, 2: n, 3: {c}}}", "del d{v}[2]"], "(-3 if o{v} is None else o{v} + 1) + len(d{v}) * 10"),
     (["d{v} = {{1: {a}, 2: n}}", "del d{v}[1]", "d{v}[1] = {b}"], "len(d{v}) * 10 + d{v}[1]"),
+    (["d{v} = {{1: {a}, 2: n, 3: {b}}}", "del d{v}[2]", "xs{v} = [{c}, n, 7]", "xs{v}[1] = {a}"], "len(d{v}) * 100 + xs{v}[0] * 10 + xs{v}[1]"),
     (["d{v} = {{1: {a}, 2: n}}", "k{v} = d{v}[n % 3] if n > {b} else d{v}[1]"], "k{v} * 10 + len(d{v})"),
     (["d{v} = {{1: {a}, 2: n}}", "del d{v}[n % 3 + 1]"], "len(d{v}) * 10 + d{v}.get(1, {b})"),
     (["d{v} = {{1: n, 2: {a}}}", "for i{v} in range(3):", "    if i{v} == n:", "        del d{v}[2]"], "len(d{v}) * 10 + d{v}.get(2, {b})"),
