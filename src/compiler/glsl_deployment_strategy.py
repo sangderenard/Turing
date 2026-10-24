@@ -27119,6 +27119,26 @@ def _fold_callsite_structural_values(
     }
     _remove_dead_metadata_nodes(graph, protected_values, remove_node)
 
+    # Program: ``def root(n, w): k = 0; while k < n: w = k + 10; k += 1;
+    # return w * 2`` (corpus c392).  Wrong record: a loop's carried initial
+    # is the version before its ``carried_update`` in the name's identity
+    # history, not a graph edge, so the parameter ``w`` looked unused and was
+    # removed; the formal seed then bound the body's ``k + 10`` as ``w`` and
+    # the product refused an unexplained root input.  Rule: the entry
+    # version of a name a loop carries is a use of that version.
+    carried_updates = {
+        int(parent)
+        for _node_id, data in graph.G.nodes(data=True)
+        if data.get("type") in {"For", "While"}
+        for parent, role in data.get("parents", ())
+        if role == "carried_update"
+    }
+    carried_entry_ids = {
+        int(history[position - 1])
+        for history in identities.values()
+        for position in range(1, len(history))
+        if int(history[position]) in carried_updates
+    }
     unused_parameters = {
         int(node_id)
         for node_id, data in graph.G.nodes(data=True)
@@ -27126,6 +27146,7 @@ def _fold_callsite_structural_values(
         and (data.get("attributes") or {}).get("binding_kind") == "parameter"
         and graph.G.out_degree(int(node_id)) == 0
         and int(node_id) not in protected_values
+        and int(node_id) not in carried_entry_ids
     }
     for node_id in sorted(unused_parameters, reverse=True):
         remove_node(node_id)
