@@ -22691,7 +22691,7 @@ def _tensor_descriptor_rule(
             # the composer's carried index, not this value: ``[n, 0]``
             # handed to ``use(rec)`` described ``rec[0]`` as ``int``
             # while the caller's ``n`` was int64 -- "incompatible physical
-            # call inputs" (corpus c397).
+            # call inputs" (corpus c465).
             scalar_dtype = {
                 "builtins.int": "int64",
                 "builtins.bool": "bool",
