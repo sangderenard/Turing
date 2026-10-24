@@ -5079,6 +5079,10 @@ def _normalize_lexical_values(
     #: field storage the reducer reloads after such a call, so a later read
     #: of its field is refused rather than answered from the cursor.
     storing_call_receivers: set[str] = set()
+    #: Field reads (``id`` of the ``Attribute``) evaluated before the store
+    #: of the statement that first passes their receiver to a storing call:
+    #: every such call holds the read among its own operands.
+    reads_before_own_store: set[int] = set()
     #: The same names for each loop being reduced, innermost last: a call
     #: later in the body stores before the next iteration's read.
     loop_body_storing_receivers: list[frozenset[str]] = []
@@ -5184,31 +5188,69 @@ def _normalize_lexical_values(
 
         names: set[str] = set()
         for call in source_walk(node):
-            if not isinstance(call, ast.Call):
-                continue
-            if (
-                isinstance(call.func, ast.Attribute)
-                and isinstance(call.func.value, ast.Name)
-                and callee_may_store(call.func.attr, receiver=True)
+            if isinstance(call, ast.Call):
+                names |= call_stored_names(call)
+        return names
+
+    def mark_reads_before_own_store(node: ast.AST) -> None:
+        """Program: ``IdentityPage(..., clock=projected.clock,
+        book=projected)`` (identity_concordance ``project_cells``, the
+        bootstrap's first refusal) or ``take(acc, acc.total * 2)``.  Wrong
+        record: a simple statement marks its storing calls' names before its
+        reads, since a read may follow the call (``acc.add(b) + acc.total``),
+        so a read among the storing call's own arguments was refused as a
+        read after the store.  Rule: Python evaluates a call's operands
+        before the call runs, so a read of a name not yet stored into is
+        before every store of this statement when each storing call on that
+        name holds the read in its own operands."""
+
+        calls = tuple(
+            (call, call_stored_names(call))
+            for call in ast.walk(node) if isinstance(call, ast.Call)
+        )
+        for read in ast.walk(node):
+            if not (
+                isinstance(read, ast.Attribute)
+                and isinstance(read.ctx, ast.Load)
+                and isinstance(read.value, ast.Name)
+                and str(read.value.id) not in storing_call_receivers
             ):
-                names.add(str(call.func.value.id))
-            callee = (
-                call.func.id if isinstance(call.func, ast.Name)
-                else call.func.attr if isinstance(call.func, ast.Attribute)
-                else None
-            )
-            for index, argument in enumerate(call.args):
-                if isinstance(argument, ast.Name) and (
-                    callee is None
-                    or callee_may_store(callee, position=index)
-                ):
-                    names.add(str(argument.id))
-            for keyword in call.keywords:
-                if isinstance(keyword.value, ast.Name) and (
-                    callee is None or keyword.arg is None
-                    or callee_may_store(callee, keyword=keyword.arg)
-                ):
-                    names.add(str(keyword.value.id))
+                continue
+            name = str(read.value.id)
+            storing = tuple(call for call, names in calls if name in names)
+            if storing and all(
+                any(item is read for item in ast.walk(call))
+                for call in storing
+            ):
+                reads_before_own_store.add(id(read))
+
+    def call_stored_names(call: ast.Call) -> set[str]:
+        """Names one call may store into."""
+
+        names: set[str] = set()
+        if (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and callee_may_store(call.func.attr, receiver=True)
+        ):
+            names.add(str(call.func.value.id))
+        callee = (
+            call.func.id if isinstance(call.func, ast.Name)
+            else call.func.attr if isinstance(call.func, ast.Attribute)
+            else None
+        )
+        for index, argument in enumerate(call.args):
+            if isinstance(argument, ast.Name) and (
+                callee is None
+                or callee_may_store(callee, position=index)
+            ):
+                names.add(str(argument.id))
+        for keyword in call.keywords:
+            if isinstance(keyword.value, ast.Name) and (
+                callee is None or keyword.arg is None
+                or callee_may_store(callee, keyword=keyword.arg)
+            ):
+                names.add(str(keyword.value.id))
         return names
     #: Per loop being reduced, innermost last: ``(receiver, field) ->
     #: (name, pre-loop value id)`` for the fields of locally constructed
@@ -8585,7 +8627,10 @@ def _normalize_lexical_values(
                     and isinstance(expression.value, ast.Name)
                     and id(expression) not in method_lookup_ids
                     and (
-                        str(expression.value.id) in storing_call_receivers
+                        (
+                            str(expression.value.id) in storing_call_receivers
+                            and id(expression) not in reads_before_own_store
+                        )
                         or any(
                             str(expression.value.id) in names
                             for names in loop_body_storing_receivers
@@ -13587,6 +13632,7 @@ def _normalize_lexical_values(
             ast.AsyncWith, ast.Try, ast.Match,
             ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
         )) and not isinstance(body_statement, getattr(ast, "TryStar", ())):
+            mark_reads_before_own_store(body_statement)
             storing_call_receivers.update(storing_call_names(body_statement))
         result = reduce_statement_body(body_statement)
         if not isinstance(body_statement, (
