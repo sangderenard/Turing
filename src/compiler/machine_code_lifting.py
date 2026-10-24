@@ -395,6 +395,26 @@ def _as_x86_register(value: X86Register | str) -> X86Register:
         raise ValueError(f"unknown x86-64 argument register {value!r}") from error
 
 
+# What a call may change, by calling convention: the caller-saved general
+# and vector registers.  The callee preserves every other register, so the
+# caller keeps its own values for those across the call.
+_CALL_VOLATILE_REGISTERS = {
+    "windows-x64": (
+        X86Register.RAX, X86Register.RCX, X86Register.RDX,
+        X86Register.R8, X86Register.R9, X86Register.R10, X86Register.R11,
+    ),
+    "sysv-amd64": (
+        X86Register.RAX, X86Register.RCX, X86Register.RDX,
+        X86Register.RSI, X86Register.RDI,
+        X86Register.R8, X86Register.R9, X86Register.R10, X86Register.R11,
+    ),
+}
+_CALL_VOLATILE_VECTOR_REGISTERS = {
+    "windows-x64": tuple(X86VectorRegister)[:6],
+    "sysv-amd64": tuple(X86VectorRegister),
+}
+
+
 class _StructuredX86Lifter:
     """Lower numeric machine tokens and structured operands into SSA."""
 
@@ -404,9 +424,16 @@ class _StructuredX86Lifter:
         decoded: Sequence[DecodedInstruction],
         argument_registers: Sequence[X86Register | str],
         argument_names: Sequence[str],
+        *,
+        calling_convention: str = "windows-x64",
     ) -> None:
         if len(argument_registers) != len(argument_names):
             raise ValueError("argument registers and names must have equal length")
+        if calling_convention not in _CALL_VOLATILE_REGISTERS:
+            raise ValueError(
+                f"no call model for calling convention {calling_convention!r}"
+            )
+        self.calling_convention = str(calling_convention)
         registers = tuple(_as_x86_register(item) for item in argument_registers)
         if len(set(registers)) != len(registers):
             raise ValueError("argument registers must be unique")
@@ -431,7 +458,9 @@ class _StructuredX86Lifter:
         self.instructions: list[Instr] = []
         self.argument_names = list(str(item) for item in argument_names)
         for register in registers:
-            value = self.fresh()
+            # A formal is the whole live-in register; its 64 bits are what
+            # every 64-bit read of it sees.
+            value = self.fresh(dtype="int64")
             self.args.append(value)
             self.registers[register] = value
         self.argument_registers = list(registers)
@@ -1596,19 +1625,38 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
         else:
             callee = self.read_operand(target, source, width=64)
             call_kind = "indirect-register" if isinstance(target, RegisterOperand) else "indirect-memory"
-        abi_registers = (
-            X86Register.RCX, X86Register.RDX, X86Register.R8, X86Register.R9,
+        # The call carries the complete register state the callee may read:
+        # its arguments are registers of the calling convention, and it may
+        # save and restore any callee-saved register.  Flags do not cross a
+        # call (DF is clear by convention).
+        call_args = [
+            callee, self.memory,
+            *(self.value(register, source) for register in X86Register),
+            *(
+                self.vector_value(register, source)
+                for register in X86VectorRegister
+            ),
+            self.mxcsr_value(),
+        ]
+        state_layout = (
+            "target", "memory",
+            *(f"register.{register.name.lower()}" for register in X86Register),
+            *(
+                f"vector-register.{register.name.lower()}"
+                for register in X86VectorRegister
+            ),
+            "system.amd64.mxcsr",
         )
-        call_args = [callee, self.memory, self.value(X86Register.RSP, source)]
-        call_args.extend(self.value(register, source) for register in abi_registers)
         call_state = self.emit(
             Handler.Call,
             call_args,
             source,
             dtype="machine_call_state",
             call_kind=call_kind,
-            calling_convention="windows-x64",
+            calling_convention=self.calling_convention,
             callee_address=(target.target_address if isinstance(target, RelativeAddressOperand) else None),
+            return_address=int(source.address) + len(source.encoded),
+            state_layout=state_layout,
             implicit_effects=(
                 "push-return-address",
                 "volatile-register-clobber",
@@ -1638,10 +1686,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 else None
             ),
         )
-        volatile = (
-            X86Register.RAX, X86Register.RCX, X86Register.RDX,
-            X86Register.R8, X86Register.R9, X86Register.R10, X86Register.R11,
-        )
+        volatile = _CALL_VOLATILE_REGISTERS[self.calling_convention]
         for selector, register in enumerate(volatile):
             field = self.constant(selector, source, dtype="int32")
             self.registers[register] = self.emit(
@@ -1651,7 +1696,19 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                 dtype="int64",
                 machine_call_projection=register.name,
             )
-        memory_field = self.constant(len(volatile), source, dtype="int32")
+        vector_volatile = _CALL_VOLATILE_VECTOR_REGISTERS[self.calling_convention]
+        for selector, register in enumerate(vector_volatile, len(volatile)):
+            field = self.constant(selector, source, dtype="int32")
+            self.vector_registers[register] = self.emit(
+                Handler.Load,
+                (call_state, field),
+                source,
+                dtype=self.vector_state_dtype,
+                machine_call_projection=register.name,
+            )
+        memory_field = self.constant(
+            len(volatile) + len(vector_volatile), source, dtype="int32",
+        )
         self.memory = self.emit(
             Handler.Load,
             (call_state, memory_field),
@@ -3524,23 +3581,14 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
             pointer = None
             if isinstance(destination, EffectiveAddressOperand):
                 assert isinstance(source_index, ImmediateOperand)
-                authored_index = int(source_index.value)
-                word_offset, bit_index = divmod(authored_index, width)
+                # An immediate index never moves the memory word: the CPU
+                # uses it modulo the operand width (bts dword [m], 35 sets
+                # bit 3 of [m]).  Only a register index addresses across
+                # words, and that form is refused above.
+                bit_index = int(source_index.value) % width
                 pointer = self.effective_address(
                     destination, source, dtype="int64",
                 )
-                if word_offset:
-                    pointer = self.emit(
-                        Handler.Add,
-                        (
-                            pointer,
-                            self.constant(
-                                word_offset * (width // 8), source,
-                                dtype="int64",
-                            ),
-                        ),
-                        source, dtype="int64", machine_bit_word_offset=True,
-                    )
                 value = self.emit(
                     Handler.Load, (self.memory, pointer), source,
                     dtype=f"int{width}", machine_state="memory", width=width,
@@ -4153,9 +4201,15 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
             ))
             return
         if semantic is MachineSemanticToken.RETURN:
+            # The memory operand is what a caller's call state receives;
+            # the callee-saved registers are the caller's own by convention.
             self.instructions.append(Instr(
-                Handler.Ret.value, [self.value(X86Register.RAX, source)], None,
-                attributes=self.provenance(source),
+                Handler.Ret.value,
+                [self.value(X86Register.RAX, source), self.memory], None,
+                attributes={
+                    **self.provenance(source),
+                    "returned_state_layout": ("register.rax", "memory"),
+                },
             ))
             return
         if semantic in {
@@ -4560,7 +4614,14 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                             },
                         ))
                         merged[register] = result
-                incoming_mxcsr = [states[pred][2] for pred in predecessors]
+                # A predecessor finished before MXCSR was first read holds
+                # None there: its MXCSR is the unchanged live-in, as for a
+                # register missing from its state.
+                incoming_mxcsr = [
+                    self.initial_mxcsr if states[pred][2] is None
+                    else states[pred][2]
+                    for pred in predecessors
+                ]
                 if self.initial_mxcsr is None:
                     merged_mxcsr = None
                 elif all(
@@ -4822,6 +4883,7 @@ def raise_binary_region_to_ssa(
     audit_preview_bytes: int = 16,
     cfg_decode: bool = False,
     cfg_entry_addresses: Sequence[int] = (),
+    calling_convention: str = "windows-x64",
 ) -> BinaryToSSAResult:
     """Raise one bounded binary region to SSA and report vocabulary coverage.
 
@@ -4932,12 +4994,15 @@ def raise_binary_region_to_ssa(
                 report.instructions,
                 argument_registers,
                 argument_names,
+                calling_convention=calling_convention,
             )
             if isinstance(lifter, _StructuredX86CFGLifter):
                 lifter.external_fallthrough_addresses = tuple(
                     report.external_fallthrough_addresses
                 )
             function = _stamp_machine_group_fingerprints(lifter.finish())
+            function.metadata["machine_entry_address"] = origin
+            function.metadata["calling_convention"] = str(calling_convention)
             if report.unreachable_spans:
                 function.metadata["machine_unreachable_spans"] = tuple(
                     (origin + start, origin + end)
