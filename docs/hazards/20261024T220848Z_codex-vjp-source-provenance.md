@@ -8,4 +8,8 @@ Observed: `test_perforated_network_compiles_and_executes_forward_and_vjp` still 
 
 Inferred: The first wrong tensor answer came from selecting a scalar kernel/count before the exact region feed had reached the planned function. The later shape settlement changed SSA shapes and allocation widths, but did not reselect those kernels.
 
-Unknown: Linux gate, full typed corpus, and differential fuzz results are pending. The NumPy cancellation difference needs an explicit source precision decision before changing matmul arithmetic.
+Observed: On the corrected commit d2bd9038, the Linux focused run passed the native linear-loss VJP, the two-row tanh VJP, native Adam parity, and keyed dynamic-span descriptor tests (4 passed). The Linux gate completed all four parts with pytest summaries. Its failure counts were aa 77, ab 7, ac 26, and rec 20, exactly matching a fresh untouched main f8c74d8d gate. Both trees reported the same one failure absent from the committed baseline: `tests/test_precompile_to_ssa.py::test_numerical_lowering_routes_scatter_through_real_llvm_algorithm`. This is an inherited baseline mismatch, not a gate pass under the strict baseline rule; no baseline file was changed. The full typed corpus exited 0 after the final code change. `FUZZ_EXT=4` with seed 20261024 and 20 programs finished 16 PASS, 4 LOUD, 0 WRONG.
+
+Observed: The final identity audit found zero discrepancies in view, toplevel, energy, controller, mapping, and oscillator. It exited 1 on the existing named `controller_untyped` native-ABI refusal for `pi_update.dt_pen`, which is also present on untouched main.
+
+Unknown: The NumPy cancellation difference needs an explicit source precision decision before changing matmul arithmetic. The strict gate requires the preceding scatter PR to merge, followed by a fresh main comparison.
