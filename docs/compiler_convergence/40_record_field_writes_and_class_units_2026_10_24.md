@@ -34,12 +34,12 @@ written to the field since construction.
 **Fix.** The fold happens only while the read's field-state cursor is empty
 or OBSERVED at that same value. When the cursor holds a WRITTEN, MERGED,
 ARM_SELECTED or LOOP_EXIT state, the read is the cursor's value, as for a
-static receiver's assigned field. The reducer merges no field state at a
-loop (plan 70, section 1.3, held for the user). So a field that an enclosing
-loop body rewrites, or that is read after such a loop, is refused by name:
-`local record field written in a loop has no merged value ...
-(loop_exit_field_state_unmerged)`. It used to return the constructor
-argument.
+static receiver's assigned field. The reducer merged no field state at a
+loop then, so a field that an enclosing loop body rewrites, or that is read
+after such a loop, was refused by name: `local record field written in a
+loop has no merged value ... (loop_exit_field_state_unmerged)`. It used to
+return the constructor argument. F4 now carries those fields through the
+loop; the refusal remains for the cases F4 lists.
 
 **Why the corpus missed it.** The corpus had no class programs. The typed
 check, `tests/test_native_semantics_corpus.py` and the fuzzer exec'd each
@@ -149,7 +149,79 @@ whole body. `return acc.add(b)` still lowers and matches Python, because
 the method's frame writes the caller's storage.
 `tests/test_class_construction_refusals.py` holds the three refusals.
 
+## F4. A field written in a loop is a loop-carried binding
+
+**Program.** `s = Acc(n, 0); for i in range(m): s.n = s.n + i; return s.n`
+(corpus c530). After F1 this was refused as
+`loop_exit_field_state_unmerged`.
+
+**Rule.** A loop already has a pre-loop and a post-loop context for names
+(the user's point, 2026-10-24): `loop_carried_bindings` maps a name to its
+value before the loop and its value at the end of the body, and the loop
+header and exit rebind every read through `lexical_read_binding` rows. A
+field of a record this function constructed is now carried the same way,
+under the binding `s.n`:
+
+- At the top of the loop (before a `while` test), the reducer records each
+  field the body writes with its entry value: the field-state cursor's
+  value, or the constructor argument when the cursor is empty.
+- Each field read in the loop posts a `lexical_read_binding` row for `s.n`,
+  so the header Phi is what the read sees on the second trip.
+- At the exit, `loop_carried_bindings["s.n"] = (entry value, body-exit
+  value)` and the cursor holds a LOOP_EXIT state at the body-exit value.
+- An `if` in the body that writes the field in one arm merges from the
+  carried value: a key with no pre-branch state (or with a pre-loop write)
+  is seeded at the entry value, and each Phi operand equal to the entry
+  value gets a read row, so the arm that did not write reads the header Phi.
+
+**Still refused.** A field of an ordinary class (a projection view,
+`constructor_complete` false) in a loop: the view's field order is not the
+constructor's argument order (`self.b = a`), so the entry value cannot be
+folded from the call. A field written in a loop that has no entry value
+(the receiver is not a local construction) keeps the old refusal.
+
+Corpus c530-c539: `for`, read-then-write, writes in alternate arms,
+`while` test and body, static unroll, nested loops, `break`, two records
+swapping fields, a pre-loop write then one arm, and `return` inside the
+loop.
+
+## F5. A field merge's arm settled to a constructor argument (SILENT)
+
+**Program.** `r1 = Rec(n, 3); if n > 7: r1.x = n + 6; return r1.x * 10 + n`
+(corpus c550, found by fuzz seed 99 as p99_24). For n=9, native returned
+165 and Python 159. Wrong on main c6e3f8b1 too.
+
+**Wrong record.** The merge `Phi12(body 8, orelse 11)` is right in the
+graph. The else arm is the field read GetAttr 11, which a late record
+settlement replaces with the constructor argument `n` (%1). Then
+`reconcile_conditional_phi_continuations`, which continues every later use
+of a Phi arm (by SSA identity) to the Phi, rewrote the later read of `n`
+to Phi12: region 3 was called with feeds (12, 12) instead of (12, 1).
+Names avoid this through `preserved_name_binding_arm_positions`, but id 11
+has no name binding, so nothing marked the arm.
+
+**Rule.** The conditional Phi records each arm's SSA id as lowered
+(`arm_lowered_value_ids`, with its read scope and merge id). An arm whose
+id at that position has changed since was settled to a resident value. If
+a `name_binding` row in that scope gives the resident a name this merge
+does not version (`n`), the continuation pass preserves the arm by
+position. If the resident's names include the merged field's receiver (`k`
+for `k.scale`: a one-field record's slot is the record itself, and every
+alias such as `j = k` binds the same value), the later use is the record
+and still continues to the merge (c426, c552). c551 runs field merges in a
+loop whose arms read the arguments; c553 is a one-field dataclass.
+
 ## Measured
+
+F4 and F5, rebased onto main ae46579: the typed corpus is 372/373 PASS
+and main ae46579 is 358/359. The one failure on both is c428, which #879
+(plan callsites placed at their call's end) made silently wrong on main:
+the `.get()` call is pulled ahead of the `__init__` of the same record.
+It passes at d1950c0c and was handed to that thread. The gate failure
+names are identical to ae46579's in all four parts (aa 77, ab 7, ac 25,
+rec 20, llvmlite installed). Fuzz at `FUZZ_EXT=4`, 60 programs each: seed
+99 was 54 PASS, 5 LOUD, 1 WRONG (p99_24, F5) and is now 55 PASS, 5 LOUD,
+0 WRONG; seed 100 is 54 PASS, 6 LOUD, 0 WRONG.
 
 At 48607a8 (the fix rebased onto main caf2e77): the typed corpus is 327/327
 PASS, and main caf2e77 is 323/323. The gate failure names are identical to
@@ -181,8 +253,9 @@ at 8c6ae0d on dd340a1:
 
 ## Open frontier
 
-- A field of a local record written in a loop is refused (F1); it needs the
-  loop field-state merge that plan 70 holds for the user.
+- A field of an ordinary class written in a loop is refused (F4). It needs
+  the entry value from the class's `__init__` frame instead of a fold of the
+  call's arguments.
 - A computed `__init__` field (no field receipt) is refused at
   construction (F3). It needs a receipt from the initializer's type.
 - A field read after a call that stores into the record is refused (F3). It
