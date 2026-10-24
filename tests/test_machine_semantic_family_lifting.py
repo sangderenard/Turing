@@ -71,8 +71,8 @@ def test_every_authoritative_token_legalizes_to_repository_ssa():
     # intentionally excluded from the legacy-prefix tensor write head until
     # that head carries explicit VEX fields.  ENDBR64 is excluded too: its
     # ModRM byte is part of the opcode, which a head row cannot pin.
-    assert len(profile.rows) == 323 + 5
-    assert len(X86InstructionToken) == 335
+    assert len(profile.rows) == 323 + 5 + 4
+    assert len(X86InstructionToken) == 339
     assert failures == []
 
 
@@ -1078,6 +1078,34 @@ def test_dynamic_register_and_constant_memory_bit_tests_legalize(
         assert any(item.attributes.get("machine_bit_reset") for item in instructions)
 
 
+def test_immediate_memory_bit_index_stays_in_the_addressed_word():
+    # bts dword [rbp], 35: the CPU takes 35 mod 32 and sets bit 3 of the
+    # dword at [rbp]; it does not address the next dword.
+    encoded = b"\x0f\xba\x6d\x00\x23\xc3"
+    lifting = raise_binary_region_to_ssa(
+        encoded, maximum_file_size=len(encoded), size=len(encoded),
+        base_address=0x1000, name="bts_memory_wide_immediate",
+        full_vocabulary_report=True, cfg_decode=True,
+    )
+    assert lifting.decoded[0].token.name == "BTS_RM32_IMM8"
+    assert lifting.failed_vocabulary == ()
+    instructions = [
+        item for block in lifting.function.blocks.values() for item in block.instrs
+    ]
+    assert not any(
+        item.attributes.get("machine_bit_word_offset") for item in instructions
+    )
+    shift = next(
+        item for item in instructions
+        if item.attributes.get("machine_bit_test_index")
+    )
+    index = next(
+        item for item in instructions
+        if item.res is not None and item.res is shift.args[1]
+    )
+    assert index.attributes.get("value") == 3
+
+
 def test_shr_rm64_cl_decodes_and_executes_zero_count_preservation():
     encoded = b"\x48\xd3\xe8\xc3"
     lifting = raise_binary_region_to_ssa(
@@ -1937,6 +1965,10 @@ def test_comiss_lowers_encoded_binary32_ordered_comparison_and_flags():
     (b"\xff\x75\xd8\x58\xc3", "PUSH_RM64", "Store"),
     (b"\x6a\x00\x58\xc3", "PUSH_IMM8", "Store"),
     (b"\x20\xc2\xc3", "AND_RM8_R8", "And"),
+    (b"\x48\x0f\xba\xea\x3f\xc3", "BTS_RM64_IMM8", "Or"),
+    (b"\x48\x0f\xba\xf1\x3f\xc3", "BTR_RM64_IMM8", "And"),
+    (b"\x48\xf7\x82\xa8\x00\x00\x00\x00\x00\x00\x18\xc3", "TEST_RM64_IMM32", "And"),
+    (b"\x66\x41\x81\xfc\xff\x00\xc3", "CMP_RM16_IMM16", "Sub"),
 ))
 def test_new_sre_frontier_families_lower_to_repository_ssa(
     encoded, token, required_op,
