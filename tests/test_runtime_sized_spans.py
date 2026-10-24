@@ -186,6 +186,37 @@ def test_disagreeing_runtime_extents_raise(tmp_path, backend):
         _run(backend, module, entry, feeds, tmp_path)
 
 
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+def test_runtime_spans_of_different_ranks_are_refused(tmp_path, backend):
+    """A runtime broadcast (rank 1 against rank 2) is not stated: refused by
+    name, never one scalar multiply."""
+
+    raw = yaml.safe_load(BASE_CONTRACT.read_text(encoding="utf-8"))
+    raw["program_abi"] = {"records": {}, "bindings": [], "values": [
+        {"function": "f", "parameter": name, "storage": "span",
+         "dtype": "float64", "rank": rank, "python_type": TENSOR_TYPE}
+        for name, rank in (("x", 1), ("y", 2))
+    ]}
+    path = tmp_path / "mixed.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            "def f(x, y):\n    return x * y\n", "f", name=f"mixed_{backend}",
+            extraction_contract=ExtractionContract(path),
+            progress=lambda _: None,
+        )
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, exports[0])
+    else:
+        from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
+
+        artifact = emit_ssa_function_to_llvm(module, exports[0])
+    assert not artifact.complete
+
+
 # -- item 3: the exported calling contract ---------------------------------
 
 @pytest.mark.parametrize("backend", ["c", "llvm"])
