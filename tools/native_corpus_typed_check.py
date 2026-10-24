@@ -14,7 +14,7 @@ BACKENDS = tuple(
     name.strip() for name in os.environ.get("TYPED_CHECK_BACKENDS", "c").split(",")
     if name.strip()
 )
-unknown_backends = set(BACKENDS) - {"c", "llvm", "fortran"}
+unknown_backends = set(BACKENDS) - {"c", "llvm", "fortran", "wasm"}
 if unknown_backends:
     raise SystemExit(f"unknown TYPED_CHECK_BACKENDS entries: {sorted(unknown_backends)}")
 # The Fortran artifact carries its runtime by default: linked in on Windows,
@@ -133,6 +133,43 @@ def run_fortran(module, export, params, outs, inputs, expects):
     return f"{'PASS' if not bad else 'FAIL'} {bad[:3]}", values
 
 
+def run_wasm(module, export, params, outs, inputs, expects):
+    # The independent repository-SSA WebAssembly core (the mobile PWA's
+    # execution product), run in node.  Same verdicts as the other lanes.
+    from src.compiler.ssa_wasm_backend import (
+        emit_ssa_module_to_wasm_core, prepare_wasm_core_execution,
+    )
+    try:
+        art = emit_ssa_module_to_wasm_core(module, export, entry_name=export)
+    except Exception as e:
+        return f"EMIT-FAIL {type(e).__name__}: {str(e)[:300]}", None
+    if not art.complete:
+        return f"EMIT-INCOMPLETE {[str(s.reason)[:150] for s in art.shortfalls[:2]]}", None
+    # Scalar formals are wasm parameters passed by value; buffers are fed
+    # one-element arrays, as in the other lanes.
+    by_value = {value_id for kind, value_id in art.parameters if kind != "buffer"}
+    results, values = [], []
+    for feeds, expect in zip(inputs, expects):
+        ex = None
+        try:
+            ex = prepare_wasm_core_execution(art, {
+                params[k]: (v if int(params[k]) in by_value else np.array([v]))
+                for k, v in feeds.items()
+            }).run()
+            arrays = [np.asarray(ex.buffers[v.id]) for v in outs]
+            flat = [x for a in arrays for x in a.reshape(-1).tolist()]
+            values.append(flat)
+            results.append(judge(feeds, expect, flat, [a.dtype.kind for a in arrays]))
+        except Exception as e:
+            values.append(None)
+            results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
+        finally:
+            if ex is not None:
+                ex.close()
+    bad = [r for r in results if r != "ok"]
+    return f"{'PASS' if not bad else 'FAIL'} {bad[:3]}", values
+
+
 def disagreements(inputs, c_values, other_values):
     return [
         f"{feeds} c={c} other={o}"
@@ -198,6 +235,12 @@ def main():
             found = disagreements(inputs, c_values, fortran_values or ())
             if found:
                 print(f"{path.stem}: DISAGREE c/fortran {found[:2]}")
+        if "wasm" in BACKENDS:
+            verdict, wasm_values = run_isolated(run_wasm, module, exports[0], params, outs, inputs, expects)
+            print(f"{path.stem}: WASM {verdict}")
+            found = disagreements(inputs, c_values, wasm_values or ())
+            if found:
+                print(f"{path.stem}: DISAGREE c/wasm {found[:2]}")
 
 
 if __name__ == "__main__":
