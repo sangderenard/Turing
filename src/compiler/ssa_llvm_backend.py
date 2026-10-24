@@ -4671,10 +4671,58 @@ def _emit_repository_call_module(
                     ))
                 computed = f"%ew.val.{tag}"
                 if predicate and compute_type == "i64":
+                    unsigned = all(
+                        str((argument.accounting or {}).get("physical_dtype")
+                            or argument.dtype).casefold().startswith("uint")
+                        for argument in instruction.args
+                    )
+                    comparison = _INTEGER_COMPARISON[operation]
+                    if unsigned and comparison[0] == "s":
+                        comparison = "u" + comparison[1:]
                     rendered = (
-                        f"{computed} = icmp {_INTEGER_COMPARISON[operation]} "
+                        f"{computed} = icmp {comparison} "
                         f"i64 {operands[0]}, {operands[1]}"
                     )
+                elif compute_type in {"i1", "i32", "i64"}:
+                    # token_kind_batch and c620: a rank-one integer span
+                    # times a scalar reached ``fmul double`` with i64
+                    # operands. The scalar emitter already owns the integer
+                    # law; span rank changes the sweep, not the declared dtype.
+                    unsigned = str(
+                        (result.accounting or {}).get("physical_dtype")
+                        or result.dtype
+                    ).casefold().startswith("uint")
+                    if unsigned and operation == "Mod":
+                        rendered = (
+                            f"{computed} = urem {compute_type} "
+                            f"{operands[0]}, {operands[1]}"
+                        )
+                    elif unsigned and operation in {"Div", "FloorDiv"}:
+                        rendered = (
+                            f"{computed} = udiv {compute_type} "
+                            f"{operands[0]}, {operands[1]}"
+                        )
+                    elif unsigned and operation in {"Max", "Min"}:
+                        comparison = "ugt" if operation == "Max" else "ult"
+                        rendered = (
+                            f"{computed}.cmp = icmp {comparison} {compute_type} "
+                            f"{operands[0]}, {operands[1]}\n"
+                            f"{computed} = select i1 {computed}.cmp, "
+                            f"{compute_type} {operands[0]}, "
+                            f"{compute_type} {operands[1]}"
+                        )
+                    else:
+                        integer = integer_scalar_lines(
+                            operation, compute_type, operands, computed,
+                        )
+                        if integer is None:
+                            shortfalls.append(LLVMEmissionShortfall(
+                                name, operation,
+                                f"integer elementwise {operation} has no "
+                                f"LLVM emission for {compute_type}",
+                            ))
+                            continue
+                        rendered = "\n".join(integer[0])
                 else:
                     rendered = template.format(*operands, out=computed)
                 for rendered_line in rendered.splitlines():
