@@ -23624,6 +23624,7 @@ def _class_surface_ssa_program(
                     note_shape(wrapper.G, value_id, ('native object graph producer', (), 'opaque_ref', 'reference'))
                     changed = True
             _fold_callsite_structural_values(wrapper)
+        round_list_elements: dict[int, dict[int, str]] = {}
         for caller_graph, caller_id, callee_graph, callee_id in compile_iter(
             linked_value_edges, "abi-edges", label="abi settlement: call edges",
         ):
@@ -23697,6 +23698,45 @@ def _class_surface_ssa_program(
                     # case, and leaving shape unset lets the truth land.
                     if extents:
                         source["shape"] = extents
+            if (
+                not str((source or {}).get("dtype") or "")
+                and (caller_graph.nodes.get(int(caller_id), {}).get(
+                    "attributes"
+                ) or {}).get("aggregate_kind") == "list"
+            ):
+                # Program: ``def evens(n): out = []; for ...:
+                # out.append(i * 3); return out`` (no annotation), then
+                # ``t = evens(n)`` (A6 probe c988).  Wrong record: the
+                # returned list's contract carried only its Python class,
+                # so the caller's view of the one arena took the float64
+                # default while the callee appended int64 (refused:
+                # "native heap context projection conflicts").  Rule: the
+                # element type the source proves for a list
+                # (``_planned_scalar_dtypes``: the join of its writers) is
+                # its span contract across the call edge, as an
+                # annotation's would be.
+                elements = round_list_elements.get(id(caller_graph))
+                if elements is None:
+                    from types import SimpleNamespace as _ElementGraph
+                    from .glsl_deployment_strategy import (
+                        _planned_scalar_dtypes as _list_element_dtypes,
+                    )
+
+                    elements = _list_element_dtypes(
+                        _ElementGraph(G=caller_graph)
+                    )
+                    round_list_elements[id(caller_graph)] = elements
+                element = elements.get(int(caller_id))
+                if element in {"int64", "float64", "bool"}:
+                    source = {
+                        **dict(source or {}),
+                        "storage": "span", "rank": 1, "dtype": element,
+                        "mutable": True, "aggregate_kind": "list",
+                    }
+                    linked_value_abi_by_graph.setdefault(
+                        id(caller_graph), {},
+                    )[int(caller_id)] = source
+                    changed = True
             if source is None:
                 continue
             source_arms = _physical_type_arms(
