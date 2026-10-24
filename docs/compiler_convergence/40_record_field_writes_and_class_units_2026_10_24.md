@@ -86,6 +86,69 @@ Records fixed:
    (`'int'`) beside `value_kind='scalar'`. It was read as a nested record
    instance ("names absent record 0").
 
+## F3. Ordinary classes constructed in a program
+
+**Program** (c423):
+
+```python
+class K:
+    def __init__(self, scale: int):
+        self.scale = scale
+    def mul(self, x: int) -> int:
+        return self.scale * x
+def root(a: int, x: int) -> int:
+    k = K(a)
+    return k.mul(x) + k.scale
+```
+
+After F2's annotated-parameter receipt, `K` has a projection view, and
+`abi_record_for_call` claimed `K(a)` as a record literal. It then refused:
+"record constructor requires a complete physical schema, but only an exact
+projection view is available". Before F2, the call reached the existing
+`__init__` frame link ("materialize class constructors and fields") and
+failed there with "record_descriptor ... no incumbent to revise".
+
+Records fixed:
+
+1. `abi_record_for_call`: a projection view (`constructor_complete:
+   False`) of a class with an authored `__init__`/`__new__` is not a
+   constructor schema. That call is the `__init__` frame link. The refusal
+   still stands for a dataclass whose layout is incomplete.
+2. The frame link registers the caller's copy of the constructor's record
+   DERIVED from the constructor's descriptor cell and the call. A bare
+   register posted no cell.
+3. Merging constructor call records posts the `call_record` row from the
+   call's cells and the row it revises. The bare list write was refused.
+4. A bound caller id that becomes a frame slot posts the constructor
+   value's type. When `self` is the field slot, the receiver's row was
+   minted untyped for the call, and result settlement refused "unresolved
+   evidence cannot erase resident type".
+
+c422-c429 pass: two instances, construction in both arms, a caller-side
+field write, crossed `__init__` fields, and keyword construction.
+
+**Silent wrong answer found on the way: a computed field.** `self.flag = n >
+3` has no field receipt, so the record view has no slot for it. `__init__`
+computed it and stored it nowhere, and `pick` read garbage (n=4 gave 3,
+where Python gives 8). **Rule.** If a class layout has a field that the
+constructor's receiver record lacks, the frame link refuses by name: "class
+construction has no physical field for attributes of its layout".
+
+**Silent wrong answer, also on main: a call that stores into a local
+record.** `acc = Acc(a); acc.add(b); return acc.total` returned `a`. So did
+a free function storing into a dataclass, `add(acc, b)`. The discarded
+call was dropped, and the field read took the construction's value. On
+main this is the same for dataclasses (checked at dd340a1). **Rule.** The
+reducer marks a name passed to a call, as an argument or as a method
+receiver, unless every authored definition of that callee provably does
+not store into that parameter. A proven read-only parameter is used only as
+loaded `p.field` operands, or as `p.method(...)` of a read-only method. A
+later field read of a constructed record under that name is refused:
+`record_stored_by_call`. A loop body's storing calls mark the name for the
+whole body. `return acc.add(b)` still lowers and matches Python, because
+the method's frame writes the caller's storage.
+`tests/test_class_construction_refusals.py` holds the three refusals.
+
 ## Measured
 
 At 48607a8 (the fix rebased onto main caf2e77): the typed corpus is 327/327
@@ -120,7 +183,9 @@ at 8c6ae0d on dd340a1:
 
 - A field of a local record written in a loop is refused (F1); it needs the
   loop field-state merge that plan 70 holds for the user.
-- Constructing an ordinary (non-dataclass) class inside a program is
-  refused: "record constructor requires a complete physical schema".
+- A computed `__init__` field (no field receipt) is refused at
+  construction (F3). It needs a receipt from the initializer's type.
+- A field read after a call that stores into the record is refused (F3). It
+  needs the call's store reloaded into the caller's field state.
 - `compile_class_to_dll` remains the deprecated adapter with the field
   lowering above; class DLLs should come from the catalogue.
