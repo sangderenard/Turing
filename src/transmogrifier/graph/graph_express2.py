@@ -1614,11 +1614,48 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         if carried_declarations and isinstance(incumbent_fact, FieldFact):
             field_fact = incumbent_fact
             cells = tuple(dict.fromkeys((*cells, incumbent_cell)))
+        mode = Mode.CONCORD
+        # Program: ``SSAReferenceEvaluator.run`` compiled as its own unit.
+        # Wrong record: the unit's partition keeps the class with ``run``
+        # alone, so ``history`` was declared from run's unannotated
+        # ``self.history = {...}``; the complete declared source then posted
+        # ``__init__``'s ``self.history: dict[int, list[Any]] = {}`` and the
+        # row refused the same field as a disagreement.  Rule: when every
+        # statement the incumbent was derived from is one of this view's
+        # declaring statements, this view is the same declaration seen with
+        # more of its statements, and only an annotation the incumbent's
+        # statements did not carry may be added (a REVISE from the larger
+        # cell set).  Two different annotations, or a view that does not
+        # contain the incumbent's statements, still disagree.
+        # The smaller view posted after the larger one reads the incumbent:
+        # its own statements are a subset of those the annotation came from.
+        if (
+            not carried_declarations
+            and isinstance(incumbent_fact, FieldFact)
+            and incumbent_fact != field_fact
+            and incumbent_fact.storage == field_fact.storage
+            and incumbent_fact.permissions == field_fact.permissions
+            and not (incumbent_fact.annotation and field_fact.annotation)
+        ):
+            incumbent_sources = {
+                source.key for source, _stage in book.edges_into(incumbent_cell)
+            }
+            view_sources = {cell.key for cell in cells}
+            if (
+                not incumbent_fact.annotation
+                and incumbent_sources and incumbent_sources < view_sources
+            ):
+                mode = Mode.REVISE
+            elif (
+                not field_fact.annotation
+                and view_sources and view_sources < incumbent_sources
+            ):
+                field_fact = incumbent_fact
         declaration_cells.append(book.post(
             CLASS_FIELD_DECLARATION,
             field_row,
             field_fact,
-            stage=INGESTION, provenance=Derived(cells), mode=Mode.CONCORD,
+            stage=INGESTION, provenance=Derived(cells), mode=mode,
         ))
     for method, entry in zip(methods, schema["methods"]):
         method_span = post_source_span(definition, method)
