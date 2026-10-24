@@ -130,6 +130,8 @@ class _JavaScriptProcessInterpreter:
         self.assumptions = frozenset(map(str, assumptions))
         self.parameter_kinds = dict(parameter_kinds or {})
         self.last_version: dict[str, int] = {}
+        self.loops: list[dict[str, Any]] = []
+        self.loop_count = 0
         self.shortfalls: list[JavaScriptExpressionShortfall] = []
         self.bindings: dict[str, dict[str, Any]] = {}
         self.binding_records: list[dict[str, Any]] = []
@@ -885,6 +887,153 @@ class _JavaScriptProcessInterpreter:
             value_kind=self._kind(yes),
         )
 
+    @staticmethod
+    def _assigned_names(node: Any) -> set[str]:
+        """Names a statement (re)assigns, not looking into nested functions."""
+
+        names: set[str] = set()
+
+        def visit(item: Any) -> None:
+            if isinstance(item, Mapping):
+                kind = item.get("type")
+                if kind in {
+                    "FunctionDeclaration", "FunctionExpression",
+                    "ArrowFunctionExpression",
+                }:
+                    return
+                target = (
+                    item.get("left") if kind == "AssignmentExpression"
+                    else item.get("argument") if kind == "UpdateExpression"
+                    else None
+                )
+                if isinstance(target, Mapping) and target.get("type") == "Identifier":
+                    names.add(str(target.get("name")))
+                for key, child in item.items():
+                    if key not in {"type", "start", "end"}:
+                        visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+
+        visit(node)
+        return names
+
+    @staticmethod
+    def _loop_exit(node: Any) -> str | None:
+        """The first return/break/continue/label inside a loop body."""
+
+        def visit(item: Any) -> str | None:
+            if isinstance(item, Mapping):
+                kind = item.get("type")
+                if kind in {
+                    "FunctionDeclaration", "FunctionExpression",
+                    "ArrowFunctionExpression",
+                }:
+                    return None
+                if kind in {
+                    "ReturnStatement", "BreakStatement", "ContinueStatement",
+                    "LabeledStatement",
+                }:
+                    return str(kind)
+                for key, child in item.items():
+                    if key not in {"type", "start", "end"}:
+                        found = visit(child)
+                        if found:
+                            return found
+            elif isinstance(item, list):
+                for child in item:
+                    found = visit(child)
+                    if found:
+                        return found
+            return None
+
+        return visit(node)
+
+    def loop(self, statement: Mapping[str, Any]) -> None:
+        """``for``/``while`` as a loop region with one Phi per carried name.
+
+        Every binding the loop assigns that is visible at its head becomes a
+        Phi (its value on entry, and its value at the end of the body).  The
+        condition and body are interpreted once against the Phis.  The back
+        edge is recorded in ``javascript_loops`` -- not as a graph edge, so
+        the graph itself stays acyclic -- with the id ranges the header and
+        body occupy (node ids are creation order).  After the loop each
+        outer name reads its Phi: the loop leaves through the header.
+        """
+
+        kind = statement.get("type")
+        exit_kind = self._loop_exit(statement.get("body"))
+        if exit_kind is not None or statement.get("test") is None:
+            self.unsupported(
+                str(kind),
+                "unsupported-loop-exit",
+                f"{exit_kind or 'a loop without a condition'} leaves the loop "
+                "other than through its condition",
+                source=statement,
+            )
+            return
+        outer = dict(self.bindings)
+        self.bindings = dict(outer)
+        initializer = statement.get("init")
+        if initializer is not None:
+            self.sequence([
+                initializer if initializer.get("type") == "VariableDeclaration"
+                else {"type": "ExpressionStatement", "expression": initializer},
+            ])
+        body = self._statement_body(statement.get("body"))
+        update = statement.get("update")
+        if update is not None:
+            body = [*body, {"type": "ExpressionStatement", "expression": update}]
+        carried = sorted(
+            self._assigned_names([statement.get("test"), body])
+            & set(self.bindings)
+        )
+        # Numbered on entry: an inner loop finishes (and is recorded) first.
+        loop_id = self.loop_count
+        self.loop_count += 1
+        header_start = self.next_id
+        phis: dict[str, int] = {}
+        phi_records: dict[str, dict[str, Any]] = {}
+        for name in carried:
+            initial = int(self.bindings[name]["value_node"])
+            phi = self.make_node(
+                Handler.Phi.name, Handler.Phi.name, name, ((initial, "init"),),
+                attributes={"javascript_loop": loop_id, "binding_name": name},
+                source=statement, value_kind=self._kind(initial),
+            )
+            if self.assign(name, phi, statement) is None:
+                self.bindings = outer
+                return
+            phis[name] = phi
+            phi_records[name] = self.bindings[name]
+        condition_value = self.expression(statement["test"])
+        condition = self.truthy(condition_value, statement["test"])
+        condition_end = self.next_id
+        _value, _returned, visible = self._branch(body, dict(self.bindings))
+        carried_next = {
+            name: int(visible[name]["value_node"]) for name in carried
+        }
+        for name in carried:
+            if self._kind(carried_next[name]) != self._kind(phis[name]):
+                self.unsupported(
+                    name,
+                    "unproved-loop-carried-kind",
+                    f"{name!r} changes JavaScript value kind across the loop",
+                    source=statement,
+                )
+        self.loops.append({
+            "id": loop_id,
+            "header_start": header_start,
+            "condition": condition,
+            "condition_end": condition_end,
+            "body_end": self.next_id,
+            "phis": dict(phis),
+            "next": carried_next,
+        })
+        self.bindings = {
+            name: phi_records.get(name, record) for name, record in outer.items()
+        }
+
     def sequence(
         self, statements: Sequence[Mapping[str, Any]],
     ) -> tuple[int | None, bool]:
@@ -1010,6 +1159,10 @@ class _JavaScriptProcessInterpreter:
                 )
                 index += 1
                 continue
+            if kind in {"ForStatement", "WhileStatement"}:
+                self.loop(statement)
+                index += 1
+                continue
             if kind == "EmptyStatement":
                 index += 1
                 continue
@@ -1088,6 +1241,9 @@ class _JavaScriptProcessInterpreter:
         self.graph.roots = [root]
         self.graph.domain_shape = (1,)
         self.graph.G.graph["javascript_entry_identity"] = self.entry_identity
+        self.graph.G.graph["javascript_loops"] = tuple(
+            dict(record) for record in self.loops
+        )
         self.graph.G.graph["javascript_binding_identities"] = tuple(
             dict(record) for record in self.binding_records
         )

@@ -3,7 +3,8 @@
 The JavaScript counterpart of ``differential_fuzz.py``.  Each program is a
 random function over two Number parameters (``a``, ``b``) and two Boolean
 parameters (``p``, ``q``) built from ``const``/``let`` bindings,
-reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``,
+reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``
+and bounded ``for``/``while`` loops,
 an optional early-return ``if`` and typed expression snippets.  It is lowered with
 ``lower_javascript_source_to_ssa``, compiled through the C backend and run on
 rows of ordinary and special values (``NaN``, ``-0``, ``Infinity``), and
@@ -146,11 +147,45 @@ class Generator:
 
         rng = self.rng
         lines = []
+        # Names declared in this block (a while counter) end with it.
+        visible = list(self.numbers)
         for _ in range(rng.randint(1, 2)):
-            if depth > 0 and rng.random() < 0.3:
+            choice = rng.random()
+            if depth > 0 and choice < 0.15:
+                lines.extend(self.loop_statement(depth - 1, indent))
+            elif depth > 0 and choice < 0.4:
                 lines.extend(self.if_statement(depth - 1, indent))
             else:
                 lines.append(f"{indent}{self.assignment(2)}")
+        self.numbers[:] = visible
+        return lines
+
+    def loop_statement(self, depth: int, indent: str) -> list[str]:
+        """A bounded for/while loop rebinding outer names in its body.
+
+        The trip count is at most a small literal, optionally cut short by
+        a data comparison, so every program terminates in node.
+        """
+
+        rng = self.rng
+        self.loop_index += 1
+        counter = f"i{self.loop_index}"
+        limit = rng.choice(("0", "1", "3", "4"))
+        guard = f"{counter} < {limit}"
+        if rng.random() < 0.4:
+            guard += f" && {counter} < {rng.choice(('a', 'b'))}"
+        self.numbers.append(counter)
+        if rng.random() < 0.7:
+            lines = [f"{indent}for (let {counter} = 0; {guard}; {counter}++) {{"]
+            lines.extend(self.block(depth, indent + "  "))
+        else:
+            lines = [f"{indent}let {counter} = 0;", f"{indent}while ({guard}) {{"]
+            lines.extend(self.block(depth, indent + "  "))
+            lines.append(f"{indent}  {counter}++;")
+        lines.append(f"{indent}}}")
+        if lines[0].lstrip().startswith("for"):
+            # A for-head let is scoped to the loop.
+            self.numbers.remove(counter)
         return lines
 
     def if_statement(self, depth: int, indent: str) -> list[str]:
@@ -168,6 +203,7 @@ class Generator:
         # Parameters are reassignable too.
         self.mutable_numbers = ["a", "b"] if rng.random() < 0.3 else []
         self.mutable_booleans = []
+        self.loop_index = 0
         for index in range(rng.randint(0, 4)):
             binding = "let" if rng.random() < 0.5 else "const"
             if rng.random() < 0.7:
@@ -183,7 +219,10 @@ class Generator:
                 if binding == "let":
                     self.mutable_booleans.append(name)
             if (self.mutable_numbers or self.mutable_booleans) and rng.random() < 0.5:
-                if rng.random() < 0.5:
+                form = rng.random()
+                if form < 0.35:
+                    lines.extend(self.loop_statement(1, "  "))
+                elif form < 0.65:
                     lines.extend(self.if_statement(1, "  "))
                 else:
                     lines.append(f"  {self.assignment(3)}")

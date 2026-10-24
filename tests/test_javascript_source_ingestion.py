@@ -132,3 +132,47 @@ def test_sibling_scopes_may_declare_the_same_name():
         "{ let u = 3; s += u; } { let u = 4; s += u; } return s; }"
     )
     assert check_program(source, "[[true], [false]]") == "PASS"
+
+
+@needs_node
+def test_loop_lowers_to_header_body_exit_blocks_with_phis():
+    lowered = lower_javascript_source_to_ssa(
+        "/** @param {number} n */ function root(n) "
+        "{ let s = 0; for (let i = 0; i < n; i++) { s += i; } return s; }"
+    )
+    assert lowered.complete, lowered.shortfall_report()
+    blocks = lowered.module.functions["root"].blocks
+    assert list(blocks) == ["entry", "loop0_header", "loop0_body", "loop0_exit"]
+    phis = [i for i in blocks["loop0_header"].instrs if i.op == "Phi"]
+    assert sorted(i.attributes["binding_name"] for i in phis) == ["i", "s"]
+    assert all(
+        i.attributes["incoming_blocks"] == ("entry", "loop0_body") for i in phis
+    )
+
+
+@needs_node
+@pytest.mark.parametrize("source", [
+    # break/continue/return leave a loop other than through its condition.
+    "/** @param {number} n */ function root(n) { let s = 0; "
+    "for (let i = 0; i < n; i++) { if (i > 2) { break; } s += i; } return s; }",
+    "/** @param {number} n */ function root(n) { let s = 0; "
+    "while (s < n) { return s; } return 1; }",
+    # A carried value that changes kind has no single dtype.
+    "/** @param {number} n */ function root(n) { let x = 0; "
+    "for (let i = 0; i < n; i++) { x = x > 0; } return x; }",
+])
+def test_loop_exits_and_kind_changes_stay_loud_refusals(source):
+    assert not lower_javascript_source_to_ssa(source).complete
+
+
+@needs_node
+def test_sibling_loops_may_declare_the_same_counter():
+    # Two loops' ``let i`` and two blocks' ``let t`` are distinct bindings;
+    # the second once collided with the first on the identity book.
+    source = (
+        "/** @param {number} n */ function root(n) { let s = 0; "
+        "for (let i = 0; i < n; i++) { s += i; } "
+        "for (let i = 0; i < 2; i++) { s *= 2; } "
+        "{ let t = 1; s += t; } { let t = 2; s += t; } return s; }"
+    )
+    assert check_program(source, "[[0], [3], [NaN]]") == "PASS"
