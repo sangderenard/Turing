@@ -6,6 +6,18 @@ on main), Fortran 349/360 (c22 by design; c397, c399, c423-c429 loud, same on
 main). Fuzz seed 67 (30): 0 WRONG / 0 TYPE. Gate names identical to main
 7e1fa643 in all four parts.
 
+2026-10-24 EXTRACTED SHADER INTERFACE (MEASURED, cloud): host-written shaders
+found by shader_extractor now publish a turing.shader-component.v1 ABI read
+from their own global declarations (glsl_interface.read_glsl_interface):
+inputs, outputs, uniforms, samplers, images and blocks, with layout
+bindings and locations. Bindings left to the host are a link-assigned
+shortfall; #if, macros in declarations, struct-typed interface and
+non-literal sizes are refused by name. glslang reflection agrees on all 24
+shaders in src; an extracted compute shader runs on llvmpipe from its
+record alone. GPU tests: same 27 failures / 4 errors as main 5d8d339. C
+corpus 351/351. Fuzz seed 66 (40): 0 WRONG / 0 TYPE. Gate names identical
+to main 5d8d339 in all four parts. See doc 38.
+
 2026-10-24 GLSL CONTROL SHELL (MEASURED, cloud): compose_control_shader's
 u_count, u_debug_capacity and u_dispatch_iteration move from default-block
 uniforms into one std140 uniform block TuringShellControls at binding 8, so
