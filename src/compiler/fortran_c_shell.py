@@ -42255,6 +42255,38 @@ def _class_surface_ssa_program(
                     caller.args.append(value)
                     available[new_id] = value
                     new_arguments.append(value)
+                # The constructor's frame slots are the caller's storage for
+                # a record it constructs, not the caller's authored ABI.
+                # Program: ``k = K(a); return k.mul(x) + k.scale`` (corpus
+                # c423).  Wrong record: each slot (and the receiver standing
+                # for ``self``) carried the constructor formal's
+                # ``program_abi_parameter`` ``self``, so the entry ABI
+                # published ``self.scale`` as an input; C zero-filled it, the
+                # Fortran entry refused "missing Fortran feed 3".  Rule: a
+                # caller formal bound to a constructor slot, and not one of
+                # the caller's authored parameters, is linked frame storage.
+                caller_parameter_ids = {
+                    int(value_id)
+                    for _name, value_id in caller.metadata.get(
+                        "parameter_names", ()
+                    )
+                }
+                frame_slot_ids = set(map(int, remap.values()))
+                for formal in caller.args:
+                    if (
+                        int(formal.id) not in frame_slot_ids
+                        or int(formal.id) in caller_parameter_ids
+                    ):
+                        continue
+                    accounting = dict(formal.accounting or {})
+                    # The constructor's own ProgramABI naming (``self`` and
+                    # its field): in the caller it names no authored input.
+                    accounting.pop("program_abi_parameter", None)
+                    accounting.pop("program_abi_field", None)
+                    accounting.setdefault(
+                        "linked_call_frame_storage", str(constructor.name),
+                    )
+                    formal.accounting = accounting
 
                 mapped_records = {}
                 for record_template in reversed(template_records):
