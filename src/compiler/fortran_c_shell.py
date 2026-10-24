@@ -5451,6 +5451,13 @@ def _authored_annotation_field_receipt(
         value_dtype = {
             "bool": "bool", "int": "int64", "float": "float64",
             "str": "int64",
+            # A mapping's arbitrary-object value uses the same authored
+            # boundary as an ``Any`` parameter, field or collection member:
+            # one fixed-width opaque handle.  Falling through to the record
+            # branch below named a record ``'Any'`` that no declaration
+            # defines (``SSAReferenceEvaluator.run``'s
+            # ``Mapping[int, Any]``, "top-level keyed value_record").
+            "Any": "opaque_ref", "object": "opaque_ref",
         }.get(str(value_name))
         value_record = None
         authored_value_scalar = dict(
