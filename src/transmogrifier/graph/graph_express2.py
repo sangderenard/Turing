@@ -858,10 +858,17 @@ def _source_ast_definition(value):
         source = textwrap.dedent(inspect.getsource(value))
     except (OSError, TypeError):
         return None
-    parsed = ast.parse(
-        source,
-        filename=str(inspect.getsourcefile(value) or "<resolved-parent>"),
-    )
+    try:
+        parsed = ast.parse(
+            source,
+            filename=str(inspect.getsourcefile(value) or "<resolved-parent>"),
+        )
+    except SyntaxError:
+        # ``re.PatternError`` is defined in ``re/_constants.py`` but names
+        # ``re`` as its module, so ``inspect`` returns lines of the wrong file
+        # (AbstractTensor discovery raised here).  Lines that do not parse
+        # are not the definition: its source is unavailable, as above.
+        return None
     definition = next(
         (
             statement
