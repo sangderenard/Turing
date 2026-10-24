@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..transmogrifier.dtype_layout import fortran_kind_table
+from .runtime_abi import HOST_CALLBACK_SCHEMA
 from ..transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -50,6 +51,7 @@ from ..transmogrifier.ssa import (
     SSASequenceTable,
     SSATensorTable,
 )
+from .max_semantics import fortran_reduction, fortran_step, is_max, max_step_rule
 from .string_table import NONE_TOKEN as _NONE_TOKEN, string_token as _string_token
 
 
@@ -133,6 +135,8 @@ _BINARY: dict[str, str] = {
     "pow": "({0} ** {1})",
     "maximum": "max({0}, {1})",
     "minimum": "min({0}, {1})",
+    "emax": "max({0}, {1})",
+    "emin": "min({0}, {1})",
     "matmul": "matmul({0}, {1})",
     "mod": "modulo({0}, {1})",
     "floordiv": "floor({0} / {1})",
@@ -3085,6 +3089,106 @@ class _FunctionEmitter:
             f"    call {symbol}({', '.join((*operands, _name(instr.res)))})"
         ]
 
+    def _host_callback_instructions(self) -> list[Instr]:
+        return [
+            instr
+            for block in self.function.blocks.values()
+            for instr in block.instrs
+            if instr.op == "HostCallback"
+        ]
+
+    def _host_callback_interfaces(self) -> list[str]:
+        """One bind(C) abstract interface and procedure pointer per call.
+
+        ``turing-host-callback-v1``: the host supplies ``R (*)(void *context,
+        A0, ...)`` and the context.  Both cross the entry as pointer-sized
+        integers; the interface states the exact C signature the call uses.
+        """
+
+        lines = []
+        for instr in self._host_callback_instructions():
+            signature = dict(instr.attributes.get("host_callback_signature") or {})
+            arguments = tuple(signature.get("arguments") or ())
+            if len(instr.args) != len(arguments) + 2:
+                raise FortranEmissionError(
+                    "host callback call does not match its signature: "
+                    f"value={instr.res.id} signature={signature!r}"
+                )
+            kinds = []
+            for position, dtype in enumerate(arguments):
+                kind = _DTYPE_KIND.get(str(dtype))
+                actual = str(self._typed(instr.args[position + 2]).dtype)
+                if kind is None or _DTYPE_KIND.get(actual) != kind:
+                    raise FortranEmissionError(
+                        "host callback argument has no exact native type: "
+                        f"value={instr.res.id} position={position} "
+                        f"declared={dtype!r} actual={actual!r}"
+                    )
+                kinds.append(kind)
+            result = signature.get("result")
+            interface = f"turing_host_callback_{int(instr.res.id)}"
+            dummies = ", ".join(
+                ("context", *(f"a{index}" for index in range(len(kinds))))
+            )
+            header = (
+                f"subroutine {interface}({dummies}) bind(C)"
+                if result is None else
+                f"function {interface}({dummies}) bind(C)"
+            )
+            body = [
+                "        import :: c_bool, c_double, c_int64_t, c_intptr_t",
+                "        integer(c_intptr_t), value :: context",
+                *(
+                    f"        {kind}, value :: a{index}"
+                    for index, kind in enumerate(kinds)
+                ),
+            ]
+            if result is not None:
+                kind = _DTYPE_KIND.get(str(result))
+                if kind is None or kind != _DTYPE_KIND.get(
+                    str(self._typed(instr.res).dtype)
+                ):
+                    raise FortranEmissionError(
+                        "host callback result has no exact native type: "
+                        f"value={instr.res.id} declared={result!r}"
+                    )
+                body.append(f"        {kind} :: {interface}")
+            lines.extend((
+                "    abstract interface",
+                f"      {header}",
+                *body,
+                "      end " + (
+                    "subroutine" if result is None else "function"
+                ) + f" {interface}",
+                "    end interface",
+                f"    procedure({interface}), pointer :: {interface}_pointer",
+            ))
+        return lines
+
+    def _host_callback_call(self, instr: Instr) -> list[str] | None:
+        if instr.op != "HostCallback":
+            return None
+        interface = f"turing_host_callback_{int(instr.res.id)}"
+        function, context, *arguments = instr.args
+        lines = [
+            "    call c_f_procpointer(transfer(int("
+            f"{self._operand(function)}, c_intptr_t), c_null_funptr), "
+            f"{interface}_pointer)",
+        ]
+        operands = ", ".join((
+            f"int({self._operand(context)}, c_intptr_t)",
+            *(self._operand(argument) for argument in arguments),
+        ))
+        signature = dict(instr.attributes.get("host_callback_signature") or {})
+        if signature.get("result") is None:
+            lines.append(f"    call {interface}_pointer({operands})")
+        else:
+            self._locals[int(instr.res.id)] = self._typed(instr.res)
+            lines.append(
+                f"    {_name(instr.res)} = {interface}_pointer({operands})"
+            )
+        return lines
+
     def _external_reference_interfaces(self) -> list[str]:
         from .shell_external_references import external_reference_thunk_symbol
 
@@ -4034,6 +4138,17 @@ class _FunctionEmitter:
 
     def _expression(self, instr: Instr) -> str | None:
         op = instr.op
+        if op == "HostCallbackPresent" and len(instr.args) == 1:
+            # ``self.trace is not None``: the host passes a null function
+            # pointer for an absent callable (turing-host-callback-v1).
+            present = (
+                "c_associated(transfer(int("
+                f"{self._operand(instr.args[0])}, c_intptr_t), "
+                "c_null_funptr))"
+            )
+            if instr.attributes.get("host_callback_present_when", True):
+                return f"logical({present}, kind=c_bool)"
+            return f"logical(.not. {present}, kind=c_bool)"
         if op in ("Call", "call"):
             # precompile_to_ssa.lower_fused_program_to_ssa wraps almost
             # every tensor op in Handler.Call (it names the C/LLVM kernel
@@ -4404,9 +4519,24 @@ class _FunctionEmitter:
                     return _REDUCTION[op].format(f"({args[0]} /= 0)")
                 return _REDUCTION[op].format(args[0])
             args = self._numeric(instr, args)
+            rule = max_step_rule(instr)
+            if (
+                rule is not None and op in ("max", "min")
+                and len(tuple(instr.args[0].shape or ())) == 1
+            ):
+                return fortran_reduction(rule, op == "max", args[0])
             return _REDUCTION[op].format(*args)
         if op in _TERNARY and len(args) == 3:
             return _TERNARY[op].format(*self._numeric(instr, args))
+        if op in ("max", "min") and len(args) == 2 and max_step_rule(instr):
+            # Builtin ``max(a, b)`` of one-element tensors: kept out of
+            # ``_BINARY``, whose membership other sites read as "elementwise
+            # with two operands" for the one-operand reduction too.
+            conformed = self._conform(instr, args)
+            if conformed is None:
+                return None
+            a, b = self._numeric(instr, conformed)
+            return fortran_step(max_step_rule(instr), op == "max", a, b)
         if op in _BINARY and len(args) == 2:
             template = _BINARY[op]
             # Shape first, then type. Conforming subscripts an operand to
@@ -4422,6 +4552,9 @@ class _FunctionEmitter:
                 args = conformed
             if op not in _LOGICAL_BINARY:
                 args = self._numeric(instr, args)
+            rule = max_step_rule(instr)
+            if rule is not None and is_max(op) is not None:
+                return fortran_step(rule, bool(is_max(op)), args[0], args[1])
             if op in {"FloorDiv", "floordiv"} and str(
                 instr.res.dtype or self.dtype
             ) in _INTEGER_DTYPES:
@@ -4629,6 +4762,11 @@ class _FunctionEmitter:
             cast = self._cast_kernel_call(instr)
             if cast is not None:
                 body.extend(cast)
+                continue
+
+            host_callback = self._host_callback_call(instr)
+            if host_callback is not None:
+                body.extend(host_callback)
                 continue
 
             call = self._ssa_call(instr)
@@ -4988,6 +5126,7 @@ class _FunctionEmitter:
             for extent in extent_names
         ]
         declarations.extend(self._external_reference_interfaces())
+        declarations.extend(self._host_callback_interfaces())
         # A referenced table must also be declared. Rendering the body sets
         # this flag, and the body is rendered before this point.
         if self.uses_sin_table:
@@ -5668,6 +5807,8 @@ def emit_module(
             if instruction.res is not None
         )
         for descriptor in table.records.values():
+            if _conceptual_record(descriptor, available_value_ids):
+                continue
             for field in descriptor.fields:
                 missing_values = set(field.value_ids) - available_value_ids
                 if missing_values:
@@ -7387,6 +7528,31 @@ def emit_module(
                 ),
                 "external_reference_thunks": external_reference_thunks,
                 **({
+                    "host_callback_schema": HOST_CALLBACK_SCHEMA,
+                    "host_callbacks": {
+                        str(function_name): [
+                            dict(entry)
+                            for entry in function.metadata["host_callbacks"]
+                        ]
+                        for function_name, function in functions.items()
+                        if function.metadata.get("host_callbacks")
+                    },
+                    "host_callback_bindings": {
+                        str(function_name): [
+                            dict(entry)
+                            for entry in function.metadata[
+                                "host_callback_bindings"
+                            ]
+                        ]
+                        for function_name, function in functions.items()
+                        if function.metadata.get("host_callback_bindings")
+                    },
+                } if any(
+                    function.metadata.get("host_callbacks")
+                    or function.metadata.get("host_callback_bindings")
+                    for function in functions.values()
+                ) else {}),
+                **({
                     "host_linear_region_inlining": list(
                         host_linear_region_inlining
                     ),
@@ -7519,12 +7685,17 @@ def emit_module(
             ],
             "record_table_schema": "turing.repository-ssa-record-table.v1",
             "record_tables": {
-                function_name: [
+                function_name: records
+                for function_name, table in module_record_tables.items()
+                if function_name in functions
+                for records in ([
                     descriptor.to_mapping()
                     for descriptor in table.records.values()
-                ]
-                for function_name, table in module_record_tables.items()
-                if function_name in functions and table.records
+                    if not _conceptual_record(
+                        descriptor, _function_value_ids(functions[function_name]),
+                    )
+                ],)
+                if records
             },
             "value_union_table_schema": (
                 "turing.repository-ssa-value-union-table.v1"
@@ -7543,6 +7714,50 @@ def emit_module(
     return FortranModule(
         name, "\n".join(lines) + "\n", subroutines, api=api,
         precision_sections=module_precision_sections,
+    )
+
+
+def _function_value_ids(function: Any) -> set[int]:
+    """Every SSA id a function defines: its formals and instruction results."""
+
+    value_ids = {int(value.id) for value in function.args}
+    value_ids.update(
+        int(instruction.res.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    )
+    return value_ids
+
+
+def _conceptual_record(descriptor: Any, available_value_ids: set[int]) -> bool:
+    """A record descriptor with no physical presence in its function.
+
+    Program: ``s = S(0); if c > 0: s.n = c * 2 else: s.n = 7 - c; return
+    s.n`` (corpus c397).  The record is a compile-time correlation: neither
+    its id nor any field value is an SSA value of ``root`` (the constructor's
+    ``0`` is overwritten on both arms and never emitted).  The C backend reads
+    record tables only for record parameters; Fortran refused the module with
+    "record 'S' field 'n' names absent SSA values [2]".  Rule: a descriptor
+    is checked (and exported) only when the record or one of its field values
+    is resident; a resident record with an absent field still refuses, and so
+    does any record with a field naming storage (a span, sequence, nested
+    record or reference): those name arenas the function must hold.
+    """
+
+    if int(descriptor.record_id) in available_value_ids:
+        return False
+    if any(
+        str(getattr(field.storage, "value", field.storage)) != "scalar"
+        or field.sequence_id is not None
+        or field.record_id is not None
+        for field in descriptor.fields
+    ):
+        return False
+    return not any(
+        int(value_id) in available_value_ids
+        for field in descriptor.fields
+        for value_id in field.value_ids
     )
 
 

@@ -19322,6 +19322,87 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 defaults[member.target.id] = value
         return defaults
 
+    def class_field_callables(definition: ast.ClassDef) -> dict[str, str]:
+        """``field -> Callable annotation`` for fields that hold a callable.
+
+        A field is a callable slot when its declaration says so: a class
+        level ``f: Callable[...]``, ``self.f: Callable[...] = ...`` in
+        ``__init__``, or ``self.f = p`` in ``__init__`` where ``p`` is a
+        parameter annotated ``Callable[...]`` (``Optional``/``| None``
+        included).
+        Every declaring store must state the same annotation; a field with a
+        store that states none, or a different one, is left out, so a call
+        through it stays refused.
+        """
+
+        def callable_text(annotation: ast.AST | None) -> str | None:
+            if annotation is None:
+                return None
+            if isinstance(annotation, ast.Constant) and isinstance(
+                annotation.value, str,
+            ):
+                try:
+                    annotation = ast.parse(annotation.value, mode="eval").body
+                except SyntaxError:
+                    return None
+            text = ast.unparse(annotation)
+            return text if "Callable" in {
+                node.id if isinstance(node, ast.Name) else node.attr
+                for node in ast.walk(annotation)
+                if isinstance(node, (ast.Name, ast.Attribute))
+            } else None
+
+        stated: dict[str, set[str | None]] = {}
+        for member in definition.body:
+            if isinstance(member, ast.AnnAssign) and isinstance(
+                member.target, ast.Name,
+            ):
+                stated.setdefault(member.target.id, set()).add(
+                    callable_text(member.annotation)
+                )
+        for method in definition.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            parameters = {
+                argument.arg: argument.annotation
+                for argument in (
+                    *method.args.posonlyargs, *method.args.args,
+                    *method.args.kwonlyargs,
+                )
+            }
+            for statement in source_walk(method):
+                # Only the constructor binds a callable slot: a store in any
+                # other method would change, mid-object, the callable the
+                # host supplies to each call.
+                constructor = method.name == "__init__"
+                if isinstance(statement, ast.AnnAssign):
+                    targets = (statement.target,)
+                    annotation = (
+                        callable_text(statement.annotation)
+                        if constructor else None
+                    )
+                elif isinstance(statement, ast.Assign):
+                    targets = tuple(statement.targets)
+                    annotation = (
+                        callable_text(parameters.get(statement.value.id))
+                        if constructor and isinstance(statement.value, ast.Name)
+                        else None
+                    )
+                else:
+                    continue
+                for target in targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "self"
+                    ):
+                        stated.setdefault(target.attr, set()).add(annotation)
+        return {
+            name: next(iter(annotations))
+            for name, annotations in stated.items()
+            if len(annotations) == 1 and None not in annotations
+        }
+
     graph.G.graph["class_table"] = {
         class_name: {
             "methods": {
@@ -19371,6 +19452,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 in class_field_classes.items()
                 if owner == class_name
             },
+            "field_callables": class_field_callables(definition),
         }
         for class_name, definition in class_definitions.items()
     }
@@ -20613,7 +20695,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 if inherited_fields != tuple(descriptor.get("fields") or ()):
                     descriptor["fields"] = inherited_fields
                     inheritance_changed = True
-                for metadata_name in ("field_defaults", "field_classes"):
+                for metadata_name in (
+                    "field_defaults", "field_classes", "field_callables",
+                ):
                     inherited = {
                         **dict(base_descriptor.get(metadata_name) or {}),
                         **dict(descriptor.get(metadata_name) or {}),
@@ -23673,7 +23757,16 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         callee, value_id
                     )[0] is not None
                 ))
-                if len(returned_facts) == 1:
+                # Program: ``def compact(n) -> tuple[list[int], bool]:
+                # ... return out, len(out) > 2`` then ``t, big =
+                # compact(n)`` (A6 probe c984).  Wrong record: the call
+                # result took the class of the one member that had a class
+                # fact (``out``: list), so the tuple result was concorded
+                # as a list and its contract became a list/tuple union.
+                # Rule: a call result is a returned member's class only
+                # when the callee returns ONE value; several outputs are
+                # one tuple, never any member.
+                if len(returned_facts) == 1 and len(returned_value_ids) == 1:
                     returned_class, returned_limbs = returned_facts[0]
                     result_book = current_identity_book()
                     result_page = result_book.page(

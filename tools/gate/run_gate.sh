@@ -28,8 +28,20 @@ for part in aa ab ac rec; do
      -q --tb=line -p no:cacheprovider --timeout 900 -rf > "$logs/part_$part.log" 2>&1) &
 done
 wait
+# A part whose log has no pytest result line never ran its tests (missing
+# requirements, a collection error, the timeout): an empty NEW list there
+# would read as a pass, so the gate fails instead.
+status=0
 for part in aa ab ac rec; do
-  echo "== $part: $(grep -E '[0-9]+ (passed|failed)' "$logs/part_$part.log" | tail -1)"
+  summary=$(grep -E '[0-9]+ (passed|failed)' "$logs/part_$part.log" | tail -1)
+  if [ -z "$summary" ]; then
+    echo "== $part: NO PYTEST SUMMARY; the part did not run. Log tail:"
+    tail -n 5 "$logs/part_$part.log" | sed 's/^/   /'
+    status=1
+    continue
+  fi
+  echo "== $part: $summary"
   comm -23 <(grep '^FAILED' "$logs/part_$part.log" | sed 's/ - .*//;s/^FAILED //' | sort) \
            <(sort "$here/baseline_$part.txt") | sed 's/^/NEW /'
 done
+exit $status

@@ -81,7 +81,7 @@ def project_native_heap_call_contexts(functions) -> None:
                     current = dict(occurrence.accounting or {})
                     for key, value in published.items():
                         if key in current and current[key] != value:
-                            raise ValueError('native heap context projection conflicts with incumbent ownership')
+                            raise ValueError(f'native heap context projection conflicts with incumbent ownership: {function.name} {actual.id} {key}={current[key]!r} vs {value!r} from {callee.name}')
                     if all(current.get(key) == value for key, value in published.items()):
                         continue
                     occurrence.accounting = {**current, **published,

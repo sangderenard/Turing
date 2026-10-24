@@ -24,6 +24,7 @@ from ..transmogrifier.dtype_layout import (
 )
 from ..transmogrifier.ssa import Function, IRModule
 from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+from .max_semantics import NUMPY, c_step, max_step_rule
 from .output_publication import (
     function_output_publications,
     publication_surface_plan,
@@ -367,6 +368,8 @@ def emit_ssa_function_to_c(
 ) -> CFunctionArtifact:
     from .ssa_object_operations import validate_object_operations
     validate_object_operations(module, function_name)
+    from .runtime_abi import refuse_host_callbacks
+    refuse_host_callbacks(module, function_name, "C")
     from .ir_identities import precision_backend_shortfalls
     from .identity_concordance import CorrelationTable
     findings = CorrelationTable._native_interface_findings(module)
@@ -514,7 +517,11 @@ def emit_ssa_function_to_c(
             # apply; the floored correction is the same one either way.
             rendered = f"{_FLOORED[op][1]}({args[0]}, {args[1]})"
         elif op in {"Max", "Min"} and len(args) == 2:
-            rendered = f"f{op.lower()}({args[0]}, {args[1]})"
+            rule = max_step_rule(instruction)
+            rendered = (
+                c_step(rule, op == "Max", args[0], args[1]) if rule
+                else f"f{op.lower()}({args[0]}, {args[1]})"
+            )
         elif op == "Neg" and len(args) == 1:
             rendered = f"(-{args[0]})"
         elif (
@@ -1785,6 +1792,8 @@ def emit_ssa_module_to_c(
     from .ir_identities import precision_backend_shortfalls
     from .ssa_object_operations import validate_object_operations
     validate_object_operations(module, function_name)
+    from .runtime_abi import refuse_host_callbacks
+    refuse_host_callbacks(module, function_name, "C")
     from .ssa_storage_requirements import module_storage_requirements
     from .identity_concordance import CorrelationTable
     findings = CorrelationTable._native_interface_findings(module)
@@ -3191,8 +3200,10 @@ def emit_ssa_module_to_c(
                 expression = f"{helper}({elements[0]}, {elements[1]})"
             elif op in {"Max", "Min"} and len(elements) == 2:
                 comparison = ">" if op == "Max" else "<"
+                rule = max_step_rule(instruction)
                 expression = (
-                    f"(({elements[0]}) {comparison} ({elements[1]}) "
+                    c_step(rule, op == "Max", elements[0], elements[1]) if rule
+                    else f"(({elements[0]}) {comparison} ({elements[1]}) "
                     f"? ({elements[0]}) : ({elements[1]}))"
                 )
             elif op == "Pow" and len(elements) == 2 and not integral:
@@ -4188,17 +4199,17 @@ def emit_ssa_module_to_c(
                         else:
                             element_type = buffer_type(source)
                         if op in {"max", "min"}:
-                            comparison = ">" if op == "max" else "<"
-                            # NaN propagates, matching the numpy reference:
-                            # once the accumulator is NaN no comparison can
-                            # displace it, and a NaN element always enters.
+                            # ``xs.max()`` (and an unstamped reduction) is
+                            # numpy's fold: NaN propagates, a tie takes the
+                            # later row.  Builtin ``max(xs)`` is CPython's
+                            # scan: only a strictly greater row replaces the
+                            # running value, so a leading NaN stays.
                             step = (
-                                f"if (turing_red_{result_id}_v {comparison} "
-                                f"turing_red_{result_id} || "
-                                f"turing_red_{result_id}_v != "
-                                f"turing_red_{result_id}_v) "
-                                f"turing_red_{result_id} = "
-                                f"turing_red_{result_id}_v;"
+                                f"turing_red_{result_id} = " + c_step(
+                                    max_step_rule(instruction) or NUMPY,
+                                    op == "max", f"turing_red_{result_id}",
+                                    f"turing_red_{result_id}_v",
+                                ) + ";"
                             )
                             initial = f"turing_red_{result_id}_src[0]"
                             start = 1
@@ -5870,6 +5881,31 @@ def emit_ssa_module_to_c(
                         else "INFINITY"
                     )
                     comparison = ">" if op.casefold() == "max" else "<"
+                    rule = max_step_rule(instruction)
+                    if rule is not None and int(element_count) > 0:
+                        # A stamped reduction folds from row 0 with its own
+                        # rule (see ``max_semantics``), never from an
+                        # infinity a NaN row could not displace.
+                        rows = (
+                            f"(({buffer_type(instruction.args[0])} *)"
+                            f"({source}))"
+                        )
+                        body.append(
+                            f"        {result_type} t{result_id} = {rows}[0];"
+                        )
+                        body.append(
+                            f"        for (ptrdiff_t r{result_id} = 1; "
+                            f"r{result_id} < {int(element_count)}; ++r{result_id}) "
+                            f"t{result_id} = " + c_step(
+                                rule, op.casefold() == "max", f"t{result_id}",
+                                f"{rows}[r{result_id}]",
+                            ) + ";"
+                        )
+                        expressions[result_id] = f"t{result_id}"
+                        addresses[result_id] = f"&t{result_id}"
+                        if _is_integer_dtype(instruction.res.dtype):
+                            integer_ids.add(result_id)
+                        continue
                     body.append(
                         f"        {result_type} t{result_id} = {initial};"
                     )
@@ -5892,10 +5928,16 @@ def emit_ssa_module_to_c(
                     comparison = ">" if op.casefold() == "max" else "<"
                     if integral:
                         integer_ids.add(result_id)
+                    rule = max_step_rule(instruction)
                     declared = (
                         f"const {result_type} t{result_id} = "
-                        f"(({args[0]}) {comparison} ({args[1]}) "
-                        f"? ({args[0]}) : ({args[1]}));"
+                        + (
+                            c_step(rule, op.casefold() == "max", args[0], args[1])
+                            if rule else
+                            f"(({args[0]}) {comparison} ({args[1]}) "
+                            f"? ({args[0]}) : ({args[1]}))"
+                        )
+                        + ";"
                     )
                 elif op == "Pow" and len(args) == 2:
                     declared_storage_type = "double"
