@@ -1,3 +1,10 @@
+2026-10-24 LANE E, E22b (MEASURED, cloud): a scheduled region with no body
+(only a post-operation fill) runs only its post-operations instead of calling
+an undefined numerical_region_N (C LOUD at main daaa83c0, c409). At 6b1204e3 (332
+programs): C 332/332, LLVM 331/332 (c367, same on main), Fortran 331 PASS
+(c22 by design). Fuzz seed 66: 0 WRONG / 0 TYPE. Gate names identical to
+main daaa83c0.
+
 2026-10-24 GLSL CONTROL SHELL (MEASURED, cloud): compose_control_shader's
 u_count, u_debug_capacity and u_dispatch_iteration move from default-block
 uniforms into one std140 uniform block TuringShellControls at binding 8, so
