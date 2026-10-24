@@ -90,8 +90,16 @@ _BINARY_REQUIREMENTS: Mapping[str, frozenset[str]] = {
         spelling: frozenset({
             "number-operands", "ecmascript-number-semantics",
         })
-        for spelling in ("+", "-", "*", "/", "**", "<", "<=", ">", ">=")
+        for spelling in ("+", "-", "*", "/", "<", "<=", ">", ">=")
     },
+    # ECMAScript leaves Number::exponentiate implementation-approximated
+    # outside its special cases, and C's pow disagrees with it inside them:
+    # "the node oracle: 1 ** NaN" is NaN in JavaScript and 1.0 from pow, and
+    # (-1) ** Infinity likewise.  It needs a chosen reference program.
+    "**": frozenset({
+        "number-operands", "ecmascript-number-semantics",
+        "ecmascript-approximated-math-reference",
+    }),
     "&&": frozenset({"boolean-operands", "pure-operands"}),
     "||": frozenset({"boolean-operands", "pure-operands"}),
     "===": frozenset({"primitive-same-type-operands"}),
@@ -120,10 +128,12 @@ def _callee_spelling(callee: Mapping[str, Any] | None) -> str:
 class _JavaScriptProcessInterpreter:
     def __init__(
         self, graph: Any, *, owner: str, assumptions: Sequence[str] = (),
+        parameter_kinds: Mapping[str, str] | None = None,
     ) -> None:
         self.graph = graph
         self.owner = str(owner)
         self.assumptions = frozenset(map(str, assumptions))
+        self.parameter_kinds = dict(parameter_kinds or {})
         self.shortfalls: list[JavaScriptExpressionShortfall] = []
         self.bindings: dict[str, dict[str, Any]] = {}
         self.binding_records: list[dict[str, Any]] = []
@@ -222,14 +232,45 @@ class _JavaScriptProcessInterpreter:
             source=source,
         )
 
+    def _facets(self, operands: Sequence[int]) -> frozenset[str]:
+        """The caller's assumptions, corrected by the operands' proved kinds.
+
+        A blanket assumption speaks only for values whose kind is unknown.
+        "the node oracle: x && y on two numbers": with "boolean-operands"
+        assumed for the region, ``&&`` lowered to LAnd and returned a bool,
+        where JavaScript returns one of the two Numbers.  A proved kind
+        therefore grants the facet it proves and revokes the ones it
+        contradicts.
+        """
+
+        facets = set(self.assumptions)
+        kinds = [self._kind(operand) for operand in operands]
+        known = {kind for kind in kinds if kind != "unknown"}
+        for facet, kind in (
+            ("number-operands", "number"), ("boolean-operands", "boolean"),
+        ):
+            if known - {kind}:
+                facets.discard(facet)
+            elif known and len(known) == 1 and "unknown" not in kinds:
+                facets.add(facet)
+        if len(known) > 1:
+            facets.discard("primitive-same-type-operands")
+        elif known and "unknown" not in kinds and known <= {"number", "boolean"}:
+            facets.add("primitive-same-type-operands")
+        return frozenset(facets)
+
     def require(
         self,
         requirements: Sequence[str],
         *,
         spelling: str,
         code: str = "unproven-javascript-semantics",
+        operands: Sequence[int] | None = None,
     ) -> bool:
-        missing = sorted(set(requirements) - self.assumptions)
+        facets = (
+            self.assumptions if operands is None else self._facets(operands)
+        )
+        missing = sorted(set(requirements) - facets)
         if not missing:
             return True
         self.shortfalls.append(JavaScriptExpressionShortfall(
@@ -367,6 +408,7 @@ class _JavaScriptProcessInterpreter:
         if kind == "number" and self.require(
             ("number-operands", "number-truthiness", "pure-operands"),
             spelling="Number truthiness",
+            operands=(operand,),
         ):
             falsy = self._number_falsy(operand, source)
             return self.make_node(
@@ -404,6 +446,7 @@ class _JavaScriptProcessInterpreter:
                 )
             if not self.require(
                 _BINARY_REQUIREMENTS.get(operator, ()), spelling=operator,
+                operands=(left, right),
             ):
                 return self.unsupported(
                     operator,
@@ -433,6 +476,7 @@ class _JavaScriptProcessInterpreter:
                     if not self.require(
                         ("number-operands", "number-truthiness", "pure-operands"),
                         spelling="!",
+                        operands=(operand,),
                     ):
                         return self.unsupported(
                             operator,
@@ -442,7 +486,9 @@ class _JavaScriptProcessInterpreter:
                             parents=((operand, "operand"),),
                         )
                     return self._number_falsy(operand, expr)
-                if self.require(("boolean-operands",), spelling="!"):
+                if self.require(
+                    ("boolean-operands",), spelling="!", operands=(operand,),
+                ):
                     return self.make_node(
                         Handler.LNot.name, Handler.LNot.name, Handler.LNot.name,
                         ((operand, "operand"),), source=expr,
@@ -465,6 +511,7 @@ class _JavaScriptProcessInterpreter:
             if not self.require(
                 ("number-operands", "ecmascript-number-semantics"),
                 spelling=operator,
+                operands=(operand,),
             ):
                 return self.unsupported(
                     operator,
@@ -542,6 +589,7 @@ class _JavaScriptProcessInterpreter:
                 program.requirements,
                 spelling=spelling,
                 code="unproven-javascript-identity",
+                operands=arguments,
             ):
                 return self.unsupported(
                     spelling,
@@ -748,6 +796,10 @@ class _JavaScriptProcessInterpreter:
                 },
                 source=parameter,
                 output_roles=("value",),
+                # A declared ABI kind ("number"/"boolean") is the parameter's
+                # proof; an undeclared one stays "unknown" and is admitted
+                # only through the caller's assumptions, as before.
+                value_kind=self.parameter_kinds.get(parameter_name, "unknown"),
             )
             self.bind(parameter_name, value_node, parameter, kind="parameter")
         body = function.get("body") or {}
@@ -845,6 +897,7 @@ def ingest_javascript_program(
     owner: str,
     entry: str | None = None,
     assumptions: Sequence[str] = (),
+    parameter_kinds: Mapping[str, str] | None = None,
 ) -> JavaScriptExpressionLowering:
     """Interpret one selected function, including nested archive functions."""
 
@@ -858,6 +911,7 @@ def ingest_javascript_program(
     name, function, declaration = selected[0]
     interpreter = _JavaScriptProcessInterpreter(
         graph, owner=owner, assumptions=assumptions,
+        parameter_kinds=parameter_kinds,
     )
     return interpreter.finish(interpreter.function(
         function, declaration=declaration, name=name,
@@ -871,6 +925,7 @@ def ingest_javascript_source(
     owner: str,
     entry: str | None = None,
     assumptions: Sequence[str] = (),
+    parameter_kinds: Mapping[str, str] | None = None,
 ) -> JavaScriptExpressionLowering:
     """Parse source with Turing's vendored Acorn and interpret one function."""
 
@@ -882,6 +937,7 @@ def ingest_javascript_source(
         owner=owner,
         entry=entry,
         assumptions=assumptions,
+        parameter_kinds=parameter_kinds,
     )
 
 

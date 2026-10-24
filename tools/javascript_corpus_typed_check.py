@@ -1,0 +1,237 @@
+"""Value-and-type check of JavaScript programs against real node.
+
+The JavaScript counterpart of ``native_corpus_typed_check.py``.  Every
+``c*.js`` in DIR declares a function ``root`` (parameter kinds in its JSDoc)
+and ends with one comment line of input rows, written as JavaScript so that
+``NaN``, ``Infinity`` and ``-0`` are spellable::
+
+    // INPUTS [[1, 2], [NaN, -0], [Infinity, true]]
+
+node evaluates the rows and ``root`` on each.  The program is lowered with
+``lower_javascript_source_to_ssa``, emitted through ``emit_ssa_to_c``,
+compiled, and called on the same rows.  Values travel between node and
+Python as IEEE-754 bit patterns, so nothing is rounded on the way: a number
+matches only when its bits match (any NaN matches any NaN; ``-0`` does not
+match ``0``).  The returned kind must match too: a JavaScript number is a
+float buffer, a boolean a bool buffer.
+
+Statuses: PASS, FAIL (WRONG or TYPE rows), REFUSED (named lowering
+shortfalls -- loud, never a wrong answer), LOWER-FAIL, EMIT-INCOMPLETE,
+EMIT-FAIL, NODE-FAIL.
+
+Usage: python tools/javascript_corpus_typed_check.py DIR
+``TURING_ROOT=<worktree>`` points it at another tree; ``TURING_NODE`` names
+the node executable (default: ``node`` on PATH, then /opt/node22/bin/node).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import warnings
+
+warnings.filterwarnings("ignore")
+ROOT = os.environ.get(
+    "TURING_ROOT", str(pathlib.Path(__file__).resolve().parents[1])
+)
+sys.path.insert(0, ROOT)
+
+
+def node_executable() -> str | None:
+    explicit = os.environ.get("TURING_NODE")
+    if explicit:
+        return explicit
+    found = shutil.which("node")
+    if found:
+        return found
+    fallback = "/opt/node22/bin/node"
+    return fallback if os.path.exists(fallback) else None
+
+
+# Runs ``root`` on every row and reports each argument and result by kind and
+# exact bits.  Anything but a number or boolean result is reported as its
+# typeof, which the judge counts as a TYPE finding.
+_NODE_ORACLE = r"""
+const fs = require("fs");
+const vm = require("vm");
+const request = JSON.parse(fs.readFileSync(0, "utf8"));
+function encode(value) {
+  if (typeof value === "number") {
+    const view = new DataView(new ArrayBuffer(8));
+    view.setFloat64(0, value);
+    return {kind: "number", bits: view.getBigUint64(0).toString(16).padStart(16, "0")};
+  }
+  if (typeof value === "boolean") return {kind: "boolean", value};
+  return {kind: typeof value, text: String(value)};
+}
+const context = vm.createContext({});
+vm.runInContext(request.source, context);
+const rows = vm.runInContext(request.inputs, context);
+const out = [];
+for (const row of rows) {
+  const args = Array.isArray(row) ? row : [row];
+  let result;
+  try {
+    result = encode(context[request.entry](...args));
+  } catch (error) {
+    result = {kind: "throw", text: String(error)};
+  }
+  out.push({args: args.map(encode), result});
+}
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def node_rows(source: str, inputs: str, entry: str = "root") -> list[dict]:
+    """Evaluate ``entry`` on each JavaScript-spelled input row in node."""
+
+    executable = node_executable()
+    if executable is None:
+        raise RuntimeError("no node executable (set TURING_NODE)")
+    # A function declaration binds on the context's global object; a
+    # ``const root = ...`` would not, so expose the entry explicitly.
+    exposed = f"{source}\n;globalThis[{json.dumps(entry)}] = {entry};\n"
+    result = subprocess.run(
+        [executable, "-e", _NODE_ORACLE],
+        input=json.dumps({
+            "source": exposed, "inputs": inputs, "entry": entry,
+        }).encode("utf-8"),
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", "replace").strip())
+    return json.loads(result.stdout.decode("utf-8"))
+
+
+def decode(item: dict):
+    if item["kind"] == "number":
+        return struct.unpack(">d", bytes.fromhex(item["bits"]))[0]
+    if item["kind"] == "boolean":
+        return bool(item["value"])
+    return item
+
+
+def number_bits(value: float) -> str:
+    return struct.pack(">d", float(value)).hex()
+
+
+def same_number(got: float, want_bits: str) -> bool:
+    want = struct.unpack(">d", bytes.fromhex(want_bits))[0]
+    if want != want:
+        return got != got
+    return number_bits(got) == want_bits
+
+
+def judge(row: dict, got, got_kind: str) -> str:
+    """``ok``, or a WRONG/TYPE line for one row."""
+
+    want = row["result"]
+    args = [decode(item) for item in row["args"]]
+    if want["kind"] == "number":
+        if got_kind != "f":
+            return f"TYPE {args} got kind {got_kind!r} want number (float)"
+        if not same_number(float(got), want["bits"]):
+            return (
+                f"WRONG {args} got {float(got)!r} [{number_bits(got)}] "
+                f"want {decode(want)!r} [{want['bits']}]"
+            )
+        return "ok"
+    if want["kind"] == "boolean":
+        if got_kind != "b":
+            return f"TYPE {args} got kind {got_kind!r} want boolean"
+        if bool(got) != bool(want["value"]):
+            return f"WRONG {args} got {bool(got)} want {want['value']}"
+        return "ok"
+    return f"TYPE {args} node returned {want['kind']} {want.get('text')!r}"
+
+
+def check_program(source: str, inputs: str, *, entry: str = "root") -> str:
+    """One status line (without the program name) for one program."""
+
+    import numpy as np
+    from src.compiler.javascript_source_ingestion import (
+        lower_javascript_source_to_ssa,
+    )
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    try:
+        rows = node_rows(source, inputs, entry)
+    except Exception as error:
+        return f"NODE-FAIL {type(error).__name__}: {str(error)[:300]}"
+    try:
+        lowered = lower_javascript_source_to_ssa(source, function_name=entry)
+    except Exception as error:
+        return f"LOWER-FAIL {type(error).__name__}: {str(error)[:300]}"
+    if not lowered.complete:
+        return "REFUSED " + "; ".join(
+            item.format()[:160] for item in lowered.shortfalls[:3]
+        )
+    function = lowered.module.functions[lowered.function_name]
+    returned = [
+        instruction.args
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    ][0]
+    try:
+        artifact = emit_ssa_to_c(lowered.module, lowered.function_name)
+        if not artifact.complete:
+            return f"EMIT-INCOMPLETE {[s.reason[:150] for s in artifact.shortfalls[:2]]}"
+        artifact.compile(pathlib.Path(tempfile.mkdtemp()) / "native")
+    except Exception as error:
+        return f"EMIT-FAIL {type(error).__name__}: {str(error)[:300]}"
+    verdicts = []
+    for row in rows:
+        args = [decode(item) for item in row["args"]]
+        if len(args) != len(function.args):
+            verdicts.append(f"ARITY {args}")
+            continue
+        try:
+            execution = artifact.prepare_execution({
+                value.id: np.array([arg], dtype=(
+                    np.bool_ if value.dtype == "bool" else np.float64
+                ))
+                for value, arg in zip(function.args, args)
+            }).run()
+            buffer = np.asarray(execution.buffers[returned[0].id]).reshape(-1)
+            verdicts.append(judge(row, buffer[0].item(), buffer.dtype.kind))
+        except Exception as error:
+            verdicts.append(f"RUN-FAIL {args} {type(error).__name__}: {str(error)[:150]}")
+    bad = [item for item in verdicts if item != "ok"]
+    return f"{'PASS' if not bad else 'FAIL'} {bad[:3] if bad else ''}".rstrip()
+
+
+def split_program(text: str) -> tuple[str, str]:
+    marker = "// INPUTS"
+    if marker not in text:
+        raise ValueError("program has no // INPUTS line")
+    source, inputs = text.rsplit(marker, 1)
+    return source, inputs.strip()
+
+
+def main(argv: list[str]) -> int:
+    directory = pathlib.Path(argv[1] if len(argv) > 1 else os.path.join(
+        ROOT, "tests", "javascript_semantics_corpus"
+    ))
+    statuses = {}
+    for path in sorted(directory.glob("c*.js")):
+        source, inputs = split_program(path.read_text(encoding="utf-8"))
+        status = check_program(source, inputs)
+        statuses[path.stem] = status.split(" ", 1)[0]
+        print(f"{path.stem}: {status}", flush=True)
+    counts: dict[str, int] = {}
+    for status in statuses.values():
+        counts[status] = counts.get(status, 0) + 1
+    print("summary:", " ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    return 0 if set(statuses.values()) <= {"PASS"} else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
