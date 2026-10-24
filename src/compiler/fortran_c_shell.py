@@ -12986,13 +12986,17 @@ def _member_completion_position(
     # display ``[n, 1]``, whose birth is placed at the display; the fill
     # copied that operand before it was born (``xs0[2]`` read 0; silent).
     # Rule: a member reading a display operand completes after that
-    # display ends, where the display's birth has already run.
+    # display ends, where the display's birth has already run.  A call
+    # operand is the same: a call completes where it ends (as a plan
+    # callsite is placed), so ``Q(b=x, a=y).get() + Q(x, y).a`` (corpus
+    # c428) placed its ``+`` region at its start, ahead of both calls, and
+    # pulled ``get()`` before the ``__init__`` that writes what it reads.
     for parent, _role in data.get("parents") or ():
         if int(parent) not in graph_obj:
             continue
         display = graph_obj.nodes[int(parent)].get("expr_obj")
         if (
-            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict))
+            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Call))
             and getattr(display, "end_lineno", None) is not None
         ):
             position = max(position, (
