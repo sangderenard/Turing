@@ -60873,6 +60873,8 @@ def compile_ast_fortran_c_shell(
     runtime_closure_only: bool = False,
     trace: bool = False,
     cpython_runtime: str | Path | None = None,
+    python_package: str | None = None,
+    extraction_contract: Any = None,
 ) -> FortranCShellExecutable:
     """Compile Python AST through the registered Fortran target and C shell.
 
@@ -60919,6 +60921,12 @@ def compile_ast_fortran_c_shell(
         precompile_only=True,
         bake_mode="whole_program",
         python_bindings=dict(python_bindings or {}),
+        # The package relative imports in ``source`` resolve against
+        # (``from . import autograd`` inside AbstractTensor.__init__).
+        python_package=python_package,
+        # Which reachable modules are ingested as Python, which stay native
+        # boundaries (stdlib, third party), and which are intrinsic.
+        extraction_contract=extraction_contract,
         progress=progress,
         checkpoint=checkpoint,
         mutable_parameters=tuple(mutable_parameters),

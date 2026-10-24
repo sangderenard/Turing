@@ -37,6 +37,21 @@ def _class_method_names(source: str, class_name: str) -> list[str]:
     ]
 
 
+def _module_package(module_path: str) -> str | None:
+    """The package a module file's relative imports resolve against: its
+    directory as a dotted path from the working directory (the repo root),
+    or None for a file outside it.  ``src/common/tensors/abstraction.py``
+    is ``src.common.tensors``, so ``from . import autograd`` resolves."""
+
+    relative = os.path.relpath(os.path.abspath(module_path), os.getcwd())
+    parts = os.path.dirname(relative).split(os.sep)
+    if not relative or relative.startswith("..") or not all(
+        part.isidentifier() for part in parts
+    ):
+        return None
+    return ".".join(parts)
+
+
 def _is_class(source: str, name: str) -> bool:
     module = ast.parse(source)
     return any(
@@ -45,7 +60,16 @@ def _is_class(source: str, name: str) -> bool:
     )
 
 
-def compile_class_to_dll(source, class_name, outdir, *, progress=None):
+PROGRAM_EXTRACTION_CONTRACT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "extraction_contracts", "program_extraction.yaml",
+)
+
+
+def compile_class_to_dll(
+    source, class_name, outdir, *, progress=None, python_package=None,
+    extraction_contract=PROGRAM_EXTRACTION_CONTRACT,
+):
     """Compile a whole class to a DLL with no privileged entry function.
 
     The class is the unit: the dependency closure is seeded from EVERY method
@@ -73,7 +97,8 @@ def compile_class_to_dll(source, class_name, outdir, *, progress=None):
     return compile_ast_fortran_c_shell(
         source, nominal, {}, outdir, name=class_name,
         library=True, dependency_seeds=seeds, progress=progress,
-        runtime_closure_only=True,
+        runtime_closure_only=True, python_package=python_package,
+        extraction_contract=extraction_contract,
     )
 
 
@@ -149,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     module_path, entrypoint, outdir = argv
     source = open(module_path, "r", encoding="utf-8").read()
+    python_package = _module_package(module_path)
     from src.compiler.fortran_c_shell import compile_ast_fortran_c_shell
 
     def progress(message: str) -> None:
@@ -162,12 +188,13 @@ def main(argv: list[str] | None = None) -> int:
                   flush=True)
             handle = compile_class_to_dll(
                 source, entrypoint, outdir, progress=progress,
+                python_package=python_package,
             )
         else:
             handle = compile_ast_fortran_c_shell(
                 source, entrypoint, {}, outdir, name=entrypoint,
                 library=True, progress=progress,
-                runtime_closure_only=True,
+                runtime_closure_only=True, python_package=python_package,
             )
     except Exception as error:  # noqa: BLE001
         traceback.print_exc()
