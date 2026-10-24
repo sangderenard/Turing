@@ -40,20 +40,18 @@ building an EXT=5 tier aimed at these areas.
 | 8 | C25: compile-time selection among known functions (a field, a table) | C | no, loud | a common class and trial pattern |
 | 9 | Everything else below, by lane table order | | | |
 
-Waiting on Albert (his call, not a lane's):
-- **PR1, pack-core semantics.** `x[i]` on a `Precision[2]` array loads one
-  double at index i, with a constant 0.0 low limb, and `y[i]` stores only
-  the leading limb. So the microprecision benchmark's interleaved-limb feeds
-  and its accuracy claims no longer describe what is compiled. Is this
-  intended, or a regression to bisect?
-- **P2, GLSL `fma()` on Mesa.** On llvmpipe and lavapipe, a precise double
-  `fma()` rounds twice: 45 of 777 elements differ from a once-rounded fma.
-  The spec allows this. Should the precision lane's FMA_MANDATORY claim
-  require a driver check, or use the split flavour?
-- **FS4, the `compile_class_to_dll` adapter.** It is deprecated, and it
-  still mis-lowers fields: per-method float64 arenas, and stores placed
-  regardless of control flow. Class DLLs should come from the catalogue.
-  Retire the adapter, or redirect it?
+Decided by Albert on 2026-10-24 (12:40), each now a row with an owner:
+- **PR1, pack-core semantics.** Loading one double with a constant 0.0 low
+  limb is right only when the input has no limbs. A limbed input must load
+  its limbs, so today's lowering is a bug for limbed `Precision[k]` inputs
+  (`y[i]` storing only the leading limb is the same bug). Owner: the shader
+  thread, after P1, since it holds the precision lane.
+- **P2, GLSL `fma()`.** Neither accept nor reject Mesa's double rounding
+  outright. Gate fma use behind a precision policy that can be set per
+  source or per region of source. Owner: the shader thread, after PR1.
+- **FS4, `compile_class_to_dll`.** Keep it, but make it raise a loud
+  deprecation warning and redirect to the catalogue route. Owner: the Field
+  stores thread.
 
 Decided on 2026-10-24 (09:10): builtin `max(x, y)` over multi-element tensors is
 refused, as Python refuses it. Elementwise maximum is `emax`, with `emin`
