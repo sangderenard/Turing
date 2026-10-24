@@ -728,3 +728,330 @@ def lower_returned_closures(tree: ast.Module) -> list[dict[str, Any]]:
             "call_sites": len(plan.sites),
         })
     return receipts
+
+
+# ---------------------------------------------------------------------------
+# Known functions held as values: a module table or an instance field.
+#
+# ``OPS = {0: inc, 1: neg}; OPS[i](a)`` and ``self.op = triple; self.op(x)``
+# select among functions the tree defines.  The callee is one of a closed,
+# known set, so the value is the same record a returned closure is: a variant
+# tag.  The table (or field) holds tags, and each call through it calls a
+# generated dispatcher ``<name>__call(tag, *args)`` that calls the tagged
+# function.  The table lookup itself is unchanged, so an absent key or an
+# index out of range refuses exactly as it did.
+#
+# Whole-tree, like the closure conversion: every reference to the table, and
+# every read of the field, must be such a call, and every value stored must
+# name a module function of one positional arity.  Anything else leaves the
+# tree untouched.
+# ---------------------------------------------------------------------------
+
+
+def _simple_positional_arity(definition: ast.FunctionDef) -> int | None:
+    arguments = definition.args
+    if (
+        arguments.posonlyargs or arguments.vararg or arguments.kwonlyargs
+        or arguments.kwarg or arguments.defaults or definition.decorator_list
+        or isinstance(definition, ast.AsyncFunctionDef)
+    ):
+        return None
+    return len(arguments.args)
+
+
+def _module_functions(tree: ast.Module) -> dict[str, ast.FunctionDef]:
+    """Module functions whose name is bound exactly once, by the def."""
+
+    defined = [
+        statement.name for statement in tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    rebound = {
+        node.id for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+    } | {
+        name for node in ast.walk(tree)
+        if isinstance(node, (ast.Global, ast.Nonlocal)) for name in node.names
+    } | {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node not in tree.body
+    } | {
+        argument.arg for node in ast.walk(tree)
+        if isinstance(node, ast.arguments)
+        for argument in (*node.posonlyargs, *node.args, *node.kwonlyargs,
+                         *filter(None, (node.vararg, node.kwarg)))
+    }
+    return {
+        statement.name: statement for statement in tree.body
+        if isinstance(statement, ast.FunctionDef)
+        and defined.count(statement.name) == 1
+        and statement.name not in rebound
+    }
+
+
+def _selection_dispatcher(
+    name: str, functions: list[ast.FunctionDef], arity: int, anchor: ast.AST,
+) -> ast.FunctionDef:
+    tag = f"{name}__tag"
+    parameters = [f"{name}__arg{position}" for position in range(arity)]
+
+    # Each branch stands for its function: it is located at that function's
+    # definition, so no two generated statements share one authored position.
+    def call(definition: ast.FunctionDef) -> ast.stmt:
+        return _copy_location(ast.Return(value=ast.Call(
+            func=ast.Name(id=definition.name, ctx=ast.Load()),
+            args=[ast.Name(id=parameter, ctx=ast.Load())
+                  for parameter in parameters],
+            keywords=[],
+        )), definition)
+
+    dispatch: list[ast.stmt] = [call(functions[-1])]
+    for index in range(len(functions) - 2, -1, -1):
+        dispatch = [ast.If(
+            test=ast.Compare(
+                left=ast.Name(id=tag, ctx=ast.Load()),
+                ops=[ast.Eq()],
+                comparators=[ast.Constant(index)],
+            ),
+            body=[call(functions[index])],
+            orelse=dispatch,
+        )]
+        _copy_location(dispatch[0], functions[index])
+    annotations: list[ast.expr | None] = []
+    for position in range(arity):
+        annotations.append(next((
+            copy.deepcopy(definition.args.args[position].annotation)
+            for definition in functions
+            if definition.args.args[position].annotation is not None
+        ), None))
+    returns = [
+        ast.dump(definition.returns) for definition in functions
+        if definition.returns is not None
+    ]
+    dispatcher = ast.FunctionDef(
+        name=f"{name}__call",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[
+                ast.arg(arg=tag, annotation=ast.Name(id="int", ctx=ast.Load())),
+                *(
+                    ast.arg(arg=parameter, annotation=annotation)
+                    for parameter, annotation in zip(parameters, annotations)
+                ),
+            ],
+            vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None,
+            defaults=[],
+        ),
+        body=dispatch,
+        decorator_list=[],
+        returns=(
+            copy.deepcopy(functions[0].returns)
+            if len(returns) == len(functions) and len(set(returns)) == 1
+            else None
+        ),
+        type_params=[],
+    )
+    return _copy_location(dispatcher, anchor)
+
+
+def _function_set(
+    values: list[ast.expr], functions: dict[str, ast.FunctionDef],
+) -> tuple[list[ast.FunctionDef], int] | None:
+    """The distinct known functions ``values`` name, and their one arity."""
+
+    chosen: list[ast.FunctionDef] = []
+    for value in values:
+        if not isinstance(value, ast.Name) or value.id not in functions:
+            return None
+        if functions[value.id] not in chosen:
+            chosen.append(functions[value.id])
+    arities = {_simple_positional_arity(definition) for definition in chosen}
+    if not chosen or len(arities) != 1 or None in arities:
+        return None
+    return chosen, arities.pop()
+
+
+def _insert_after_functions(tree: ast.Module, statement: ast.stmt,
+                            before: ast.stmt) -> None:
+    tree.body.insert(tree.body.index(before), statement)
+
+
+def _lower_function_tables(
+    tree: ast.Module, functions: dict[str, ast.FunctionDef], taken: set[str],
+) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    parents = _parents(tree)
+    for statement in list(tree.body):
+        if not (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and isinstance(statement.value, (ast.Dict, ast.List, ast.Tuple))
+        ):
+            continue
+        name = statement.targets[0].id
+        display = statement.value
+        values = list(display.values if isinstance(display, ast.Dict) else display.elts)
+        if isinstance(display, ast.Dict) and any(key is None for key in display.keys):
+            continue
+        selected = _function_set(values, functions)
+        if selected is None or f"{name}__call" in taken:
+            continue
+        chosen, arity = selected
+        bindings = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and node.id == name
+            and not isinstance(node.ctx, ast.Load)
+        ]
+        if bindings != [statement.targets[0]] or any(
+            isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names
+            for node in ast.walk(tree)
+        ) or any(
+            isinstance(node, ast.arguments) and name in _parameter_names(node)
+            for node in ast.walk(tree)
+        ):
+            continue
+        sites: list[ast.Call] = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Name) and node.id == name
+                    and isinstance(node.ctx, ast.Load)):
+                continue
+            subscript = parents.get(id(node))
+            call = parents.get(id(subscript))
+            if not (
+                isinstance(subscript, ast.Subscript)
+                and subscript.value is node
+                and isinstance(call, ast.Call)
+                and call.func is subscript
+                and not call.keywords
+                and len(call.args) == arity
+                and not any(isinstance(argument, ast.Starred) for argument in call.args)
+            ):
+                sites = []
+                break
+            sites.append(call)
+        if not sites:
+            continue
+        tags = [ast.Constant(chosen.index(functions[value.id])) for value in values]
+        for value, tag in zip(values, tags):
+            _copy_location(tag, value)
+        if isinstance(display, ast.Dict):
+            display.values = tags
+        else:
+            display.elts = tags
+        dispatcher = _selection_dispatcher(name, chosen, arity, statement)
+        _insert_after_functions(tree, dispatcher, statement)
+        for call in sites:
+            callee = _copy_location(
+                ast.Name(id=dispatcher.name, ctx=ast.Load()), call.func,
+            )
+            call.args = [call.func, *call.args]
+            call.func = callee
+        taken.add(dispatcher.name)
+        receipts.append({
+            "table": name, "functions": [d.name for d in chosen],
+            "call_sites": len(sites),
+        })
+    return receipts
+
+
+def _lower_function_fields(
+    tree: ast.Module, functions: dict[str, ast.FunctionDef], taken: set[str],
+) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    parents = _parents(tree)
+    for owner in [s for s in tree.body if isinstance(s, ast.ClassDef)]:
+        methods = [m for m in owner.body if isinstance(m, ast.FunctionDef)]
+        member_names = {
+            member.name for member in owner.body
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        } | {
+            target.id for member in owner.body if isinstance(member, (ast.Assign, ast.AnnAssign))
+            for target in (member.targets if isinstance(member, ast.Assign) else [member.target])
+            if isinstance(target, ast.Name)
+        }
+        stored: dict[str, list[ast.Assign]] = {}
+        for method in methods:
+            if not method.args.args:
+                continue
+            receiver = method.args.args[0].arg
+            for node in ast.walk(method):
+                if (
+                    isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Attribute)
+                    and isinstance(node.targets[0].value, ast.Name)
+                    and node.targets[0].value.id == receiver
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in functions
+                ):
+                    stored.setdefault(node.targets[0].attr, []).append(node)
+        for attribute, assignments in stored.items():
+            dispatcher_name = f"{owner.name}__{attribute}"
+            if attribute in member_names or f"{dispatcher_name}__call" in taken:
+                continue
+            selected = _function_set([a.value for a in assignments], functions)
+            if selected is None:
+                continue
+            chosen, arity = selected
+            assigned = {id(a.targets[0]) for a in assignments}
+            sites: list[ast.Call] = []
+            accepted = True
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Attribute) and node.attr == attribute):
+                    continue
+                if id(node) in assigned:
+                    continue
+                call = parents.get(id(node))
+                method = _enclosing_function(node, parents)
+                if not (
+                    isinstance(node.ctx, ast.Load)
+                    and isinstance(call, ast.Call) and call.func is node
+                    and not call.keywords and len(call.args) == arity
+                    and not any(isinstance(a, ast.Starred) for a in call.args)
+                    and method in methods and method.args.args
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == method.args.args[0].arg
+                ):
+                    accepted = False
+                    break
+                sites.append(call)
+            if not accepted or not sites:
+                continue
+            for assignment in assignments:
+                assignment.value = _copy_location(
+                    ast.Constant(chosen.index(functions[assignment.value.id])),
+                    assignment.value,
+                )
+            dispatcher = _selection_dispatcher(dispatcher_name, chosen, arity, owner)
+            _insert_after_functions(tree, dispatcher, owner)
+            for call in sites:
+                callee = _copy_location(
+                    ast.Name(id=dispatcher.name, ctx=ast.Load()), call.func,
+                )
+                call.args = [call.func, *call.args]
+                call.func = callee
+            taken.add(dispatcher.name)
+            receipts.append({
+                "field": f"{owner.name}.{attribute}",
+                "functions": [d.name for d in chosen],
+                "call_sites": len(sites),
+            })
+    return receipts
+
+
+def lower_known_function_selections(tree: ast.Module) -> list[dict[str, Any]]:
+    """Convert tables and fields of known functions in ``tree`` in place."""
+
+    if not isinstance(tree, ast.Module):
+        return []
+    taken = {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    } | {
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    }
+    functions = _module_functions(tree)
+    receipts = _lower_function_tables(tree, functions, taken)
+    receipts.extend(_lower_function_fields(tree, functions, taken))
+    return receipts

@@ -40,7 +40,10 @@ from .python_special_cases import (
     python_dispatch_entry_expressions,
 )
 from .python_identity_programs import resolve_python_identity
-from .closure_values import lower_returned_closures
+from .closure_values import (
+    lower_known_function_selections,
+    lower_returned_closures,
+)
 from ...common.tensors.operator_catalog import (
     include_ast_parent_outside_abstract_tensor,
 )
@@ -6350,6 +6353,10 @@ class ProcessGraph(TiledObject):
             # returned closure becomes a capture record before spans and
             # pursuit activity are stamped (closure_values.py).
             self._closure_value_receipts = lower_returned_closures(tree)
+            # A table or field of known functions holds variant tags too.
+            self._closure_value_receipts.extend(
+                lower_known_function_selections(tree)
+            )
         parent_links = ()
         unresolved_calls = ()
         self._graph_profile_verbose = bool(profile_verbose) or bool(
@@ -6423,6 +6430,10 @@ class ProcessGraph(TiledObject):
             # closure-returning function, so the whole-tree conversion sees
             # all of its call sites (closure_values.py).
             self._closure_value_receipts = lower_returned_closures(tree)
+            # A table or field of known functions holds variant tags too.
+            self._closure_value_receipts.extend(
+                lower_known_function_selections(tree)
+            )
             dispatch_operations = tuple(getattr(tree, "_turing_dispatch_operations", ()))
             if dispatch_operations:
                 self.G.graph["dispatch_operations"] = dispatch_operations
