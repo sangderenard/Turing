@@ -1,3 +1,9 @@
+2026-10-24 LANE E, E24 (MEASURED, cloud): a table delete counts rows with an
+int64 counter, so LLVM compiles every keyed-delete program (12 were refused
+on an i32/i64 phi at main 11944336). At 376f1f19 (328 programs): C 328/328, LLVM
+327/328 (c367, same on main), Fortran 327 PASS (c22 by design). Fuzz seed
+64: 0 WRONG / 0 TYPE. Gate names identical to main 11944336.
+
 2026-10-24 LANE E, E23 (MEASURED, cloud): `for k, w in d.items()` types k as
 a key and w as a row of d (it fell to float64: C WRONG on large ints at main
 da63b7dd, c404, c405; Fortran COMPILE-FAIL c337). At 086aac37 (325 programs):
