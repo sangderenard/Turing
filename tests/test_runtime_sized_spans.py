@@ -401,3 +401,49 @@ def test_static_reductions_deploy_and_runtime_ones_are_refused(tmp_path):
         if ops & {"mean", "prod"}:
             assert not shader.complete
             assert "one element per invocation" in shader.shortfalls[0].reason
+
+
+# -- builtin max/min of one tensor ------------------------------------------
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("source,expected", [
+    ("def f(x, y):\n    return max(y) + min(x)\n", 9.0 + 1.0),
+    ("def f(x, y):\n    return y.max() - x.min()\n", 9.0 - 1.0),
+])
+def test_builtin_max_of_one_static_tensor_is_its_largest_element(
+    tmp_path, backend, source, expected,
+):
+    """``max(y)`` iterates a rank-1 tensor and returns one element, as
+    ``y.max()`` does; it is not an elementwise selector of one operand."""
+
+    module, entry, parameters, result = _lower(
+        tmp_path, source, f"one_max_{backend}", 1, shape=(5,),
+    )
+    x = np.array([1.0, 5.0, 2.0, 4.0, 3.0])
+    y = np.array([3.0, 9.0, -1.0, 2.0, 0.0])
+    _artifact, execution = _run(
+        backend, module, entry,
+        {parameters["x"]: x, parameters["y"]: y}, tmp_path,
+    )
+    got = np.asarray(execution.buffers[int(result.id)]).reshape(-1)
+    np.testing.assert_allclose(got, [expected])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("source", [
+    "def f(x, y):\n    return max(y)\n",
+    "def f(x, y):\n    return y.max(axis=0)\n",
+])
+def test_rank_two_max_reductions_are_refused_not_guessed(tmp_path, backend, source):
+    """``max(y)`` of a (2, 3) tensor raises in Python, and no backend spells
+    ``y.max(axis=0)`` yet: each is refused by name, never one row or a
+    broadcast whole-array maximum."""
+
+    module, entry, parameters, _result = _lower(
+        tmp_path, source, f"two_max_{backend}", 2, shape=(2, 3),
+    )
+    with pytest.raises(AssertionError):
+        _run(
+            backend, module, entry,
+            {parameters["y"]: np.arange(6.0).reshape(2, 3)}, tmp_path,
+        )

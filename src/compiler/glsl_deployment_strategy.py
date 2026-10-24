@@ -26212,6 +26212,24 @@ def _fold_callsite_structural_values(
                 )
                 if len(parent_descriptors) != len(numerical_parents):
                     parent_descriptors = ()
+                # Program: ``max(y)`` over a static (5,) ``y``.  Wrong
+                # record: the lone operand "broadcast" to (5,), so the
+                # builtin read as an elementwise Max (C refused it, LLVM
+                # raised).  Rule: builtin ``max``/``min`` of ONE rank-1
+                # iterable returns one of its elements -- a scalar.
+                if (
+                    operation in {"max", "min"}
+                    and isinstance(data.get("expr_obj"), ast.Call)
+                    and isinstance(data["expr_obj"].func, ast.Name)
+                    and len(data["expr_obj"].args) == 1
+                    and len(parent_descriptors) == 1
+                    and len(tuple(parent_descriptors[0]["shape"])) == 1
+                ):
+                    data["tensor"] = {
+                        "shape": (),
+                        "dtype": parent_descriptors[0]["dtype"],
+                    }
+                    parent_descriptors = ()
                 if parent_descriptors:
                     try:
                         shape = tuple(np.broadcast_shapes(*(
