@@ -1,4 +1,4 @@
-2026-10-24 LANE D, D2: SEQUENCE COPIES AND COLLECTION BRANCH JOINS (MEASURED, cloud):
+2026-10-24 LANE D, D2: SEQUENCE COPIES, COLLECTION BRANCH JOINS AND SLICES (MEASURED, cloud):
 `_planned_scalar_dtypes_from` gains two element-class rules. A copy of a
 sequence (`list(xs)`, `tuple(xs)`, `set(xs)`, `frozenset(xs)`) holds its
 argument's rows; a dict argument proves nothing, since iterating it yields
@@ -14,3 +14,11 @@ Not green, found on the way, WRONG on main as well: a list rebound on a
 branch and then appended (`rep = [1]; if k > 2: rep = [k, 2];
 rep.append(3); sum(rep)`) loses the appended row in `sum` (k=0: 12, want
 42); sent to the silent-wrong lane.
+Re-measured with the slice rule (a slice is a collection of its base's
+rows, not one row of it) at a45ea3d1 vs main 3aaa36d1: gate names identical
+in all four parts (aa 86, ab 8, ac 26, rec 20); typed corpus 380/381 on both
+trees (the same c428); fuzz seed 31, FUZZ_EXT=3: 30 PASS. Emitted-plan
+fallbacks over 381 programs: 732 -> 676 (c386 33 -> 7, c294 16 -> 6, c291
+and c292 14 -> 4). Also WRONG on main: a float store into an int slice
+(`ys = xs[:2]; ys[0] = 0.5`) is truncated, not refused; sent to the
+silent-wrong lane.
