@@ -217,3 +217,27 @@ ac 26 / rec 20 (exactly the baselines).
 Pinned by `tests/test_any_valued_local_mapping_row.py`.  Corpus 329/329
 PASS, fuzz seed 56 30/30 PASS, cloud gate aa 89 / ab 7 / ac 26 / rec 20
 (exactly the baselines).
+
+## Where the remaining interpreter blockers converge (inferred, 2026-10-24 09:10)
+
+Every per-method refusal left traces to an `Any`-typed object.
+`function: Any`, `instruction: Any` and `module: Any` are really
+`transmogrifier.ssa.Function`, `Instr` and the module.
+
+- `_step`: "formatted glyph component has no resident producer: value=333".
+  Value 333 is `{function.name}` in the no-semantics error.  `name` is an
+  attribute of an opaque `Any`, so native code has nothing to format.
+- `_call` and `_external_call`: "iterable-access=closure_aggregate".
+  Both are loops over `instruction.args`, an attribute of an opaque `Any`.
+- `_execute`: `self.trace(...)` (the stored callable) and `self._step(...)`.
+  The second is opaque only in a per-method unit, where the receiver's class
+  is unresolved.
+- `run`: the keyed field `_root_frame` is given a dict the frame grows.  The
+  field view has no capacity part, and real support needs the object to own
+  that heap.
+
+So the trial's limit is the interpreter's own `Any` annotations, not one
+missing compiler case.  Annotating them with the real dataclasses would let
+`op`, `args`, `res` and `name` lower as record fields.  `attributes` and
+`metadata` stay `Dict[str, Any]`, so the attribute reads still need opaque
+handles or host calls.  Not measured.
