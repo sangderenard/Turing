@@ -8622,6 +8622,13 @@ class _ControlSSABuilder(TiledObject):
                 return self._carried_entry_value(key, int(value_id), source_bindings, reader)
             if before is not None:
                 candidate = before
+                # The loop carries this initial under other bindings, and
+                # this read is not one of them: the preheader value is read
+                # inside the loop.  Recorded so the completed-module loop
+                # scope pass does not rebind it to the carried Phi.
+                self.__dict__.setdefault("_retained_outer_reads", set()).add(
+                    (int(key[1]), int(value_id))
+                )
         return candidate
 
     def _carried_entry_value(
@@ -17175,17 +17182,23 @@ class _ControlSSABuilder(TiledObject):
         # Name-carried arms (decision 7.2): an arm that did not rebind the
         # name takes the entered version; an arm whose version the builder
         # cannot find is refused with ``Unresolved(NAME_ARM_VERSION_MISSING)``.
+        # Program: ``a = k * 2; b = a; if k > 1: b = b - 1 else: a = a + 10;
+        # return b, a``.  Wrong record: both names enter the branch as value
+        # 2, and the arms were keyed by that shared initial id, so ``b``'s
+        # true arm (7) overwrote ``a``'s and ``a`` merged as Phi(7, 2): (5, 5)
+        # for (5, 6).  Rule: a carried arm belongs to its alias (its merge),
+        # never to the entered value two names may share.
         true_carried = {}
         carried_name_sources: dict[int, list[Any]] = {}
-        for true_id, _false_id, initial_id, _merged_id in (
+        for position, (true_id, _false_id, initial_id, _merged_id) in enumerate(
             conditional.carried_aliases
         ):
             arm_value, arm_source = self._carried_name_arm(
                 true_id, initial_id, carried_snapshots[int(initial_id)],
                 snapshot_cells.get(int(initial_id)), path=f"{path}.body",
             )
-            true_carried[int(initial_id)] = arm_value
-            carried_name_sources[int(initial_id)] = [arm_source]
+            true_carried[position] = arm_value
+            carried_name_sources[position] = [arm_source]
         # Field-carried merges name their arms as ``reducer_field_state``
         # cells; the arm's value is the version posted AT that cell, never a
         # graph-id lookup that may miss and default to the snapshot.
@@ -17194,7 +17207,9 @@ class _ControlSSABuilder(TiledObject):
             len(conditional.carried_aliases) - len(carried_field_cells)
         )
         carried_field_sources: dict[int, list[Any]] = {}
-        for alias, cells in zip(conditional.carried_aliases, carried_field_cells):
+        for position, (alias, cells) in enumerate(
+            zip(conditional.carried_aliases, carried_field_cells)
+        ):
             if cells is None:
                 continue
             initial_id = int(alias[2])
@@ -17202,8 +17217,8 @@ class _ControlSSABuilder(TiledObject):
                 cells[0], cells[1], carried_snapshots[initial_id],
                 path=f"{path}.body", arm_value_id=int(alias[0]),
             )
-            true_carried[initial_id] = true_value
-            carried_field_sources[initial_id] = [true_source]
+            true_carried[position] = true_value
+            carried_field_sources[position] = [true_source]
         true_results = {
             int(result_id): self.external_value(int(true_id))
             for true_id, _false_id, result_id in conditional.result_aliases
@@ -17309,16 +17324,18 @@ class _ControlSSABuilder(TiledObject):
                             (str(edge_block.name), int(slot)), presence,
                         )
         false_carried = {}
-        for _true_id, false_id, initial_id, _merged_id in (
+        for position, (_true_id, false_id, initial_id, _merged_id) in enumerate(
             conditional.carried_aliases
         ):
             arm_value, arm_source = self._carried_name_arm(
                 false_id, initial_id, carried_snapshots[int(initial_id)],
                 snapshot_cells.get(int(initial_id)), path=f"{path}.orelse",
             )
-            false_carried[int(initial_id)] = arm_value
-            carried_name_sources.setdefault(int(initial_id), []).append(arm_source)
-        for alias, cells in zip(conditional.carried_aliases, carried_field_cells):
+            false_carried[position] = arm_value
+            carried_name_sources.setdefault(position, []).append(arm_source)
+        for position, (alias, cells) in enumerate(
+            zip(conditional.carried_aliases, carried_field_cells)
+        ):
             if cells is None:
                 continue
             initial_id = int(alias[2])
@@ -17326,8 +17343,8 @@ class _ControlSSABuilder(TiledObject):
                 cells[1], cells[0], carried_snapshots[initial_id],
                 path=f"{path}.orelse", arm_value_id=int(alias[1]),
             )
-            false_carried[initial_id] = false_value
-            carried_field_sources.setdefault(initial_id, []).append(false_source)
+            false_carried[position] = false_value
+            carried_field_sources.setdefault(position, []).append(false_source)
         for _true_id, false_id, initial_id, merged_id in (
             conditional.carried_sequence_aliases
         ):
@@ -17415,17 +17432,19 @@ class _ControlSSABuilder(TiledObject):
             if selections and len({id(pool) for pool, _ in selections}) == 1:
                 pool, _handle = selections[0]
                 self.child_table_selections[int(result_id)] = (pool, merged)
-        for (
+        for position, ((
             true_value_id, false_value_id, initial_value_id, merged_value_id,
-        ), field_cells in zip(conditional.carried_aliases, carried_field_cells):
+        ), field_cells) in enumerate(
+            zip(conditional.carried_aliases, carried_field_cells)
+        ):
             initial = carried_snapshots[int(initial_value_id)]
-            true_value = true_carried[int(initial_value_id)]
-            false_value = false_carried[int(initial_value_id)]
+            true_value = true_carried[position]
+            false_value = false_carried[position]
             # The Phi's operands on the book: each arm's source cell (its
             # binding, or the snapshot cell when it did not write) and the
             # snapshot cell -- PHI_CONDITIONAL (plan 80 B2.3).
             phi_operands = (
-                *carried_name_sources.get(int(initial_value_id), ()),
+                *carried_name_sources.get(position, ()),
                 snapshot_cells.get(int(initial_value_id)),
                 true_value, false_value, predicate,
             )
@@ -17518,7 +17537,7 @@ class _ControlSSABuilder(TiledObject):
             # source; the merge then posts nothing rather than post a
             # snapshot as an arm.
             if field_cells is not None and field_cells[2] is not None:
-                sources = carried_field_sources.get(int(initial_value_id), [])
+                sources = carried_field_sources.get(position, [])
                 if len(sources) == 2 and all(
                     isinstance(source, Ref) for source in sources
                 ):
@@ -20497,9 +20516,15 @@ class _ControlSSABuilder(TiledObject):
             named_returns.append((name, int(value.id)))
             self._revise_semantic_output(name, int(value.id))
             superseded.update(map(int, history))
-            if value.id not in returned_ids:
-                returned.append(value)
-                returned_ids.add(value.id)
+            # Program: ``a = p; b = p; return a, b`` (the tire's
+            # ``balloon_tire_membrane_face``: ``pressure_force_1_x_n`` and
+            # ``pressure_force_0_x_n`` are one sympy value).  Wrong record:
+            # the second name sharing an id got no slot, so its
+            # ``function_output`` row was never posted and the page refused
+            # against ``named_returns``.  Rule: every named return is its own
+            # output slot; only unnamed outputs are deduplicated by id.
+            returned.append(value)
+            returned_ids.add(value.id)
         for value_id in self.output_value_ids:
             value = self.external_values.get(value_id)
             if value is None:
@@ -21417,6 +21442,11 @@ class _ControlSSABuilder(TiledObject):
                     # whose id doubles as a written field slot must resolve
                     # to the phi, not the unwritten slot argument.
                     "carried_port_values": page_metadata["carried_port_values"],
+                    # (loop node, value id): a preheader value some non-carried
+                    # binding reads inside that loop (``_resolve_read``).
+                    "loop_retained_outer_reads": tuple(sorted(
+                        self.__dict__.get("_retained_outer_reads", ())
+                    )),
                     "value_aliases": page_metadata["value_aliases"],
                     "value_names": tuple(value_names),
                     "parameter_names": page_metadata["parameter_names"],

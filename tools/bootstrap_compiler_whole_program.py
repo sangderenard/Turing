@@ -9,6 +9,13 @@ import subprocess
 import sys
 from typing import Sequence
 
+# Windows parity receipt (2026-10-24): direct execution makes ``tools`` the
+# import root on Windows, so the documented command stopped at ``import src``
+# before planning a unit.  Establish this script's repository root before the
+# compiler import, matching the existing typed-corpus entrypoint mechanism.
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPOSITORY_ROOT))
+
 from src.compiler.whole_program_compiler_bootstrap import (
     bootstrap_provenance_core,
     build_whole_program_compiler,

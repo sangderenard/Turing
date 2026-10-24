@@ -145,12 +145,27 @@ EXTENDED = [
     # c440-c443, the tire's ``metrics.unresolved_report = list(lines)``)
     (["r{v} = [{a}, {c}]", "if n > {a}:", "    r{v} = [n, {b}, {c}, 1]"], "sum(r{v}) * 10 + len(r{v}) + max(r{v})"),
     (["r{v} = [{c}]", "if n % 2 == 0:", "    w{v} = [n]", "    for i{v} in range({a}):", "        w{v}.append(i{v} + {b})", "    r{v} = list(w{v})"], "len(r{v}) * 10 + r{v}[-1]"),
+    # a copied name (``b = a``) rebound after the copy, in straight code,
+    # in one arm of an if/else, and as the seed of a loop that reads the
+    # copy (corpus c446-c449)
+    (["p{v}, q{v} = twin(n + {a})"], "p{v} * 10 + q{v}"),
+    (["a{v} = n + {a}", "b{v} = a{v}", "b{v} += {b}"], "a{v} * 100 + b{v}"),
+    (["a{v} = n * {a}", "b{v} = a{v}", "if n > {c}:", "    b{v} = b{v} - 1", "else:", "    a{v} = a{v} + {b}"], "a{v} * 100 + b{v}"),
+    (["b{v} = n % 5 + {a}", "c{v} = b{v}", "while c{v} < {c} + 20:", "    c{v} = c{v} + b{v}"], "c{v} * 10 + b{v}"),
+    (["b{v} = n + {a}", "c{v} = b{v}", "for i{v} in range({c} % 4):", "    c{v} = c{v} * 2 + b{v}"], "c{v} - b{v}"),
 ]
 EXT_HELPERS = """from src.common.tensors.abstraction import AbstractTensor
 
 
 def pair(x: int, y: int) -> tuple[int, int]:
     return x // y, x % y
+
+
+def twin(x: int) -> tuple[int, int]:
+    p = x * 3
+    a = p
+    b = p
+    return a, b
 
 
 def maybe_inc(x: int, y: int):
@@ -309,6 +324,8 @@ EXTENDED3 = [
     (["t{v} = 0", "for k{v}, x{v} in enumerate([{a}, n, {b}], n % 4 + {c}):", "    t{v} = t{v} * 10 + k{v} * x{v}"], "t{v}"),
     # a callee filters a list literal in its loop, so it keeps live flags (c197)
     ([], "positives([{a}, -{b}, {c}]) * 10 + n"),
+    # a runtime replication grown by an append, then reduced (E22a; lane E)
+    (["ys{v} = [{a}] * (n % 4)", "ys{v}.append(n + {b})"], "sum(ys{v}) * 10 + len(ys{v})"),
     # a keyed delete, then a store and lookups (E24; lane E)
     (["d{v} = {{1: n, 2: {a}, 5: {b}}}", "del d{v}[2]", "d{v}[8] = n + {c}"], "len(d{v}) * 100 + d{v}[8] + d{v}[5] * 10 + d{v}[1]"),
     # a tuple target over dict items holding a large int (E23; lane E)
@@ -470,6 +487,11 @@ EXTENDED4 = [
     (["r{v} = Rec(n, {a})", "if n > {b}:", "    r{v}.x = n + {c}"], "r{v}.x * 10 + r{v}.y"),
     (["r{v} = Rec({a}, n)", "r{v}.y = r{v}.x + n", "if n % 2 == 0:", "    r{v}.x = {b}", "else:", "    r{v}.x = r{v}.y - {c}"], "r{v}.x * 100 + r{v}.y"),
     (["r{v} = Rec(n, n)", "f{v} = r{v}.x", "r{v}.x = f{v} * {a}"], "f{v} * 10 + r{v}.x"),
+    # Corpus c436: an int ``round`` of a float, ties to even, read by int math.
+    # Corpus c470-c472, c480, c481: sets of runtime rows, built after their source.
+    (["xs{v} = [i{v} % 3 for i{v} in range(n % 5 + {c})]", "s{v} = {{x{v} for x{v} in xs{v}}}"], "len(s{v}) * 10 + len(set(xs{v}))"),
+    (["t{v} = {{{a}, n % 4, 1}}", "u{v} = [0, n % {a}]"], "len(t{v}) * 10 + int(any(u{v}))"),
+    (["r{v} = round(n * 0.5 + {a} * 0.25)", "s{v} = 0", "for i{v} in range({c} % 3 + 1):", "    s{v} += round(i{v} * 0.5 - n * 0.75)"], "r{v} * 10 + s{v}"),
 ]
 EXT4_HELPERS = """from dataclasses import dataclass
 

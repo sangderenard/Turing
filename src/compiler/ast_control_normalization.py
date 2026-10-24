@@ -815,6 +815,95 @@ def _normalize_builtin_divmod(
     return tuple(receipts)
 
 
+def _normalize_set_constructor(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Spell ``set(xs)`` and ``frozenset(xs)`` as a set comprehension.
+
+    Program: ``values = [i % 3 for i in range(n)]; len(frozenset(values))``
+    (the SSA interpreter thread's c470-c472).  Wrong record: the one-argument
+    constructor became an ``aggregate_materialization`` keyed set that no
+    pass fills (only list and tuple snapshots and dict copies have one), so
+    ``len`` read an unwritten cell: 0 for n=7, where Python gives 3.  Rule:
+    Python defines ``set(it)`` as the set of the members ``it`` yields, which
+    is ``{v for v in it}``; a generator argument's own ``elt`` and clauses
+    become the comprehension's.  The compiler already lowers a set
+    comprehension as unique inserts.  Only the builtins are rewritten (a
+    module that binds either name keeps its calls).  A ``frozenset`` result
+    has no mutating method a program could call, so its members are the set
+    comprehension's.
+    """
+
+    names = {"set", "frozenset"}
+    shadowed = {
+        name
+        for node in ast.walk(tree)
+        for name in (
+            node.id if isinstance(node, ast.Name)
+            and isinstance(node.ctx, (ast.Store, ast.Del)) else None,
+            node.name if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ) else None,
+            node.arg if isinstance(node, ast.arg) else None,
+            (node.asname or node.name) if isinstance(node, ast.alias)
+            else None,
+        )
+        if name in names
+    }
+    rewritable = names - shadowed
+    if not rewritable:
+        return ()
+    used = {
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
+    }
+    member = "_turing_set_member"
+    while member in used:
+        member = "_" + member
+    receipts: list[dict[str, Any]] = []
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_Call(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if (
+                not isinstance(node.func, ast.Name)
+                or node.func.id not in rewritable
+                or len(node.args) != 1
+                or node.keywords
+                or isinstance(node.args[0], ast.Starred)
+            ):
+                return node
+            argument = node.args[0]
+            if isinstance(argument, (ast.Set, ast.List, ast.Tuple)) and all(
+                isinstance(element, ast.Constant) for element in argument.elts
+            ):
+                # A literal table (``frozenset({"a", "b"})``, often a module
+                # constant) is folded whole at compile time.
+                return node
+            if isinstance(argument, ast.GeneratorExp):
+                comprehension = ast.SetComp(
+                    elt=argument.elt, generators=argument.generators,
+                )
+            else:
+                comprehension = ast.SetComp(
+                    elt=ast.Name(id=member, ctx=ast.Load()),
+                    generators=[ast.comprehension(
+                        target=ast.Name(id=member, ctx=ast.Store()),
+                        iter=argument, ifs=[], is_async=0,
+                    )],
+                )
+            receipts.append({
+                "line": int(getattr(node, "lineno", -1)),
+                "column": int(getattr(node, "col_offset", -1)),
+                "constructor": node.func.id,
+            })
+            return ast.copy_location(comprehension, node)
+
+    Rewriter().visit(tree)
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 _MAPPING_ANNOTATIONS = frozenset({
     "dict", "Dict", "Mapping", "MutableMapping", "defaultdict",
     "OrderedDict",

@@ -328,10 +328,17 @@ def _javascript_dependency_graph(source: str, *, identity: str) -> Any:
     declarations = _js_top_level_declarations(program.get("body", []))
 
     graph = ProcessGraph(materialize_memory=False)
+    # The memory graph's node identity is an integer.  A declaration's name
+    # is its data ("declaration_name"), never its node id: string ids made
+    # every JavaScript Dream section fail in NodeEntry with "'str' object
+    # cannot be interpreted as an integer".
+    node_ids = {name: index for index, name in enumerate(declarations)}
     for name, statement in declarations.items():
         graph.G.add_node(
-            name,
+            node_ids[name],
             type=statement.get("type"),
+            label=name,
+            declaration_name=name,
             language="javascript",
             block=identity,
         )
@@ -341,9 +348,9 @@ def _javascript_dependency_graph(source: str, *, identity: str) -> Any:
         _js_collect_identifier_references(
             statement, other_names - {name}, referenced,
         )
-        for target in referenced:
-            graph.G.add_edge(name, target, role="depends-on")
-    graph.roots = list(declarations)
+        for target in sorted(referenced):
+            graph.G.add_edge(node_ids[name], node_ids[target], role="depends-on")
+    graph.roots = [node_ids[name] for name in declarations]
     return graph
 
 

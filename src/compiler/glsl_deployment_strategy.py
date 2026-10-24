@@ -2798,6 +2798,21 @@ def _planned_scalar_dtypes_from(
             if reference in REGION_SCALAR_CAST_DTYPES:
                 settle(scalar, node_id, REGION_SCALAR_CAST_DTYPES[reference])
                 continue
+            # Silent lane, D6.  Program: ``x = n * 1.25 + 0.5; return
+            # math.floor(x) + 1`` (corpus c437).  Wrong record: nothing
+            # proved the result class, so the operand rule typed the
+            # result float64 and an int program returned a float.  Rule:
+            # on a proven scalar, ``math.floor``/``ceil``/``trunc`` and
+            # one-argument ``round`` return ``int`` in Python.
+            if reference in {
+                "round", "math.floor", "math.ceil", "math.trunc",
+            }:
+                arguments = parents(data, "arg:")
+                if len(arguments) == 1 and scalar.get(arguments[0]) in {
+                    "int64", "float64", "bool",
+                }:
+                    settle(scalar, node_id, "int64")
+                continue
             if op in {"truediv", "div"}:
                 operands = parents(data, "lhs", "rhs")
                 if operands and all(scalar.get(o) is not None for o in operands):
@@ -4390,6 +4405,13 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
+                if operation in {"floor", "ceil", "trunc", "round"}:
+                    # A scalar ``math.floor(x)`` is a Python ``int`` whatever
+                    # its operand's class; the source proof says so
+                    # (``_planned_scalar_dtypes_from``), the operand does not.
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven is not None:
+                        dtype = str(proven)
                 if operation in {
                     "sum", "prod", "min", "max", "any", "all",
                     "unsqueeze", "squeeze",
@@ -21358,6 +21380,21 @@ class _StructuralValueAlias:
     source_id: int
 
 
+def _holds_runtime_fact(value: Any, unresolved: Any) -> bool:
+    """Whether a folded container value has a runtime member anywhere."""
+
+    if value is unresolved or isinstance(value, _ProgramABIValueFact):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _holds_runtime_fact(item, unresolved)
+            for pair in value.items() for item in pair
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds_runtime_fact(item, unresolved) for item in value)
+    return False
+
+
 @dataclass(frozen=True)
 class _ProgramABIValueFact:
     """Declared source type attached to a physical native parameter."""
@@ -25037,6 +25074,10 @@ def _fold_callsite_structural_values(
             if node_type == "List" or isinstance(expression, ast.List):
                 return list(values)
             if node_type == "Set" or isinstance(expression, ast.Set):
+                # ``{1, 2, n}``: a runtime member may equal a literal one,
+                # so the display's members (and its length) are not known.
+                if _holds_runtime_fact(values, unresolved):
+                    return unresolved
                 return set(values)
             return tuple(values)
         if node_type in {"GetAttr", "Attribute"} or isinstance(
@@ -25629,6 +25670,18 @@ def _fold_callsite_structural_values(
                 return isinstance(values[0], accepted)
         if any(value is unresolved or isinstance(value, _ProgramABIValueFact)
                for value in values):
+            return unresolved
+        if name in {"set", "frozenset", "any", "all", "sorted", "max", "min"} and any(
+            _holds_runtime_fact(value, unresolved) for value in values
+        ):
+            # Program: ``values = [1, 2, 2, n]; len(set(values))`` (silent
+            # lane; the SSA interpreter thread's c470-c472).  Wrong record:
+            # the list's known value held ``n`` as its declared-parameter
+            # fact, ``set`` hashed that fact as one more distinct member,
+            # and ``len`` folded to 3, which is wrong when n is 1 or 2.
+            # Rule: a runtime member is not a value; dedupe, truth and
+            # order over one prove nothing.  ``len`` and ``list`` keep
+            # their count and order, which hold whatever the member is.
             return unresolved
         try:
             if name in {"bool", "int", "float"}:
