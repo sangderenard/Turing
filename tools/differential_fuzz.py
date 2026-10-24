@@ -332,6 +332,8 @@ EXTENDED3 = [
     (["d{v} = {{{a}: n + 36028797018963969, {b}: {c}}}", "t{v} = 0", "for k{v}, w{v} in d{v}.items():", "    t{v} += k{v} * 10 + w{v}"], "t{v}"),
     # a list grown at run time, then sorted (Fortran list growth; lane E)
     (["xs{v} = []", "for k{v} in range(n % 4 + {a} + 1):", "    xs{v}.append((k{v} * {b} + n) % 9)", "ys{v} = sorted(xs{v})"], "ys{v}[0] * 100 + ys{v}[-1] * 10 + len(xs{v})"),
+    # a sorted grown list, then a runtime replication with no region body (E22b; lane E)
+    (["xs{v} = []", "for k{v} in range(n % 4 + {a} + 1):", "    xs{v}.append((k{v} * {b} + n) % 9)", "ys{v} = sorted(xs{v})", "zs{v} = [{c}] * (n % 4 + 1)"], "ys{v}[0] * 100 + len(zs{v}) * 10 + zs{v}[0]"),
 ]
 EXT3_HELPERS = """def setfirst(xs: list[int], v: int) -> None:
     xs[0] = v
