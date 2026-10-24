@@ -88,6 +88,7 @@ from .ast_control_normalization import (
     _normalize_chained_comparisons as _normalize_chained_comparisons,
     _normalize_constant_membership as _normalize_constant_membership,
     _normalize_builtin_divmod as _normalize_builtin_divmod,
+    _normalize_mapping_get as _normalize_mapping_get,
     _normalize_direct_tail_recursion as _normalize_direct_tail_recursion,
     _normalize_none_default_assignments as _normalize_none_default_assignments,
     _normalize_top_level_guard_returns as _normalize_top_level_guard_returns,
@@ -5450,6 +5451,13 @@ def _authored_annotation_field_receipt(
         value_dtype = {
             "bool": "bool", "int": "int64", "float": "float64",
             "str": "int64",
+            # A mapping's arbitrary-object value uses the same authored
+            # boundary as an ``Any`` parameter, field or collection member:
+            # one fixed-width opaque handle.  Falling through to the record
+            # branch below named a record ``'Any'`` that no declaration
+            # defines (``SSAReferenceEvaluator.run``'s
+            # ``Mapping[int, Any]``, "top-level keyed value_record").
+            "Any": "opaque_ref", "object": "opaque_ref",
         }.get(str(value_name))
         value_record = None
         authored_value_scalar = dict(
@@ -58550,6 +58558,7 @@ def _lower_ast_source_to_ssa_impl(
     # the short-circuit normalization nests it.
     chained_comparison_receipts.extend(_normalize_constant_membership(tree))
     chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
+    chained_comparison_receipts.extend(_normalize_mapping_get(tree))
     short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
     loop_else_receipts = list(_normalize_loop_else(tree))
     if chained_comparison_receipts:
@@ -58963,6 +58972,9 @@ def _lower_ast_source_to_ssa_impl(
         )
         chained_comparison_receipts.extend(
             _normalize_builtin_divmod(discovered_tree)
+        )
+        chained_comparison_receipts.extend(
+            _normalize_mapping_get(discovered_tree)
         )
         short_circuit_receipts.extend(
             _normalize_binary_short_circuit(discovered_tree)

@@ -51,6 +51,10 @@ from ...common.tensors.topological_reducer import (
     register_call_shaped_type,
     register_runnable_definition_type,
 )
+from .javascript_identity_programs import (
+    begin_javascript_ingestion,
+    post_javascript_ingestion_identity,
+)
 
 
 _NODE_CLASS_CACHE: dict[str, type] = {}
@@ -102,7 +106,7 @@ JS_ROLE_SCHEMAS: dict[str, dict[str, dict[str, Any]]] = {
     "VariableDeclarator": {"up": {"id": 1, "init": 1}, "down": {}},
     "Identifier": {"up": {}, "down": {}},
     "Literal": {"up": {}, "down": {}},
-    "BinaryExpression": {"up": {"left": 1, "operator": 1, "right": 1}, "down": {}},
+    "BinaryExpression": {"up": {"left": 1, "right": 1}, "down": {}},
     "ArrowFunctionExpression": {
         "up": {"params": "many", "body": 1}, "down": {},
     },
@@ -134,6 +138,48 @@ def install_js_role_schemas(graph: Any) -> None:
     """
 
     graph.role_schemas = {**role_schemas, **JS_ROLE_SCHEMAS}
+
+
+def build_javascript_structural_graph(
+    graph: Any, root: Any, *, owner: str = "<javascript>",
+) -> int:
+    """Build the ESTree shape through the ordinary ProcessGraph edge writer.
+
+    This graph is descriptive, not a claim that ESTree functions are already
+    runnable by the Python-oriented reducer.  Stable source rows are installed
+    first so ``build_graph`` can use its normal identity-transition path.
+    """
+
+    install_js_role_schemas(graph)
+    begin_javascript_ingestion(graph, owner)
+    seen: set[int] = set()
+    pending = [root]
+    while pending:
+        node = pending.pop()
+        node_id = id(node)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        kind = type(node).__name__
+        source = {
+            "type": kind,
+            "start": getattr(node, "start", None),
+            "end": getattr(node, "end", None),
+        }
+        post_javascript_ingestion_identity(
+            graph, node_id, owner=owner, qualname="<structural>",
+            kind=kind, operation="", label=kind, source=source,
+        )
+        schema = JS_ROLE_SCHEMAS.get(kind, {})
+        for role in (*schema.get("up", {}), *schema.get("down", {})):
+            value = getattr(node, role, None)
+            values = value if isinstance(value, list) else (value,)
+            pending.extend(
+                item for item in values
+                if item is not None and type(item).__name__ in JS_ROLE_SCHEMAS
+            )
+    graph.G.graph["source_language"] = "javascript"
+    return graph.build_graph(root)
 
 
 # ``pycparser``'s ``c_ast`` nodes are already real Python objects (unlike
@@ -203,6 +249,7 @@ def install_c_role_schemas(graph: Any) -> None:
 
 __all__ = [
     "estree_dict_to_node",
+    "build_javascript_structural_graph",
     "install_js_role_schemas",
     "JS_ROLE_SCHEMAS",
     "install_c_role_schemas",

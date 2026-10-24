@@ -762,3 +762,32 @@ unchanged (static, which is what Windows uses).
 - Gate at `ea3e85b5` and at main `39fe7283`, each on a clean worktree:
   aa 89 / ab 8 / ac 26 / rec 21 on both, with the same failure names in
   every part.
+
+## E23: dict items tuple targets are a key and a row
+
+- **Program:** `for k, w in d.items(): s += k * 10 + w` over a dict
+  holding a large int row (c404) or a large int key (c405), and c337
+  (`del d0[1]` beside such a loop).
+- **Wrong record:** the planner's scalar rule types the tuple target of
+  `zip` and `enumerate` but had no rule for `items`, so both names fell
+  to the float64 domain default. C summed int keys and rows through float64
+  and returned rounded results (c404 and c405 WRONG at main `da63b7dd`).
+  LLVM refused the i64/double phi. Fortran refused int64 actuals for REAL(8)
+  formals, which surfaced as c337 COMPILE-FAIL after #827.
+- **Rule:** over `d.items()` the first name is a key of `d`: the join of
+  its key members and its stores' indices. The second name is a row of `d`
+  (`glsl_deployment_strategy._planned_scalar_dtypes_from`, beside the zip
+  and enumerate rules).
+- **Still open (LLVM, loud):** after a keyed delete, LLVM refuses an i32/i64
+  phi (c337, c338, c370, c371, c387, c388, c389, c430-c433). Each does the
+  same at main.
+
+### Receipts for E23
+
+- Corpus at `086aac37` on main `da63b7dd` (325 programs): C 325/325, LLVM
+  313/325, Fortran 324 PASS, 1 WRONG (c22, by design). The LLVM misses are
+  c367 and the delete-family phi refusals above; each does the same at main.
+- Fuzz seed 63 (`FUZZ_EXT=3`, `llvm,fortran`, 30 programs): 30 PASS,
+  0 WRONG and 0 TYPE. The new snippet was not drawn; c404 is its program.
+- Gate at `086aac37` and at main `da63b7dd`, each on a clean worktree: aa 89 /
+  ab 7 / ac 26 / rec 20 on both, with the same failure names in every part.

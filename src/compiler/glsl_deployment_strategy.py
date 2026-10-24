@@ -1961,12 +1961,38 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
     ``get`` with a typed default, assume the default's type and accept the
     assumption only if, under it, the dict's writers join to exactly that
     type (a consistent typing of the cycle). Otherwise nothing is assumed.
+
+    Program: ``d = {1: 10}; d[1] += n`` (corpus c374, plan C6).  Wrong
+    record: the same cycle without ``get``: the store's value reads ``d[1]``,
+    whose class is the element type the store joins into, so the row read
+    entered the ``+ n`` region at the float64 default and the int table
+    refused the float store.  Rule: a dict display whose members all have a
+    proven class is a second source of the assumption (their join), accepted
+    by the same writers check.
     """
 
     proven = _planned_scalar_dtypes_from(graph)
     G = graph.G
     hypotheses: dict[int, str] = {}
     for node_id, data in G.nodes(data=True):
+        if (
+            isinstance(data.get("expr_obj"), ast.Dict)
+            and int(node_id) not in proven
+        ):
+            members = {
+                proven.get(int(parent))
+                for parent, role in data.get("parents") or ()
+                if str(role).startswith("values")
+            }
+            if members and None not in members:
+                dtype = (
+                    "int64" if members <= {"int64", "bool"} and len(members) > 1
+                    else next(iter(members)) if len(members) == 1 else ""
+                )
+                if dtype in {"int64", "float64", "bool"}:
+                    if hypotheses.setdefault(int(node_id), dtype) != dtype:
+                        hypotheses[int(node_id)] = ""
+            continue
         if str(data.get("op") or data.get("type") or "").casefold() != "get":
             continue
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
@@ -1981,6 +2007,46 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
             continue
         if hypotheses.setdefault(receiver, dtype) != dtype:
             hypotheses[receiver] = ""
+    # Program: ``xs = [6, n, 2]; for j in range(len(xs)): xs[j] = xs[j] *
+    # 2`` (corpus c169).  Lane D, D2.  The same cycle without ``get``: the
+    # display's element type is the join of its members and its stores, the
+    # store's value reads ``xs[j]``, and that read is the element type, so
+    # the rows fell to the float64 domain default.  Rule: a collection whose
+    # members are all proven and whose element type is not assumes its
+    # members' join, accepted only under the same check (its writers then
+    # join to exactly that type).
+    for node_id, data in G.nodes(data=True):
+        node_id = int(node_id)
+        attributes = data.get("attributes") or {}
+        if node_id in proven or node_id in hypotheses:
+            continue
+        if attributes.get("aggregate_kind") not in {"list", "set", "dict"}:
+            continue
+        if str(data.get("op") or data.get("type") or "").casefold().startswith(
+            "indexed"
+        ):
+            continue
+        role = (
+            "values" if attributes.get("aggregate_kind") == "dict"
+            else "arg"
+            if attributes.get("producer_kind") == "sequence_materialization"
+            else "elts"
+        )
+        members = [
+            int(parent) for parent, member_role in data.get("parents") or ()
+            if str(member_role).startswith(role) and int(parent) in G
+        ]
+        dtypes = {proven.get(member) for member in members}
+        if not members or None in dtypes or not dtypes <= {
+            "int64", "float64", "bool",
+        }:
+            continue
+        joined = (
+            next(iter(dtypes)) if len(dtypes) == 1
+            else "int64" if dtypes == {"int64", "bool"} else None
+        )
+        if joined is not None:
+            hypotheses[node_id] = joined
     hypotheses = {key: value for key, value in hypotheses.items() if value}
     if not hypotheses:
         return proven
@@ -2323,6 +2389,63 @@ def _planned_scalar_dtypes_from(
                     if counted:
                         held_types = (
                             "int64", element.get(counted[0]),
+                        )
+                        for item, held in zip(
+                            loop_expression.target.elts, held_types,
+                        ):
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
+                # Program: ``for k, w in d.items(): s += k * 10 + w`` (c337,
+                # c404, c405; lane E).  Wrong record: as with ``zip``, the
+                # tuple target's names were never typed, so both fell to the
+                # float64 default; C summed int rows through float64 (a large
+                # int value came back rounded) and Fortran refused the int64
+                # actuals for REAL(8) formals.  Rule: over ``d.items()`` the
+                # first name is a key of ``d`` (the join of its key members
+                # and its stores' indices) and the second is a row of ``d``.
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and len(loop_expression.target.elts) == 2
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and operation(zipped) == "items"
+                ):
+                    tables = parents(zipped, "operand")
+                    table = tables[0] if len(tables) == 1 else None
+                    if (
+                        table is not None
+                        and is_collection(table)
+                        and (G.nodes[table].get("attributes") or {}).get(
+                            "aggregate_kind"
+                        ) == "dict"
+                    ):
+                        keys = [
+                            scalar.get(key)
+                            for key in parents(G.nodes[table], "keys")
+                        ]
+                        for child in G.successors(table):
+                            if operation(G.nodes[child]) in {
+                                "indexedstore", "setitem",
+                            }:
+                                keys.extend(
+                                    scalar.get(index)
+                                    for index in parents(
+                                        G.nodes[child], "index",
+                                    )
+                                )
+                        held_types = (
+                            join(keys) if keys else None,
+                            element.get(table),
                         )
                         for item, held in zip(
                             loop_expression.target.elts, held_types,
@@ -19989,9 +20112,26 @@ def _propagate_callsite_tensor_specializations(
     round_index = 0
     seen_round_states: dict[str, int] = {}
 
+    # Function-table graphs this loop has written planner descriptors to.
+    # Program: ``entry`` calls ``t.red(n > 1)`` and ``red`` is not one of
+    # ``graphs`` (corpus c469 shape).  Wrong record: the round published
+    # ``red``'s ``flag`` descriptor (``changed`` True) but the digest read
+    # only ``graphs``, so the state equalled the seed state: "repeated a
+    # completed state at round 1".  Rule: a graph the loop writes is part of
+    # the state the guard reads.
+    published_callee_graphs: dict[int, Any] = {}
+
     def specialization_state() -> tuple[str, int]:
         facts = []
         tensor_fact_count = 0
+        for item in published_callee_graphs.values():
+            if any(item.G is graph.G for graph in graphs):
+                continue
+            facts.append((
+                str(item.G.graph.get("function_name") or ""),
+                "callee-planner",
+                repr(item.G.graph.get("planner_tensor_descriptors") or {}),
+            ))
         for item in graphs:
             function_name = str(item.G.graph.get("function_name") or "")
             planner = item.G.graph.get("planner_tensor_descriptors") or {}
@@ -20731,6 +20871,7 @@ def _propagate_callsite_tensor_specializations(
             if not additions:
                 continue
             existing.update(copy.deepcopy(additions))
+            published_callee_graphs.setdefault(id(callee.G), callee)
             _apply_callsite_tensor_descriptors(callee, additions)
             # The catalogue graph is shared by every callsite.  A tensor
             # descriptor alone is not a complete structural specialization:

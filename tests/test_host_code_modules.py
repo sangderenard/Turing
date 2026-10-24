@@ -490,17 +490,27 @@ def test_cpython_pycfunction_resolver_finds_sre_compile_interior_entry():
     import _sre
     from src.compiler.binary_ingestion import parse_pe_image
 
+    import sys
+
     identity = resolve_host_code_identity(_sre.compile)
 
     assert identity is not None
-    assert identity.provider == "cpython-pycfunction"
+    assert identity.provider == (
+        "cpython-pycfunction" if sys.platform == "win32"
+        else "cpython-elf-pycfunction"
+    )
     assert identity.symbol == "_sre.compile"
     assert identity.entry_rva is not None
     assert identity.calling_convention == "cpython-pycfunction-flags:0x82"
     encoded = identity.module_path.read_bytes()
-    image, _statistics = parse_pe_image(
-        encoded, maximum_file_size=len(encoded)
-    )
+    if sys.platform == "win32":
+        image, _statistics = parse_pe_image(
+            encoded, maximum_file_size=len(encoded)
+        )
+    else:
+        from src.compiler.elf_ingestion import parse_elf_image
+
+        image = parse_elf_image(encoded)
     owner = image.runtime_function_for_rva(identity.entry_rva)
     assert owner is not None
     assert owner.begin_rva <= identity.entry_rva < owner.end_rva

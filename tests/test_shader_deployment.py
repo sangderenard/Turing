@@ -29,6 +29,7 @@ from src.compiler.shader_deployment import (
     SPIRV_PRODUCT_SCHEMA,
     publish_extracted_shader,
     publish_spirv_product,
+    spirv_deployment,
 )
 from src.compiler.shader_extractor import ExtractedShader
 from src.compiler.ssa_spirv_backend import (
@@ -120,7 +121,7 @@ def test_glsl_compute_product_publishes_the_arena_launch_contract(tmp_path):
 
     assert manifest["source"] == "kernel.comp"
     assert (record["language"], record["version"], record["stage"]) == ("glsl-430", "430", "compute")
-    (arena,) = record["resources"]
+    arena, slot_table, extent_table = record["resources"]
     assert (arena["kind"], arena["set"], arena["binding"], arena["layout"]) == (
         "storage-buffer", 0, 0, "std430",
     )
@@ -129,28 +130,40 @@ def test_glsl_compute_product_publishes_the_arena_launch_contract(tmp_path):
     for view in arena["realizes"]:
         assert view["byte_offset"] == {"control": "u_slot", "index": view["slot"], "scale": 4}
         assert view["rank"] == 1 and view["shape"] is None
+    # The launch controls are read-only storage blocks at the next
+    # contiguous bindings, never loose uniforms.
+    assert [(item["name"], item["set"], item["binding"], item["access"])
+            for item in (slot_table, extent_table)] == [
+        ("TuringLaunchSlots", 0, 1, "read"), ("TuringLaunchExtents", 0, 2, "read"),
+    ]
+    assert "uniform" not in component.source
     launch = record["launch"]
     assert launch["local_size"] == [32, 1, 1]
     assert launch["element_count"]["control"] == "u_count"
     controls = {control["name"]: control for control in launch["controls"]}
-    assert set(controls) == {"u_count", "u_extent", "u_slot"}
+    assert {name: (item["storage"], item["binding"], item["byte_offset"])
+            for name, item in controls.items()} == {
+        "u_slot": ("storage-buffer", 1, 0),
+        "u_count": ("storage-buffer", 2, 0),
+        "u_extent": ("storage-buffer", 2, 4),
+    }
     assert controls["u_slot"]["length"] == len(api["metadata"]["component_abi"]["ports"])
-    for name in controls:
-        assert f"uniform uint {name}" in component.source
-    assert [item["code"] for item in record["shortfalls"]] == ["vulkan-default-uniform-controls"]
+    assert record["shortfalls"] == [] and record["complete"]
+    assert [item["client"] for item in record["target"]["clients"]] == ["opengl", "vulkan"]
 
 
 @pytest.mark.skipif(shutil.which("glslangValidator") is None, reason="no glslangValidator")
-def test_glsl_compute_shortfall_matches_the_reference_compiler(tmp_path):
+def test_glsl_compute_source_compiles_for_every_client_it_claims(tmp_path):
     component = emit_glsl_compute_component(_program(), name="kernel")
     source = component.write(tmp_path)
     opengl = subprocess.run(["glslangValidator", str(source)], capture_output=True, text=True)
     assert opengl.returncode == 0, opengl.stdout
     vulkan = subprocess.run(
-        ["glslangValidator", "-V", str(source), "-o", str(tmp_path / "x.spv")],
+        ["glslangValidator", "-V", "--target-env", "vulkan1.1", str(source),
+         "-o", str(tmp_path / "x.spv")],
         capture_output=True, text=True,
     )
-    assert "non-opaque uniforms outside a block" in vulkan.stdout
+    assert vulkan.returncode == 0, vulkan.stdout
 
 
 def test_glsl_compute_ports_carry_the_dtype_the_source_reads():
@@ -264,21 +277,120 @@ def test_spirv_library_and_deployable_shader_are_separate_products(tmp_path):
     )
 
 
-def test_deployable_spirv_refuses_what_one_element_per_invocation_cannot_carry():
-    a = SSAValue(0, "float32", (4,))
-    b = SSAValue(1, "float32", (4,))
-    r = SSAValue(2, "float32", (4,))
-    shaped = Function("shaped", [a, b], {"entry": BasicBlock("entry", [
+def _spans(rank, *ids, dtype="float32"):
+    return [
+        SSAValue(i, dtype, (), accounting={"program_abi_rank": rank})
+        for i in ids
+    ]
+
+
+def test_deployable_spirv_refuses_what_one_invocation_cannot_carry():
+    # The library unrolls static shapes only: a runtime-sized span is
+    # refused there, never read as its element 0.
+    a, b, r = _spans(1, 0, 1, 2)
+    runtime = Function("runtime", [a, b], {"entry": BasicBlock("entry", [
         Instr("add", [a, b], r), Instr("Ret", [], None),
     ])})
-    refused = emit_deployable_compute_shader(shaped, outputs=[r])
-    assert not refused.complete and refused.source == ""
-    assert any("has shape (4,)" in item.reason for item in refused.shortfalls)
+    library = emit_function(runtime, outputs=[r])
+    assert any("runtime-sized span" in item.reason for item in library.shortfalls)
 
-    function, result = _scalar()
-    two = emit_deployable_compute_shader(function, outputs=[result, result])
-    assert not two.complete
-    assert any("exactly one result" in item.reason for item in two.shortfalls)
+    # Element mode needs one rank, elementwise operations, span outputs.
+    (x,) = _spans(1, 0)
+    (y,) = _spans(2, 1)
+    (z,) = _spans(2, 2)
+    mixed = Function("mixed", [x, y], {"entry": BasicBlock("entry", [
+        Instr("add", [x, y], z), Instr("Ret", [], None),
+    ])})
+    (u,) = _spans(1, 0)
+    total = SSAValue(1, "float32", ())
+    reduced = Function("reduced", [u], {"entry": BasicBlock("entry", [
+        Instr("sum", [u], total), Instr("Ret", [], None),
+    ])})
+    for function, outputs, reason in (
+        (mixed, [z], "one rank"),
+        (reduced, [total], "is a scalar beside"),
+    ):
+        refused = emit_deployable_compute_shader(function, outputs=outputs)
+        assert not refused.complete and refused.source == ""
+        assert any(reason in item.reason for item in refused.shortfalls), (
+            refused.shortfalls
+        )
+
+    function, _result = _scalar()
+    none = emit_deployable_compute_shader(function, outputs=[])
+    assert not none.complete
+    assert any("at least one result" in item.reason for item in none.shortfalls)
+
+
+def _elementwise_runtime():
+    """``(a + b) * s`` over runtime-sized rank-2 spans, ``s`` a scalar."""
+
+    a, b, total, scaled = _spans(2, 0, 1, 3, 4)
+    s = SSAValue(2, "float32", ())
+    function = Function("runtime", [a, b, s], {"entry": BasicBlock("entry", [
+        Instr("add", [a, b], total), Instr("mul", [total, s], scaled),
+        Instr("Ret", [], None),
+    ])})
+    return function, [scaled]
+
+
+def test_runtime_sized_elementwise_deploys_one_element_per_invocation():
+    function, outputs = _elementwise_runtime()
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    record = spirv_deployment(shader).to_mapping()
+    views = {item["name"]: item["realizes"][0] for item in record["resources"]}
+    for name in ("feed_0", "feed_1", "output_0"):
+        assert views[name]["rank"] == 2 and views[name]["shape"] is None
+        assert views[name]["byte_extent"] == {
+            "control": "element_count", "index": 0, "scale": 4,
+        }
+    assert views["feed_0"]["extents_from"] == "fed"
+    assert views["output_0"]["extents_from"] == views["feed_0"]["slot"]
+    # The scalar broadcasts: one element, read by every invocation.
+    assert views["feed_2"]["rank"] == 0 and views["feed_2"]["byte_extent"] == 4
+    element_count = record["launch"]["element_count"]
+    assert element_count["rank"] == 2
+    assert element_count["elements_of"] == views["feed_0"]["slot"]
+
+
+def _instanced():
+    """``(a + b) * s`` and ``a - b`` over (2, 3) instances, ``s`` scalar."""
+
+    a, b = SSAValue(0, "float32", (2, 3)), SSAValue(1, "float32", (2, 3))
+    s = SSAValue(2, "float32", ())
+    total, scaled, difference = (
+        SSAValue(3, "float32", (2, 3)), SSAValue(4, "float32", (2, 3)),
+        SSAValue(5, "float32", (2, 3)),
+    )
+    function = Function("instanced", [a, b, s], {"entry": BasicBlock("entry", [
+        Instr("add", [a, b], total), Instr("mul", [total, s], scaled),
+        Instr("sub", [a, b], difference), Instr("Ret", [], None),
+    ])})
+    return function, [scaled, difference]
+
+
+def test_deployable_spirv_states_instance_shapes_and_every_output():
+    function, outputs = _instanced()
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    record = spirv_deployment(shader).to_mapping()
+    views = {
+        item["name"]: item["realizes"][0] for item in record["resources"]
+    }
+    assert [item["name"] for item in record["resources"]] == [
+        "feed_0", "feed_1", "feed_2", "output_0", "output_1",
+    ]
+    for name in ("feed_0", "feed_1", "output_0", "output_1"):
+        view = views[name]
+        assert view["instance_shape"] == [2, 3]
+        assert view["rank"] == 3 and view["shape"] is None
+        assert view["byte_extent"] == {
+            "control": "element_count", "index": 0, "scale": 4 * 6,
+        }
+    assert views["feed_2"]["instance_shape"] == []
+    assert views["feed_2"]["byte_extent"]["scale"] == 4
+    assert views["output_1"]["extents_from"] == views["output_0"]["extents_from"]
 
 
 _HAVE_SPIRV_TOOLS = all(shutil.which(tool) for tool in ("spirv-as", "spirv-val"))
@@ -359,3 +471,176 @@ def test_deployable_spirv_matches_python_when_run_from_its_record(tmp_path, dtyp
         expected = {"add": np.add, "mul": np.multiply, "sub": np.subtract}[op](*feeds)
     assert output[:count].tobytes() == expected.tobytes()
     assert (output[count:] == 12345).all()
+
+
+def test_instanced_deployable_spirv_matches_python_on_vulkan(tmp_path):
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _instanced()
+    product = publish_spirv_product(
+        tmp_path / "product",
+        emit_deployable_compute_shader(function, outputs=outputs),
+    )
+    record = product.deployment
+    count = 300
+    rng = np.random.default_rng(3)
+    a = rng.standard_normal((count, 2, 3)).astype(np.float32)
+    b = rng.standard_normal((count, 2, 3)).astype(np.float32)
+    s = rng.standard_normal(count).astype(np.float32)
+    fed = {0: a, 1: b, 2: s}
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        per_instance = math.prod(view["instance_shape"])
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = fed[view["value_id"]]
+        else:
+            buffers[resource["binding"]] = np.full(
+                (count + 64) * per_instance, 12345, dtype=np.float32,
+            )
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    group = record["launch"]["group_count"]["invocations_per_group"]
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(math.ceil(count / group) + 1),
+         "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    outputs_by_name = {
+        item["name"]: np.fromfile(paths[item["binding"]], dtype=np.float32)
+        for item in record["resources"] if item["access"] == "read_write"
+    }
+    expected = {
+        "output_0": ((a + b) * s[:, None, None]).reshape(-1),
+        "output_1": (a - b).reshape(-1),
+    }
+    for name, want in expected.items():
+        got = outputs_by_name[name]
+        np.testing.assert_allclose(got[: count * 6], want, rtol=1e-6)
+        assert (got[count * 6:] == 12345).all()
+
+
+@pytest.mark.parametrize("dtype", ["float32", "int32"])
+def test_glsl_arena_product_runs_on_vulkan_from_its_record(tmp_path, dtype):
+    """The same GLSL arena source, compiled for Vulkan, launched only from
+    the published record, must return numpy's answer."""
+
+    if shutil.which("glslangValidator") is None:
+        pytest.skip("no glslangValidator")
+    probe = _vulkan_probe(tmp_path)
+    meta = {value_id: Meta(shape=(1,), dtype=dtype, device="glsl") for value_id in (1, 2, 3)}
+    component = emit_glsl_compute_component(_program(meta), name="arena", local_size=64)
+    _, _, api, record = _published(component.write(tmp_path / "product"))
+    spv = tmp_path / "arena.spv"
+    compiled = subprocess.run(
+        ["glslangValidator", "-V", "--target-env", "vulkan1.1",
+         str(tmp_path / "product" / record["source"]["file"]), "-o", str(spv)],
+        capture_output=True, text=True,
+    )
+    assert compiled.returncode == 0, compiled.stdout
+
+    count = 777
+    numpy_type = {"f32": np.float32, "i32": np.int32}
+    rng = np.random.default_rng(11)
+    ports = api["metadata"]["component_abi"]["ports"]
+    # The host chooses each port's arena word offset; the record says only
+    # that u_slot[i] carries it. Leave gaps so a wrong offset shows.
+    offsets = {port["slot"]: 5 + port["slot"] * (count + 3) for port in ports}
+    arena_words = np.full(5 + len(ports) * (count + 3) + 64, 0xDEADBEEF, dtype=np.uint32)
+    feeds = []
+    for port in ports:
+        if port["role"] == "feed":
+            values = (rng.standard_normal(count) * 1000).astype(numpy_type[port["dtype"]])
+            arena_words[offsets[port["slot"]]:offsets[port["slot"]] + count] = values.view(np.uint32)
+            feeds.append(values)
+    rule_values = {"element_count": count}
+    buffers = {}
+    for resource in record["resources"]:
+        if resource["name"] == "Arena":
+            buffers[resource["binding"]] = arena_words
+            continue
+        words = np.zeros(resource["byte_extent"] // 4, dtype=np.uint32)
+        for control in record["launch"]["controls"]:
+            if control["binding"] != resource["binding"]:
+                continue
+            for index, rule in enumerate(control["derivation"]):
+                value = (
+                    offsets[rule["port_slot"]] if rule["rule"] == "arena_word_offset"
+                    else rule_values[rule["rule"]]
+                )
+                words[control["byte_offset"] // 4 + index] = value
+        buffers[resource["binding"]] = words
+    assert sorted(buffers) == list(range(len(buffers)))
+    paths = []
+    for binding in sorted(buffers):
+        path = tmp_path / f"binding{binding}.bin"
+        buffers[binding].tofile(path)
+        paths.append(str(path))
+    group = record["launch"]["group_count"]["invocations_per_group"]
+    ran = subprocess.run(
+        [str(probe), str(spv), str(math.ceil(count / group) + 1), "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    result = np.fromfile(paths[0], dtype=np.uint32)
+    output = next(port for port in ports if port["role"] == "output")
+    start = offsets[output["slot"]]
+    with np.errstate(over="ignore"):
+        expected = np.add(*feeds)
+    assert result[start:start + count].tobytes() == expected.tobytes()
+    assert (result[start + count:start + count + 3] == 0xDEADBEEF).all()
+
+
+def test_runtime_sized_deployable_spirv_matches_python_on_vulkan(tmp_path):
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _elementwise_runtime()
+    product = publish_spirv_product(
+        tmp_path / "product",
+        emit_deployable_compute_shader(function, outputs=outputs),
+    )
+    record = product.deployment
+    rng = np.random.default_rng(5)
+    # Extents the shader never saw: the host supplies their product.
+    a = rng.standard_normal((17, 13)).astype(np.float32)
+    b = rng.standard_normal((17, 13)).astype(np.float32)
+    s = np.array([0.75], dtype=np.float32)
+    count = a.size
+    fed = {0: a, 1: b, 2: s}
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = fed[view["value_id"]]
+        else:
+            buffers[resource["binding"]] = np.full(count + 64, 12345, dtype=np.float32)
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    group = record["launch"]["group_count"]["invocations_per_group"]
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(math.ceil(count / group) + 1),
+         "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    output = next(
+        item for item in record["resources"] if item["access"] == "read_write"
+    )
+    got = np.fromfile(paths[output["binding"]], dtype=np.float32)
+    np.testing.assert_allclose(got[:count], ((a + b) * s[0]).reshape(-1), rtol=1e-6)
+    assert (got[count:] == 12345).all()

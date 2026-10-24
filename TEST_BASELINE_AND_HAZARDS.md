@@ -1,3 +1,20 @@
+2026-10-24 GLSL ARENA CONTROLS (MEASURED, cloud): composed GLSL shaders read
+u_count/u_extent/u_slot from two read-only std430 storage blocks (set 0,
+bindings 1 and 2) instead of default-block uniforms, so the same source
+compiles for OpenGL and Vulkan; run on lavapipe from its product record it
+matches numpy bit for bit (f32, i32). GL host and BLAS C shell updated (the
+shell compiles for Windows; not run, it needs Windows). GPU tests on
+llvmpipe GL 4.5 (PYOPENGL_PLATFORM=egl SDL_VIDEODRIVER=offscreen): same 28
+failures / 4 errors as main da63b7d. At 560f17f: C corpus 323/323. Gate names
+identical to main da63b7d in all four parts. See doc 38.
+
+2026-10-24 LANE E, E23 (MEASURED, cloud): `for k, w in d.items()` types k as
+a key and w as a row of d (it fell to float64: C WRONG on large ints at main
+da63b7dd, c404, c405; Fortran COMPILE-FAIL c337). At 086aac37 (325 programs):
+C 325/325, LLVM 313/325 (delete-family phi refusals and c367, same on main),
+Fortran 324 PASS (c22 by design). Fuzz seed 63: 0 WRONG / 0 TYPE. Gate names
+identical to main da63b7dd.
+
 2026-10-24 SHADER PRODUCTS (MEASURED, cloud): shader emitters publish source,
 API sidecar, nodus-turing-shader-artifact-v1 manifest and SHA256SUMS, with a
 turing.shader-deployment.v1 record (physical resources, launch controls,

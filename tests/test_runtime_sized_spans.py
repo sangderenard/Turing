@@ -301,3 +301,49 @@ def test_operator_matrix(tmp_path, backend, geometry, operation):
     np.testing.assert_allclose(
         got.reshape(-1).astype(float), expected.reshape(-1).astype(float),
     )
+
+
+# -- deployable SPIR-V from the same sanctioned entry ------------------------
+
+def test_rank_only_region_deploys_as_elementwise_spirv(tmp_path):
+    """The lowered region of the representative op is elementwise over
+    rank-2 runtime-sized spans, so it deploys one element per invocation."""
+
+    import shutil
+    import subprocess
+
+    from src.compiler.shader_deployment import spirv_deployment
+    from src.compiler.ssa_spirv_backend import emit_deployable_compute_shader
+
+    module, entry, _parameters, _result = _lower(
+        tmp_path, REPRESENTATIVE, "rep_spirv", 2,
+    )
+    (region_name,) = [name for name in module.functions if name != entry]
+    region = module.functions[region_name]
+    outputs = [
+        argument for block in region.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+        for argument in instruction.args
+    ]
+    shader = emit_deployable_compute_shader(region, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    record = spirv_deployment(shader).to_mapping()
+    spans = [
+        item["realizes"][0] for item in record["resources"]
+        if item["realizes"][0]["rank"]
+    ]
+    assert len(spans) == 3 and all(view["shape"] is None for view in spans)
+    if shutil.which("spirv-as") and shutil.which("spirv-val"):
+        source = tmp_path / "region.spvasm"
+        source.write_text(shader.source)
+        binary = tmp_path / "region.spv"
+        assembled = subprocess.run(
+            ["spirv-as", "--target-env", "vulkan1.1", str(source), "-o", str(binary)],
+            capture_output=True, text=True,
+        )
+        assert assembled.returncode == 0, assembled.stderr
+        validated = subprocess.run(
+            ["spirv-val", "--target-env", "vulkan1.1", str(binary)],
+            capture_output=True, text=True,
+        )
+        assert validated.returncode == 0, validated.stderr
