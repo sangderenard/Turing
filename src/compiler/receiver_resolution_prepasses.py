@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import copy
 import os
 import sys
 from typing import Any
@@ -15,6 +14,32 @@ from .concordance_declarations import (
     SCALAR_INTRINSIC_RECEIVER as _SCALAR_INTRINSIC_RECEIVER,
 )
 from ..transmogrifier.function_table import FunctionReference
+
+
+def _syntax_copy(node: Any) -> Any:
+    """Copy an expression's syntax: AST fields deep, annotations shared.
+
+    Program: ``re.compile("ab+")`` pursued into ``re._compiler``.  Wrong
+    record: ``copy.deepcopy`` of the authored call also copied the
+    compiler's private annotations on its nodes (bindings holding module
+    objects), and crashed with "cannot pickle 'mappingproxy' object".  Rule:
+    a rewritten expression is new syntax; the annotations the compiler hung
+    on the authored nodes are facts about those occurrences and are shared,
+    never cloned.
+    """
+
+    if isinstance(node, list):
+        return [_syntax_copy(item) for item in node]
+    if not isinstance(node, ast.AST):
+        return node
+    copied = type(node)(**{
+        field: _syntax_copy(getattr(node, field))
+        for field in node._fields if hasattr(node, field)
+    })
+    for key, value in vars(node).items():
+        if key not in node._fields:
+            setattr(copied, key, value)
+    return copied
 
 
 def _lower_python_scalar_intrinsics(graph: Any) -> None:
@@ -506,9 +531,9 @@ def _resolve_grounded_method_references(graph: Any) -> None:
             continue
         selector = next(iter(selectors))
         reference, receiver_id, method_name, receiver_expression = bound_selectors[selector]
-        rewritten = copy.deepcopy(expression)
+        rewritten = _syntax_copy(expression)
         rewritten.func = ast.copy_location(ast.Attribute(
-            value=copy.deepcopy(receiver_expression), attr=method_name, ctx=ast.Load()), expression.func)
+            value=_syntax_copy(receiver_expression), attr=method_name, ctx=ast.Load()), expression.func)
         data.setdefault("authored_expr_obj", expression)
         data["expr_obj"] = rewritten
         data["type"], data["op"] = "Call", "call"

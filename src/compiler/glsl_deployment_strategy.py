@@ -1687,15 +1687,35 @@ def _concord_call_argument_operands(
 _MUTABLE_RETURN_KINDS = frozenset({"list", "set", "dict", "bytearray"})
 
 
+def _born_in_callee_list(child_graph: Any, value_id: int) -> bool:
+    """A list this function creates (a display, a materialization or a
+    comprehension), not a parameter's or another object's storage."""
+
+    data = child_graph.nodes[value_id] if value_id in child_graph else {}
+    attributes = data.get("attributes") or {}
+    return (
+        attributes.get("aggregate_kind") == "list"
+        and attributes.get("binding_kind") != "parameter"
+        and (
+            attributes.get("producer_kind")
+            in {"aggregate", "sequence_materialization"}
+            or data.get("type") == "LoopResult"
+            or isinstance(data.get("expr_obj"), ast.ListComp)
+        )
+    )
+
+
 def _refuse_divergent_collection_returns(child_graph: Any) -> None:
     """Refuse a function whose return sites return different mutable
-    collections in one slot (see the receipt at its caller)."""
+    collections in one slot, unless each is a list born in the function
+    (see the receipt at its caller)."""
 
     sites = child_graph.graph.get("return_slot_values") or {}
     by_slot: dict[int, set[int]] = {}
     for values in sites.values():
         for slot, value_id in enumerate(values or ()):
-            by_slot.setdefault(slot, set()).add(int(value_id))
+            if value_id is not None:
+                by_slot.setdefault(slot, set()).add(int(value_id))
     for slot, value_ids in by_slot.items():
         if len(value_ids) < 2:
             continue
@@ -1705,14 +1725,23 @@ def _refuse_divergent_collection_returns(child_graph: Any) -> None:
             )
             for value_id in value_ids if value_id in child_graph
         }
-        if kinds & _MUTABLE_RETURN_KINDS:
-            raise ValueError(
-                f"function {child_graph.graph.get('function_name')!r} returns "
-                f"different collections in return slot {slot} "
-                f"(values {tuple(sorted(value_ids))}); a returned collection "
-                "is one storage and the variadic sequence return is not "
-                "lowered"
-            )
+        if not kinds & _MUTABLE_RETURN_KINDS:
+            continue
+        if all(
+            _born_in_callee_list(child_graph, value_id)
+            for value_id in value_ids
+        ):
+            # Each return edge copies its list into the one result list
+            # (``_copy_divergent_sequence_returns``); a list born here dies
+            # at the return, so the copy is unobservable.
+            continue
+        raise ValueError(
+            f"function {child_graph.graph.get('function_name')!r} returns "
+            f"different collections in return slot {slot} "
+            f"(values {tuple(sorted(value_ids))}); a returned collection "
+            "is one storage, and only lists born in the function are "
+            "copied into the one result"
+        )
 
 
 def _authored_output_paths(graph, outputs):
@@ -2871,6 +2900,20 @@ def _planned_scalar_dtypes_from(
             # as for a conditional expression.
             if isinstance(expression, ast.IfExp) or op == "phi":
                 arms = parents(data, "body", "orelse")
+                # Lane D, D2.  Program: ``if n > 0: d[4] = n * 3`` then
+                # ``d[3] = d[3] + 1`` (corpus c389).  A join of two versions
+                # of a collection is that collection: its rows are the join
+                # of its arms' rows.  Nobody read that, so every read of the
+                # joined table, and every store fed by one, took the
+                # float64 domain default.  An arm still unproven leaves the
+                # join unproven.
+                if arms and all(
+                    is_collection(o) or o in element for o in arms
+                ) and not any(o in scalar for o in arms):
+                    settle(element, node_id, join(
+                        [element.get(o) for o in arms]
+                    ))
+                    continue
                 settle(scalar, node_id, join([scalar.get(o) for o in arms]))
                 continue
             # Lane D, D2.  Program: ``if a > 0 and b < n: ...``, ``x = p or
@@ -3549,10 +3592,10 @@ def _build_shell_hierarchy_plan(
                 # two return sites return two different lists (two arenas),
                 # but the one output named only the last, so the caller
                 # read the empty list's storage on every path (silent).
-                # Rule: a returned mutable collection is one storage; return
-                # sites that return different collections have no one
-                # result arena, and that is refused by name until the
-                # variadic sequence-return lowering exists (lanes plan A6).
+                # Rule: a returned mutable collection is one storage.  Lists
+                # born in the callee are copied into the one result at
+                # their return sites (``_copy_divergent_sequence_returns``,
+                # lanes plan A6); any other mix is refused by name.
                 _refuse_divergent_collection_returns(child_graph)
                 child_output_paths = _authored_output_paths(
                     child.process_graph, child_outputs,

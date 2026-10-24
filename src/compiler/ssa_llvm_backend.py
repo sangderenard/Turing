@@ -506,6 +506,22 @@ def _host_target_lines() -> tuple[str, ...]:
     return lines
 
 
+def _module_target_lines(module: _IRModule) -> tuple[str, ...]:
+    """LLVM header owned by the module's verified build-target receipt."""
+
+    from .native_code_retention import build_target_from_metadata
+
+    target = build_target_from_metadata(module.metadata)
+    if target is None:
+        return _host_target_lines()
+    if target.llvm_triple is None:
+        return ()
+    # LLVM derives the target data layout from the named triple.  Do not copy
+    # a host layout into a cross-target module or maintain a second layout
+    # table beside the toolchain.
+    return (f'target triple = "{target.llvm_triple}"',)
+
+
 import re as _noalias_re
 
 _FORMAL_ACTUAL = _noalias_re.compile(r"^%(arg|out)\.(\d+)$")
@@ -4697,7 +4713,12 @@ def _emit_repository_call_module(
                     count = str(int(accounting["sequence_static_length"]))
                 elif static_shape and all(
                     isinstance(item, int) for item in static_shape
-                ) and accounting.get("program_abi_storage") != "sequence":
+                ) and accounting.get("program_abi_storage") != "sequence" and (
+                    # Program: ``ys = [5] * (n % 4); ys.append(n);
+                    # sum(ys)`` (c407, E22a).  A heap cell's (1,) shape is
+                    # the cell, not its rows; they are its live length.
+                    heap_layout is None
+                ):
                     # A span declared with a static shape has exactly that
                     # many elements (``y.max()`` over a (5,) span, as C
                     # reads it); a sequence's shape is its arena bound.
@@ -5406,7 +5427,7 @@ def _emit_repository_call_module(
     )
     llvm_ir = "\n\n".join(part for part in (
         f'source_filename = "turing.ssa-llvm.{entry_name}"',
-        "\n".join(_host_target_lines()),
+        "\n".join(_module_target_lines(module)),
         "\n".join(declarations[symbol] for symbol in sorted(declarations)),
         "\n\n".join(definitions[symbol] for symbol in sorted(definitions)),
         "\n\n".join(annotated_functions),
@@ -5558,6 +5579,9 @@ class LLVMFunctionArtifact:
     extent_order: tuple[tuple[int, str, int | None], ...]
     shortfalls: tuple[LLVMEmissionShortfall, ...]
     buffer_dtypes: tuple[str, ...] = ()
+    #: The registry-owned platform contract selected before lowering.  This
+    #: is not inferred from the emitted text when the object compiler runs.
+    build_target: _Any = None
     linked_objects: tuple[tuple[str, str], ...] = ()
     object_path: _Path | None = None
     needs_validation_runtime: bool = False
@@ -6555,6 +6579,8 @@ def emit_ssa_function_to_llvm(
     shipped artifact depends on this existing.
     """
 
+    from .native_code_retention import build_target_from_metadata
+    artifact_build_target = build_target_from_metadata(module.metadata)
     from .ssa_object_operations import validate_object_operations
     validate_object_operations(module, function_name)
     function = module.functions[function_name]
@@ -6580,6 +6606,7 @@ def emit_ssa_function_to_llvm(
             buffer_shapes=tuple(piece["buffer_shapes"]),
             buffer_dtypes=tuple(piece["buffer_dtypes"]),
             extent_order=tuple(piece["extent_order"]), shortfalls=(),
+            build_target=artifact_build_target,
             linked_objects=tuple(piece["linked_objects"]),
             needs_validation_runtime=bool(piece.get("needs_validation_runtime")))
 
@@ -6613,7 +6640,7 @@ def emit_ssa_function_to_llvm(
         or any(str(i.op) == "Alloca" or i.attributes.get("native_heap_abi")
                for b in module.functions[function_name].blocks.values() for i in b.instrs)
     ):
-        return _emit_repository_call_module(
+        artifact = _emit_repository_call_module(
             module,
             function_name,
             entry_name=entry_name or function_name,
@@ -6621,6 +6648,8 @@ def emit_ssa_function_to_llvm(
             watch=watch,
             history=history,
         )
+        artifact.build_target = artifact_build_target
+        return artifact
 
     function = module.functions[function_name]
     name = entry_name or function_name
@@ -7593,6 +7622,7 @@ def emit_ssa_function_to_llvm(
         )
     llvm_ir = "\n".join((
         f'source_filename = "turing.ssa-llvm.{name}"',
+        *_module_target_lines(module),
         *globals_out,
         *declarations,
         "",
@@ -7668,6 +7698,7 @@ def emit_ssa_function_to_llvm(
         buffer_dtypes=tuple(
             value_llvm_types.get(value_id, "double") for value_id in buffer_ids
         ),
+        build_target=artifact_build_target,
         needs_text_sink=publishes_text,
         output_publications=publications,
         output_surfaces=publication_surface_plan(publications, target="llvm"),
@@ -7718,7 +7749,20 @@ def compile_artifact(
     build_dir.mkdir(parents=True, exist_ok=True)
     source = build_dir / f"{artifact.name}.ll"
     source.write_text(artifact.llvm_ir, encoding="utf-8")
-    library = build_dir / f"{artifact.name}{'.obj' if _object_only else '.dll'}"
+    target = artifact.build_target
+    object_extension = (
+        ".o"
+        if target is not None and target.object_formats & {
+            "macho-object", "elf-object",
+        }
+        else ".obj"
+    )
+    if target is not None and target.operating_system == "ios" and not _object_only:
+        raise ValueError(
+            "ios-arm64 LLVM emission produces a Mach-O object here; final "
+            "linking and signing require the iPhoneOS SDK on an Xcode host"
+        )
+    library = build_dir / f"{artifact.name}{object_extension if _object_only else '.dll'}"
     # Same LLVM toolchain resolution the C backend uses: the ziglang package
     # bundles clang, invoked through the interpreter, no PATH assumptions.
     import importlib.util as _importlib_util
@@ -7746,13 +7790,58 @@ def compile_artifact(
         "cc", "-c" if _object_only else "-shared", optimization_flag,
         "-o", str(library), str(source),
     ]
+    if target is not None and (
+        target.toolchain_target is not None or target.llvm_triple is not None
+    ):
+        command[command.index("cc") + 1:command.index("cc") + 1] = [
+            "-target", target.toolchain_target or target.llvm_triple,
+        ]
+    if not _object_only and _sys.platform == "win32":
+        # The validation runtime deliberately exports its inspection API with
+        # __declspec(dllexport).  MinGW then stops auto-exporting the LLVM
+        # module's plain IR definitions, which left the descriptor-named row
+        # entry absent from otherwise valid Windows products.  A module-
+        # definition file makes the artifact's canonical entry identity an
+        # explicit input to the same link, independent of auto-export policy.
+        export_definition = build_dir / f"{artifact.name}.def"
+        export_definition.write_text(
+            f"EXPORTS\n    {artifact.name}\n", encoding="utf-8",
+        )
+        command.append(str(export_definition))
     if _fma_contract_enabled():
         # The module names no target, so contraction permission alone reaches
         # no FMA unit; name the host. Same switch as the `contract` flag.
         command.insert(command.index(optimization_flag) + 1, "-march=native")
     from .work_contract import active_contract as _active_work_contract
 
+    import platform as _platform
+    host_os = (
+        "windows" if _sys.platform == "win32"
+        else "macos" if _sys.platform == "darwin"
+        else "linux" if _sys.platform.startswith("linux")
+        else _sys.platform
+    )
+    host_architecture = {
+        "amd64": "amd64", "x86_64": "amd64",
+        "arm64": "arm64", "aarch64": "arm64",
+    }.get(_platform.machine().casefold(), _platform.machine().casefold())
+    cross_target = target is not None and (
+        target.operating_system.casefold() != host_os
+        or target.architecture.casefold() != host_architecture
+    )
     for extra_flag in _active_work_contract().compiler_flags:
+        if cross_target and str(extra_flag) == "-march=native":
+            # ``native`` names the build host, which is not the selected
+            # platform during a cross build.  The registered target triple is
+            # authoritative and its toolchain chooses that architecture's
+            # baseline CPU.  Other explicit -march/-mcpu values are refused
+            # below rather than silently rewritten.
+            continue
+        if cross_target and str(extra_flag).startswith(("-march=", "-mcpu=")):
+            raise ValueError(
+                f"compiler flag {extra_flag!r} conflicts with explicit "
+                f"build target {target.identity!r}"
+            )
         command.insert(command.index(optimization_flag) + 1, str(extra_flag))
     if not _object_only:
         import hashlib

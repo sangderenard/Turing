@@ -413,6 +413,21 @@ class X86InstructionToken(IntEnum):
     SBB_RM64_R64 = 317
     PXOR_XMM_XMMM128 = 318
     LEAVE = 319
+    NOP_RM_CS = 320
+    JMP_RM64_NOTRACK = 321
+    MOVQ_XMMM64_XMM = 322
+    CMOVL_R64_RM64 = 323
+    SBB_RM32_IMM8 = 324
+    SBB_RM64_IMM8 = 325
+    PSUBD_XMM_XMMM128 = 326
+    PADDD_XMM_XMMM128 = 327
+    SETGE_RM8 = 328
+    ADC_RM32_IMM8 = 329
+    ADC_RM64_IMM8 = 330
+    MOVSX_R16_RM8 = 331
+    PUSH_RM64 = 332
+    PUSH_IMM8 = 333
+    AND_RM8_R8 = 334
 
 
 class MachineSemanticToken(IntEnum):
@@ -500,6 +515,9 @@ class MachineSemanticToken(IntEnum):
     ATOMIC_INCREMENT = 79
     VECTOR_INSERT_128_LANE = 80
     STACK_FRAME_LEAVE = 81
+    VECTOR_ADD_DWORDS = 82
+    VECTOR_SUBTRACT_DWORDS = 83
+    INTEGER_ADD_WITH_CARRY = 84
 
 
 class X86Register(IntEnum):
@@ -1596,6 +1614,25 @@ def _decode_movsx_r32_rm8_operands(
     return (decoded.reg, source), decoded.next_offset
 
 
+def _decode_movsx_r16_rm8_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    _need(region, offset, 1, address)
+    modrm = int(region[offset])
+    decoded = _decode_modrm(region, offset, address, rex, register_width=16)
+    source: MachineOperand = decoded.rm
+    if isinstance(source, RegisterOperand):
+        if rex is None and (modrm & 0x7) >= 4:
+            raise VocabularyDecodeError(
+                f"{address:#x}: legacy high-byte source needs a distinct register token"
+            )
+        source = RegisterOperand(source.register, width=8)
+    return (decoded.reg, source), decoded.next_offset
+
+
 def _decode_movzx_r32_rm8_operands(
     region: memoryview,
     offset: int,
@@ -1752,6 +1789,34 @@ def _decode_cmp_rm16_imm8_operands(region, offset, address, rex):
     return _decode_group_rm_imm(
         region, offset, address, rex,
         extension=7, operand_width=16, immediate_width=1, signed=True,
+    )
+
+
+def _decode_adc_rm32_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=2, operand_width=32, immediate_width=1, signed=True,
+    )
+
+
+def _decode_adc_rm64_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=2, operand_width=64, immediate_width=1, signed=True,
+    )
+
+
+def _decode_sbb_rm32_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=3, operand_width=32, immediate_width=1, signed=True,
+    )
+
+
+def _decode_sbb_rm64_imm8_operands(region, offset, address, rex):
+    return _decode_group_rm_imm(
+        region, offset, address, rex,
+        extension=3, operand_width=64, immediate_width=1, signed=True,
     )
 
 
@@ -2384,6 +2449,18 @@ def _decode_dec_rm32_operands(region, offset, address, rex):
     return _decode_unary_group_rm(
         region, offset, address, rex, extension=1, operand_width=32,
     )
+
+
+def _decode_push_rm64_operands(region, offset, address, rex):
+    return _decode_unary_group_rm(
+        region, offset, address, rex, extension=6, operand_width=64,
+    )
+
+
+def _decode_push_imm8_operands(region, offset, address, rex):
+    # PUSH imm8 stores the byte sign-extended to the 64-bit stack slot.
+    _need(region, offset, 1, address)
+    return (ImmediateOperand(int(region[offset]), width=8, signed=True),), offset + 1
 
 
 def _decode_jmp_rm64_operands(region, offset, address, rex):
@@ -3808,6 +3885,97 @@ _X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
         X86InstructionToken.LEAVE, MachineSemanticToken.STACK_FRAME_LEAVE,
         b"\xc9", _decode_no_operands, allow_rex=False,
     ),
+    # Segment overrides GCC pads with.  In 64-bit mode CS and DS overrides
+    # do not change an address, so each form keeps its unprefixed meaning;
+    # 3E before an indirect jump is CET's NOTRACK mark.
+    InstructionSpec(
+        X86InstructionToken.NOP_RM_CS, MachineSemanticToken.NO_OPERATION,
+        b"\x0f\x1f", _decode_nop_rm_operands, modrm_extension=0, allow_rex=True,
+        allowed_legacy_prefixes=frozenset({0x66, 0x2e}),
+        required_legacy_prefixes=frozenset({0x2e}),
+    ),
+    InstructionSpec(
+        X86InstructionToken.JMP_RM64_NOTRACK, MachineSemanticToken.INDIRECT_JUMP,
+        b"\xff", _decode_jmp_rm64_operands, modrm_extension=4,
+        allow_rex=True, allow_rex_w=True,
+        allowed_legacy_prefixes=frozenset({0x3e}),
+        required_legacy_prefixes=frozenset({0x3e}),
+    ),
+    # The store direction of MOVQ: xmm/m64 := low qword of xmm.  The
+    # register form clears bits 64 through 127 of the destination.
+    InstructionSpec(
+        X86InstructionToken.MOVQ_XMMM64_XMM, MachineSemanticToken.VECTOR_MOVE,
+        b"\x0f\xd6", _decode_vector_rm_reg_operands, allow_rex=True,
+        allowed_legacy_prefixes=frozenset({0x66}),
+        required_legacy_prefixes=frozenset({0x66}),
+    ),
+    InstructionSpec(
+        X86InstructionToken.CMOVL_R64_RM64, MachineSemanticToken.CONDITIONAL_MOVE,
+        b"\x0f\x4c", _decode_binary_r64_rm64_operands,
+        allow_rex=True, allow_rex_w=True, require_rex_w=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.SBB_RM32_IMM8,
+        MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW,
+        b"\x83", _decode_sbb_rm32_imm8_operands, modrm_extension=3,
+        allow_rex=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.SBB_RM64_IMM8,
+        MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW,
+        b"\x83", _decode_sbb_rm64_imm8_operands, modrm_extension=3,
+        allow_rex=True, allow_rex_w=True, require_rex_w=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.PSUBD_XMM_XMMM128,
+        MachineSemanticToken.VECTOR_SUBTRACT_DWORDS,
+        b"\x0f\xfa", _decode_vector_reg_rm_operands, allow_rex=True,
+        allowed_legacy_prefixes=frozenset({0x66}),
+        required_legacy_prefixes=frozenset({0x66}),
+    ),
+    InstructionSpec(
+        X86InstructionToken.PADDD_XMM_XMMM128,
+        MachineSemanticToken.VECTOR_ADD_DWORDS,
+        b"\x0f\xfe", _decode_vector_reg_rm_operands, allow_rex=True,
+        allowed_legacy_prefixes=frozenset({0x66}),
+        required_legacy_prefixes=frozenset({0x66}),
+    ),
+    InstructionSpec(
+        X86InstructionToken.SETGE_RM8, MachineSemanticToken.CONDITIONAL_SET,
+        b"\x0f\x9d", _decode_sete_rm8_operands, modrm_extension=0,
+        allow_rex=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.ADC_RM32_IMM8,
+        MachineSemanticToken.INTEGER_ADD_WITH_CARRY,
+        b"\x83", _decode_adc_rm32_imm8_operands, modrm_extension=2,
+        allow_rex=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.ADC_RM64_IMM8,
+        MachineSemanticToken.INTEGER_ADD_WITH_CARRY,
+        b"\x83", _decode_adc_rm64_imm8_operands, modrm_extension=2,
+        allow_rex=True, allow_rex_w=True, require_rex_w=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.MOVSX_R16_RM8, MachineSemanticToken.SIGN_EXTEND,
+        b"\x0f\xbe", _decode_movsx_r16_rm8_operands, allow_rex=True,
+        allowed_legacy_prefixes=frozenset({0x66}),
+        required_legacy_prefixes=frozenset({0x66}),
+    ),
+    InstructionSpec(
+        X86InstructionToken.PUSH_RM64, MachineSemanticToken.STACK_PUSH,
+        b"\xff", _decode_push_rm64_operands, modrm_extension=6,
+        allow_rex=True, allow_rex_w=True,
+    ),
+    InstructionSpec(
+        X86InstructionToken.PUSH_IMM8, MachineSemanticToken.STACK_PUSH,
+        b"\x6a", _decode_push_imm8_operands, allow_rex=False,
+    ),
+    InstructionSpec(
+        X86InstructionToken.AND_RM8_R8, MachineSemanticToken.BITWISE_AND,
+        b"\x20", _decode_binary_rm8_r8_operands, allow_rex=True,
+    ),
     # CET's indirect-branch landing mark (F3 0F 1E FA), which GCC places at
     # every System V function entry and PLT stub.  It has no architectural
     # effect outside CET enforcement.  The whole ModRM byte is part of the
@@ -3880,6 +4048,7 @@ def _attach_reversible_layout(spec: InstructionSpec) -> InstructionSpec:
             "_decode_sete_rm8_operands",
             "_decode_call_rm64_operands",
             "_decode_jmp_rm64_operands",
+            "_decode_push_rm64_operands",
             "_decode_not_rm64_operands",
             "_decode_not_rm32_operands",
             "_decode_not_rm8_operands",
@@ -3982,6 +4151,7 @@ def _attach_reversible_layout(spec: InstructionSpec) -> InstructionSpec:
             "_decode_movsx_r64_rm16_operands",
             "_decode_movsx_r64_rm8_operands",
             "_decode_movsx_r32_rm8_operands",
+            "_decode_movsx_r16_rm8_operands",
             "_decode_vector_xmm_rm64_operands",
             "_decode_r64_xmm_rm64_operands",
             "_decode_r32_xmm_rm64_operands",

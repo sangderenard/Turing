@@ -1,0 +1,8 @@
+{
+  "name": "Turing Mobile Reference",
+  "short_name": "Turing",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#101827",
+  "theme_color": "#182438"
+}

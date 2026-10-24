@@ -71,8 +71,8 @@ def test_every_authoritative_token_legalizes_to_repository_ssa():
     # intentionally excluded from the legacy-prefix tensor write head until
     # that head carries explicit VEX fields.  ENDBR64 is excluded too: its
     # ModRM byte is part of the opcode, which a head row cannot pin.
-    assert len(profile.rows) == 314
-    assert len(X86InstructionToken) == 320
+    assert len(profile.rows) == 323 + 5
+    assert len(X86InstructionToken) == 335
     assert failures == []
 
 
@@ -517,6 +517,43 @@ def test_sar_imm8_and_jns_rel32_complete_decode_vm_and_ssa_path():
         for block in lifting.function.blocks.values()
         for item in block.instrs
     )
+
+
+@pytest.mark.parametrize(("encoded", "token", "source_width", "target_width"), (
+    (b"\x0f\xb7\x07\xc3", "MOVZX_R32_RM16", 16, 32),
+    (b"\x0f\xb6\x07\xc3", "MOVZX_R32_RM8", 8, 32),
+    (b"\x0f\xbf\x07\xc3", "MOVSX_R32_RM16", 16, 32),
+    (b"\x48\x0f\xbe\x07\xc3", "MOVSX_R64_RM8", 8, 64),
+    (b"\x48\x0f\xbf\x07\xc3", "MOVSX_R64_RM16", 16, 64),
+    (b"\x48\x63\x07\xc3", "MOVSXD_R64_RM32", 32, 64),
+    (b"\x66\x0f\xbe\x07\xc3", "MOVSX_R16_RM8", 8, 16),
+))
+def test_extension_from_memory_loads_the_source_width(
+    encoded, token, source_width, target_width,
+):
+    # The token name spells both widths; reading only the first made each
+    # of these load the destination width, taking the neighbouring bytes.
+    lifting = raise_binary_region_to_ssa(
+        encoded, maximum_file_size=len(encoded), size=len(encoded),
+        base_address=0x1000, name="extend_from_memory",
+        full_vocabulary_report=True,
+    )
+    assert lifting.failed_vocabulary == ()
+    assert lifting.decoded[0].token.name == token
+    instructions = [
+        item
+        for block in lifting.function.blocks.values()
+        for item in block.instrs
+        if item.attributes.get("machine_address") == 0x1000
+    ]
+    (load,) = [item for item in instructions if item.op == "Load"]
+    assert load.attributes["width"] == source_width
+    (extension,) = [
+        item for item in instructions
+        if item.op in {"ZExt", "SExt"} and item.args[0] is load.res
+    ]
+    assert extension.attributes["from_width"] == source_width
+    assert extension.attributes["to_width"] == target_width
 
 
 def test_movsx_r64_rm8_sib_decodes_executes_and_legalizes():
@@ -1883,6 +1920,23 @@ def test_comiss_lowers_encoded_binary32_ordered_comparison_and_flags():
     (b"\x48\x19\xf6\xc3", "SBB_RM64_R64", "Sub"),
     (b"\x66\x0f\xef\xc0\xc3", "PXOR_XMM_XMMM128", "Xor"),
     (b"\x55\x48\x89\xe5\xc9\xc3", "PUSH_R64", "Load"),
+    (b"\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00\xc3", "NOP_RM_CS", "Ret"),
+    (b"\x66\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00\xc3", "NOP_RM_CS", "Ret"),
+    (b"\x66\x0f\xd6\x45\xb8\xc3", "MOVQ_XMMM64_XMM", "Store"),
+    (b"\x66\x0f\xd6\xc8\xc3", "MOVQ_XMMM64_XMM", "And"),
+    (b"\x48\x0f\x4c\xc2\xc3", "CMOVL_R64_RM64", "Select"),
+    (b"\x83\xd8\xff\xc3", "SBB_RM32_IMM8", "Sub"),
+    (b"\x48\x83\xd8\xff\xc3", "SBB_RM64_IMM8", "Sub"),
+    (b"\x48\x83\x5d\xc8\xff\xc3", "SBB_RM64_IMM8", "Store"),
+    (b"\x66\x0f\xfa\xc7\xc3", "PSUBD_XMM_XMMM128", "VectorSubtractModulo"),
+    (b"\x66\x0f\xfe\xc1\xc3", "PADDD_XMM_XMMM128", "VectorAddModulo"),
+    (b"\x0f\x9d\xc0\xc3", "SETGE_RM8", "Select"),
+    (b"\x48\x83\xd6\x00\xc3", "ADC_RM64_IMM8", "Add"),
+    (b"\x83\xd2\x01\xc3", "ADC_RM32_IMM8", "Add"),
+    (b"\x66\x41\x0f\xbe\xcc\xc3", "MOVSX_R16_RM8", "SExt"),
+    (b"\xff\x75\xd8\x58\xc3", "PUSH_RM64", "Store"),
+    (b"\x6a\x00\x58\xc3", "PUSH_IMM8", "Store"),
+    (b"\x20\xc2\xc3", "AND_RM8_R8", "And"),
 ))
 def test_new_sre_frontier_families_lower_to_repository_ssa(
     encoded, token, required_op,

@@ -74,6 +74,7 @@ _BINARY_WRITE = frozenset({
     MachineSemanticToken.INTEGER_ADD,
     MachineSemanticToken.INTEGER_SUBTRACT,
     MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW,
+    MachineSemanticToken.INTEGER_ADD_WITH_CARRY,
     MachineSemanticToken.BITWISE_AND,
     MachineSemanticToken.BITWISE_OR,
     MachineSemanticToken.BITWISE_XOR,
@@ -210,7 +211,10 @@ def symbolic_effect_for_instruction(instruction) -> MachineSymbolicEffect:
         read(0)
         read(1)
         write(0)
-        if semantic is MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW:
+        if semantic in {
+            MachineSemanticToken.INTEGER_SUBTRACT_WITH_BORROW,
+            MachineSemanticToken.INTEGER_ADD_WITH_CARRY,
+        }:
             reads.append("flags")
     elif semantic in _BINARY_FLAGS_ONLY:
         read(0)
@@ -343,6 +347,8 @@ def symbolic_effect_for_instruction(instruction) -> MachineSymbolicEffect:
         MachineSemanticToken.VECTOR_ADD_QWORDS,
         MachineSemanticToken.VECTOR_COMPARE_EQUAL_QWORDS,
         MachineSemanticToken.VECTOR_SUBTRACT_QWORDS,
+        MachineSemanticToken.VECTOR_ADD_DWORDS,
+        MachineSemanticToken.VECTOR_SUBTRACT_DWORDS,
     }:
         read(0)
         read(1)

@@ -5012,6 +5012,9 @@ def _normalize_lexical_values(
     ] | None = None,
     class_field_classes: Mapping[tuple[str, str], str] | None = None,
     static_parameter_bindings: Mapping[str, Any] | None = None,
+    authored_definitions_by_name: Mapping[
+        str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]
+    ] | None = None,
 ) -> dict[int, tuple[str, ...]]:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -5021,6 +5024,15 @@ def _normalize_lexical_values(
     defining value; source-language ``Load`` and ``Store`` wrappers disappear.
     """
 
+    # The module a bare name in this definition resolves in first
+    # (``FunctionTable.lexical_reference``): ``re.compile``'s ``_compile``
+    # is ``re._compile``, never ``re._compiler._compile``.
+    statement_identity = getattr(statement, "_python_source_identity", None)
+    statement_module = (
+        str(statement_identity[0])
+        if isinstance(statement_identity, tuple) and len(statement_identity) == 2
+        else None
+    )
     graph = function_graph
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
@@ -5062,6 +5074,225 @@ def _normalize_lexical_values(
     #: at a loop, so the first pass over a body sees no cursor for a field
     #: the body itself rewrites later; that read is not the construction's.
     loop_body_field_writes: list[frozenset[tuple[str, str]]] = []
+    #: Local names passed (as an argument or a method receiver) to a call
+    #: that may store into them.  A record this function constructs has no
+    #: field storage the reducer reloads after such a call, so a later read
+    #: of its field is refused rather than answered from the cursor.
+    storing_call_receivers: set[str] = set()
+    #: The same names for each loop being reduced, innermost last: a call
+    #: later in the body stores before the next iteration's read.
+    loop_body_storing_receivers: list[frozenset[str]] = []
+    storing_definitions = dict(authored_definitions_by_name or {})
+    #: ``acc.add`` in ``acc.add(b)`` is a method lookup, not a field read.
+    method_lookup_ids = {
+        id(node.func) for node in ast.walk(statement)
+        if isinstance(node, ast.Call)
+    }
+    parameter_store_cache: dict[tuple[int, str], bool] = {}
+
+    def parameter_may_store(definition: Any, name: str) -> bool:
+        """Whether ``definition`` may store into its parameter ``name``.
+
+        Proven read-only only when every use is a loaded ``name.field``
+        operand, or ``name.method(...)`` of a read-only method of that name.
+        Anything else (a field or element store, the bare name escaping
+        into a call, a return or an assignment) may store."""
+
+        key = (id(definition), str(name))
+        if key in parameter_store_cache:
+            return parameter_store_cache[key]
+        parameter_store_cache[key] = False  # recursion: assume read-only
+        parents = {
+            id(child): node
+            for node in ast.walk(definition)
+            for child in ast.iter_child_nodes(node)
+        }
+        stores = False
+        for node in ast.walk(definition):
+            if not (isinstance(node, ast.Name) and node.id == name):
+                continue
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                stores = True
+                break
+            attribute = parents.get(id(node))
+            if not (
+                isinstance(attribute, ast.Attribute)
+                and attribute.value is node
+                and isinstance(attribute.ctx, ast.Load)
+            ):
+                stores = True
+                break
+            outer = parents.get(id(attribute))
+            if isinstance(outer, ast.Call) and outer.func is attribute:
+                if callee_may_store(attribute.attr, receiver=True):
+                    stores = True
+                    break
+                continue
+            if isinstance(outer, ast.Attribute) or (
+                isinstance(outer, ast.Subscript)
+                and not isinstance(outer.ctx, ast.Load)
+            ):
+                stores = True
+                break
+        parameter_store_cache[key] = stores
+        return stores
+
+    def callee_may_store(
+        callee: str, *, receiver: bool = False, position: int | None = None,
+        keyword: str | None = None,
+    ) -> bool:
+        """Whether every authored definition named ``callee`` may store
+        into the argument at ``position``/``keyword`` (its receiver when
+        ``receiver``).  An unknown callee may store."""
+
+        definitions = tuple(storing_definitions.get(str(callee), ()))
+        if not definitions:
+            return True
+        for definition in definitions:
+            arguments = (
+                *definition.args.posonlyargs, *definition.args.args,
+            )
+            if receiver:
+                index = 0
+            elif position is not None:
+                index = int(position) + (
+                    1 if str(callee) != "__init__"
+                    and arguments and arguments[0].arg in {"self"}
+                    else 0
+                )
+            else:
+                index = None
+            if index is not None:
+                if index >= len(arguments):
+                    return True
+                name = arguments[index].arg
+            else:
+                names = {
+                    argument.arg for argument in (
+                        *arguments, *definition.args.kwonlyargs,
+                    )
+                }
+                if keyword not in names:
+                    return True
+                name = str(keyword)
+            if parameter_may_store(definition, name):
+                return True
+        return False
+
+    def storing_call_names(node: ast.AST) -> set[str]:
+        """Names in ``node`` that a call may store into."""
+
+        names: set[str] = set()
+        for call in source_walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            if (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and callee_may_store(call.func.attr, receiver=True)
+            ):
+                names.add(str(call.func.value.id))
+            callee = (
+                call.func.id if isinstance(call.func, ast.Name)
+                else call.func.attr if isinstance(call.func, ast.Attribute)
+                else None
+            )
+            for index, argument in enumerate(call.args):
+                if isinstance(argument, ast.Name) and (
+                    callee is None
+                    or callee_may_store(callee, position=index)
+                ):
+                    names.add(str(argument.id))
+            for keyword in call.keywords:
+                if isinstance(keyword.value, ast.Name) and (
+                    callee is None or keyword.arg is None
+                    or callee_may_store(callee, keyword=keyword.arg)
+                ):
+                    names.add(str(keyword.value.id))
+        return names
+    #: Per loop being reduced, innermost last: ``(receiver, field) ->
+    #: (name, pre-loop value id)`` for the fields of locally constructed
+    #: records that the loop body writes.  At the loop exit each becomes a
+    #: carried binding ``name.field`` (initial, body-exit value), exactly as
+    #: a rebound name is carried.
+    loop_field_entry_values: list[dict[tuple[int, str], tuple[str, int]]] = []
+
+    def concord_carried_field_read(
+        expression: ast.Attribute, receiver: int, attribute_id: int,
+    ) -> None:
+        """A read of a loop-carried field names its binding ``name.field``
+        on its consumer edges, as a Name read does: the loop's header and
+        exit choose per read, and an unattributed read of the initial is
+        refused there."""
+
+        if not isinstance(expression.value, ast.Name):
+            return
+        key = (int(receiver), str(expression.attr))
+        cursor_cell = field_state_cursor.get(key)
+        state = field_state_at(cursor_cell)
+        carried = any(key in entries for entries in loop_field_entry_values) or (
+            isinstance(state, _FieldState)
+            and state.kind is _FieldStateKind.LOOP_EXIT
+        )
+        if not carried:
+            return
+        _concord_lexical_reads(
+            graph, ingestion_read_scope, int(attribute_id),
+            f"{expression.value.id}.{expression.attr}",
+            binding_cell=cursor_cell or current_name_binding_cell(
+                str(expression.value.id), int(receiver),
+            ),
+        )
+
+    def constructed_field_value(name: str, attr: str) -> int | None:
+        """The current value of field ``attr`` of the record ``name`` this
+        function constructed: the field-state cursor's value, else the
+        constructor argument that initialised it.  None when neither is
+        known (no constructor schema, a nested call)."""
+
+        receiver = environment.get(name)
+        if not isinstance(receiver, int) or receiver not in graph.G:
+            return None
+        receiver_data = graph.G.nodes[int(receiver)]
+        construction = receiver_data.get("expr_obj")
+        class_identity = (receiver_data.get("attributes") or {}).get("class_ref")
+        if not isinstance(construction, ast.Call) or class_identity is None:
+            return None
+        state = field_state_at(field_state_cursor.get((int(receiver), str(attr))))
+        if isinstance(state, _FieldState):
+            value = _cell_node_id(state.value)
+            return int(value) if value is not None and value in graph.G else None
+        if state is not None:
+            return None
+        records = dict(
+            (graph.G.graph.get("program_abi") or {}).get("records") or {}
+        )
+        matching = tuple(
+            record for record_name, record in records.items()
+            if str(record_name) == str(class_identity)
+            or str(record.get("identity") or record_name) == str(class_identity)
+            or str(record.get("identity") or record_name).endswith(
+                "." + str(class_identity)
+            )
+        )
+        if len(matching) != 1 or matching[0].get("constructor_complete") is False:
+            # A projection view is not a constructor schema: its field order
+            # is not the constructor's argument order (``self.b = a``).
+            return None
+        field_names = tuple(map(str, dict(matching[0].get("fields") or {})))
+        field_expression = next((
+            keyword.value for keyword in construction.keywords
+            if keyword.arg == attr
+        ), None)
+        if field_expression is None and attr in field_names:
+            position = field_names.index(attr)
+            if position < len(construction.args):
+                field_expression = construction.args[position]
+        if field_expression is None:
+            return None
+        value = resolve_expression(field_expression)
+        return int(value) if isinstance(value, int) and value in graph.G else None
+
     # The most recent node that mutated ``(receiver_node_id, attr)`` --
     # a whole-attribute ``SetAttr`` or an element-wise ``obj.field[i, j] =``
     # ``IndexedStore``.  A later bare read of the same field consults this so
@@ -8102,7 +8333,9 @@ def _normalize_lexical_values(
                 static_value = static_bindings.get(expression.id)
                 function_reference = (
                     (lexical_function_bindings or {}).get(expression.id)
-                    or function_table.lexical_reference(expression.id)
+                    or function_table.lexical_reference(
+                        expression.id, module=statement_module,
+                    )
                 )
                 if (
                     producer_id is None
@@ -8348,6 +8581,29 @@ def _normalize_lexical_values(
                 )
                 if (
                     isinstance(receiver_expression, ast.Call)
+                    and receiver_class is not None
+                    and isinstance(expression.value, ast.Name)
+                    and id(expression) not in method_lookup_ids
+                    and (
+                        str(expression.value.id) in storing_call_receivers
+                        or any(
+                            str(expression.value.id) in names
+                            for names in loop_body_storing_receivers
+                        )
+                    )
+                ):
+                    # ``acc.add(b); return acc.total`` (or a free function
+                    # storing into ``acc``) answered the construction's value:
+                    # the call's store into the record is not reloaded here.
+                    raise ValueError(
+                        "local record field read after a call that may store "
+                        f"into it has no reloaded value: "
+                        f"{expression.value.id}.{expression.attr} at line "
+                        f"{getattr(expression, 'lineno', '?')} "
+                        "(record_stored_by_call)"
+                    )
+                if (
+                    isinstance(receiver_expression, ast.Call)
                     and len(matching_records) == 1
                     and isinstance(constructed_state, _FieldState)
                     and constructed_state.kind in {
@@ -8364,6 +8620,9 @@ def _normalize_lexical_values(
                     # assigned field is read above.
                     current_value = _cell_node_id(constructed_state.value)
                     if current_value is not None and current_value in graph.G:
+                        concord_carried_field_read(
+                            expression, int(receiver), int(attribute_id),
+                        )
                         _redirect_value(
                             graph, int(attribute_id), int(current_value)
                         )
@@ -8373,7 +8632,11 @@ def _normalize_lexical_values(
                     and any(
                         (str(expression.value.id), str(expression.attr))
                         in writes
-                        for writes in loop_body_field_writes
+                        and (int(receiver), str(expression.attr))
+                        not in entries
+                        for writes, entries in zip(
+                            loop_body_field_writes, loop_field_entry_values,
+                        )
                     )
                 )
                 if (
@@ -8452,6 +8715,9 @@ def _normalize_lexical_values(
                                 post_callable_identity(
                                     int(field_value), int(function_ref),
                                 )
+                            concord_carried_field_read(
+                                expression, int(receiver), int(attribute_id),
+                            )
                             _redirect_value(
                                 graph, int(attribute_id), int(field_value)
                             )
@@ -13282,7 +13548,54 @@ def _normalize_lexical_values(
             })
         return id(dispatch)
 
+    def capture_loop_field_entries(body_statement: ast.stmt) -> None:
+        """Push the pre-loop value of every constructed-record field the
+        loop body writes (``loop_field_entry_values``).  A ``while``
+        pushes before its test, which is read every iteration."""
+
+        entry_values: dict[tuple[int, str], tuple[str, int]] = {}
+        for nested in body_statement.body:
+            for member in source_walk(nested):
+                for target in (
+                    member.targets if isinstance(member, ast.Assign)
+                    else (member.target,)
+                    if isinstance(member, (ast.AugAssign, ast.AnnAssign))
+                    else ()
+                ):
+                    if not (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                    ):
+                        continue
+                    receiver_id = environment.get(target.value.id)
+                    key = (receiver_id, str(target.attr))
+                    if not isinstance(receiver_id, int) or key in entry_values:
+                        continue
+                    value = constructed_field_value(
+                        str(target.value.id), str(target.attr),
+                    )
+                    if value is not None:
+                        entry_values[key] = (str(target.value.id), int(value))
+        loop_field_entry_values.append(entry_values)
+
     def reduce_statement(body_statement: ast.stmt) -> int | None:
+        # A simple statement's own reads may follow its storing call
+        # (``return acc.add(b) + acc.total``), so its names are marked
+        # first; a compound statement's after its nested statements ran.
+        if not isinstance(body_statement, (
+            ast.If, ast.For, ast.AsyncFor, ast.While, ast.With,
+            ast.AsyncWith, ast.Try, ast.Match,
+            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+        )) and not isinstance(body_statement, getattr(ast, "TryStar", ())):
+            storing_call_receivers.update(storing_call_names(body_statement))
+        result = reduce_statement_body(body_statement)
+        if not isinstance(body_statement, (
+            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+        )):
+            storing_call_receivers.update(storing_call_names(body_statement))
+        return result
+
+    def reduce_statement_body(body_statement: ast.stmt) -> int | None:
         if isinstance(body_statement, (ast.Nonlocal, ast.Global)):
             # Scope declarations affect name binding while parsing; they are
             # not runtime operations and must never reach an execution
@@ -13946,7 +14259,51 @@ def _normalize_lexical_values(
                 for field_key in tuple(dict.fromkeys(
                     (*body_field_cells, *else_field_cells)
                 )):
+                    carried_entry = next((
+                        entries[field_key]
+                        for entries in reversed(loop_field_entry_values)
+                        if field_key in entries
+                    ), None)
                     if field_key in before_field_cells:
+                        entered_cell = before_field_cells[field_key]
+                        entered = field_state_at(entered_cell)
+                        if not (
+                            carried_entry is not None
+                            and isinstance(entered, _FieldState)
+                            and entered.kind is not _FieldStateKind.OBSERVED
+                            and _cell_node_id(entered.value)
+                            == int(carried_entry[1])
+                        ):
+                            continue
+                        # The branch is entered with the field unchanged
+                        # since the loop began: a write BEFORE the loop.  Its
+                        # version is the pre-loop one, but inside the loop
+                        # the field is the carried value.  Re-enter as an
+                        # observation of that value (below), so the arm that
+                        # leaves it alone reads the loop's version.
+                        for arm_cells in (body_field_cells, else_field_cells):
+                            if arm_cells.get(field_key) in (None, entered_cell):
+                                arm_cells.pop(field_key, None)
+                        before_field_cells.pop(field_key)
+                    if carried_entry is not None:
+                        # Inside a loop that carries this field, the state
+                        # before the branch is the carried value, not a read
+                        # of the record's storage: field writes are versions,
+                        # and the storage still holds the construction.
+                        seeded_cell = post_field_state(
+                            field_key[0], field_key[1],
+                            _FieldStateKind.OBSERVED,
+                            int(carried_entry[1]), int(carried_entry[1]),
+                            sources=field_state_sources(
+                                field_key[0], field_key[1],
+                                node_identity_cell(graph, int(carried_entry[1])),
+                            ),
+                            stage=_REDUCER_FIELD_MERGE,
+                        )
+                        before_field_cells[field_key] = seeded_cell
+                        for arm_cells in (body_field_cells, else_field_cells):
+                            if arm_effect_cell(arm_cells, field_key) is None:
+                                arm_cells[field_key] = seeded_cell
                         continue
                     receiver_id, attribute_name = field_key
                     receiver_class = receiver_class_identity(receiver_id)
@@ -14161,6 +14518,43 @@ def _normalize_lexical_values(
                         ),
                         source=body_statement,
                     )
+                    carried_entry = next((
+                        entries[field_key]
+                        for entries in reversed(loop_field_entry_values)
+                        if field_key in entries
+                    ), None)
+                    if carried_entry is not None:
+                        # The arm that left a carried field alone reads its
+                        # carried version: name that binding on the Phi's
+                        # operand, as a Name read would, so the loop header
+                        # rebinds it.
+                        from ...compiler.concordance_declarations import (
+                            OPERAND_POSITION as _OPERAND_POSITION_STAGE,
+                        )
+
+                        carried_name = (
+                            f"{carried_entry[0]}.{attribute_name}"
+                        )
+                        for operand_value, operand_role, operand_cell in (
+                            (body_value, "body", body_cell),
+                            (else_value, "orelse", else_cell),
+                        ):
+                            if int(operand_value) != int(carried_entry[1]):
+                                continue
+                            current_identity_book().post(
+                                _LEXICAL_READ_BINDING,
+                                (
+                                    ingestion_read_scope,
+                                    int(merged_value), operand_role, 0,
+                                ),
+                                carried_name,
+                                stage=_OPERAND_POSITION_STAGE,
+                                provenance=_Derived(_source_cells((
+                                    operand_cell,
+                                    node_identity_cell(graph, int(merged_value)),
+                                ))),
+                                mode=_Mode.CONCORD,
+                            )
                     if merged_attributes.get("producer_kind") == (
                         "aggregate_phi"
                     ):
@@ -14325,6 +14719,8 @@ def _normalize_lexical_values(
                 reduce_statement(nested)
             return id(body_statement)
         if isinstance(body_statement, (ast.For, ast.While)):
+            if isinstance(body_statement, ast.While):
+                capture_loop_field_entries(body_statement)
             # A discarded bound-method result is an effectful body statement
             # unless a later lowering proves otherwise.  Record the actual
             # statement calls here; loop composition must not rediscover
@@ -14640,6 +15036,8 @@ def _normalize_lexical_values(
                 # body updates such as ``data = data[0] if data else []``.
                 before_loop = dict(environment)
             before_loop_field_cells = dict(field_state_cursor)
+            if not isinstance(body_statement, ast.While):
+                capture_loop_field_entries(body_statement)
             loop_body_field_writes.append(frozenset(
                 (str(target.value.id), str(target.attr))
                 for nested in body_statement.body
@@ -14653,11 +15051,18 @@ def _normalize_lexical_values(
                 if isinstance(target, ast.Attribute)
                 and isinstance(target.value, ast.Name)
             ))
+            loop_body_storing_receivers.append(frozenset(
+                name
+                for nested in body_statement.body
+                for name in storing_call_names(nested)
+            ))
             try:
                 for nested in body_statement.body:
                     reduce_statement(nested)
             finally:
                 loop_body_field_writes.pop()
+                loop_body_storing_receivers.pop()
+                carried_field_entries = loop_field_entry_values.pop()
             for nested in body_statement.orelse:
                 reduce_statement(nested)
             loop_id = id(body_statement)
@@ -14670,9 +15075,45 @@ def _normalize_lexical_values(
             loop_cell = (
                 node_identity_cell(graph, loop_id) if loop_id in graph.G else None
             )
+            carried_fields: dict[str, tuple[int, int]] = {}
             for field_key, exit_cell in tuple(field_state_cursor.items()):
                 entry_cell = before_loop_field_cells.get(field_key)
                 if entry_cell == exit_cell:
+                    continue
+                exit_state = field_state_at(exit_cell)
+                entry = carried_field_entries.get(field_key)
+                exit_value = (
+                    _cell_node_id(exit_state.value)
+                    if isinstance(exit_state, _FieldState) else None
+                )
+                if (
+                    entry is not None
+                    and exit_value is not None
+                    and exit_value in graph.G
+                    and loop_id in graph.G
+                    and int(exit_value) != int(entry[1])
+                ):
+                    # The pre-loop and body-exit versions of a constructed
+                    # record's field are a carried pair, like a rebound
+                    # name: the loop's realization gives the header and exit
+                    # their phi/port.  The post-loop state is LOOP_EXIT at
+                    # the body-exit value, which that port continues.
+                    binding = f"{entry[0]}.{field_key[1]}"
+                    carried_fields[binding] = (int(entry[1]), int(exit_value))
+                    read_cells = tuple(dict.fromkeys(
+                        cell for cell in (entry_cell, exit_cell, loop_cell)
+                        if cell is not None
+                    ))
+                    field_state_cursor[field_key] = field_state_book.post(
+                        _REDUCER_FIELD_STATE, field_state_row(*field_key),
+                        _FieldState(
+                            _FieldStateKind.LOOP_EXIT,
+                            node_identity_cell(graph, int(exit_value)),
+                            node_identity_cell(graph, int(loop_id)),
+                        ),
+                        stage=_REDUCER_FIELD_MERGE,
+                        provenance=_Derived(read_cells), mode=_Mode.REVISE,
+                    )
                     continue
                 # Normalizing ``field[i] = value`` retires the Assign
                 # wrapper that the original For body edge named. The field
@@ -14930,6 +15371,8 @@ def _normalize_lexical_values(
                         loop_carried_bindings[name] = (
                             int(initial), next(iter(continuation_values)),
                         )
+                for binding, pair in carried_fields.items():
+                    loop_carried_bindings.setdefault(binding, pair)
                 loop_attributes["loop_carried_bindings"] = (
                     loop_carried_bindings
                 )
@@ -17059,6 +17502,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 elif isinstance(member, ast.ClassDef):
                     self.visit_ClassDef(member)
             return None
+
+    authored_definitions_by_name: dict[str, tuple[Any, ...]] = {}
+    for definition in function_definitions.values():
+        if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            authored_definitions_by_name[str(definition.name)] = (
+                *authored_definitions_by_name.get(str(definition.name), ()),
+                definition,
+            )
 
     for owner_id, definition in compile_iter(function_definitions.items(),
             "lexical-owners", label="Lexical function owners indexed"):
@@ -23030,6 +23481,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             class_field_storage_contracts=class_field_storage_contracts,
             class_field_classes=class_field_classes,
             static_parameter_bindings=static_parameter_bindings,
+            authored_definitions_by_name=authored_definitions_by_name,
         )
         lexical_free_names_by_function.update(nested_lexical_free_names)
         generator_yields = tuple(

@@ -11570,6 +11570,10 @@ def _sequence_value_kinds(
 
 
 #: Aggregate kinds whose truthiness is "has members" (``if r:``).
+# A mutable collection is one storage wherever it is returned (the planner's
+# rule 3): its output is the collection itself, never its member leaves.
+_MUTABLE_AGGREGATE_KINDS = frozenset({"list", "set", "dict", "bytearray"})
+
 _TRUTHINESS_AGGREGATE_KINDS = frozenset({
     "list", "set", "frozenset", "dict", "tuple", "bytes", "bytearray", "str",
 })
@@ -12858,17 +12862,9 @@ def _control_block_position(
         # the call's start, before the region computing its key ``i % 3``
         # (scratch c202: the lookup read the key before its definition).
         # It completes where its call ends.
-        position = node_position(int(block.source_call_node_id))
-        call = (graph_obj.nodes.get(int(block.source_call_node_id)) or {}).get(
-            "expr_obj"
-        ) if int(block.source_call_node_id) in graph_obj else None
-        if getattr(call, "end_lineno", None) is None:
-            return position
-        return max(position, (
-            int(call.end_lineno),
-            int(getattr(call, "end_col_offset", 0) or 0),
-            int(block.source_call_node_id),
-        ))
+        return _call_completion_position(
+            graph_obj, int(block.source_call_node_id), node_position,
+        )
     if isinstance(block, ResourceScopeBlock):
         return node_position(block.source_scope_id)
     if isinstance(block, (ExternalReferenceCallBlock, DispatchBlock)):
@@ -12881,7 +12877,13 @@ def _control_block_position(
                 (1 << 30, 0, 0),
             )
         if line.startswith("__plan_callsite_") and line.endswith("__"):
-            return node_position(int(line[len("__plan_callsite_"):-2]))
+            # A call executes after its arguments, like a query: placed at the
+            # call's start, ``bump({0: 1, 1: 3}, n)`` ran before the member
+            # stores of the dict display it was passed, and the callee's
+            # required-key lookup refused at run time.
+            return _call_completion_position(
+                graph_obj, int(line[len("__plan_callsite_"):-2]), node_position,
+            )
     if isinstance(block, ConditionalBlock) and block.source_node_id is not None:
         return _conditional_block_position(graph_obj, int(block.source_node_id))
     if isinstance(block, LoopControlBlock) and block.site_node_id is not None:
@@ -12898,6 +12900,24 @@ def _control_block_position(
             for child in block.blocks
         )
     return (1 << 30, 0, 0)
+
+
+def _call_completion_position(
+    graph_obj: Any, call_id: int, node_position: Any,
+) -> tuple[int, int, int]:
+    """Authored position at which a call completes: where its call ends."""
+
+    position = node_position(int(call_id))
+    call = (graph_obj.nodes.get(int(call_id)) or {}).get(
+        "expr_obj"
+    ) if int(call_id) in graph_obj else None
+    if getattr(call, "end_lineno", None) is None:
+        return position
+    return max(position, (
+        int(call.end_lineno),
+        int(getattr(call, "end_col_offset", 0) or 0),
+        int(call_id),
+    ))
 
 
 def _loop_block_position(graph_obj: Any, node_id: int) -> tuple[int, int, int]:
@@ -20682,6 +20702,24 @@ def _settle_linked_dynamic_sequences(
             (id(graph_obj), value_id)
             for value_id in local_lists & output_ids
         )
+        # Program: ``if n > 2: return [n]`` / ``return []`` (lanes plan A6).
+        # Wrong record: the result list (the ``[]``) was FIXED at its own
+        # zero rows, so the return edge's copy of ``[n]`` into it reported
+        # full and the caller read an empty list.  Rule: a list one return
+        # site returns while another site returns a different list is
+        # filled at run time from whichever site returned; it is DYNAMIC.
+        returned_by_slot: dict[int, set[int]] = {}
+        for site_values in (graph_obj.graph.get("return_slot_values") or {}).values():
+            for slot, value_id in enumerate(site_values or ()):
+                if value_id is not None:
+                    returned_by_slot.setdefault(slot, set()).add(int(value_id))
+        seeds.update(
+            (id(graph_obj), value_id)
+            for value_ids in returned_by_slot.values() if len(value_ids) > 1
+            for value_id in value_ids
+            if (graph_obj.nodes.get(value_id, {}).get("attributes") or {})
+            .get("aggregate_kind") == "list"
+        )
         for mutation in _sequence_append_call_mutations(graph_obj):
             if mutation.operator == "clear":
                 continue
@@ -20778,6 +20816,7 @@ def _class_surface_ssa_program(
     tensor_ssa_reference: Any = None,
     progress: Callable[[str], None] | None = None,
     release_dispatch_regions: bool = False,
+    build_target: Any = None,
 ):
     """Lower every planned method of a whole object to one reusable SSA unit.
 
@@ -20798,6 +20837,14 @@ def _class_surface_ssa_program(
     This boundary deliberately precedes Fortran emission so the fully lowered
     whole-object SSA can be inspected and verified before target emission.
     """
+
+    from .native_code_retention import (
+        WINDOWS_AMD64_NATIVE_LINKER,
+        resolve_build_target,
+    )
+    resolved_build_target = resolve_build_target(
+        build_target or WINDOWS_AMD64_NATIVE_LINKER
+    )
 
     from ..transmogrifier.ssa import (
         IRModule, SSAMachineControlTable, SSAMachineIndirectTable,
@@ -24398,15 +24445,12 @@ def _class_surface_ssa_program(
             host_native_module = entry.metadata.get("host_native_module")
             host_root_function = all_functions.get(str(host_root))
             if host_root_function is not None:
-                from .native_code_retention import (
-                    WINDOWS_AMD64_NATIVE_LINKER,
-                    select_host_implementation,
-                )
+                from .native_code_retention import select_host_implementation
                 implementation_decision = select_host_implementation(
                     repository_ssa_complete=host_repository_ssa_complete,
                     machine_state_ssa_complete=host_machine_state_complete,
                     retained_native_module=host_native_module,
-                    target=WINDOWS_AMD64_NATIVE_LINKER,
+                    target=resolved_build_target,
                 )
                 host_root_function.metadata.update({
                     "host_ssa_complete": (
@@ -26356,6 +26400,8 @@ def _class_surface_ssa_program(
                 if (
                     node_attributes.get("producer_kind") == "aggregate"
                     and members
+                    and node_attributes.get("aggregate_kind")
+                    not in _MUTABLE_AGGREGATE_KINDS
                 ):
                     return tuple(
                         leaf
@@ -26367,6 +26413,8 @@ def _class_surface_ssa_program(
             aggregate_root = bool(
                 root_attributes.get("producer_kind") == "aggregate"
                 and root_attributes.get("aggregate_leaf_value_ids")
+                and root_attributes.get("aggregate_kind")
+                not in _MUTABLE_AGGREGATE_KINDS
             )
             if aggregate_root:
                 required_root_output_value_ids.extend(
@@ -27784,6 +27832,39 @@ def _class_surface_ssa_program(
                 ):
                     dynamic_sequence_ids.add(destination_id)
                     grown = True
+        # Program: ``if n < 0: return []`` then a loop-built ``return out``
+        # (A6 probe c996).  Wrong record: the ``[]`` (a folded constant, no
+        # authored bound) was an output-history member, so it stayed
+        # caller-provided FIXED storage with no capacity and the wrapper
+        # refused it.  Rule: a list one return site returns while the
+        # output is another list is copied into the output at that site
+        # (``_copy_divergent_sequence_returns``); it is this function's
+        # private list, DYNAMIC unless a bound covers it.
+        returned_by_slot: dict[int, set[int]] = {}
+        for site_values in (graph_obj.graph.get("return_slot_values") or {}).values():
+            for slot, value_id in enumerate(site_values or ()):
+                if value_id is not None:
+                    returned_by_slot.setdefault(slot, set()).add(int(value_id))
+        final_output_ids = {
+            int(history[-1])
+            for name in tuple(graph_obj.graph.get("function_outputs") or ())
+            for history in (tuple(
+                (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
+            ),)
+            if history
+        }
+        dynamic_sequence_ids = {
+            *dynamic_sequence_ids,
+            *(
+                value_id
+                for value_ids in returned_by_slot.values() if len(value_ids) > 1
+                for value_id in value_ids
+                if value_id not in final_output_ids
+                and value_id not in sequence_capacity_bounds
+                and (graph_obj.nodes.get(value_id, {}).get("attributes") or {})
+                .get("aggregate_kind") == "list"
+            ),
+        }
         dynamic_sequence_ids = tuple(sorted(dynamic_sequence_ids))
         from types import SimpleNamespace as _GraphView
         from .glsl_deployment_strategy import _planned_scalar_dtypes
@@ -29069,6 +29150,22 @@ def _class_surface_ssa_program(
 
     abi_records = dict(program_abi.get("records") or {})
 
+    def authored_constructor_method(candidates: Iterable[Any]) -> Any:
+        for definition in getattr(class_table, "classes", ()) or ():
+            identity = str(definition.identity)
+            if not any(
+                identity in {str(candidate)}
+                or identity.rsplit(".", 1)[-1] == str(candidate)
+                for candidate in candidates
+            ):
+                continue
+            return next((
+                method for method in definition.methods
+                if method.name in {"__new__", "__init__"}
+                and method.function_name is not None
+            ), None)
+        return None
+
     def abi_record_for_call(data: Mapping[str, Any]):
         if str(data.get("type") or data.get("op") or "").casefold() != "call":
             return None
@@ -29084,6 +29181,17 @@ def _class_surface_ssa_program(
                 or identity.endswith("." + str(candidate))
                 for candidate in candidates
             ):
+                if (
+                    record.get("constructor_complete") is False
+                    and authored_constructor_method(candidates) is not None
+                ):
+                    # An ordinary class's projection view (fields its
+                    # ``__init__`` assigns) is not a constructor schema.  Its
+                    # construction is the ``__init__`` call, linked into the
+                    # caller's frame below ("materialize class constructors
+                    # and fields"); claiming it here as a record literal
+                    # refused every such program.
+                    return None
                 if record.get("constructor_complete") is False:
                     from .identity_concordance import ConcordanceRefusal
 
@@ -41400,6 +41508,27 @@ def _class_surface_ssa_program(
                 if len(templates) != 1:
                     continue
                 template = templates[0]
+                # The object is the constructor's receiver record.  A field of
+                # the class layout absent from it (``self.m = n * 3``: no
+                # field receipt, so no record view slot) is computed by
+                # ``__init__`` and stored nowhere; reads of it then took
+                # whatever the frame held.  Refuse by name instead.
+                unslotted_fields = tuple(
+                    str(field.name) for field in class_definition.fields
+                    if str(field.name) not in {
+                        str(member.name) for member in template.fields
+                    }
+                )
+                if unslotted_fields:
+                    from .identity_concordance import ConcordanceRefusal
+
+                    raise ConcordanceRefusal(
+                        "class construction has no physical field for "
+                        "attributes of its layout: "
+                        f"class={str(class_definition.identity)!r}, "
+                        f"fields={unslotted_fields!r}, record view="
+                        f"{tuple(str(member.name) for member in template.fields)!r}"
+                    )
                 constructor_records_by_id = {
                     int(record.record_id): record
                     for record in constructor_table.records.values()
@@ -41633,6 +41762,36 @@ def _class_surface_ssa_program(
                         "record_instance": str(class_identity),
                         "constructor_callsite_id": int(node_id),
                     })
+                    # A bound caller id (the receiver, when the constructor's
+                    # ``self`` is its field slot) already has a caller row,
+                    # minted untyped for the call.  The frame slot it now is
+                    # carries the constructor value's posted type; a
+                    # resident-only dtype left the row unresolved, and result
+                    # settlement refused it.
+                    from .ssa_record_return_state import publish_ssa_value_type
+                    from .structural_concordance import function_value_structure
+
+                    slot_structure, slot_cell = function_value_structure(
+                        constructor, old_id,
+                    )
+                    caller_cell = _frame_value_cell(caller, new_id)
+                    if (
+                        caller_cell is not None
+                        and slot_structure.dtype not in (None, "", "unknown")
+                        and function_value_structure(caller, new_id)[0].dtype
+                        in (None, "", "unknown")
+                    ):
+                        publish_ssa_value_type(
+                            caller, value, dtype=slot_structure.dtype,
+                            shape=slot_structure.shape,
+                            sources=_frame_cells(
+                                slot_cell, caller_cell,
+                                _frame_value_cell(constructor, old_id),
+                                *_frame_call_cells(caller_graph, int(node_id)),
+                            ),
+                            stage=FRAME_LINK,
+                            physical=_frame_physical_fields(constructor, old_id),
+                        )
                     caller.args.append(value)
                     available[new_id] = value
                     new_arguments.append(value)
@@ -41721,7 +41880,25 @@ def _class_surface_ssa_program(
                         str(record_template.identity),
                         tuple(mapped_fields),
                     )
-                    caller_records.register(mapped_record)
+                    # The caller's copy of a constructor-owned record stands
+                    # on the constructor's descriptor and the call; a bare
+                    # register posted no cell, so the next revision of the
+                    # row had no incumbent.
+                    from .concordance_declarations import RECORD_DESCRIPTOR
+
+                    caller_records.register(
+                        mapped_record,
+                        sources=_frame_cells(
+                            _frame_table_cell(
+                                constructor_table,
+                                int(record_template.record_id),
+                                RECORD_DESCRIPTOR,
+                                function=constructor,
+                            ),
+                            *_frame_call_cells(caller_graph, int(node_id)),
+                        ),
+                        stage=FRAME_LINK,
+                    )
                     mapped_records[int(record_template.record_id)] = mapped_record
                 mapped_fields = list(
                     mapped_records[int(template.record_id)].fields
@@ -43962,15 +44139,28 @@ def _class_surface_ssa_program(
             if int(candidate.callsite_id) == int(record.callsite_id)
             and candidate.callee_symbol == record.callee_symbol
         ), None)
+        # The merged row stands on the constructor call's own cells and the
+        # row it revises; a bare list write posted none and was refused.
+        constructor_call_cells = _frame_cells(
+            current_identity_book().latest_ref(
+                CALL_RECORD, (call_records.owner, str(record.caller)),
+            ),
+            *_frame_call_cells(
+                source_graphs_by_symbol.get(str(record.caller)),
+                record.callsite_id,
+            ),
+        )
         if duplicate_index is None:
-            existing.append(record)
+            existing.append(
+                record, sources=constructor_call_cells, stage=FRAME_LINK,
+            )
         else:
             candidate = existing[duplicate_index]
             # The hierarchy-owned constructor occurrence supplies lexical loop
             # ownership and explicit self/argument bindings; the record-ABI
             # occurrence supplies the complete caller-storage frame.  Merge
             # those two views into one execution record.
-            existing[duplicate_index] = replace(
+            existing.replace(duplicate_index, replace(
                 record,
                 argument_bindings=(
                     candidate.argument_bindings or record.argument_bindings
@@ -43981,7 +44171,7 @@ def _class_surface_ssa_program(
                 enclosing_loop_ids=(
                     candidate.enclosing_loop_ids or record.enclosing_loop_ids
                 ),
-            )
+            ), sources=constructor_call_cells, stage=FRAME_LINK)
         call_anchor_value_ids[(record.caller, record.callsite_id)] = (
             constructor_anchors.get((record.caller, record.callsite_id))
         )
@@ -56895,6 +57085,9 @@ def _class_surface_ssa_program(
         f"complete; functions={len(lowered_module.functions)} "
         f"exports={len(export_symbols)}"
     )
+    lowered_module.metadata["build_target"] = (
+        resolved_build_target.to_mapping()
+    )
 
     return (
         lowered_module,
@@ -56911,6 +57104,7 @@ def lower_class_surface_to_ssa(
     artifact_name: str,
     *,
     tensor_ssa_reference: Any = None,
+    build_target: Any = None,
 ):
     """Public target-neutral entry to the repository whole-object lowering.
 
@@ -56926,6 +57120,7 @@ def lower_class_surface_to_ssa(
         compilation,
         artifact_name,
         tensor_ssa_reference=tensor_ssa_reference,
+        build_target=build_target,
     )
 
 
@@ -57045,6 +57240,7 @@ def _lower_resolved_process_graph_deployment(
     allow_authored_source_callees: bool = False,
     assignment_normalization: Iterable[Any] = (),
     progress: Callable[[str], None] | None = None,
+    build_target: Any = None,
 ):
     """Lower an already reduced ProcessGraph through the canonical backend path.
 
@@ -57328,6 +57524,7 @@ def _lower_resolved_process_graph_deployment(
         # This function owns ``deployment`` and reads nothing of it after the
         # lowering returns.
         release_dispatch_regions=True,
+        build_target=build_target,
     )
     stage_boundary("ssa-source: repository SSA lowered")
     if linked_source_region_ssa:
@@ -57569,6 +57766,7 @@ def _lower_ast_source_to_ssa_impl(
     stop_after_compilation_unit_plan: bool = False,
     retain_linked_piece_bodies: bool = True,
     native_object_context: Any = None,
+    build_target: Any = None,
 ):
     """Ingest one complete authored program and lower it directly to SSA.
 
@@ -57585,6 +57783,17 @@ def _lower_ast_source_to_ssa_impl(
 
     from .compiler_bootstrap_runtime import (
         activate_registered_compiler_bootstraps,
+    )
+    from .native_code_retention import (
+        WINDOWS_AMD64_NATIVE_LINKER,
+        resolve_build_target,
+    )
+
+    # Resolve the platform contract before source ingestion.  Every later
+    # backend/decompiler decision receives this same record; no pass is
+    # allowed to reinterpret a target-name string independently.
+    build_target = resolve_build_target(
+        build_target or WINDOWS_AMD64_NATIVE_LINKER
     )
 
     compile_substage("source normalisation: activate accepted compiler versions")
@@ -59989,6 +60198,7 @@ def _lower_ast_source_to_ssa_impl(
         linked_source_region_ssa=linked_source_region_ssa,
         assignment_normalization=assignment_receipts,
         progress=progress,
+        build_target=build_target,
     )
     # Deployment stamps the exact shape/copy scope onto each retained source
     # graph.  Index those identities only after that writer has run; an index

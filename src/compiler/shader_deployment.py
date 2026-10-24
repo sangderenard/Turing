@@ -38,6 +38,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 from .compiled_program_api import CompiledProgramAPI, EntryPoint
@@ -140,6 +141,8 @@ class PhysicalResource:
     extensions: tuple[str, ...] = ()
     capabilities: tuple[str, ...] = ()
     specialization_constants: tuple[Mapping[str, Any], ...] = ()
+    #: The declared members of a block resource, in declaration order.
+    members: tuple[Mapping[str, Any], ...] = ()
 
     def to_mapping(self) -> dict[str, Any]:
         mapping: dict[str, Any] = {
@@ -162,6 +165,8 @@ class PhysicalResource:
             mapping["location"] = self.location
         if self.uniform is not None:
             mapping["uniform"] = self.uniform
+        if self.members:
+            mapping["members"] = _plain(self.members)
         return mapping
 
 
@@ -432,6 +437,146 @@ def glsl_compute_deployment(component: Any) -> ShaderDeployment:
     )
 
 
+def precision_compute_deployment(artifact: Any) -> ShaderDeployment:
+    """The SSBO launch contract of a precision-core compute shader.
+
+    ``ssa_glsl_compute_backend`` binds the array formals at bindings
+    ``0..n-1`` (``Buffer<slot> { double data[]; }``, ``readonly`` unless
+    stored into) and the scalars block at binding ``n``: ``uint
+    element_count`` at byte 0 and padding at byte 4, then ``double
+    scalars[]`` at byte 8, or ``scalars[]`` at byte 0 when the count is
+    baked. Invocation ``gl_GlobalInvocationID.x`` is element ``i``; nothing
+    reads y or z. The array extents are the host's (``prepare_execution``
+    sizes each buffer from its feed), so each is runtime-sized.
+    """
+
+    abi = artifact.component_abi
+    version, profile = glsl_version_directive(artifact.source)
+    extensions = tuple(re.findall(
+        r"^[ \t]*#[ \t]*extension[ \t]+(\w+)", artifact.source, re.M,
+    ))
+    by_value = {int(port.value_id): port for port in abi.ports}
+    written = {int(value_id) for value_id in artifact.written_buffers}
+    resources = [
+        PhysicalResource(
+            name=f"Buffer{slot}", kind="storage-buffer",
+            access="read_write" if int(value_id) in written else "read",
+            layout="std430", dtype="f64", element_bytes=8,
+            set=0, binding=slot,
+            realizes=(PortView(
+                by_value[int(value_id)].slot, 0, None, 1, None,
+                extents_from="fed", value_id=int(value_id),
+            ),),
+            extensions=extensions, capabilities=("Float64",),
+        )
+        for slot, value_id in enumerate(artifact.buffer_order)
+    ]
+    baked = artifact.baked_count
+    header = 0 if baked is not None else 8
+    coefficients = artifact.coefficient_order
+    scalar_binding = len(artifact.buffer_order)
+    members = (
+        () if baked is not None else (
+            {"name": "element_count", "glsl_type": "uint", "dtype": "u32",
+             "array": None, "byte_offset": 0},
+            {"name": "_pad0", "glsl_type": "uint", "dtype": "u32",
+             "array": None, "byte_offset": 4},
+        )
+    ) + ({"name": "scalars", "glsl_type": "double", "dtype": "f64",
+          "array": [None], "byte_offset": header},)
+    resources.append(PhysicalResource(
+        name="ScalarFeed", kind="storage-buffer", access="read",
+        layout="std430", dtype="f64", element_bytes=8,
+        set=0, binding=scalar_binding,
+        byte_extent=header + 8 * max(1, len(coefficients)),
+        realizes=tuple(
+            PortView(
+                by_value[int(value_id)].slot, header + 8 * index, 8, 0, (),
+                value_id=int(value_id),
+            )
+            for index, value_id in enumerate(coefficients)
+        ),
+        extensions=extensions, capabilities=("Float64",),
+        members=members,
+    ))
+    local = (int(artifact.local_size), 1, 1)
+    if baked is None:
+        controls = (LaunchControl(
+            "element_count", "storage-buffer", "u32",
+            ({"rule": "element_count", "value_id": int(artifact.scalar_order[0])},),
+            binding=scalar_binding, byte_offset=0,
+        ),)
+        group_count = {
+            "rule": "cover",
+            "work": "element_count",
+            "invocations_per_group": local[0],
+            "minimum_groups": "ceil(element_count / invocations_per_group)",
+            "linearization": "gl_GlobalInvocationID.x only; y and z groups must be 1",
+            "guard": "element_count",
+            "groups": None,
+        }
+        element_count = {
+            "source": "control", "control": "element_count",
+            "kind": "element_count", "rank": 1, "shape": None, "value": None,
+        }
+    else:
+        controls = ()
+        group_count = {
+            "rule": "exact",
+            "groups": [max(1, -(-int(baked) // local[0])), 1, 1],
+        }
+        element_count = {
+            "source": "baked", "kind": "element_count",
+            "rank": 1, "shape": [int(baked)], "value": int(baked),
+        }
+    launch = LaunchContract(
+        local_size=local, group_count=group_count,
+        element_count=element_count,
+        extents={"type": "uint32_t", "order": [{
+            "slot": None, "buffer": "ScalarFeed", "kind": "element_count", "axis": None,
+        }] if baked is None else []},
+        controls=controls,
+    )
+    return ShaderDeployment(
+        component_id=abi.component_id,
+        product_kind=SHADER_SOURCE,
+        language=abi.language,
+        version=version, profile=profile,
+        stage=abi.stage, entrypoint=abi.entrypoint,
+        target={
+            "client": "opengl", "environment": "opengl4.3", "spirv_version": None,
+            # Every resource is a storage block in set 0, so the source also
+            # compiles as GLSL for Vulkan (with shaderFloat64).
+            "clients": [
+                {"client": "opengl", "environment": "opengl4.3", "spirv_version": None},
+                {"client": "vulkan", "environment": "vulkan1.1", "spirv_version": "1.3"},
+            ],
+        },
+        resources=tuple(resources),
+        launch=launch,
+        provenance={
+            "emitter": "ssa_glsl_compute_backend.emit_ssa_module_to_glsl_compute",
+            "precision_sections": bool(artifact.precision_sections),
+        },
+        shortfalls=(
+            *(
+                Shortfall("emission", f"{item.operation}: {item.reason}")
+                for item in artifact.shortfalls
+            ),
+            *(
+                (Shortfall(
+                    "fma-rounding",
+                    "GLSL lets an fma() consumed by a precise variable round "
+                    "like a*b+c; it fixes only that every such fma() rounds "
+                    "the same way. The kernel's single-rounding obligation "
+                    "holds only on a driver whose double fma() rounds once.",
+                ),)
+                if re.search(r"\bfma\(", artifact.source) else ()
+            ),
+        ),
+    )
+
+
 def _broadcast(shapes: Iterable[Sequence[int]]) -> tuple[int, ...]:
     result: tuple[int, ...] = ()
     for shape in shapes:
@@ -554,36 +699,237 @@ def webgl_fragment_deployment(module: Any) -> ShaderDeployment:
     )
 
 
+def _extracted_port(declaration: Any, stage: str) -> tuple[str, str, str, str]:
+    """``(role, transport, kind, access)`` of one declared interface item."""
+
+    from .glsl_interface import is_opaque
+
+    storage = declaration.storage
+    if storage == "varying":
+        storage = "out" if stage == "vertex" else "in"
+    qualifiers = set(declaration.qualifiers)
+    written = (
+        ("output", "write") if "writeonly" in qualifiers
+        else ("feed", "read") if "readonly" in qualifiers
+        else ("output", "read_write")
+    )
+    if storage == "in":
+        if stage == "vertex":
+            return "feed", "vertex-attribute", "vertex-attribute", "read"
+        return "feed", "stage-input", "stage-input", "read"
+    if storage == "out":
+        if stage == "fragment":
+            return "output", "draw-buffer", "draw-buffer", "write"
+        return "output", "stage-output", "stage-output", "write"
+    if storage == "buffer":
+        role, access = written
+        return role, "storage-buffer", "storage-buffer", access
+    if declaration.is_block:
+        return "uniform", "uniform-buffer", "uniform-buffer", "read"
+    if declaration.glsl_type.startswith(("image", "iimage", "uimage")):
+        role, access = written
+        return role, "storage-image", "storage-image", access
+    if declaration.glsl_type == "atomic_uint":
+        return "output", "atomic-counter", "atomic-counter", "read_write"
+    if is_opaque(declaration.glsl_type):
+        return "feed", "texture", "sampled-texture", "read"
+    return "uniform", "default-uniform", "default-uniform", "read"
+
+
+def _extracted_view(slot: int, array: tuple[int, ...] | None) -> PortView:
+    if array is None:
+        return PortView(slot, 0, None, 0, ())
+    if any(size < 0 for size in array):
+        return PortView(slot, 0, None, len(array), None, extents_from="fed")
+    return PortView(slot, 0, None, len(array), tuple(array))
+
+
+def _extracted_interface(shader: Any) -> tuple[Any, tuple[PhysicalResource, ...], tuple[Shortfall, ...]]:
+    """The component ABI and resources an extracted shader declares.
+
+    Ports come from the source's own global declarations
+    (``glsl_interface.read_glsl_interface``): feeds, then outputs, then
+    uniforms, each in declaration order. ``backend_binding`` is the declared
+    ``binding``, else the declared ``location``, else ``-1`` when the host or
+    the linker assigns it. A resource whose binding or location the source
+    leaves to the host is a ``link-assigned`` shortfall, because the record
+    alone cannot bind it.
+    """
+
+    from .glsl_interface import glsl_dtype, read_glsl_interface
+    from .shader_component_abi import (
+        ComponentPort,
+        ComponentSentinels,
+        ShaderComponentABI,
+    )
+
+    interface = read_glsl_interface(shader.source)
+    stage = shader.stage
+    rows = []
+    for declaration in interface.declarations:
+        role, transport, kind, access = _extracted_port(declaration, stage)
+        rows.append((role, transport, kind, access, declaration))
+    order = {"feed": 0, "output": 1, "uniform": 2}
+    rows.sort(key=lambda row: order[row[0]])
+    ports: list[Any] = []
+    resources: list[PhysicalResource] = []
+    unassigned: list[str] = []
+    fragment_outputs = sum(1 for row in rows if row[2] == "draw-buffer")
+    for slot, (role, transport, kind, access, declaration) in enumerate(rows):
+        binding = declaration.layout_int("binding")
+        location = declaration.layout_int("location")
+        members = declaration.members
+        if len(members) == 1:
+            glsl_type, array = members[0].glsl_type, members[0].array
+        elif members:
+            glsl_type, array = "block", declaration.array
+        else:
+            glsl_type, array = declaration.glsl_type, declaration.array
+        dtype = glsl_dtype(glsl_type)
+        ports.append(ComponentPort(
+            slot=slot, name=str(declaration.name), role=role, dtype=dtype, value_id=None,
+            backend_binding=(
+                binding if binding is not None
+                else location if location is not None else -1
+            ),
+            transport=transport,
+        ))
+        by_binding = kind in {
+            "storage-buffer", "uniform-buffer", "sampled-texture",
+            "storage-image", "atomic-counter",
+        }
+        if by_binding and binding is None:
+            unassigned.append(f"{declaration.name} ({kind}, binding)")
+        if kind == "vertex-attribute" and location is None:
+            unassigned.append(f"{declaration.name} ({kind}, location)")
+        if kind == "draw-buffer" and location is None and fragment_outputs > 1:
+            unassigned.append(f"{declaration.name} ({kind}, location)")
+        packing = next(
+            (key for key, _value in declaration.layout
+             if key in {"std140", "std430", "shared", "packed", "scalar"}),
+            None,
+        )
+        element = dtype.split("x", 1)[0]
+        resources.append(PhysicalResource(
+            name=str(declaration.name),
+            kind=kind,
+            access=access,
+            layout=(
+                packing or ("shared" if kind in {"storage-buffer", "uniform-buffer"} else "glsl")
+            ),
+            dtype=dtype,
+            element_bytes=_ELEMENT_BYTES.get(element, 0) if glsl_type != "block" else 0,
+            set=(
+                declaration.layout_int("set")
+                if declaration.has_layout("set")
+                else (0 if by_binding and binding is not None else None)
+            ),
+            binding=binding,
+            location=location,
+            uniform=str(declaration.name) if kind == "default-uniform" else None,
+            realizes=(_extracted_view(slot, array),),
+            members=tuple(member.to_mapping() for member in members),
+        ))
+    abi = ShaderComponentABI(
+        component_id=str(shader.source_name or f"{Path(shader.filename).stem}_{shader.line}"),
+        language=shader.language,
+        stage=stage,
+        entrypoint="main",
+        ports=tuple(ports),
+        sentinels=ComponentSentinels.for_ports(len(ports)),
+        decorations=MappingProxyType({
+            "interface": "declared",
+            "reader": "glsl_interface.read_glsl_interface",
+            **({"local_size": list(interface.local_size)} if interface.local_size else {}),
+        }),
+    )
+    shortfalls: list[Shortfall] = []
+    if unassigned:
+        shortfalls.append(Shortfall(
+            "link-assigned",
+            "the source leaves these to the host program or the linker, so "
+            "the record alone cannot bind them: " + ", ".join(unassigned),
+        ))
+    return abi, tuple(resources), tuple(shortfalls)
+
+
 def extracted_shader_deployment(shader: Any) -> ShaderDeployment:
-    """A host-compiled shader: exact source and its provenance, no ABI yet."""
+    """A host-compiled shader: exact source, provenance, declared interface."""
+
+    return extracted_shader_component(shader)[1]
+
+
+def extracted_shader_component(shader: Any) -> tuple[Any, ShaderDeployment]:
+    """The component ABI (or None) and deployment of an extracted shader.
+
+    The component ABI is read from the source's own declarations. A source
+    whose interface cannot be read with certainty has none, and keeps the
+    ``no-component-abi`` shortfall with the reader's reason.
+    """
+
+    from .glsl_interface import GLSLInterfaceRefusal
+    from .shader_stages import STAGES
 
     version, profile = glsl_version_directive(shader.source)
     identity = shader.source_name or f"{Path(shader.filename).stem}_{shader.line}"
-    return ShaderDeployment(
+    provenance = {
+        "emitter": "shader_extractor.extract_shader_compile_calls",
+        "filename": shader.filename,
+        "line": shader.line,
+        "source_symbol": shader.source_name,
+        "compiler_call": shader.compiler,
+        "source_sha256": shader.sha256,
+    }
+    target = {
+        "client": "opengl-es" if profile == "es" else "opengl",
+        "environment": None, "spirv_version": None,
+    }
+    common = dict(
         component_id=str(identity),
         product_kind=SHADER_SOURCE,
         language=shader.language, version=version, profile=profile,
-        stage=shader.stage, entrypoint="main",
-        target={
-            "client": "opengl-es" if profile == "es" else "opengl",
-            "environment": None, "spirv_version": None,
-        },
-        resources=(), launch=None,
-        provenance={
-            "emitter": "shader_extractor.extract_shader_compile_calls",
-            "filename": shader.filename,
-            "line": shader.line,
-            "source_symbol": shader.source_name,
-            "compiler_call": shader.compiler,
-            "source_sha256": shader.sha256,
-        },
-        shortfalls=(Shortfall(
-            "no-component-abi",
-            "the host program declares this shader's bindings; Turing has not "
-            "derived a logical component ABI for it, so no physical resources "
-            "or launch controls are published",
-        ),),
-        component_abi_published=False,
+        stage=shader.stage, entrypoint="main", target=target,
+        provenance=provenance,
+    )
+    reason = None
+    if shader.stage not in STAGES:
+        reason = f"the component ABI has no {shader.stage!r} stage"
+    else:
+        try:
+            abi, resources, shortfalls = _extracted_interface(shader)
+        except GLSLInterfaceRefusal as error:
+            reason = f"the declared interface cannot be read: {error}"
+    if reason is not None:
+        return None, ShaderDeployment(
+            **common, resources=(), launch=None,
+            shortfalls=(Shortfall("no-component-abi", reason),),
+            component_abi_published=False,
+        )
+    launch = None
+    stage_shortfalls: tuple[Shortfall, ...]
+    if shader.stage == "compute":
+        local_size = tuple(abi.decorations.get("local_size") or (1, 1, 1))
+        launch = LaunchContract(
+            local_size=local_size,  # type: ignore[arg-type]
+            group_count={"rule": "host"},
+            element_count={"source": "host", "kind": "element_count",
+                           "rank": None, "shape": None, "value": None},
+            extents={"type": None, "order": []},
+        )
+        stage_shortfalls = (Shortfall(
+            "host-launch",
+            "the host program chooses the group count at its dispatch call; "
+            "Turing has not read that call",
+        ),)
+    else:
+        stage_shortfalls = (Shortfall(
+            "graphics-stage",
+            "the host program links this stage into a raster pipeline and "
+            "issues the draw; the record describes the stage's interface only",
+        ),)
+    return abi, ShaderDeployment(
+        **common, resources=resources, launch=launch,
+        shortfalls=(*stage_shortfalls, *shortfalls),
     )
 
 
@@ -819,14 +1165,20 @@ def publish_extracted_shader(
 ) -> PublishedShaderProduct:
     """Publish a host-extracted shader with its provenance carried along."""
 
-    deployment = extracted_shader_deployment(shader)
+    abi, deployment = extracted_shader_component(shader)
     name = str(name or deployment.component_id)
+    metadata: dict[str, Any] = {
+        "stage": shader.stage,
+        "extracted_shader": dict(shader.to_mapping()["origin"]),
+    }
+    if abi is not None:
+        metadata["component_abi"] = abi.to_mapping()
     api = CompiledProgramAPI(
         module=name,
         language=shader.language,
         entry="main",
         entry_points=(EntryPoint("main", "main", "numerical"),),
-        metadata={"stage": shader.stage, "extracted_shader": dict(shader.to_mapping()["origin"])},
+        metadata=metadata,
     )
     return publish_shader_source(
         directory, name=name, source=shader.source,
@@ -941,6 +1293,7 @@ __all__ = [
     "NODUS_REQUEST_SCHEMA", "PhysicalResource", "PortView", "PublishedShaderProduct",
     "SCHEMA", "SHADER_SOURCE", "SPIRV_PRODUCT_SCHEMA", "ShaderDeployment", "Shortfall",
     "control_ref", "extracted_shader_deployment", "glsl_compute_deployment",
+    "precision_compute_deployment",
     "glsl_version_directive", "publish_extracted_shader", "publish_shader_source",
     "publish_spirv_product", "spirv_deployment", "webgl_fragment_deployment",
     "wgsl_deployment",

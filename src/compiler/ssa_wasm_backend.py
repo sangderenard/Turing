@@ -644,6 +644,12 @@ def emit_ssa_module_to_wasm_core(
         def __init__(self, bindings):
             self.slots = dict(bindings)
             self.integers = set()
+            # A repository Call may return ``ssa.aggregate``.  The wrapper's
+            # GetElementPtr carries the exact ``source_output_id`` for each
+            # member, so retain that identity rather than reconstructing it
+            # from aggregate position after the callee is inlined.
+            self.aggregate_members = {}
+            self.direct_pointer_values = {}
 
     root_env = _Env({
         int(formal.id): index for index, formal in enumerate(root.args)
@@ -702,6 +708,19 @@ def emit_ssa_module_to_wasm_core(
             builder.local_set(slot_for(env, instruction.res, integer))
             return
         if operation == "GetElementPtr" and len(instruction.args) >= 2:
+            aggregate = env.aggregate_members.get(int(instruction.args[0].id))
+            source_output_id = instruction.attributes.get("source_output_id")
+            if aggregate is not None and source_output_id is not None:
+                held = aggregate.get(int(source_output_id))
+                if held is None:
+                    shortfalls.append(WasmEmissionShortfall(
+                        operation,
+                        "aggregate has no declared source output "
+                        f"%t{source_output_id}",
+                    ))
+                    return
+                env.direct_pointer_values[int(instruction.res.id)] = held
+                return
             # address = base_offset + (index << 3); limbs are f64.
             if not (push(env, instruction.args[0])
                     and push(env, instruction.args[1])):
@@ -710,6 +729,10 @@ def emit_ssa_module_to_wasm_core(
             builder.local_set(slot_for(env, instruction.res, True))
             return
         if operation == "Load" and instruction.args:
+            direct = env.direct_pointer_values.get(int(instruction.args[0].id))
+            if direct is not None:
+                env.slots[int(instruction.res.id)] = direct
+                return
             if not push(env, instruction.args[0]):
                 return
             builder.load()
@@ -789,6 +812,40 @@ def emit_ssa_module_to_wasm_core(
                 inline_call(callee_env, callee_instruction)
                 continue
             emit_straight_instruction(callee_env, callee_instruction)
+        if instruction.res is None:
+            return
+        returned = tuple(
+            item.args
+            for item in callee.blocks["entry"].instrs
+            if str(item.op) in {"Ret", "Return"}
+        )
+        declared = tuple(
+            int(value_id)
+            for value_id in instruction.attributes.get("output_ids", ())
+        )
+        if not returned or len(declared) != len(returned[-1]):
+            shortfalls.append(WasmEmissionShortfall(
+                "Call",
+                f"callee {callee_name!r} aggregate result disagrees with "
+                "its declared output_ids",
+            ))
+            return
+        returned_by_id = {
+            int(value.id): callee_env.slots.get(int(value.id))
+            for value in returned[-1]
+        }
+        if set(returned_by_id) != set(declared) or any(
+            held is None for held in returned_by_id.values()
+        ):
+            shortfalls.append(WasmEmissionShortfall(
+                "Call",
+                f"callee {callee_name!r} did not materialize its exact "
+                "declared output identities",
+            ))
+            return
+        env.aggregate_members[int(instruction.res.id)] = {
+            value_id: returned_by_id[value_id] for value_id in declared
+        }
 
     # -- the wrapper CFG through the label dispatcher -----------------------
     order = list(root.blocks)
