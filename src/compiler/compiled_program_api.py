@@ -63,6 +63,10 @@ class Parameter:
     # projection is part of the public ABI contract; wrappers must not infer
     # it from an anonymous SSA spelling or silently supply a placeholder.
     source_transform: str | None = None
+    # Physical element order at the ABI boundary.  Ordinary shaped Fortran
+    # dummies are column-major.  Repository SSA tensor arenas retain their
+    # declared dense row-major layout even when passed through such a dummy.
+    layout: str | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         mapping: dict[str, Any] = {
@@ -83,6 +87,8 @@ class Parameter:
             mapping["source_name"] = self.source_name
         if self.source_transform is not None:
             mapping["source_transform"] = self.source_transform
+        if self.layout is not None:
+            mapping["layout"] = self.layout
         return mapping
 
 
@@ -173,6 +179,7 @@ def describe_fortran_function(
     reference_argument_ids: Iterable[int] = (),
     value_dtypes: Mapping[int, str] | None = None,
     value_shapes: Mapping[int, Sequence[int]] | None = None,
+    value_layouts: Mapping[int, str] | None = None,
 ) -> EntryPoint:
     """Describe one emitted Fortran subroutine's calling contract.
 
@@ -300,6 +307,7 @@ def describe_fortran_function(
                 extents=dimensions,
                 source_name=authored_source_name,
                 source_transform=source_transforms.get(int(value.id)),
+                layout=(value_layouts or {}).get(int(value.id)),
             )
         )
     for value in outputs:
@@ -330,6 +338,7 @@ def describe_fortran_function(
                 extents=dimensions,
                 source_name=source_names.get(int(value.id)),
                 source_transform=source_transforms.get(int(value.id)),
+                layout=(value_layouts or {}).get(int(value.id)),
             )
         )
     return EntryPoint(
