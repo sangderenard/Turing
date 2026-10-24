@@ -25399,6 +25399,36 @@ def _class_surface_ssa_program(
             for item in getattr(hierarchy_plan, "items", ())
             if isinstance(item, PlanCall)
         )
+        # Which caller arguments each call's callee provably stores into
+        # (``_mutated_sequence_node_ids`` of the callee holds the formal's
+        # Input, escapes into its own calls included).  The callsite
+        # scheduler orders a storing call against EARLIER readers of that
+        # arena too (write-after-read); a call left out of this map (no
+        # child graph, or a binding to a non-Input) keeps the may-write
+        # treatment.
+        from .glsl_deployment_strategy import _mutated_sequence_node_ids
+
+        callsite_stored_argument_ids: dict[int, frozenset[int]] = {}
+        for planned_call in local_plan_calls:
+            child_graph = getattr(getattr(
+                getattr(shell, "callsite_function_shells", {}).get(
+                    int(planned_call.callsite_id)
+                ),
+                "process_graph", None,
+            ), "G", None)
+            if child_graph is None or not all(
+                child_graph.nodes.get(int(callee_id), {}).get("type") == "Input"
+                for _caller_id, callee_id in planned_call.argument_bindings
+            ):
+                continue
+            stored_formals = set(_mutated_sequence_node_ids(child_graph))
+            callsite_stored_argument_ids[int(planned_call.callsite_id)] = (
+                frozenset(
+                    int(caller_id)
+                    for caller_id, callee_id in planned_call.argument_bindings
+                    if int(callee_id) in stored_formals
+                )
+            )
         sequence_call_result_kinds: dict[int, str] = {}
         return_sequence_kind_by_reference: dict[int, str] = {}
         if source_function_table is not None:
@@ -27549,6 +27579,7 @@ def _class_surface_ssa_program(
                 native_object_type_tests=native_type_tests,
                 native_value_type_abi=native_value_type_abi,
                 native_value_type_tests=native_value_type_tests,
+                callsite_stored_argument_ids=callsite_stored_argument_ids,
                 identity_table=dict(graph_obj.graph.get("identity_table") or {}),
                 function_outputs=tuple(
                     graph_obj.graph.get("function_outputs") or ()

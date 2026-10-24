@@ -23250,6 +23250,7 @@ def _schedule_loop_callsites(
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
     callsite_projection_ids: Mapping[int, tuple[int, ...]] | None = None,
+    callsite_stored_argument_ids: Mapping[int, frozenset[int]] | None = None,
     pure_region_indices: frozenset[int] = frozenset(),
     table_region_operations: Mapping[int, Any] | None = None,
     table_region_post_operations: Mapping[int, Any] | None = None,
@@ -24079,7 +24080,7 @@ def _schedule_loop_callsites(
                 # call's arguments among them are its writes (below).
                 run_arenas: set[int] = set()
 
-                def sequence_accesses(candidate, include_calls=True):
+                def sequence_accesses(candidate, include_calls=True, calls=True):
                     """One arena's reads and its writes, told apart.
 
                     These used to be one set, and every pair of accesses to an
@@ -24130,20 +24131,41 @@ def _schedule_loop_callsites(
                     # -239).  Rule: a call writes every arena of this run it
                     # receives as an argument -- its callee may store into
                     # that storage, and the call boundary is where the
-                    # caller sees it.  (Which callee stores is not known
-                    # here, so such a write takes no write-after-read edge;
-                    # see ``call_writes`` below.)
-                    if include_calls and isinstance(candidate, StatementBlock):
+                    # caller sees it.  Where the callee is known
+                    # (``callsite_stored_argument_ids``) a call writes exactly
+                    # the arguments it stores into, as a mutation does, and
+                    # the others not at all.  Where it is not known, every
+                    # arena argument is a MAY write, which takes no
+                    # write-after-read edge (``call_writes`` below).
+                    if calls and isinstance(candidate, StatementBlock):
                         for line in candidate.lines:
                             match = _CALLSITE_MARKER.fullmatch(str(line))
                             if match is None:
                                 continue
+                            callsite_id = int(match.group(1))
+                            stored = (callsite_stored_argument_ids or {}).get(
+                                callsite_id
+                            )
+                            # Every arena argument is READ by the call: a
+                            # whole-bound ``head(xs)`` before ``swap(xs)``
+                            # must not move after it (c384 once ``xs`` stopped
+                            # binding by member).
+                            reads.update(
+                                int(value_id)
+                                for value_id in bindings.get(
+                                    callsite_id, ((), ())
+                                )[0]
+                                if int(value_id) in run_arenas
+                            )
+                            if stored is None and not include_calls:
+                                continue
                             writes.update(
                                 int(value_id)
                                 for value_id in bindings.get(
-                                    int(match.group(1)), ((), ())
+                                    callsite_id, ((), ())
                                 )[0]
                                 if int(value_id) in run_arenas
+                                and (stored is None or int(value_id) in stored)
                             )
                     if isinstance(candidate, SequenceMutationBlock):
                         writes.add(int(candidate.mutation.sequence_value_id))
@@ -24165,7 +24187,7 @@ def _schedule_loop_callsites(
                         writes.add(int(mutation.sequence_value_id))
                     for child in getattr(candidate, 'blocks', ()):
                         child_reads, child_writes = sequence_accesses(
-                            child, include_calls
+                            child, include_calls, calls
                         )
                         reads |= child_reads
                         writes |= child_writes
@@ -24173,7 +24195,7 @@ def _schedule_loop_callsites(
                         child = getattr(candidate, field, None)
                         if child is not None:
                             child_reads, child_writes = sequence_accesses(
-                                child, include_calls
+                                child, include_calls, calls
                             )
                             reads |= child_reads
                             writes |= child_writes
@@ -24267,16 +24289,21 @@ def _schedule_loop_callsites(
                     )[1]
                     # A call fed an arena VALUE a later statement of the run
                     # produces already follows that producer by its value
-                    # edge; ordering it as a writer by run position would
+                    # edge; ordering it as an accessor by run position would
                     # close a cycle with that edge (a generator call placed
                     # ahead of the loop filling its argument).
+                    direct_reads, direct_writes = sequence_accesses(
+                        child, calls=False
+                    )
                     late_fed = {
-                        arena for arena in call_writes
+                        arena
+                        for arena in (reads | writes) - (direct_reads | direct_writes)
                         if any(
                             producer > position
                             for producer in producers.get(int(arena), ())
                         )
                     }
+                    reads -= late_fed
                     writes -= late_fed
                     call_writes -= late_fed
                     # Program: ``if n > 6: t = [n, 3] else: t = [8, n]``,
@@ -25172,6 +25199,7 @@ def lower_control_sections_to_ssa(
         int, tuple[tuple[int, str, int], ...]
     ] | None = None,
     callsite_projection_ids: Mapping[int, tuple[int, ...]] | None = None,
+    callsite_stored_argument_ids: Mapping[int, frozenset[int]] | None = None,
     source_sequence_ids: tuple[int, ...] = (),
     dynamic_sequence_ids: tuple[int, ...] = (),
     sequence_memberships: tuple[
@@ -27819,6 +27847,7 @@ def lower_control_sections_to_ssa(
         region_signatures,
         region_dependency_signatures,
         callsite_projection_ids=callsite_projection_ids,
+        callsite_stored_argument_ids=callsite_stored_argument_ids,
         pure_region_indices=frozenset(
             index for index, instructions in planned_region_instructions.items()
             if all(instruction.op in _PURE_REGION_OPS for instruction in instructions)

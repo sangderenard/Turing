@@ -1112,6 +1112,7 @@ def _formal_storage_is_mutated(callee_graph: Any, parameter: str) -> bool:
 
 def _aggregate_binds_by_member(
     caller_graph: Any, actual_id: int, callee_graph: Any, parameter: str,
+    call_id: int | None = None,
 ) -> bool:
     """Whether one call may bind an authored aggregate by its members.
 
@@ -1125,8 +1126,25 @@ def _aggregate_binds_by_member(
     aggregate is bound whole, as its storage.
     """
 
+    # Program: ``xs = [n, 6]; swap(xs); return head(xs)`` (scratch s37/f).
+    # Wrong record: neither the caller's own mutations nor ``head`` change
+    # ``xs``, so ``head`` was bound to the display leaves and returned ``n``
+    # where Python returns 6 (clean audit).  ``swap`` stores into the same
+    # storage.  Rule: an aggregate that also escapes into ANOTHER call may
+    # be changed by that callee, so its leaves are not its contents here
+    # either; it is bound whole.
+    from .resident_sequence_materialization import (
+        _call_escaped_argument_edges,
+    )
+
+    escapes_elsewhere = any(
+        int(argument) == int(actual_id)
+        and (call_id is None or int(call) != int(call_id))
+        for call, argument in _call_escaped_argument_edges(caller_graph)
+    )
     return not (
-        int(actual_id) in _mutated_sequence_node_ids(
+        escapes_elsewhere
+        or int(actual_id) in _mutated_sequence_node_ids(
             caller_graph, include_call_escapes=False,
         )
         or _formal_storage_is_mutated(callee_graph, parameter)
@@ -19596,7 +19614,7 @@ def _propagate_callsite_tensor_specializations(
             if leaves and not static_argument and all(
                 int(leaf) in caller.G for leaf in leaves
             ) and _aggregate_binds_by_member(
-                caller.G, int(parent), callee.G, parameter,
+                caller.G, int(parent), callee.G, parameter, int(node_id),
             ):
                 # Same member-identity rule as callsite specialization: the
                 # callee's return descriptors may depend on aggregate members
@@ -27702,7 +27720,7 @@ def _callsite_specialized_shell_type(
         )
         leaves = _authored_aggregate_leaves(caller, int(parent))
         if leaves and not static_argument and _aggregate_binds_by_member(
-            caller.G, int(parent), original.G, parameter,
+            caller.G, int(parent), original.G, parameter, int(node_id),
         ):
             # Every authored member is a scoped callee identity whether or
             # not its tensor contract is already known.  A member without a

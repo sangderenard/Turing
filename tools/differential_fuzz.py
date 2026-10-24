@@ -376,6 +376,7 @@ def build(m: int) -> list[int]:
 # replication, aliasing and sets.  Seeds 80-83 found the families of corpus
 # c333-c338.
 EXTENDED4 = [
+    (["xs{v} = [n, {a}]", "r{v} = xs{v}[0]", "swap(xs{v})"], "r{v} * 100 + head(xs{v}) * 10 + xs{v}[1]"),
     (["d{v} = {{0: n}}", "d{v}[1] = d{v}.get(0, -1) + {a}", "t{v} = 0", "for y{v} in [x{v} * n for x{v} in [{b}, 0]]:", "    t{v} += y{v}", "xs{v} = [n, {c}]", "h{v} = head(xs{v})", "swap(xs{v})"], "d{v}[1] * 10 + len(d{v}) + t{v} + h{v} * 100 + xs{v}[0] * 10 + xs{v}[1]"),
     (["xs{v} = [n, {a}, {b}, {c}]", "s{v} = 0", "while xs{v}:", "    s{v} = s{v} * 3 + xs{v}.pop()"], "s{v}"),
     (["xs{v} = [{a}, n, {b}]", "r{v} = xs{v}[-1]", "xs{v}.pop(0)", "s{v} = 0", "for k{v}, x{v} in enumerate([{c}, n], n % 3 + {a}):", "    s{v} = s{v} * 10 + k{v} * x{v}"], "r{v} * 10 + len(xs{v}) + s{v}"),
