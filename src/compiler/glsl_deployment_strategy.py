@@ -2765,6 +2765,21 @@ def _planned_scalar_dtypes_from(
             if reference in REGION_SCALAR_CAST_DTYPES:
                 settle(scalar, node_id, REGION_SCALAR_CAST_DTYPES[reference])
                 continue
+            # Silent lane, D6.  Program: ``x = n * 1.25 + 0.5; return
+            # math.floor(x) + 1`` (corpus c437).  Wrong record: nothing
+            # proved the result class, so the operand rule typed the
+            # result float64 and an int program returned a float.  Rule:
+            # on a proven scalar, ``math.floor``/``ceil``/``trunc`` and
+            # one-argument ``round`` return ``int`` in Python.
+            if reference in {
+                "round", "math.floor", "math.ceil", "math.trunc",
+            }:
+                arguments = parents(data, "arg:")
+                if len(arguments) == 1 and scalar.get(arguments[0]) in {
+                    "int64", "float64", "bool",
+                }:
+                    settle(scalar, node_id, "int64")
+                continue
             if op in {"truediv", "div"}:
                 operands = parents(data, "lhs", "rhs")
                 if operands and all(scalar.get(o) is not None for o in operands):
@@ -4347,6 +4362,13 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
+                if operation in {"floor", "ceil", "trunc", "round"}:
+                    # A scalar ``math.floor(x)`` is a Python ``int`` whatever
+                    # its operand's class; the source proof says so
+                    # (``_planned_scalar_dtypes_from``), the operand does not.
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven is not None:
+                        dtype = str(proven)
                 if operation in {
                     "sum", "prod", "min", "max", "any", "all",
                     "unsqueeze", "squeeze",
