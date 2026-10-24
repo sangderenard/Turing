@@ -72,8 +72,11 @@ def test_keyed_tensor_lookup_helper_posts_physical_dtype():
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         progress=lambda _message: None,
     )[0]
+    # ``reading.voltage_v[key]`` is a subscript read, so its helper is the
+    # required (KeyError-raising) lookup.
     assert any(
-        name.endswith("ssa_sequence_2_lookup") for name in module.functions
+        name.endswith("ssa_sequence_2_lookup_required")
+        for name in module.functions
     )
     assert _unposted_or_unsourced(module) == []
 

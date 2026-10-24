@@ -27871,6 +27871,14 @@ def _class_surface_ssa_program(
                 table_lookups=table_lookups,
                 table_lookup_loop_owners=table_lookup_loop_owners,
                 table_lookup_defaults=table_lookup_defaults,
+                # An authored ``d[k]`` read requires its key (KeyError when
+                # absent); ``d.get`` does not.
+                table_lookup_required_ids=frozenset(
+                    int(data.get("value_id", node_id))
+                    for node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("op") or data.get("type") or "").casefold()
+                    == "indexed"
+                ),
                 table_stores=table_stores,
                 table_deletions=table_deletions,
                 # The table version each keyed delete reads (its ``base``).

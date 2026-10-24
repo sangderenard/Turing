@@ -158,3 +158,52 @@ def test_guard_nested_in_a_loop_arm_is_placed_inside_that_arm():
         extraction_contract=str(CONTRACT), progress=lambda _message: None,
     )
     assert CorrelationTable.build(module).findings(module) == []
+
+
+@pytest.mark.parametrize("statement", ["return d[n]", "del d[n]\n    return len(d)"])
+def test_absent_mapping_key_raises_where_python_raises_key_error(statement, tmp_path):
+    """``d[n]`` and ``del d[n]`` with ``n`` absent raise ``KeyError``.
+
+    The lookup returned 0 and the delete went on (both helpers knew the key
+    was absent and reported it only in a status nobody read).  A present key
+    still returns Python's value.
+    """
+    import numpy as np
+
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    source = (
+        "def root(n: int) -> int:\n"
+        "    d = {1: n, 2: 5}\n"
+        f"    {statement}\n"
+    )
+    namespace: dict = {}
+    exec(source, namespace)
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="corpus_absent_key",
+        extraction_contract=str(CONTRACT), progress=lambda _message: None,
+    )
+    root = module.functions[exports[0]]
+    parameters = dict(root.metadata["parameter_names"])
+    outputs = [
+        instruction.args
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    ][0]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native")
+
+    def run(n: int):
+        execution = artifact.prepare_execution(
+            {parameters["n"]: np.array([n])}
+        ).run()
+        return float(execution.buffers[outputs[0].id].reshape(-1)[0])
+
+    assert run(1) == float(namespace["root"](1))
+    with pytest.raises(KeyError):
+        namespace["root"](7)
+    with pytest.raises(Exception):
+        run(7)

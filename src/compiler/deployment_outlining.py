@@ -43,7 +43,8 @@ from ..transmogrifier.ssa import BasicBlock, Function, Instr
 #: Sequence helper verbs that only read; anything else on a shared handle is
 #: an ordered mutation the barrier join cannot legalize.
 _SEQUENCE_READ_VERBS = frozenset({
-    "lookup", "lookup_or_default", "get", "getitem", "length", "contains",
+    "lookup", "lookup_or_default", "lookup_required", "get", "getitem",
+    "length", "contains",
     "read", "peek",
 })
 
