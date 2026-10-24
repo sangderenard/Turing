@@ -139,6 +139,14 @@ def check(buf, base, instr, n=200, frame=False):
     (b"\x66\x0f\xfe\xc1", "PADDD_XMM_XMMM128"),
     (b"\x0f\x9d\xc0", "SETGE_RM8"),
     (b"\x66\x2e\x0f\x1f\x84\x00\x00\x00\x00\x00", "NOP_RM_CS"),
+    (b"\x48\x83\xd6\x00", "ADC_RM64_IMM8"),
+    (b"\x48\x83\xd1\xff", "ADC_RM64_IMM8"),
+    (b"\x83\xd2\x01", "ADC_RM32_IMM8"),
+    (b"\x41\x83\xd0\x7f", "ADC_RM32_IMM8"),
+    (b"\x66\x41\x0f\xbe\xcc", "MOVSX_R16_RM8"),
+    (b"\x66\x0f\xbe\xc1", "MOVSX_R16_RM8"),
+    (b"\x20\xc2", "AND_RM8_R8"),
+    (b"\x44\x20\xc0", "AND_RM8_R8"),
 ))
 def test_reference_semantics_agree_with_the_cpu(page, encoded, token):
     buf, base = page
