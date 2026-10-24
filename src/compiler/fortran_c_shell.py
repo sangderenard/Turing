@@ -29037,6 +29037,22 @@ def _class_surface_ssa_program(
 
     abi_records = dict(program_abi.get("records") or {})
 
+    def authored_constructor_method(candidates: Iterable[Any]) -> Any:
+        for definition in getattr(class_table, "classes", ()) or ():
+            identity = str(definition.identity)
+            if not any(
+                identity in {str(candidate)}
+                or identity.rsplit(".", 1)[-1] == str(candidate)
+                for candidate in candidates
+            ):
+                continue
+            return next((
+                method for method in definition.methods
+                if method.name in {"__new__", "__init__"}
+                and method.function_name is not None
+            ), None)
+        return None
+
     def abi_record_for_call(data: Mapping[str, Any]):
         if str(data.get("type") or data.get("op") or "").casefold() != "call":
             return None
@@ -29052,6 +29068,17 @@ def _class_surface_ssa_program(
                 or identity.endswith("." + str(candidate))
                 for candidate in candidates
             ):
+                if (
+                    record.get("constructor_complete") is False
+                    and authored_constructor_method(candidates) is not None
+                ):
+                    # An ordinary class's projection view (fields its
+                    # ``__init__`` assigns) is not a constructor schema.  Its
+                    # construction is the ``__init__`` call, linked into the
+                    # caller's frame below ("materialize class constructors
+                    # and fields"); claiming it here as a record literal
+                    # refused every such program.
+                    return None
                 if record.get("constructor_complete") is False:
                     from .identity_concordance import ConcordanceRefusal
 
@@ -41368,6 +41395,27 @@ def _class_surface_ssa_program(
                 if len(templates) != 1:
                     continue
                 template = templates[0]
+                # The object is the constructor's receiver record.  A field of
+                # the class layout absent from it (``self.m = n * 3``: no
+                # field receipt, so no record view slot) is computed by
+                # ``__init__`` and stored nowhere; reads of it then took
+                # whatever the frame held.  Refuse by name instead.
+                unslotted_fields = tuple(
+                    str(field.name) for field in class_definition.fields
+                    if str(field.name) not in {
+                        str(member.name) for member in template.fields
+                    }
+                )
+                if unslotted_fields:
+                    from .identity_concordance import ConcordanceRefusal
+
+                    raise ConcordanceRefusal(
+                        "class construction has no physical field for "
+                        "attributes of its layout: "
+                        f"class={str(class_definition.identity)!r}, "
+                        f"fields={unslotted_fields!r}, record view="
+                        f"{tuple(str(member.name) for member in template.fields)!r}"
+                    )
                 constructor_records_by_id = {
                     int(record.record_id): record
                     for record in constructor_table.records.values()
@@ -41601,6 +41649,36 @@ def _class_surface_ssa_program(
                         "record_instance": str(class_identity),
                         "constructor_callsite_id": int(node_id),
                     })
+                    # A bound caller id (the receiver, when the constructor's
+                    # ``self`` is its field slot) already has a caller row,
+                    # minted untyped for the call.  The frame slot it now is
+                    # carries the constructor value's posted type; a
+                    # resident-only dtype left the row unresolved, and result
+                    # settlement refused it.
+                    from .ssa_record_return_state import publish_ssa_value_type
+                    from .structural_concordance import function_value_structure
+
+                    slot_structure, slot_cell = function_value_structure(
+                        constructor, old_id,
+                    )
+                    caller_cell = _frame_value_cell(caller, new_id)
+                    if (
+                        caller_cell is not None
+                        and slot_structure.dtype not in (None, "", "unknown")
+                        and function_value_structure(caller, new_id)[0].dtype
+                        in (None, "", "unknown")
+                    ):
+                        publish_ssa_value_type(
+                            caller, value, dtype=slot_structure.dtype,
+                            shape=slot_structure.shape,
+                            sources=_frame_cells(
+                                slot_cell, caller_cell,
+                                _frame_value_cell(constructor, old_id),
+                                *_frame_call_cells(caller_graph, int(node_id)),
+                            ),
+                            stage=FRAME_LINK,
+                            physical=_frame_physical_fields(constructor, old_id),
+                        )
                     caller.args.append(value)
                     available[new_id] = value
                     new_arguments.append(value)
@@ -41689,7 +41767,25 @@ def _class_surface_ssa_program(
                         str(record_template.identity),
                         tuple(mapped_fields),
                     )
-                    caller_records.register(mapped_record)
+                    # The caller's copy of a constructor-owned record stands
+                    # on the constructor's descriptor and the call; a bare
+                    # register posted no cell, so the next revision of the
+                    # row had no incumbent.
+                    from .concordance_declarations import RECORD_DESCRIPTOR
+
+                    caller_records.register(
+                        mapped_record,
+                        sources=_frame_cells(
+                            _frame_table_cell(
+                                constructor_table,
+                                int(record_template.record_id),
+                                RECORD_DESCRIPTOR,
+                                function=constructor,
+                            ),
+                            *_frame_call_cells(caller_graph, int(node_id)),
+                        ),
+                        stage=FRAME_LINK,
+                    )
                     mapped_records[int(record_template.record_id)] = mapped_record
                 mapped_fields = list(
                     mapped_records[int(template.record_id)].fields
@@ -43930,15 +44026,28 @@ def _class_surface_ssa_program(
             if int(candidate.callsite_id) == int(record.callsite_id)
             and candidate.callee_symbol == record.callee_symbol
         ), None)
+        # The merged row stands on the constructor call's own cells and the
+        # row it revises; a bare list write posted none and was refused.
+        constructor_call_cells = _frame_cells(
+            current_identity_book().latest_ref(
+                CALL_RECORD, (call_records.owner, str(record.caller)),
+            ),
+            *_frame_call_cells(
+                source_graphs_by_symbol.get(str(record.caller)),
+                record.callsite_id,
+            ),
+        )
         if duplicate_index is None:
-            existing.append(record)
+            existing.append(
+                record, sources=constructor_call_cells, stage=FRAME_LINK,
+            )
         else:
             candidate = existing[duplicate_index]
             # The hierarchy-owned constructor occurrence supplies lexical loop
             # ownership and explicit self/argument bindings; the record-ABI
             # occurrence supplies the complete caller-storage frame.  Merge
             # those two views into one execution record.
-            existing[duplicate_index] = replace(
+            existing.replace(duplicate_index, replace(
                 record,
                 argument_bindings=(
                     candidate.argument_bindings or record.argument_bindings
@@ -43949,7 +44058,7 @@ def _class_surface_ssa_program(
                 enclosing_loop_ids=(
                     candidate.enclosing_loop_ids or record.enclosing_loop_ids
                 ),
-            )
+            ), sources=constructor_call_cells, stage=FRAME_LINK)
         call_anchor_value_ids[(record.caller, record.callsite_id)] = (
             constructor_anchors.get((record.caller, record.callsite_id))
         )

@@ -5012,6 +5012,9 @@ def _normalize_lexical_values(
     ] | None = None,
     class_field_classes: Mapping[tuple[str, str], str] | None = None,
     static_parameter_bindings: Mapping[str, Any] | None = None,
+    authored_definitions_by_name: Mapping[
+        str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]
+    ] | None = None,
 ) -> dict[int, tuple[str, ...]]:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -5062,6 +5065,142 @@ def _normalize_lexical_values(
     #: at a loop, so the first pass over a body sees no cursor for a field
     #: the body itself rewrites later; that read is not the construction's.
     loop_body_field_writes: list[frozenset[tuple[str, str]]] = []
+    #: Local names passed (as an argument or a method receiver) to a call
+    #: that may store into them.  A record this function constructs has no
+    #: field storage the reducer reloads after such a call, so a later read
+    #: of its field is refused rather than answered from the cursor.
+    storing_call_receivers: set[str] = set()
+    #: The same names for each loop being reduced, innermost last: a call
+    #: later in the body stores before the next iteration's read.
+    loop_body_storing_receivers: list[frozenset[str]] = []
+    storing_definitions = dict(authored_definitions_by_name or {})
+    #: ``acc.add`` in ``acc.add(b)`` is a method lookup, not a field read.
+    method_lookup_ids = {
+        id(node.func) for node in ast.walk(statement)
+        if isinstance(node, ast.Call)
+    }
+    parameter_store_cache: dict[tuple[int, str], bool] = {}
+
+    def parameter_may_store(definition: Any, name: str) -> bool:
+        """Whether ``definition`` may store into its parameter ``name``.
+
+        Proven read-only only when every use is a loaded ``name.field``
+        operand, or ``name.method(...)`` of a read-only method of that name.
+        Anything else (a field or element store, the bare name escaping
+        into a call, a return or an assignment) may store."""
+
+        key = (id(definition), str(name))
+        if key in parameter_store_cache:
+            return parameter_store_cache[key]
+        parameter_store_cache[key] = False  # recursion: assume read-only
+        parents = {
+            id(child): node
+            for node in ast.walk(definition)
+            for child in ast.iter_child_nodes(node)
+        }
+        stores = False
+        for node in ast.walk(definition):
+            if not (isinstance(node, ast.Name) and node.id == name):
+                continue
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                stores = True
+                break
+            attribute = parents.get(id(node))
+            if not (
+                isinstance(attribute, ast.Attribute)
+                and attribute.value is node
+                and isinstance(attribute.ctx, ast.Load)
+            ):
+                stores = True
+                break
+            outer = parents.get(id(attribute))
+            if isinstance(outer, ast.Call) and outer.func is attribute:
+                if callee_may_store(attribute.attr, receiver=True):
+                    stores = True
+                    break
+                continue
+            if isinstance(outer, ast.Attribute) or (
+                isinstance(outer, ast.Subscript)
+                and not isinstance(outer.ctx, ast.Load)
+            ):
+                stores = True
+                break
+        parameter_store_cache[key] = stores
+        return stores
+
+    def callee_may_store(
+        callee: str, *, receiver: bool = False, position: int | None = None,
+        keyword: str | None = None,
+    ) -> bool:
+        """Whether every authored definition named ``callee`` may store
+        into the argument at ``position``/``keyword`` (its receiver when
+        ``receiver``).  An unknown callee may store."""
+
+        definitions = tuple(storing_definitions.get(str(callee), ()))
+        if not definitions:
+            return True
+        for definition in definitions:
+            arguments = (
+                *definition.args.posonlyargs, *definition.args.args,
+            )
+            if receiver:
+                index = 0
+            elif position is not None:
+                index = int(position) + (
+                    1 if str(callee) != "__init__"
+                    and arguments and arguments[0].arg in {"self"}
+                    else 0
+                )
+            else:
+                index = None
+            if index is not None:
+                if index >= len(arguments):
+                    return True
+                name = arguments[index].arg
+            else:
+                names = {
+                    argument.arg for argument in (
+                        *arguments, *definition.args.kwonlyargs,
+                    )
+                }
+                if keyword not in names:
+                    return True
+                name = str(keyword)
+            if parameter_may_store(definition, name):
+                return True
+        return False
+
+    def storing_call_names(node: ast.AST) -> set[str]:
+        """Names in ``node`` that a call may store into."""
+
+        names: set[str] = set()
+        for call in source_walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            if (
+                isinstance(call.func, ast.Attribute)
+                and isinstance(call.func.value, ast.Name)
+                and callee_may_store(call.func.attr, receiver=True)
+            ):
+                names.add(str(call.func.value.id))
+            callee = (
+                call.func.id if isinstance(call.func, ast.Name)
+                else call.func.attr if isinstance(call.func, ast.Attribute)
+                else None
+            )
+            for index, argument in enumerate(call.args):
+                if isinstance(argument, ast.Name) and (
+                    callee is None
+                    or callee_may_store(callee, position=index)
+                ):
+                    names.add(str(argument.id))
+            for keyword in call.keywords:
+                if isinstance(keyword.value, ast.Name) and (
+                    callee is None or keyword.arg is None
+                    or callee_may_store(callee, keyword=keyword.arg)
+                ):
+                    names.add(str(keyword.value.id))
+        return names
     # The most recent node that mutated ``(receiver_node_id, attr)`` --
     # a whole-attribute ``SetAttr`` or an element-wise ``obj.field[i, j] =``
     # ``IndexedStore``.  A later bare read of the same field consults this so
@@ -8346,6 +8485,29 @@ def _normalize_lexical_values(
                         (int(receiver), str(expression.attr))
                     )
                 )
+                if (
+                    isinstance(receiver_expression, ast.Call)
+                    and receiver_class is not None
+                    and isinstance(expression.value, ast.Name)
+                    and id(expression) not in method_lookup_ids
+                    and (
+                        str(expression.value.id) in storing_call_receivers
+                        or any(
+                            str(expression.value.id) in names
+                            for names in loop_body_storing_receivers
+                        )
+                    )
+                ):
+                    # ``acc.add(b); return acc.total`` (or a free function
+                    # storing into ``acc``) answered the construction's value:
+                    # the call's store into the record is not reloaded here.
+                    raise ValueError(
+                        "local record field read after a call that may store "
+                        f"into it has no reloaded value: "
+                        f"{expression.value.id}.{expression.attr} at line "
+                        f"{getattr(expression, 'lineno', '?')} "
+                        "(record_stored_by_call)"
+                    )
                 if (
                     isinstance(receiver_expression, ast.Call)
                     and len(matching_records) == 1
@@ -13283,6 +13445,23 @@ def _normalize_lexical_values(
         return id(dispatch)
 
     def reduce_statement(body_statement: ast.stmt) -> int | None:
+        # A simple statement's own reads may follow its storing call
+        # (``return acc.add(b) + acc.total``), so its names are marked
+        # first; a compound statement's after its nested statements ran.
+        if not isinstance(body_statement, (
+            ast.If, ast.For, ast.AsyncFor, ast.While, ast.With,
+            ast.AsyncWith, ast.Try, ast.Match,
+            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+        )) and not isinstance(body_statement, getattr(ast, "TryStar", ())):
+            storing_call_receivers.update(storing_call_names(body_statement))
+        result = reduce_statement_body(body_statement)
+        if not isinstance(body_statement, (
+            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+        )):
+            storing_call_receivers.update(storing_call_names(body_statement))
+        return result
+
+    def reduce_statement_body(body_statement: ast.stmt) -> int | None:
         if isinstance(body_statement, (ast.Nonlocal, ast.Global)):
             # Scope declarations affect name binding while parsing; they are
             # not runtime operations and must never reach an execution
@@ -14653,11 +14832,17 @@ def _normalize_lexical_values(
                 if isinstance(target, ast.Attribute)
                 and isinstance(target.value, ast.Name)
             ))
+            loop_body_storing_receivers.append(frozenset(
+                name
+                for nested in body_statement.body
+                for name in storing_call_names(nested)
+            ))
             try:
                 for nested in body_statement.body:
                     reduce_statement(nested)
             finally:
                 loop_body_field_writes.pop()
+                loop_body_storing_receivers.pop()
             for nested in body_statement.orelse:
                 reduce_statement(nested)
             loop_id = id(body_statement)
@@ -17059,6 +17244,14 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 elif isinstance(member, ast.ClassDef):
                     self.visit_ClassDef(member)
             return None
+
+    authored_definitions_by_name: dict[str, tuple[Any, ...]] = {}
+    for definition in function_definitions.values():
+        if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            authored_definitions_by_name[str(definition.name)] = (
+                *authored_definitions_by_name.get(str(definition.name), ()),
+                definition,
+            )
 
     for owner_id, definition in compile_iter(function_definitions.items(),
             "lexical-owners", label="Lexical function owners indexed"):
@@ -23030,6 +23223,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             class_field_storage_contracts=class_field_storage_contracts,
             class_field_classes=class_field_classes,
             static_parameter_bindings=static_parameter_bindings,
+            authored_definitions_by_name=authored_definitions_by_name,
         )
         lexical_free_names_by_function.update(nested_lexical_free_names)
         generator_yields = tuple(
