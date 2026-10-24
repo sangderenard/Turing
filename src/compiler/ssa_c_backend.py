@@ -5796,6 +5796,28 @@ def emit_ssa_module_to_c(
                         f"t{result_id} = "
                         f"{_UNARY_PREDICATES[op.casefold()]}({args[0]});"
                     )
+                elif (
+                    op.casefold() == "abs" and len(args) == 1
+                    and is_integer(instruction.args[0])
+                    and _is_integer_dtype(instruction.res.dtype)
+                ):
+                    # Program: ``c0 = abs(n - 5); return c0 + sum(ws)``
+                    # (fuzz p11_63, corpus c420).  Wrong record: ``Abs``
+                    # was spelled ``fabs`` into a double local whatever its
+                    # dtype, and the int64 result slot took that double's
+                    # bits: 21 came back as 4620693217682128909.  Rule: an
+                    # integer ``Abs`` is integer magnitude in the result's
+                    # own type, as the LLVM lane spells it (negation wraps
+                    # through the unsigned type, as LLVM's ``sub`` does).
+                    kind = _scalar_c_type(instruction.res.dtype)
+                    declared_storage_type = kind
+                    integer_ids.add(result_id)
+                    declared = (
+                        f"const {kind} t{result_id} = "
+                        f"(({args[0]}) < 0 ? ({kind})(0 - "
+                        f"({_unsigned_c_type(instruction.res.dtype)})"
+                        f"({args[0]})) : ({args[0]}));"
+                    )
                 elif op.casefold() in _UNARY_FOLDED and len(args) == 1:
                     declared_storage_type = "double"
                     declared = (
