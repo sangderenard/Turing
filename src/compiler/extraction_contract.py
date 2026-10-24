@@ -740,6 +740,23 @@ class ProgramABIValueBinding:
         return receipt
 
 
+def binding_names_function(
+    pattern: str, function_name: str, method_owner: str | None = None,
+) -> bool:
+    """Whether a contract binding's ``function`` pattern names this function.
+
+    A method is named either bare (``_value``) or qualified by its owning
+    class (``SSAReferenceEvaluator._value``); the qualified spelling is the
+    only one that does not also select every same-named function elsewhere.
+    """
+
+    if fnmatchcase(str(function_name), str(pattern)):
+        return True
+    return method_owner is not None and fnmatchcase(
+        f"{method_owner}.{function_name}", str(pattern)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramABIContract:
     """Typed host/native boundary independent of Python object identity."""
@@ -1004,7 +1021,9 @@ class ProgramABIContract:
     ) -> dict[str, ProgramABIRecord]:
         result = {}
         for binding in self.bindings:
-            if fnmatchcase(str(function_name), binding.function):
+            if binding_names_function(
+                binding.function, function_name, method_owner,
+            ):
                 result[binding.parameter] = self.records[binding.record]
         # An instance method's receiver already has an exact source-level
         # class identity.  Let that identity select the matching record ABI
@@ -1032,11 +1051,13 @@ class ProgramABIContract:
         return result
 
     def values_for_function(
-        self, function_name: str,
+        self, function_name: str, *, method_owner: str | None = None,
     ) -> dict[str, ProgramABIValueBinding]:
         result = {}
         for binding in self.values:
-            if fnmatchcase(str(function_name), binding.function):
+            if binding_names_function(
+                binding.function, function_name, method_owner,
+            ):
                 result[binding.parameter] = binding
         return result
 

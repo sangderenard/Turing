@@ -4764,6 +4764,8 @@ def _record_receipts_for_function(
     one declared record has that class identity.
     """
 
+    from .extraction_contract import binding_names_function
+
     parameter_names = set(map(str, parameters))
     records = dict(program_abi.get("records") or {})
     selected: dict[str, Mapping[str, Any]] = {}
@@ -4772,7 +4774,10 @@ def _record_receipts_for_function(
         record_name = str(binding.get("record") or "")
         if (
             parameter in parameter_names
-            and fnmatchcase(str(function_name), str(binding.get("function") or ""))
+            and binding_names_function(
+                str(binding.get("function") or ""), function_name,
+                method_owner,
+            )
             and record_name in records
         ):
             selected[parameter] = records[record_name]
@@ -21653,6 +21658,8 @@ def _class_surface_ssa_program(
             contract["python_types"] = ordered
             contract.pop("python_type", None)
 
+    from .extraction_contract import binding_names_function
+
     planned_graphs_by_shell: dict[int, Any] = {}
     for planned_shell in planned_shells:
         planned_graph = getattr(
@@ -21664,15 +21671,27 @@ def _class_surface_ssa_program(
         function_name = planned_graph.graph.get("function_name")
         if function_name is None:
             continue
-        if program_abi and not planned_graph.graph.get("parameter_record_abi"):
-            selected = _record_receipts_for_function(
-                program_abi,
-                str(function_name),
-                planned_graph.graph.get("function_parameters") or (),
-                method_owner=planned_graph.graph.get("method_owner"),
+        if program_abi:
+            # Fill each parameter the contract or the receiver's class names
+            # and no earlier view already holds.  An explicit binding for one
+            # parameter must not cost the receiver its class record.
+            incumbent_records = dict(
+                planned_graph.graph.get("parameter_record_abi") or {}
             )
+            selected = {
+                parameter: record
+                for parameter, record in _record_receipts_for_function(
+                    program_abi,
+                    str(function_name),
+                    planned_graph.graph.get("function_parameters") or (),
+                    method_owner=planned_graph.graph.get("method_owner"),
+                ).items()
+                if parameter not in incumbent_records
+            }
             if selected:
-                planned_graph.graph["parameter_record_abi"] = selected
+                planned_graph.graph["parameter_record_abi"] = {
+                    **incumbent_records, **selected,
+                }
         _lower_optional_record_presence_graph(planned_graph)
         if program_abi and not planned_graph.graph.get("parameter_value_abi"):
             value_bindings = _contract_input_binding_names(planned_graph)
@@ -21680,8 +21699,9 @@ def _class_surface_ssa_program(
                 str(binding.get("parameter")): dict(binding)
                 for binding in tuple(program_abi.get("values") or ())
                 if str(binding.get("parameter") or "") in value_bindings
-                and fnmatchcase(
-                    str(function_name), str(binding.get("function") or "")
+                and binding_names_function(
+                    str(binding.get("function") or ""), str(function_name),
+                    planned_graph.graph.get("method_owner"),
                 )
             }
             if selected_values:
@@ -24645,15 +24665,27 @@ def _class_surface_ssa_program(
                                 for parent, _role in _related.get("parents") or ()
                             )
                         _frontier = _next_frontier
-        if program_abi and not graph_obj.graph.get("parameter_record_abi"):
-            selected = _record_receipts_for_function(
-                program_abi,
-                str(function_name),
-                graph_obj.graph.get("function_parameters") or (),
-                method_owner=graph_obj.graph.get("method_owner"),
+        if program_abi:
+            # Fill each parameter the contract or the receiver's class names
+            # and no earlier view already holds.  An explicit binding for one
+            # parameter must not cost the receiver its class record.
+            incumbent_records = dict(
+                graph_obj.graph.get("parameter_record_abi") or {}
             )
+            selected = {
+                parameter: record
+                for parameter, record in _record_receipts_for_function(
+                    program_abi,
+                    str(function_name),
+                    graph_obj.graph.get("function_parameters") or (),
+                    method_owner=graph_obj.graph.get("method_owner"),
+                ).items()
+                if parameter not in incumbent_records
+            }
             if selected:
-                graph_obj.graph["parameter_record_abi"] = selected
+                graph_obj.graph["parameter_record_abi"] = {
+                    **incumbent_records, **selected,
+                }
         from .glsl_deployment_strategy import (
             _repair_missing_phi_initial_identities,
         )
@@ -59918,7 +59950,8 @@ def _lower_ast_source_to_ssa_impl(
                 {}
                 if extraction_policy is None else
                 extraction_policy.program_abi.values_for_function(
-                    function_name
+                    function_name,
+                    method_owner=function_graph.graph.get("method_owner"),
                 )
             )
             value_bindings = _contract_input_binding_names(function_graph)
@@ -60069,7 +60102,8 @@ def _lower_ast_source_to_ssa_impl(
                 {}
                 if extraction_policy is None else
                 extraction_policy.program_abi.values_for_function(
-                    function_name
+                    function_name,
+                    method_owner=function_graph.graph.get("method_owner"),
                 )
             )
             value_bindings = _contract_input_binding_names(function_graph)
