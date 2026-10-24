@@ -24042,7 +24042,7 @@ def _mutated_sequence_node_ids(
                                      if str(role) == "base")
     if include_merge_aliases:
         # Program: ``rep = [1]; if k > 2: rep = [k, 1, 2]`` then
-        # ``sum(rep)`` (corpus c396).  Wrong record: the branch copies its
+        # ``sum(rep)`` (corpus c442).  Wrong record: the branch copies its
         # list into the initial list's storage (``carried_sequence_
         # aliases``), which no mutation record names, so ``sum`` unrolled
         # over the initial display's one member (3 for 6, silently).  Rule:

@@ -2303,7 +2303,7 @@ def _static_sequence_capacity_survey(
         if parent in local_replications
     }
     # Program: ``rep = [9]; if k > 2: rep = [k, 1, 2]`` then ``len(rep)``
-    # (corpus c392).  Wrong record: a list rebound on a branch is carried by
+    # (corpus c440).  Wrong record: a list rebound on a branch is carried by
     # copying the arm's list into the initial list's storage
     # (``carried_sequence_aliases``), but that copy is no mutation this
     # survey reads, so ``[]`` kept the bound of its own display, the copy
@@ -2778,7 +2778,7 @@ def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
     """Whether a list merge is one branch rebinding its initial list.
 
     Program: the tire's ``metrics.unresolved_report = list(lines)`` on one
-    branch of ``step_with_dt_control_used`` (corpus c392).  Such a merge
+    branch of ``step_with_dt_control_used`` (corpus c440).  Such a merge
     (an ``aggregate_phi`` whose other arm is its initial list) is carried
     by the conditional, which copies the arm into the initial list's
     storage (``carried_sequence_aliases``); the merge names that storage.
@@ -2998,7 +2998,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             if not layout_members_of(layout):
                 # Program: the tire's ``metrics.unresolved_report =
                 # list(lines)`` on one branch of
-                # ``step_with_dt_control_used`` (corpus c392).  A list
+                # ``step_with_dt_control_used`` (corpus c440).  A list
                 # rebound on one branch, the other keeping its initial
                 # list, is carried by the conditional: it copies the arm
                 # into the initial list's storage (``carried_sequence_
