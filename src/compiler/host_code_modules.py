@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from .cpython_compile_ssa import (
     NativeCompileSSAResult,
+    lift_elf_export_to_ssa,
     lift_pe_export_to_ssa,
 )
 from .binary_ingestion import parse_pe_image
@@ -372,11 +373,53 @@ def register_host_code_resolver(
         _HOST_RESOLVERS.append(resolver)
 
 
+class _DlInfo(ctypes.Structure):
+    _fields_ = [
+        ("dli_fname", ctypes.c_char_p), ("dli_fbase", ctypes.c_void_p),
+        ("dli_sname", ctypes.c_char_p), ("dli_saddr", ctypes.c_void_p),
+    ]
+
+
+def _loaded_elf_image(address: int) -> tuple[Path, int] | None:
+    """The file and mapping base of the loaded ELF image holding ``address``.
+
+    This is the image the running interpreter executes, which is not always
+    a libpython: Debian's ``python3`` links CPython into the executable.
+    """
+
+    try:
+        dladdr = ctypes.CDLL(None).dladdr
+    except (AttributeError, OSError):
+        return None
+    dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(_DlInfo)]
+    dladdr.restype = ctypes.c_int
+    info = _DlInfo()
+    if not dladdr(ctypes.c_void_p(int(address)), ctypes.byref(info)):
+        return None
+    if not info.dli_fname or info.dli_fbase is None:
+        return None
+    name = os.fsdecode(info.dli_fname)
+    # glibc names the main program by its argv[0].
+    path = Path(name if "/" in name else "/proc/self/exe").resolve()
+    return (path, int(info.dli_fbase)) if path.is_file() else None
+
+
 def _cpython_builtin_resolver(value: Any) -> HostCodeIdentity | None:
     """Resolve CPython builtins to their stable exported implementation ABI."""
 
     if value is not compile:
         return None
+    if sys.platform != "win32":
+        try:
+            address = ctypes.cast(
+                ctypes.pythonapi.Py_CompileString, ctypes.c_void_p,
+            ).value
+        except AttributeError:
+            return None
+        loaded = None if address is None else _loaded_elf_image(int(address))
+        if loaded is None:
+            return None
+        return HostCodeIdentity("cpython-elf", loaded[0], "Py_CompileString")
     path = (
         Path(sys.executable).resolve().parent
         / f"python{sys.version_info.major}{sys.version_info.minor}.dll"
@@ -395,7 +438,7 @@ def _cpython_pycfunction_resolver(value: Any) -> HostCodeIdentity | None:
     if not callable(value) or inspect.isfunction(value):
         return None
     if sys.platform != "win32":
-        return None
+        return _cpython_elf_pycfunction_identity(value)
     try:
         get_function = ctypes.pythonapi.PyCFunction_GetFunction
         get_function.argtypes = [ctypes.py_object]
@@ -429,6 +472,43 @@ def _cpython_pycfunction_resolver(value: Any) -> HostCodeIdentity | None:
     qualname = str(getattr(value, "__qualname__", getattr(value, "__name__", "builtin")))
     return HostCodeIdentity(
         "cpython-pycfunction", path, f"{module}.{qualname}", int(entry_rva),
+        f"cpython-pycfunction-flags:{flags:#x}",
+    )
+
+
+def _cpython_elf_pycfunction_identity(value: Any) -> HostCodeIdentity | None:
+    """The ELF counterpart of the PE ``ml_meth`` resolution above."""
+
+    from .elf_ingestion import parse_elf_image
+
+    try:
+        get_function = ctypes.pythonapi.PyCFunction_GetFunction
+        get_function.argtypes = [ctypes.py_object]
+        get_function.restype = ctypes.c_void_p
+        get_flags = ctypes.pythonapi.PyCFunction_GetFlags
+        get_flags.argtypes = [ctypes.py_object]
+        get_flags.restype = ctypes.c_int
+        address = int(get_function(value) or 0)
+        flags = int(get_flags(value))
+    except (AttributeError, ctypes.ArgumentError, SystemError, TypeError, ValueError):
+        return None
+    if not address:
+        return None
+    loaded = _loaded_elf_image(address)
+    if loaded is None:
+        return None
+    path, mapped_base = loaded
+    try:
+        image = parse_elf_image(path.read_bytes())
+    except (OSError, ValueError):
+        return None
+    entry_rva = image.rva_for_loaded_address(address, mapped_base)
+    if image.runtime_function_for_rva(entry_rva) is None:
+        return None
+    module = str(getattr(value, "__module__", "builtins"))
+    qualname = str(getattr(value, "__qualname__", getattr(value, "__name__", "builtin")))
+    return HostCodeIdentity(
+        "cpython-elf-pycfunction", path, f"{module}.{qualname}", int(entry_rva),
         f"cpython-pycfunction-flags:{flags:#x}",
     )
 
@@ -644,11 +724,15 @@ def _extract_host_code_identity(
                 identity, legacy_result, key, cache_path, True,
             )
 
-    if identity.provider not in {
+    if identity.provider in {"cpython-elf", "cpython-elf-pycfunction"}:
+        lift = lift_elf_export_to_ssa
+    elif identity.provider in {
         "cpython-pe", "cpython-pycfunction", "pe-export", "pe-dependency",
     }:
+        lift = lift_pe_export_to_ssa
+    else:
         raise ValueError(f"unknown host-code provider {identity.provider!r}")
-    result = lift_pe_export_to_ssa(
+    result = lift(
         identity.module_path,
         root_symbol=identity.symbol,
         root_rva=identity.entry_rva,
