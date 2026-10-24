@@ -431,7 +431,9 @@ class _StructuredX86Lifter:
         self.instructions: list[Instr] = []
         self.argument_names = list(str(item) for item in argument_names)
         for register in registers:
-            value = self.fresh()
+            # A formal is the whole live-in register; its 64 bits are what
+            # every 64-bit read of it sees.
+            value = self.fresh(dtype="int64")
             self.args.append(value)
             self.registers[register] = value
         self.argument_registers = list(registers)

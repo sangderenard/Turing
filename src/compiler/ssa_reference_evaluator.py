@@ -202,6 +202,131 @@ if _INVENTED:
     )
 
 
+# -- lifted machine code ---------------------------------------------------
+#
+# A function that declares ``machine_state_model`` was lifted from machine
+# code (machine_code_lifting).  Its integer values are fixed-width bit
+# patterns read from each value's ``intN`` dtype, which is how the C and
+# Fortran backends already render these spellings on integers: ``And`` is a
+# bitwise AND modulo 2**N, ``Trunc`` keeps the low bits of the result width,
+# ``Shr`` is the logical shift the lifter emits for SHR (``AShr`` is SAR).
+# The Python frontend's meanings above (logical ``And``, float ``Trunc``) do
+# not apply to such a function, and its machine names are the IR registry's
+# own handlers, audited below.
+_MACHINE_INTEGER_OPERATIONS = frozenset({
+    "Const", "Cast", "Trunc", "ZExt", "SExt",
+    "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "AShr",
+    "Eq", "Ne", "ULt", "ULe", "LNot", "LAnd", "LOr", "Select",
+    "SMulLow", "SMulHigh", "SMulOverflow", "UMulLow", "UMulHigh",
+})
+
+
+def _audit_machine_vocabulary() -> None:
+    from ..transmogrifier.ssa_registry import Handler
+
+    unknown = _MACHINE_INTEGER_OPERATIONS - {item.value for item in Handler}
+    if unknown:
+        raise ImportError(
+            "ssa_reference_evaluator gives machine semantics to names the IR "
+            f"registry does not define: {sorted(unknown)}"
+        )
+
+
+_audit_machine_vocabulary()
+
+
+def _machine_width(dtype: Any) -> int | None:
+    text = str(dtype)
+    if text == "bool":
+        return None
+    if text.startswith("int") and text[3:].isdigit():
+        return int(text[3:])
+    raise SSAEvaluationError(f"no machine integer width for dtype {text!r}")
+
+
+def _machine_typed(value: Any, dtype: Any) -> int | bool:
+    width = _machine_width(dtype)
+    if width is None:
+        return bool(value)
+    return int(value) & ((1 << width) - 1)
+
+
+def _machine_signed(value: int, width: int) -> int:
+    value &= (1 << width) - 1
+    return value - (1 << width) if value >> (width - 1) & 1 else value
+
+
+def _machine_integer_value(
+    function: Any, instruction: Any, values: Mapping[int, Any],
+) -> int | bool:
+    op = str(instruction.op)
+    attributes = instruction.attributes or {}
+    result = instruction.res
+    args = [values[int(item.id)] for item in instruction.args]
+    arg_dtypes = [str(item.dtype) for item in instruction.args]
+    width = _machine_width(result.dtype)
+    if op == "Const":
+        return _machine_typed(attributes["value"], result.dtype)
+    if op in {"Cast", "Trunc"}:
+        return _machine_typed(args[0], result.dtype)
+    if op in {"ZExt", "SExt"}:
+        source = int(attributes.get("from_width") or _machine_width(arg_dtypes[0]))
+        value = int(args[0]) & ((1 << source) - 1)
+        if op == "SExt":
+            value = _machine_signed(value, source)
+        return _machine_typed(value, result.dtype)
+    if op in {"And", "Or", "Xor"} and width is None:
+        left, right = bool(args[0]), bool(args[1])
+        return {"And": left and right, "Or": left or right, "Xor": left != right}[op]
+    if op in {"Add", "Sub", "Mul", "And", "Or", "Xor"}:
+        left, right = int(args[0]), int(args[1])
+        raw = {
+            "Add": left + right, "Sub": left - right, "Mul": left * right,
+            "And": left & right, "Or": left | right, "Xor": left ^ right,
+        }[op]
+        return raw & ((1 << width) - 1)
+    if op in {"Shl", "Shr", "AShr"}:
+        value, count = int(args[0]), int(args[1])
+        mask = (1 << width) - 1
+        if op == "Shl":
+            return (value << count) & mask
+        if op == "Shr":
+            return ((value & mask) >> count) & mask
+        return (_machine_signed(value, width) >> count) & mask
+    if op in {"Eq", "Ne"} and all(item == "bool" for item in arg_dtypes):
+        return (bool(args[0]) == bool(args[1])) is (op == "Eq")
+    if op in {"Eq", "Ne", "ULt", "ULe"}:
+        widths = [_machine_width(item) for item in arg_dtypes]
+        if None in widths:
+            raise SSAEvaluationError(
+                f"{function.name}: {op} compares a bool with an integer"
+            )
+        mask = (1 << max(widths)) - 1
+        left, right = int(args[0]) & mask, int(args[1]) & mask
+        return {"Eq": left == right, "Ne": left != right,
+                "ULt": left < right, "ULe": left <= right}[op]
+    if op == "LNot":
+        return not bool(args[0])
+    if op in {"LAnd", "LOr"}:
+        left, right = bool(args[0]), bool(args[1])
+        return (left and right) if op == "LAnd" else (left or right)
+    if op == "Select":
+        return _machine_typed(args[1] if bool(args[0]) else args[2], result.dtype)
+    # The fixed-width multiply halves: their ``width`` attribute is the
+    # operand width, independent of the result dtype.
+    bits = int(attributes["width"])
+    if op.startswith("S"):
+        product = _machine_signed(int(args[0]), bits) * _machine_signed(int(args[1]), bits)
+    else:
+        product = (int(args[0]) & ((1 << bits) - 1)) * (int(args[1]) & ((1 << bits) - 1))
+    low = product & ((1 << bits) - 1)
+    if op.endswith("Low"):
+        return _machine_typed(low, result.dtype)
+    if op.endswith("High"):
+        return _machine_typed(product >> bits, result.dtype)
+    return product != _machine_signed(low, bits)
+
+
 def _declared_formal_names(function: Any) -> dict[str, int]:
     """Formal name -> position, from whichever record the function carries.
 
@@ -447,6 +572,15 @@ class SSAReferenceEvaluator:
                 operation = str(instruction.op)
 
                 if operation in {"Br", "br"}:
+                    if "target" not in instruction.attributes:
+                        # A lifted direct jump into another function hands
+                        # it the live machine state, which no Br carries.
+                        raise SSAEvaluationError(
+                            f"{function.name}: Br has no target block "
+                            f"(machine transfer to "
+                            f"{instruction.attributes.get('target_address')!r} "
+                            "needs machine address linking)"
+                        )
                     next_block = str(instruction.attributes.get("target"))
                     break
                 if operation in {"CondBr", "condbr"}:
@@ -523,6 +657,21 @@ class SSAReferenceEvaluator:
     ) -> None:
         operation = self._operation_name(instruction)
         result = instruction.res
+
+        if (getattr(function, "metadata", None) or {}).get(
+            "machine_state_model",
+        ) is not None:
+            if operation in _MACHINE_INTEGER_OPERATIONS:
+                values[int(result.id)] = _machine_integer_value(
+                    function, instruction, values,
+                )
+                return
+            if operation not in {"Phi", "phi"}:
+                raise SSAEvaluationError(
+                    f"{function.name}: no machine semantics for "
+                    f"{operation!r} in lifted code. Add it deliberately "
+                    "rather than letting the evaluator guess."
+                )
 
         if operation in {"Const", "const"}:
             attributes = instruction.attributes
