@@ -19989,9 +19989,26 @@ def _propagate_callsite_tensor_specializations(
     round_index = 0
     seen_round_states: dict[str, int] = {}
 
+    # Function-table graphs this loop has written planner descriptors to.
+    # Program: ``entry`` calls ``t.red(n > 1)`` and ``red`` is not one of
+    # ``graphs`` (corpus c469 shape).  Wrong record: the round published
+    # ``red``'s ``flag`` descriptor (``changed`` True) but the digest read
+    # only ``graphs``, so the state equalled the seed state: "repeated a
+    # completed state at round 1".  Rule: a graph the loop writes is part of
+    # the state the guard reads.
+    published_callee_graphs: dict[int, Any] = {}
+
     def specialization_state() -> tuple[str, int]:
         facts = []
         tensor_fact_count = 0
+        for item in published_callee_graphs.values():
+            if any(item.G is graph.G for graph in graphs):
+                continue
+            facts.append((
+                str(item.G.graph.get("function_name") or ""),
+                "callee-planner",
+                repr(item.G.graph.get("planner_tensor_descriptors") or {}),
+            ))
         for item in graphs:
             function_name = str(item.G.graph.get("function_name") or "")
             planner = item.G.graph.get("planner_tensor_descriptors") or {}
@@ -20731,6 +20748,7 @@ def _propagate_callsite_tensor_specializations(
             if not additions:
                 continue
             existing.update(copy.deepcopy(additions))
+            published_callee_graphs.setdefault(id(callee.G), callee)
             _apply_callsite_tensor_descriptors(callee, additions)
             # The catalogue graph is shared by every callsite.  A tensor
             # descriptor alone is not a complete structural specialization:
