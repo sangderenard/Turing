@@ -199,7 +199,12 @@ def test_emitted_program_fuses_intermediates_into_locals():
         3,
     )
     src = emit_program_source(program)
-    assert src.count("buffer") == 1          # one shared arena, no temporary SSBOs
+    # One shared data arena, no temporary SSBOs; the only other storage
+    # blocks are the two read-only launch-control tables.
+    assert src.count(" buffer ") == 3
+    assert "buffer Arena" in src
+    assert "readonly buffer TuringLaunchSlots" in src
+    assert "readonly buffer TuringLaunchExtents" in src
     assert "float s2 = s0 + s1;" in src
     assert "float s3 = exp(s2);" in src
     assert "arena[u_slot[2] + (gid)] = floatBitsToUint(s3);" in src

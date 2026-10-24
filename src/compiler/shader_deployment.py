@@ -284,10 +284,11 @@ def glsl_compute_deployment(component: Any) -> ShaderDeployment:
     """The arena launch contract of a desktop GLSL compute component.
 
     ``compose_shader`` declares one std430 ``Arena`` of ``uint`` words and
-    three default-block controls; ``_bind_arena`` and ``_dispatch_many`` set
-    them: ``u_count`` and ``u_extent[0]`` to the dispatch's element count,
-    and ``u_slot[i]`` to the arena word offset of port ``i`` (feeds, then
-    outputs). Each port is therefore a view at ``4 * u_slot[i]`` bytes.
+    two read-only std430 control blocks; ``_bind_launch_controls`` fills
+    them: ``u_slot[i]`` (``TuringLaunchSlots``) is the arena word offset of
+    port ``i`` (feeds, then outputs), and ``u_count`` then ``u_extent[0]``
+    (``TuringLaunchExtents``) are the dispatch's element count. Each port is
+    therefore a view at ``4 * u_slot[i]`` bytes.
     """
 
     abi = component.component_abi
@@ -341,16 +342,38 @@ def glsl_compute_deployment(component: Any) -> ShaderDeployment:
         byte_extent=None,
     )
     port_count = len(abi.ports)
+    slot_binding = int(abi.decorations["launch_slot_binding"])
+    extent_binding = int(abi.decorations["launch_extent_binding"])
+    operations = 1  # a component is one composed elementwise operation
+    control_resources = (
+        PhysicalResource(
+            name="TuringLaunchSlots", kind="storage-buffer", access="read",
+            layout="std430", dtype="u32", element_bytes=4,
+            set=0, binding=slot_binding, realizes=(),
+            byte_extent=4 * port_count,
+        ),
+        PhysicalResource(
+            name="TuringLaunchExtents", kind="storage-buffer", access="read",
+            layout="std430", dtype="u32", element_bytes=4,
+            set=0, binding=extent_binding, realizes=(),
+            byte_extent=4 * (1 + operations),
+        ),
+    )
     controls = (
-        LaunchControl("u_count", "default-uniform", "u32", ({"rule": "element_count"},)),
         LaunchControl(
-            "u_extent", "default-uniform", "u32",
-            ({"rule": "element_count", "operation": 0},),
+            "u_count", "storage-buffer", "u32", ({"rule": "element_count"},),
+            binding=extent_binding, byte_offset=0,
         ),
         LaunchControl(
-            "u_slot", "default-uniform", "u32",
+            "u_extent", "storage-buffer", "u32",
+            ({"rule": "element_count", "operation": 0},),
+            binding=extent_binding, byte_offset=4,
+        ),
+        LaunchControl(
+            "u_slot", "storage-buffer", "u32",
             tuple({"rule": "arena_word_offset", "port_slot": slot}
                   for slot in range(port_count)),
+            binding=slot_binding, byte_offset=0,
         ),
     )
     local = (int(component.local_size), 1, 1)
@@ -388,25 +411,24 @@ def glsl_compute_deployment(component: Any) -> ShaderDeployment:
         },
         controls=controls,
     )
-    shortfalls = [
-        Shortfall(
-            "vulkan-default-uniform-controls",
-            "u_count, u_extent and u_slot are default-block uniforms. GLSL for "
-            "a Vulkan client requires them in a uniform block or push "
-            "constants, so this source compiles for an OpenGL client only.",
-        ),
-    ]
     return ShaderDeployment(
         component_id=abi.component_id,
         product_kind=SHADER_SOURCE,
         language=abi.language,
         version=version, profile=profile,
         stage=abi.stage, entrypoint=abi.entrypoint,
-        target={"client": "opengl", "environment": "opengl4.3", "spirv_version": None},
-        resources=(arena,),
+        target={
+            "client": "opengl", "environment": "opengl4.3", "spirv_version": None,
+            # Every resource is a storage block in set 0 at bindings 0..2,
+            # so the same source also compiles as GLSL for Vulkan.
+            "clients": [
+                {"client": "opengl", "environment": "opengl4.3", "spirv_version": None},
+                {"client": "vulkan", "environment": "vulkan1.1", "spirv_version": "1.3"},
+            ],
+        },
+        resources=(arena, *control_resources),
         launch=launch,
         provenance={"emitter": "glsl_component_backend.emit_glsl_compute_component"},
-        shortfalls=tuple(shortfalls),
     )
 
 
