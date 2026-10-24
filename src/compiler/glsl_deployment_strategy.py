@@ -23231,17 +23231,25 @@ def _tensor_descriptor_rule(
                             "rank": next(iter(ranks)),
                             "metadata_state": "dynamic",
                         }
-                    return {
-                        "shape": (),
-                        "dtype": "unknown",
-                        "rank": max(
-                            max(ranks),
-                            *(len(tuple(side.get("shape") or ()))
-                              for side in sides if side is not None),
-                        ),
-                        "metadata_state": "dynamic",
-                        "unsettled_broadcast": True,
-                    }
+                    # Settled runtime spans of different ranks need a runtime
+                    # broadcast law this pass does not state: unsettled,
+                    # never the scalar default.  A side that is not settled
+                    # yet (None), or a runtime span beside a static one,
+                    # falls through: a callee's span is runtime-sized only
+                    # until its callsite specialization states the shape,
+                    # and answering it here instead made that fixed point
+                    # oscillate (test_aggregate_call_identity, history
+                    # tuple; main 6058d247).
+                    if len(ranks) > 1 and all(
+                        side is not None for side in sides
+                    ):
+                        return {
+                            "shape": (),
+                            "dtype": "unknown",
+                            "rank": max(ranks),
+                            "metadata_state": "dynamic",
+                            "unsettled_broadcast": True,
+                        }
         if operation in {"zeros", "ones", "empty", "full"}:
             shape_source = next((
                 int(parent)

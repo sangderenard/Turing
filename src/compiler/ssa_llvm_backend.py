@@ -4430,6 +4430,19 @@ def _emit_repository_call_module(
                 # trip count, so its own extents must agree at run time.  A
                 # runtime broadcast is not stated by the planner's law; a
                 # mismatch raises (77) instead of reading past a buffer.
+                if _runtime_sized_span(result) and any(
+                    _declared_span_rank(argument) not in {
+                        0, _declared_span_rank(result),
+                    }
+                    for argument in instruction.args
+                ):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"elementwise {operation} over runtime-sized span "
+                        f"%t{result_id} mixes operand ranks; a runtime "
+                        "broadcast is not stated",
+                    ))
+                    continue
                 extent_operand = _elementwise_extent_operand(instruction)
                 checked = [
                     argument for argument in instruction.args
