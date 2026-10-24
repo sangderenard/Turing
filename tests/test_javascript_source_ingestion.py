@@ -176,3 +176,35 @@ def test_sibling_loops_may_declare_the_same_counter():
         "{ let t = 1; s += t; } { let t = 2; s += t; } return s; }"
     )
     assert check_program(source, "[[0], [3], [NaN]]") == "PASS"
+
+
+SPECIAL_PAIRS = (
+    "[[5, 3], [-5, 3], [5, -3], [-0, 3], [0, -3], [5, 0], [NaN, 1], [1, NaN], "
+    "[Infinity, 2], [2, Infinity], [-2, -Infinity], [-0, -0], [0, -0], [-0, 0]]"
+)
+
+
+@needs_node
+@pytest.mark.parametrize("expression", [
+    # Truncated remainder with the dividend's sign; Mod alone is floored.
+    "a % b",
+    # NaN wins and equal zeros order +0 above -0; a ternary or fmax does not.
+    "Math.max(a, b)", "Math.min(a, b)", "Math.min(b, a)",
+    # +-0 and NaN come back unchanged.
+    "Math.sign(a)",
+])
+def test_remainder_and_math_extrema_are_exact_against_node(expression):
+    source = (
+        "/** @param {number} a @param {number} b */ "
+        f"function root(a, b) {{ return {expression}; }}"
+    )
+    assert check_program(source, SPECIAL_PAIRS) == "PASS"
+
+
+@needs_node
+@pytest.mark.parametrize("source", [
+    "/** @param {boolean} p @param {number} b */ function root(p, b) { return p % b; }",
+    "/** @param {number} a */ function root(a) { return Math.max(a, a, 1); }",
+])
+def test_remainder_of_a_boolean_and_variadic_max_stay_loud_refusals(source):
+    assert not lower_javascript_source_to_ssa(source).complete
