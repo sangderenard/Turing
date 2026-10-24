@@ -1697,6 +1697,29 @@ def _indexed_store_source(graph: Any, value_id: Any) -> Any:
     return value_id
 
 
+def _is_row_collection(graph: Any, value_id: Any) -> bool:
+    """Whether a subscript base is a list or dict, which takes no array mask.
+
+    Program: ``def bump(xs: list[int], n): for i in range(4): xs[i % 2] +=
+    n`` with the caller reading its own list (corpus c375).  Wrong record:
+    the annotated formal has no concorded class during reduction, so the
+    masked-update rule rebound ``xs`` to a ``where`` value and the caller's
+    list never changed (13 for -53, silently).  Rule: besides the concorded
+    class, the formal's ``aggregate_kind`` (from its annotation) says it is
+    a list.
+    """
+
+    target = getattr(graph, "G", graph)
+    if _resolved_source_value_class(graph, value_id)[0] in {
+        "builtins.list", "builtins.dict",
+    }:
+        return True
+    if not isinstance(value_id, int) or value_id not in target:
+        return False
+    attributes = target.nodes[value_id].get("attributes") or {}
+    return attributes.get("aggregate_kind") in {"list", "dict"}
+
+
 def _concorded_numeric_descriptor(
     graph: Any, value_id: Any,
 ) -> NumericFeatureDescriptor | None:
@@ -13161,15 +13184,24 @@ def _normalize_lexical_values(
                 # dict takes no array mask, so its subscript is one row.  A
                 # base already stored into is read through the stores'
                 # ``base`` edges to the sequence that carries the class.
-                and _resolved_source_value_class(
-                    graph,
-                    _indexed_store_source(
-                        graph,
-                        environment.get(body_statement.target.value.id),
+                # A formal not yet read has no Input; its annotation's
+                # aggregate kind (the record its Input is built from) says.
+                and not (
+                    isinstance(body_statement.target.value, ast.Name)
+                    and (
+                        _is_row_collection(graph, _indexed_store_source(
+                            graph,
+                            environment.get(body_statement.target.value.id),
+                        ))
+                        or (
+                            environment.get(body_statement.target.value.id)
+                            is None
+                            and parameter_aggregate_kinds.get(
+                                body_statement.target.value.id
+                            ) in {"list", "dict"}
+                        )
                     )
-                    if isinstance(body_statement.target.value, ast.Name)
-                    else None,
-                )[0] not in {"builtins.list", "builtins.dict"}
+                )
                 and not all(
                     isinstance(item, ast.Slice)
                     or (
