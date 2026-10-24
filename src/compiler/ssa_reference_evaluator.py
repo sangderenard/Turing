@@ -213,7 +213,8 @@ if _INVENTED:
 # patterns read from each value's ``intN`` dtype, which is how the C and
 # Fortran backends already render these spellings on integers: ``And`` is a
 # bitwise AND modulo 2**N, ``Trunc`` keeps the low bits of the result width,
-# ``Shr`` is the logical shift the lifter emits for SHR (``AShr`` is SAR).
+# ``LShr`` is the logical shift the lifter emits for SHR (``AShr`` is SAR);
+# ``Shr`` is the source ``>>`` and sign-fills like ``AShr``.
 # The Python frontend's meanings above (logical ``And``, float ``Trunc``) do
 # not apply to such a function, and its machine names are the IR registry's
 # own handlers, audited below.
@@ -232,7 +233,7 @@ if _INVENTED:
 # convention lets the callee change is clobbered: using one raises.
 _MACHINE_INTEGER_OPERATIONS = frozenset({
     "Const", "Cast", "Trunc", "ZExt", "SExt",
-    "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "AShr",
+    "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "AShr", "LShr",
     "Eq", "Ne", "ULt", "ULe", "LNot", "LAnd", "LOr", "Select",
     "SMulLow", "SMulHigh", "SMulOverflow", "UMulLow", "UMulHigh",
 })
@@ -308,12 +309,12 @@ def _machine_integer_value(
             "And": left & right, "Or": left | right, "Xor": left ^ right,
         }[op]
         return raw & ((1 << width) - 1)
-    if op in {"Shl", "Shr", "AShr"}:
+    if op in {"Shl", "Shr", "AShr", "LShr"}:
         value, count = int(args[0]), int(args[1])
         mask = (1 << width) - 1
         if op == "Shl":
             return (value << count) & mask
-        if op == "Shr":
+        if op == "LShr":
             return ((value & mask) >> count) & mask
         return (_machine_signed(value, width) >> count) & mask
     if op in {"Eq", "Ne"} and all(item == "bool" for item in arg_dtypes):
