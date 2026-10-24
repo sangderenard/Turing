@@ -1093,6 +1093,51 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
     def bool_constant(self, value: bool, source: DecodedInstruction) -> SSAValue:
         return self.constant(int(bool(value)), source, dtype="bool")
 
+    def attach_external_transfer_state(self) -> None:
+        """Give a block's transfer out of this function its machine state.
+
+        A jump to another function (a tail call, or a branch into another
+        region) hands over every register, the flags and the memory, as
+        IndirectBr does; the destination's own record then says what it
+        reads.  Transfers inside the function carry nothing.
+        """
+
+        if not self.instructions:
+            return
+        terminator = self.instructions[-1]
+        attributes = terminator.attributes
+        if terminator.op == Handler.Br.value:
+            external = "target" not in attributes and attributes.get(
+                "target_address",
+            ) is not None
+        elif terminator.op == Handler.CondBr.value:
+            external = bool(attributes.get("machine_external_control"))
+        else:
+            external = False
+        if not external:
+            return
+        state = [
+            self.memory,
+            *(self.value(register, None) for register in X86Register),
+            *(
+                self.vector_value(register, None)
+                for register in X86VectorRegister
+            ),
+            self.mxcsr_value(),
+            *(self.flag(flag) for flag in self._FLAG_NAMES),
+        ]
+        terminator.args.extend(state)
+        attributes["transfer_state_layout"] = (
+            "memory",
+            *(f"register.{register.name.lower()}" for register in X86Register),
+            *(
+                f"vector-register.{register.name.lower()}"
+                for register in X86VectorRegister
+            ),
+            "system.amd64.mxcsr",
+            *(f"flag.{flag.lower()}" for flag in self._FLAG_NAMES),
+        )
+
     def _bool(self, handler: Handler, args, source: DecodedInstruction, **attributes) -> SSAValue:
         return self.emit(handler, args, source, dtype="bool", **attributes)
 
@@ -1448,6 +1493,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                         "synthetic_machine_fallthrough": True,
                     },
                     ))
+            self.attach_external_transfer_state()
             blocks[label] = BasicBlock(
                 label, list(self.instructions), list(successors[label]),
             )
@@ -4463,13 +4509,35 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
         # Discover the vector-register slice before CFG state allocation so
         # loops and merges receive the same explicit XMM Phi treatment as
         # general registers. Unused XMM registers are not added to the ABI.
+        decoded_addresses = {item.address for item in self.decoded}
         for source in self.decoded:
             for operand in source.operands:
                 if isinstance(operand, VectorRegisterOperand):
                     self.initial_vector_value(operand.register)
-            if source.semantic is MachineSemanticToken.INDIRECT_JUMP:
+            if (
+                source.semantic in {
+                    MachineSemanticToken.DIRECT_RELATIVE_JUMP,
+                    MachineSemanticToken.CONDITIONAL_RELATIVE_JUMP,
+                }
+                and self._target(source) is not None
+                and self._target(source) not in decoded_addresses
+            ) or (
+                source.address + len(source.encoded)
+                in self.external_fallthrough_addresses
+            ):
+                # A transfer out of the function carries the complete state.
+                for register in X86VectorRegister:
+                    self.initial_vector_value(register)
+                self.initial_mxcsr_value()
+            if source.semantic in {
+                MachineSemanticToken.INDIRECT_JUMP,
+                MachineSemanticToken.DIRECT_RELATIVE_CALL,
+                MachineSemanticToken.INDIRECT_CALL,
+            }:
                 # IndirectBr exports a complete architectural continuation,
-                # including state not otherwise referenced in this region.
+                # including state not otherwise referenced in this region,
+                # and a Call carries the complete state and redefines the
+                # convention's vector registers, which later blocks see.
                 for register in X86VectorRegister:
                     self.initial_vector_value(register)
                 self.initial_mxcsr_value()
@@ -4743,6 +4811,7 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
                     Handler.Br.value, [], None,
                     attributes={"target": labels[0], "synthetic_machine_fallthrough": True},
                     ))
+            self.attach_external_transfer_state()
             blocks[label] = BasicBlock(label, list(self.instructions), list(successors[label]))
             states[label] = (
                 dict(self.registers), dict(self.vector_registers),
