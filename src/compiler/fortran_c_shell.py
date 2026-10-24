@@ -15187,10 +15187,12 @@ def _install_lexical_sequence_queries(
                 for parent, role in sequence_data.get("parents") or ()
                 if str(role) == "generators"
             ), None)
+        # A dict's or set's ``len`` is read at its call too: read inside a
+        # later region it saw the table after every delete authored between.
         local_list_truth = (
             expression.func.id in {"bool", "len"}
             and len(arguments) == 1
-            and sequence_attributes.get("aggregate_kind") in {"list", "tuple"}
+            and sequence_attributes.get("aggregate_kind") in {"list", "tuple", "dict", "set"}
             and sequence_attributes.get("producer_kind") in {"aggregate", "aggregate_materialization"}
             and (data.get("attributes") or {}).get("extraction_identity")
                 == f"builtins.{expression.func.id}"
@@ -27016,8 +27018,15 @@ def _class_surface_ssa_program(
         # control effect like a held append: a table-delete mutation placed
         # in its arm (synthesized from the retained conditional when the arm
         # has no region), so it runs exactly when and where its ``if`` does.
+        # Program: ``d1 = {1: n, 2: 3, 3: -1}; t = len(d1) + n; del d1[2]``,
+        # then ``len(d1) * 100 + t`` (silent lane, fuzz p136_20 family).
+        # Wrong record: an unconditional delete rode a region chosen by
+        # value-id order, but a graph built from demand numbers ``t``'s
+        # ``len`` after the delete, so ``t`` saw the shorter table (199 for
+        # 200), and a membership test guarding a branch ran before the
+        # delete (a deleted key read as present).  Rule: every keyed delete
+        # is an authored control effect, placed at its source position.
         from .control_source import ControlSequenceMutation
-        held_table_delete_ids = _held_table_delete_ids(graph)
         held_table_deletes = tuple(
             ControlSequenceMutation(
                 sequence_value_id=int(sequence_id),
@@ -27033,8 +27042,7 @@ def _class_surface_ssa_program(
                 ),
             )
             for effect_id, key, sequence_id, _storage in table_deletions
-            if int(effect_id) in held_table_delete_ids
-            and int(effect_id) in graph_obj
+            if int(effect_id) in graph_obj
             and sequence_id is not None
             and key != ()
         )

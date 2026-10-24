@@ -12184,7 +12184,37 @@ class _ControlSSABuilder(TiledObject):
         length = self.fresh_value(
             dtype="int64", transform=LOAD, operands=(length_address,),
         )
-        self.emit(Handler.Load, [length_address], length, attributes=attributes)
+        if (
+            query.operation in {"length", "truth"}
+            and descriptor.live_flags_value_id is not None
+        ):
+            # A table that retains deleted rows has the length of its live
+            # rows (the region-read rule in ``_read``); the length cell
+            # still counts the tombstones.
+            from .ir_sequence_tables import lower_sequence_live_length
+
+            helper_name = self._sequence_helper_name(
+                sequence_id, "live_length",
+            )
+            self._register_sequence_lowering(lower_sequence_live_length(
+                descriptor,
+                function_name=helper_name,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+            ))
+            self.emit(
+                Handler.Call, list(storage), length,
+                attributes={
+                    **attributes,
+                    "callee": helper_name,
+                    "source_linked": True,
+                    "ssa_sequence_operation": "live_length",
+                    "sequence_id": sequence_id,
+                },
+            )
+        else:
+            self.emit(
+                Handler.Load, [length_address], length, attributes=attributes,
+            )
         if query.operation == "any":
             preheader = self.current
             header = self.new_block("sequence_any_header")
