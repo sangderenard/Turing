@@ -568,6 +568,7 @@ EXTENDED5 = [
     (["xs{v} = [n, {a}, {b}]", "setfirst(xs{v}, {c})", "swap(xs{v})"], "xs{v}[0] * 100 + xs{v}[1] * 10 + xs{v}[2]"),
     (["d{v} = {{1: n, 2: {a}, 3: {b}}}", "t{v} = len(d{v}) + n", "del d{v}[{c} % 3 + 1]", "u{v} = d{v}[n % 4] if n % 4 in d{v} else t{v}"], "len(d{v}) * 100 + t{v} * 10 + u{v}"),
     (["s{v} = {{n, {a}, {b} + 10}}", "t{v} = len(s{v})", "s{v}.add(n + 20)"], "len(s{v}) * 10 + t{v}"),
+    (["r{v} = [{a}]", "if n > {c}:", "    r{v} = [n, {b}]", "r{v}.append({c})"], "sum(r{v}) * 100 + max(r{v}) * 10 + len(r{v})"),
 ]
 
 
