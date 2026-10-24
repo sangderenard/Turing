@@ -452,22 +452,23 @@ def validate_precompile_ssa_compatibility(
             ):
                 continue
             location = f"program:step[{index}]"
-            if (
-                step.op_name == "scatter"
-                and isinstance(step.attrs, dict)
-                and step.attrs.get("reduce", "sum") != "sum"
-            ):
-                # The step's reduction policy selects its semantics.  The
-                # existing scatter kernel implements only sum.
-                reduction = step.attrs["reduce"]
+            if step.op_name == "scatter" and isinstance(step.attrs, dict):
+                reduction = step.attrs.get("reduce", "sum")
+            else:
+                reduction = "sum"
+            if step.op_name == "scatter" and reduction not in {
+                "sum", "mean", "max", "min",
+            }:
                 policy_shortfalls.append(SSACompatibilityShortfall(
                     "scatter", 1, (location,),
-                    f"scatter reduce={reduction!r} has no matching repository SSA "
-                    "kernel; only reduce='sum' is currently implemented",
+                    f"scatter reduce={reduction!r} is not one of "
+                    "('sum', 'mean', 'max', 'min')",
                 ))
                 continue
-            compatibility_name = ssa_compatibility_name_for_precompile(
-                step.op_name
+            compatibility_name = (
+                f"Call[scatter_{reduction}_double]"
+                if step.op_name == "scatter"
+                else ssa_compatibility_name_for_precompile(step.op_name)
             )
             if compatibility_name is None:
                 shortfall_locations.setdefault(step.op_name, []).append(

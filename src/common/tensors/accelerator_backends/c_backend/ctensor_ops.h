@@ -135,6 +135,36 @@ void scatter_sum_double(
     int index_count,
     const double* values);
 
+void scatter_mean_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count,
+    const double* values);
+
+void scatter_max_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count,
+    const double* values);
+
+void scatter_min_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count,
+    const double* values);
+
 void index_assign_double(
     double* target,
     const int* shape,

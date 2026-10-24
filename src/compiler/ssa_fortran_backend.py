@@ -2971,6 +2971,11 @@ class _FunctionEmitter:
         elif output_count == 1 and instr.res is not None:
             self._locals[instr.res.id] = self._typed(instr.res)
             arguments.append(_name(instr.res))
+        elif instr.res is None and {
+            output for _input, output in self.callee_inout_pairs.get(callee, ())
+        } == set(range(output_count)):
+            # Every result is already carried by an explicit inout operand.
+            pass
         elif output_count != 0 or instr.res is not None:
             return None
         native_callee = self.callee_native_symbols.get(str(callee), str(callee))

@@ -103,26 +103,25 @@ def _lower_target_graph(source=SOURCE):
     return module, entry, parameters, returned
 
 
-def test_scatter_reduction_policy_survives_capture_and_refuses_wrong_kernel():
-    with pytest.raises(
-        ValueError,
-        match=(
-            "scatter reduce='mean' has no matching repository SSA kernel; "
-            "only reduce='sum' is currently implemented"
-        ),
-    ):
-        _lower_target_graph(
-            SOURCE.replace('reduce="sum"', 'reduce="mean"', 1)
-        )
-
-
-@pytest.mark.parametrize("backend", ("c", "llvm"))
-def test_c623_repeated_scatter_uses_accumulation_kernel(tmp_path, backend):
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    ("reduce", "expected"),
+    (
+        ("sum", [3.0, 5.0, 0.0]),
+        ("mean", [0.75, 2.5, 0.0]),
+        ("max", [1.0, 5.0, 0.0]),
+        ("min", [0.0, 0.0, 0.0]),
+    ),
+)
+def test_c623_repeated_scatter_uses_exact_reduction_kernel(
+    tmp_path, backend, reduce, expected,
+):
     source = (
         Path(__file__).parent
         / "compiler_scatter_corpus"
         / "c623_repeated_scatter_sum.py"
     ).read_text(encoding="utf-8")
+    source = source.replace('reduce="sum"', f'reduce="{reduce}"')
     contract = ExtractionContract(CONTRACT).with_program_abi({
         "records": {},
         "bindings": [],
@@ -137,7 +136,7 @@ def test_c623_repeated_scatter_uses_accumulation_kernel(tmp_path, backend):
         ],
     })
     module, _outputs, exports = lower_ast_source_to_ssa(
-        source, "root", name="c623_repeated_scatter_sum",
+        source, "root", name=f"c623_repeated_scatter_{reduce}",
         extraction_contract=contract,
         python_bindings={"AbstractTensor": AbstractTensor},
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
@@ -160,7 +159,7 @@ def test_c623_repeated_scatter_uses_accumulation_kernel(tmp_path, backend):
         for instruction in block.instrs
         if instruction.op == "Call"
     }
-    assert "scatter_sum_double" in kernels
+    assert f"scatter_{reduce}_double" in kernels
     assert "index_assign_double" not in kernels
     _artifact, execution = _run(
         backend, module, entry,
@@ -172,7 +171,7 @@ def test_c623_repeated_scatter_uses_accumulation_kernel(tmp_path, backend):
     )
     np.testing.assert_array_equal(
         np.asarray(execution.buffers[int(returned.id)]),
-        np.asarray([3., 5., 0.]),
+        np.asarray(expected),
     )
 
 

@@ -145,6 +145,18 @@ ffi.cdef("""
         const double* input, double* output, const int* shape,
         int ndim, int dim, const long long* indices, int index_count,
         const double* values);
+    void scatter_mean_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const long long* indices, int index_count,
+        const double* values);
+    void scatter_max_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const long long* indices, int index_count,
+        const double* values);
+    void scatter_min_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const long long* indices, int index_count,
+        const double* values);
     void slice_copy_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, int start, int step, int count);
