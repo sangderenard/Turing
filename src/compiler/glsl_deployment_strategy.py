@@ -1961,12 +1961,38 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
     ``get`` with a typed default, assume the default's type and accept the
     assumption only if, under it, the dict's writers join to exactly that
     type (a consistent typing of the cycle). Otherwise nothing is assumed.
+
+    Program: ``d = {1: 10}; d[1] += n`` (corpus c374, plan C6).  Wrong
+    record: the same cycle without ``get``: the store's value reads ``d[1]``,
+    whose class is the element type the store joins into, so the row read
+    entered the ``+ n`` region at the float64 default and the int table
+    refused the float store.  Rule: a dict display whose members all have a
+    proven class is a second source of the assumption (their join), accepted
+    by the same writers check.
     """
 
     proven = _planned_scalar_dtypes_from(graph)
     G = graph.G
     hypotheses: dict[int, str] = {}
     for node_id, data in G.nodes(data=True):
+        if (
+            isinstance(data.get("expr_obj"), ast.Dict)
+            and int(node_id) not in proven
+        ):
+            members = {
+                proven.get(int(parent))
+                for parent, role in data.get("parents") or ()
+                if str(role).startswith("values")
+            }
+            if members and None not in members:
+                dtype = (
+                    "int64" if members <= {"int64", "bool"} and len(members) > 1
+                    else next(iter(members)) if len(members) == 1 else ""
+                )
+                if dtype in {"int64", "float64", "bool"}:
+                    if hypotheses.setdefault(int(node_id), dtype) != dtype:
+                        hypotheses[int(node_id)] = ""
+            continue
         if str(data.get("op") or data.get("type") or "").casefold() != "get":
             continue
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
