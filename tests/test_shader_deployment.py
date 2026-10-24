@@ -236,8 +236,12 @@ def test_extracted_shader_product_carries_its_provenance(tmp_path):
         "filename": "demo.py", "line": 12, "source_symbol": "FRAG",
         "compiler_call": "glCompileShader", "source_sha256": shader.sha256,
     }
-    assert record["component_abi"] is None
-    assert [item["code"] for item in record["shortfalls"]] == ["no-component-abi"]
+    assert record["component_abi"]["record"] == "metadata.component_abi"
+    (port,) = api["metadata"]["component_abi"]["ports"]
+    assert (port["name"], port["role"], port["dtype"], port["transport"]) == (
+        "c", "output", "f32x4", "draw-buffer",
+    )
+    assert [item["code"] for item in record["shortfalls"]] == ["graphics-stage"]
 
 
 def _scalar(dtype="float32", op="add"):
