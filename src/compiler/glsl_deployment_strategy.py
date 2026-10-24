@@ -2643,7 +2643,10 @@ def _planned_scalar_dtypes_from(
                 is_collection(node_id)
                 or attributes.get("sequence_element_class_ref")
                 or attributes.get("mapping_value_class_ref")
-            ) and not op.startswith("indexed"):
+            ) and (
+                not op.startswith("indexed")
+                or attributes.get("producer_kind") == "sequence_slice"
+            ):
                 # Program: ``for y in [x * n for x in xs]: t += y``.  Wrong
                 # record: an unrolled comprehension (``sequence_materialization``)
                 # holds its elements as ``arg0``..``argN``, not ``elts``, so its
@@ -2668,6 +2671,17 @@ def _planned_scalar_dtypes_from(
                 if attributes.get("producer_kind") == "sorted_materialization":
                     writers.extend(
                         element.get(source) for source in parents(data, "arg:0")
+                    )
+                # Lane D, D2.  Program: ``ys = xs[-2:]; ys[0] * 10`` (corpus
+                # c386, c291).  A slice is a new list of its base's rows.  It
+                # is an ``Indexed`` node, so the element-read rule took it and
+                # gave the slice itself the scalar class of one row; its own
+                # rows had no class, and every read of them took the float64
+                # domain default.  Rule: a slice is a collection holding its
+                # base's element class, joined with its own later writers.
+                if attributes.get("producer_kind") == "sequence_slice":
+                    writers.extend(
+                        element.get(base) for base in parents(data, "base")
                     )
                 # Lane D, D2.  Program: ``rep = [1]`` then ``if k > 2: rep =
                 # [k, 1, 2]`` and ``sum(rep) + max(rep)`` (corpus c442).  A
