@@ -23901,6 +23901,26 @@ def _mutated_sequence_node_ids(
                 pending_bases.extend(int(parent) for parent, role in base.get("parents") or ()
                                      if str(role) == "base")
     if include_merge_aliases:
+        # Program: ``rep = [1]; if k > 2: rep = [k, 1, 2]`` then
+        # ``sum(rep)`` (corpus c396).  Wrong record: the branch copies its
+        # list into the initial list's storage (``carried_sequence_
+        # aliases``), which no mutation record names, so ``sum`` unrolled
+        # over the initial display's one member (3 for 6, silently).  Rule:
+        # the initial list of a list rebound on a branch is changed there.
+        for _node_id, merged in graph_obj.nodes(data=True):
+            merged_attributes = merged.get("attributes") or {}
+            initial = merged_attributes.get("initial_value_id")
+            if (
+                merged_attributes.get("producer_kind") == "aggregate_phi"
+                and initial is not None
+                and int(initial) in graph_obj
+                and any(
+                    str(role) in {"body", "orelse"}
+                    and int(parent) != int(initial)
+                    for parent, role in merged.get("parents") or ()
+                )
+            ):
+                mutated_sequence_ids.add(int(initial))
         # Program: ``a = [1, 2]; if n > 2: t = a else: t = [3, 4]`` then
         # ``t.append(9); return len(a) * 10 + len(t)`` (scratch c961).
         # Wrong record: ``t`` is ``a`` on one path, but only ``t`` was
