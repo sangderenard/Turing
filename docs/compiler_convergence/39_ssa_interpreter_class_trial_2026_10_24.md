@@ -1,4 +1,4 @@
-# 38. Whole-class trial: the SSA interpreter (2026-10-24)
+# 39. Whole-class trial: the SSA interpreter (2026-10-24)
 
 Albert asked for a whole-class compile of the Python SSA interpreter as a
 standing source of frontier errors, the way AbstractTensor's whole-class trial
