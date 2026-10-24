@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import pickle
 import queue
+import struct
 import subprocess
 import symtable
 import sys
@@ -4897,6 +4898,12 @@ def _resolved_process_graph_dispatch_table() -> dict[type, Any]:
     dispatch[io.TextIOWrapper] = _reduce_import_owned_text_stream
     dispatch[type(threading.Lock())] = lambda _lock: (_new_lock, ())
     dispatch[type(threading.RLock())] = lambda _lock: (_new_rlock, ())
+    # Program: ``SSAReferenceEvaluator._external_call`` compiled as its own
+    # unit.  Wrong record: its graph binds ``struct.Struct`` layouts, which
+    # stock pickle refuses, so the unit died at worker hand-off with a
+    # TypeError instead of reaching the compiler.  Rule: a ``Struct`` is an
+    # immutable layout fully named by its format string.
+    dispatch[struct.Struct] = lambda layout: (struct.Struct, (layout.format,))
     return dispatch
 
 

@@ -309,6 +309,24 @@ def test_resolved_graph_checkpoint_uses_general_import_owned_type_identity():
     assert restored["implementation_type"] is class_declared_outside_its_public_slot
 
 
+def test_resolved_graph_checkpoint_restores_struct_layouts_by_format():
+    import struct
+
+    from src.compiler.project_compilation_product import (
+        _dump_resolved_process_graph,
+    )
+
+    # SSAReferenceEvaluator._external_call's graph binds struct layouts.
+    layout = struct.Struct("<iQd")
+    stream = io.BytesIO()
+    _dump_resolved_process_graph({"layout": layout}, stream)
+
+    restored = pickle.loads(stream.getvalue())["layout"]
+    assert isinstance(restored, struct.Struct)
+    assert restored.format == layout.format
+    assert restored.pack(1, 2, 3.5) == layout.pack(1, 2, 3.5)
+
+
 def test_native_tensor_index_is_not_a_tuple_projection(tmp_path):
     source = "def leaf(x):\n    return x * 2.0\ndef root(x):\n    return leaf(x)[0] + 1.0\n"
     contract = ExtractionContract("extraction_contracts/program_extraction.yaml").with_program_abi({
