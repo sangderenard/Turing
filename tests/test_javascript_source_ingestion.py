@@ -114,7 +114,9 @@ def test_transcendentals_compile_to_repository_operations_within_the_ulp_tier():
 @pytest.mark.parametrize(
     "path", sorted(CORPUS.glob("c*.js")), ids=lambda path: path.stem,
 )
-def test_javascript_corpus_matches_node_bit_for_bit(path):
+def test_javascript_corpus_matches_node(path):
+    # Bit for bit, or within the ulp tier when the program uses an
+    # implementation-approximated operation (the status then says so).
     source, inputs = split_program(path.read_text(encoding="utf-8"))
     status = check_program(source, inputs)
-    assert status == "PASS", status
+    assert status == "PASS" or status.startswith("PASS (approximated"), status

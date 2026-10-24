@@ -129,6 +129,7 @@ class _JavaScriptProcessInterpreter:
         self.owner = str(owner)
         self.assumptions = frozenset(map(str, assumptions))
         self.parameter_kinds = dict(parameter_kinds or {})
+        self.last_version: dict[str, int] = {}
         self.shortfalls: list[JavaScriptExpressionShortfall] = []
         self.bindings: dict[str, dict[str, Any]] = {}
         self.binding_records: list[dict[str, Any]] = []
@@ -482,52 +483,64 @@ class _JavaScriptProcessInterpreter:
             parents=((operand, "value"),),
         )
 
+    def binary(
+        self, operator: str, left: int, right: int,
+        expr: Mapping[str, Any],
+    ) -> int:
+        """One JavaScript binary operator on two interpreted operands.
+
+        Shared by binary expressions and compound assignment (``x += y`` is
+        ``x = x + y`` on the binding's current version).
+        """
+
+        parents = ((left, "left"), (right, "right"))
+        handler = JAVASCRIPT_BINARY_TO_SSA.get(operator)
+        if handler is None:
+            reason = (
+                "needs a JavaScript-specific reduction program"
+                if operator in JAVASCRIPT_UNSUPPORTED_BINARY
+                else "is not a recognized JavaScript binary operator"
+            )
+            return self.unsupported(
+                operator,
+                "unsupported-binary-operator",
+                f"{operator!r} {reason}",
+                source=expr,
+                parents=parents,
+            )
+        if not self.require(
+            _BINARY_REQUIREMENTS.get(operator, ()), spelling=operator,
+            operands=(left, right),
+        ):
+            return self.unsupported(
+                operator,
+                "untranslated-binary-operator",
+                f"{operator!r} has unproved JavaScript semantics",
+                source=expr,
+                parents=parents,
+            )
+        if handler is Handler.Pow:
+            return self._exponentiate(left, right, expr)
+        result_kind = (
+            "boolean"
+            if handler in {
+                Handler.Eq, Handler.Ne, Handler.Lt, Handler.Le,
+                Handler.Gt, Handler.Ge, Handler.LAnd, Handler.LOr,
+            }
+            else "number"
+        )
+        return self.make_node(
+            handler.name, handler.name, handler.name, parents,
+            source=expr, value_kind=result_kind,
+        )
+
     def expression(self, expr: Mapping[str, Any]) -> int:
         kind = expr.get("type")
         if kind in ("BinaryExpression", "LogicalExpression"):
             operator = str(expr.get("operator"))
             left = self.expression(expr["left"])
             right = self.expression(expr["right"])
-            parents = ((left, "left"), (right, "right"))
-            handler = JAVASCRIPT_BINARY_TO_SSA.get(operator)
-            if handler is None:
-                reason = (
-                    "needs a JavaScript-specific reduction program"
-                    if operator in JAVASCRIPT_UNSUPPORTED_BINARY
-                    else "is not a recognized JavaScript binary operator"
-                )
-                return self.unsupported(
-                    operator,
-                    "unsupported-binary-operator",
-                    f"{operator!r} {reason}",
-                    source=expr,
-                    parents=parents,
-                )
-            if not self.require(
-                _BINARY_REQUIREMENTS.get(operator, ()), spelling=operator,
-                operands=(left, right),
-            ):
-                return self.unsupported(
-                    operator,
-                    "untranslated-binary-operator",
-                    f"{operator!r} has unproved JavaScript semantics",
-                    source=expr,
-                    parents=parents,
-                )
-            if handler is Handler.Pow:
-                return self._exponentiate(left, right, expr)
-            result_kind = (
-                "boolean"
-                if handler in {
-                    Handler.Eq, Handler.Ne, Handler.Lt, Handler.Le,
-                    Handler.Gt, Handler.Ge, Handler.LAnd, Handler.LOr,
-                }
-                else "number"
-            )
-            return self.make_node(
-                handler.name, handler.name, handler.name, parents,
-                source=expr, value_kind=result_kind,
-            )
+            return self.binary(operator, left, right, expr)
         if kind == "UnaryExpression":
             operator = str(expr.get("operator"))
             operand = self.expression(expr["argument"])
@@ -725,6 +738,147 @@ class _JavaScriptProcessInterpreter:
             return list(node.get("body", ()))
         return [node]
 
+    def assign(
+        self,
+        name: str,
+        value_node: int,
+        source: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """A new version of an existing ``let`` or parameter binding.
+
+        A JavaScript assignment rebinds the name; the region stays acyclic
+        because the new value is a new node and later reads see the new
+        version.  ``const`` and free names are refused, as JavaScript would
+        throw (TypeError / ReferenceError in strict code).
+        """
+
+        binding = self.bindings.get(name)
+        if binding is None or binding["kind"] not in {"let", "parameter"}:
+            self.shortfalls.append(JavaScriptExpressionShortfall(
+                "unsupported-assignment-target",
+                f"{name!r} is "
+                + ("not a binding of this region" if binding is None
+                   else f"a {binding['kind']} binding")
+                + "; only let and parameter bindings are reassignable",
+            ))
+            return None
+        # Versions are numbered per name across the whole region, so the two
+        # arms of an if never post different values under one version.
+        version = self.last_version.get(name, int(binding["version"])) + 1
+        self.last_version[name] = version
+        record = {
+            **binding,
+            "version": version,
+            "value_node": int(value_node),
+            "start": source.get("start"),
+            "end": source.get("end"),
+        }
+        record["binding_cell"] = self._post_binding(record)
+        self.bindings[name] = record
+        self.binding_records.append(record)
+        return record
+
+    def assignment_statement(self, expr: Mapping[str, Any]) -> None:
+        """``x = e``, ``x op= e``, ``x++``/``x--`` as a whole statement."""
+
+        kind = expr.get("type")
+        target = (
+            expr.get("left") if kind == "AssignmentExpression"
+            else expr.get("argument")
+        ) or {}
+        if target.get("type") != "Identifier":
+            self.unsupported(
+                str(target.get("type")),
+                "unsupported-assignment-target",
+                "only plain names are assignable in the numeric region",
+                source=expr,
+            )
+            return
+        name = str(target["name"])
+        if kind == "UpdateExpression":
+            current = self.read_identifier(target)
+            one = self.make_node(
+                "Constant", Handler.Const.name, "1", (),
+                attributes={"value": 1.0}, constant=1.0, source=expr,
+                output_roles=("value",), value_kind="number",
+            )
+            operator = "+" if expr.get("operator") == "++" else "-"
+            value = self.binary(operator, current, one, expr)
+        else:
+            operator = str(expr.get("operator"))
+            right = self.expression(expr.get("right") or {})
+            if operator == "=":
+                value = right
+            elif operator.endswith("=") and operator[:-1] in JAVASCRIPT_BINARY_TO_SSA:
+                if operator[:-1] in {"&&", "||"}:
+                    # x &&= y assigns only when x is truthy: a branch, not
+                    # a binary operator.
+                    value = self.unsupported(
+                        operator,
+                        "unsupported-assignment",
+                        f"{operator!r} is a conditional assignment",
+                        source=expr,
+                        parents=((right, "right"),),
+                    )
+                else:
+                    value = self.binary(
+                        operator[:-1], self.read_identifier(target), right, expr,
+                    )
+            else:
+                value = self.unsupported(
+                    operator,
+                    "unsupported-assignment",
+                    f"{operator!r} has no JavaScript translation here",
+                    source=expr,
+                    parents=((right, "right"),),
+                )
+        self.assign(name, value, expr)
+
+    def _branch(
+        self,
+        statements: Sequence[Mapping[str, Any]],
+        outer: Mapping[str, dict[str, Any]],
+    ) -> tuple[int | None, bool, dict[str, dict[str, Any]]]:
+        """Interpret one arm in its own block scope.
+
+        Returns the arm's value and whether every path returned, and the
+        arm's final versions of the bindings visible outside it.  Names the
+        arm declares are dropped: ``let``/``const`` are block scoped.
+        """
+
+        self.bindings = dict(outer)
+        value, returned = self.sequence(statements)
+        visible = {name: self.bindings[name] for name in outer}
+        return value, returned, visible
+
+    def _select(
+        self,
+        condition: int,
+        yes: int,
+        no: int,
+        source: Mapping[str, Any],
+        *,
+        control: str,
+    ) -> int:
+        if self._kind(yes) != self._kind(no):
+            return self.unsupported(
+                "if",
+                "unproved-conditional-result",
+                f"{control} arms have different JavaScript value kinds",
+                source=source,
+                parents=(
+                    (condition, "condition"), (yes, "if_true"),
+                    (no, "if_false"),
+                ),
+            )
+        return self.make_node(
+            Handler.Select.name, Handler.Select.name, Handler.Select.name,
+            ((condition, "condition"), (yes, "if_true"), (no, "if_false")),
+            attributes={"javascript_control": control},
+            source=source,
+            value_kind=self._kind(yes),
+        )
+
     def sequence(
         self, statements: Sequence[Mapping[str, Any]],
     ) -> tuple[int | None, bool]:
@@ -733,11 +887,11 @@ class _JavaScriptProcessInterpreter:
             statement = statements[index]
             kind = statement.get("type")
             if kind == "VariableDeclaration":
-                if statement.get("kind") != "const":
+                if statement.get("kind") not in {"const", "let"}:
                     self.unsupported(
                         str(statement.get("kind")),
                         "unsupported-binding-kind",
-                        "let/var require lexical lifetime and CFG handling",
+                        "var bindings are function scoped and hoisted",
                         source=statement,
                     )
                     index += 1
@@ -754,7 +908,10 @@ class _JavaScriptProcessInterpreter:
                         )
                         continue
                     value = self.expression(initializer)
-                    self.bind(str(target["name"]), value, target, kind="const")
+                    self.bind(
+                        str(target["name"]), value, target,
+                        kind=str(statement.get("kind")),
+                    )
                 index += 1
                 continue
             if kind == "ReturnStatement":
@@ -767,54 +924,77 @@ class _JavaScriptProcessInterpreter:
                         source=statement,
                     ), True
                 return self.expression(argument), True
+            if kind == "BlockStatement":
+                outer = dict(self.bindings)
+                value, returned, visible = self._branch(
+                    list(statement.get("body", ())), outer,
+                )
+                self.bindings = visible
+                if returned:
+                    return value, True
+                index += 1
+                continue
             if kind == "IfStatement":
-                if statement.get("alternate") is not None:
+                # Both arms are interpreted; their versions of each outer
+                # binding meet in a Select on the condition.  An arm that
+                # returns takes the rest of the function with the other arm
+                # only: the rest runs on that path alone.
+                outer = dict(self.bindings)
+                condition_value = self.expression(statement["test"])
+                condition = self.truthy(condition_value, statement["test"])
+                yes, yes_returns, yes_bindings = self._branch(
+                    self._statement_body(statement.get("consequent")), outer,
+                )
+                no, no_returns, no_bindings = self._branch(
+                    self._statement_body(statement.get("alternate")), outer,
+                )
+                rest = list(statements[index + 1:])
+                if yes_returns and not no_returns:
+                    self.bindings = no_bindings
+                    no, no_returns = self.sequence(rest)
+                elif no_returns and not yes_returns:
+                    self.bindings = yes_bindings
+                    yes, yes_returns = self.sequence(rest)
+                if yes_returns and no_returns:
+                    self.bindings = outer
+                    if yes is None or no is None:
+                        return None, False
+                    return self._select(
+                        condition, yes, no, statement,
+                        control="early-return-if",
+                    ), True
+                if yes_returns or no_returns:
+                    self.bindings = outer
                     return self.unsupported(
                         "if",
                         "unsupported-control-flow",
-                        "the acyclic region accepts early-return if without else",
+                        "both early-return paths must produce a value",
                         source=statement,
                     ), False
-                saved = dict(self.bindings)
-                condition_value = self.expression(statement["test"])
-                condition = self.truthy(condition_value, statement["test"])
-                self.bindings = dict(saved)
-                yes, yes_returns = self.sequence(
-                    self._statement_body(statement.get("consequent"))
-                )
-                self.bindings = dict(saved)
-                no, no_returns = self.sequence(statements[index + 1:])
-                self.bindings = saved
-                if yes_returns and no_returns and yes is not None and no is not None:
-                    if self._kind(yes) != self._kind(no):
-                        return self.unsupported(
-                            "if",
-                            "unproved-conditional-result",
-                            "early-return arms have different JavaScript value kinds",
-                            source=statement,
-                            parents=(
-                                (condition, "condition"), (yes, "if_true"),
-                                (no, "if_false"),
-                            ),
-                        ), False
-                    return self.make_node(
-                        Handler.Select.name,
-                        Handler.Select.name,
-                        Handler.Select.name,
-                        ((condition, "condition"), (yes, "if_true"),
-                         (no, "if_false")),
-                        attributes={"javascript_control": "early-return-if"},
-                        source=statement,
-                        value_kind=self._kind(yes),
-                    ), True
-                return self.unsupported(
-                    "if",
-                    "unsupported-control-flow",
-                    "both early-return paths must produce a value",
-                    source=statement,
-                ), False
+                self.bindings = dict(outer)
+                for name, record in outer.items():
+                    a = yes_bindings[name]
+                    b = no_bindings[name]
+                    if a["value_node"] == b["value_node"]:
+                        self.bindings[name] = a if a["version"] >= b["version"] else b
+                        continue
+                    merged = self._select(
+                        condition, int(a["value_node"]), int(b["value_node"]),
+                        statement, control="if-merge",
+                    )
+                    self.bindings[name] = record
+                    self.assign(name, merged, statement)
+                index += 1
+                continue
             if kind == "ExpressionStatement":
-                value = self.expression(statement["expression"])
+                expression = statement["expression"]
+                if expression.get("type") in {
+                    "AssignmentExpression", "UpdateExpression",
+                }:
+                    self.assignment_statement(expression)
+                    index += 1
+                    continue
+                value = self.expression(expression)
                 self.unsupported(
                     "expression-statement",
                     "unsupported-effect",
@@ -822,6 +1002,9 @@ class _JavaScriptProcessInterpreter:
                     source=statement,
                     parents=((value, "value"),),
                 )
+                index += 1
+                continue
+            if kind == "EmptyStatement":
                 index += 1
                 continue
             self.unsupported(
