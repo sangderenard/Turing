@@ -292,6 +292,8 @@ EXTENDED3 = [
     (["t{v} = 0", "for k{v}, x{v} in enumerate([{a}, n, {b}], n % 4 + {c}):", "    t{v} = t{v} * 10 + k{v} * x{v}"], "t{v}"),
     # a callee filters a list literal in its loop, so it keeps live flags (c197)
     ([], "positives([{a}, -{b}, {c}]) * 10 + n"),
+    # a runtime replication grown by an append, then reduced (E22a; lane E)
+    (["ys{v} = [{a}] * (n % 4)", "ys{v}.append(n + {b})"], "sum(ys{v}) * 10 + len(ys{v})"),
     # a keyed delete, then a store and lookups (E24; lane E)
     (["d{v} = {{1: n, 2: {a}, 5: {b}}}", "del d{v}[2]", "d{v}[8] = n + {c}"], "len(d{v}) * 100 + d{v}[8] + d{v}[5] * 10 + d{v}[1]"),
     # a tuple target over dict items holding a large int (E23; lane E)

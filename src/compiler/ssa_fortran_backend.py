@@ -3717,12 +3717,19 @@ class _FunctionEmitter:
 
         if operation not in ("max", "min", "sum", "all", "any"):
             return None
-        if not instr.args or tuple(instr.args[0].shape or ()):
+        if not instr.args:
             return None
         source = instr.args[0]
+        # Program: ``ys = [5] * (n % 4); ys.append(n); sum(ys)`` (E22a).  A
+        # heap sequence's operand is its pointer cell, whose (1,) shape is
+        # the cell, not the rows; its rows are its view over the live length.
+        heap = int(source.id) in self._heap_elements
+        if tuple(source.shape or ()) and not heap:
+            return None
         accounting = dict(source.accounting or {})
         if not (
-            accounting.get("sequence_arena")
+            heap
+            or accounting.get("sequence_arena")
             or accounting.get("program_abi_storage") in ("span", "sequence")
         ):
             return None
