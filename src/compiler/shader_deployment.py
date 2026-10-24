@@ -777,10 +777,14 @@ def publish_extracted_shader(
     )
 
 
-def _run_tool(command: Sequence[str]) -> dict[str, Any]:
+def _run_tool(command: Sequence[str], *, tool: str) -> dict[str, Any]:
     completed = subprocess.run(list(command), capture_output=True, text=True)
     return {
-        "tool": Path(command[0]).name,
+        # Windows parity receipt (2026-10-24): shutil.which returns an
+        # executable path whose basename can be ``spirv-as.EXE``.  The
+        # manifest records the selected tool identity, not the host path's
+        # spelling, so carry the authored identity from the selection site.
+        "tool": tool,
         "arguments": list(command[1:]),
         "returncode": completed.returncode,
         "diagnostics": (completed.stdout + completed.stderr).strip(),
@@ -814,7 +818,10 @@ def publish_spirv_product(directory: str | Path, product: Any) -> PublishedShade
         binary_path = None
     else:
         env = ["--target-env", target_env] if target_env else []
-        tools.append(_run_tool([assembler, *env, str(assembly_path), "-o", str(binary_path)]))
+        tools.append(_run_tool(
+            [assembler, *env, str(assembly_path), "-o", str(binary_path)],
+            tool="spirv-as",
+        ))
         if tools[-1]["returncode"] != 0:
             shortfalls.append(Shortfall("assembly-failed", tools[-1]["diagnostics"]))
             binary_path = None
@@ -823,7 +830,9 @@ def publish_spirv_product(directory: str | Path, product: Any) -> PublishedShade
             if validator is None:
                 shortfalls.append(Shortfall("not-validated", "no spirv-val was found"))
             else:
-                tools.append(_run_tool([validator, *env, str(binary_path)]))
+                tools.append(_run_tool(
+                    [validator, *env, str(binary_path)], tool="spirv-val",
+                ))
                 if tools[-1]["returncode"] != 0:
                     shortfalls.append(Shortfall("validation-failed", tools[-1]["diagnostics"]))
     files = [assembly_path, *([binary_path] if binary_path is not None else [])]
