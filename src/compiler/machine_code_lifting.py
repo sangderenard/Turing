@@ -1073,8 +1073,10 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
         width = getattr(operand, "width", None)
         if width is not None:
             return int(width)
+        # The trailing separator is a lookahead: consuming it would hide the
+        # next operand's leading ``_`` and read MOVZX_R32_RM16 as one width.
         widths = re.findall(
-            r"(?:^|_)(?:XMMM|RM|R|M)(128|64|32|16|8)(?:_|$)",
+            r"(?:^|_)(?:XMMM|RM|R|M)(128|64|32|16|8)(?=_|$)",
             source.token.name,
         )
         if widths:

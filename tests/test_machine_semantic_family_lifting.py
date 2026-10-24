@@ -519,6 +519,43 @@ def test_sar_imm8_and_jns_rel32_complete_decode_vm_and_ssa_path():
     )
 
 
+@pytest.mark.parametrize(("encoded", "token", "source_width", "target_width"), (
+    (b"\x0f\xb7\x07\xc3", "MOVZX_R32_RM16", 16, 32),
+    (b"\x0f\xb6\x07\xc3", "MOVZX_R32_RM8", 8, 32),
+    (b"\x0f\xbf\x07\xc3", "MOVSX_R32_RM16", 16, 32),
+    (b"\x48\x0f\xbe\x07\xc3", "MOVSX_R64_RM8", 8, 64),
+    (b"\x48\x0f\xbf\x07\xc3", "MOVSX_R64_RM16", 16, 64),
+    (b"\x48\x63\x07\xc3", "MOVSXD_R64_RM32", 32, 64),
+    (b"\x66\x0f\xbe\x07\xc3", "MOVSX_R16_RM8", 8, 16),
+))
+def test_extension_from_memory_loads_the_source_width(
+    encoded, token, source_width, target_width,
+):
+    # The token name spells both widths; reading only the first made each
+    # of these load the destination width, taking the neighbouring bytes.
+    lifting = raise_binary_region_to_ssa(
+        encoded, maximum_file_size=len(encoded), size=len(encoded),
+        base_address=0x1000, name="extend_from_memory",
+        full_vocabulary_report=True,
+    )
+    assert lifting.failed_vocabulary == ()
+    assert lifting.decoded[0].token.name == token
+    instructions = [
+        item
+        for block in lifting.function.blocks.values()
+        for item in block.instrs
+        if item.attributes.get("machine_address") == 0x1000
+    ]
+    (load,) = [item for item in instructions if item.op == "Load"]
+    assert load.attributes["width"] == source_width
+    (extension,) = [
+        item for item in instructions
+        if item.op in {"ZExt", "SExt"} and item.args[0] is load.res
+    ]
+    assert extension.attributes["from_width"] == source_width
+    assert extension.attributes["to_width"] == target_width
+
+
 def test_movsx_r64_rm8_sib_decodes_executes_and_legalizes():
     # movsx rdi, byte ptr [r14 + rbp + 0x20]; ret
     encoded = b"\x49\x0f\xbe\x7c\x2e\x20\xc3"
