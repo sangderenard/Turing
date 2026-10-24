@@ -80,6 +80,25 @@ def test_scan_reports_sign_and_scatter_as_real_llvm_algorithm_calls():
     assert require_precompile_ssa_compatible(program) is program
 
 
+@pytest.mark.parametrize("reduce", ["mean", "max", "min"])
+def test_validator_names_unsupported_scatter_reduction_policy(reduce):
+    program = FusedProgram(
+        version=1,
+        feeds={0},
+        steps=[OpStep(0, "scatter", [0], {"reduce": reduce}, 1)],
+        outputs={"result": 1},
+        meta=_meta(0, 1),
+    )
+
+    result = validate_precompile_ssa_compatibility(program)
+
+    assert result.valid_precompile
+    assert not result.ssa_compatible
+    assert f"scatter reduce='{reduce}'" in result.compatibility_shortfalls[0].reason
+    with pytest.raises(PrecompileSSAValidationError, match=f"reduce='{reduce}'"):
+        require_precompile_ssa_compatible(program)
+
+
 def test_format_scan_finds_unproduced_values_duplicate_writers_and_metadata():
     program = FusedProgram(
         version=1,

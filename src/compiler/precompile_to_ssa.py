@@ -734,6 +734,17 @@ def lower_fused_program_to_ssa(
                 ),
             )
         location = f"{function_name}:step[{index}]"
+        if step.op_name == "scatter" and step.attrs.get("reduce", "sum") != "sum":
+            # The authored scatter reduction policy travels in the step.
+            # Mapping scatter(mean/max/min) to scatter_sum_double silently
+            # changes repeated-destination results; only sum has a kernel.
+            reduction = step.attrs["reduce"]
+            shortfalls.append(SSALoweringShortfall(
+                "numerical", "scatter", location,
+                f"scatter reduce={reduction!r} has no matching repository SSA "
+                "kernel; only reduce='sum' is currently implemented",
+            ))
+            continue
         algorithm = tensor_algorithm(step)
         handler = (
             Handler.Const

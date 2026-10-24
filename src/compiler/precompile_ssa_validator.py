@@ -442,6 +442,7 @@ def validate_precompile_ssa_compatibility(
     semantic = labelled_programs[0][1]
     compatible_locations: dict[tuple[str, str], list[str]] = {}
     shortfall_locations: dict[str, list[str]] = {}
+    policy_shortfalls: list[SSACompatibilityShortfall] = []
     if isinstance(semantic, FusedProgram) and isinstance(
         semantic.steps, list
     ):
@@ -451,6 +452,16 @@ def validate_precompile_ssa_compatibility(
             ):
                 continue
             location = f"program:step[{index}]"
+            if step.op_name == "scatter" and step.attrs.get("reduce", "sum") != "sum":
+                # The step's reduction policy selects its semantics.  The
+                # existing scatter kernel implements only sum.
+                reduction = step.attrs["reduce"]
+                policy_shortfalls.append(SSACompatibilityShortfall(
+                    "scatter", 1, (location,),
+                    f"scatter reduce={reduction!r} has no matching repository SSA "
+                    "kernel; only reduce='sum' is currently implemented",
+                ))
+                continue
             compatibility_name = ssa_compatibility_name_for_precompile(
                 step.op_name
             )
@@ -497,7 +508,7 @@ def validate_precompile_ssa_compatibility(
         for (precompile_name, ssa_name), locations
         in sorted(compatible_locations.items())
     )
-    shortfalls = tuple(
+    shortfalls = tuple(policy_shortfalls) + tuple(
         SSACompatibilityShortfall(
             operation_name,
             len(locations),
