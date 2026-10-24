@@ -121,64 +121,10 @@ words past the element count are untouched with an extra group dispatched.
 - A component ABI for extracted host shaders.
 - The precision-core compute lane (`ssa_glsl_compute_backend`) has no
   component ABI, so it has no product yet.
-- Deployable SPIR-V for a NON-elementwise function over runtime-sized spans
-  (a reduction, a matmul). That needs a structured loop in the library
-  function, because static shapes are unrolled. Elementwise ones deploy in
-  element mode (see "Element mode"), and whole-array reductions over STATIC
-  shapes unroll (see "Reductions").
-
-## Vulkan-ready arena controls (follow-up, 2026-10-24)
-
-`compose_shader`, the one place a composed elementwise/structural shader is
-finished, now declares its controls as read-only std430 storage blocks at
-set 0, bindings 1 and 2, the same mechanism the control shell already used
-for its tables (bindings 4 and 6). The two tables are separate so a wrong
-extent count can never shift the slot offsets. Writers changed with it:
-
-- the GL host (`_bind_launch_controls`, called from both `_dispatch_many`
-  paths) uploads `u_slot[]` and `[u_count, *u_extent]` into two small
-  buffers, re-specifying each store per dispatch so a queued dispatch keeps
-  its own words. `_bind_arena` binds only the arena, so the control shell's
-  own bindings are untouched. The dispatch now unbinds 0..2;
-- the standalone BLAS C shell (`glsl_blas_deployment`) binds the same two
-  buffers instead of calling `glUniform*`.
-
-Evidence (cloud: llvmpipe OpenGL 4.5, lavapipe Vulkan):
-
-- the GPU test set (`test_glsl_backend`, `test_glsl_fused_network`,
-  `test_glsl_jit_backend`, BLAS, shader tests and others) fails the same 28
-  names and errors the same 4 on this branch and on main; the operator tests
-  that compare against numpy pass on both;
-- the published GLSL compute product compiles with `glslangValidator` for
-  OpenGL and with `-V --target-env vulkan1.1`, and run on Vulkan from its
-  record alone (resources, control derivations, byte offsets, group rule) it
-  matches numpy bit for bit for float32 and int32 add over 777 elements, with
-  arena words past the output left untouched;
-- the BLAS shell compiles for x86_64-windows-gnu with `-Wall -Werror`. It
-  has not been run here; it needs Windows.
-
-## Instances (follow-up, rank-known tensor lowering thread)
-
-Program: a deployable entry over `(a + b) * s` and `a - b`, with `a` and `b`
-of shape (2, 3) and `s` a scalar. Wrong record: emission refused both the
-shape and the second result, so array-shaped products could not be
-deployed.
-
-Rule: invocation `i` runs one instance of the function. A value of static
-shape `S` holds `element_count` instances of `prod(S)` elements each, row
-major, back to back; a scalar's instance is one element. Each output is its
-own buffer, in order. The library function returns a struct when there are
-several outputs, and `main` extracts each member. Each `realizes` view
-states `instance_shape` (`[]` for a scalar), `rank` = 1 + its length,
-`shape` null (the leading extent is the instance count), and `byte_extent`
-scaled by `element_bytes * prod(instance_shape)`. A runtime-sized span is
-refused by name in both the library and the deployable product. Before
-this, the library read one as a scalar.
-
-Evidence: `test_deployable_spirv_states_instance_shapes_and_every_output`,
-and `test_instanced_deployable_spirv_matches_python_on_vulkan`. On lavapipe,
-over 300 instances, both outputs match numpy and the words past the
-instance count are untouched.
+- Deployable SPIR-V for a matmul, an axis reduction, or any function that
+  mixes a reduction with other work over runtime-sized spans. Elementwise
+  functions deploy in element mode, and a lone whole-span reduction deploys
+  in reduction mode (see "Reduction mode").
 
 ## Element mode (runtime-sized spans)
 
@@ -194,8 +140,9 @@ their element 0, and their `byte_extent` is one element. `element_count` is
 the product of the host's extents (`launch.element_count.rank` = R,
 `elements_of` = the first span feed's slot). Span views state `rank` R,
 `shape` null, and `extents_from` (`"fed"`, or the first span feed's slot for
-an output). Mixed ranks, a reduction, or a scalar output beside span outputs
-are refused by name.
+an output). Mixed ranks, a non-elementwise operation, or a scalar output
+beside span outputs are refused by name (a lone reduction runs in reduction
+mode instead).
 
 Evidence: `test_runtime_sized_elementwise_deploys_one_element_per_invocation`,
 `test_runtime_sized_deployable_spirv_matches_python_on_vulkan` (lavapipe, a
@@ -216,12 +163,45 @@ right. `sum(xs, start)` starts from `start`. `max` and `min` let a NaN in
 and never displace one, which matches numpy and the C backend. `all` and
 `any` count NaN as true. `mean` divides the sum by the element count and
 needs a float result. An axis reduction, a bool sum, and `max`, `min` or
-`mean` of no elements are refused by name. Over runtime-sized spans a
-reduction still has no spelling (see Open).
+`mean` of no elements are refused by name. Over runtime-sized spans see
+"Reduction mode".
 
 Evidence: `tests/test_ssa_spirv_backend.py::test_whole_array_reductions_assemble_and_validate`
 (float32, float64, int32 pass spirv-val),
 `tests/test_shader_deployment.py::test_reductions_over_instances_match_python_on_vulkan`
 (lavapipe, 200 (2, 3) instances with one NaN, matches numpy), and
-`tests/test_runtime_sized_spans.py::test_static_reductions_deploy_and_runtime_ones_are_refused`
+`tests/test_runtime_sized_spans.py::test_reduction_regions_deploy_static_and_runtime_sized`
 (the sanctioned entry's reduction regions deploy and pass spirv-val).
+
+## Reduction mode (runtime-sized spans)
+
+Program: `x.mean() - y.prod()` with `x` and `y` declared `storage: span,
+rank: 1` and no shape. Each reduction region was refused: the library has
+no count to unroll, and element mode writes one element per invocation.
+
+Rule: a function whose only instruction is a whole-span `sum`, `prod`,
+`max`, `min`, `mean`, `all` or `any` of a runtime-sized span feed (`sum`
+may take a scalar start feed) deploys as ONE looping invocation.
+Invocation 0 runs a structured loop (`OpLoopMerge`) over
+`[0, element_count)` and folds left to right with the unrolled form's rules.
+Then it writes element 0 of `output_0`. Every other invocation does nothing.
+The record says:
+
+- `launch.group_count` is `{rule: fixed, groups: 1}`.
+- `launch.element_count` names `reduction` and `minimum`. The minimum is 1
+  for `max`, `min` and `mean`: with no elements they have no value, and the
+  shader writes nothing.
+- The span feed is sized by `element_count`. The output and any start feed
+  are one element.
+
+An axis, a bool result, or a reduction beside other work is refused by name.
+
+Evidence: `tests/test_shader_deployment.py::test_runtime_sized_reduction_deploys_as_one_looping_invocation`
+(the record), and `test_runtime_sized_reduction_matches_python_on_vulkan`.
+That second test runs on lavapipe and covers:
+
+- every op over float32, and `sum`/`max` over int32;
+- (7, 5) extents the shader never saw;
+- a NaN for `max`/`min`;
+- an empty span, where `max`/`min`/`mean` leave the sentinel untouched;
+- two groups launched, with no effect beyond the first invocation.
