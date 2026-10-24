@@ -213,18 +213,28 @@ if _INVENTED:
 # The Python frontend's meanings above (logical ``And``, float ``Trunc``) do
 # not apply to such a function, and its machine names are the IR registry's
 # own handlers, audited below.
+#
+# Its ``memory`` value is the machine semantics' own ``PagedByteMemory``
+# (``map_elf_image`` builds one from a loaded image).  A ``Load``/``Store``
+# that names a ``machine_state`` reads or writes ``width`` bits little-endian
+# at its pointer; each ``Store`` yields a new memory value, as the SSA
+# threads it.  An unmapped address is refused by name.
 _MACHINE_INTEGER_OPERATIONS = frozenset({
     "Const", "Cast", "Trunc", "ZExt", "SExt",
     "Add", "Sub", "Mul", "And", "Or", "Xor", "Shl", "Shr", "AShr",
     "Eq", "Ne", "ULt", "ULe", "LNot", "LAnd", "LOr", "Select",
     "SMulLow", "SMulHigh", "SMulOverflow", "UMulLow", "UMulHigh",
 })
+_MACHINE_MEMORY_OPERATIONS = frozenset({"Load", "Store"})
+_MACHINE_MEMORY_STATES = frozenset({"memory", "stack-push", "stack-pop"})
 
 
 def _audit_machine_vocabulary() -> None:
     from ..transmogrifier.ssa_registry import Handler
 
-    unknown = _MACHINE_INTEGER_OPERATIONS - {item.value for item in Handler}
+    unknown = (
+        _MACHINE_INTEGER_OPERATIONS | _MACHINE_MEMORY_OPERATIONS
+    ) - {item.value for item in Handler}
     if unknown:
         raise ImportError(
             "ssa_reference_evaluator gives machine semantics to names the IR "
@@ -325,6 +335,38 @@ def _machine_integer_value(
     if op.endswith("High"):
         return _machine_typed(product >> bits, result.dtype)
     return product != _machine_signed(low, bits)
+
+
+def _machine_memory_value(
+    function: Any, instruction: Any, values: Mapping[int, Any],
+) -> Any:
+    from .amd64_machine_semantics import PagedByteMemory
+
+    op = str(instruction.op)
+    attributes = instruction.attributes or {}
+    memory = values[int(instruction.args[0].id)]
+    if not isinstance(memory, PagedByteMemory):
+        raise SSAEvaluationError(
+            f"{function.name}: {op} at {attributes.get('machine_address')!r} "
+            f"needs a PagedByteMemory machine memory, got {type(memory).__name__}"
+        )
+    width = int(attributes["width"])
+    pointer = int(values[int(instruction.args[1].id)]) & ((1 << 64) - 1)
+    try:
+        if op == "Load":
+            return _machine_typed(
+                memory.read_unsigned(pointer, width), instruction.res.dtype,
+            )
+        stored = int(values[int(instruction.args[2].id)])
+        for offset in range(width // 8):
+            memory[pointer + offset]  # a store maps no new memory
+        return memory.write_unsigned(pointer, width, stored)
+    except KeyError as error:
+        raise SSAEvaluationError(
+            f"{function.name}: {op} of {width} bits at {pointer:#x} "
+            f"(machine address {attributes.get('machine_address')!r}) "
+            "touches unmapped memory"
+        ) from error
 
 
 def _declared_formal_names(function: Any) -> dict[str, int]:
@@ -663,6 +705,15 @@ class SSAReferenceEvaluator:
         ) is not None:
             if operation in _MACHINE_INTEGER_OPERATIONS:
                 values[int(result.id)] = _machine_integer_value(
+                    function, instruction, values,
+                )
+                return
+            if (
+                operation in _MACHINE_MEMORY_OPERATIONS
+                and (instruction.attributes or {}).get("machine_state")
+                in _MACHINE_MEMORY_STATES
+            ):
+                values[int(result.id)] = _machine_memory_value(
                     function, instruction, values,
                 )
                 return

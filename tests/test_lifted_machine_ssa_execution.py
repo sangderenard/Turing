@@ -2,8 +2,10 @@
 
 A lifted function declares ``machine_state_model``; its integer handlers are
 fixed-width bit patterns, not the Python frontend's logical ``And`` or float
-``Trunc``.  The final test executes a function lifted from libpython and
-compares it with the same library's native export.
+``Trunc``, and its memory is the machine semantics' ``PagedByteMemory``.
+The libpython tests execute functions lifted from the shared library, over
+that library's own mapped and relocated image, and compare them with the
+same library's native exports.
 """
 
 import ctypes
@@ -12,6 +14,7 @@ import sys
 
 import pytest
 
+from src.compiler.amd64_machine_semantics import PagedByteMemory, map_elf_image
 from src.compiler.machine_code_lifting import raise_binary_region_to_ssa
 from src.compiler.ssa_reference_evaluator import (
     SSAEvaluationError, SSAReferenceEvaluator,
@@ -32,17 +35,26 @@ def _lift(encoded, registers=("rdi", "rsi")):
     return IRModule({"subject": lifting.function})
 
 
-def _run(module, function_name="subject", **named):
+_STACK_TOP = 0x7FFF0000
+
+
+def _with_stack(memory):
+    return memory.map_zeroes(_STACK_TOP - 0x10000, 0x11000)
+
+
+def _run(module, function_name="subject", memory=None, **named):
     """Bind every live-in formal by its argument name, then run."""
 
     function = module.functions[function_name]
     names = function.metadata["argument_names"]
+    if memory is None:
+        memory = _with_stack(PagedByteMemory.empty())
     arguments = {}
     for name, formal in zip(names, function.args):
         if formal.dtype == "memory":
-            continue
-        if name == "__machine_rsp":
-            arguments[int(formal.id)] = 0x7FFF0000
+            arguments[int(formal.id)] = memory
+        elif name == "__machine_rsp":
+            arguments[int(formal.id)] = _STACK_TOP
         else:
             arguments[int(formal.id)] = named.get(name, 0)
     return SSAReferenceEvaluator(module).run(function_name, arguments).returned
@@ -69,11 +81,52 @@ def test_lifted_integer_handlers_are_fixed_width_bit_patterns():
         assert _run(module, arg0=left, arg1=right)[0] & 0xFFFFFFFF == expected
 
 
-def test_lifted_memory_access_is_refused_by_name():
+_DATA = 0x5000
+_DATA_BYTES = bytes.fromhex("ff80fe8f01020304")
+
+
+def _data_memory():
+    return _with_stack(PagedByteMemory.empty()).map_bytes(_DATA, _DATA_BYTES)
+
+
+def test_lifted_loads_read_the_mapped_memory_and_refuse_unmapped_addresses():
     # mov rax, [rdi]; ret
     module = _lift(b"\x48\x8b\x07\xc3")
-    with pytest.raises(SSAEvaluationError, match="'Load' in lifted code"):
-        _run(module, arg0=0x1000)
+    returned = _run(module, memory=_data_memory(), arg0=_DATA)
+    assert returned[0] == int.from_bytes(_DATA_BYTES, "little")
+    with pytest.raises(SSAEvaluationError, match="at 0x9000 .*unmapped memory"):
+        _run(module, memory=_data_memory(), arg0=0x9000)
+
+
+@pytest.mark.parametrize(("encoded", "expected"), (
+    # movzx eax, word [rdi]
+    (b"\x0f\xb7\x07", 0x80FF),
+    # movzx eax, byte [rdi + 1]
+    (b"\x0f\xb6\x47\x01", 0x80),
+    # movsx eax, word [rdi]
+    (b"\x0f\xbf\x07", 0xFFFF80FF),
+    # movsx rax, byte [rdi + 1]
+    (b"\x48\x0f\xbe\x47\x01", (1 << 64) - 0x80),
+    # movsxd rax, dword [rdi]
+    (b"\x48\x63\x07", (1 << 64) - 0x70017F01),
+    # movsx rax, word [rdi + 4]
+    (b"\x48\x0f\xbf\x47\x04", 0x0201),
+))
+def test_extending_loads_read_the_source_width_from_memory(encoded, expected):
+    # The source width is the token name's last width; a load of the
+    # destination width would also read the neighbouring bytes.
+    module = _lift(encoded + b"\xc3")
+    assert _run(module, memory=_data_memory(), arg0=_DATA)[0] == expected
+
+
+def test_lifted_stores_thread_a_new_memory_value():
+    # mov [rdi], rsi; mov rax, [rdi]; ret
+    module = _lift(b"\x48\x89\x37\x48\x8b\x07\xc3")
+    memory = _data_memory()
+    assert _run(module, memory=memory, arg0=_DATA, arg1=0x1122)[0] == 0x1122
+    assert memory.read_unsigned(_DATA, 64) == int.from_bytes(_DATA_BYTES, "little")
+    with pytest.raises(SSAEvaluationError, match="Store .*unmapped memory"):
+        _run(module, memory=memory, arg0=0x9000, arg1=1)
 
 
 def test_transfer_out_of_the_lifted_function_is_refused_by_name():
@@ -101,19 +154,81 @@ def _shared_libpython():
     return path if path.is_file() else None
 
 
-@pytest.mark.skipif(
+_LINUX_LIBPYTHON = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="lifts and loads a Linux libpython",
 )
-def test_lifted_pytime_as_microseconds_matches_the_native_export():
-    from src.compiler.cpython_compile_ssa import lift_elf_export_to_ssa
+
+
+@pytest.fixture(scope="module")
+def libpython():
+    from src.compiler.elf_ingestion import parse_elf_image
 
     path = _shared_libpython()
     if path is None:
         pytest.skip("no shared libpython beside this interpreter")
-    # The same image is lifted and executed natively.  _PyTime_AsMicroseconds
-    # touches no interpreter state, so a second copy of the library is safe.
-    native = ctypes.CDLL(str(path), mode=ctypes.RTLD_LOCAL)._PyTime_AsMicroseconds
+    image = parse_elf_image(path.read_bytes())
+    memory, external = map_elf_image(PagedByteMemory.empty(), image)
+    # A second, uninitialised copy of the library.  The functions called
+    # here touch no interpreter state, so it is safe to run them natively.
+    native = ctypes.CDLL(str(path), mode=ctypes.RTLD_LOCAL)
+    return path, image, _with_stack(memory), external, native
+
+
+@_LINUX_LIBPYTHON
+def test_mapped_libpython_image_matches_the_dynamic_loader(libpython):
+    _path, image, memory, external, native = libpython
+    rva = image.export_by_name("_PyTime_AsMicroseconds").rva
+    bias = ctypes.cast(native._PyTime_AsMicroseconds, ctypes.c_void_p).value - rva
+    relro = next(item for item in image.sections if item.name == ".data.rel.ro")
+    checked = 0
+    for record in image.relocation_records:
+        if not relro.contains_rva(record.offset) or record.type != 8:
+            continue
+        loaded = ctypes.c_uint64.from_address(bias + record.offset).value
+        assert memory.read_unsigned(record.offset, 64) == loaded - bias
+        checked += 1
+    assert checked > 1000
+    # Slots the loader fills from other modules point at unmapped addresses.
+    assert {item.relocation_type for item in external} >= {6, 7}
+    with pytest.raises(KeyError):
+        memory.read_unsigned(external[0].target_address, 8)
+    with pytest.raises(KeyError):
+        memory.read_unsigned(0, 8)
+
+
+@_LINUX_LIBPYTHON
+@pytest.mark.parametrize("symbol", (
+    "_PyUnicode_ToLowercase", "_PyUnicode_IsAlpha", "_PyUnicode_ToDecimalDigit",
+))
+def test_lifted_unicode_table_lookups_match_the_native_export(libpython, symbol):
+    from src.compiler.cpython_compile_ssa import lift_elf_export_to_ssa
+
+    path, _image, memory, _external, native = libpython
+    function = getattr(native, symbol)
+    function.restype = ctypes.c_int
+    function.argtypes = [ctypes.c_uint32]
+    lifted = lift_elf_export_to_ssa(path, root_symbol=symbol)
+    assert lifted.blockers == ()
+    rng = random.Random(symbol)
+    points = (
+        *range(0x300), 0x10FFFF, 0x110000, 0xFFFFFFFF,
+        *(rng.randrange(0x110000) for _ in range(300)),
+    )
+    for point in points:
+        returned = _run(
+            lifted.module, lifted.root_function, memory=memory, arg0=point,
+        )[0] & 0xFFFFFFFF
+        signed = returned - (1 << 32) if returned >> 31 else returned
+        assert signed == function(point), hex(point)
+
+
+@_LINUX_LIBPYTHON
+def test_lifted_pytime_as_microseconds_matches_the_native_export(libpython):
+    from src.compiler.cpython_compile_ssa import lift_elf_export_to_ssa
+
+    path, _image, _memory, _external, native = libpython
+    native = native._PyTime_AsMicroseconds
     native.restype = ctypes.c_int64
     native.argtypes = [ctypes.c_int64, ctypes.c_int]
 
