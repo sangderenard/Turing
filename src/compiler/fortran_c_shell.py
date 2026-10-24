@@ -56783,6 +56783,37 @@ def _emit_class_surface_module(
     )
     if ssa_module is None:
         return None, ()
+    # Every activation root is a method the library promises to export.  The
+    # surface lowering passes over a planned shell that never received a
+    # control program, so a root with no lowered function was dropped, not
+    # refused: ``SSAReferenceEvaluator`` once shipped a library holding
+    # ``__init__`` alone.  Read the two records against each other here --
+    # the deployment's activation roots and each function's
+    # ``source_function_reference`` -- and refuse by name.
+    deployment = getattr(compilation, "deployment", None)
+    lowered_references = {
+        int(function.metadata["source_function_reference"])
+        for function in ssa_module.functions.values()
+        if function.metadata.get("source_function_reference") is not None
+    }
+    dropped_roots = tuple(
+        int(reference)
+        for reference in getattr(deployment, "activation_root_references", ())
+        if int(reference) not in lowered_references
+    )
+    if dropped_roots:
+        function_shells = dict(getattr(deployment, "function_shells", {}) or {})
+        raise FortranEmissionError(
+            "class surface planned activation roots it never lowered: "
+            + ", ".join(
+                f"{reference} "
+                + repr(str(getattr(getattr(getattr(
+                    function_shells.get(reference), "process_graph", None,
+                ), "G", None), "graph", {}).get("function_name") or "?"))
+                for reference in dropped_roots
+            )
+            + "; refusing to emit a library without them"
+        )
     emitted = emit_module(
         ssa_module,
         name=f"{artifact_name}_fortran",

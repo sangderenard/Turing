@@ -1211,7 +1211,7 @@ def compile_ast_aot(
                 # Whole-program mode keeps the complete catalogue, but these
                 # authored targets still cause the exact source-pursuit
                 # activation cells consumed by deployment.
-                activation_roots=targets,
+                activation_roots=tuple(dict.fromkeys((*targets, *dependency_seeds))),
                 tensor_code_references=tensor_code_references,
                 retain=retain,
                 progress=_report,
