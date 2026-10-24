@@ -92,7 +92,10 @@ class RetainedNativeModule:
             }
         ):
             return NativeRetentionMode.TRANSLATE
-        if self.format == "pe-image" and target.accepts_loadable_images:
+        if (
+            self.format in {"pe-image", "elf-image"}
+            and target.accepts_loadable_images
+        ):
             return NativeRetentionMode.LOADABLE_IMAGE
         if self.format in {"coff-object", "elf-object", "macho-object"} and target.accepts_relocatable_objects:
             return NativeRetentionMode.RELOCATABLE_OBJECT
@@ -153,6 +156,42 @@ def retain_pe_image(
             int(item.raw_offset), int(item.characteristics),
         ) for item in image.sections),
         tuple((int(item.type), int(item.rva)) for item in image.base_relocations),
+        tuple((
+            int(item.begin_rva), int(item.end_rva), int(item.unwind_info_rva),
+        ) for item in image.runtime_functions),
+        str(source_identity),
+    )
+
+
+def retain_elf_image(
+    image,
+    *,
+    source_identity: str = "",
+) -> RetainedNativeModule:
+    """Retain a parsed ELF64 AMD64 image whole, as ``retain_pe_image`` does.
+
+    ``relocations`` are the dynamic relocations (type, offset); the FDE
+    ranges stand where ``.pdata`` stands for PE.
+    """
+
+    exports = {}
+    for item in image.exports:
+        previous = exports.setdefault(item.name, int(item.rva))
+        if previous != int(item.rva):
+            raise ValueError(f"conflicting retained ELF export {item.name!r}")
+    return RetainedNativeModule(
+        "elf-image", "amd64", "linux", "sysv-amd64",
+        bytes(image.encoded), int(image.image_base), int(image.entrypoint_rva),
+        bool(image.is_shared_library), MappingProxyType(exports),
+        tuple(
+            (item.library, item.name, int(item.iat_rva), False)
+            for item in image.imports
+        ),
+        tuple((
+            item.name, int(item.virtual_address), int(item.raw_size),
+            int(item.raw_offset), int(item.flags),
+        ) for item in image.sections),
+        tuple(image.relocations),
         tuple((
             int(item.begin_rva), int(item.end_rva), int(item.unwind_info_rva),
         ) for item in image.runtime_functions),
@@ -259,5 +298,5 @@ __all__ = [
     "NativeRetentionMode", "NativeTargetContext", "RetainedNativeModule",
     "PORTABLE_AMD64_MACHINE_SSA_VM", "WINDOWS_AMD64_NATIVE_LINKER",
     "WINDOWS_AMD64_NATIVE_LOADER",
-    "retain_pe_image", "select_host_implementation",
+    "retain_elf_image", "retain_pe_image", "select_host_implementation",
 ]

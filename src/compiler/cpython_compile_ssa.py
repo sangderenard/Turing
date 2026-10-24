@@ -427,6 +427,68 @@ def lift_pe_export_to_ssa(
     image, _statistics = parse_pe_image(
         encoded, maximum_file_size=len(encoded)
     )
+    return _lift_image_export_to_ssa(
+        image, path,
+        root_symbol=root_symbol,
+        root_rva=root_rva,
+        root_calling_convention=root_calling_convention,
+        argument_registers=_WINDOWS_X64_ARGUMENT_REGISTERS,
+        import_link_kind="pe-import",
+        retained=lambda: retain_pe_image(
+            image, source_identity=str(path.resolve()),
+        ),
+    )
+
+
+# The integer argument registers of each calling convention, in order.
+_WINDOWS_X64_ARGUMENT_REGISTERS = ("rcx", "rdx", "r8", "r9")
+_SYSV_AMD64_ARGUMENT_REGISTERS = ("rdi", "rsi", "rdx", "rcx", "r8", "r9")
+
+
+def lift_elf_export_to_ssa(
+    image_path: str | Path,
+    *,
+    root_symbol: str = "Py_CompileString",
+    root_rva: int | None = None,
+    root_calling_convention: str = "",
+) -> NativeCompileSSAResult:
+    """Lift the reachable closure rooted at an ELF64 AMD64 export or address.
+
+    The same worklist as the PE lifter over the records ``parse_elf_image``
+    translates: ``.eh_frame`` FDEs bound functions as ``.pdata`` does, GOT
+    slots named by dynamic relocations are imports, and arguments arrive in
+    the System V registers.
+    """
+
+    from .elf_ingestion import parse_elf_image
+    from .native_code_retention import retain_elf_image
+
+    path = Path(image_path)
+    image = parse_elf_image(path.read_bytes())
+    return _lift_image_export_to_ssa(
+        image, path,
+        root_symbol=root_symbol,
+        root_rva=root_rva,
+        root_calling_convention=root_calling_convention,
+        argument_registers=_SYSV_AMD64_ARGUMENT_REGISTERS,
+        import_link_kind="elf-import",
+        retained=lambda: retain_elf_image(
+            image, source_identity=str(path.resolve()),
+        ),
+    )
+
+
+def _lift_image_export_to_ssa(
+    image: Any,
+    path: Path,
+    *,
+    root_symbol: str,
+    root_rva: int | None,
+    root_calling_convention: str,
+    argument_registers: tuple[str, ...],
+    import_link_kind: str,
+    retained: Any,
+) -> NativeCompileSSAResult:
     if root_rva is None:
         exported = image.export_by_name(root_symbol)
         if exported is None or exported.rva is None:
@@ -458,8 +520,10 @@ def lift_pe_export_to_ssa(
             maximum_file_size=len(region),
             base_address=int(image.image_base) + rva,
             name=function_name,
-            argument_registers=("rcx", "rdx", "r8", "r9"),
-            argument_names=("arg0", "arg1", "arg2", "arg3"),
+            argument_registers=argument_registers,
+            argument_names=tuple(
+                f"arg{index}" for index in range(len(argument_registers))
+            ),
             full_vocabulary_report=True,
             cfg_decode=True,
         )
@@ -547,7 +611,8 @@ def lift_pe_export_to_ssa(
                             indirect_links.append(SSAMachineIndirectLink(
                                 function.name, source_address, edge_kind,
                                 operand_kind, slot_address,
-                                "pe-import", external_identity=external_identity,
+                                import_link_kind,
+                                external_identity=external_identity,
                             ))
                             blockers.append(NativeCompileSSABlocker(
                                 len(blockers) + 1,
@@ -558,13 +623,13 @@ def lift_pe_export_to_ssa(
                                 function.name,
                                 "external-machine-module",
                                 source_address,
-                                f"named PE import {external_identity} requires "
-                                "a retained or translated machine module",
+                                f"named {import_link_kind} {external_identity} "
+                                "requires a retained or translated machine module",
                                 external_identity,
                             ))
                             instruction.attributes.update({
                                 "external_identity": external_identity,
-                                "external_reference_kind": "pe-import-slot",
+                                "external_reference_kind": f"{import_link_kind}-slot",
                                 "indirect_target_resolved": True,
                             })
                             continue
@@ -680,7 +745,7 @@ def lift_pe_export_to_ssa(
         path.resolve(),
         reached,
         tuple(blockers),
-        retain_pe_image(image, source_identity=str(path.resolve())),
+        retained(),
     )
 
 
@@ -697,6 +762,7 @@ def lift_cpython_compile_to_ssa(
 __all__ = [
     "NativeCompileSSABlocker",
     "NativeCompileSSAResult",
+    "lift_elf_export_to_ssa",
     "lift_pe_export_to_ssa",
     "lift_cpython_compile_to_ssa",
 ]

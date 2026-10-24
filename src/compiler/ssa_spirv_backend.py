@@ -47,6 +47,7 @@ reason to block on it.
 from __future__ import annotations
 
 import itertools
+import math
 import shutil
 import subprocess
 import tempfile
@@ -413,6 +414,18 @@ class _ModuleBuilder:
             type_id = self.type_ids[key]
         return type_id
 
+    def struct_type(self, members: Sequence[str]) -> str:
+        """An ``OpTypeStruct`` over ``members``, declared once per member list."""
+
+        key = f"struct({','.join(members)})"
+        if key not in self.type_ids:
+            id_ = self.fresh("structty")
+            self.type_lines.append(
+                f"{id_} = OpTypeStruct {' '.join(members)}"
+            )
+            self.type_ids[key] = id_
+        return self.type_ids[key]
+
     def pointer_type(self, storage_class: str, pointee: str) -> str:
         key = f"ptr({storage_class};{pointee})"
         if key not in self.type_ids:
@@ -420,6 +433,86 @@ class _ModuleBuilder:
             self.type_lines.append(f"{id_} = OpTypePointer {storage_class} {pointee}")
             self.type_ids[key] = id_
         return self.type_ids[key]
+
+
+def _declared_rank(value: SSAValue) -> int:
+    """Axes a value states: its static shape, or the declared span rank its
+    accounting carries when the extents arrive at run time."""
+
+    accounting = getattr(value, "accounting", None) or {}
+    return max(
+        len(tuple(value.shape or ())),
+        int(accounting.get("program_abi_rank", 0) or 0),
+    )
+
+
+def _runtime_sized(value: SSAValue) -> bool:
+    return _declared_rank(value) > len(tuple(value.shape or ()))
+
+
+def _elementwise_runtime_rank(
+    function: Function, outputs: Sequence[SSAValue],
+) -> tuple[int | None, str | None]:
+    """The rank R when ``function`` is elementwise over runtime-sized spans.
+
+    Every value must be a runtime-sized span of one rank R or a rank-0
+    scalar; every instruction that reads or writes a span must be an
+    elementwise operation whose result is such a span; every output must
+    be one. Then element ``k`` of every result depends only on element
+    ``k`` of the span operands and on the scalars, and one invocation per
+    element computes the function exactly. Returns ``(R, None)``, or
+    ``(None, reason)``.
+    """
+
+    from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+    from .ssa_llvm_backend import scalar_likeness
+
+    if len(function.blocks) != 1:
+        return None, "multi-block control flow"
+    block = next(iter(function.blocks.values()))
+    values = (
+        *function.args, *outputs,
+        *(instr.res for instr in block.instrs if instr.res is not None),
+    )
+    ranks = {_declared_rank(value) for value in values if _runtime_sized(value)}
+    if len(ranks) != 1:
+        return None, (
+            "runtime-sized spans of ranks "
+            f"{sorted(ranks)}; element mode needs one rank"
+        )
+    rank = next(iter(ranks))
+    shaped = next((value for value in values if value.shape), None)
+    if shaped is not None:
+        return None, (
+            f"%t{shaped.id} has static shape {tuple(shaped.shape)} beside "
+            "runtime-sized spans"
+        )
+    scalar_output = next(
+        (value for value in outputs if not _runtime_sized(value)), None,
+    )
+    if scalar_output is not None:
+        return None, (
+            f"output %t{scalar_output.id} is a scalar beside runtime-sized "
+            "outputs; element mode writes one element per invocation"
+        )
+    for instr in block.instrs:
+        if instr.op in ("Ret", "ret", "Return", "return"):
+            continue
+        spans_in = any(_runtime_sized(argument) for argument in instr.args)
+        span_out = instr.res is not None and _runtime_sized(instr.res)
+        if not (spans_in or span_out):
+            continue
+        operation = str(
+            instr.attributes.get("tensor_operation") or instr.op
+        )
+        operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+            operation.casefold(), operation,
+        )
+        if not span_out or scalar_likeness(operation) is None:
+            return None, (
+                f"{instr.op} over a runtime-sized span is not elementwise"
+            )
+    return rank, None
 
 
 class _FunctionEmitter:
@@ -438,8 +531,13 @@ class _FunctionEmitter:
         dtype: str = DEFAULT_DTYPE,
         outputs: Sequence[SSAValue] = (),
         carried_shortfalls: Sequence[SPIRVShortfall] = (),
+        runtime_elements: bool = False,
     ):
         self.function = function
+        # The deployable entry's element mode: runtime-sized spans of an
+        # elementwise function arrive one element per invocation, so the
+        # body computes on scalars (``_elementwise_runtime_rank``).
+        self.runtime_elements = bool(runtime_elements)
         self.builder = builder
         self.dtype = dtype
         self.outputs = tuple(outputs)
@@ -473,18 +571,38 @@ class _FunctionEmitter:
             )
         block = next(iter(function.blocks.values()))
 
-        if len(self.outputs) > 1:
+        # Program: ``x * y`` over spans declared ``storage: span, rank: 1``
+        # with no ``shape``.  The rank rides the accounting and ``.shape`` is
+        # empty, so this emitter would read each one as a scalar and return
+        # x[0] * y[0].  Rule: a value whose declared rank exceeds its static
+        # shape has runtime extents, which an unrolled single-block function
+        # cannot address; it is refused by name.
+        runtime_sized = next((
+            value for value in (
+                *function.args, *self.outputs,
+                *(instr.res for instr in block.instrs if instr.res is not None),
+            )
+            if _runtime_sized(value)
+        ), None)
+        if runtime_sized is not None and not self.runtime_elements:
             return self._bail(
                 "<function>", block.name,
-                "multiple outputs are not yet supported by the SPIR-V "
-                "backend (region-call aggregate unbundling is future work)",
+                f"%t{runtime_sized.id} is a runtime-sized span (rank "
+                f"{_declared_rank(runtime_sized)}, no static shape); the "
+                "SPIR-V backend unrolls static shapes only",
             )
 
-        return_type = (
-            self._plain_type(self.outputs[0])
-            if self.outputs
-            else self.builder.void_type()
-        )
+        # Several outputs leave as one struct, member m being output m; a
+        # caller (the deployable entry) extracts each member.
+        if len(self.outputs) > 1:
+            return_type = self.builder.struct_type(
+                [self._plain_type(out) for out in self.outputs]
+            )
+        elif self.outputs:
+            return_type = self._plain_type(self.outputs[0])
+        else:
+            return_type = self.builder.void_type()
+        self.return_type = return_type
         param_types = [self._value_type(a) for a in function.args]
         fn_type = self.builder.function_type(return_type, param_types)
 
@@ -727,6 +845,31 @@ class _FunctionEmitter:
             )
             return
         if instr.op in ("Ret", "ret", "Return", "return"):
+            if len(self.outputs) > 1:
+                members = []
+                for out in self.outputs:
+                    if not out.shape:
+                        members.append(self._name(out))
+                        continue
+                    pointer = self._array_pointer.get(out.id)
+                    if pointer is None:
+                        self._shortfall(
+                            instr.op, block.name,
+                            f"output %t{out.id} has no known array storage",
+                        )
+                        return
+                    loaded = self.builder.fresh("v")
+                    body.append(
+                        f"    {loaded} = OpLoad {self._plain_type(out)} {pointer}"
+                    )
+                    members.append(loaded)
+                value_id = self.builder.fresh("v")
+                body.append(
+                    f"    {value_id} = OpCompositeConstruct {self.return_type} "
+                    + " ".join(members)
+                )
+                body.append(f"    OpReturnValue {value_id}")
+                return
             if self.outputs:
                 out = self.outputs[0]
                 if out.shape:
@@ -1081,6 +1224,15 @@ class SPIRVStorageBinding:
     element_bytes: int
     access: str  # "read" | "read_write"
     value_id: int | None = None
+    #: The static shape of ONE instance of this value (``()`` for a
+    #: scalar): the buffer holds ``element_count`` instances back to back,
+    #: each ``prod(instance_shape)`` elements, row-major.
+    instance_shape: tuple[int, ...] = ()
+    #: Element mode: the rank of a runtime-sized span read or written one
+    #: element per invocation (0 otherwise).
+    runtime_rank: int = 0
+    #: Element mode: a rank-0 feed every invocation reads at element 0.
+    broadcast: bool = False
 
 
 @dataclass
@@ -1088,11 +1240,14 @@ class SPIRVDeployableShader:
     """A GLCompute SPIR-V module with an entry point and a descriptor ABI.
 
     A separate product from :class:`SPIRVModule`: the library function is
-    called once per invocation by ``main``, which reads one element of each
-    feed buffer at ``GlobalInvocationId.x``, writes one element of the output
-    buffer, and guards on the control buffer's ``element_count`` word. Every
-    resource is a storage buffer in descriptor set 0 at a contiguous binding
-    (feeds in argument order, then the output, then the control buffer).
+    called once per invocation by ``main``, which reads instance
+    ``GlobalInvocationId.x`` of each feed buffer, writes that instance of
+    every output buffer, and guards on the control buffer's
+    ``element_count`` word (the instance count). An instance of a value of
+    static shape ``S`` is ``prod(S)`` consecutive elements, row-major; a
+    scalar's is one element. Every resource is a storage buffer in
+    descriptor set 0 at a contiguous binding (feeds in argument order, then
+    the outputs in order, then the control buffer).
     """
 
     name: str
@@ -1130,12 +1285,24 @@ def emit_deployable_compute_shader(
     name: str | None = None,
     module: IRModule | None = None,
 ) -> SPIRVDeployableShader:
-    """Wrap one scalar SSA function in a GLCompute entry point.
+    """Wrap one SSA function in a GLCompute entry point.
 
     The function body is the same translation the library product uses;
-    only the interface differs. A function the per-invocation contract
-    cannot carry (an array formal or result, a boolean element, more than
-    one result) is a shortfall, never a guessed layout.
+    only the interface differs. Each invocation is one INSTANCE of the
+    function: invocation ``i`` reads instance ``i`` of every feed buffer,
+    calls the function once, and writes instance ``i`` of every output
+    buffer. A scalar value occupies one element per instance; a value of
+    static shape ``S`` occupies ``prod(S)`` consecutive elements, row-major,
+    so instance ``i`` starts at element ``i * prod(S)``. Several outputs are
+    several output buffers, in order.
+
+    An elementwise function over runtime-sized spans of one rank (rank
+    stated, no static shape) runs in ELEMENT mode instead: invocation ``i``
+    computes element ``i`` of every span, rank-0 feeds broadcast (each
+    invocation reads their element 0), and ``element_count`` is the product
+    of the host's extents. What neither mode can carry (mixed span ranks, a
+    non-elementwise operation over a span, a boolean element, no result) is
+    a shortfall, never a guessed layout.
     """
 
     name = str(name or function.name)
@@ -1150,20 +1317,37 @@ def emit_deployable_compute_shader(
         )
 
     outputs = tuple(outputs)
-    if len(outputs) != 1:
+    if not outputs:
         shortfalls.append(SPIRVShortfall(
             "<entry>", "*",
-            f"a deployable compute entry writes exactly one result per "
-            f"invocation; {function.name} names {len(outputs)}",
+            f"a deployable compute entry writes at least one result per "
+            f"invocation; {function.name} names none",
         ))
         return refused()
-    for value in (*function.args, outputs[0]):
-        if value.shape:
+    # Element mode: an elementwise function over runtime-sized spans of one
+    # rank runs one ELEMENT per invocation instead of one instance; its
+    # rank-0 feeds broadcast (every invocation reads element 0).
+    element_rank = None
+    if any(_runtime_sized(value) for value in (*function.args, *outputs)):
+        element_rank, reason = _elementwise_runtime_rank(function, outputs)
+        if element_rank is None:
             shortfalls.append(SPIRVShortfall(
                 "<entry>", "*",
-                f"%t{value.id} has shape {tuple(value.shape)}; a deployable "
-                "entry reads one storage-buffer element per value and "
-                "invocation, so array-shaped values need their own layout",
+                f"{function.name} reads or writes runtime-sized spans but "
+                f"cannot run one element per invocation: {reason}",
+            ))
+            return refused()
+    for value in (*function.args, *outputs):
+        if element_rank is not None:
+            pass
+        elif not all(
+            isinstance(size, int) and size > 0
+            for size in tuple(value.shape or ())
+        ):
+            shortfalls.append(SPIRVShortfall(
+                "<entry>", "*",
+                f"%t{value.id} has shape {tuple(value.shape)}, which is not "
+                "a static positive extent per axis",
             ))
         if _STORAGE_ELEMENT.get(str(value.dtype or dtype)) is None:
             shortfalls.append(SPIRVShortfall(
@@ -1191,10 +1375,12 @@ def emit_deployable_compute_shader(
         module if module is not None else function, (function.name,)
     )
     builder = _ModuleBuilder(linkage=False)
-    library = _emit_function(
+    emitter = _FunctionEmitter(
         function, builder, dtype=dtype, outputs=outputs,
         carried_shortfalls=precision.get(function.name, ()),
+        runtime_elements=element_rank is not None,
     )
+    library = emitter.emit()
     if library.shortfalls:
         shortfalls.extend(library.shortfalls)
         return refused()
@@ -1234,8 +1420,12 @@ def emit_deployable_compute_shader(
         return block_types[element_type]
 
     bindings: list[SPIRVStorageBinding] = []
-    variables: list[tuple[str, str, str]] = []  # (variable, element type, pointer)
-    roles = [("feed", value) for value in function.args] + [("output", outputs[0])]
+    # (variable, element type, storage element pointer, value)
+    variables: list[tuple[str, str, str, SSAValue]] = []
+    roles = [("feed", value) for value in function.args] + [
+        ("output", value) for value in outputs
+    ]
+    output_position = 0
     for binding, (role, value) in enumerate(roles):
         value_dtype = str(value.dtype or dtype)
         spelling, stride = _STORAGE_ELEMENT[value_dtype]
@@ -1250,14 +1440,23 @@ def emit_deployable_compute_shader(
         decorations.append(f"OpDecorate {variable} Binding {binding}")
         if role == "feed":
             decorations.append(f"OpDecorate {variable} NonWritable")
-        variables.append((variable, element_type, element_pointer))
+        variables.append((variable, element_type, element_pointer, value))
+        shape = tuple(int(size) for size in tuple(value.shape or ()))
         bindings.append(SPIRVStorageBinding(
             binding,
-            f"feed_{value.id}" if role == "feed" else "output_0",
+            f"feed_{value.id}" if role == "feed" else f"output_{output_position}",
             role, spelling, stride,
             "read" if role == "feed" else "read_write",
             int(value.id),
+            instance_shape=shape,
+            runtime_rank=(
+                _declared_rank(value)
+                if element_rank is not None and _runtime_sized(value) else 0
+            ),
+            broadcast=element_rank is not None and not _runtime_sized(value),
         ))
+        if role == "output":
+            output_position += 1
 
     control_binding = len(roles)
     control_block = builder.fresh("ctl")
@@ -1276,11 +1475,23 @@ def emit_deployable_compute_shader(
     ))
     uint_pointer = builder.pointer_type("StorageBuffer", uint)
     main_type = builder.function_type(void, ())
-    result_type = builder.scalar_type(str(outputs[0].dtype or dtype))
 
+    def flat_indices(shape: tuple[int, ...]):
+        return itertools.product(*(range(size) for size in shape))
+
+    feeds = variables[:len(function.args)]
+    # Function-storage variables must open the entry block.
+    staged = {}
     body = [
         f"%main = OpFunction {void} None {main_type}",
         "%main_entry = OpLabel",
+    ]
+    for position, (_variable, element_type, _pointer, value) in enumerate(feeds):
+        if value.shape:
+            local_array = emitter._value_type(value)
+            body.append(f"%feed_arr_{position} = OpVariable {local_array} Function")
+            staged[position] = f"%feed_arr_{position}"
+    body.extend([
         f"%gid_v = OpLoad {v3uint} %gid",
         f"%index = OpCompositeExtract {uint} %gid_v 0",
         f"%count_ptr = OpAccessChain {uint_pointer} %control {zero}",
@@ -1289,21 +1500,90 @@ def emit_deployable_compute_shader(
         "OpSelectionMerge %main_merge None",
         "OpBranchConditional %inside %main_body %main_merge",
         "%main_body = OpLabel",
-    ]
-    loaded: list[str] = []
-    for position, (variable, element_type, element_pointer) in enumerate(variables[:-1]):
+    ])
+
+    def instance_base(tag: str, size: int) -> str:
+        if size == 1:
+            return "%index"
         body.append(
-            f"%feed_ptr_{position} = OpAccessChain {element_pointer} "
-            f"{variable} {zero} %index"
+            f"%base_{tag} = OpIMul {uint} %index {builder.uint_constant(size)}"
         )
-        body.append(f"%feed_val_{position} = OpLoad {element_type} %feed_ptr_{position}")
-        loaded.append(f"%feed_val_{position}")
-    output_variable, _output_type, output_pointer = variables[-1]
+        return f"%base_{tag}"
+
+    def element_at(tag: str, base: str, flat: int) -> str:
+        if flat == 0:
+            return base
+        body.append(
+            f"%at_{tag}_{flat} = OpIAdd {uint} {base} {builder.uint_constant(flat)}"
+        )
+        return f"%at_{tag}_{flat}"
+
+    loaded: list[str] = []
+    for position, (variable, element_type, element_pointer, value) in enumerate(feeds):
+        if not value.shape:
+            broadcast = element_rank is not None and not _runtime_sized(value)
+            body.append(
+                f"%feed_ptr_{position} = OpAccessChain {element_pointer} "
+                f"{variable} {zero} {zero if broadcast else '%index'}"
+            )
+            body.append(f"%feed_val_{position} = OpLoad {element_type} %feed_ptr_{position}")
+            loaded.append(f"%feed_val_{position}")
+            continue
+        shape = tuple(int(size) for size in value.shape)
+        tag = f"f{position}"
+        base = instance_base(tag, math.prod(shape))
+        local_pointer = builder.pointer_type("Function", element_type)
+        for flat, nested in enumerate(flat_indices(shape)):
+            at = element_at(tag, base, flat)
+            body.append(
+                f"%{tag}_src_{flat} = OpAccessChain {element_pointer} "
+                f"{variable} {zero} {at}"
+            )
+            body.append(f"%{tag}_val_{flat} = OpLoad {element_type} %{tag}_src_{flat}")
+            body.append(
+                f"%{tag}_dst_{flat} = OpAccessChain {local_pointer} "
+                f"{staged[position]} "
+                + " ".join(builder.uint_constant(item) for item in nested)
+            )
+            body.append(f"OpStore %{tag}_dst_{flat} %{tag}_val_{flat}")
+        loaded.append(staged[position])
+    body.append(
+        f"%result = OpFunctionCall {emitter.return_type} %{function.name}"
+        + "".join(f" {item}" for item in loaded)
+    )
+    for member, (variable, element_type, element_pointer, value) in enumerate(
+        variables[len(function.args):]
+    ):
+        tag = f"o{member}"
+        if len(outputs) > 1:
+            body.append(
+                f"%{tag}_value = OpCompositeExtract "
+                f"{emitter._plain_type(value)} %result {member}"
+            )
+            produced = f"%{tag}_value"
+        else:
+            produced = "%result"
+        if not value.shape:
+            body.append(
+                f"%{tag}_ptr = OpAccessChain {element_pointer} {variable} "
+                f"{zero} %index"
+            )
+            body.append(f"OpStore %{tag}_ptr {produced}")
+            continue
+        shape = tuple(int(size) for size in value.shape)
+        base = instance_base(tag, math.prod(shape))
+        for flat, nested in enumerate(flat_indices(shape)):
+            at = element_at(tag, base, flat)
+            body.append(
+                f"%{tag}_val_{flat} = OpCompositeExtract {element_type} "
+                f"{produced} " + " ".join(str(item) for item in nested)
+            )
+            body.append(
+                f"%{tag}_dst_{flat} = OpAccessChain {element_pointer} "
+                f"{variable} {zero} {at}"
+            )
+            body.append(f"OpStore %{tag}_dst_{flat} %{tag}_val_{flat}")
     body.extend([
-        f"%result = OpFunctionCall {result_type} %{function.name}"
-        + "".join(f" {item}" for item in loaded),
-        f"%output_ptr = OpAccessChain {output_pointer} {output_variable} {zero} %index",
-        "OpStore %output_ptr %result",
         "OpBranch %main_merge",
         "%main_merge = OpLabel",
         "OpReturn",

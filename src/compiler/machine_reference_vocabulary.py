@@ -406,6 +406,7 @@ class X86InstructionToken(IntEnum):
     STOSB = 310
     VMOVNTDQ_M256_YMM = 311
     REP_STOSB = 312
+    ENDBR64 = 313
 
 
 class MachineSemanticToken(IntEnum):
@@ -1078,6 +1079,18 @@ def _decode_no_operands(
     address: int,
     rex: int | None,
 ) -> tuple[tuple[MachineOperand, ...], int]:
+    return (), offset
+
+
+def _decode_endbr64_operands(
+    region: memoryview,
+    offset: int,
+    address: int,
+    rex: int | None,
+) -> tuple[tuple[MachineOperand, ...], int]:
+    # Its own family: the reversible read head's 0F map row is one opcode
+    # byte plus ModRM fields, which cannot pin ModRM to FA alone, so ENDBR64
+    # stays a reference-decoder-only token.
     return (), offset
 
 
@@ -3750,6 +3763,17 @@ _X86_64_REFERENCE_VOCABULARY: tuple[InstructionSpec, ...] = (
     InstructionSpec(
         X86InstructionToken.REP_STOSB, MachineSemanticToken.STRING_STORE,
         b"\xaa", _decode_rep_stosb_operands, allow_rex=False,
+        allowed_legacy_prefixes=frozenset({0xf3}),
+        required_legacy_prefixes=frozenset({0xf3}),
+    ),
+    # CET's indirect-branch landing mark (F3 0F 1E FA), which GCC places at
+    # every System V function entry and PLT stub.  It has no architectural
+    # effect outside CET enforcement.  The whole ModRM byte is part of the
+    # opcode: F3 0F 1E with any other ModRM is a different instruction
+    # (RDSSP, ENDBR32), so this spec matches FA alone.
+    InstructionSpec(
+        X86InstructionToken.ENDBR64, MachineSemanticToken.NO_OPERATION,
+        b"\x0f\x1e\xfa", _decode_endbr64_operands, allow_rex=False,
         allowed_legacy_prefixes=frozenset({0xf3}),
         required_legacy_prefixes=frozenset({0xf3}),
     ),

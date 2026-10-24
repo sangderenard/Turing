@@ -28128,6 +28128,49 @@ def lower_control_sections_to_ssa(
                     "branch or loop arm",
                 ))
                 continue
+            # Program: ``xs0 = [n, 3]; r0 = xs0[0]; swap(xs0); d1 = {1: 2, 2:
+            # n}; del d1[n % 3 + 1]`` (fuzz p122_35).  Wrong record: the
+            # carrier region also computes the delete's key (fused with
+            # ``r0``), and the delete ran as its pre-operation, reading the
+            # key before the region defined it (audit use-not-dominated; the
+            # helper then raised error 84 for a present key).  Rule: a delete
+            # whose key the carrier region produces is that region's
+            # post-operation.
+            key_ids = (
+                tuple(map(int, deletion[1]))
+                if isinstance(deletion[1], tuple) else (int(deletion[1]),)
+            )
+            produced_here = {
+                int(value_id)
+                for value_id, index in region_source_values
+                if int(index) == int(region_index)
+            }
+            if any(key_id in produced_here for key_id in key_ids):
+                table_reads = {
+                    int(value_id)
+                    for value_id, sequence_id in (
+                        sequence_length_values or {}
+                    ).items()
+                    if int(sequence_id) == int(deletion[2] or -1)
+                } | {
+                    int(result_id)
+                    for result_id, _query, sequence_id in table_lookups
+                    if int(sequence_id) == int(deletion[2] or -1)
+                }
+                if table_reads & set(map(int, region_signatures.get(
+                    int(region_index), ((), ()),
+                )[0])):
+                    shortfalls.append(SSALoweringShortfall(
+                        "ssa-table", "delete-key-carrier", control_name,
+                        f"delete {effect_id}'s key is computed by region "
+                        f"{int(region_index)}, which also reads the table "
+                        "the delete changes",
+                    ))
+                    continue
+                table_region_post_operations.setdefault(
+                    region_index, [],
+                ).insert(0, ("delete", deletion))
+                continue
             table_region_operations.setdefault(region_index, []).insert(0, ("delete", deletion))
         else:
             table_epilogue_operations.append(("delete", deletion))

@@ -52,14 +52,17 @@ the input whose extents an output takes, `extents.order` entries are
 
 ## Per emitter (observed from each emitter's own code)
 
-- **Desktop GLSL compute** (`glsl_component_backend`). One resource: the
-  std430 `Arena` of `uint` words at set 0, binding 0. Every port is a view
-  at `4 * u_slot[slot]` bytes, extent `4 * u_extent[0]` unless a static shape
+- **Desktop GLSL compute** (`glsl_component_backend`). The std430 `Arena`
+  of `uint` words at set 0, binding 0, plus two read-only std430 control
+  blocks: `TuringLaunchSlots { uint u_slot[]; }` at binding 1 and
+  `TuringLaunchExtents { uint u_count; uint u_extent[]; }` at binding 2
+  (section "Vulkan-ready arena controls" below). Every port is a view at
+  `4 * u_slot[slot]` bytes, extent `4 * u_extent[0]` unless a static shape
   was given. Controls: `u_count` and `u_extent[0]` are the element count,
-  `u_slot[i]` the arena word offset of port `i` (`_bind_arena`,
-  `_dispatch_many`). Group count: any grid covering the element count
-  (`turing_linear_gid` folds x/y/z; the `u_extent[0]` guard stops the rest).
-  The logical `backend_binding` numbers are not descriptor bindings here.
+  `u_slot[i]` the arena word offset of port `i` (`_bind_launch_controls`).
+  Group count: any grid covering the element count (`turing_linear_gid`
+  folds x/y/z; the `u_extent[0]` guard stops the rest). The logical
+  `backend_binding` numbers are not descriptor bindings here.
 - **WGSL** (`ssa_webgpu_backend`). One storage buffer per port at
   `@group(0) @binding(backend_binding)`, extent `4 * count` (times the member
   count when packed), exact groups from the launch plan, count baked as a
@@ -80,17 +83,16 @@ the input whose extents an output takes, `extents.order` entries are
 
 ## Shortfalls published (each checked, not assumed)
 
-- `vulkan-default-uniform-controls` (GLSL compute): `u_count`, `u_extent`
-  and `u_slot` are default-block uniforms. `glslangValidator` accepts the
-  source for OpenGL and refuses it with `-V`: "non-opaque uniforms outside a
-  block: not allowed when using GLSL for Vulkan". Making the arena
-  Vulkan-ready needs the controls in a uniform block or push constants,
-  which changes the GL runtime's binding code; it is not done here.
+- `vulkan-default-uniform-controls` (GLSL compute), as first published:
+  `u_count`, `u_extent` and `u_slot` were default-block uniforms, which
+  `glslangValidator -V` refuses ("non-opaque uniforms outside a block").
+  Closed by the follow-up below; the record no longer carries it.
 - `graphics-stage` (WebGL): a raster pipeline with the companion vertex
   stage, not a compute dispatch.
 - `no-component-abi` (extracted shaders).
-- Deployable SPIR-V refuses by name: an array-shaped value, a dtype with no
-  storage element (bool), or more than one result.
+- Deployable SPIR-V refuses by name: a runtime-sized span (rank stated, no
+  static shape), a dtype with no storage element (bool), or no result.
+  Array-shaped values and several results are carried (see "Instances").
 
 ## Fault found on the way
 
@@ -113,8 +115,90 @@ words past the element count are untouched with an extra group dispatched.
 
 ## Open
 
-- A Vulkan-ready spelling of the GLSL arena controls.
+- The installed control shell (`compose_control_shader`) still declares
+  `uniform uint u_count` (and `u_debug_capacity`, `u_dispatch_iteration`);
+  it is not a published product yet.
 - A component ABI for extracted host shaders.
 - The precision-core compute lane (`ssa_glsl_compute_backend`) has no
   component ABI, so it has no product yet.
-- Deployable SPIR-V for array-shaped SSA values and multi-result functions.
+- Deployable SPIR-V for a NON-elementwise function over runtime-sized spans
+  (a reduction, a matmul). That needs a structured loop in the library
+  function, because static shapes are unrolled. Elementwise ones deploy in
+  element mode (see "Element mode").
+
+## Vulkan-ready arena controls (follow-up, 2026-10-24)
+
+`compose_shader`, the one place a composed elementwise/structural shader is
+finished, now declares its controls as read-only std430 storage blocks at
+set 0, bindings 1 and 2, the same mechanism the control shell already used
+for its tables (bindings 4 and 6). The two tables are separate so a wrong
+extent count can never shift the slot offsets. Writers changed with it:
+
+- the GL host (`_bind_launch_controls`, called from both `_dispatch_many`
+  paths) uploads `u_slot[]` and `[u_count, *u_extent]` into two small
+  buffers, re-specifying each store per dispatch so a queued dispatch keeps
+  its own words. `_bind_arena` binds only the arena, so the control shell's
+  own bindings are untouched. The dispatch now unbinds 0..2;
+- the standalone BLAS C shell (`glsl_blas_deployment`) binds the same two
+  buffers instead of calling `glUniform*`.
+
+Evidence (cloud: llvmpipe OpenGL 4.5, lavapipe Vulkan):
+
+- the GPU test set (`test_glsl_backend`, `test_glsl_fused_network`,
+  `test_glsl_jit_backend`, BLAS, shader tests and others) fails the same 28
+  names and errors the same 4 on this branch and on main; the operator tests
+  that compare against numpy pass on both;
+- the published GLSL compute product compiles with `glslangValidator` for
+  OpenGL and with `-V --target-env vulkan1.1`, and run on Vulkan from its
+  record alone (resources, control derivations, byte offsets, group rule) it
+  matches numpy bit for bit for float32 and int32 add over 777 elements, with
+  arena words past the output left untouched;
+- the BLAS shell compiles for x86_64-windows-gnu with `-Wall -Werror`. It
+  has not been run here; it needs Windows.
+
+## Instances (follow-up, rank-known tensor lowering thread)
+
+Program: a deployable entry over `(a + b) * s` and `a - b`, with `a` and `b`
+of shape (2, 3) and `s` a scalar. Wrong record: emission refused both the
+shape and the second result, so array-shaped products could not be
+deployed.
+
+Rule: invocation `i` runs one instance of the function. A value of static
+shape `S` holds `element_count` instances of `prod(S)` elements each, row
+major, back to back; a scalar's instance is one element. Each output is its
+own buffer, in order. The library function returns a struct when there are
+several outputs, and `main` extracts each member. Each `realizes` view
+states `instance_shape` (`[]` for a scalar), `rank` = 1 + its length,
+`shape` null (the leading extent is the instance count), and `byte_extent`
+scaled by `element_bytes * prod(instance_shape)`. A runtime-sized span is
+refused by name in both the library and the deployable product. Before
+this, the library read one as a scalar.
+
+Evidence: `test_deployable_spirv_states_instance_shapes_and_every_output`,
+and `test_instanced_deployable_spirv_matches_python_on_vulkan`. On lavapipe,
+over 300 instances, both outputs match numpy and the words past the
+instance count are untouched.
+
+## Element mode (runtime-sized spans)
+
+Program: `(x - y) * (x + y) * 0.5` with `x` and `y` declared `storage: span,
+rank: 2` and no shape. Its lowered region is elementwise over runtime-sized
+spans. Wrong record: the deployable entry refused it, because instances need
+static extents.
+
+Rule: when every span is runtime-sized with one rank R, and every operation
+over a span is elementwise with a span result, invocation `i` computes
+element `i` of every span. Rank-0 feeds broadcast: each invocation reads
+their element 0, and their `byte_extent` is one element. `element_count` is
+the product of the host's extents (`launch.element_count.rank` = R,
+`elements_of` = the first span feed's slot). Span views state `rank` R,
+`shape` null, and `extents_from` (`"fed"`, or the first span feed's slot for
+an output). Mixed ranks, a reduction, or a scalar output beside span outputs
+are refused by name.
+
+Evidence: `test_runtime_sized_elementwise_deploys_one_element_per_invocation`,
+`test_runtime_sized_deployable_spirv_matches_python_on_vulkan` (lavapipe, a
+(17, 13) feed the shader never saw, matches numpy; the words past the count
+are untouched), and
+`tests/test_runtime_sized_spans.py::test_rank_only_region_deploys_as_elementwise_spirv`
+(the sanctioned entry's region deploys and passes spirv-val).

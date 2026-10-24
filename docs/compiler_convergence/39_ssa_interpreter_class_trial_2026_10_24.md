@@ -97,3 +97,50 @@ defect, not new work.
 
 The gate was not run in the cloud (it adds about 70 names even on `main`).
 Both changes are on the library route only.
+
+## Follow-up: family A fixed (seeded methods get a body)
+
+`compile_ast_aot` called `prepare_graph_precompile` on the entry's shell
+alone.  Preparation walks only that shell's callsite tree, so every other
+activation root reached the whole-object lowering with no control program
+(and since #835, was refused by name).  Each activation root's own shell is
+now prepared.  `Acc.add` (a two-method class) compiles and returns `a + b`
+natively, the same as Python (`tests/test_whole_class_compile_trial.py`).
+
+The interpreter's class route now reaches `_execute`'s loop and stops at
+family D, in a narrower form: `_step` resolves now, and the one opaque effect
+left is `self.trace(...)`.  That is a call through an `Optional[Callable]`
+field, which has no modelled state transition.  New row: a call through a
+callable-valued field.
+
+Corpus 323/323 PASS, fuzz seed 48 30/30 PASS, cloud gate aa 89 / ab 7 /
+ac 26 / rec 20 (exactly the baselines).
+
+## Follow-up: family B fixed (`Any` is not a record name)
+
+The keyed-value annotation contract (`_authored_annotation_field_receipt`,
+the mapping branch) mapped every non-scalar value name to a record identity.
+So `Mapping[int, Any]` declared `value_record='Any'`, a record that no
+declaration defines.  `Any` and `object` now take the repository's existing
+arbitrary-object boundary (`opaque_ref`), as they already do for parameters,
+record fields and collection members.  Pinned by
+`tests/test_any_mapping_value_receipt.py`.
+
+Trial after the fix (catalogue): the 'Any' record refusal is gone from
+`__init__`, `run`, `_operand`, `_step` and `_value`.
+
+- `__init__`, `_operand` and `_value` are now partial (unresolved program-ABI
+  references for the `Any` parameters, and unused parameters).
+- `_step` refuses at an f-string: "formatted glyph component has no resident
+  producer".
+- The class route now stops at "sequence contract concordance disagreement for
+  '__init__' value 1": duplicates/1 committed, unique/2 declared.  Inferred:
+  `frozenset(int(value) for value in history)` is declared as a unique
+  2-column row against its committed duplicates/1 layout.
+
+Not done: a native value check.  A dict display passed to an annotated dict
+parameter refuses on main whatever the value type ("no proven capacity").
+That is Lane C's frontier, so no corpus program can hold this yet.
+
+Corpus 323/323 PASS, fuzz seed 49 30/30 PASS, cloud gate aa 89 / ab 7 /
+ac 26 / rec 20 (exactly the baselines).

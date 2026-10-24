@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..common.tensors.accelerator_backends.glsl_backend import (
+    ARENA_BINDING,
+    LAUNCH_EXTENT_BINDING,
+    LAUNCH_SLOT_BINDING,
     _normalize_dtype,
     emit_multi_output_program_source,
 )
@@ -94,7 +97,9 @@ def emit_glsl_compute_component(
         decorations={
             "execution_model": "compute",
             "workgroup_size": (int(local_size), 1, 1),
-            "arena_binding": 0,
+            "arena_binding": ARENA_BINDING,
+            "launch_slot_binding": LAUNCH_SLOT_BINDING,
+            "launch_extent_binding": LAUNCH_EXTENT_BINDING,
             "sentinel_policy": "validate-before-dispatch/publish-after-dispatch",
         },
     )

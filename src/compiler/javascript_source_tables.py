@@ -3,9 +3,11 @@
 Mirrors :mod:`glsl_source_tables`: these tables are lexical only. They select
 an existing :class:`Handler` for a JS surface spelling; they do not add SSA
 operations and JS syntax does not survive past the lookup. Operators whose
-JS semantics have no exact existing Handler (type-coercing equality, unsigned
-shift, unary `+`/`typeof`/`void`/`delete`) are listed as unsupported rather
-than mapped to a Handler that would misrepresent their behavior.
+JS semantics have no exact existing Handler (type-coercing equality,
+ECMAScript remainder, unsigned shift, unary `+`/`typeof`/`void`/`delete`) are
+listed as unsupported rather than mapped to a Handler that would misrepresent
+their behavior. The semantic interpreter separately requires proved numeric,
+coercion, realm and effect facets before using any lexical selection here.
 """
 
 from __future__ import annotations
@@ -14,6 +16,10 @@ from types import MappingProxyType
 from typing import Mapping
 
 from ..transmogrifier.ssa_registry import Handler
+from ..transmogrifier.graph.javascript_identity_programs import (
+    javascript_surface_identities,
+    resolve_javascript_identity,
+)
 
 
 JAVASCRIPT_BINARY_TO_SSA: Mapping[str, Handler] = MappingProxyType({
@@ -21,13 +27,7 @@ JAVASCRIPT_BINARY_TO_SSA: Mapping[str, Handler] = MappingProxyType({
     "-": Handler.Sub,
     "*": Handler.Mul,
     "/": Handler.Div,
-    "%": Handler.Mod,
     "**": Handler.Pow,
-    "<<": Handler.Shl,
-    ">>": Handler.Shr,
-    "&": Handler.And,
-    "|": Handler.Or,
-    "^": Handler.Xor,
     "&&": Handler.LAnd,
     "||": Handler.LOr,
     "===": Handler.Eq,
@@ -41,7 +41,6 @@ JAVASCRIPT_BINARY_TO_SSA: Mapping[str, Handler] = MappingProxyType({
 JAVASCRIPT_UNARY_TO_SSA: Mapping[str, Handler] = MappingProxyType({
     "-": Handler.Neg,
     "!": Handler.LNot,
-    "~": Handler.Not,
 })
 
 # One deterministic surface spelling per existing Handler. '==' and '!=' are
@@ -55,28 +54,32 @@ SSA_TO_JAVASCRIPT_UNARY: Mapping[Handler, str] = MappingProxyType({
 })
 
 # Listed for precise diagnostics. Loose '==' / '!=' involve type coercion,
-# '>>>' is unsigned shift, and unary '+'/'typeof'/'void'/'delete' have no
-# arithmetic Handler equivalent. Naming them here is not a lowering table and
-# does not invent an opcode -- the same discipline glsl_source_tables.py uses
-# for WEBGL_UNLOWERED_CALLS.
-JAVASCRIPT_UNSUPPORTED_BINARY = frozenset({"==", "!=", ">>>"})
-JAVASCRIPT_UNSUPPORTED_UNARY = frozenset({"+", "typeof", "void", "delete"})
+# Remainder, shifts and bitwise operators need ECMAScript's ToInt32/ToUint32
+# programs.  ``Handler.And``/``Or``/``Xor`` and ``Handler.Not`` are logical in
+# the repository evaluator, so selecting them here would be a silent semantic
+# substitution.  They remain named shortfalls until those programs exist.
+JAVASCRIPT_UNSUPPORTED_BINARY = frozenset({
+    "==", "!=", "%", "<<", ">>", ">>>", "&", "|", "^",
+})
+JAVASCRIPT_UNSUPPORTED_UNARY = frozenset({
+    "+", "~", "typeof", "void", "delete",
+})
 
 # Calls listed here already exist on the ProcessGraph/AbstractTensor surface,
 # the same shared vocabulary GLSL_DIRECT_CALLS selects into via Handler.Call.
+JAVASCRIPT_SURFACE_IDENTITIES: Mapping[str, str] = javascript_surface_identities()
 JAVASCRIPT_DIRECT_CALLS: Mapping[str, str] = MappingProxyType({
-    spelling: name
-    for spelling, name in (
-        ("Math.abs", "abs"), ("Math.acos", "acos"), ("Math.acosh", "acosh"),
-        ("Math.asin", "asin"), ("Math.asinh", "asinh"), ("Math.atan", "atan"),
-        ("Math.atanh", "atanh"), ("Math.ceil", "ceil"), ("Math.cos", "cos"),
-        ("Math.cosh", "cosh"), ("Math.exp", "exp"), ("Math.floor", "floor"),
-        ("Math.log", "log"), ("Math.max", "maximum"), ("Math.min", "minimum"),
-        ("Math.pow", "pow"), ("Math.round", "round"), ("Math.sign", "sign"),
-        ("Math.sin", "sin"), ("Math.sinh", "sinh"), ("Math.sqrt", "sqrt"),
-        ("Math.tan", "tan"), ("Math.tanh", "tanh"), ("Math.trunc", "trunc"),
-        ("Number.isNaN", "isnan"),
-    )
+    spelling: resolve_javascript_identity(identity).operator
+    for spelling, identity in JAVASCRIPT_SURFACE_IDENTITIES.items()
+})
+
+# These familiar spellings are intentionally not replacement identities.
+# ECMAScript Math.round is ties-toward-+infinity, whereas the repository's
+# existing round operation is ties-to-even.  A later exact JS program may
+# decompose that behavior using existing operations; mapping it to ``round``
+# here would silently change results.
+JAVASCRIPT_UNSUPPORTED_CALLS = MappingProxyType({
+    "Math.round": "ECMAScript ties-toward-+infinity has no exact direct operator",
 })
 
 
@@ -110,6 +113,8 @@ validate_invertible_tables()
 __all__ = [
     "JAVASCRIPT_BINARY_TO_SSA",
     "JAVASCRIPT_DIRECT_CALLS",
+    "JAVASCRIPT_SURFACE_IDENTITIES",
+    "JAVASCRIPT_UNSUPPORTED_CALLS",
     "JAVASCRIPT_UNARY_TO_SSA",
     "JAVASCRIPT_UNSUPPORTED_BINARY",
     "JAVASCRIPT_UNSUPPORTED_UNARY",
