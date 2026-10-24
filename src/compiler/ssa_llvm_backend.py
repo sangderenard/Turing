@@ -87,7 +87,7 @@ _UNARY: dict[str, str] = {
     "Floor": "{out} = call double @llvm.floor.f64(double {0})",
     "Ceil": "{out} = call double @llvm.ceil.f64(double {0})",
     "Trunc": "{out} = call double @llvm.trunc.f64(double {0})",
-    "Round": "{out} = call double @llvm.round.f64(double {0})",
+    "Round": "{out} = call double @llvm.roundeven.f64(double {0})",
     "IsFinite": (
         "{out}.abs = call double @llvm.fabs.f64(double {0})\n"
         "{out} = fcmp one double {out}.abs, 0x7FF0000000000000"
@@ -173,7 +173,7 @@ _FUSED_UNARY: dict[str, str] = {
     "LOG": "{out} = call double @llvm.log.f64(double {0})",
     "NEG": "{out} = fneg double {0}",
     "ABS": "{out} = call double @llvm.fabs.f64(double {0})",
-    "ROUND": "{out} = call double @llvm.round.f64(double {0})",
+    "ROUND": "{out} = call double @llvm.roundeven.f64(double {0})",
     "TRUNC": "{out} = call double @llvm.trunc.f64(double {0})",
     "FLOOR": "{out} = call double @llvm.floor.f64(double {0})",
     "CEIL": "{out} = call double @llvm.ceil.f64(double {0})",
@@ -738,6 +738,13 @@ def integer_scalar_lines(
     evaluation converted back to the declared integer type.
     """
 
+    if (
+        str(operation).casefold() in {"floor", "ceil", "round", "trunc"}
+        and len(operands) == 1
+    ):
+        # ``math.floor(n)``/``round(n)`` of an int is the int itself (corpus
+        # c437); a round trip through double would lose bits above 2**53.
+        return ([f"{register} = add {operand_type} {operands[0]}, 0"], operand_type)
     if operation == "FloorDiv" and len(operands) == 2:
         # Heap-parent indexing in the compiler's own graph kernel uses
         # (position - 1) // 2, including -1 // 2 at the root. LLVM sdiv

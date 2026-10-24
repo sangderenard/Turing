@@ -243,8 +243,20 @@ _UNARY: dict[str, str] = {
         "(aint({0}) - merge(1.0_c_double, 0.0_c_double, "
         "{0} < aint({0})))"
     ),
-    "ceil": "real(ceiling({0}), c_double)",
-    "round": "real(nint({0}), c_double)",
+    # CEILING and NINT return a default (32-bit) INTEGER, so they had the
+    # same cliff at 2**31; and NINT rounds ties away from zero where
+    # Python's ``round`` (and the C lane's ``nearbyint``) rounds them to
+    # even: ``round(-2.5)`` came back -3, not -2 (silent lane D6, corpus
+    # c436).  Both stay in the reals.  A tie is the one place ANINT and
+    # ties-to-even disagree, and there twice ANINT of the half is even.
+    "ceil": (
+        "(aint({0}) + merge(1.0_c_double, 0.0_c_double, "
+        "{0} > aint({0})))"
+    ),
+    "round": (
+        "merge(2.0_c_double * anint({0} / 2.0_c_double), anint({0}), "
+        "abs({0} - aint({0})) == 0.5_c_double)"
+    ),
     "sign": "sign(1.0_c_double, {0})",
     "logical_not": "(.not. {0})",
     "trunc": "aint({0})",
