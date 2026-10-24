@@ -101,19 +101,20 @@ contracts, loop composer) had the same 26 failures as main, and so did the
 gate (aa 96, ab 21, ac 57, rec 40).
 
 AbstractTensor, from a scratch copy with the autograd branch cut from
-`__init__` (199 methods, catalogue `--emit-native`, torch installed):
+`__init__` (199 methods, catalogue `--emit-native --jobs 4`, torch installed),
+at 8c6ae0d on dd340a1:
 
-- 75 complete, 68 partial, 56 failed.
-- Native: 11 linked, and 58 more fail only at the link. On this Linux
-  container `-static-libgfortran` cannot go into a shared object, because
-  Ubuntu's `libgfortran.a` is not PIC. That is a toolchain policy question;
-  it was not changed here.
-- Partial: mostly `missing_used_parameters` / `unresolved_required_source_values`
-  (47).
-- Failed: torch-free discovery is fixed. The remaining failures are API
-  type expectations with no native ABI for unannotated parameters (`self`,
-  `idx`), `_pre_autograd`'s closure, and a source-value-class disagreement in
-  `compression.coefficient_events`.
+- 75 complete, 72 partial, 52 failed.
+- Native: 70 shared libraries linked. Catalogue verification reports
+  "unsupported" for record ABIs. Five native failures remain: `get_tensor`
+  and `to_dtype` have no Fortran expression, one dangling SSA operand at a
+  loop exit, and `matmul` given an operand of rank above 2. A run before
+  #839 also failed 58 units at the link, because `-static-libgfortran`
+  cannot go into a Linux shared object; #839 links it dynamically.
+- Partial: mostly `missing_used_parameters` / `unresolved_required_source_values`.
+- Failed: API type expectations with no native ABI for unannotated
+  parameters (`self`, `idx`), `_pre_autograd`'s closure, and a
+  source-value-class disagreement in `compression.coefficient_events`.
 
 ## Open frontier
 
@@ -123,4 +124,3 @@ AbstractTensor, from a scratch copy with the autograd branch cut from
   refused: "record constructor requires a complete physical schema".
 - `compile_class_to_dll` remains the deprecated adapter with the field
   lowering above; class DLLs should come from the catalogue.
-- Linux shared objects cannot use the static libgfortran runtime.

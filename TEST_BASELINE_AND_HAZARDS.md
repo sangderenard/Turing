@@ -7,9 +7,10 @@ programs because the typed check, the corpus test and the fuzzer exec'd
 programs with no __name__ (RecursionError); that is fixed. Catalogue class
 units: annotated-parameter fields, `__init__` kept in unit slices, int64 slot
 index. At 48607a8 on caf2e77: corpus 327/327 (main 323/323); gate names
-identical to caf2e77. Fuzz seed 97 FUZZ_EXT=4: 0 WRONG / 0 TYPE. NOT GREEN:
-compile_class_to_dll (deprecated) still mis-lowers fields; Linux shared
-objects cannot link static libgfortran (58 AbstractTensor units). See doc 40.
+identical to caf2e77. Fuzz seed 97 FUZZ_EXT=4: 0 WRONG / 0 TYPE.
+AbstractTensor catalogue (autograd cut): 75 complete, 70 native libraries.
+NOT GREEN: compile_class_to_dll (deprecated) still mis-lowers fields. See
+doc 40.
 
 2026-10-24 GLSL ARENA CONTROLS (MEASURED, cloud): composed GLSL shaders read
 u_count/u_extent/u_slot from two read-only std430 storage blocks (set 0,
