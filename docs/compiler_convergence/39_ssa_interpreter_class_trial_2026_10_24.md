@@ -198,3 +198,22 @@ Also found, handed to the silent lane: `len(set(v for v in xs))` and
 
 Corpus 325/325 PASS, fuzz seed 54 30/30 PASS, cloud gate aa 89 / ab 7 /
 ac 26 / rec 20 (exactly the baselines).
+
+## Follow-up: `run`'s dict value type, then its keyed field
+
+- `values: dict[int, Any] = {}` declared its value column as the int64 handle
+  of a record named 'Any' (`_annotation_storage` in the topological
+  reducer), so storing `arguments[key]` refused as a row dtype
+  disagreement.  A mapping's `Any`/`object` value is now `opaque_ref`.  An
+  `Any` key, and `Any` inside a nested aggregate, keep their integer handle
+  (five gate tests pin that).
+- `run` then crashed in `resolve_keyed_mapping_iterables` with the raw
+  invariant "heap sequence length/capacity must be distinct".  The keyed
+  field `_root_frame` is published as the caller-supplied exactly-full view
+  (length and capacity are one part), and `run` assigns it a dict it then
+  grows.  That case now refuses by field.  Real support would give the field
+  its own capacity part.
+
+Pinned by `tests/test_any_valued_local_mapping_row.py`.  Corpus 329/329
+PASS, fuzz seed 56 30/30 PASS, cloud gate aa 89 / ab 7 / ac 26 / rec 20
+(exactly the baselines).
