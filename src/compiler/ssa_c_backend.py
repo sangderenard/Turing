@@ -368,6 +368,8 @@ def emit_ssa_function_to_c(
 ) -> CFunctionArtifact:
     from .ssa_object_operations import validate_object_operations
     validate_object_operations(module, function_name)
+    from .runtime_abi import refuse_host_callbacks
+    refuse_host_callbacks(module, function_name, "C")
     from .ir_identities import precision_backend_shortfalls
     from .identity_concordance import CorrelationTable
     findings = CorrelationTable._native_interface_findings(module)
@@ -1790,6 +1792,8 @@ def emit_ssa_module_to_c(
     from .ir_identities import precision_backend_shortfalls
     from .ssa_object_operations import validate_object_operations
     validate_object_operations(module, function_name)
+    from .runtime_abi import refuse_host_callbacks
+    refuse_host_callbacks(module, function_name, "C")
     from .ssa_storage_requirements import module_storage_requirements
     from .identity_concordance import CorrelationTable
     findings = CorrelationTable._native_interface_findings(module)

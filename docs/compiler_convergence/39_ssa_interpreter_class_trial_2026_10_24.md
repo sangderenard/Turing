@@ -281,3 +281,17 @@ one row; this change leaves the match alone.
 frontier: `isinstance(stored, _Pointer)` and `stored.read()` on the untyped
 object read back from `values`.  Pinned by
 `tests/test_method_contract_bindings.py`.
+
+## Follow-up: stored callable fields call the host
+
+Albert chose the real native call for `self.trace(...)`.  A `Callable`
+field is now a function pointer and an opaque context the host passes to
+each method (`turing-host-callback-v1`, doc 41).  A test class with one
+required and one optional callback matches Python in results and in the
+order of the host's calls.  The interpreter itself now refuses while
+planning `_execute`'s `self.trace(...)`: `trace` is
+`Callable[[str, Any, dict[int, Any]], None] | None`, and a `str` or `dict`
+argument has no declared callback representation yet.  That refusal names
+the type; it replaces the old refusal of the call.  The constructor's store
+of a field with no callback shape stays a store, so methods that never call
+`trace` (`_value`, `_operand`) compile as before.

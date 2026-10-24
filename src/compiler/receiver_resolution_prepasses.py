@@ -610,6 +610,21 @@ def _resolve_grounded_method_references(graph: Any) -> None:
     # resolve. Apply the reducer's source-linked-call rule again now: the
     # resolved callee owns its effects, rather than a second opaque mutation
     # at the callsite. Unresolved external calls keep their original effects.
+    from .glsl_deployment_strategy import _stored_callable_field_call
+
+    def host_callback_call(data: Any) -> bool:
+        # A call through a callable slot (class table ``field_callables``)
+        # runs host code given only its arguments: it is not a mutation of
+        # the receiver whose field names it.
+        field = _stored_callable_field_call(graph.G, data)
+        if field is None:
+            return False
+        owner, name = field
+        return name in dict(
+            dict((graph.G.graph.get("class_table") or {}).get(owner) or {})
+            .get("field_callables") or {}
+        )
+
     linked_calls = {
         int(node_id) for node_id, data in graph.G.nodes(data=True)
         if any((data.get("attributes") or {}).get(key) is not None
@@ -617,6 +632,7 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                    "method_ref", "callee_ref", "resolved_ast_parent",
                    "indirect_callable_id",
                ))
+        or host_callback_call(data)
     }
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}

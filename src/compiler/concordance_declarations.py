@@ -759,6 +759,9 @@ class MetadataRule(Enum):
     CATALOGUED_BUILTIN_CALL = "catalogued_builtin_call"
     GROUNDED_TENSOR_PROPERTY = "grounded_tensor_property"
     SCALAR_INTRINSIC = "scalar_intrinsic"
+    #: A call through a host-supplied callable slot, or its presence test
+    #: (``turing-host-callback-v1``): native work (``EXECUTABLE``).
+    HOST_CALLBACK = "host_callback"
     COORDINATOR_SHORT_CIRCUIT = "coordinator_short_circuit"
     LINKED_REFERENCE = "linked_reference"
     STATIC_PYTHON_REFERENCE = "static_python_reference"

@@ -7950,7 +7950,7 @@ def _executable_rules():
     return frozenset((
         MetadataRule.PRECISION_OPERATOR, MetadataRule.CATALOGUED_BUILTIN_CALL,
         MetadataRule.GROUNDED_TENSOR_PROPERTY, MetadataRule.SCALAR_INTRINSIC,
-        MetadataRule.NUMERICAL_WORK,
+        MetadataRule.HOST_CALLBACK, MetadataRule.NUMERICAL_WORK,
     ))
 
 
@@ -7989,6 +7989,8 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
     from .concordance_declarations import MetadataRule as Rule
 
     data = graph.G.nodes[node_id]
+    if str(data.get("type")) in {"HostCallback", "HostCallbackPresent"}:
+        return Rule.HOST_CALLBACK
     precision_operator = (data.get("attributes") or {}).get(
         "python_precision_operator"
     )
@@ -11414,6 +11416,67 @@ def _control_partition_keys(
         )
         for node_id in node_ids
     }
+
+
+def _host_callback_order_edges(graph: Any) -> frozenset[tuple[int, int]]:
+    """Order host callbacks as their source does.
+
+    Program: ``self.log(i); if self.score is not None: total +=
+    self.score(i, total); self.log(-i)`` in a loop body.  Wrong record: the
+    two ``log`` calls share no value with ``score``, so the region reducer
+    fused them into one region ahead of the branch and the host saw
+    ``log(0), log(0), score(0)`` for Python's ``log(0), score(0), log(0)``.
+    Rule: a host callback is an observable effect, so each one precedes the
+    next in source order (``turing-host-callback-v1`` promises the host its
+    calls in program order).
+    """
+
+    def span(data):
+        expression = data.get("expr_obj")
+        return (
+            int(getattr(expression, "lineno", 0) or 0),
+            int(getattr(expression, "col_offset", 0) or 0),
+            int(getattr(expression, "end_lineno", 0) or 0),
+            int(getattr(expression, "end_col_offset", 0) or 0),
+        )
+
+    callbacks = [
+        (span(data), int(node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("type")) == "HostCallback"
+    ]
+    # A branch that holds a callback is itself one step of the order: the
+    # calls after it follow the whole branch, not just the call inside it.
+    branches = [
+        (span(data), int(node_id))
+        for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.If)
+        and any(
+            span(data)[:2] <= position[:2] and position[2:] <= span(data)[2:]
+            for position, _callback in callbacks
+        )
+    ]
+
+    def contains(outer, inner):
+        return outer[:2] <= inner[:2] and inner[2:] <= outer[2:]
+
+    steps = sorted((*callbacks, *branches))
+    edges = {
+        (int(earlier[1]), int(later[1]))
+        for index, earlier in enumerate(steps)
+        for later in steps[index + 1:]
+        if not contains(earlier[0], later[0])
+    }
+    kept = _source_order_edges_within_value_order(graph.G, edges)
+    if kept != edges:
+        raise ValueError(
+            "host callbacks cannot keep their source order: "
+            f"{sorted(edges - set(kept))}"
+        )
+    # The region schedule and the SSA lowering order regions by this graph's
+    # ancestry; neither sees an edge that is passed only to the reducer.
+    graph.G.graph["host_callback_order_edges"] = tuple(sorted(kept))
+    return frozenset(kept)
 
 
 def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
@@ -24217,7 +24280,10 @@ def _remove_dead_metadata_nodes(
         # method without it.  Rule: a call through a stored callable field
         # is an effect the class surface must lower or refuse, never dead
         # metadata.
-        if _stored_callable_field_call(graph.G, data) is not None:
+        if (
+            _stored_callable_field_call(graph.G, data) is not None
+            or str(data.get("type")) == "HostCallback"
+        ):
             return False
         attributes = data.get("attributes") or {}
         dead_pure_tensor_call = bool(
@@ -32653,6 +32719,16 @@ def strategize_shell_deployment(
         "resolve-grounded-method-references-before-loops",
         lambda: _resolve_grounded_method_references(graph),
     )
+    # A call through a host-supplied callable slot is lowered before loops
+    # and control planning read it: as a statement it is an ordered host
+    # call, and its ``is None`` test reads the function pointer instead of
+    # becoming a separate caller-supplied predicate.
+    from .fortran_c_shell import _lower_host_callback_field_calls_graph
+
+    selection_phase(
+        "lower-host-callback-field-calls",
+        lambda: _lower_host_callback_field_calls_graph(graph.G),
+    )
     canonical_value_ids = bool(
         graph.G.graph.get("canonical_value_ids")
     )
@@ -32865,6 +32941,7 @@ def strategize_shell_deployment(
             partition_keys=partition_keys,
             extra_dependency_edges=(
                 *closure_edges, *_sequence_effect_read_edges(graph),
+                *_host_callback_order_edges(graph),
             ),
             fusible_node_ids=_shader_fusible_node_ids(
                 graph, executable_nodes,
