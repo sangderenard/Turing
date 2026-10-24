@@ -3524,23 +3524,14 @@ class _StructuredX86CFGLifter(_StructuredX86Lifter):
             pointer = None
             if isinstance(destination, EffectiveAddressOperand):
                 assert isinstance(source_index, ImmediateOperand)
-                authored_index = int(source_index.value)
-                word_offset, bit_index = divmod(authored_index, width)
+                # An immediate index never moves the memory word: the CPU
+                # uses it modulo the operand width (bts dword [m], 35 sets
+                # bit 3 of [m]).  Only a register index addresses across
+                # words, and that form is refused above.
+                bit_index = int(source_index.value) % width
                 pointer = self.effective_address(
                     destination, source, dtype="int64",
                 )
-                if word_offset:
-                    pointer = self.emit(
-                        Handler.Add,
-                        (
-                            pointer,
-                            self.constant(
-                                word_offset * (width // 8), source,
-                                dtype="int64",
-                            ),
-                        ),
-                        source, dtype="int64", machine_bit_word_offset=True,
-                    )
                 value = self.emit(
                     Handler.Load, (self.memory, pointer), source,
                     dtype=f"int{width}", machine_state="memory", width=width,
