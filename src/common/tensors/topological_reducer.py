@@ -23673,7 +23673,16 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         callee, value_id
                     )[0] is not None
                 ))
-                if len(returned_facts) == 1:
+                # Program: ``def compact(n) -> tuple[list[int], bool]:
+                # ... return out, len(out) > 2`` then ``t, big =
+                # compact(n)`` (A6 probe c984).  Wrong record: the call
+                # result took the class of the one member that had a class
+                # fact (``out``: list), so the tuple result was concorded
+                # as a list and its contract became a list/tuple union.
+                # Rule: a call result is a returned member's class only
+                # when the callee returns ONE value; several outputs are
+                # one tuple, never any member.
+                if len(returned_facts) == 1 and len(returned_value_ids) == 1:
                     returned_class, returned_limbs = returned_facts[0]
                     result_book = current_identity_book()
                     result_page = result_book.page(
