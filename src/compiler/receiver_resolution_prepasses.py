@@ -650,6 +650,69 @@ def _resolve_grounded_method_references(graph: Any) -> None:
             data["attributes"] = {**attributes, "loop_state_effects": retained}
 
 
+#: ``max_semantics`` values (docs: "What max means in Turing").  Each names
+#: one authored meaning of ``max``/``min``; backends spell exactly that one.
+MAX_SEMANTICS = (
+    "select", "scan", "reduce", "reduce_axis", "elementwise", "emax",
+)
+
+
+def max_semantics_of_call(expression: Any) -> str | None:
+    """The meaning of ``max``/``min`` the authored call states, or ``None``.
+
+    Program: ``max(x, y)``, ``max(xs)``, ``y.max()``, ``y.max(axis=0)`` and
+    ``x.maximum(y)`` all reach the backends as one op name, and each backend
+    guessed between them from the operand count and shapes.  Rule: the call
+    FORM decides, never a name or a shape.  A builtin ``max`` with two or
+    more positional arguments is Python's ``select`` scan over them; with
+    one it is a ``scan`` over that iterable; a ``.max()``/``.amax()`` method
+    with no positional argument is a whole ``reduce``, or ``reduce_axis``
+    when an axis is named; ``maximum``/``minimum`` is ``elementwise`` (numpy's
+    rule) and ``emax``/``emin`` is ``emax`` (the builtin's rule per element).
+    Any other form is left unstamped.
+    """
+
+    if not isinstance(expression, ast.Call):
+        return None
+    function = expression.func
+    keywords = {str(item.arg) for item in expression.keywords if item.arg}
+    positional = [item for item in expression.args if not isinstance(item, ast.Starred)]
+    if len(positional) != len(expression.args):
+        return None
+    if isinstance(function, ast.Name) and function.id in {"max", "min"}:
+        if keywords:  # ``key=``/``default=`` are not spelled
+            return None
+        if len(positional) >= 2:
+            return "select"
+        if len(positional) == 1:
+            return "scan"
+        return None
+    if not isinstance(function, ast.Attribute):
+        return None
+    if function.attr in {"maximum", "minimum"}:
+        return "elementwise"
+    if function.attr in {"emax", "emin"}:
+        return "emax"
+    if function.attr in {"max", "min", "amax", "amin"} and not positional:
+        if keywords & {"axis", "dim"}:
+            return "reduce_axis"
+        if not keywords - {"keepdims", "keepdim"}:
+            return "reduce"
+    return None
+
+
+def _stamp_max_semantics(graph: Any) -> None:
+    """Post ``max_semantics`` on every ``max``/``min`` call node it states."""
+
+    for _node_id, data in graph.G.nodes(data=True):
+        semantics = max_semantics_of_call(data.get("expr_obj"))
+        if semantics is None:
+            continue
+        attributes = dict(data.get("attributes") or {})
+        attributes["max_semantics"] = semantics
+        data["attributes"] = attributes
+
+
 def _resolve_grounded_tensor_operations(graph: Any) -> None:
     """Promote method-name candidates only along tensor-valued SSA edges."""
 
