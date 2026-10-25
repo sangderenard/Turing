@@ -14,7 +14,8 @@ import sys
 import sysconfig
 import threading
 from typing import Any, Iterable, Mapping
-
+import types
+from importlib.machinery import BuiltinImporter
 import yaml
 
 
@@ -1389,11 +1390,25 @@ class ExtractionContract:
                 or inspect.ismethod(value)
                 or inspect.isbuiltin(target)
                 or inspect.ismodule(target)
+                or isinstance(target, (
+                    types.MethodDescriptorType,
+                    types.WrapperDescriptorType,
+                    types.ClassMethodDescriptorType,
+                    types.MethodWrapperType,
+                    types.GetSetDescriptorType,
+                    types.MemberDescriptorType,
+                ))
             )
             else "instance"
         )
         definition_target = type(target) if occurrence == "instance" else target
-        module = str(getattr(definition_target, "__module__", ""))
+
+        owner = getattr(definition_target, "__objclass__", None)
+
+        module = str(
+            getattr(definition_target, "__module__", None)
+            or getattr(owner, "__module__", "")
+        )
         qualname = str(getattr(
             definition_target,
             "__qualname__",
@@ -1444,6 +1459,16 @@ class ExtractionContract:
                 )
         else:
             source_available = availability[1]
+
+        # A native module compiled into Python has no separate module file.
+        # Use the loaded module's declared origin and loader as evidence.
+        loaded_module = sys.modules.get(module)
+        module_spec = getattr(loaded_module, "__spec__", None)
+        native_builtin_module = (
+            getattr(module_spec, "origin", None) == "built-in"
+            and getattr(module_spec, "loader", None) is BuiltinImporter
+        )
+
         resolved = Path(origin).resolve() if origin else None
         if module == "builtins":
             classification = "builtin"
@@ -1452,6 +1477,8 @@ class ExtractionContract:
         elif suffix in {".pyd", ".so", ".dylib"}:
             classification = "native_extension"
         elif inspect.isbuiltin(target):
+            classification = "native_extension"
+        elif not origin and native_builtin_module:
             classification = "native_extension"
         elif (
             resolved is not None

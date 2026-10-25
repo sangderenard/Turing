@@ -13,6 +13,7 @@ import os
 import pickle
 import textwrap
 import types
+import array
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
 from ...compiler.bitops import BitTensorMemoryGraph
@@ -377,7 +378,8 @@ def _ast_aggregate_kind(value):
     proves the same kind.
     """
 
-    aggregate_types = {list, set, dict, tuple, bytes, bytearray}
+    aggregate_types = {list, set, dict, tuple, array.array, bytes, bytearray}
+    
     if isinstance(value, _ASTReferenceAlternatives):
         kinds = {_ast_aggregate_kind(option) for option in value.values}
         kinds.discard(None)
@@ -1553,7 +1555,14 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         "attributes": tuple(attributes),
         "methods": tuple({
             "name": method.name,
-            "graph_identity": f"{definition.name}.{method.name}",
+            "graph_identity": (
+                    ".".join(
+                        str(part)
+                        for part in (getattr(method, "_python_source_identity", None) or ())
+                        if part
+                    )
+                    or f"{definition.name}.{method.name}"
+                ),
             "ast_node_id": source_span_row(definition, method),
             "parameters": tuple(
                 argument.arg for argument in (
