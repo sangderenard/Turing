@@ -29742,7 +29742,23 @@ def _class_surface_ssa_program(
                     return None
                 if record.get("constructor_complete") is False:
                     from .identity_concordance import ConcordanceRefusal
-
+                    print(
+                        "VOCABULARY_CONSTRUCTOR:",
+                        "candidates=", candidates,
+                        "classes=", [
+                            (
+                                definition.identity,
+                                [
+                                    (method.name, method.function_reference, method.function_name)
+                                    for method in definition.methods
+                                    if method.name in {"__new__", "__init__"}
+                                ],
+                            )
+                            for definition in (getattr(class_table, "classes", ()) or ())
+                            if str(definition.identity).rsplit(".", 1)[-1] == "Vocabulary"
+                        ],
+                        flush=True,
+                    )
                     raise ConcordanceRefusal(
                         "record constructor requires a complete physical "
                         "schema, but only an exact projection view is "
@@ -42069,7 +42085,18 @@ def _class_surface_ssa_program(
                 )
                 if unslotted_fields:
                     from .identity_concordance import ConcordanceRefusal
-
+                    print(
+                        "VOCABULARY_LAYOUT_MISMATCH:",
+                        "class_identity=", repr(class_identity),
+                        "class_fields=",
+                        tuple(str(field.name) for field in class_definition.fields),
+                        "template_identity=", repr(template.identity),
+                        "template_record_id=", repr(template.record_id),
+                        "template_fields=",
+                        tuple(str(member.name) for member in template.fields),
+                        "unslotted_fields=", unslotted_fields,
+                        flush=True,
+                    )
                     raise ConcordanceRefusal(
                         "class construction has no physical field for "
                         "attributes of its layout: "

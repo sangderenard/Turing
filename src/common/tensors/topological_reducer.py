@@ -9077,6 +9077,18 @@ def _normalize_lexical_values(
                     ))
                     if receiver_class is not None else None
                 )
+                if expression.attr == "exact_atoms":
+                    print(
+                        "EXACT_ATOMS_FIELD:",
+                        "receiver_class=", repr(receiver_class),
+                        "field_kind=", repr(field_kind),
+                        "entries=", {
+                            key: kind
+                            for key, kind in (class_field_aggregate_kinds or {}).items()
+                            if key[1] == "exact_atoms"
+                        },
+                        flush=True,
+                    )
                 field_storage = (
                     dict((class_field_storage_contracts or {}).get((
                         str(receiver_class), str(expression.attr)
@@ -15602,13 +15614,16 @@ def _normalize_lexical_values(
                         graph.G.nodes[initial].get("attributes") or {}
                     )
                     aggregate_kind = state_attributes.get("aggregate_kind")
+
+                    if name == "self.exact_atoms" and call.func.attr == "append":
+                        print("EXACT_ATOMS_KIND:", repr(aggregate_kind), flush=True)
                     sequence_policy = (
                         "unique"
                         if aggregate_kind in {"set", "dict"}
                         else (
                             "duplicates"
                             if aggregate_kind in {
-                                "list", "tuple", "bytes", "bytearray"
+                                "list", "tuple", "bytes", "bytearray", "array"
                             }
                             else None
                         )
@@ -18744,7 +18759,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     if isinstance(value, ast.Name)
                     and value.id in {
                         "list", "set", "frozenset", "dict", "tuple",
-                        "bytes", "bytearray",
+                        "array.array", "bytes", "bytearray",
                     }
                     else None
                 )
@@ -18854,9 +18869,22 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         )
                         if pending not in class_declared_field_aliases:
                             class_declared_field_aliases.add(pending)
-                    if outer_kind is not None:
+                    target_kind = outer_kind
+                    if target_kind is None:
+                        from ...transmogrifier.graph.graph_express2 import (
+                            _ast_aggregate_kind,
+                            _class_field_reference,
+                        )
+
+                        target_kind = _ast_aggregate_kind(
+                            _class_field_reference(
+                                source_class, str(target.attr), frozenset()
+                            )
+                        )
+
+                    if target_kind is not None:
                         class_field_aggregate_kinds.setdefault(
-                            (str(owner_name), str(target.attr)), outer_kind
+                            (str(owner_name), str(target.attr)), target_kind
                         )
                 if not (
                     isinstance(value, ast.Call)
