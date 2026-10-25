@@ -755,6 +755,10 @@ def scalar_region_formal(callee, formal):
 
 def physical_call_input_conflicts(functions):
     """Collect the whole frontier before inference mutates any value types."""
+    canonical = {
+        'double': 'float64', 'float': 'float32',
+        'i64': 'int64', 'i32': 'int32', 'i1': 'bool',
+    }
     conflicts = []
     for caller in functions.values():
         for block in caller.blocks.values():
@@ -778,6 +782,8 @@ def physical_call_input_conflicts(functions):
                     formal_type = (formal.accounting or {}).get('physical_dtype') or formal.dtype
                     if scalar_region_formal(callee, formal):
                         formal_type = formal.dtype
+                    actual_type = canonical.get(actual_type, actual_type)
+                    formal_type = canonical.get(formal_type, formal_type)
                     if (actual_type in {None, '', 'unknown', 'ptr'} or formal_type in {None, '', 'unknown', 'ptr'}
                             or actual_type == formal_type):
                         continue
