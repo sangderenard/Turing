@@ -17619,9 +17619,7 @@ def _sequence_column_dtype_contracts(
                     contracts[value_id] = dtypes
     for node_id, data in graph_obj.nodes(data=True):
         value_id = int(data.get("value_id", node_id))
-        if value_id not in declared or str(
-            data.get("type") or data.get("op") or ""
-        ).casefold() != "getattr":
+        if str(data.get("type") or data.get("op") or "").casefold() != "getattr":
             continue
         receiver_id = next((
             int(parent)
@@ -17651,6 +17649,13 @@ def _sequence_column_dtype_contracts(
             continue
         storage = str(field.get("storage") or "")
         aggregate_kind = str(field.get("aggregate_kind") or "").casefold()
+        # Vocabulary.put mutates self.exact_atoms = array("I").  That
+        # GetAttr is born when append lowers, not in local sequence
+        # declarations.  Its declared uint32 row must reach that birth.
+        if value_id not in declared and not (
+            storage == "span" and aggregate_kind == "array"
+        ):
+            continue
         if storage == "table":
             dtypes = tuple(
                 str(column.get("dtype") or "unknown")
@@ -17658,12 +17663,16 @@ def _sequence_column_dtype_contracts(
             )
         elif storage == "span" and aggregate_kind in {
             "list", "tuple", "set", "frozenset", "iterable", "sequence",
-            "bytes", "bytearray", "str",
+            "bytes", "bytearray", "str", "array",
         }:
+            # Vocabulary.exact_atoms = array("I") declares uint32 rows.
+            # Without this source contract, append lowering mints an int64
+            # SSA column before record ABI materialization can revise its
+            # descriptor.  The authored array dtype owns both records.
             dtypes = (str(field.get("dtype") or "unknown"),)
         else:
             continue
-        if len(dtypes) == declared[value_id]:
+        if len(dtypes) == declared.get(value_id, 1):
             contracts[value_id] = dtypes
     for parameter_name, annotation in (
         _current_authored_parameter_annotations(graph_obj).items()
