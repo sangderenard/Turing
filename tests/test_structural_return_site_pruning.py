@@ -245,7 +245,7 @@ def root():
             r"unsupported mixed-element native type ABI: .*"
             r"exact callsite element classes \('builtins.bool', "
             r"'builtins.int'\).*VALUE_TYPE_ABI declares "
-            r"\('builtins.int',\).*no per-element class tag"
+            r"\('unknown',\).*no per-element class tag"
         ),
     ):
         lower_ast_source_to_ssa(
