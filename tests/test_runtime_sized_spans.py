@@ -185,6 +185,44 @@ def test_integer_span_scalar_arithmetic_matches_c_and_llvm(
             assert output["extents_from"] == buffers[parameters["x"]]["index"]
 
 
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+def test_indexed_python_integer_keeps_scalar_storage_across_calls(tmp_path, backend):
+    from src.compiler.structural_concordance import function_value_structure
+
+    source = (
+        REPO / "tests" / "record_view_corpus" / "c629_indexed_scalar_call.py"
+    ).read_text(encoding="utf-8")
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="indexed_scalar_call",
+        extraction_contract=BASE_CONTRACT,
+        progress=lambda _message: None, progress_bars=False,
+    )
+    count = next(
+        function for function in module.functions.values()
+        if "begin" in dict(function.metadata.get("parameter_names", ()))
+    )
+    parameters = dict(count.metadata["parameter_names"])
+    for name in ("begin", "end"):
+        structure, _cell = function_value_structure(
+            count, parameters[name], book=module.metadata["identity_book"],
+        )
+        assert (structure.kind, structure.dtype, structure.rank) == (
+            "scalar", "int64", 0,
+        )
+    root = module.functions[exports[0]]
+    parameters = dict(root.metadata["parameter_names"])
+    feeds = {
+        parameters["offsets"]: np.array([2, 5, 8], dtype=np.int64),
+        parameters["index"]: np.array([1], dtype=np.int64),
+    }
+    _artifact, execution = _run(backend, module, exports[0], feeds, tmp_path)
+    result = next(
+        instruction.args[0] for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    )
+    assert np.asarray(execution.buffers[result.id]).reshape(-1).tolist() == [18]
+
+
 def test_c620_integer_mask_arithmetic_uses_the_span_dtype(tmp_path):
     source = (
         REPO / "tests" / "integer_span_corpus" /
