@@ -4312,6 +4312,15 @@ class CorrelationTable:
             key = self._abi_or_member_key(name, formal)
             if key is not None:
                 caller_by_key[key].append(value_id)
+
+        def sequence_roles_of(symbol, value_id):
+            table = (getattr(module, "sequence_tables", {}) or {}).get(symbol)
+            return frozenset(
+                role for _sequence_id, role in (
+                    () if table is None else table.member_claims(value_id)
+                )
+            )
+
         for block_name, block in function.blocks.items():
             for index, instruction in enumerate(block.instrs):
                 if instruction.op not in {"Call", "call"}:
@@ -4329,10 +4338,24 @@ class CorrelationTable:
                     accounting = dict(getattr(argument, "accounting", {}) or {})
                     if not accounting.get("linked_call_frame_storage"):
                         continue
-                    owned = [
-                        owner for owner in caller_by_key.get(key, ())
-                        if owner != argument_id
-                    ]
+                    formal_roles = sequence_roles_of(callee_name, int(callee_id))
+                    owned = []
+                    for owner in caller_by_key.get(key, ()):
+                        if owner == argument_id:
+                            continue
+                        owner_roles = sequence_roles_of(name, owner)
+                        # c631: the callee's operational status lease is
+                        # not the caller's column/length/capacity storage.
+                        # The same field identity alone erased those roles
+                        # and falsely reported a duplicate. Compare the
+                        # descriptor-owned roles when both endpoints state
+                        # them; absent role evidence keeps the old check.
+                        if (
+                            formal_roles and owner_roles
+                            and formal_roles.isdisjoint(owner_roles)
+                        ):
+                            continue
+                        owned.append(owner)
                     if owned:
                         found.append(Finding(
                             "duplicate-storage-across-call", name, argument_id,
