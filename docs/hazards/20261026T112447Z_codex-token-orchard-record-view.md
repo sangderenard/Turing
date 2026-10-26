@@ -6,4 +6,6 @@ Observed: `materialize_parameter_record_abi` built the declared sequence field b
 
 Observed: Before the fix, the focused canonical `array('Q')` method relay raised a record/sequence descriptor conflict. After the fix, `tests/test_ir_sequence_tables.py::test_declared_array_receiver_refines_raw_span_before_method_linking` passes; its identity-book history shows the same record field transition from raw SPAN to SEQUENCE, retaining the `uint64` first column. Corpus `c624_array_receiver_relay.py` is the authored source.
 
-Unknown: The complete Token Orchard whole-core audit has not been rerun on this branch. This is a lowering/provenance repair; it does not claim native execution parity or clear later arena, heap, or ABI frontiers.
+Observed: The complete Token Orchard `Vocabulary.intern_batch` lowering audit was run once against this branch through the canonical entry. It passed the former `_intern_validated_span` -> `_cover_span` `exact_begin` refusal and reached a separate named frontier: `token_orchard_whole_core_entry` callsite 5 -> `intern_batch` requires `Vocabulary._candidates` sequence member `('column', 2)` but the bound caller record 3 names no such member.
+
+Unknown: That new `_candidates` caller-record mismatch needs its own provenance trace. This repair does not claim native execution parity or clear later arena, heap, or ABI frontiers.
