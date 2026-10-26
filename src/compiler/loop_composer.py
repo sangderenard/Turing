@@ -3214,6 +3214,31 @@ class LoopComposer:
             graph.G.graph.get("return_slot_values") or {}
         )
 
+        def return_site_is_unreachable(site_cell: Any) -> bool:
+            if site_cell is None:
+                return False
+            from .concordance_declarations import (
+                RETURN_SITE_SLOT, RETURN_SITE_UNREACHABLE,
+            )
+            from .identity_concordance import Unresolved, current_identity_book
+
+            scope = graph.G.graph.get("lexical_read_scope")
+            book = current_identity_book()
+            page = book.pages.get(RETURN_SITE_SLOT.name)
+            if scope is None or page is None:
+                return False
+            rows = tuple(
+                row for row in page.scope_rows(tuple(scope))
+                if row[1] == site_cell
+            )
+            if not rows:
+                return False
+            return all(
+                isinstance(fact := page.latest(row), Unresolved)
+                and fact.reason == RETURN_SITE_UNREACHABLE
+                for row in rows
+            )
+
         def terminal_return_expressions(
             statements: Iterable[ast.stmt],
         ) -> set[int]:
@@ -3313,8 +3338,18 @@ class LoopComposer:
                         ))
                     continue
                 if isinstance(statement, ast.Return) and statement.value is not None:
-                    return_value_id = graph_node_for_ast(statement.value)
                     returned = statement.value
+                    site_cell = return_site_cell_for(graph, returned)
+                    # Program: the int64 `offsets` span makes the
+                    # `not isinstance(offset, int) or isinstance(offset,
+                    # bool)` return in `validate_batch_envelope` impossible.
+                    # The structural fold revises that site's slot rows to
+                    # RETURN_SITE_UNREACHABLE while the retained loop still
+                    # owns its source AST. Do not rebuild a loop return edge
+                    # for a site the authoritative page has retired.
+                    if return_site_is_unreachable(site_cell):
+                        continue
+                    return_value_id = graph_node_for_ast(statement.value)
                     slot_values = return_slot_values.get((
                         int(getattr(returned, "lineno", -1)),
                         int(getattr(returned, "col_offset", -1)),
@@ -3359,7 +3394,7 @@ class LoopComposer:
                             tuple(chain),
                             tuple(slot_values),
                             (
-                                return_site_cell_for(graph, returned),
+                                site_cell,
                                 return_site_span(returned),
                             ),
                         ))

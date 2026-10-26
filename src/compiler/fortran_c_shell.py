@@ -18133,6 +18133,33 @@ def _sequence_column_dtype_contracts(
             elif destination_contract is not None and source is None:
                 contracts[source_id] = destination_contract
                 changed = True
+    for node_id, data in graph_obj.nodes(data=True):
+        value_id = int(data.get("value_id", node_id))
+        if value_id not in declared or declared[value_id] != 1:
+            continue
+        attributes = data.get("attributes") or {}
+        class_fact = attributes.get(
+            "callsite_sequence_element_class_fact"
+        )
+        class_cells = tuple(attributes.get(
+            "callsite_sequence_element_class_cells"
+        ) or ())
+        if (
+            not isinstance(class_fact, tuple)
+            or len(class_fact) < 2
+            or int(class_fact[1]) != 1
+            or tuple(class_fact[2:]) != (
+                "callsite iterable element class",
+            )
+            or not class_cells
+        ):
+            continue
+        dtype = {
+            "builtins.int": "int64",
+            "builtins.bool": "bool",
+        }.get(str(class_fact[0]))
+        if dtype is not None:
+            contracts[value_id] = (dtype,)
     return contracts
 
 
@@ -23927,6 +23954,21 @@ def _class_surface_ssa_program(
                 int(value_id), (),
             ),
         )))
+        callsite_node_abi = next((
+            data.get("attributes") or {}
+            for node_id, data in owner.nodes(data=True)
+            if int(data.get("value_id", node_id)) == int(value_id)
+            and (data.get("attributes") or {}).get(
+                "callsite_sequence_element_class_fact"
+            ) is not None
+        ), {})
+        callsite_element_fact = callsite_node_abi.get(
+            "callsite_sequence_element_class_fact"
+        )
+        callsite_element_cells = tuple(
+            callsite_node_abi.get("callsite_sequence_element_class_cells")
+            or ()
+        )
         established = dict(contract.get("python_type_abis") or ())
         arms = []
         for identity in identities:
@@ -23937,6 +23979,36 @@ def _class_surface_ssa_program(
                         "native union arm is not a ValueTypeABIAlternative: "
                         f"{identity!r} -> {arm!r}"
                     )
+                if (
+                    identity == "builtins.list"
+                    and arm.storage == "span"
+                    and arm.rank == 1
+                    and isinstance(callsite_element_fact, tuple)
+                    and len(callsite_element_fact) >= 2
+                    and int(callsite_element_fact[1]) == 1
+                    and tuple(callsite_element_fact[2:]) == (
+                        "callsite iterable element class",
+                    )
+                    and callsite_element_cells
+                ):
+                    callsite_dtype = {
+                        "builtins.int": "int64",
+                        "builtins.bool": "bool",
+                    }.get(str(callsite_element_fact[0]))
+                    if callsite_dtype is not None:
+                        arm = _ValueTypeABIAlternative(
+                            identity=arm.identity,
+                            storage=arm.storage,
+                            dtype=callsite_dtype,
+                            shape=arm.shape,
+                            rank=arm.rank,
+                            storage_identity=arm.storage_identity,
+                            source_cells=tuple(dict.fromkeys((
+                                *arm.source_cells, *callsite_element_cells,
+                            ))),
+                            metadata_state=arm.metadata_state,
+                            row_shape=arm.row_shape,
+                        )
                 arms.append(arm)
                 continue
             if identity == "builtins.NoneType":
@@ -25123,10 +25195,54 @@ def _class_surface_ssa_program(
         contracts = linked_value_abi_by_graph.get(id(planned_graph), {})
         if contracts:
             from .concordance_declarations import (
+                SOURCE_VALUE_CLASS as _SOURCE_VALUE_CLASS,
                 VALUE_TYPE_ABI as _VALUE_TYPE_ABI,
                 ValueTypeABIFact as _ValueTypeABIFact,
             )
             copy_scope, _copy_identity_page = _copy_scope(planned_graph)
+            for node_id, data in planned_graph.nodes(data=True):
+                value_id = int(data.get("value_id", node_id))
+                attributes = data.get("attributes") or {}
+                class_fact = attributes.get(
+                    "callsite_sequence_element_class_fact"
+                )
+                class_cells = tuple(attributes.get(
+                    "callsite_sequence_element_class_cells"
+                ) or ())
+                contract = contracts.get(value_id)
+                contract_types = set(map(str, (
+                    contract.get("python_types") or (
+                        contract.get("python_type"),
+                    )
+                ))) if contract is not None else set()
+                if (
+                    not isinstance(class_fact, tuple)
+                    or len(class_fact) < 2
+                    or int(class_fact[1]) != 1
+                    or tuple(class_fact[2:]) != (
+                        "callsite iterable element class",
+                    )
+                    or not class_cells
+                    or contract is None
+                    or str(contract.get("storage") or "") != "span"
+                    or int(contract.get("rank") or 0) != 1
+                    or "builtins.list" not in contract_types
+                ):
+                    continue
+                callsite_dtype = {
+                    "builtins.int": "int64",
+                    "builtins.bool": "bool",
+                }.get(str(class_fact[0]))
+                if callsite_dtype is None:
+                    continue
+                contract["dtype"] = callsite_dtype
+                linked_value_type_source_cells_by_graph.setdefault(
+                    id(planned_graph), {},
+                )[value_id] = tuple(dict.fromkeys((
+                    *linked_value_type_source_cells_by_graph.get(
+                        id(planned_graph), {},
+                    ).get(value_id, ()), *class_cells,
+                )))
             for value_id, contract in contracts.items():
                 alternatives = tuple(sorted(set(
                     _canonical_program_abi_type_identity(
@@ -25175,7 +25291,10 @@ def _class_surface_ssa_program(
                 incumbent = shape_identity_book.latest_ref(
                     _VALUE_TYPE_ABI, row,
                 )
-                if incumbent is not None and _cell_fact(incumbent) == fact:
+                incumbent_fact = (
+                    None if incumbent is None else _cell_fact(incumbent)
+                )
+                if incumbent is not None and incumbent_fact == fact:
                     continue
                 source_cell = _identity_cell(planned_graph, int(value_id))
                 if source_cell is None:

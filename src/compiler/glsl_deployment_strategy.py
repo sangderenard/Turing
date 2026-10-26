@@ -1176,6 +1176,38 @@ def _authored_aggregate_descriptor_tree(graph: Any, value_id: int) -> Any:
     )
 
 
+def _authored_aggregate_class_tree(graph: Any, value_id: int) -> Any:
+    """Return the exact semantic class receipt tree for aggregate members.
+
+    A scalar member often has no tensor descriptor, so the descriptor tree
+    above records ``None`` for both ``[0, 1]`` and ``[False, True]``. That
+    loses the existing source-class distinction needed by callsite shells.
+    Preserve each leaf's canonical SOURCE_VALUE_CLASS fact and exact cell in
+    the specialization key; do not infer its class from its ABI dtype.
+    """
+
+    value_id = int(value_id)
+    leaves = _authored_aggregate_leaves(graph, value_id)
+    if leaves:
+        return tuple(
+            _authored_aggregate_class_tree(graph, int(leaf))
+            for leaf in leaves
+        )
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from .concordance_declarations import SOURCE_VALUE_CLASS
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    row = (_source_numeric_scope(graph.G), value_id)
+    cell = book.latest_ref(SOURCE_VALUE_CLASS, row)
+    if cell is None:
+        return None
+    fact = book.page(SOURCE_VALUE_CLASS.name).cell(
+        cell.row, cell.column,
+    )
+    return (fact, cell)
+
+
 def _atomic_region_node_order(
     graph: Any,
     topological_nodes: tuple[int, ...],
@@ -19987,7 +20019,33 @@ def _propagate_callsite_tensor_specializations(
             or int(entry.reference.address) in runtime_references
         )
     )
-
+    table_graph_ids = {
+        id(entry.graph.G)
+        for entry in function_table
+        if entry.graph is not None
+    }
+    graph_function_ref = graph.G.graph.get("function_ref")
+    if graph_function_ref is not None:
+        try:
+            function_source = function_table.entry(
+                int(graph_function_ref)
+            ).graph
+        except (KeyError, TypeError, ValueError):
+            function_source = None
+        if function_source is not None and function_source.G is not graph.G:
+            table_graph_ids.add(id(graph.G))
+    isolated_callers = {}
+    for caller in graphs:
+        if id(caller.G) in table_graph_ids:
+            isolated_callers.setdefault(
+                id(caller.G),
+                extract_clean_process_subgraph(caller, caller.G),
+            )
+    if isolated_callers:
+        graphs = [
+            isolated_callers.get(id(caller.G), caller)
+            for caller in graphs
+        ]
     #: (caller graph, call node) -> per-slot callee return value cells of
     #: the latest ``call_result_descriptor`` answer for that call.
     return_cells_by_call: dict[tuple[int, int], tuple] = {}
@@ -20221,6 +20279,9 @@ def _propagate_callsite_tensor_specializations(
         _apply_callsite_tensor_descriptors(specialized, descriptors)
         _apply_callsite_aggregate_descriptors(
             specialized, aggregate_descriptors,
+        )
+        _post_callsite_loop_element_classes(
+            caller, int(node_id), specialized, specializations,
         )
         if not _expand_specialized_unbroadcast_identity(specialized):
             _fold_callsite_structural_values(specialized)
@@ -21926,6 +21987,11 @@ def _stable_signature_value(value: Any) -> object:
         ))
     if isinstance(value, (tuple, list, set, frozenset)):
         return tuple(_stable_signature_value(item) for item in value)
+    if isinstance(value, (bool, int, float, complex, str, bytes, type(None))):
+        # Python bools compare equal to the integers 0 and 1. A specialization
+        # signature must retain the authored class: ``[False, True]`` and
+        # ``[0, 1]`` take different isinstance branches.
+        return (type(value).__module__, type(value).__qualname__, value)
     try:
         hash(value)
     except TypeError:
@@ -25171,9 +25237,36 @@ def _fold_callsite_structural_values(
         if node_type in {"Constant", "Const", "const"}:
             return constant(data)
         if node_type in {"Input", "input"}:
+            input_attributes = data.get("attributes") or {}
             binding_name = (data.get("attributes") or {}).get(
                 "binding_name"
             )
+            if input_attributes.get("binding_kind") == "loop":
+                loop_class_fact = source_value_class_page.latest((
+                    source_value_class_scope,
+                    int(data.get("value_id", node_id)),
+                ))
+                if (
+                    isinstance(loop_class_fact, tuple)
+                    and len(loop_class_fact) >= 3
+                    and loop_class_fact[2]
+                    == "callsite iterable element class"
+                ):
+                    class_identity = str(loop_class_fact[0])
+                    dtype = {
+                        "builtins.bool": "bool",
+                        "builtins.int": "int64",
+                        "builtins.float": "float64",
+                    }.get(class_identity)
+                    if class_identity == "unknown" or dtype is None:
+                        return _ProgramABIValueFact(
+                            "unknown", "scalar", None,
+                            type_expectations=("unknown",),
+                        )
+                    return _ProgramABIValueFact(
+                        class_identity, "scalar", dtype,
+                        type_expectations=(class_identity,),
+                    )
             if binding_name is None:
                 identities = graph.G.graph.get("identity_table") or {}
                 parameters = set(map(
@@ -25926,6 +26019,60 @@ def _fold_callsite_structural_values(
                         and producer_attributes.get("aggregate_kind") == object_type.__name__):
                     return issubclass(object_type, accepted)
             if isinstance(values[0], _ProgramABIValueFact):
+                exact_loop_class = source_value_class_page.latest((
+                    source_value_class_scope,
+                    int(graph.G.nodes.get(
+                        int(arguments[0]), {},
+                    ).get("value_id", arguments[0]))
+                    if arguments else -1,
+                ))
+                if (
+                    isinstance(exact_loop_class, tuple)
+                    and len(exact_loop_class) >= 3
+                    and exact_loop_class[2]
+                    == "callsite iterable element class"
+                ):
+                    class_identity = str(exact_loop_class[0])
+                    if class_identity == "unknown":
+                        return unresolved
+                    actual = safe_types(ast.Name(
+                        id=class_identity.rsplit(".", 1)[-1],
+                        ctx=ast.Load(),
+                    ))
+                    accepted = safe_types(
+                        expression.args[1]
+                        if len(expression.args) > 1 else None
+                    )
+                    if actual and accepted:
+                        try:
+                            return issubclass(actual[0], accepted)
+                        except TypeError:
+                            return unresolved
+                    return unresolved
+                argument_node = (
+                    graph.G.nodes.get(int(arguments[0]), {})
+                    if arguments else {}
+                )
+                argument_attributes = (
+                    argument_node.get("attributes") or {}
+                )
+                accepted_types = safe_types(
+                    expression.args[1]
+                    if len(expression.args) > 1 else None
+                )
+                # ``list[int]`` does not prove an exact Python ``int`` for
+                # a loop item: bool is an int subclass and is accepted by
+                # the annotation. Without a callsite's exact homogeneous
+                # element-class Ref, the negative bool test must stay live.
+                # The callsite class projection above is the only proof that
+                # lets a literal int or bool sequence select this predicate.
+                if (
+                    argument_attributes.get("binding_kind") == "loop"
+                    and str(values[0].python_type).removeprefix("builtins.")
+                    == "int"
+                    and bool in accepted_types
+                ):
+                    return unresolved
                 if len(values[0].type_expectations) > 1:
                     # The API declares a runtime union.  The structural fold
                     # cannot choose one arm; native type SSA consumes the
@@ -27792,13 +27939,62 @@ def _fold_callsite_structural_values(
                 int(node_id)
                 for node_id, data in graph.G.nodes(data=True)
                 if id(data.get("expr_obj")) in rejected_ast_ids
+                # ``replace`` keeps the reducer-owned authored AST identity
+                # when it rewrites a rejected Return/Tuple into a structural
+                # Constant.  Its live ``expr_obj`` is then None, so checking
+                # only that display record leaves the rejected transport
+                # node behind with the source site's span and may let the
+                # later control pass publish it as a loop value.
+                or id(data.get("authored_expr_obj")) in rejected_ast_ids
                 or isinstance(data.get("expr_obj"), ast.AST)
                 and _ast_source_signature(data["expr_obj"])
+                in rejected_signatures
+                or isinstance(data.get("authored_expr_obj"), ast.AST)
+                and _ast_source_signature(data["authored_expr_obj"])
                 in rejected_signatures
                 or (int(retained_control_id), str(rejected_role)) in (
                     branch_memberships.get(int(node_id), frozenset())
                 )
             }
+            # Program: the `isinstance(offset, int)` early-return inside
+            # `validate_batch_envelope` is structurally disproved for an
+            # int64 span. Wrong record: the rejected Return/Tuple and its
+            # literal slot are removed, while `return_slot_values` still
+            # reads the source `return_site_slot` page as though that site
+            # could reach the function exit; control lowering then resurrects
+            # the absent literal as an untyped formal. Rule: when this fold
+            # rejects a source return construct, revise that exact site's
+            # existing slot rows to RETURN_SITE_UNREACHABLE. Preserve the
+            # construct's ingestion identity: a structural constant may have
+            # lost return_site_cell, while authored_expr_obj still names the
+            # reducer's exact ingestion_value Ref.
+            return_site_spans = (
+                graph.G.graph.get("return_site_spans") or {}
+            )
+            ingestion_scope = graph.G.graph.get("ingestion_value_scope")
+            rejected_return_site_cells = set()
+            for node_id in rejected_nodes:
+                if node_id not in graph.G:
+                    continue
+                data = graph.G.nodes[node_id]
+                site_cell = (data.get("attributes") or {}).get(
+                    "return_site_cell"
+                )
+                if site_cell not in return_site_spans:
+                    authored_expression = data.get("authored_expr_obj")
+                    if authored_expression is None:
+                        continue
+                    authored_identity = id(authored_expression)
+                    site_cell = next((
+                        candidate for candidate in return_site_spans
+                        if getattr(getattr(candidate, "page", None), "name", None)
+                        == "ingestion_value"
+                        and len(getattr(candidate, "row", ())) == 2
+                        and candidate.row[0] == ingestion_scope
+                        and int(candidate.row[1]) == authored_identity
+                    ), None)
+                if site_cell in return_site_spans:
+                    rejected_return_site_cells.add(site_cell)
             specialized = list(
                 graph.G.graph.get(
                     "structurally_specialized_conditional_node_ids", ()
@@ -27846,6 +28042,7 @@ def _fold_callsite_structural_values(
                 }
             remove_node(int(control_id))
             identities = graph.G.graph.get("identity_table") or {}
+            return_sites_pruned_for_selected_arm = False
             if selected_return_id is not None:
                 graph.roots = [int(selected_return_id)]
                 # ``selected_return_id`` is the return STATEMENT's value: for
@@ -27914,6 +28111,20 @@ def _fold_callsite_structural_values(
                         _post_pruned_return_sites(
                             graph, selected_sites, int(retained_control_id),
                         )
+                        return_sites_pruned_for_selected_arm = True
+            if (
+                rejected_return_site_cells
+                and not return_sites_pruned_for_selected_arm
+            ):
+                # A structural fold inside a loop can reject a Return arm
+                # while its retained arm continues the loop and has no
+                # terminal Return of its own. Keep every other site, including
+                # accepted returns elsewhere in the loop, and retire only the
+                # exact return-site Refs attached to rejected source nodes.
+                _post_pruned_return_sites(
+                    graph, {}, int(retained_control_id),
+                    rejected_sites=rejected_return_site_cells,
+                )
             # Versions whose nodes the arm removal took revise to
             # ``Unresolved(BINDING_VERSION_REMOVED)`` (plan 80, A2.7).
             _post_identity_table_mutation(graph, removed=(
@@ -28480,6 +28691,264 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
     return True
 
 
+def _post_callsite_loop_element_classes(
+    caller: Any, call_id: int, specialized: Any,
+    specializations: Mapping[str, Any],
+) -> None:
+    """Carry exact literal sequence member classes to loop bindings.
+
+    A method's ``list[int]`` annotation describes its generic formal. If one
+    callsite supplies ``[False, True]``, the loop target is a bool at that
+    callsite under Python semantics. Keep that fact in this specialization's
+    existing ``source_value_class`` rows, derived from the caller's exact
+    member class Refs. A mixed or unread member class is recorded as unknown,
+    so a negative ``isinstance`` test cannot be folded from the generic
+    annotation alone.
+    """
+
+    if int(call_id) not in caller.G:
+        return
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope, node_identity_cell,
+    )
+    from .call_argument_binding import (
+        _callsite_parameter_name, _expanded_callsite_argument_edges,
+        _method_parameter_layout,
+    )
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, SOURCE_VALUE_CLASS,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    book = current_identity_book()
+    class_page = book.page(SOURCE_VALUE_CLASS)
+    caller_scope = _source_numeric_scope(caller.G)
+    callee_scope = _source_numeric_scope(specialized.G)
+    program_abi_values = tuple(
+        (caller.G.graph.get("program_abi") or {}).get("values") or ()
+    )
+
+    def exact_program_abi_element_class(
+        actual_id: int, parameter: str,
+    ) -> tuple[str, tuple[Any, ...]] | None:
+        """Read a typed span's element class from this exact caller ABI row.
+
+        A generic ``list[int]`` annotation admits bool by Python's subtype
+        rules. An explicitly declared native int64 span, however, is already
+        physically an integer row. Carry that caller fact to this call's loop
+        targets so the structural fold can remove the impossible bool arm.
+        """
+
+        actual = caller.G.nodes.get(int(actual_id), {})
+        attributes = actual.get("attributes") or {}
+        if (
+            actual.get("type") != "Input"
+            or attributes.get("binding_kind") != "parameter"
+            or str(attributes.get("binding_name") or "") != str(parameter)
+        ):
+            return None
+        function_name = str(caller.G.graph.get("function_name") or "")
+        rows = tuple(
+            row for row in program_abi_values
+            if str((row or {}).get("function") or "") == function_name
+            and str((row or {}).get("parameter") or "") == str(parameter)
+        )
+        if len(rows) != 1:
+            return None
+        row = rows[0]
+        if (
+            str(row.get("storage") or "") not in {"span", "sequence"}
+            or int(row.get("rank") or 0) != 1
+        ):
+            return None
+        element_class = {
+            "int64": "builtins.int",
+            "bool": "builtins.bool",
+        }.get(str(row.get("dtype") or ""))
+        if element_class is None:
+            return None
+        value_id = int(actual.get("value_id", actual_id))
+        cells = tuple(dict.fromkeys((
+            node_identity_cell(caller, int(actual_id)),
+            book.latest_ref(SOURCE_VALUE_CLASS, (caller_scope, value_id)),
+        )))
+        cells = tuple(cell for cell in cells if cell is not None)
+        return (element_class, cells) if cells else None
+
+    receiver, positional, _all = _method_parameter_layout(specialized.G)
+    formal_ids = {
+        str(name): tuple(map(int, history or ()))
+        for name, history in (
+            specialized.G.graph.get("identity_table") or {}
+        ).items()
+        if str(name) in set(map(
+            str, specialized.G.graph.get("function_parameters") or (),
+        ))
+    }
+    for actual_id, role_value in _expanded_callsite_argument_edges(
+        caller, int(call_id),
+    ):
+        parameter = _callsite_parameter_name(
+            str(role_value), receiver, positional,
+        )
+        if parameter is None:
+            continue
+        parameter = str(parameter)
+        abi_element_class = exact_program_abi_element_class(
+            int(actual_id), parameter,
+        )
+        formal_candidates = tuple(
+            value_id for value_id in formal_ids.get(parameter, ())
+            if value_id in specialized.G
+            and (specialized.G.nodes[value_id].get("attributes") or {}).get(
+                "binding_kind"
+            ) == "parameter"
+        )
+        if len(formal_candidates) != 1:
+            continue
+        formal_id = int(formal_candidates[0])
+        leaves = _authored_aggregate_leaves(caller, int(actual_id))
+        if leaves and not _aggregate_binds_by_member(
+            caller.G, int(actual_id), specialized.G, parameter, int(call_id),
+        ):
+            actual_expression = caller.G.nodes[int(actual_id)].get(
+                "expr_obj"
+            )
+            # A direct literal has no alias outside this call, and the
+            # callee's mutation test above is the same owner rule used by
+            # aggregate-frame planning. Its exact leaf class tree remains
+            # valid even when iteration requires passing the whole storage
+            # instead of splitting the list into member arguments.
+            if not (
+                isinstance(actual_expression, (ast.List, ast.Tuple))
+                and int(formal_id) not in _mutated_sequence_node_ids(
+                    specialized.G
+                )
+            ):
+                leaves = ()
+        if (
+            parameter not in specializations
+            and abi_element_class is None
+            and not leaves
+        ):
+            continue
+        member_classes: list[str] = []
+        member_cells: list[Any] = []
+        for leaf in leaves:
+            leaf_data = caller.G.nodes.get(int(leaf), {})
+            leaf_value_id = int(leaf_data.get("value_id", leaf))
+            class_row = (caller_scope, leaf_value_id)
+            fact = class_page.latest(class_row)
+            cell = book.latest_ref(SOURCE_VALUE_CLASS, class_row)
+            if (
+                not isinstance(fact, tuple) or len(fact) < 2
+                or cell is None
+            ):
+                member_classes = []
+                break
+            member_classes.append(str(fact[0]))
+            member_cells.append(cell)
+        exact_class = (
+            member_classes[0]
+            if member_classes and len(set(member_classes)) == 1 else None
+        )
+        if exact_class is None and abi_element_class is not None:
+            exact_class, abi_cells = abi_element_class
+            member_cells.extend(abi_cells)
+        if exact_class is None and not member_classes:
+            continue
+        class_fact = (
+            (exact_class, 1, "callsite iterable element class")
+            if exact_class is not None
+            else (
+                "unknown", 1, "callsite iterable element class",
+                tuple(sorted(set(member_classes))),
+            )
+        )
+        formal_data = specialized.G.nodes[formal_id]
+        formal_attributes = dict(formal_data.get("attributes") or {})
+        actual_cell = node_identity_cell(caller, int(actual_id))
+        if exact_class is not None:
+            # A member-bound homogeneous aggregate has a callsite-specific
+            # physical row class as well as a loop-target class. Leaving the
+            # formal's annotated ``list[int]`` row in place made the bool
+            # specialization accept a bool span at the call edge while its
+            # callee frame still declared int64 storage; LLVM correctly
+            # refused that bool-to-int64 pointer ABI. The class tree in the
+            # shell key and its exact member/ProgramABI cells are the source
+            # of this derived formal view.
+            formal_attributes["sequence_element_class_ref"] = exact_class
+            formal_attributes[
+                "callsite_sequence_element_class_fact"
+            ] = class_fact
+            formal_attributes[
+                "callsite_sequence_element_class_cells"
+            ] = tuple(member_cells)
+            formal_data["attributes"] = formal_attributes
+        for loop_id, loop_data in specialized.G.nodes(data=True):
+            attributes = loop_data.get("attributes") or {}
+            if str(attributes.get("source_type") or "") != "For":
+                continue
+            iterable_ids = tuple(
+                int(parent)
+                for parent, role in loop_data.get("parents") or ()
+                if str(role) == "iterable" and int(parent) in specialized.G
+            )
+            if formal_id not in iterable_ids:
+                continue
+            target_ids = tuple(map(int, dict(
+                attributes.get("loop_target_bindings") or {}
+            ).values()))
+            for target_id in target_ids:
+                if target_id not in specialized.G:
+                    continue
+                target_data = specialized.G.nodes[target_id]
+                target_attributes = target_data.get("attributes") or {}
+                if target_attributes.get("binding_kind") != "loop":
+                    continue
+                target_value_id = int(target_data.get("value_id", target_id))
+                target_row = (callee_scope, target_value_id)
+                previous = book.latest_ref(SOURCE_VALUE_CLASS, target_row)
+                try:
+                    target_cell = node_identity_cell(
+                        specialized, target_id,
+                    )
+                except ValueError:
+                    target_cell = None
+                cells = tuple(dict.fromkeys(
+                    cell for cell in (
+                        previous, actual_cell, target_cell, *member_cells,
+                    ) if cell is not None
+                ))
+                if not cells:
+                    continue
+                if class_page.latest(target_row) != class_fact:
+                    book.post(
+                        SOURCE_VALUE_CLASS, target_row, class_fact,
+                        stage=PLANNER_TENSOR_SPECIALIZATION,
+                        provenance=Derived(cells),
+                        mode=(Mode.CONCORD if previous is None else Mode.REVISE),
+                    )
+                # Program: ``for offset in offsets`` in an annotated
+                # ``list[int]`` function called with ``[0, True]``.  The
+                # formal's declaration supplied ``result_class_ref=int``;
+                # retaining that annotation silently turned the bool check
+                # into a constant false.  Rule: this callsite's exact member
+                # class receipts own the loop target in this specialized copy.
+                target_attributes[
+                    "callsite_iterable_element_class_fact"
+                ] = class_fact
+                target_attributes[
+                    "callsite_iterable_element_class_cells"
+                ] = tuple(member_cells)
+                if exact_class is not None:
+                    target_attributes["result_class_ref"] = exact_class
+                else:
+                    target_attributes.pop("result_class_ref", None)
+
+
 def _callsite_specialized_shell_type(
     owner: Any,
     node_id: int,
@@ -28513,6 +28982,7 @@ def _callsite_specialized_shell_type(
     specializations = {}
     tensor_descriptors: dict[str, dict[str, Any]] = {}
     aggregate_descriptors: dict[str, tuple[Any, ...]] = {}
+    aggregate_member_classes: dict[str, tuple[Any, ...]] = {}
     record_descriptors: dict[str, dict[str, Any]] = {}
     # What each argument is, as the caller's concordance states it.  The
     # specialization's parameters are exactly these values.
@@ -28629,6 +29099,10 @@ def _callsite_specialized_shell_type(
                 _authored_aggregate_descriptor_tree(caller, int(leaf))
                 for leaf in leaves
             )
+            aggregate_member_classes[parameter] = tuple(
+                _authored_aggregate_class_tree(caller, int(leaf))
+                for leaf in leaves
+            )
         if static_argument:
             try:
                 specializations[parameter] = _source_static_literal(
@@ -28700,6 +29174,10 @@ def _callsite_specialized_shell_type(
                 _authored_aggregate_descriptor_tree(caller, int(leaf))
                 for leaf in capture_leaves
             )
+            aggregate_member_classes[capture_name] = tuple(
+                _authored_aggregate_class_tree(caller, int(leaf))
+                for leaf in capture_leaves
+            )
             bound_parameters.add(capture_name)
             continue
         capture_descriptor = _tensor_descriptor(caller, capture_value)
@@ -28731,18 +29209,7 @@ def _callsite_specialized_shell_type(
         return fallback
 
     def stable(value: Any) -> object:
-        if isinstance(value, dict):
-            return tuple(sorted(
-                (stable(key), stable(item))
-                for key, item in value.items()
-            ))
-        if isinstance(value, (tuple, list, set, frozenset)):
-            return tuple(stable(item) for item in value)
-        try:
-            hash(value)
-        except TypeError:
-            return repr(value)
-        return value
+        return _stable_signature_value(value)
 
     callsite_contract = (
         int(reference),
@@ -28757,6 +29224,10 @@ def _callsite_specialized_shell_type(
         tuple(sorted(
             (name, stable(value))
             for name, value in aggregate_descriptors.items()
+        )),
+        tuple(sorted(
+            (name, stable(value))
+            for name, value in aggregate_member_classes.items()
         )),
         tuple(sorted(
             (name, stable(value))
@@ -28894,6 +29365,36 @@ def _callsite_specialized_shell_type(
     _apply_callsite_aggregate_descriptors(
         specialized, aggregate_descriptors,
     )
+    _post_callsite_loop_element_classes(
+        caller, int(node_id), specialized, specializations,
+    )
+    # Save the exact per-callsite ABI view by canonical value identity before
+    # structural folding rewrites the formal node's attribute dictionary.
+    from ..common.tensors.topological_reducer import node_identity_cell
+    callsite_sequence_class_views = {}
+    for source_node, source_data in specialized.G.nodes(data=True):
+        source_value = int(source_data.get("value_id", source_node))
+        source_attrs = source_data.get("attributes") or {}
+        source_fact = source_attrs.get(
+            "callsite_sequence_element_class_fact"
+        )
+        source_cells = tuple(source_attrs.get(
+            "callsite_sequence_element_class_cells"
+        ) or ())
+        if source_fact is None or not source_cells:
+            continue
+        identity_cell = node_identity_cell(specialized, source_value)
+        if identity_cell is None:
+            raise ValueError(
+                "callsite sequence class has no canonical formal identity: "
+                f"{specialized.G.graph.get('function_name')} value "
+                f"{source_value}"
+            )
+        callsite_sequence_class_views[identity_cell] = (
+            source_attrs.get("sequence_element_class_ref"),
+            source_fact,
+            source_cells,
+        )
     if not _expand_specialized_unbroadcast_identity(specialized):
         _fold_callsite_structural_values(specialized)
     planned = strategize_shell_deployment(
@@ -28901,6 +29402,26 @@ def _callsite_specialized_shell_type(
         max_nodes_per_dispatch=int(max_nodes_per_dispatch),
         _function_table_stack=(id(function_table),),
     )
+    # ``strategize_shell_deployment`` installs the executable process-graph
+    # copy used by sectional lowering. Rejoin the same exact callsite class
+    # receipts on that copy after its graph owner is established; the earlier
+    # source template is not the graph whose VALUE_TYPE_ABI the emitter reads.
+    planned_process_graph = getattr(planned, "process_graph", None)
+    if planned_process_graph is not None and hasattr(planned_process_graph, "G"):
+        for planned_node, planned_data in planned_process_graph.G.nodes(data=True):
+            planned_value = int(planned_data.get("value_id", planned_node))
+            identity_cell = node_identity_cell(
+                planned_process_graph, planned_value,
+            )
+            view = callsite_sequence_class_views.get(identity_cell)
+            if view is None:
+                continue
+            sequence_class, class_fact, class_cells = view
+            attributes = dict(planned_data.get("attributes") or {})
+            attributes["sequence_element_class_ref"] = sequence_class
+            attributes["callsite_sequence_element_class_fact"] = class_fact
+            attributes["callsite_sequence_element_class_cells"] = class_cells
+            planned_data["attributes"] = attributes
     # Recursive planning above specializes the callee's own calls first.  At
     # this point its return descriptor is therefore the exact callsite
     # contract, including facts that did not exist during the earlier global
