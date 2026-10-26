@@ -46764,20 +46764,29 @@ def _class_surface_ssa_program(
                                 for spliced in sequence
                                 if spliced.res is not None
                             }
-                            arena_members = {
+                            returned_members = {
                                 placeholder_id: values[source_id]
                                 for placeholder_id, source_id
                                 in placeholder_sources.items()
                                 if placeholder_id not in rebound
                                 and source_id in values
-                                and any(
-                                    argument is values[source_id]
-                                    for spliced in sequence
-                                    if spliced.op in {"Call", "call"}
-                                    for argument in spliced.args
+                                and (
+                                    any(
+                                        argument is values[source_id]
+                                        for spliced in sequence
+                                        if spliced.op in {"Call", "call"}
+                                        for argument in spliced.args
+                                    )
+                                    or any(
+                                        spliced.res is values[source_id]
+                                        and spliced.attributes.get(
+                                            "source_output_id"
+                                        ) == source_id
+                                        for spliced in sequence
+                                    )
                                 )
                             }
-                            if arena_members:
+                            if returned_members:
                                 # Program: ``t, big = compact(n)`` where
                                 # ``compact`` returns ``out, flag`` (A6
                                 # probe c985).  Wrong record: the list
@@ -46786,12 +46795,18 @@ def _class_surface_ssa_program(
                                 # read a dangling cell.  Rule: a returned
                                 # list is one storage the callee fills in
                                 # place; its member IS the caller arena the
-                                # linked call passes, so the placeholder's
-                                # consumers read that arena.
+                                # linked call passes. c630 returns two lists
+                                # after a conditional fill: their physical
+                                # outputs are instead exact Load projections
+                                # of the linked aggregate. Retiring their
+                                # versioned placeholders without following
+                                # source_output_id left root's Ret undefined.
+                                # In both cases the recorded result edge
+                                # supplies the physical value to consumers.
                                 for consumer_block in caller.blocks.values():
                                     for consumer in consumer_block.instrs:
                                         consumer.args = [
-                                            arena_members.get(
+                                            returned_members.get(
                                                 int(argument.id), argument,
                                             )
                                             if argument is placeholder_results.get(
