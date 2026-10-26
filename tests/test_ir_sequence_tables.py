@@ -1955,6 +1955,7 @@ def test_array_u32_receiver_column_keeps_authored_dtype_before_append():
         module, put_name, entry_name="array_u32_append_probe",
     )
     assert llvm.shortfalls == ()
+    assert llvm.buffer_element_dtypes[llvm.buffer_order.index(column.id)] == "uint32"
     assert "trunc i64" in llvm.llvm_ir
 
 

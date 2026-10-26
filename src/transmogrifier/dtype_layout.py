@@ -1,57 +1,13 @@
-"""The compiler's one dtype/layout authority.
+"""The compiler's dtype/layout authority.
 
-Every dtype name the compiler accepts is declared here exactly once, as a
-frozen :class:`DTypeLayout` carrying its byte size, natural alignment and the
-spelling each lane uses for it (C ABI, C module-lane storage, LLVM, WebAssembly,
-Fortran kind, numpy dtype, nodus code), together with every alias the backends
-accept for it.  The per-backend tables that used to carry these facts are now
-lookups into this module (``docs/UNION_TYPE_DESIGN_2026-09-29.md`` §1 "dtype
-authority: none" and §3.3).
+Every scalar spelling and alias resolves to one DTypeLayout. Storage, ABI,
+allocation and byte-count views are derived from that layout, rather than
+keeping a second vocabulary that can silently turn an integer into double.
+Backend tables include only layouts with a declared native representation.
 
-**Alignment is new information.**  No copy carried an alignment; each one
-recorded only a byte size (and the LLVM lane wrote ``align 8`` on everything
-it could).  ``alignment`` is declared here for the first time: the byte size
-for every scalar, which is 1 for the one-byte types (bool / i1 / uint8).  The
-C and LLVM spellings of the types no lane emits today (int8, int16, uint16,
-uint64, float32's LLVM ``float``) are likewise declared fresh; they are the
-fixed ``<stdint.h>`` / LLVM names, not compiler policy, and no lookup below
-returns them because no copy ever did.
-
-**The twelve copies this module replaces** (each lookup reproduces one copy's
-vocabulary, case handling and unknown-name fallback exactly; the copies did
-not agree with each other, so the per-copy vocabularies below are as much a
-part of the record as the byte sizes):
-
-1. ``compiled_program_api._C_TYPES`` -> :func:`c_abi_type_table`,
-   :func:`c_abi_type` (C ABI spelling + ctypes name; unknown -> double).
-2. ``ssa_c_backend._numpy_dtype`` -> :func:`c_lane_numpy_dtype` (collapses
-   to the four storage classes the C module lane allocates; unknown ->
-   ``"float64"``; ``uint8`` shares bool's one-byte storage).
-3. ``ssa_c_backend._dtype_for_c_storage`` -> :func:`c_lane_dtype_for_storage`
-   (C storage spelling -> repository dtype of that storage class).
-4. ``ssa_c_backend.solved_buffer_type``'s inline mapping ->
-   :func:`c_lane_storage_for_llvm_type` (LLVM spelling -> C storage spelling;
-   ``i1`` is stored as ``uint8_t``; unknown -> ``"double"``).
-5. ``ssa_llvm_backend._value_llvm_type``'s name mapping ->
-   :func:`llvm_type_for_dtype` (unknown -> ``"double"``).
-6. ``ssa_llvm_backend._LLVM_TYPE_BYTES`` -> :func:`llvm_type_bytes_table`.
-7. ``ssa_fortran_backend._DTYPE_KIND`` -> :func:`fortran_kind_table`.
-8. ``tensor_ssa_lowering``'s three inline ``dtype_bytes`` dicts ->
-   :func:`dtype_byte_size` (unknown -> 8).
-9. ``accelerator_backends.ssa_backend.SSATensorOperations._dtype_bytes`` ->
-   :func:`dtype_byte_size`.
-10. ``fused_program_wasm_backend._TYPES`` -> :func:`wasm_type_table`.
-11. ``ssa_javascript_backend._dtype_is_int64`` -> :func:`dtype_is_int64`.
-12. ``ssa_storage_requirements``'s default ``"float64"`` -> :data:`DEFAULT_DTYPE`.
-13. ``fortran_c_shell._NUMPY_DTYPES`` -> :func:`shell_numpy_dtype_table`,
-    :func:`shell_numpy_dtype` (numpy dtype spelling of the C shell's ABI
-    vocabulary; the shell casefolds the name; unknown -> ``None``, which the
-    shell raises on).
-
-This module imports nothing from the repository so that every lane can import
-it.  The nodus codes mirror ``NodusTensorDType`` in nodus' ``tensor_abi.h``
-(``accelerator_backends/nodus_arena.py``), which loads a DLL on import and is
-therefore not imported from here.
+A missing dtype retains the repository's float64 default. An explicit name
+without a layout is refused; a width-only LLVM reverse lookup cannot restore
+signedness and must never replace the originating dtype at an ABI boundary.
 """
 
 from __future__ import annotations
@@ -114,28 +70,28 @@ _DECLARED: tuple[DTypeLayout, ...] = (
     DTypeLayout(
         name="uint8", kind="uint", byte_size=1, alignment=1,
         c_type="uint8_t", ctypes_name="c_uint8", c_storage_type="uint8_t",
-        llvm_type="i8", wasm_type=None, fortran_kind=None,
+        llvm_type="i8", wasm_type=None, fortran_kind="unsigned(c_int8_t)",
         numpy_dtype="uint8", nodus_code=7,
         aliases=("uint8", "u8"),
     ),
     DTypeLayout(
         name="int8", kind="int", byte_size=1, alignment=1,
         c_type="int8_t", ctypes_name="c_int8", c_storage_type="int8_t",
-        llvm_type="i8", wasm_type=None, fortran_kind=None,
+        llvm_type="i8", wasm_type=None, fortran_kind="integer(c_int8_t)",
         numpy_dtype="int8", nodus_code=3,
         aliases=("int8",),
     ),
     DTypeLayout(
         name="int16", kind="int", byte_size=2, alignment=2,
         c_type="int16_t", ctypes_name="c_int16", c_storage_type="int16_t",
-        llvm_type="i16", wasm_type=None, fortran_kind=None,
+        llvm_type="i16", wasm_type=None, fortran_kind="integer(c_int16_t)",
         numpy_dtype="int16", nodus_code=4,
         aliases=("int16",),
     ),
     DTypeLayout(
         name="uint16", kind="uint", byte_size=2, alignment=2,
         c_type="uint16_t", ctypes_name="c_uint16", c_storage_type="uint16_t",
-        llvm_type="i16", wasm_type=None, fortran_kind=None,
+        llvm_type="i16", wasm_type=None, fortran_kind="unsigned(c_int16_t)",
         numpy_dtype="uint16", nodus_code=12,
         aliases=("uint16",),
     ),
@@ -149,7 +105,7 @@ _DECLARED: tuple[DTypeLayout, ...] = (
     DTypeLayout(
         name="uint32", kind="uint", byte_size=4, alignment=4,
         c_type="uint32_t", ctypes_name="c_uint32", c_storage_type="uint32_t",
-        llvm_type="i32", wasm_type=None, fortran_kind=None,
+        llvm_type="i32", wasm_type=None, fortran_kind="unsigned(c_int32_t)",
         numpy_dtype="uint32", nodus_code=13,
         aliases=("uint32", "u32"),
     ),
@@ -165,7 +121,7 @@ _DECLARED: tuple[DTypeLayout, ...] = (
     DTypeLayout(
         name="uint64", kind="uint", byte_size=8, alignment=8,
         c_type="uint64_t", ctypes_name="c_uint64", c_storage_type="uint64_t",
-        llvm_type="i64", wasm_type=None, fortran_kind=None,
+        llvm_type="i64", wasm_type=None, fortran_kind="unsigned(c_int64_t)",
         numpy_dtype="uint64", nodus_code=14,
         aliases=("uint64", "u64"),
     ),
@@ -184,9 +140,8 @@ _DECLARED: tuple[DTypeLayout, ...] = (
         aliases=("float64", "f64", "double"),
     ),
     # The machine-word storage address internal values cross function
-    # boundaries as (LLVM ``ptr``, C ``void *``).  Not a repository dtype: no
-    # dtype-name lookup below resolves to it; it exists for the LLVM-spelling
-    # lookups (byte width, C storage) that must know it.
+    # boundaries as (LLVM ``ptr``, C ``void *``). It has no numeric numpy
+    # scalar representation; pointer ABI views retain that distinct kind.
     DTypeLayout(
         name="ptr", kind="ptr", byte_size=8, alignment=8,
         c_type="void *", ctypes_name="c_void_p", c_storage_type="void *",
@@ -201,8 +156,8 @@ DTYPES: Mapping[str, DTypeLayout] = MappingProxyType(
     {layout.name: layout for layout in _DECLARED}
 )
 
-#: Every accepted spelling -> canonical name.  Exact spelling; the per-copy
-#: lookups apply whatever case folding their copy applied.
+#: Every accepted spelling -> canonical name. Exact spelling; callers that
+#: accept case-insensitive user input casefold it before resolving.
 ALIASES: Mapping[str, str] = MappingProxyType({
     alias: layout.name for layout in _DECLARED for alias in layout.aliases
 })
@@ -227,115 +182,34 @@ def layout_for(name: object) -> DTypeLayout:
     return layout
 
 
-def _resolve_within(name: str, vocabulary: frozenset[str]) -> DTypeLayout | None:
-    return resolve(name) if name in vocabulary else None
-
-
-def _check_vocabulary(vocabulary: frozenset[str]) -> frozenset[str]:
-    unknown = sorted(vocabulary - ALIASES.keys())
-    if unknown:
-        raise RuntimeError(f"dtype_layout: vocabulary names undeclared dtypes {unknown}")
-    return vocabulary
-
-
 # --------------------------------------------------------------------------
-# Per-lane vocabularies.  Each is exactly the key set of the copy it replaces.
+# Layout views. Native backend support is a property of the same record.
 # --------------------------------------------------------------------------
 
-#: ``compiled_program_api._C_TYPES`` keys (declaration order kept).
-C_ABI_NAMES: tuple[str, ...] = (
-    "uint8", "u8",
-    "float", "float32", "f32",
-    "double", "float64", "f64",
-    "int", "int32", "i32",
-    "int64", "i64", "opaque_ref",
-    "bool", "logical",
-)
-_C_ABI_VOCABULARY = _check_vocabulary(frozenset(C_ABI_NAMES))
+_SCALAR_LAYOUTS = tuple(layout for layout in _DECLARED if layout.kind != "ptr")
+_SCALAR_NAMES = tuple(alias for layout in _SCALAR_LAYOUTS for alias in layout.aliases)
 
-#: The names ``ssa_c_backend._numpy_dtype`` recognised (casefolded).
-C_LANE_NAMES: tuple[str, ...] = (
-    "bool", "i1", "uint8", "u8",
-    "int", "int32", "i32",
-    "int64", "i64", "long",
-    # float32 spans are their own storage class (``float *``); ``float`` is
-    # deliberately absent -- the repository spells Python's binary64 ``float``.
-    "float32", "f32",
-)
-_C_LANE_VOCABULARY = _check_vocabulary(frozenset(C_LANE_NAMES))
+C_ABI_NAMES: tuple[str, ...] = _SCALAR_NAMES
+C_LANE_NAMES: tuple[str, ...] = _SCALAR_NAMES
+SHELL_NUMPY_NAMES: tuple[str, ...] = _SCALAR_NAMES
+LLVM_LANE_NAMES: tuple[str, ...] = tuple(ALIASES)
+BYTE_SIZE_NAMES: tuple[str, ...] = tuple(ALIASES)
+C_LANE_STORAGE_CLASSES: tuple[str, ...] = tuple(layout.name for layout in _SCALAR_LAYOUTS)
 
-#: The storage classes the C module lane allocates, in the order
-#: ``_dtype_for_c_storage`` tested them.  A dtype belongs to the class whose
-#: ``c_storage_type`` it shares (uint8 -> bool); anything else is float64.
-#: float32 spans are stored as ``float`` (the LLVM lane's ``float``), so a
-#: float32 value's public buffer is float32.
-C_LANE_STORAGE_CLASSES: tuple[str, ...] = (
-    "bool", "int32", "int64", "float32", "float64",
-)
-
-#: The names ``ssa_llvm_backend._value_llvm_type`` recognised (lowercased).
-LLVM_LANE_NAMES: tuple[str, ...] = (
-    "bool", "i1",
-    "int", "int32", "i32",
-    "int64", "i64", "long",
-    "opaque_ref",
-    "float32", "f32",
-)
-_LLVM_LANE_VOCABULARY = _check_vocabulary(frozenset(LLVM_LANE_NAMES))
-
-#: The layouts whose LLVM spelling the LLVM lane emits -- the key set of
-#: ``_LLVM_TYPE_BYTES`` and of ``solved_buffer_type``'s mapping.  Reverse
-#: lookups by LLVM spelling search only these (``i64`` is also uint64's
-#: spelling, and ``i8``/``i16`` are shared by two dtypes each).
+# LLVM integer spelling states width, not sign. These representative layouts
+# are used only by width/byte views. Call and buffer code must retain its exact
+# dtype record to distinguish uint32 from int32, or uint64 from int64.
 LLVM_LANE_TYPES: tuple[str, ...] = (
-    "float64", "float32", "int64", "ptr", "int32", "bool",
+    "float64", "float32", "int64", "ptr", "int32", "int16", "int8", "bool",
 )
-
-#: ``ssa_fortran_backend._DTYPE_KIND`` keys (exact case).
-FORTRAN_NAMES: tuple[str, ...] = (
-    "double", "i64", "i32", "i1",
-    "float64", "float32", "float",
-    "int64", "int32", "int",
-    "bool", "opaque_ref",
+FORTRAN_NAMES: tuple[str, ...] = tuple(
+    alias for layout in _SCALAR_LAYOUTS if layout.fortran_kind is not None
+    for alias in layout.aliases
 )
-_FORTRAN_VOCABULARY = _check_vocabulary(frozenset(FORTRAN_NAMES))
-
-#: Keys of the ``dtype_bytes`` dicts in ``tensor_ssa_lowering`` and of
-#: ``ssa_backend._dtype_bytes`` (lowercased).  Note ``f32``/``f64``/``u8``/
-#: ``long``/``opaque_ref``/``logical`` were NOT keys and fell to the default.
-BYTE_SIZE_NAMES: tuple[str, ...] = (
-    "bool", "i1", "int8", "uint8",
-    "int16", "uint16",
-    "float32", "float", "int32", "i32",
-    "float64", "double", "int64", "i64",
+WASM_NAMES: tuple[str, ...] = tuple(
+    alias for layout in _SCALAR_LAYOUTS if layout.wasm_type is not None
+    for alias in layout.aliases
 )
-_BYTE_SIZE_VOCABULARY = _check_vocabulary(frozenset(BYTE_SIZE_NAMES))
-
-#: ``fused_program_wasm_backend._TYPES`` keys (declaration order kept).
-WASM_NAMES: tuple[str, ...] = (
-    "float64", "f64", "double",
-    "float32", "f32", "float",
-    "int64", "i64", "long",
-    "int32", "i32", "int",
-)
-_WASM_VOCABULARY = _check_vocabulary(frozenset(WASM_NAMES))
-
-#: ``fortran_c_shell._NUMPY_DTYPES`` keys (declaration order kept).  The same
-#: sixteen names as :data:`C_ABI_NAMES` in the shell's own order.
-SHELL_NUMPY_NAMES: tuple[str, ...] = (
-    "uint8", "u8",
-    "bool", "logical",
-    "float", "float32", "f32",
-    "double", "float64", "f64",
-    "int", "int32", "i32",
-    "int64", "i64", "opaque_ref",
-)
-_SHELL_NUMPY_VOCABULARY = _check_vocabulary(frozenset(SHELL_NUMPY_NAMES))
-
-for _name in LLVM_LANE_TYPES + C_LANE_STORAGE_CLASSES:
-    if _name not in DTYPES:
-        raise RuntimeError(f"dtype_layout: lane names undeclared dtype {_name!r}")
-del _name
 
 
 # --------------------------------------------------------------------------
@@ -352,14 +226,9 @@ def c_abi_type_table() -> dict[str, tuple[str, str]]:
 
 
 def c_abi_type(dtype: object) -> tuple[str, str]:
-    """C ABI spelling and ctypes name for ``dtype``; unknown -> double.
+    """Exact C ABI spelling and ctypes name; refuse an undeclared name."""
 
-    Exact spelling (no case folding), ``None``/empty -> :data:`DEFAULT_DTYPE`.
-    """
-
-    layout = _resolve_within(str(dtype or DEFAULT_DTYPE), _C_ABI_VOCABULARY)
-    if layout is None:
-        layout = DTYPES[DEFAULT_DTYPE]
+    layout = layout_for(str(dtype or DEFAULT_DTYPE).casefold())
     return (layout.c_type, layout.ctypes_name)
 
 
@@ -368,43 +237,39 @@ def c_abi_type(dtype: object) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 
 def c_lane_dtype_for_storage(c_type: str) -> str:
-    """Repository dtype of the C module lane's storage class spelled ``c_type``.
+    """Repository dtype stated by a C scalar spelling.
 
-    ``uint8_t`` -> ``"bool"``, ``int32_t`` -> ``"int32"``, ``int64_t`` ->
-    ``"int64"``, anything else -> ``"float64"``.
+    c632 exposed the old uint8_t -> bool collapse. A shared one-byte storage
+    width is not shared value identity: the declared uint8_t type is uint8.
+    Bool is recovered from its own C spelling, not from an unsigned byte.
     """
 
-    for name in C_LANE_STORAGE_CLASSES:
-        if DTYPES[name].c_storage_type == c_type:
-            return name
-    return DEFAULT_DTYPE
+    for layout in _SCALAR_LAYOUTS:
+        if layout.c_type == c_type:
+            return layout.name
+    raise KeyError(f"no C storage layout declared for {c_type!r}")
 
 
 def c_lane_numpy_dtype(dtype: object) -> str:
-    """numpy dtype the C module lane allocates for ``dtype``.
+    """Exact numpy allocation dtype of the originating scalar layout."""
 
-    Casefolded; collapses to the four storage classes (bool / int32 / int64 /
-    float64) by C storage spelling, so ``uint8`` lands in bool's one-byte
-    class; every unrecognised name is ``"float64"``.
-    """
-
-    name = str(dtype or DEFAULT_DTYPE).casefold()
-    layout = _resolve_within(name, _C_LANE_VOCABULARY)
-    if layout is None:
-        return DEFAULT_DTYPE
-    storage_class = DTYPES[c_lane_dtype_for_storage(layout.c_storage_type)]
-    return str(storage_class.numpy_dtype)
+    layout = layout_for(str(dtype or DEFAULT_DTYPE).casefold())
+    if layout.numpy_dtype is None:
+        raise KeyError(f"no numpy storage layout declared for {dtype!r}")
+    return layout.numpy_dtype
 
 
 def c_lane_storage_for_llvm_type(llvm_type: object) -> str:
-    """C storage spelling for an LLVM-lane spelling; unknown -> ``"double"``.
+    """C storage spelling for an LLVM width; refuse an undeclared width.
 
-    ``i1`` -> ``uint8_t``, ``i32`` -> ``int32_t``, ``i64`` -> ``int64_t``,
-    ``double`` -> ``double``, ``ptr`` -> ``void *``.
+    This view does not recover signedness. An exact originating dtype takes
+    precedence at semantic storage/call boundaries.
     """
 
     layout = by_llvm_type(llvm_type)
-    return DTYPES[DEFAULT_DTYPE].c_storage_type if layout is None else layout.c_storage_type
+    if layout is None:
+        raise KeyError(f"no LLVM storage layout declared for {llvm_type!r}")
+    return layout.c_storage_type
 
 
 # --------------------------------------------------------------------------
@@ -412,16 +277,14 @@ def c_lane_storage_for_llvm_type(llvm_type: object) -> str:
 # --------------------------------------------------------------------------
 
 def llvm_type_for_dtype(dtype: object) -> str:
-    """LLVM spelling the LLVM lane emits for ``dtype``; unknown -> ``"double"``.
+    """LLVM width stated by the exact dtype; refuse an undeclared name.
 
-    Lowercased; ``None``/empty -> :data:`DEFAULT_DTYPE`.  The aggregate-output
-    ``ptr`` case and the ``physical_dtype`` accounting read stay with the
-    caller; this is only the name mapping.
+    c626/c632 preserved uint32/uint8 in SSA, but the old restricted name view
+    emitted double. The physical width is always read from that same layout.
+    Scalar float32 promotion remains the consuming emitter's stated policy.
     """
 
-    name = str(dtype or DEFAULT_DTYPE).lower()
-    layout = _resolve_within(name, _LLVM_LANE_VOCABULARY)
-    return DTYPES[DEFAULT_DTYPE].llvm_type if layout is None else layout.llvm_type
+    return layout_for(str(dtype or DEFAULT_DTYPE).casefold()).llvm_type
 
 
 def by_llvm_type(llvm_type: object) -> DTypeLayout | None:
@@ -470,14 +333,15 @@ def fortran_kind_table() -> dict[str, str]:
 # --------------------------------------------------------------------------
 
 def dtype_byte_size(dtype: object, default: int = 8) -> int:
-    """Element bytes for ``dtype`` under the tensor-lowering vocabulary.
+    """Exact layout byte count; ``default`` applies only to an absent dtype.
 
-    Lowercased; ``None``/empty -> :data:`DEFAULT_DTYPE`; unrecognised -> ``default``.
+    uint32 used to miss a legacy whitelist and allocate/count eight-byte rows
+    even though its authority states four. Explicit names cannot fall through.
     """
 
-    name = str(dtype or DEFAULT_DTYPE).lower()
-    layout = _resolve_within(name, _BYTE_SIZE_VOCABULARY)
-    return default if layout is None else layout.byte_size
+    if dtype is None or str(dtype) == "":
+        return default
+    return layout_for(str(dtype).casefold()).byte_size
 
 
 # --------------------------------------------------------------------------
@@ -524,14 +388,13 @@ def shell_numpy_dtype_table() -> dict[str, str]:
 
 
 def shell_numpy_dtype(dtype: object) -> str | None:
-    """numpy dtype spelling the C shell packs ``dtype`` as; unknown -> ``None``.
+    """Exact numpy dtype spelling; unknown/non-numeric types return None.
 
-    Casefolded (the shell's call site casefolds before the lookup).  ``None``
-    and the empty string are unknown, as they were in the table.
+    The shell turns absence of a numeric layout into its named refusal.
     """
 
-    layout = _resolve_within(str(dtype).casefold(), _SHELL_NUMPY_VOCABULARY)
-    return None if layout is None else str(layout.numpy_dtype)
+    layout = resolve(str(dtype).casefold())
+    return None if layout is None or layout.numpy_dtype is None else layout.numpy_dtype
 
 
 __all__ = [

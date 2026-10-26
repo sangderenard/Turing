@@ -334,12 +334,19 @@ class ProgramABIField:
             from src.transmogrifier.dtype_layout import resolve as resolve_dtype
 
             layout = resolve_dtype(dtype)
+            if layout is not None and str(dtype) != "opaque_ref":
+                # c621's u64 contract is the catalogue's uint64 type. Publish
+                # that identity here, before tensor laws call NumPy dtype
+                # promotion; carrying the alias as a second type key made
+                # the static-span remainder fail while uint64 worked.
+                # opaque_ref retains its existing semantic handle spelling.
+                dtype = layout.name
             # Program c621: a uint64 span remainder kept uint64 in SSA, but
-            # C allocated double and LLVM emitted frem double.  The catalog
-            # declares unsigned layouts without a Fortran native kind; no
-            # signedness-preserving C/LLVM/Fortran program ABI exists yet.
-            # Refuse the authored physical type before any lane can silently
-            # replace it with its floating default.
+            # C allocated double and LLVM emitted frem double. All native
+            # lanes now consume the declared unsigned layout; Fortran's
+            # actual compiler capability is checked at compilation. Keep a
+            # future unsigned layout without a native kind refused rather
+            # than silently replacing it with a floating default.
             if layout is not None and layout.kind == "uint" and layout.fortran_kind is None:
                 raise ExtractionContractError(
                     f"{location}.dtype {dtype!r} has no exact native "
@@ -455,6 +462,10 @@ class ProgramABIField:
                     raise ExtractionContractError(
                         f"{column_location} requires name and dtype"
                     )
+                from src.transmogrifier.dtype_layout import resolve as resolve_dtype
+                column_layout = resolve_dtype(column_dtype)
+                if column_layout is not None and str(column_dtype) != "opaque_ref":
+                    column_dtype = column_layout.name
                 column_vocabulary = raw_column.get("token_vocabulary")
                 if column_vocabulary is not None and (
                     not isinstance(column_vocabulary, (list, tuple))

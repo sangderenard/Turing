@@ -7627,10 +7627,16 @@ def _authored_dataclass_record_views(
             and isinstance(value.args[0], ast.Constant)
             and isinstance(value.args[0].value, str)
         ):
+            # c633: array("H") and the signed counterparts have the same
+            # declared row contract as B/I/Q. Retain that contract at its
+            # authored constructor; later consumers must not infer it from
+            # an append operand or a native register width.
             dtype = {
-                "B": "uint8",
-                "I": "uint32",
-                "Q": "uint64",
+                "b": "int8", "B": "uint8",
+                "h": "int16", "H": "uint16",
+                "i": "int32", "I": "uint32",
+                "q": "int64", "Q": "uint64",
+                "f": "float32", "d": "float64",
             }.get(value.args[0].value)
 
             if dtype is not None:
@@ -9824,6 +9830,11 @@ def compile_fortran_module_c_shell(
                 getattr(module, "precision_sections", False)
             ),
         )
+        from .fortran_toolchain import native_fortran_flags
+        try:
+            fortran_flags = native_fortran_flags(compiler, module.source, fortran_flags)
+        except ValueError as error:
+            raise FortranEmissionError(str(error)) from error
         commands.append([
             compiler, *fortran_flags, "-c", str(fortran_path),
             "-o", str(fortran_object),
@@ -47593,13 +47604,22 @@ def _class_surface_ssa_program(
                                 invocation_local = recursive_frame_lease(
                                     caller_graph, record.callsite_id, argument, callee,
                                 )
+                                # c631: the propagated status formal copied
+                                # physical_dtype=int into the caller resident,
+                                # while its mint posted no physical layout.
+                                # A lease's resident and birth row both derive
+                                # from the callee's one posted formal record.
+                                lease_source, lease_physical = (
+                                    _posted_lease_source(callee, argument)
+                                )
                                 caller_storage = clone_value(
-                                    _lease_source(argument),
+                                    lease_source,
                                     mint_compiler_value_id(
                                         caller, FRAME_STORAGE_CLONE,
                                         (_frame_value_cell(callee, argument_id),),
-                                        dtype=argument.dtype,
-                                        shape=tuple(argument.shape or ()),
+                                        dtype=lease_source.dtype,
+                                        shape=tuple(lease_source.shape or ()),
+                                        physical=lease_physical,
                                     ),
                                     accounting={
                                         "linked_call_frame_storage": str(
@@ -60252,6 +60272,7 @@ def _lower_ast_source_to_ssa_impl(
                 "buffer_order": tuple(int(v) for v in piece.artifact.buffer_order),
                 "buffer_shapes": tuple(piece.artifact.buffer_shapes),
                 "buffer_dtypes": tuple(piece.artifact.buffer_dtypes),
+                "buffer_element_dtypes": tuple(piece.artifact.buffer_element_dtypes),
                 "linked_objects": tuple(getattr(piece.artifact, "linked_objects", ())),
                 "extent_order": tuple(
                     (int(v), str(kind), None if axis is None else int(axis))

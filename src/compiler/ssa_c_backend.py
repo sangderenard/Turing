@@ -21,6 +21,8 @@ from ..transmogrifier.dtype_layout import (
     c_lane_dtype_for_storage,
     c_lane_numpy_dtype,
     c_lane_storage_for_llvm_type,
+    layout_for as dtype_layout,
+    resolve as resolve_dtype,
 )
 from ..transmogrifier.ssa import Function, IRModule
 from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
@@ -696,26 +698,30 @@ def _scalar_c_type(dtype) -> str:
     name = str(dtype or "float64").casefold()
     if name == "ptr":
         return "double *"
-    if name in {"bool", "i1"}:
-        return "uint8_t"
-    if name in {"int", "int32", "i32"}:
-        return "int32_t"
-    if name in {"int64", "i64", "long"}:
-        return "int64_t"
-    return "double"
+    if name == "none":
+        # Conceptual None's existing inert scalar carrier; not a numeric dtype.
+        return "double"
+    layout = dtype_layout(name)
+    # Scalar float32 arithmetic deliberately uses the native lane's double
+    # register contract. Its span storage remains float below.
+    return "double" if layout.name == "float32" else layout.c_storage_type
 
 
 def _unsigned_c_type(dtype) -> str:
-    name = str(dtype or "int64").casefold()
-    if name in {"bool", "i1"}:
-        return "uint8_t"
-    if name in {"int", "int32", "i32"}:
-        return "uint32_t"
-    return "uint64_t"
+    layout = dtype_layout(str(dtype or "int64").casefold())
+    if layout.kind not in {"int", "uint", "bool"}:
+        raise ValueError(f"unsigned integer spelling requires an integer dtype: {dtype!r}")
+    return dtype_layout(f"uint{8 * layout.byte_size}").c_storage_type
 
 
 def _is_integer_dtype(dtype) -> bool:
-    return _scalar_c_type(dtype) in {"uint8_t", "int32_t", "int64_t"}
+    layout = resolve_dtype(str(dtype or "float64").casefold())
+    return layout is not None and layout.kind in {"int", "uint", "bool"}
+
+
+def _is_unsigned_dtype(dtype) -> bool:
+    layout = resolve_dtype(str(dtype or "float64").casefold())
+    return layout is not None and layout.kind == "uint"
 
 
 def supported_scalar_operations() -> frozenset[str]:
@@ -759,15 +765,9 @@ def _buffer_c_type(dtype) -> str:
     name = str(dtype or "float64").casefold()
     if name == "ptrptr_float64":
         return "double *"
-    if name in {"bool", "i1"}:
-        return "uint8_t"
-    if name in {"int", "int32", "i32"}:
-        return "int32_t"
-    if name in {"int64", "i64", "long"}:
-        return "int64_t"
-    if name in {"float32", "f32"}:
-        return "float"
-    return "double"
+    if name == "none":
+        return "double"
+    return dtype_layout(name).c_storage_type
 
 
 def _value_buffer_c_type(value) -> str:
@@ -881,8 +881,15 @@ def _aggregate_contains_text(value) -> bool:
 
 
 def _c_numeric_literal(value: bool | int | float, c_type: str) -> str:
-    if c_type in {"uint8_t", "int32_t", "int64_t", "long long"}:
-        return str(int(value))
+    integer = (dtype_layout("int64") if c_type == "long long"
+               else dtype_layout(c_lane_dtype_for_storage(c_type)))
+    if integer.kind in {"int", "uint", "bool"}:
+        numeric = int(value)
+        if integer.kind == "uint":
+            return f"{numeric}ULL"
+        if numeric == -(1 << 63):
+            return "(-9223372036854775807LL - 1LL)"
+        return f"{numeric}LL"
     numeric = float(value)
     # ``float.hex`` spells non-finite values as Python text ("inf", "nan"),
     # which is not C.  Use the same <math.h> spelling as scalar constants.
@@ -896,6 +903,10 @@ def _c_numeric_literal(value: bool | int | float, c_type: str) -> str:
 def _numpy_dtype(dtype) -> str:
     """numpy dtype this lane allocates for ``dtype`` (transmogrifier.dtype_layout)."""
 
+    # Pointer-array inputs are the existing structural helper ABI. Their
+    # elements carry native addresses, never floating numerical values.
+    if str(dtype).casefold() in {"ptr", "ptrptr_float64"}:
+        return "uintp"
     return c_lane_numpy_dtype(dtype)
 
 
@@ -2406,10 +2417,34 @@ def emit_ssa_module_to_c(
                 f"types={sorted(physical)} members={members[:24]}",
                 file=sys.stderr, flush=True,
             )
+        # The repository's pointer-array helper ABI is structural storage,
+        # not an undeclared scalar dtype. Its slot is a double pointer and
+        # must be handled before consulting a numeric LLVM width.
+        if str(value.dtype).casefold() == "ptrptr_float64":
+            return "double *"
         from .ssa_llvm_backend import _value_llvm_type
 
         llvm_type = _value_llvm_type(value)
+        # uint64 and int64 share LLVM i64, but not the C value domain.
+        # The native uint64 Add(2**53+1, 0) audit must retain its declaring
+        # dtype after width settlement; reversing i64 alone loses signedness.
+        declared = resolve_dtype(str((value.accounting or {}).get(
+            "physical_dtype") or value.dtype or "float64").casefold())
+        if declared is not None and declared.llvm_type == llvm_type:
+            return declared.c_storage_type
         return c_lane_storage_for_llvm_type(llvm_type)
+
+    def solved_buffer_dtype(owner: str, value, held: str) -> str:
+        value = storage_values.get(owner, {}).get(int(value.id), value)
+        if str(value.dtype).casefold() == "ptrptr_float64":
+            return "ptrptr_float64"
+        # bool and uint8 share uint8_t memory but different public value
+        # classes. Preserve the declaring record, not a reverse C lookup.
+        layout = resolve_dtype(str((value.accounting or {}).get(
+            "physical_dtype") or value.dtype or "float64").casefold())
+        if layout is not None and layout.c_storage_type == held:
+            return layout.name
+        return _dtype_for_c_storage(held)
 
     # Internal repository functions publish through caller-owned output
     # storage, exactly like the LLVM module lane. Authored scalar-return C
@@ -3169,6 +3204,16 @@ def emit_ssa_module_to_c(
                     f"((const {buffer_type(argument)} *)({source}))[{index}]"
                 )
             integral = all(map(is_integer, instruction.args))
+            integer_kinds = {
+                layout.kind for argument in instruction.args
+                if (layout := resolve_dtype(argument.dtype)) is not None
+                and layout.kind in {"int", "uint"}
+            }
+            if integer_kinds == {"int", "uint"}:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"mixed signed/unsigned operands require an explicit conversion in {fn}",
+                ))
+                return
             # The graph's own spellings (``neg``, ``abs``) are the same
             # operations as the tables' capitalized keys.
             op = next((
@@ -3184,7 +3229,10 @@ def emit_ssa_module_to_c(
                         f"((double){elements[0]} / (double){elements[1]})"
                     )
                 elif integral and op in {"Add", "Sub", "Mul"}:
-                    unsigned = _unsigned_c_type(result.dtype)
+                    layout = dtype_layout(result.dtype)
+                    unsigned = dtype_layout(
+                        f"uint{max(32, 8 * layout.byte_size)}"
+                    ).c_storage_type
                     expression = (
                         f"({result_type})(({unsigned}){elements[0]} "
                         f"{_BINARY[op]} ({unsigned}){elements[1]})"
@@ -3196,8 +3244,19 @@ def emit_ssa_module_to_c(
                     f"({elements[0]} {_C_COMPARISONS[op]} {elements[1]})"
                 )
             elif op in _FLOORED and len(elements) == 2:
-                helper = _FLOORED[op][0 if integral else 1]
-                expression = f"{helper}({elements[0]}, {elements[1]})"
+                if integral and all(_is_unsigned_dtype(value.dtype)
+                                    for value in instruction.args):
+                    symbol = "%" if op == "Mod" else "/"
+                    expression = f"({elements[0]} {symbol} {elements[1]})"
+                elif integral and any(_is_unsigned_dtype(value.dtype)
+                                      for value in instruction.args):
+                    shortfalls.append(CEmissionShortfall(
+                        op, f"mixed signed/unsigned floor operation requires an explicit conversion in {fn}",
+                    ))
+                    return
+                else:
+                    helper = _FLOORED[op][0 if integral else 1]
+                    expression = f"{helper}({elements[0]}, {elements[1]})"
             elif op in {"Max", "Min"} and len(elements) == 2:
                 comparison = ">" if op == "Max" else "<"
                 rule = max_step_rule(instruction)
@@ -3914,7 +3973,7 @@ def emit_ssa_module_to_c(
                         ))
                         continue
                     if is_integer(instruction.res) or isinstance(held, int):
-                        expressions[int(instruction.res.id)] = str(int(held))
+                        expressions[int(instruction.res.id)] = _c_numeric_literal(held, buffer_type(instruction.res))
                         integer_ids.add(int(instruction.res.id))
                     else:
                         numeric = float(held)
@@ -5570,9 +5629,32 @@ def emit_ssa_module_to_c(
                     continue
                 result_id = int(instruction.res.id)
                 declared = None
+                integer_kinds = {
+                    layout.kind for argument in instruction.args
+                    if (layout := resolve_dtype(argument.dtype)) is not None
+                    and layout.kind in {"int", "uint"}
+                }
+                if (integer_kinds == {"int", "uint"}
+                        and op in set(_BINARY) | set(_INTEGER_BINARY)
+                        | set(_FLOORED) | set(_C_COMPARISONS) | {"Max", "Min", "Select"}):
+                    # C's usual arithmetic conversions reinterpret negative
+                    # int64 as uint64. A mixed row needs an authored conversion
+                    # before selecting one integer domain; never let the C
+                    # printer decide that physical contract implicitly.
+                    shortfalls.append(CEmissionShortfall(
+                        op, f"mixed signed/unsigned operands require an explicit conversion in {fn}",
+                    ))
+                    continue
                 declared_storage_type = _scalar_c_type(instruction.res.dtype)
                 if op in {"GetElementPtr", "getelementptr"} and len(args) >= 2:
-                    base = instruction.args[0]
+                    # Checked sequence extend passes source length formal 11
+                    # (int64[1]) as a ptr-typed address occurrence. The formal
+                    # already owns its pointee type; reading the occurrence
+                    # proxy instead emitted double* and decoded length 3 as 0.
+                    # Address views consult the existing declaring record.
+                    base = storage_values[fn].get(
+                        int(instruction.args[0].id), instruction.args[0],
+                    )
                     pointer_depth = _pointer_value_depth(base)
                     heap_layout = heap_element(base)
                     if heap_layout is not None:
@@ -5779,12 +5861,14 @@ def emit_ssa_module_to_c(
                     )
                 elif op == "SExt" and len(args) == 1:
                     result_type = _scalar_c_type(instruction.res.dtype)
-                    source_type = _scalar_c_type(instruction.args[0].dtype)
+                    source_layout = dtype_layout(instruction.args[0].dtype)
+                    source_type = (dtype_layout(f"int{8 * source_layout.byte_size}").c_storage_type
+                                   if source_layout.kind != "bool" else "int8_t")
                     integer_ids.add(result_id)
-                    declared = (
-                        f"const {result_type} t{result_id} = "
-                        f"({result_type})(({source_type})({args[0]}));"
-                    )
+                    source = f"(({source_type})({args[0]}))"
+                    if source_layout.kind == "bool":
+                        source = f"(-(({args[0]}) != 0))"
+                    declared = f"const {result_type} t{result_id} = ({result_type})({source});"
                 elif op == "ZExt" and len(args) == 1:
                     result_type = _scalar_c_type(instruction.res.dtype)
                     source_type = _unsigned_c_type(instruction.args[0].dtype)
@@ -5940,6 +6024,11 @@ def emit_ssa_module_to_c(
                         + ";"
                     )
                 elif op == "Pow" and len(args) == 2:
+                    if _is_integer_dtype(instruction.res.dtype):
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"integer Pow requires the shared exact power reduction before C emission in {fn}",
+                        ))
+                        continue
                     declared_storage_type = "double"
                     # Constant exponents approved by the active work contract
                     # have already been rewritten by
@@ -5977,7 +6066,14 @@ def emit_ssa_module_to_c(
                             f"((double)({args[0]}) / (double)({args[1]}))"
                         )
                     if integral and op in {"Add", "Sub", "Mul"}:
-                        unsigned = _unsigned_c_type(instruction.res.dtype)
+                        layout = dtype_layout(instruction.res.dtype)
+                        # C promotes uint8/uint16 to signed int before Mul;
+                        # uint16_max**2 would then overflow signed int. Use
+                        # the canonical uint32 working type before the final
+                        # declared-width cast, matching native integer wrap.
+                        unsigned = dtype_layout(
+                            f"uint{max(32, 8 * layout.byte_size)}"
+                        ).c_storage_type
                         expression = (
                             f"({kind})(({unsigned})({args[0]}) "
                             f"{_BINARY[op]} ({unsigned})({args[1]}))"
@@ -6004,10 +6100,21 @@ def emit_ssa_module_to_c(
                     # operand while the ``shr`` beside it was integral, so
                     # this was decided per operand somewhere upstream; an
                     # integer operation should not depend on that.
-                    left = f"(int64_t)({left})"
+                    left_type = (_scalar_c_type(instruction.args[0].dtype)
+                                 if is_integer(instruction.args[0]) else "int64_t")
+                    left = f"({left_type})({left})"
                     right = f"(int64_t)({right})"
-                    if op in {"LShr", "Shr"}:
-                        left = f"({_unsigned_c_type(instruction.args[0].dtype)})({left})"
+                    if op in {"LShr", "Shr", "Shl"}:
+                        layout = dtype_layout(instruction.args[0].dtype)
+                        unsigned = dtype_layout(
+                            f"uint{max(32, 8 * layout.byte_size)}"
+                        ).c_storage_type
+                        source_unsigned = _unsigned_c_type(instruction.args[0].dtype)
+                        left = f"({unsigned})(({source_unsigned})({left}))"
+                    elif op == "AShr":
+                        layout = dtype_layout(instruction.args[0].dtype)
+                        signed = dtype_layout(f"int{8 * layout.byte_size}").c_storage_type
+                        left = f"({signed})({left})"
                     declared = (
                         f"const {kind} t{result_id} = "
                         f"({kind})({left} {_INTEGER_BINARY[op]} {right});"
@@ -6037,10 +6144,22 @@ def emit_ssa_module_to_c(
                     kind = _scalar_c_type(instruction.res.dtype)
                     if integral:
                         integer_ids.add(result_id)
-                    declared = (
-                        f"const {kind} t{result_id} = "
-                        f"{helper}({args[0]}, {args[1]});"
-                    )
+                    if integral and all(_is_unsigned_dtype(value.dtype)
+                                        for value in instruction.args):
+                        # A uint64 above INT64_MAX must never enter the signed
+                        # long-long floor helper. Unsigned division is already
+                        # floored because both operands are nonnegative.
+                        symbol = "%" if op == "Mod" else "/"
+                        expression = f"({args[0]} {symbol} {args[1]})"
+                    elif integral and any(_is_unsigned_dtype(value.dtype)
+                                          for value in instruction.args):
+                        shortfalls.append(CEmissionShortfall(
+                            op, f"mixed signed/unsigned floor operation requires an explicit conversion in {fn}",
+                        ))
+                        continue
+                    else:
+                        expression = f"{helper}({args[0]}, {args[1]})"
+                    declared = f"const {kind} t{result_id} = {expression};"
                 elif op in _C_UNSIGNED_COMPARISONS and len(args) == 2:
                     integer_ids.add(result_id)
                     left_type = _unsigned_c_type(instruction.args[0].dtype)
@@ -6451,7 +6570,7 @@ def emit_ssa_module_to_c(
             requirement.shape if requirement is not None else formal.shape or ()
         ))
         held = solved_buffer_type(function_name, formal)
-        buffer_dtypes.append(_dtype_for_c_storage(held))
+        buffer_dtypes.append(solved_buffer_dtype(function_name, formal, held))
         index = len(buffer_order) - 1
         entry_lines.append(
             f"    {held} *b{index} = "
@@ -6514,7 +6633,7 @@ def emit_ssa_module_to_c(
             if output_id in storage_requirements else output.shape or ()
         ))
         element_type = solved_buffer_type(function_name, output)
-        buffer_dtypes.append(_dtype_for_c_storage(element_type))
+        buffer_dtypes.append(solved_buffer_dtype(function_name, output, element_type))
         index = len(buffer_order) - 1
         entry_lines.append(
             f"    {element_type} *b{index} = "

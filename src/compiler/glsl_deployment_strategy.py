@@ -23558,6 +23558,19 @@ def _tensor_descriptor_rule(
                         continue
                     node = graph.G.nodes[operand]
                     attributes = node.get("attributes") or {}
+                    if (
+                        attributes.get("program_abi_storage") == "scalar"
+                        and int(attributes.get("program_abi_rank", 0)) == 0
+                        and int(side.get("rank", 0)) == 0
+                    ):
+                        # c621: dynamic uint64 x % scalar uint64 n. The
+                        # published scalar descriptor for n is settled even
+                        # though ingestion also attaches tensor metadata.
+                        # Discarding it here made result 2 a static rank-0
+                        # float64, erasing x's declared runtime rank. Retain
+                        # this exact ProgramABI scalar in the existing
+                        # broadcast law, as for proven scalar reductions.
+                        continue
                     semantic_operand = str(
                         attributes.get("tensor")
                         or attributes.get("tensor_candidate")

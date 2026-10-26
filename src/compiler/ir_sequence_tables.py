@@ -4379,10 +4379,22 @@ def lower_sequence_extend(
         return unsupported
     if len(destination.column_value_ids) != len(source.column_value_ids):
         raise ValueError("sequence extend requires matching row widths")
+    from ..transmogrifier.dtype_layout import layout_for
+    source_layouts = tuple(map(layout_for, source.column_dtypes))
+    destination_layouts = tuple(map(layout_for, destination.column_dtypes))
+    for source_layout, destination_layout in zip(source_layouts, destination_layouts, strict=True):
+        if source_layout == destination_layout:
+            continue
+        # c634: array("Q").extend(list[int]) copies rows; it does not
+        # identify the source arena with the array's physical storage. The
+        # existing insert loop must convert each loaded row before insertion.
+        if (source_layout.kind not in {"bool", "int", "uint", "float"}
+                or destination_layout.kind not in {"int", "uint", "float"}
+                or (source_layout.kind == "float" and destination_layout.kind != "float")
+                or any(destination.column_shapes) or any(source.column_shapes)):
+            raise ValueError("sequence extend has no declared scalar row conversion: "
+                             f"{source_layout.name} -> {destination_layout.name}")
     if destination.heap_owner_value_id is not None or source.heap_owner_value_id is not None:
-        from ..transmogrifier.dtype_layout import layout_for
-        if tuple(map(layout_for, destination.column_dtypes)) != tuple(map(layout_for, source.column_dtypes)):
-            raise ValueError("heap sequence extend requires matching element layouts")
         if any(destination.column_shapes) or any(source.column_shapes):
             raise ValueError("heap sequence extend requires scalar row columns")
 
@@ -4507,19 +4519,67 @@ def lower_sequence_extend(
     else:
         builder.branch(body, call_insert)
 
+    # Use the same checked integer-row conversion contract as append. Bounds
+    # are compared in the loaded source's domain; a bound outside that domain
+    # cannot fail and must not itself be encoded in a too-narrow constant.
+    insert_block = call_insert
+    converted_rows = []
+    for value, source_layout, destination_layout in zip(
+        row_values, source_layouts, destination_layouts, strict=True,
+    ):
+        if source_layout == destination_layout:
+            converted_rows.append(value)
+            continue
+        if destination_layout.kind in {"int", "uint"}:
+            source_bits, target_bits = 8 * source_layout.byte_size, 8 * destination_layout.byte_size
+            source_min = (0 if source_layout.kind in {"uint", "bool"} else -(1 << (source_bits - 1)))
+            source_max = ((1 << source_bits) - 1 if source_layout.kind == "uint" else
+                          1 if source_layout.kind == "bool" else (1 << (source_bits - 1)) - 1)
+            target_min = (0 if destination_layout.kind == "uint" else -(1 << (target_bits - 1)))
+            target_max = ((1 << target_bits) - 1 if destination_layout.kind == "uint" else
+                          (1 << (target_bits - 1)) - 1)
+            for operation, bound, needed in (
+                ("Ge", target_min, target_min > source_min),
+                ("Le", target_max, target_max < source_max),
+            ):
+                if not needed:
+                    continue
+                valid = builder.fresh("bool")
+                builder.emit(insert_block, operation,
+                             [value, builder.const(insert_block, bound, dtype=source_layout.name)], valid)
+                accepted = builder.block(f"row_{value.id}_{operation}_accepted")
+                invalid = builder.block(f"row_{value.id}_{operation}_invalid")
+                builder.cond(insert_block, valid, accepted, invalid)
+                builder.emit(invalid, "Call", [], attributes={
+                    "callee": "turing_validation_error", "error_code": 74,
+                    "binding": f"ssa_sequence_{destination_layout.name}_range",
+                    "source_linked": True,
+                })
+                builder.emit(invalid, "Ret", [builder.const(invalid, 3)])
+                insert_block = accepted
+        converted = builder.fresh(destination_layout.name)
+        builder.emit(insert_block, "Cast", [value], converted, attributes={
+            "target_dtype": destination_layout.name,
+            "binding": (f"ssa_sequence_{destination_layout.name}_range"
+                        if destination_layout.kind in {"int", "uint"} else
+                        f"ssa_sequence_{destination_layout.name}_conversion"),
+            "source_dtype": source_layout.name,
+        })
+        converted_rows.append(converted)
+    row_values = converted_rows
     insert_status = builder.fresh("int")
     insert_values = {value.id: value for value in all_storage}
     insert_values.update(zip(insert_function.metadata["sequence_row_argument_ids"], row_values))
     builder.emit(
-        call_insert,
+        insert_block,
         "Call",
         [insert_values[value.id] for value in insert_function.args],
         insert_status,
         attributes={"callee": insert_name, "source_linked": True},
     )
     is_full = builder.fresh("bool")
-    builder.emit(call_insert, "Eq", [insert_status, full_status], is_full)
-    builder.cond(call_insert, is_full, exhausted, latch)
+    builder.emit(insert_block, "Eq", [insert_status, full_status], is_full)
+    builder.cond(insert_block, is_full, exhausted, latch)
     builder.emit(latch, "Add", [index, one], next_index)
     builder.branch(latch, header)
     completed_status = _status_branch(builder, complete, 1, result_block)
