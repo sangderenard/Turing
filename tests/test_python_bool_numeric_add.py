@@ -149,3 +149,29 @@ def test_bool_tensor_add_keeps_the_boolean_tensor_result_domain():
     result = next(value for value in planned if value.id == 2)
     assert result.dtype == "bool"
     assert result.shape == (2,)
+
+
+def test_single_leaf_llvm_bool_arithmetic_uses_integer_result(tmp_path):
+    from src.transmogrifier.ssa import BasicBlock, Function, IRModule, Instr, SSAValue
+
+    left, right = SSAValue(0, 'bool'), SSAValue(1, 'bool')
+    results = [SSAValue(index + 2, 'int64') for index in range(3)]
+    function = Function('bool_leaf', [left, right], {
+        'entry': BasicBlock('entry', [
+            *[Instr(op, [left, right], result)
+              for op, result in zip(('Add', 'Sub', 'Mul'), results)],
+            Instr('Ret', results, None),
+        ]),
+    })
+    artifact = emit_ssa_function_to_llvm(IRModule({function.name: function}), function.name)
+    assert artifact.complete, artifact.shortfalls
+    native = compile_llvm_artifact(artifact, directory=tmp_path / 'leaf')
+    for a, b in itertools.product((False, True), repeat=2):
+        execution = prepare_llvm_execution(native, {
+            left.id: np.asarray([a]), right.id: np.asarray([b]),
+        }).run()
+        assert tuple(execution.buffers[result.id].item() for result in results) == (
+            int(a) + int(b), int(a) - int(b), int(a) * int(b),
+        )
+        assert all(execution.buffers[result.id].dtype == np.dtype('int64')
+                   for result in results)
