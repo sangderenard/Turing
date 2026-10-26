@@ -5615,8 +5615,21 @@ class _ControlSSABuilder(TiledObject):
                         },
                     )
                 else:
+                    # c632's record materialization retains the length as
+                    # one sequence cell, not a plain span formal. Address
+                    # that exact cell through the ordinary memory SSA before
+                    # loading it, as sequence initialization already does.
+                    address = self.fresh_value(
+                        dtype="ptr", transform=ADDRESS, operands=(length_cell,),
+                    )
                     self.emit(
-                        Handler.Load, [length_cell], value,
+                        Handler.GetElementPtr,
+                        [length_cell, self.constant_value(0, length_cell)],
+                        address,
+                        attributes={"binding": "ssa_sequence_length_address"},
+                    )
+                    self.emit(
+                        Handler.Load, [address], value,
                         attributes={
                             "binding": "ssa_sequence_length_value",
                             "sequence_id": int(sequence_id),
@@ -16341,32 +16354,41 @@ class _ControlSSABuilder(TiledObject):
                     value.dtype = literal_dtype
                     self._revise_value(value)
             converted_values = []
+            from ..transmogrifier.dtype_layout import resolve as dtype_layout
             for value, row_dtype in zip(
                 mutation_values, destination.column_dtypes, strict=True,
             ):
-                if str(row_dtype) != "uint32" or str(value.dtype) != "int64":
+                layout = dtype_layout(row_dtype)
+                if (layout is None or layout.kind != "uint"
+                        or str(value.dtype) != "int64"):
                     converted_values.append(value)
                     continue
-                # c626: array("I") owns a uint32 physical row, while an
-                # indexed Python int source is int64.  Check its range before
-                # narrowing; a silent wrap would change the authored value.
+                # c626/c632: array("I") and array("B") own their declared
+                # unsigned rows; the Python int source is int64. Check the
+                # declared layout's range before converting. An int64 source
+                # already fits the upper bound of uint64 when nonnegative.
                 zero = self.constant_value(0, value, dtype="int64")
-                maximum = self.constant_value(0xFFFFFFFF, value, dtype="int64")
                 nonnegative = self.fresh_value(
                     dtype="bool", transform=CONTROL_PREDICATE,
                     operands=(value, zero),
                 )
                 self.emit(Handler.Ge, [value, zero], nonnegative)
-                bounded = self.fresh_value(
-                    dtype="bool", transform=CONTROL_PREDICATE,
-                    operands=(value, maximum),
-                )
-                self.emit(Handler.Le, [value, maximum], bounded)
-                valid = self.fresh_value(
-                    dtype="bool", transform=CONTROL_PREDICATE,
-                    operands=(nonnegative, bounded),
-                )
-                self.emit(Handler.LAnd, [nonnegative, bounded], valid)
+                valid = nonnegative
+                if layout.byte_size < 8:
+                    maximum = self.constant_value(
+                        (1 << (8 * layout.byte_size)) - 1, value, dtype="int64",
+                    )
+                    bounded = self.fresh_value(
+                        dtype="bool", transform=CONTROL_PREDICATE,
+                        operands=(value, maximum),
+                    )
+                    self.emit(Handler.Le, [value, maximum], bounded)
+                    valid = self.fresh_value(
+                        dtype="bool", transform=CONTROL_PREDICATE,
+                        operands=(nonnegative, bounded),
+                    )
+                    self.emit(Handler.LAnd, [nonnegative, bounded], valid)
+                range_binding = f"ssa_sequence_{layout.name}_range"
                 accepted = self.new_block("validation_pass")
                 invalid = self.new_block("validation_fail")
                 self.conditional_branch(valid, accepted, invalid)
@@ -16374,18 +16396,18 @@ class _ControlSSABuilder(TiledObject):
                 self.emit(Handler.Call, [], attributes={
                     "callee": "turing_validation_error",
                     "error_code": 74,
-                    "binding": "ssa_sequence_uint32_range",
+                    "binding": range_binding,
                 })
                 self.branch(accepted)
                 self.current = accepted
                 narrowed = self.fresh_value(
-                    dtype="uint32", transform=CONTROL_CAST,
+                    dtype=layout.name, transform=CONTROL_CAST,
                     operands=(value,),
                 )
                 self.emit(
                     Handler.Cast, [value], narrowed,
-                    attributes={"target_dtype": "uint32",
-                                "binding": "ssa_sequence_uint32_range"},
+                    attributes={"target_dtype": layout.name,
+                                "binding": range_binding},
                 )
                 converted_values.append(narrowed)
             mutation_values = tuple(converted_values)

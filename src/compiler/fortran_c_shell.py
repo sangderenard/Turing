@@ -10295,7 +10295,7 @@ def _field_slot_ops(
         attribute = (data.get("attributes") or {}).get("attribute")
         if field_aggregate_kinds.get(str(attribute)) not in {
             "list", "set", "frozenset", "dict", "tuple", "bytes",
-            "bytearray",
+            "bytearray", "array",
         }:
             continue
         aggregate_reads.append((
@@ -10377,7 +10377,7 @@ def _field_slot_ops(
             )
         elif storage == "span" and aggregate_kind in {
             "list", "tuple", "set", "frozenset", "iterable", "sequence",
-            "bytes", "bytearray", "str",
+            "bytes", "bytearray", "str", "array",
         }:
             policy = (
                 "unique" if aggregate_kind in {"set", "frozenset"}
@@ -10948,7 +10948,7 @@ def _field_slot_ops(
             aggregate_kind = field_aggregate_kinds.get(str(attribute))
             if aggregate_kind in {
                 "list", "set", "frozenset", "dict", "tuple", "bytes",
-                "bytearray",
+                "bytearray", "array",
             }:
                 sequence_id = field_sequence_ids[canonical_field(str(attribute))]
                 # A field read is a view of the field's current resident, not
@@ -28861,6 +28861,10 @@ def _class_surface_ssa_program(
                     graph_obj,
                     sequence_declarations,
                     {
+                        # c632: repeated record-array reads already have one
+                        # planned identity. Resolve len() through that record
+                        # instead of leaving each read as an undefined scalar.
+                        **resolved_concordant_alias_bindings(str(symbol)),
                         **_loop_carried_storage_aliases(graph_obj),
                         **{
                             int(value_id): int(resident_id)

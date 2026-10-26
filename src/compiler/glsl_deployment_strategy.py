@@ -9051,7 +9051,7 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             continue
         destination_data = graph_obj.nodes[destination]
         destination_kind = _receiver_collection_kind(destination_data)
-        if destination_kind not in {"list", "set", "bytes", "bytearray"}:
+        if destination_kind not in {"list", "set", "bytes", "bytearray", "array"}:
             continue
         records[int(node_id)] = {
             "expression": expression,
