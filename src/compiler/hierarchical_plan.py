@@ -756,15 +756,17 @@ def plan_region_to_ssa_instrs(
         values[value_id] = made
         return made
 
-    def cast_comparison_operand(
+    def cast_u32_integer_operand(
         item: PlanLine, source_position: int, operand: SSAValue,
     ) -> SSAValue:
-        """Widen the exact uint32 side of ``values[0] < scalar``.
+        """Embed the exact uint32 operand in an int64 SSA operation.
 
-        The sequence row is physically uint32 and the scalar is int64. Every
-        uint32 value fits int64, so int64 is their exact common comparison
-        domain. Keep the conversion in repository SSA so the C, LLVM and
-        Fortran emitters all see the same typed operands.
+        Every uint32 value fits int64. Comparisons therefore use an exact
+        common domain. For Add, use it only when the existing result rule has
+        already selected int64; this reuses the repository's typed int64 Add
+        behavior instead of choosing a separate overflow policy. Keep each
+        conversion in repository SSA so all native emitters see the same
+        explicitly converted operands.
         """
 
         from .concordance_declarations import (
@@ -787,7 +789,7 @@ def plan_region_to_ssa_instrs(
             )
         if source is None:
             raise ConcordanceRefusal(
-                "planner comparison widening cannot name the exact operand "
+                "planner integer widening cannot name the exact operand "
                 f"identity for SSA value {operand.id}"
             )
         cast_id = _mint_ssa_id(
@@ -1015,6 +1017,24 @@ def plan_region_to_ssa_instrs(
             continue
 
         operands = [value(value_id) for value_id in semantic_inputs]
+        def scalar_uint32(value_id: int, dtype: str) -> bool:
+            return (
+                dtype == "uint32"
+                and int(value_id) in shape_of
+                and shape_of.get(int(value_id), ()) == ()
+                and int(value_id) in rank_of
+                and rank_of.get(int(value_id), 0) == 0
+            )
+
+        def scalar_int64(value_id: int, dtype: str) -> bool:
+            return (
+                dtype in {"int64", "i64"}
+                and int(value_id) in shape_of
+                and shape_of.get(int(value_id), ()) == ()
+                and int(value_id) in rank_of
+                and rank_of.get(int(value_id), 0) == 0
+            )
+
         if (
             opcode.casefold() in {"lt", "le", "gt", "ge", "eq", "ne"}
             and len(semantic_inputs) == 2
@@ -1022,34 +1042,38 @@ def plan_region_to_ssa_instrs(
             left_id, right_id = semantic_inputs
             left_dtype = str(dtype_of.get(left_id) or "")
             right_dtype = str(dtype_of.get(right_id) or "")
-            def scalar_uint32(value_id: int, dtype: str) -> bool:
-                return (
-                    dtype == "uint32"
-                    and int(value_id) in shape_of
-                    and shape_of.get(int(value_id), ()) == ()
-                    and int(value_id) in rank_of
-                    and rank_of.get(int(value_id), 0) == 0
-                )
-
-            def scalar_int64(value_id: int, dtype: str) -> bool:
-                return (
-                    dtype in {"int64", "i64"}
-                    and int(value_id) in shape_of
-                    and shape_of.get(int(value_id), ()) == ()
-                    and int(value_id) in rank_of
-                    and rank_of.get(int(value_id), 0) == 0
-                )
-
             if (
                 scalar_uint32(left_id, left_dtype)
                 and scalar_int64(right_id, right_dtype)
             ):
-                operands[0] = cast_comparison_operand(item, 0, operands[0])
+                operands[0] = cast_u32_integer_operand(item, 0, operands[0])
             elif (
                 scalar_uint32(right_id, right_dtype)
                 and scalar_int64(left_id, left_dtype)
             ):
-                operands[1] = cast_comparison_operand(item, 1, operands[1])
+                operands[1] = cast_u32_integer_operand(item, 1, operands[1])
+        elif (
+            opcode.casefold() == "add"
+            and len(semantic_inputs) == 2
+            and str(dtype_of.get(int(item.outputs[0])) or "") == "int64"
+        ):
+            # The existing numeric result law selects int64 when one operand
+            # is int64. Convert only a scalar uint32 side, whose full source
+            # range embeds exactly in that domain. uint64/int64 and every
+            # unproved/ranked pair continue to the backend's honest refusal.
+            left_id, right_id = semantic_inputs
+            left_dtype = str(dtype_of.get(left_id) or "")
+            right_dtype = str(dtype_of.get(right_id) or "")
+            if (
+                scalar_uint32(left_id, left_dtype)
+                and scalar_int64(right_id, right_dtype)
+            ):
+                operands[0] = cast_u32_integer_operand(item, 0, operands[0])
+            elif (
+                scalar_uint32(right_id, right_dtype)
+                and scalar_int64(left_id, left_dtype)
+            ):
+                operands[1] = cast_u32_integer_operand(item, 1, operands[1])
 
         instructions.append(Instr(
             opcode,

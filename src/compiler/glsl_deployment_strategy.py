@@ -4317,7 +4317,15 @@ def _build_shell_hierarchy_plan(
                     if isinstance(literal, bool):
                         dtype = "bool"
                     elif isinstance(literal, int):
-                        dtype = "int"
+                        # A Python integer literal is the same signed int64
+                        # scalar published for this identity by control SSA.
+                        # In Vocabulary._aggregate_matches, the loop seed
+                        # ``i = 0`` had no graph tensor descriptor, so this
+                        # fallback stamped the planned comparison input as
+                        # ``int`` (the int32 storage alias) while the retained
+                        # loop Phi's posted SSA_VALUE was int64. Keep the
+                        # planner closure on that existing primitive contract.
+                        dtype = "int64"
                     elif isinstance(literal, float):
                         dtype = "float64"
                 # Callable/operator-reference edges are provenance, not
@@ -4625,6 +4633,30 @@ def _build_shell_hierarchy_plan(
             for value_id in (*region_nodes, *region_captures)
             for descriptor in (planned_descriptor(int(value_id)),)
             if descriptor is not None
+        )
+        # A static scalar literal has no tensor descriptor to contribute a
+        # rank row. Preserve its exact rank-zero source fact in the same
+        # PlanClosure rank view: the retained ``i = 0; while i < u32_count``
+        # comparison otherwise had an int64 literal dtype but no scalar-rank
+        # proof, so the existing lossless u32-to-int64 comparison Cast could
+        # not run. List/tuple constants remain governed by their descriptor
+        # and extent above.
+        value_ranks += tuple(
+            (int(value_id), 0)
+            for value_id in (*region_nodes, *region_captures)
+            if planned_descriptor(int(value_id)) is None
+            and int(value_id) in graph.G
+            and str(
+                graph.G.nodes[int(value_id)].get("op")
+                or graph.G.nodes[int(value_id)].get("type")
+                or ""
+            ).casefold() in {"const", "constant"}
+            and isinstance(
+                (graph.G.nodes[int(value_id)].get("attributes") or {}).get(
+                    "value", graph.G.nodes[int(value_id)].get("constant")
+                ),
+                (bool, int, float),
+            )
         )
         # A capture produced by a shape-only operation outside the region is
         # fed its source's storage (the operation has no runtime existence);
