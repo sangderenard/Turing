@@ -9608,6 +9608,11 @@ class _ControlSSABuilder(TiledObject):
             if pending is not None and int(read_id) not in self.external_values:
                 del self.consumer_row_loads[int(read_id)]
                 self._emit_sequence_row_load(*pending)
+            elif int(read_id) in self.sequence_length_values:
+                # c632's row=len(field) precedes append but its scalar is
+                # consumed at return.  Freeze that exact temporal read at
+                # the same pre-effect boundary as an indexed row load.
+                self.external_value(int(read_id))
 
     def emit(
         self,
@@ -9646,11 +9651,6 @@ class _ControlSSABuilder(TiledObject):
 
             local_id = (
                 str(result.id)
-            elif int(read_id) in self.sequence_length_values:
-                # c632's row=len(field) precedes append but its scalar is
-                # consumed at return.  Freeze that exact temporal read at
-                # the same pre-effect boundary as an indexed row load.
-                self.external_value(int(read_id))
                 if result is not None
                 else f"{self.current.name}:{self._evolution_instruction}:{op.value}"
             )

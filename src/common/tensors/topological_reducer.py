@@ -13147,24 +13147,6 @@ def _normalize_lexical_values(
             # RHS node, effect = this SetAttr (plan 70, S4).  The written
             # cell is stamped on the SetAttr so a consumer names the cell,
             # never the RHS id or the SetAttr id.
-            written_cell = post_field_state(
-                receiver, target.attr, _FieldStateKind.WRITTEN,
-                int(value), int(node_id),
-                sources=field_state_sources(
-                    receiver, target.attr,
-                    node_identity_cell(graph, int(value)),
-                    node_identity_cell(graph, int(node_id)),
-                ),
-                stage=_REDUCER_FIELD_WRITE,
-            )
-            node_data.setdefault("attributes", {})["field_state_cell"] = (
-                written_cell
-            )
-            # A plain-named receiver (``counter.value = ...``) gets its own
-            # identity binding the same way a bare ``ast.Name`` target does
-            # above -- the field write is already a real, correctly wired
-            # SetAttr node; it was just never named, so it never reached
-            # ``identity_table`` for anything downstream to select by name.
             declared_field_cell = declared_field_schema_cell(
                 str(method_owner)
                 if method_owner is not None
@@ -13177,6 +13159,25 @@ def _normalize_lexical_values(
                 node_data.setdefault("attributes", {})[
                     "field_declaration_cell"
                 ] = declared_field_cell
+            written_cell = post_field_state(
+                receiver, target.attr, _FieldStateKind.WRITTEN,
+                int(value), int(node_id),
+                sources=field_state_sources(
+                    receiver, target.attr,
+                    node_identity_cell(graph, int(value)),
+                    node_identity_cell(graph, int(node_id)),
+                    declared_field_cell,
+                ),
+                stage=_REDUCER_FIELD_WRITE,
+            )
+            node_data.setdefault("attributes", {})["field_state_cell"] = (
+                written_cell
+            )
+            # A plain-named receiver (``counter.value = ...``) gets its own
+            # identity binding the same way a bare ``ast.Name`` target does
+            # above -- the field write is already a real, correctly wired
+            # SetAttr node; it was just never named, so it never reached
+            # ``identity_table`` for anything downstream to select by name.
             if isinstance(target.value, ast.Name):
                 field_identity = f"{target.value.id}.{target.attr}"
                 identity_bindings.setdefault(
@@ -13184,7 +13185,6 @@ def _normalize_lexical_values(
                 ).append(node_id)
                 record_ingestion_definition(field_identity, node_id, target)
                 # ``callee_ref``/``method_ref``/``class_ref`` each let a
-                    declared_field_cell,
                 # dependency walk recurse into the thing a node depends on --
                 # a real node reference grounded in the class's own layout,
                 # not a label invented at this call site.  ``attribute_slot``
@@ -24133,29 +24133,6 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         target = static_bindings.get(entry.name)
         if callable(target):
             external_function_table.resolve_callable(entry.reference, target)
-    graph.python_bindings = canonicalize_python_static_bindings(
-        graph.python_bindings
-    )
-    # Source discovery annotates definitions with their exact lexical Python
-    # environment.  Most annotations are removed when their function graph is
-    # finalized, but ProcessGraph.node_map deliberately retains every source
-    # occurrence.  Canonicalize any surviving environment through the same
-    # Python special case so a dead frontend annotation cannot reintroduce the
-    # live wrapper after all actual uses have become Constant leaves.
-    for expression in graph.node_map.values():
-        bindings = getattr(expression, "_python_bindings", None)
-        if isinstance(bindings, Mapping):
-            expression._python_bindings = canonicalize_python_static_bindings(
-                bindings
-            )
-    return graph
-
-
-__all__ = [
-    "normalize_python_attribute_special_cases",
-    "reduce_abstract_tensor_topology",
-    "specialize_python_precision_widths",
-]
             # c632's array constructor is declared by this exact import
             # reference.  Preserve its collection identity before function
             # subgraphs lose the external table; a later GetAttr is a view,
@@ -24185,3 +24162,26 @@ __all__ = [
                             "sequence_key_columns": (),
                             "sequence_writable": True,
                         })
+    graph.python_bindings = canonicalize_python_static_bindings(
+        graph.python_bindings
+    )
+    # Source discovery annotates definitions with their exact lexical Python
+    # environment.  Most annotations are removed when their function graph is
+    # finalized, but ProcessGraph.node_map deliberately retains every source
+    # occurrence.  Canonicalize any surviving environment through the same
+    # Python special case so a dead frontend annotation cannot reintroduce the
+    # live wrapper after all actual uses have become Constant leaves.
+    for expression in graph.node_map.values():
+        bindings = getattr(expression, "_python_bindings", None)
+        if isinstance(bindings, Mapping):
+            expression._python_bindings = canonicalize_python_static_bindings(
+                bindings
+            )
+    return graph
+
+
+__all__ = [
+    "normalize_python_attribute_special_cases",
+    "reduce_abstract_tensor_topology",
+    "specialize_python_precision_widths",
+]
