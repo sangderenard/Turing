@@ -72,3 +72,5 @@ failures remain open; no audit guard or fixture expectation was weakened.
 No full manager, bootstrap, or unrelated returned-arena repair was run by
 this lane. This receipt supersedes the intermediate public-source blocker
 status in the singleton LLVM aggregate receipt.
+
+Root clean integration checkout C:/dev/tg-child-review at769351d9: combined native iterable layouts, mixed integer conversions, scoped extend children and helper scope/direct-copy tests completed63passed3deselected40.88s. The3deselected cases are the explicitly tracked returned-array SOURCE native failures; no full green claim includes them.
