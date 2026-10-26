@@ -27575,6 +27575,27 @@ def _class_surface_ssa_program(
                     and any(int(parent) in receivers and str(role) == "object"
                             for parent, role in data.get("parents") or ())
                 )
+                from .identity_concordance import committed_sequence_contract
+                scalar_write_sources_for_field = tuple(
+                    int(graph_obj.nodes[parent].get("value_id", parent))
+                    for _node_id, data in graph_obj.nodes(data=True)
+                    if str(data.get("type") or data.get("op")).casefold()
+                    == "setattr"
+                    and (data.get("attributes") or {}).get("attribute")
+                    == field_name
+                    and any(
+                        int(parent) in receivers and str(role) == "object"
+                        for parent, role in data.get("parents") or ()
+                    )
+                    for parent, role in data.get("parents") or ()
+                    if str(role) == "value" and parent in graph_obj
+                    and committed_sequence_contract(
+                        str(symbol),
+                        int(graph_obj.nodes[parent].get("value_id", parent)),
+                    ) is None
+                )
+                if not scalar_write_sources_for_field:
+                    continue
                 if getters:
                     field_id = min(getters)
                 elif written_cells:
@@ -27596,6 +27617,20 @@ def _class_surface_ssa_program(
                         continue
                     roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
                     if roles.get("object") not in receivers or "value" not in roles:
+                        continue
+                    # Index.__init__ assigns an empty dict to its declared
+                    # _candidates field.  _field_slot_ops already owns that
+                    # source as a sequence; treating it as a reference field
+                    # write below stores its truth value into an opaque slot
+                    # and creates a second, unrelated sequence identity.
+                    # A posted sequence contract owns the whole assignment.
+                    from .identity_concordance import committed_sequence_contract
+                    source_value_id = int(graph_obj.nodes[roles["value"]].get(
+                        "value_id", roles["value"],
+                    ))
+                    if committed_sequence_contract(
+                        str(symbol), source_value_id,
+                    ) is not None:
                         continue
                     value = _graph_control_expression(graph_obj, roles["value"], resident=resident_value_ids)
                     if value is not None:
@@ -37055,9 +37090,19 @@ def _class_surface_ssa_program(
                 # literal recovery then folded into a constant on every
                 # path, and the incoming value reached no return site.
                 scalar_writes_as_storage = bool(field_read_ids)
+                from .identity_concordance import committed_sequence_contract
                 candidate_ids = tuple(dict.fromkeys(
                     resolve_record_storage(value_id) for value_id in (
                     *field_read_ids,
+                    *(
+                        value_id
+                        for value_id in write_source_ids_by_field.get(
+                            str(field_name), ()
+                        )
+                        if committed_sequence_contract(
+                            str(symbol), int(value_id),
+                        ) is not None
+                    ),
                     *(
                         write_source_ids_by_field.get(str(field_name), ())
                         if storage not in {"scalar", "reference"}
@@ -37236,6 +37281,32 @@ def _class_surface_ssa_program(
                         and not sequence.key_columns
                         and sequence.child_table_pool is None
                     )
+                    # Index.__init__ writes an empty dict.  The shell gives
+                    # that literal a generic key/value descriptor, before
+                    # its consumers prove a four-column key and child pool.
+                    # The literal has no rows, so the sole old key column can
+                    # become key column 0; the sole old value column remains
+                    # the unique non-key value column of the accepted view.
+                    # Both physical column identities survive this revision.
+                    source_node = graph.nodes.get(int(sequence_id), {})
+                    source_literal = source_node.get("expr_obj")
+                    empty_dict_sequence = (
+                        sequence is not None
+                        and isinstance(source_literal, ast.Dict)
+                        and not source_literal.keys
+                        and not source_literal.values
+                        and str((source_node.get("attributes") or {}).get(
+                            "aggregate_kind") or "") == "dict"
+                        and tuple(sequence.column_dtypes)
+                        == ("unknown", "unknown")
+                        and len(sequence.column_value_ids) == 2
+                        and sequence.key_columns == (0,)
+                        and sequence.child_table_pool is None
+                        and sequence.column_value_ids[0] == sequence_id
+                        and len(
+                            set(range(column_count)) - set(key_columns)
+                        ) == 1
+                    )
                     if (
                         sequence is not None
                         and declared_array_dtype is not None
@@ -37253,15 +37324,24 @@ def _class_surface_ssa_program(
                             function, sequence_table, sequence,
                             stage=RECORD_ABI_MATERIALIZATION, revise=True,
                         )
-                    if provisional_sequence and column_count > 1:
-                        column_ids = (
-                            int(sequence.column_value_ids[0]),
-                            *(
-                                mint_member(
-                                    ("column", position), dtypes[position],
-                                )
-                                for position in range(1, column_count)
-                            ),
+                    if (provisional_sequence or empty_dict_sequence) and column_count > 1:
+                        retained_columns = {
+                            0: int(sequence.column_value_ids[0]),
+                        }
+                        if empty_dict_sequence:
+                            value_role, = tuple(
+                                set(range(column_count)) - set(key_columns)
+                            )
+                            retained_columns[int(value_role)] = int(
+                                sequence.column_value_ids[1]
+                            )
+                        column_ids = tuple(
+                            retained_columns[position]
+                            if position in retained_columns
+                            else mint_member(
+                                ("column", position), dtypes[position],
+                            )
+                            for position in range(column_count)
                         )
                         live_flags_id = sequence.live_flags_value_id
                         if requires_live_flags and live_flags_id is None:
@@ -37310,6 +37390,21 @@ def _class_surface_ssa_program(
                             function, sequence_table, sequence,
                             stage=RECORD_ABI_MATERIALIZATION, revise=True,
                         )
+                        for position, member_id in enumerate(column_ids):
+                            if int(member_id) in values:
+                                continue
+                            member_dtype, member_shape = accepted_member_abi(
+                                ("column", position), dtypes[position],
+                            )
+                            member = _adopt_graph_formal(
+                                function, graph, int(member_id),
+                                GLOBAL_MONOTONIC_IDS.declaration,
+                                dtype=str(member_dtype),
+                                shape=tuple(member_shape),
+                                physical={"storage": "sequence"},
+                            )
+                            function.args.append(member)
+                            values[int(member_id)] = member
                     if sequence is not None and (
                         (requires_status and sequence.status_address_id is None)
                         or (
@@ -38845,11 +38940,15 @@ def _class_surface_ssa_program(
                             declared = declared_by_storage.get(
                                 resident.storage_identity
                             )
-                            if not (
-                                resident.storage is SSARecordFieldStorage.SPAN
-                                and declared is not None
-                                and declared.storage
-                                is SSARecordFieldStorage.SEQUENCE
+                            if (
+                                declared is None
+                                or declared.storage
+                                is not SSARecordFieldStorage.SEQUENCE
+                                or resident.storage not in {
+                                    SSARecordFieldStorage.SPAN,
+                                    SSARecordFieldStorage.SEQUENCE,
+                                }
+                                or resident == declared
                             ):
                                 refined_fields.append(resident)
                                 continue
@@ -38861,20 +38960,35 @@ def _class_surface_ssa_program(
                                     int(declared.sequence_id)
                                 )
                             )
+                            same_span_column = (
+                                resident.storage is SSARecordFieldStorage.SPAN
+                                and sequence is not None
+                                and bool(sequence.column_value_ids)
+                                and bool(sequence.column_dtypes)
+                                and tuple(resident.value_ids)
+                                == (int(sequence.column_value_ids[0]),)
+                                and str(resident.dtype)
+                                == str(sequence.column_dtypes[0])
+                            )
+                            same_sequence_members = (
+                                resident.storage
+                                is SSARecordFieldStorage.SEQUENCE
+                                and resident.sequence_id == declared.sequence_id
+                                and set(resident.value_ids).issubset(
+                                    declared.value_ids
+                                )
+                            )
                             if (
                                 sequence is None
-                                or not sequence.column_value_ids
-                                or not sequence.column_dtypes
                                 or resident.name != declared.name
-                                or tuple(resident.value_ids)
-                                != (int(sequence.column_value_ids[0]),)
-                                or str(resident.dtype)
-                                != str(sequence.column_dtypes[0])
+                                or not (
+                                    same_span_column or same_sequence_members
+                                )
                             ):
                                 raise ValueError(
                                     f"{symbol}: declared sequence field "
                                     f"{resident.storage_identity!r} "
-                                    "disagrees with its resident span"
+                                    "disagrees with its resident storage"
                                 )
                             refined_fields.append(declared)
                             sequence_sources.append(_frame_table_cell(
