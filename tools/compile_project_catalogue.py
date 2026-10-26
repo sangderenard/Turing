@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+import yaml
 from typing import Sequence
 
 from src.compiler.project_compilation_product import (
@@ -279,6 +280,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="emit each complete dependency-linked unit as a shared library",
     )
     parser.add_argument(
+        "--verification-cases", type=Path,
+        help="YAML/JSON mapping authored entry names to probes and supplied expected_probe_results; requires --emit-native",
+    )
+    parser.add_argument(
         "--plan-only", action="store_true",
         help=(
             "for exactly one entry, stop after post-reduction ProcessGraph "
@@ -351,6 +356,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
+    if arguments.verification_cases is not None and not arguments.emit_native:
+        parser.error("--verification-cases requires --emit-native")
+    if arguments.verification_cases is not None and any(vars(arguments).get(mode) for mode in (
+        "worker", "partitioned_source", "plan_only", "planned_unit", "compile_resolved_plan", "creep_resolved_plan",
+    )):
+        parser.error("--verification-cases applies to project catalogues or --creep-project")
     if arguments.stage_units is not None and (
         not arguments.compile_resolved_plan or arguments.stage_units < 1
     ):
@@ -458,6 +469,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             bootstrap_products=selected_products,
             seed_product=arguments.seed_product,
             max_rounds=arguments.max_bootstrap_rounds,
+            verification_cases=(None if arguments.verification_cases is None else
+                                yaml.safe_load(arguments.verification_cases.read_text(encoding="utf-8"))),
             progress=lambda event: print(
                 json.dumps(event, sort_keys=True), flush=True,
             ),
@@ -855,6 +868,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         extraction_contract=arguments.extraction_contract,
         emit_native=arguments.emit_native,
+        verification_cases=(None if arguments.verification_cases is None else
+                            yaml.safe_load(arguments.verification_cases.read_text(encoding="utf-8"))),
         seed_product=arguments.seed_product,
         progress=lambda event: print(
             json.dumps(event, sort_keys=True), flush=True,
@@ -872,7 +887,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{arguments.output.resolve() / 'manifest.json'}",
         flush=True,
     )
-    return 1 if failed or partial or blocked else 0
+    for verification in manifest.get("native_case_verification", ()):
+        print(json.dumps(verification, sort_keys=True), flush=True)
+    case_failure = any(not item.get("verified") for item in manifest.get("native_case_verification", ()))
+    return 1 if failed or partial or blocked or case_failure else 0
 
 
 if __name__ == "__main__":
