@@ -37361,6 +37361,48 @@ def _class_surface_ssa_program(
                             function, sequence_table, sequence,
                             stage=RECORD_ABI_MATERIALIZATION, revise=True,
                         )
+                    if (
+                        sequence is not None
+                        and len(sequence.column_value_ids) == column_count
+                        and tuple(sequence.key_columns) == tuple(key_columns)
+                    ):
+                        # c628: batch mutates a tuple-keyed dict after relay
+                        # reads it.  The shared field receipt has int64 keys,
+                        # but the mutation's existing descriptor kept unknown
+                        # columns.  A later read-only frame view then collided
+                        # with that mutable owner.  Complete this descriptor
+                        # from the reconciled field receipt here, retaining
+                        # every storage/capability member of the owner.
+                        resident_dtypes = sequence.column_dtypes or (
+                            ("unknown",) * column_count
+                        )
+                        refined_dtypes = []
+                        for resident_dtype, declared_dtype in zip(
+                            resident_dtypes, dtypes, strict=True,
+                        ):
+                            if resident_dtype == "unknown":
+                                refined_dtypes.append(declared_dtype)
+                            elif declared_dtype in {"unknown", resident_dtype}:
+                                refined_dtypes.append(resident_dtype)
+                            else:
+                                raise ValueError(
+                                    f"{symbol}: field {storage_identity!r} "
+                                    "has conflicting sequence column dtypes: "
+                                    f"{resident_dtype!r} != {declared_dtype!r}"
+                                )
+                        if tuple(refined_dtypes) != sequence.column_dtypes:
+                            sequence = replace(
+                                sequence,
+                                column_dtypes=tuple(refined_dtypes),
+                            )
+                            _frame_register_sequence(
+                                function, sequence_table, sequence,
+                                access_book.latest_ref(
+                                    RECORD_FIELD_SEQUENCE_VIEW,
+                                    (access_scope, storage_identity),
+                                ),
+                                stage=RECORD_ABI_MATERIALIZATION, revise=True,
+                            )
                     if (provisional_sequence or empty_dict_sequence) and column_count > 1:
                         retained_columns = {
                             0: int(sequence.column_value_ids[0]),
@@ -37767,6 +37809,10 @@ def _class_surface_ssa_program(
                     # member, exactly as the new-sequence branch above does,
                     # so linked native interfaces can select the descriptor
                     # by its full physical surface.
+                    column_types = dict(zip(
+                        map(int, sequence.column_value_ids),
+                        sequence.column_dtypes,
+                    ))
                     for member_id in physical_members:
                         member = values.get(int(member_id))
                         if member is None:
@@ -37774,6 +37820,31 @@ def _class_surface_ssa_program(
                                 f"{symbol}: record field {storage_identity!r} "
                                 f"has no SSA value for sequence member "
                                 f"{int(member_id)}"
+                            )
+                        column_dtype = column_types.get(int(member_id))
+                        if (
+                            member.dtype in {None, "", "unknown"}
+                            and column_dtype not in {None, "", "unknown"}
+                        ):
+                            # c628's empty-dict constructor column is born
+                            # unknown.  Publish the field's proven type here;
+                            # the later descriptor sweep must not be the first
+                            # writer of an int64 resident with an unknown row.
+                            from .ssa_record_return_state import (
+                                publish_ssa_value_type,
+                            )
+                            publish_ssa_value_type(
+                                function, member,
+                                dtype=(
+                                    "ptr" if sequence.heap_owner_value_id
+                                    is not None else str(column_dtype)
+                                ),
+                                shape=member.shape,
+                                sources=_frame_cells(_frame_table_cell(
+                                    sequence_table, sequence.sequence_id,
+                                    SEQUENCE_DESCRIPTOR,
+                                )),
+                                stage=RECORD_ABI_MATERIALIZATION,
                             )
                         # Rule: post first; accounting is a view (see the
                         # sequence-view stamp above): the member's row carries

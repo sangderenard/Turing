@@ -1822,6 +1822,55 @@ def test_empty_dict_constructor_keeps_accepted_receiver_table_roles():
     )
 
 
+def test_readonly_forwarding_keeps_typed_mutable_sequence_owner():
+    from dataclasses import replace
+
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c628_dict_readonly_forwarding.py"
+    ).read_text(encoding="utf-8")
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="dict_readonly_forwarding",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts" / "program_extraction.yaml"
+        ),
+        progress=lambda _message: None, progress_bars=False,
+    )
+    batch = next(name for name in module.functions if "__batch__" in name)
+    field = next(
+        field for record in module.record_tables[batch].records.values()
+        for field in record.fields
+        if field.storage_identity == "Index._candidates"
+    )
+    table = module.sequence_tables[batch]
+    owner = table.by_id(field.sequence_id)
+    assert owner.column_dtypes == ("int64",) * 4 + ("unknown",)
+    assert owner.writable
+    assert owner.status_address_id is not None
+    assert owner.child_table_pool is not None
+    history = module.metadata["identity_book"].page(
+        "sequence_descriptor"
+    ).history((table.owner, owner.sequence_id))
+    original = history[0][1]
+    assert original.column_dtypes == (
+        "unknown", "int64", "unknown", "unknown", "unknown",
+    )
+    assert replace(original, column_dtypes=owner.column_dtypes) == owner
+    relay = next(name for name in module.functions if "__relay__" in name)
+    forwarded_field = next(
+        field for record in module.record_tables[relay].records.values()
+        for field in record.fields
+        if field.storage_identity == "Index._candidates"
+    )
+    forwarded = module.sequence_tables[relay].by_id(
+        forwarded_field.sequence_id
+    )
+    assert forwarded.column_dtypes == owner.column_dtypes
+    assert not forwarded.writable
+    assert forwarded.status_address_id is None
+
+
 def test_array_u32_receiver_column_keeps_authored_dtype_before_append():
     source = (
         Path(__file__).parent / "record_view_corpus"
