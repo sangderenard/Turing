@@ -43,6 +43,9 @@ Findings (each is one concrete disagreement, with the two claims):
     read (Phi operands exempt; they arrive over predecessor edges).
 ``phi-edge-not-predecessor``
     a Phi names an incoming block that has no CFG edge to its owner.
+``child-selection-not-guarded``
+    a selected child view or allocation effect is outside its declared
+    capacity/selection predicate's true CFG edge.
 ``alias-target-missing``
     a recorded value alias points at neither a physical definition nor an
     owned structural record descriptor.
@@ -4569,10 +4572,65 @@ class CorrelationTable:
                     definition_sites[int(instruction.res.id)].append(
                         (block_name, index)
                     )
+        definitions = {
+            int(instruction.res.id): instruction
+            for block in function.blocks.values() for instruction in block.instrs
+            if instruction.res is not None
+        }
+        selection_validities = {
+            int(instruction.attributes["source_value_id"]): int(instruction.res.id)
+            for instruction in definitions.values()
+            if instruction.attributes.get("binding") == "selected_child_validity"
+        }
+
+        def implies_guard(condition_id: int, guard_id: int, seen=None) -> bool:
+            if condition_id == guard_id:
+                return True
+            visited = set() if seen is None else seen
+            if condition_id in visited:
+                return False
+            visited.add(condition_id)
+            producer = definitions.get(condition_id)
+            # A true conjunction entails each of its explicit Boolean inputs.
+            return bool(producer is not None and producer.op == "LAnd"
+                        and str(producer.res.dtype) == "bool" and any(
+                implies_guard(int(argument.id), guard_id, visited)
+                for argument in producer.args
+            ))
+
+        def guarded_by_true_edge(block_name: str, guard_id: int) -> bool:
+            owner_dominators = dominators.get(block_name, set())
+            for candidate in owner_dominators:
+                for branch in function.blocks[candidate].instrs:
+                    if branch.op != "CondBr" or not branch.args:
+                        continue
+                    target = str(branch.attributes.get("true_target"))
+                    if target in owner_dominators and implies_guard(int(branch.args[0].id), guard_id):
+                        return True
+            return False
         for block_name, block in function.blocks.items():
             if block_name not in dominators:
                 continue
             for index, instruction in enumerate(block.instrs):
+                guard_id = instruction.attributes.get("child_selection_guard_value_id")
+                if guard_id is not None:
+                    producer = definitions.get(int(guard_id))
+                    guard_value = producer.res if producer is not None else formals.get(int(guard_id))
+                    if guard_value is None or str(guard_value.dtype) != "bool":
+                        found.append(Finding("child-selection-not-guarded", name,
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}#{index} guard {int(guard_id)} is not an existing Boolean SSA value"))
+                if instruction.attributes.get("binding") == "selected_child_row_view":
+                    source_id = int(instruction.attributes["source_value_id"])
+                    expected = selection_validities.get(source_id)
+                    if expected is not None and guard_id != expected:
+                        found.append(Finding("child-selection-not-guarded", name,
+                            int(instruction.res.id),
+                            f"selected view {source_id} claims guard {guard_id!r}, but its selection owns {expected}"))
+                if guard_id is not None and not guarded_by_true_edge(block_name, int(guard_id)):
+                    found.append(Finding("child-selection-not-guarded", name,
+                        None if instruction.res is None else int(instruction.res.id),
+                        f"{block_name}#{index} {instruction.op} is outside guard {int(guard_id)}'s true edge"))
                 if instruction.op in {"Phi", "phi"}:
                     incoming = tuple(map(str, instruction.attributes.get("incoming_blocks") or ()))
                     invalid = tuple(edge for edge in incoming if edge not in predecessors[str(block_name)])

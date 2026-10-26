@@ -2,6 +2,8 @@
 from pathlib import Path
 import numpy as np
 import pytest
+import subprocess
+import sys
 
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import concordance_report
@@ -52,9 +54,15 @@ def test_setdefault_append_uses_the_selected_child_row_storage():
     # now reaches a validation block, whose tail owns the merge edge.
     missing = next(name for name in function.blocks if name.startswith("mapping_setdefault_missing"))
     incoming = list(phi.attributes["incoming_blocks"])
+    original_incoming = tuple(incoming)
     incoming[-1] = missing
     phi.attributes["incoming_blocks"] = tuple(incoming)
     assert "[phi-edge-not-predecessor]" in concordance_report(module)
+    phi.attributes["incoming_blocks"] = original_incoming
+    owner = next(block for block in function.blocks.values() if view in block.instrs)
+    owner.instrs.remove(view)
+    function.blocks[next(iter(function.blocks))].instrs.insert(0, view)
+    assert "[child-selection-not-guarded]" in concordance_report(module)
 
 
 def test_reassigned_append_parameter_does_not_publish_its_old_annotation():
@@ -74,8 +82,7 @@ def test_nonempty_child_default_does_not_silently_initialize_an_empty_row():
             progress=lambda _: None, progress_bars=False)
 
 
-@pytest.mark.parametrize("backend", ["c", "llvm", "fortran"])
-def test_caller_owned_child_pool_found_missing_and_repeated_mutations(backend, tmp_path):
+def _exercise_caller_owned_child_pool(backend, tmp_path, *, undersized_pool=False, undersized_outer=False):
     source = (ROOT / "tests/record_view_corpus/c639_caller_mapping_child.py").read_text()
     module, outputs, exports = lower_ast_source_to_ssa(
         source, "root", name="caller_child_pool",
@@ -104,14 +111,21 @@ def test_caller_owned_child_pool_found_missing_and_repeated_mutations(backend, t
     for column in descriptor.column_value_ids:
         feeds[column] = np.zeros(4, dtype="int64")
     feeds[descriptor.length_address_id] = np.array([0], dtype="int64")
-    feeds[descriptor.capacity_value_id] = np.array([4], dtype="int64")
+    feeds[descriptor.capacity_value_id] = np.array([0 if undersized_outer else 4], dtype="int64")
     feeds[descriptor.status_address_id] = np.zeros(1, dtype="int32")
     for column in pool.column_value_ids:
         feeds[column] = np.zeros(16, dtype="int64")
     feeds[pool.length_value_id] = np.zeros(4, dtype="int64")
-    feeds[pool.capacity_value_id] = np.array([4], dtype="int64")
+    feeds[pool.capacity_value_id] = np.array([3 if undersized_pool else 16], dtype="int64")
     feeds[pool.row_stride_value_id] = np.array([4], dtype="int64")
     feeds[pool.status_value_id] = np.zeros(4, dtype="int32")
+    if undersized_pool or undersized_outer:
+        for column in descriptor.column_value_ids:
+            feeds[column][:] = 123
+        for column in pool.column_value_ids:
+            feeds[column][:] = 111
+        feeds[pool.length_value_id][:] = 77
+        feeds[pool.status_value_id][:] = 91
     scalar_members = {}
     for record_id, record in module.record_tables[root].records.items():
         if record.identity in {"builtins.int", "builtins.bool"} and record_id in feeds:
@@ -138,6 +152,29 @@ def test_caller_owned_child_pool_found_missing_and_repeated_mutations(backend, t
         assert artifact.complete, artifact.shortfalls
         built = compile_fortran_module_c_shell(artifact, {}, tmp_path / "native", entrypoint=root, library=True)
         execution = FortranCoreNative(built.executable_path, artifact.api.entry_point(root), artifact.api).prepare_execution(feeds)
+    def set_inputs(write, key, value, query):
+        for name, payload in zip(("write", "key", "value", "query"), (write, key, value, query)):
+            value_id = parameters[name]
+            execution.buffers[value_id][0] = payload
+            for member in scalar_members.get(value_id, ()):
+                if member in execution.buffers:
+                    execution.buffers[member][0] = payload
+
+    if undersized_pool or undersized_outer:
+        set_inputs(True, 3, 99, 3)
+        before = {value_id: execution.buffers[value_id].copy() for value_id in field.value_ids}
+        print("BOUNDS_EXECUTION_BEGIN", backend, flush=True)
+        if backend == "fortran":
+            # ERROR STOP must run only in the child process below.
+            execution.run()
+            raise AssertionError("undersized Fortran pool did not stop")
+        with pytest.raises(RuntimeError, match="75"):
+            execution.run()
+        for value_id, snapshot in before.items():
+            assert np.array_equal(execution.buffers[value_id], snapshot), value_id
+        print("BOUNDS_NO_MUTATION", backend, flush=True)
+        return
+
     big = 2**53 + 1
     transactions = [
         (False, 3, 0, 3, 0), (True, 3, big, 3, big),
@@ -145,12 +182,7 @@ def test_caller_owned_child_pool_found_missing_and_repeated_mutations(backend, t
         (True, 9, 11, 9, 11), (False, 3, 0, 3, big + 7),
     ]
     for write, key, value, query, expected in transactions:
-        for name, value in zip(("write", "key", "value", "query"), (write, key, value, query)):
-            value_id = parameters[name]
-            execution.buffers[value_id][0] = value
-            for member in scalar_members.get(value_id, ()):
-                if member in execution.buffers:
-                    execution.buffers[member][0] = value
+        set_inputs(write, key, value, query)
         result = execution.run()
         assert result.buffers[outputs[root][0].id].item() == expected
     assert execution.buffers[descriptor.length_address_id].item() == 2
@@ -159,6 +191,30 @@ def test_caller_owned_child_pool_found_missing_and_repeated_mutations(backend, t
     assert execution.buffers[pool.column_value_ids[0]][4] == 11
     report = concordance_report(module)
     assert "0 finding(s)" in report, report
+
+
+@pytest.mark.parametrize("backend", ["c", "llvm", "fortran"])
+def test_caller_owned_child_pool_found_missing_and_repeated_mutations(backend, tmp_path):
+    _exercise_caller_owned_child_pool(backend, tmp_path)
+
+
+@pytest.mark.parametrize("backend", ["c", "llvm", "fortran"])
+@pytest.mark.parametrize("exhaustion", ["pool", "outer"])
+def test_undersized_flattened_pool_refuses_without_initializing_or_appending(backend, exhaustion, tmp_path):
+    probe = (
+        "from pathlib import Path\n"
+        "from tests.test_mapping_child_sequence_views import _exercise_caller_owned_child_pool\n"
+        f"_exercise_caller_owned_child_pool({backend!r}, Path({str(tmp_path)!r}), undersized_pool={exhaustion == 'pool'}, undersized_outer={exhaustion == 'outer'})\n"
+    )
+    result = subprocess.run([sys.executable, "-u", "-c", probe], cwd=ROOT,
+                            capture_output=True, text=True, timeout=60)
+    if backend == "fortran":
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "BOUNDS_EXECUTION_BEGIN fortran" in result.stdout
+        assert "ERROR STOP 75" in result.stderr, result.stdout + result.stderr
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "BOUNDS_NO_MUTATION " + backend in result.stdout
 
 
 def test_empty_default_indexed_child_requires_presence_and_bounds_proof():

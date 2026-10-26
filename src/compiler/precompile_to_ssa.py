@@ -2630,6 +2630,9 @@ class _ControlSSABuilder(TiledObject):
             int, tuple[SSAChildTablePoolDescriptor, SSAValue]
         ] = {}
         self.selected_child_extent_values: dict[int, SSAValue] = {}
+        self.empty_default_child_ids: set[int] = set()
+        self.child_selection_validity: dict[int, SSAValue] = {}
+        self.active_child_selections: set[int] = set()
         # Exact loop-local element loads retained past loop-scope withdrawal.
         # The binding map correctly forgets a ``for`` target at loop exit,
         # but the child arena descriptor still needs the physical dtype proved
@@ -4217,6 +4220,7 @@ class _ControlSSABuilder(TiledObject):
                 pool, result
             )
             if empty_default:
+                self.empty_default_child_ids.add(int(result_id))
                 # ``for x in d.get(k, ())``: lookup status owns presence.
                 # A missing key yields the authored empty tuple; it must
                 # never read child row zero's length (zero is a valid handle).
@@ -4413,7 +4417,7 @@ class _ControlSSABuilder(TiledObject):
         )
     def _emit_table_store(
         self, _effect_id: int, key_id: int | tuple[int, ...],
-        value_id: int, sequence_id: int
+        value_id: int, sequence_id: int, *, child_guard: SSAValue | None = None,
     ) -> None:
         if int(sequence_id) in self.native_object_source_ids:
             keys = key_id if isinstance(key_id, tuple) else (key_id,)
@@ -4635,6 +4639,7 @@ class _ControlSSABuilder(TiledObject):
                 "source_linked": True,
                 "ssa_sequence_operation": "table_store",
                 "sequence_id": int(sequence_id),
+                **({"child_selection_guard_value_id": int(child_guard.id)} if child_guard is not None else {}),
             },
         )
         self._require_table_store_room(int(sequence_id), int(_effect_id))
@@ -8771,6 +8776,12 @@ class _ControlSSABuilder(TiledObject):
     ) -> Any:
         """A call argument, read by the binding its operand read."""
 
+        if int(value_id) in self.child_selection_validity:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "bounded-child-call", self.function_name,
+                "a possibly exhausted child selection cannot cross an unguarded source call",
+            ))
+            return self.external_value(int(value_id))
         if self.lexical_read_scope is None or not self.enclosing_loop_states:
             return self.external_value(int(value_id))
         operand = self._book().page("call_argument_operand").latest(
@@ -9818,6 +9829,12 @@ class _ControlSSABuilder(TiledObject):
                 resident_id = int(self.value_aliases[resident_id])
             child_selection = self.child_table_selections.get(iterable_id)
             if child_selection is not None:
+                if iterable_id in self.child_selection_validity:
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "ssa-table", "bounded-child-query", self.function_name,
+                        "a possibly exhausted child selection needs an exact guarded iterable extent",
+                    ))
+                    return self.constant_value(0)
                 pool, handle = child_selection
                 pool_length = self.external_value(pool.length_value_id)
                 length_address = self.fresh_value(
@@ -11216,12 +11233,30 @@ class _ControlSSABuilder(TiledObject):
         dtype the proposal refines."""
         value_id = int(value_id)
         selected = self.child_table_selections.get(value_id)
-        if selected is not None and value_id in self.selected_child_extent_values:
+        if selected is not None and value_id in self.empty_default_child_ids:
             self.shortfalls.append(SSALoweringShortfall(
                 "ssa-table", "optional-child-view", location,
                 "an empty-default child lookup is not an unconditional mutable row view",
             ))
             return None
+        if selected is not None and value_id in self.child_selection_validity:
+            if value_id not in self.active_child_selections:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-table", "unguarded-child-view", location,
+                    "a bounded child selection requires its exact control-owned validity guard",
+                ))
+                return None
+            existing_view = self.sequence_descriptors.get(value_id)
+            if existing_view is not None and any(
+                not self._value_dominates_current_edge(self.ssa_value_objects[column])
+                for column in existing_view.column_value_ids
+                if column in self.ssa_value_objects
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-table", "conditional-child-view-reuse", location,
+                    "a selected row view from another conditional needs an explicit merged physical view",
+                ))
+                return None
         if selected is not None and selected[0].shape_value_id is None and value_id not in self.sequence_descriptors:
             # ``d.setdefault(k, []).append(v)``: the returned collection is
             # exactly the selected pool row. Allocating an arena for this
@@ -11237,7 +11272,8 @@ class _ControlSSABuilder(TiledObject):
                 address = self.fresh_value(dtype=str(dtype), transform=ADDRESS, operands=(base, offset),
                                            physical={"arena": True, "storage": "span", "rank": 1})
                 self.emit(Handler.GetElementPtr, [base, offset], address,
-                          attributes={"binding": "selected_child_row_view", "source_value_id": value_id})
+                          attributes={"binding": "selected_child_row_view", "source_value_id": value_id,
+                                      **({"child_selection_guard_value_id": int(self.child_selection_validity[value_id].id)} if value_id in self.child_selection_validity else {})})
                 columns.append(address)
             lengths = self.external_value(pool.length_value_id)
             length = self.fresh_value(dtype="ptr", transform=ADDRESS, operands=(lengths, handle), physical={"physical_dtype": "int64"})
@@ -12205,12 +12241,20 @@ class _ControlSSABuilder(TiledObject):
                 f"sequence:{int(mutation.sequence_value_id)}",
             )
             return
-        if mutation.predicate_expression is None:
+        selection_validity = self.child_selection_validity.get(int(mutation.sequence_value_id))
+        if mutation.predicate_expression is None and selection_validity is None:
             self._lower_sequence_mutation_body(mutation, path=path)
             return
-        predicate = self.lower_control_expression(
-            mutation.predicate_expression
-        )
+        predicate = selection_validity
+        if mutation.predicate_expression is not None:
+            authored_predicate = self.lower_control_expression(mutation.predicate_expression)
+            if predicate is None:
+                predicate = authored_predicate
+            else:
+                combined = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(predicate, authored_predicate))
+                self.emit(Handler.LAnd, [predicate, authored_predicate], combined,
+                          attributes={"binding": "selected_child_mutation_guard"})
+                predicate = combined
         selected = self.new_block("sequence_mutation_selected")
         skipped = self.new_block("sequence_mutation_skipped")
         complete = self.new_block("sequence_mutation_merge")
@@ -12218,7 +12262,11 @@ class _ControlSSABuilder(TiledObject):
         self.current = skipped
         self.branch(complete)
         self.current = selected
+        if selection_validity is not None:
+            self.active_child_selections.add(int(mutation.sequence_value_id))
         self._lower_sequence_mutation_body(mutation, path=path)
+        if selection_validity is not None:
+            self.active_child_selections.discard(int(mutation.sequence_value_id))
         if not self.current.successors:
             self.branch(complete)
         self.current = complete
@@ -16060,6 +16108,36 @@ class _ControlSSABuilder(TiledObject):
                     int(new_handle.id), new_handle, BindingKind.SEQUENCE_RESULT,
                     outer_length,
                 )
+                # Same flattened-pool rule as append_child_copy: each new
+                # handle owns one whole stride, and the outer row must fit.
+                # Error runtime calls return, so the failure edge MUST skip
+                # initialization/store and the dependent append's row view.
+                outer_capacity = self.sequence_storage_values[int(destination.sequence_id)][len(destination.column_value_ids) + 1]
+                stride = self.external_value(pool.row_stride_value_id)
+                pool_capacity = self.external_value(pool.capacity_value_id)
+                outer_room = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(outer_length, outer_capacity))
+                self.emit(Handler.Lt, [outer_length, outer_capacity], outer_room)
+                next_length = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION, operands=(outer_length,))
+                self.emit(Handler.Add, [outer_length, self.constant_value(1, outer_length, dtype="int64")], next_length)
+                row_end = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION, operands=(next_length, stride))
+                self.emit(Handler.Mul, [next_length, stride], row_end)
+                pool_room = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(row_end, pool_capacity))
+                self.emit(Handler.Le, [row_end, pool_capacity], pool_room)
+                room = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(outer_room, pool_room))
+                self.emit(Handler.LAnd, [outer_room, pool_room], room,
+                          attributes={"binding": "selected_child_allocation_bounds"})
+                room_pass = self.new_block("validation_pass")
+                room_fail = self.new_block("validation_fail")
+                missing_join = self.new_block("if_merge")
+                self.conditional_branch(room, room_pass, room_fail)
+                self.current = room_fail
+                self.emit(Handler.Call, [], attributes={
+                    "callee": "turing_validation_error", "error_code": 75,
+                    "failure": "fixed_capacity_exhausted", "binding": "selected_child_allocation_bounds",
+                    "source_effect_node_id": int(mutation.effect_node_id),
+                })
+                self.branch(missing_join)
+                self.current = room_pass
                 pool_length = self.external_value(int(pool.length_value_id))
                 child_length_address = self.fresh_value(
                     dtype="ptr", transform=ADDRESS,
@@ -16069,12 +16147,12 @@ class _ControlSSABuilder(TiledObject):
                     Handler.GetElementPtr,
                     [pool_length, new_handle],
                     child_length_address,
-                    attributes={"binding": "ssa_child_table_length"},
+                    attributes={"binding": "ssa_child_table_length", "child_selection_guard_value_id": int(room.id)},
                 )
                 self.emit(
                     Handler.Store,
                     [self.constant_value(0, child_length_address), child_length_address],
-                    attributes={"binding": "ssa_child_table_initialize"},
+                    attributes={"binding": "ssa_child_table_initialize", "child_selection_guard_value_id": int(room.id)},
                 )
                 if pool.status_value_id is not None:
                     pool_status = self.external_value(int(pool.status_value_id))
@@ -16086,17 +16164,20 @@ class _ControlSSABuilder(TiledObject):
                         Handler.GetElementPtr,
                         [pool_status, new_handle],
                         child_status_address,
-                        attributes={"binding": "ssa_child_table_status"},
+                        attributes={"binding": "ssa_child_table_status", "child_selection_guard_value_id": int(room.id)},
                     )
                     self.emit(
                         Handler.Store,
                         [self.constant_value(0, child_status_address), child_status_address],
-                        attributes={"binding": "ssa_child_table_initialize"},
+                        attributes={"binding": "ssa_child_table_initialize", "child_selection_guard_value_id": int(room.id)},
                     )
                 self._emit_table_store(
                     int(mutation.effect_node_id), key_ids,
                     int(new_handle.id), int(destination.sequence_id),
+                    child_guard=room,
                 )
+                self.branch(missing_join)
+                self.current = missing_join
                 missing_exit_name = self.current.name
                 self.branch(complete)
 
@@ -16118,6 +16199,11 @@ class _ControlSSABuilder(TiledObject):
                         "binding": "ssa_mapping_setdefault_result",
                     },
                 )
+                validity = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(found, room))
+                self.emit(Handler.Phi, [self.constant_value(True, found, dtype="bool"), room], validity,
+                          attributes={"incoming_blocks": (found_block.name, missing_exit_name),
+                                      "binding": "selected_child_validity", "source_value_id": int(mutation.effect_node_id)})
+                self.child_selection_validity[int(mutation.effect_node_id)] = validity
                 self._bind(
                     int(mutation.effect_node_id), result,
                     BindingKind.SEQUENCE_RESULT, lookup_handle, new_handle,
