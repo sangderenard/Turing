@@ -1,4 +1,4 @@
-2026-10-26 TITLE (MEASURED, where): 
+2026-10-26 IMPORTED ARRAY OWNER BIRTH (MEASURED, Windows):
 # Imported constructor array ownership
 
 Manager4 failed after310s at stage9: imported Vocabulary.__init__.domain
@@ -40,3 +40,5 @@ review checkout C:/dev/tg-child-review at5bcc1bba completed11focused suites
 refusals/mappingviews/fixedbounds/returnpruning/boolnumeric/mixedcomparison):
 106passed189.21s. That receipt predates this imported allocation birth fix;
 manager4's failure remains a separate observed result, not a native success.
+
+Clean integration checkout C:/dev/tg-child-review at1dda48ca: imported array birth, owned array native, constructed child pool, project native cases, and extraction source sheet suites completed31passed129.46s. Manager5 was running separately at this checkpoint; no full-manager native result is claimed.
