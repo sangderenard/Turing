@@ -1715,6 +1715,45 @@ def test_retained_field_sequence_populates_typed_record_from_lowered_storage():
     ]
 
 
+def test_declared_array_receiver_refines_raw_span_before_method_linking():
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c624_array_receiver_relay.py"
+    ).read_text(encoding="utf-8")
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="array_receiver_relay",
+        extraction_contract=contract,
+        progress=lambda _message: None, progress_bars=False,
+    )
+
+    inspect_name = next(
+        name for name in module.record_tables
+        if "__inspect__" in name
+    )
+    table = module.record_tables[inspect_name]
+    (record,) = tuple(table.records.values())
+    history = module.metadata["identity_book"].page(
+        "record_descriptor"
+    ).history((table.owner, int(record.record_id)))
+    field_history = [
+        field
+        for _column, descriptor in history
+        for field in descriptor.fields
+        if field.storage_identity == "Vocabulary.exact_begin"
+    ]
+    assert field_history[0].storage is SSARecordFieldStorage.SPAN
+    assert field_history[-1].storage is SSARecordFieldStorage.SEQUENCE
+    sequence = module.sequence_tables[inspect_name].by_id(
+        int(field_history[-1].sequence_id)
+    )
+    assert field_history[0].value_ids == (sequence.column_value_ids[0],)
+    assert sequence.column_dtypes == ("uint64",)
+
+
 def test_static_program_reference_is_typed_ssa_and_native_handle_storage():
     handle = -734_921
     module, shortfalls, _ = lower_control_sections_to_ssa(
