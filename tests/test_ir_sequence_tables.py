@@ -1754,6 +1754,74 @@ def test_declared_array_receiver_refines_raw_span_before_method_linking():
     assert sequence.column_dtypes == ("uint64",)
 
 
+def test_empty_dict_constructor_keeps_accepted_receiver_table_roles():
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c625_dict_constructor_forwarding.py"
+    ).read_text(encoding="utf-8-sig")
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="dict_constructor_forwarding",
+        extraction_contract=contract,
+        progress=lambda _message: None, progress_bars=False,
+    )
+
+    receiver_views = {}
+    for symbol, table in module.record_tables.items():
+        fields = (
+            field for record in table.records.values()
+            for field in record.fields
+            if field.storage_identity == "Index._candidates"
+        )
+        for field in fields:
+            sequence = module.sequence_tables[symbol].by_id(
+                int(field.sequence_id)
+            )
+            assert field.storage is SSARecordFieldStorage.SEQUENCE
+            assert sequence is not None
+            assert sequence.key_columns == (0, 1, 2, 3)
+            assert len(sequence.column_value_ids) == 5
+            assert sequence.child_table_pool is not None
+            assert set(field.value_ids) == {
+                *sequence.column_value_ids,
+                sequence.length_address_id,
+                sequence.capacity_value_id,
+                sequence.status_address_id,
+                *sequence.child_table_pool.column_value_ids,
+                sequence.child_table_pool.length_value_id,
+                sequence.child_table_pool.capacity_value_id,
+                sequence.child_table_pool.row_stride_value_id,
+                sequence.child_table_pool.status_value_id,
+                sequence.child_table_pool.live_flags_value_id,
+            }
+            receiver_views[symbol] = sequence
+
+    constructor = next(
+        symbol for symbol in receiver_views if symbol.endswith("____init__")
+    )
+    assert any(symbol.endswith("__root") for symbol in receiver_views)
+    assert any("__batch__" in symbol for symbol in receiver_views)
+    sequence = receiver_views[constructor]
+    history = module.metadata["identity_book"].page(
+        "sequence_descriptor"
+    ).history((module.sequence_tables[constructor].owner, sequence.sequence_id))
+    generic = history[0][1]
+    assert generic.column_value_ids[0] == sequence.column_value_ids[0]
+    (value_role,) = tuple(
+        set(range(len(sequence.column_value_ids))) - set(sequence.key_columns)
+    )
+    assert generic.column_value_ids[1] == sequence.column_value_ids[value_role]
+    assert not any(
+        instruction.attributes.get("binding")
+        == "scalar_record_field_assignment"
+        for block in module.functions[constructor].blocks.values()
+        for instruction in block.instrs
+    )
+
+
 def test_static_program_reference_is_typed_ssa_and_native_handle_storage():
     handle = -734_921
     module, shortfalls, _ = lower_control_sections_to_ssa(
