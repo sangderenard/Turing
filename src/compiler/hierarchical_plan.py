@@ -403,6 +403,7 @@ def plan_region_to_ssa_instrs(
     dtype_of = {
         int(value_id): dtype for value_id, _shape, dtype in region.value_shapes
     }
+    source_dtype_of = dict(dtype_of)
     rank_of = {
         int(value_id): int(rank) for value_id, rank in region.value_ranks
     }
@@ -428,6 +429,58 @@ def plan_region_to_ssa_instrs(
     predicate_type_page = current_identity_book().page(
         "operator_result_type_concordance"
     )
+
+    def source_result_class(value_id: int) -> str | None:
+        """Read the source class through this value's exact identity edges."""
+
+        if lexical_read_scope is None:
+            return None
+        from .concordance_declarations import CANONICAL_VALUE, SOURCE_VALUE_CLASS
+
+        book = current_identity_book()
+        fork_ref = book.latest_ref(
+            CANONICAL_VALUE, (tuple(lexical_read_scope), int(value_id)),
+        )
+        if fork_ref is None:
+            return None
+        origins = tuple(
+            source
+            for source, _stage in book.edges_into(fork_ref)
+            if source.page.name == CANONICAL_VALUE.name
+            and isinstance(source.row, tuple)
+            and len(source.row) == 2
+            and int(source.row[1]) == int(value_id)
+        )
+        if len(origins) != 1:
+            return None
+        source_classes = []
+        for target, _stage in book.edges_out_of(origins[0]):
+            if not (
+                target.page.name == SOURCE_VALUE_CLASS.name
+                and isinstance(target.row, tuple)
+                and len(target.row) == 2
+                and int(target.row[1]) == int(value_id)
+            ):
+                continue
+            fact = book.page(SOURCE_VALUE_CLASS).latest(target.row)
+            if isinstance(fact, tuple) and fact:
+                source_classes.append(str(fact[0]))
+        concordant_classes = tuple(dict.fromkeys(source_classes))
+        return concordant_classes[0] if len(concordant_classes) == 1 else None
+
+    def authored_scalar_result_dtype(value_id: int) -> str | None:
+        """Preserve the declared scalar ABI only for its exact source class."""
+
+        dtype = source_dtype_of.get(int(value_id))
+        if (
+            shape_of.get(int(value_id), ()) == ()
+            and rank_of.get(int(value_id), 0) == 0
+            and dtype in {"int", "int32", "int64", "i32", "i64"}
+            and source_result_class(int(value_id)) == "builtins.int"
+        ):
+            return str(dtype)
+        return None
+
     for item in region.items:
         if not (
             isinstance(item, PlanLine)
@@ -594,7 +647,10 @@ def plan_region_to_ssa_instrs(
                     or "float64"
                 )
             elif opcode in dtype_preserving_ops:
-                inferred = promoted_numeric_dtype(semantic_input_ids(item))
+                inferred = (
+                    authored_scalar_result_dtype(output_id)
+                    or promoted_numeric_dtype(semantic_input_ids(item))
+                )
             elif opcode in projection_ops:
                 sources = semantic_input_ids(item)
                 inferred = (
@@ -699,6 +755,61 @@ def plan_region_to_ssa_instrs(
         )
         values[value_id] = made
         return made
+
+    def cast_comparison_operand(
+        item: PlanLine, source_position: int, operand: SSAValue,
+    ) -> SSAValue:
+        """Widen the exact uint32 side of ``values[0] < scalar``.
+
+        The sequence row is physically uint32 and the scalar is int64. Every
+        uint32 value fits int64, so int64 is their exact common comparison
+        domain. Keep the conversion in repository SSA so the C, LLVM and
+        Fortran emitters all see the same typed operands.
+        """
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CONTROL_CAST, PLANNER_HIERARCHY, SSA_VALUE,
+        )
+        from .identity_concordance import ConcordanceRefusal, current_identity_book
+        from .precompile_to_ssa import _mint_ssa_id
+
+        book = current_identity_book()
+        source = (
+            None if lexical_read_scope is None else
+            book.latest_ref(
+                CANONICAL_VALUE,
+                (tuple(lexical_read_scope), int(operand.id)),
+            )
+        )
+        if source is None:
+            source = book.latest_ref(
+                SSA_VALUE, (function_scope, int(operand.id)),
+            )
+        if source is None:
+            raise ConcordanceRefusal(
+                "planner comparison widening cannot name the exact operand "
+                f"identity for SSA value {operand.id}"
+            )
+        cast_id = _mint_ssa_id(
+            book, function_scope, CONTROL_CAST, (source,),
+            dtype="int64", shape=tuple(operand.shape),
+            stage=PLANNER_HIERARCHY,
+        )
+        converted = SSAValue(
+            cast_id, dtype="int64", shape=tuple(operand.shape),
+            accounting={},
+        )
+        values[cast_id] = converted
+        instructions.append(Instr(
+            "Cast", [operand], converted,
+            arg_roles=["operand"],
+            attributes={
+                "source_operator": str(item.opcode),
+                "target_dtype": "int64",
+            },
+        ))
+        fork_operand_read(item, source_position, converted, "operand", operand)
+        return converted
 
     def fork_operand_read(
         item: PlanLine, source_position: int, consumer: SSAValue,
@@ -903,9 +1014,46 @@ def plan_region_to_ssa_instrs(
             fork_operand_read(item, 2, result, "upper", upper)
             continue
 
+        operands = [value(value_id) for value_id in semantic_inputs]
+        if (
+            opcode.casefold() in {"lt", "le", "gt", "ge", "eq", "ne"}
+            and len(semantic_inputs) == 2
+        ):
+            left_id, right_id = semantic_inputs
+            left_dtype = str(dtype_of.get(left_id) or "")
+            right_dtype = str(dtype_of.get(right_id) or "")
+            def scalar_uint32(value_id: int, dtype: str) -> bool:
+                return (
+                    dtype == "uint32"
+                    and int(value_id) in shape_of
+                    and shape_of.get(int(value_id), ()) == ()
+                    and int(value_id) in rank_of
+                    and rank_of.get(int(value_id), 0) == 0
+                )
+
+            def scalar_int64(value_id: int, dtype: str) -> bool:
+                return (
+                    dtype in {"int64", "i64"}
+                    and int(value_id) in shape_of
+                    and shape_of.get(int(value_id), ()) == ()
+                    and int(value_id) in rank_of
+                    and rank_of.get(int(value_id), 0) == 0
+                )
+
+            if (
+                scalar_uint32(left_id, left_dtype)
+                and scalar_int64(right_id, right_dtype)
+            ):
+                operands[0] = cast_comparison_operand(item, 0, operands[0])
+            elif (
+                scalar_uint32(right_id, right_dtype)
+                and scalar_int64(left_id, left_dtype)
+            ):
+                operands[1] = cast_comparison_operand(item, 1, operands[1])
+
         instructions.append(Instr(
             opcode,
-            [value(value_id) for value_id in semantic_inputs],
+            operands,
             result,
             arg_roles=list(semantic_roles),
             attributes=attributes,

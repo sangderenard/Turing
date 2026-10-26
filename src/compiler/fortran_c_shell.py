@@ -7627,10 +7627,16 @@ def _authored_dataclass_record_views(
             and isinstance(value.args[0], ast.Constant)
             and isinstance(value.args[0].value, str)
         ):
+            # c633: array("H") and the signed counterparts have the same
+            # declared row contract as B/I/Q. Retain that contract at its
+            # authored constructor; later consumers must not infer it from
+            # an append operand or a native register width.
             dtype = {
-                "B": "uint8",
-                "I": "uint32",
-                "Q": "uint64",
+                "b": "int8", "B": "uint8",
+                "h": "int16", "H": "uint16",
+                "i": "int32", "I": "uint32",
+                "q": "int64", "Q": "uint64",
+                "f": "float32", "d": "float64",
             }.get(value.args[0].value)
 
             if dtype is not None:
@@ -9824,6 +9830,11 @@ def compile_fortran_module_c_shell(
                 getattr(module, "precision_sections", False)
             ),
         )
+        from .fortran_toolchain import native_fortran_flags
+        try:
+            fortran_flags = native_fortran_flags(compiler, module.source, fortran_flags)
+        except ValueError as error:
+            raise FortranEmissionError(str(error)) from error
         commands.append([
             compiler, *fortran_flags, "-c", str(fortran_path),
             "-o", str(fortran_object),
@@ -10660,8 +10671,10 @@ def _field_slot_ops(
             )
         ))
         if not snapshot and aggregate_kind not in {
-            "list", "set", "frozenset", "dict", "bytes", "bytearray"
+            "list", "set", "frozenset", "dict", "bytes", "bytearray", "array"
         }:
+            continue
+        if aggregate_kind == "array" and attributes.get("producer_kind") != "sequence_materialization":
             continue
         if (
             aggregate_kind == "bytes"
@@ -11084,7 +11097,7 @@ def _field_slot_ops(
             )
             if (
                 aggregate_kind in {
-                    "list", "set", "dict", "tuple", "bytearray",
+                    "list", "set", "dict", "tuple", "bytearray", "array",
                 }
                 and attribute not in field_aliases
             ):
@@ -11109,6 +11122,16 @@ def _field_slot_ops(
                         ),
                     )
                 field_sequence_ids[canonical_attribute] = int(source_id)
+                if aggregate_kind == "array":
+                    # c632's SetAttr is the exact edge from the constructor
+                    # allocation to its declared typed field.  Its source
+                    # must own that layout before the heap descriptor birth,
+                    # not first acquire it from a later GetAttr view.
+                    declared_dtype = attributes.get("program_abi_dtype")
+                    if declared_dtype is not None:
+                        source_data.setdefault("attributes", {})[
+                            "sequence_column_dtypes"
+                        ] = (str(declared_dtype),)
                 sequence_initializations.append((
                     int(source_id),
                     "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
@@ -21299,6 +21322,50 @@ def _settle_linked_dynamic_sequences(
         right = find((id(callee_graph), int(callee_id)))
         if left != right:
             parent[left] = right
+    # c632: constructor SetAttr and method GetAttr are two views of the
+    # same instance slot.  Project only recorded field declaration cells
+    # through the exact receiver call bindings.  A class field declaration
+    # alone never joins separate instance components.
+    from .concordance_declarations import CLASS_FIELD_DECLARATION
+    from .identity_concordance import Ref, current_identity_book
+
+    field_views = {}
+    book = current_identity_book()
+    for graph_obj in graphs:
+        for node_id, data in graph_obj.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            declaration = attributes.get("field_declaration_cell")
+            if not isinstance(declaration, Ref):
+                continue
+            if declaration.page != CLASS_FIELD_DECLARATION:
+                raise ValueError("field access names a non-field declaration")
+            page = book.pages.get(CLASS_FIELD_DECLARATION.name)
+            if page is None or page.cell(declaration.row, declaration.column) is None:
+                raise ValueError("field access names an absent field declaration")
+            operation = str(data.get("type") or data.get("op") or "").casefold()
+            parents = tuple(data.get("parents") or ())
+            receiver_roles = {"object", "base", "receiver"} if operation == "setattr" else {"value", "object", "base", "receiver"}
+            receivers = tuple(int(value) for value, role in parents if role in receiver_roles)
+            if len(receivers) != 1:
+                continue
+            receiver = (id(graph_obj), int(graph_obj.nodes[receivers[0]].get("value_id", receivers[0])))
+            if receiver not in parent:
+                continue
+            if operation == "setattr":
+                values = tuple(int(value) for value, role in parents if role == "value")
+                if len(values) != 1:
+                    continue
+                value_id = int(graph_obj.nodes[values[0]].get("value_id", values[0]))
+            elif operation == "getattr":
+                value_id = int(data.get("value_id", node_id))
+            else:
+                continue
+            field_views.setdefault((find(receiver), declaration), []).append((id(graph_obj), value_id))
+    for views in field_views.values():
+        for view in views[1:]:
+            left, right = find(views[0]), find(view)
+            if left != right:
+                parent[left] = right
     linked = set(parent)
     seeds: set[tuple[int, int]] = set()
     for graph_obj in graphs:
@@ -25257,6 +25324,7 @@ def _class_surface_ssa_program(
             for item in sequence_schema_shortfalls
         )
     lowered_symbol_contracts: dict[str, Any] = {}
+    source_graphs_by_symbol: dict[str, Any] = {}
     for shell_index, shell in compile_iter(
         enumerate(planned_shells, 1), "functions", total=len(planned_shells),
         label="SSA lowering: shells completed",
@@ -26182,6 +26250,14 @@ def _class_surface_ssa_program(
                 )
             continue
         lowered_symbol_contracts[symbol] = shell_contract
+        # c637: two caller methods reach the same _atom_token specialization.
+        # Only this accepted shell lowers the executable and revises its
+        # semantic_output to the exit Phi. A later equivalent shell is skipped
+        # above; indexing its unlowered graph replaced that Phi with branch
+        # value 14 in Ret. Publish the source owner at the same acceptance
+        # point, so recovery reads the exact graph that produced this Function.
+        if graph_obj.graph.get("function_name") is not None:
+            source_graphs_by_symbol[symbol] = graph_obj
         # Instance fields flow through the object's field arena: ``self`` is a
         # slot array, a field read is a load from its slot, a field write a
         # store. In whole-program precompile mode the field-op region is never
@@ -29841,17 +29917,6 @@ def _class_surface_ssa_program(
         SSAValue,
     )
 
-    source_graphs_by_symbol = {
-        shell_symbols.get(
-            id(shell),
-            f"{artifact_name}__{graph.graph.get('function_name')}",
-        ): graph
-        for shell in planned_shells
-        for graph in (
-            getattr(getattr(shell, "process_graph", None), "G", None),
-        )
-        if graph is not None and graph.graph.get("function_name") is not None
-    }
     for repository_symbol, source_graph in compile_iter(tuple(source_graphs_by_symbol.items()),
             "source-graph-index", label="Source graph spellings indexed"):
         _index_source_graph_spellings(
@@ -34172,6 +34237,7 @@ def _class_surface_ssa_program(
                 bool(pool.live_flags_value_id is not None),
                 bool(pool.writable),
             ),
+            descriptor.heap_owner_value_id is not None,
         )
     # A typed sequence row has one complete, fixed physical ABI.  Once a
     # record identity is used as such a row anywhere in this source closure,
@@ -34619,7 +34685,7 @@ def _class_surface_ssa_program(
         # declared storage identity.  Reconcile complementary evidence here
         # before publishing the one cross-method physical view.
         def unresolved_sequence_view(receipt):
-            dtypes, column_count, key_columns, _live, _capacity, child_pool = receipt
+            dtypes, column_count, key_columns, _live, _capacity, child_pool, _owner = receipt
 
             return (
                 (
@@ -34655,6 +34721,7 @@ def _class_surface_ssa_program(
             live_flags,
             capacity_policy,
             first_child_pool,
+            heap_owner_present,
         ) = evidence[0][0]
 
         resolved_dtypes = list(first_dtypes)
@@ -34668,6 +34735,7 @@ def _class_surface_ssa_program(
                 candidate_live_flags,
                 candidate_capacity_policy,
                 candidate_child_pool,
+                candidate_heap_owner_present,
             ) = receipt
 
             # These are structural properties of the same physical table.
@@ -34678,6 +34746,7 @@ def _class_surface_ssa_program(
                 or candidate_key_columns != key_columns
                 or candidate_live_flags != live_flags
                 or candidate_capacity_policy != capacity_policy
+                or candidate_heap_owner_present != heap_owner_present
             ):
                 raise ValueError(
                     "record field sequence structural disagreement for "
@@ -34725,6 +34794,7 @@ def _class_surface_ssa_program(
             bool(live_flags),
             str(capacity_policy),
             child_pool,
+            bool(heap_owner_present),
         )
 
         _frame_post(
@@ -37230,7 +37300,7 @@ def _class_surface_ssa_program(
                         if declared_array_field:
                             view = (
                                 (str(field["dtype"]),), 1, (), False,
-                                "fixed", None,
+                                "fixed", None, False,
                             )
                         else:
                             raise ValueError(
@@ -37240,7 +37310,7 @@ def _class_surface_ssa_program(
                     (
                         column_dtypes, column_count, key_columns,
                         retains_deleted_rows, capacity_policy,
-                        child_pool_layout,
+                        child_pool_layout, retains_heap_owner,
                     ) = view
                     accepted_sequence_members = (
                         exact_accepted_sequence_members(storage_identity)
@@ -37258,6 +37328,13 @@ def _class_surface_ssa_program(
                         role: tuple[Any, ...], dtype: str,
                         shape: tuple[int, ...] = (),
                     ) -> tuple[str, tuple[int, ...]]:
+                        # An owner-bearing field forwards the existing heap
+                        # ABI even in a method that only passes the record:
+                        # scalar pointer cells for columns, one owner slot.
+                        if retains_heap_owner and role[0] == "column":
+                            dtype, shape = "ptr", ()
+                        elif retains_heap_owner and role == ("heap_owner_value_id",):
+                            dtype, shape = "ptr", (1,)
                         return accepted_sequence_members.get(
                             role, (str(dtype), tuple(shape)),
                         )
@@ -37286,6 +37363,20 @@ def _class_surface_ssa_program(
                         if sequence_table.by_id(int(value_id)) is not None
                     ), int(candidate_ids[0]))
                     sequence = sequence_table.by_id(sequence_id)
+                    if retains_heap_owner and sequence is not None and (
+                        sequence.heap_owner_value_id is None
+                    ):
+                        raise ValueError(
+                            f"{symbol}: field {storage_identity!r} requires its "
+                            "declared heap owner but has no bound sequence owner"
+                        )
+                    if sequence is not None and (
+                        sequence.heap_owner_value_id is not None
+                    ) != bool(retains_heap_owner):
+                        raise ValueError(
+                            f"{symbol}: field {storage_identity!r} heap owner "
+                            "presence disagrees with its structural receipt"
+                        )
                     column_count = int(column_count)
                     dtypes = tuple(map(str, column_dtypes))
                     if not dtypes:
@@ -37536,6 +37627,10 @@ def _class_surface_ssa_program(
                             mint_member(("live_flags_value_id",), "bool")
                             if requires_live_flags else None
                         )
+                        heap_owner_id = (
+                            mint_member(("heap_owner_value_id",), "ptr")
+                            if retains_heap_owner else None
+                        )
                         members = (
                             tuple(
                                 (
@@ -37580,6 +37675,11 @@ def _class_surface_ssa_program(
                                 ),)
                                 if live_flags_id is not None else ()
                             )
+                            + (
+                                ((heap_owner_id, *accepted_member_abi(
+                                    ("heap_owner_value_id",), "ptr",
+                                )),) if heap_owner_id is not None else ()
+                            )
                         )
                         for member_id, member_dtype, member_shape in members:
                             value = values.get(int(member_id))
@@ -37614,8 +37714,19 @@ def _class_surface_ssa_program(
                                     "device": value.device,
                                 },
                             )
+                            heap_fields = {}
+                            if heap_owner_id is not None:
+                                if int(member_id) == int(heap_owner_id):
+                                    heap_fields = {"heap_owner": True}
+                                elif int(member_id) in column_ids:
+                                    position = column_ids.index(int(member_id))
+                                    heap_fields = {
+                                        "heap_element_dtype": dtypes[position],
+                                        "heap_owner_value_id": int(heap_owner_id),
+                                    }
                             value.accounting = _frame_accounting_from_posted({
                                 **dict(value.accounting or {}),
+                                **heap_fields,
                                 "program_abi_record": str(record["identity"]),
                                 "program_abi_parameter": str(parameter_name),
                                 "program_abi_field": str(field_name),
@@ -37646,6 +37757,7 @@ def _class_surface_ssa_program(
                                     else int(live_flags_id)
                                 ),
                                 capacity_policy=str(capacity_policy),
+                                heap_owner_value_id=heap_owner_id,
                                 writable=mutable,
                             ),
                             stage=RECORD_ABI_MATERIALIZATION,
@@ -37747,7 +37859,7 @@ def _class_surface_ssa_program(
                                 stage=RECORD_ABI_MATERIALIZATION,
                                 revise=True,
                             )
-                        elif sequence_view_receipt(sequence)[-1] != child_pool_layout:
+                        elif sequence_view_receipt(sequence)[5] != child_pool_layout:
                             raise ValueError(
                                 f"{symbol}: field {storage_identity!r} "
                                 "has a child-pool layout disagreement"
@@ -37784,6 +37896,10 @@ def _class_surface_ssa_program(
                         *(
                             (int(sequence.live_flags_value_id),)
                             if sequence.live_flags_value_id is not None else ()
+                        ),
+                        *(
+                            (int(sequence.heap_owner_value_id),)
+                            if sequence.heap_owner_value_id is not None else ()
                         ),
                         *(
                             (
@@ -42958,6 +43074,8 @@ def _class_surface_ssa_program(
                               if canonical.status_address_id is not None else ()),
                             *((canonical.live_flags_value_id,)
                               if canonical.live_flags_value_id is not None else ()),
+                            *((canonical.heap_owner_value_id,)
+                              if canonical.heap_owner_value_id is not None else ()),
                         )
                         resident_ids = tuple(remap[int(value_id)]
                                              for value_id in canonical_ids)
@@ -42981,6 +43099,8 @@ def _class_surface_ssa_program(
                                   if local.status_address_id is not None else ()),
                                 *((local.live_flags_value_id,)
                                   if local.live_flags_value_id is not None else ()),
+                                *((local.heap_owner_value_id,)
+                                  if local.heap_owner_value_id is not None else ()),
                             )
                             if len(local_ids) == len(resident_ids):
                                 remap.update(zip(
@@ -42998,6 +43118,11 @@ def _class_surface_ssa_program(
                         continue
                     source = constructor_values.get(old_id, SSAValue(old_id))
                     value = clone_value(source, new_id, accounting={
+                        **_accounting_across_call(
+                            getattr(source, "accounting", None), remap,
+                            unbound_owner_is_error=True,
+                            describe=f"constructor {constructor.name} -> {caller.name}",
+                        ),
                         "record_instance": str(class_identity),
                         "constructor_callsite_id": int(node_id),
                     })
@@ -47593,13 +47718,22 @@ def _class_surface_ssa_program(
                                 invocation_local = recursive_frame_lease(
                                     caller_graph, record.callsite_id, argument, callee,
                                 )
+                                # c631: the propagated status formal copied
+                                # physical_dtype=int into the caller resident,
+                                # while its mint posted no physical layout.
+                                # A lease's resident and birth row both derive
+                                # from the callee's one posted formal record.
+                                lease_source, lease_physical = (
+                                    _posted_lease_source(callee, argument)
+                                )
                                 caller_storage = clone_value(
-                                    _lease_source(argument),
+                                    lease_source,
                                     mint_compiler_value_id(
                                         caller, FRAME_STORAGE_CLONE,
                                         (_frame_value_cell(callee, argument_id),),
-                                        dtype=argument.dtype,
-                                        shape=tuple(argument.shape or ()),
+                                        dtype=lease_source.dtype,
+                                        shape=tuple(lease_source.shape or ()),
+                                        physical=lease_physical,
                                     ),
                                     accounting={
                                         "linked_call_frame_storage": str(
@@ -60252,6 +60386,7 @@ def _lower_ast_source_to_ssa_impl(
                 "buffer_order": tuple(int(v) for v in piece.artifact.buffer_order),
                 "buffer_shapes": tuple(piece.artifact.buffer_shapes),
                 "buffer_dtypes": tuple(piece.artifact.buffer_dtypes),
+                "buffer_element_dtypes": tuple(piece.artifact.buffer_element_dtypes),
                 "linked_objects": tuple(getattr(piece.artifact, "linked_objects", ())),
                 "extent_order": tuple(
                     (int(v), str(kind), None if axis is None else int(axis))

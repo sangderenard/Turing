@@ -11572,7 +11572,26 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         if isinstance(expression, (ast.For, ast.AsyncFor, ast.While))
     ]
     loops = [(start, end) for start, end, _node, _expression in loop_nodes]
-    readers_by_sequence: dict[int, list[tuple[tuple[int, int], int]]] = {}
+    # c632: separate GetAttr occurrences of one instance field name the
+    # same length cell.  Their retained declaration Ref and receiver edge
+    # identify that storage; the occurrence id does not.
+    field_storage_keys = {}
+    for node_id, data in graph.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        declaration = attributes.get("field_declaration_cell")
+        if declaration is None or str(data.get("type") or "").casefold() != "getattr":
+            continue
+        receivers = tuple(parent for parent, role in data.get("parents") or ()
+                          if role in {"value", "object", "base", "receiver"})
+        if len(receivers) == 1:
+            field_storage_keys[int(data.get("value_id", node_id))] = (
+                int(graph.G.nodes[receivers[0]].get("value_id", receivers[0])), declaration,
+            )
+
+    def storage_key(value_id):
+        return field_storage_keys.get(int(value_id), int(value_id))
+
+    readers_by_sequence: dict[Any, list[tuple[tuple[int, int], int]]] = {}
     reader_ends: dict[int, tuple[int, int]] = {}
     for node_id, data in graph.G.nodes(data=True):
         expression = data.get("expr_obj")
@@ -11588,7 +11607,7 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
             if parent not in graph.G:
                 continue
             sequence_id = int(graph.G.nodes[parent].get("value_id", parent))
-            readers_by_sequence.setdefault(sequence_id, []).append((
+            readers_by_sequence.setdefault(storage_key(sequence_id), []).append((
                 (int(line), int(getattr(expression, "col_offset", 0) or 0)),
                 int(node_id),
             ))
@@ -11835,14 +11854,14 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                 int(getattr(loop, "end_col_offset", 0) or 0),
             )
             for start, reader in readers_by_sequence.get(
-                int(record["sequence_value_id"]), (),
+                storage_key(record["sequence_value_id"]), (),
             ):
                 if start >= end and reader != int(loop_node):
                     edges.add((int(loop_node), reader))
             continue
         end = (int(end_line), int(getattr(expression, "end_col_offset", 0) or 0))
         for start, reader in readers_by_sequence.get(
-            int(record["sequence_value_id"]), (),
+            storage_key(record["sequence_value_id"]), (),
         ):
             if start >= end and reader != int(effect_id):
                 edges.add((int(effect_id), reader))
@@ -11905,7 +11924,7 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                 int(block.lineno), int(getattr(block, "col_offset", 0) or 0),
             )
         for _reader_start, reader in readers_by_sequence.get(
-            int(record["sequence_value_id"]), (),
+            storage_key(record["sequence_value_id"]), (),
         ):
             reader_end = reader_ends.get(int(reader))
             if (reader_end is not None and reader_end <= start
@@ -23558,6 +23577,19 @@ def _tensor_descriptor_rule(
                         continue
                     node = graph.G.nodes[operand]
                     attributes = node.get("attributes") or {}
+                    if (
+                        attributes.get("program_abi_storage") == "scalar"
+                        and int(attributes.get("program_abi_rank", 0)) == 0
+                        and int(side.get("rank", 0)) == 0
+                    ):
+                        # c621: dynamic uint64 x % scalar uint64 n. The
+                        # published scalar descriptor for n is settled even
+                        # though ingestion also attaches tensor metadata.
+                        # Discarding it here made result 2 a static rank-0
+                        # float64, erasing x's declared runtime rank. Retain
+                        # this exact ProgramABI scalar in the existing
+                        # broadcast law, as for proven scalar reductions.
+                        continue
                     semantic_operand = str(
                         attributes.get("tensor")
                         or attributes.get("tensor_candidate")
@@ -26677,6 +26709,28 @@ def _fold_callsite_structural_values(
                                 ), parent_descriptors[0]["dtype"])
                             ),
                         }
+                        # Program: ``def f(a: bool, b: bool): return a + b``.
+                        # Wrong record: both bool operands made the scalar
+                        # result descriptor bool, so native Add returned a
+                        # predicate (True for 2, or i1 wraparound) instead of
+                        # Python's integer 2. Rule: an exact authored builtin
+                        # int result class plus the planner's proven int64
+                        # scalar ABI owns this scalar result descriptor; bool
+                        # tensor results have a different source class and
+                        # keep their tensor algebra domain.
+                        result_id = int(node_id)
+                        source_class = source_value_class_page.latest((
+                            source_value_class_scope, result_id,
+                        ))
+                        if (
+                            shape == ()
+                            and isinstance(source_class, tuple)
+                            and source_class
+                            and str(source_class[0]) == "builtins.int"
+                            and _planned_scalar_dtypes(graph).get(result_id)
+                            == "int64"
+                        ):
+                            data["tensor"]["dtype"] = "int64"
             if operation in {"indexed", "getitem", "subscript"}:
                 expression = data.get("expr_obj")
                 source_descriptor = None

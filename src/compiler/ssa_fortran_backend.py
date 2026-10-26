@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..transmogrifier.dtype_layout import fortran_kind_table
+from ..transmogrifier.dtype_layout import fortran_kind_table, resolve as resolve_dtype_layout, DTYPES as DTYPE_LAYOUTS
 from .runtime_abi import HOST_CALLBACK_SCHEMA
 from ..transmogrifier.ssa import (
     BasicBlock,
@@ -363,8 +363,24 @@ _REAL_OPERAND = frozenset(
 )
 
 _INTEGER_DTYPES = frozenset(
-    {"int", "int8", "int16", "int32", "int64", "i32", "i64", "i1", "bool", "logical"}
+    {alias for layout in DTYPE_LAYOUTS.values()
+     if layout.kind in {"int", "uint", "bool"} for alias in layout.aliases}
 )
+
+
+def _native_integer_conversion(expression: str, dtype: str) -> str:
+    layout = resolve_dtype_layout(dtype)
+    if layout is None or layout.kind not in {"int", "uint"}:
+        raise FortranEmissionError(f"no native integer conversion for dtype {dtype!r}")
+    # The kind and signedness are both read from the same physical layout.
+    kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")")
+    intrinsic = "uint" if layout.kind == "uint" else "int"
+    return f"{intrinsic}({expression}, {kind})"
+
+
+def _unsigned_dtype(dtype: str) -> bool:
+    layout = resolve_dtype_layout(dtype)
+    return layout is not None and layout.kind == "uint"
 
 _LOGICAL_DTYPES = frozenset({"i1", "bool", "logical"})
 
@@ -829,6 +845,13 @@ def _literal(value: Any, dtype: str | None = None) -> str:
     So the declared type decides the spelling, and the payload only decides
     the value.
     """
+    layout = resolve_dtype_layout(dtype) if dtype else None
+    if layout is not None and layout.kind == "uint" and isinstance(value, int) and not isinstance(value, bool):
+        width = 8 * layout.byte_size
+        if not 0 <= value < (1 << width):
+            raise FortranEmissionError(f"constant {value} is outside {layout.name}")
+        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")")
+        return f"{value}u_{kind}"
     if (
         dtype
         and isinstance(value, int)
@@ -1699,6 +1722,14 @@ class _FunctionEmitter:
             "repeat",
         ):
             return True
+        if (operation in {"GetElementPtr", "getelementptr"}
+                and consumer.args and int(consumer.args[0].id) == int(value.id)):
+            # id_space.compose's ')' glyph is string_token value 3 with
+            # declared arena shape (1,). Its sole consumer indexes that arena.
+            # Inlining the token produced a literal as the Store destination.
+            # The exact address-base edge requires a named designator, even
+            # when the literal producer is not spelled Const.
+            return True
         if consumer.res is None:
             return False
         if (
@@ -2082,6 +2113,8 @@ class _FunctionEmitter:
         """Return a zero with the kind of ``value``'s emitted expression."""
 
         typed = self._typed(value)
+        if _unsigned_dtype(str(typed.dtype or self.dtype)):
+            return _literal(0, str(typed.dtype))
         producer = self._producers.get(typed.id)
         if producer is not None and typed.id in self._inlined:
             operation = (
@@ -2095,6 +2128,8 @@ class _FunctionEmitter:
                 # at every nesting level by _expression.
                 return "0_c_int64_t"
         dtype = str(typed.dtype or self.dtype).casefold()
+        if _unsigned_dtype(dtype):
+            return _literal(0, dtype)
         if dtype.endswith("int64"):
             return "0_c_int64_t"
         if dtype.endswith(("int32", "int")):
@@ -2318,12 +2353,33 @@ class _FunctionEmitter:
         result_dtype = str(self._typed(target).dtype or self.dtype)
         target_logical = result_dtype in _LOGICAL_DTYPES
         source_logical = self._is_logical(value)
+        target_layout = resolve_dtype_layout(result_dtype)
+        # The checked array(float32) extend helper inlines its int64 Cast at
+        # the insert call. The old writer stated float32 but returned
+        # real(value,c_double), so the callee's REAL(c_float) formal refused.
+        # The expression's kind must be the exact target layout at the Cast.
+        if target_layout is not None and target_layout.kind == "float":
+            source_dtype = str(self._typed(value).dtype or self.dtype)
+            if source_dtype == result_dtype and not source_logical:
+                return expression
+            kind = str(target_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            if source_logical:
+                expression = "merge(1_c_int64_t, 0_c_int64_t, " + expression + ")"
+            return f"real({expression}, {kind})"
+        if target_layout is not None and target_layout.kind in {"int", "uint"}:
+            source_dtype = str(self._typed(value).dtype or self.dtype)
+            if source_logical:
+                expression = "merge(1_c_int64_t, 0_c_int64_t, " + expression + ")"
+            if source_dtype == result_dtype and not source_logical:
+                return expression
+            return _native_integer_conversion(expression, result_dtype)
         if target_logical:
             if source_logical:
                 return expression
             source_dtype = str(getattr(value, "dtype", None) or self.dtype)
             zero = (
-                "0_c_int64_t" if source_dtype.endswith("int64")
+                _literal(0, source_dtype) if _unsigned_dtype(source_dtype)
+                else "0_c_int64_t" if source_dtype.endswith("int64")
                 else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
                 else "0.0_c_double"
             )
@@ -2383,12 +2439,21 @@ class _FunctionEmitter:
         target_dtype = str(target.dtype or self.dtype)
         source_logical = source_dtype in _LOGICAL_DTYPES
         target_logical = target_dtype in _LOGICAL_DTYPES
+        target_layout = resolve_dtype_layout(target_dtype)
+        if target_layout is not None and target_layout.kind == "float":
+            if source_dtype == target_dtype and not source_logical:
+                return expression
+            kind = str(target_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            if source_logical:
+                expression = "merge(1_c_int64_t, 0_c_int64_t, " + expression + ")"
+            return f"real({expression}, {kind})"
         if source_logical and target_logical:
             return f"logical({expression}, kind=c_bool)"
         if source_logical != target_logical:
             if target_logical:
                 zero = (
-                    "0_c_int64_t" if source_dtype.endswith("int64")
+                    _literal(0, source_dtype) if _unsigned_dtype(source_dtype)
+                else "0_c_int64_t" if source_dtype.endswith("int64")
                     else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
                     else "0.0_c_double"
                 )
@@ -2404,6 +2469,9 @@ class _FunctionEmitter:
             )
         source_integer = source_dtype in _INTEGER_DTYPES
         target_integer = target_dtype in _INTEGER_DTYPES
+        if target_integer and target_dtype not in _LOGICAL_DTYPES:
+            return (expression if source_dtype == target_dtype else
+                    _native_integer_conversion(expression, target_dtype))
         if target_integer:
             kind = (
                 "c_int64_t" if target_dtype.endswith("64")
@@ -2857,7 +2925,8 @@ class _FunctionEmitter:
             if target_logical and not source_logical:
                 source_dtype = str(source_value.dtype or self.dtype)
                 zero = (
-                    "0_c_int64_t" if source_dtype.endswith("int64")
+                    _literal(0, source_dtype) if _unsigned_dtype(source_dtype)
+                else "0_c_int64_t" if source_dtype.endswith("int64")
                     else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
                     else "0.0_c_double"
                 )
@@ -4201,6 +4270,33 @@ class _FunctionEmitter:
         args = [self._operand(a) for a in instr.args]
         constant = instr.attributes.get("constant", None)
 
+        # c634: uint64 values above INT64_MAX must stay native unsigned
+        # across every operator, not int(..., c_int64_t) or REAL storage.
+        # GNU's -funsigned kind owns the same width as the C uint buffer.
+        unsigned_values = [value for value in instr.args
+                           if _unsigned_dtype(str(self._typed(value).dtype or self.dtype))]
+        unsigned_op = {"BitAnd": "bitand", "BitOr": "bitor", "BitXor": "bitxor"}.get(op, op)
+        if unsigned_values and unsigned_op in _BINARY and len(args) == 2:
+            shift = unsigned_op in {"Shl", "Shr", "shl", "shr"}
+            operand_dtypes = {str(self._typed(value).dtype) for value in instr.args}
+            if not shift and len(operand_dtypes) != 1:
+                # Promotions must be explicit SSA Casts: the printer does not
+                # get to choose a signed/unsigned mixed-domain value contract.
+                return None
+            if unsigned_op in {"ULt", "ULe", "UGt", "UGe"}:
+                return {"ULt": "({0} < {1})", "ULe": "({0} <= {1})",
+                        "UGt": "({0} > {1})", "UGe": "({0} >= {1})"}[unsigned_op].format(*args)
+            if shift:
+                intrinsic = "shiftr" if unsigned_op in {"Shr", "shr"} else "shiftl"
+                return f"{intrinsic}({args[0]}, int({args[1]}, c_int64_t))"
+            if unsigned_op in {"FloorDiv", "floordiv"}:
+                return f"({args[0]} / {args[1]})"
+            if unsigned_op in {"Div", "truediv"} and str(instr.res.dtype or self.dtype) not in _INTEGER_DTYPES:
+                return f"(real({args[0]}, c_double) / real({args[1]}, c_double))"
+            return _BINARY[unsigned_op].format(*args)
+        if unsigned_values and op in {"Abs", "abs"} and len(args) == 1:
+            return args[0]
+
         if op in {"SiToFp", "UiToFp"} and len(instr.args) == 1 and self._is_logical(instr.args[0]):
             return _UNARY["bool_to_float64"].format(args[0])
 
@@ -4597,6 +4693,38 @@ class _FunctionEmitter:
                 return f"(.not. {args[0]})"
             zero = self._truth_zero(instr.args[0])
             return f"({args[0]} == {zero})"
+        if op in {"SiToFp", "UiToFp"} and len(args) == 1:
+            source_dtype = str(self._typed(instr.args[0]).dtype or self.dtype)
+            source_layout = resolve_dtype_layout(source_dtype)
+            target_layout = resolve_dtype_layout(str(instr.res.dtype or self.dtype))
+            if source_layout is None or source_layout.kind not in {"int", "uint"} or target_layout is None or target_layout.kind != "float":
+                return None
+            source_kind = str(source_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            target_kind = str(target_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            source_conversion = "uint" if op == "UiToFp" else "int"
+            # UiToFp(int64 -1) means the unsigned 64-bit word, not -1.0.
+            # The explicit opcode owns interpretation even when its storage
+            # value's dtype has the opposite signedness.
+            return f"real({source_conversion}({args[0]}, {source_kind}), {target_kind})"
+        if op in {"SExt", "ZExt"} and len(args) == 1:
+            source_layout = resolve_dtype_layout(str(self._typed(instr.args[0]).dtype or self.dtype))
+            if source_layout is None or source_layout.kind not in {"int", "uint"}:
+                return None
+            source_kind = str(source_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            source_conversion = "uint" if op == "ZExt" else "int"
+            interpreted = f"{source_conversion}({args[0]}, {source_kind})"
+            return _native_integer_conversion(interpreted, str(instr.res.dtype or self.dtype))
+        if op in {"Trunc", "FpToSi", "FpToUi"} and len(args) == 1:
+            target_dtype = str(instr.res.dtype or self.dtype)
+            target_layout = resolve_dtype_layout(target_dtype)
+            if target_layout is None or target_layout.kind not in {"int", "uint"}:
+                return None
+            if op in {"FpToSi", "FpToUi"}:
+                target_kind = str(target_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+                intrinsic = "uint" if op == "FpToUi" else "int"
+                converted = f"{intrinsic}({args[0]}, {target_kind})"
+                return _native_integer_conversion(converted, target_dtype)
+            return _native_integer_conversion(args[0], target_dtype)
         if op in _UNARY and len(args) == 1:
             if op not in _LOGICAL_UNARY and op not in _LOGICAL_RESULT_UNARY:
                 args = self._numeric(instr, args)
@@ -6022,13 +6150,19 @@ def emit_module(
     roots = {
         name for name in explicitly_requested_roots if name in functions
     }
-    if not roots and outputs is None:
+    if not roots and outputs is None and not extra_roots:
         roots.update(str(name) for name in named_outputs if str(name) in functions)
-    roots.update(
-        str(name)
-        for name, function in functions.items()
-        if function.metadata.get("control_ir")
-    )
+    if not explicitly_requested_roots and not extra_roots:
+        # A nested format-spec validation diagnostic can leave an uncalled
+        # decimal formatter in the canonical catalogue. With an explicit root
+        # interface, its control_ir does not make it a standalone heap-return
+        # entry. Follow the selected roots' real call edges below; retain the
+        # implicit whole-control surface only when no interface was selected.
+        roots.update(
+            str(name)
+            for name, function in functions.items()
+            if function.metadata.get("control_ir")
+        )
     roots.update(str(root) for root in extra_roots if str(root) in functions)
     if roots:
         reachable = set()
@@ -7872,6 +8006,7 @@ def compile_module(
         stage_standalone_fortran_runtime,
         standalone_fortran_link_flags,
         standalone_runtime_shim_sources,
+        native_fortran_flags,
     )
 
     workdir = Path(
@@ -7886,6 +8021,7 @@ def compile_module(
         precision_sections=bool(getattr(module, "precision_sections", False)),
     ))
     try:
+        compile_flags = native_fortran_flags(compiler, module.source, compile_flags)
         link_flags = (
             standalone_fortran_link_flags(compiler, shared=True)
             if standalone else ()

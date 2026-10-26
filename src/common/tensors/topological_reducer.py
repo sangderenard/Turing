@@ -9098,6 +9098,10 @@ def _normalize_lexical_values(
                 refined_field_cell = declared_field_schema_cell(
                     receiver_class, expression.attr,
                 )
+                if refined_field_cell is not None:
+                    graph.G.nodes[attribute_id].setdefault("attributes", {})[
+                        "field_declaration_cell"
+                    ] = refined_field_cell
                 refined_field_fact = (
                     None if refined_field_cell is None
                     else field_state_book.page(
@@ -10524,16 +10528,26 @@ def _normalize_lexical_values(
                 )
         if isinstance(expression, ast.Subscript) and node_id in graph.G:
             base_id = resolve_expression(expression.value)
+            # c636: a helper fills result[i] in a loop, then returns
+            # result[:i]; its caller appends len(returned) to array("I").
+            # The immediate base is the last IndexedStore effect, whose
+            # attributes do not declare a collection. Its existing base-edge
+            # storage identity owns that declaration. Read it for the slice
+            # contract while retaining base_id as the ordered dataflow edge.
+            base_contract_id = (
+                _indexed_store_source(graph, base_id)
+                if isinstance(expression.slice, ast.Slice) else base_id
+            )
             base_attributes = (
-                graph.G.nodes[base_id].get("attributes") or {}
-                if isinstance(base_id, int) and base_id in graph.G else {}
+                graph.G.nodes[base_contract_id].get("attributes") or {}
+                if isinstance(base_contract_id, int) and base_contract_id in graph.G else {}
             )
             base_class_cell = (
                 current_identity_book().latest_ref(
                     _SOURCE_VALUE_CLASS,
-                    (value_class_scope, int(base_id)),
+                    (value_class_scope, int(base_contract_id)),
                 )
-                if isinstance(base_id, int) else None
+                if isinstance(base_contract_id, int) else None
             )
             base_class_fact = (
                 None if base_class_cell is None else
@@ -13133,6 +13147,18 @@ def _normalize_lexical_values(
             # RHS node, effect = this SetAttr (plan 70, S4).  The written
             # cell is stamped on the SetAttr so a consumer names the cell,
             # never the RHS id or the SetAttr id.
+            declared_field_cell = declared_field_schema_cell(
+                str(method_owner)
+                if method_owner is not None
+                and isinstance(target.value, ast.Name)
+                and target.value.id in {"self", "cls"}
+                else receiver_class_identity(receiver),
+                target.attr,
+            )
+            if declared_field_cell is not None:
+                node_data.setdefault("attributes", {})[
+                    "field_declaration_cell"
+                ] = declared_field_cell
             written_cell = post_field_state(
                 receiver, target.attr, _FieldStateKind.WRITTEN,
                 int(value), int(node_id),
@@ -13140,6 +13166,7 @@ def _normalize_lexical_values(
                     receiver, target.attr,
                     node_identity_cell(graph, int(value)),
                     node_identity_cell(graph, int(node_id)),
+                    declared_field_cell,
                 ),
                 stage=_REDUCER_FIELD_WRITE,
             )
@@ -24106,6 +24133,35 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         target = static_bindings.get(entry.name)
         if callable(target):
             external_function_table.resolve_callable(entry.reference, target)
+            # c632's array constructor is declared by this exact import
+            # reference.  Preserve its collection identity before function
+            # subgraphs lose the external table; a later GetAttr is a view,
+            # not the allocation's birth.
+            from array import array as _source_array_type
+            if target is _source_array_type:
+                for source_graph in (graph.G, *(
+                    member.graph.G for member in function_table
+                    if getattr(member, "graph", None) is not None
+                )):
+                    for _node_id, source_data in source_graph.nodes(data=True):
+                        source_attributes = source_data.get("attributes") or {}
+                        if (
+                            str(source_data.get("type") or source_data.get("op") or "").casefold() != "call"
+                            or source_attributes.get("external_callee_ref") != entry.reference.address
+                        ):
+                            continue
+                        # Only the empty allocation participates here. An
+                        # initializer needs its own ordered row/copy birth;
+                        # it cannot be inferred from the array result class.
+                        if tuple(role for _parent, role in source_data.get("parents") or ()) != ("arg:0",):
+                            continue
+                        source_data.setdefault("attributes", {}).update({
+                            "aggregate_kind": "array",
+                            "producer_kind": "sequence_materialization",
+                            "sequence_column_count": 1,
+                            "sequence_key_columns": (),
+                            "sequence_writable": True,
+                        })
     graph.python_bindings = canonicalize_python_static_bindings(
         graph.python_bindings
     )

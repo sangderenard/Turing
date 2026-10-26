@@ -1112,7 +1112,7 @@ _LOG = logging.getLogger(__name__)
 
 
 def _canonical_sequence_dtype(dtype: str | None) -> str | None:
-    """Widen any sub-int64 integer dtype to int64.
+    """Widen inferred Python-integer candidates without a declared row.
 
     A sequence's storage array is one shared piece of memory that every
     function touching that sequence declares independently (each
@@ -9608,6 +9608,11 @@ class _ControlSSABuilder(TiledObject):
             if pending is not None and int(read_id) not in self.external_values:
                 del self.consumer_row_loads[int(read_id)]
                 self._emit_sequence_row_load(*pending)
+            elif int(read_id) in self.sequence_length_values:
+                # c632's row=len(field) precedes append but its scalar is
+                # consumed at return.  Freeze that exact temporal read at
+                # the same pre-effect boundary as an indexed row load.
+                self.external_value(int(read_id))
 
     def emit(
         self,
@@ -11218,6 +11223,15 @@ class _ControlSSABuilder(TiledObject):
             if policy == "unique" else ()
         )
         def _canonicalize_column(raw_dtype: str | None, column: int) -> str | None:
+            # c633: the constructor and every record read already agree on
+            # array("b")'s int8 row. Generic Python-integer inference must
+            # not widen that authored physical row to int64 in this callee.
+            # Only an inferred column without a source contract is widened.
+            declared_columns = self.source_sequence_column_dtypes.get(value_id, ())
+            declared_dtype = (declared_columns[column]
+                              if column < len(declared_columns) else None)
+            if declared_dtype not in {None, "", "unknown", "None"}:
+                return str(declared_dtype)
             canonical = _canonical_sequence_dtype(raw_dtype)
             if canonical != raw_dtype and _LOG.isEnabledFor(logging.DEBUG):
                 _LOG.debug(
@@ -16359,15 +16373,29 @@ class _ControlSSABuilder(TiledObject):
                 mutation_values, destination.column_dtypes, strict=True,
             ):
                 layout = dtype_layout(row_dtype)
-                if (layout is None or layout.kind != "uint"
+                if (layout is not None and layout.kind == "float"
+                        and str(value.dtype) == "int64"):
+                    converted = self.fresh_value(
+                        dtype=layout.name, transform=CONTROL_CAST, operands=(value,),
+                    )
+                    self.emit(Handler.Cast, [value], converted, attributes={
+                        "target_dtype": layout.name,
+                        "binding": f"ssa_sequence_{layout.name}_conversion",
+                    })
+                    converted_values.append(converted)
+                    continue
+                if (layout is None or layout.kind not in {"int", "uint"}
+                        or layout.name == "int64"
                         or str(value.dtype) != "int64"):
                     converted_values.append(value)
                     continue
-                # c626/c632: array("I") and array("B") own their declared
-                # unsigned rows; the Python int source is int64. Check the
-                # declared layout's range before converting. An int64 source
-                # already fits the upper bound of uint64 when nonnegative.
-                zero = self.constant_value(0, value, dtype="int64")
+                # c626/c632/c633: a typed array owns its declared integer
+                # row; the Python int source is int64. Validate that row's
+                # bounds before converting, including signed narrow rows.
+                # A nonnegative int64 already fits uint64's upper bound.
+                lower_bound = (0 if layout.kind == "uint" else
+                               -(1 << (8 * layout.byte_size - 1)))
+                zero = self.constant_value(lower_bound, value, dtype="int64")
                 nonnegative = self.fresh_value(
                     dtype="bool", transform=CONTROL_PREDICATE,
                     operands=(value, zero),
@@ -16376,7 +16404,8 @@ class _ControlSSABuilder(TiledObject):
                 valid = nonnegative
                 if layout.byte_size < 8:
                     maximum = self.constant_value(
-                        (1 << (8 * layout.byte_size)) - 1, value, dtype="int64",
+                        (1 << (8 * layout.byte_size - (layout.kind == "int"))) - 1,
+                        value, dtype="int64",
                     )
                     bounded = self.fresh_value(
                         dtype="bool", transform=CONTROL_PREDICATE,
@@ -16653,32 +16682,42 @@ class _ControlSSABuilder(TiledObject):
                     int(source.sequence_id), ()
                 ),
             ) or (self._function_root(),)
-            concorded_dtypes = concord_sequence_row_dtypes(
-                self.function_name,
-                {
-                    int(destination.sequence_id): destination.column_dtypes,
-                    int(source.sequence_id): source.column_dtypes,
-                },
-                source=f"{location}: {operation} equivalence",
-                sources=_dtype_cells,
-                stage=self._stage(),
+            # c634: extend copies known rows of different numeric types;
+            # its helper checks/converts each value. Those arenas do not
+            # become physically equivalent merely because one is copied.
+            typed_row_conversion = (
+                operation == "extend"
+                and tuple(destination.column_dtypes) != tuple(source.column_dtypes)
+                and all(dtype not in {None, "", "unknown", "None"}
+                        for dtype in (*destination.column_dtypes, *source.column_dtypes))
             )
-            if tuple(destination.column_dtypes) != concorded_dtypes:
-                destination = replace(
-                    destination, column_dtypes=concorded_dtypes
+            if not typed_row_conversion:
+                concorded_dtypes = concord_sequence_row_dtypes(
+                    self.function_name,
+                    {
+                        int(destination.sequence_id): destination.column_dtypes,
+                        int(source.sequence_id): source.column_dtypes,
+                    },
+                    source=f"{location}: {operation} equivalence",
+                    sources=_dtype_cells,
+                    stage=self._stage(),
                 )
-                self.sequence_descriptors[
-                    int(destination.sequence_id)
-                ] = destination
-            if tuple(source.column_dtypes) != concorded_dtypes:
-                source = replace(source, column_dtypes=concorded_dtypes)
-                self.sequence_descriptors[int(source.sequence_id)] = source
+                if tuple(destination.column_dtypes) != concorded_dtypes:
+                    destination = replace(
+                        destination, column_dtypes=concorded_dtypes
+                    )
+                    self.sequence_descriptors[
+                        int(destination.sequence_id)
+                    ] = destination
+                if tuple(source.column_dtypes) != concorded_dtypes:
+                    source = replace(source, column_dtypes=concorded_dtypes)
+                    self.sequence_descriptors[int(source.sequence_id)] = source
             for descriptor in (destination, source):
                 for value, dtype in zip(
                     self.sequence_storage_values[
                         int(descriptor.sequence_id)
                     ],
-                    concorded_dtypes,
+                    descriptor.column_dtypes if typed_row_conversion else concorded_dtypes,
                 ):
                     if str(value.dtype or "unknown") in {
                         "", "None", "unknown",
@@ -16809,7 +16848,8 @@ class _ControlSSABuilder(TiledObject):
             )):
                 if column not in destination_tags:
                     if (
-                        str(destination_dtype) != str(source_dtype)
+                        (str(destination_dtype) != str(source_dtype)
+                         and not typed_row_conversion)
                         or tuple(destination_shape) != tuple(source_shape)
                     ):
                         raise ValueError(
@@ -26448,7 +26488,8 @@ def lower_control_sections_to_ssa(
     }
     effect_preceding_row_reads: dict[int, tuple[int, ...]] = {}
     for reader, effect in sequence_read_before_effects:
-        if int(reader) in row_load_by_result:
+        if (int(reader) in row_load_by_result
+                or int(reader) in (sequence_length_values or {})):
             effect_preceding_row_reads[int(effect)] = (
                 *effect_preceding_row_reads.get(int(effect), ()), int(reader),
             )
