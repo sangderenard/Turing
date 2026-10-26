@@ -23553,7 +23553,12 @@ def _class_surface_ssa_program(
                     )[value_id] = tuple(dict.fromkeys((
                         page_cell, *class_cells, *builtin_class_cells,
                     )))
-            class_fact = class_page.latest((numeric_scope, value_id))
+            class_cell = attributes.get(
+                "callsite_iterable_element_class_cell"
+            ) or shape_identity_book.latest_ref(
+                _ABI_VALUE_CLASS, (numeric_scope, value_id),
+            )
+            class_fact = None if class_cell is None else _cell_fact(class_cell)
             if not (
                 isinstance(class_fact, tuple)
                 and class_fact
@@ -23561,9 +23566,6 @@ def _class_surface_ssa_program(
             ):
                 continue
             identity = str(class_fact[0])
-            class_cell = shape_identity_book.latest_ref(
-                _ABI_VALUE_CLASS, (numeric_scope, value_id),
-            )
             if class_cell is None:
                 raise ValueError(
                     "source value class fact has no exact concordance cell: "
@@ -23734,6 +23736,7 @@ def _class_surface_ssa_program(
 
     for planned_graph in planned_graphs_by_shell.values():
         tests = tuple(_source_type_tests(planned_graph).values())
+        numeric_scope = _source_numeric_scope(planned_graph)
         predicate_subjects = {
             int(test["subject_value_id"])
             for test in tests
@@ -23785,6 +23788,68 @@ def _class_surface_ssa_program(
                 id(planned_graph), {}
             )
             contract = contracts.setdefault(subject_id, {})
+            # Program: String Core's `validate_batch_envelope` loops over an
+            # exact `list[int]` element and checks both `isinstance(offset,
+            # int)` and `isinstance(offset, bool)`, then compares that offset
+            # numerically. Wrong record: the predicate-only fallback below
+            # assigned the loop target an opaque reference ABI even though
+            # its single SOURCE_VALUE_CLASS cell proves `builtins.int`; the
+            # loop Load was int64, but the planned region feed became a
+            # reference and refused transport to the scalar int64 Phi.
+            # Rule: where the source-class row itself names one primitive
+            # class and no physical contract already owns this value, carry
+            # that class's existing primitive ABI receipt into the same
+            # VALUE_TYPE_ABI contract. The class cell remains the cause; an
+            # absent, mixed, or non-primitive class keeps the reference/tag
+            # path below.
+            class_row = (numeric_scope, int(subject_id))
+            class_cell = subject_attributes.get(
+                "callsite_iterable_element_class_cell"
+            ) or shape_identity_book.latest_ref(
+                _ABI_VALUE_CLASS, class_row,
+            )
+            class_fact = None if class_cell is None else _cell_fact(class_cell)
+            class_identity = (
+                str(class_fact[0])
+                if isinstance(class_fact, tuple) and class_fact
+                and class_fact[0] else None
+            )
+            contract_classes = set(map(
+                str, contract.get("python_types") or (),
+            ))
+            if contract.get("python_type") is not None:
+                contract_classes.add(str(contract["python_type"]))
+            if (
+                not contract.get("storage")
+                and class_cell is not None
+                and class_identity in {
+                    "builtins.int", "builtins.bool", "builtins.float",
+                }
+                and contract_classes == {class_identity}
+            ):
+                primitive_receipt = _authored_annotation_field_receipt(
+                    ast.Name(
+                        id=class_identity.rsplit(".", 1)[-1],
+                        ctx=ast.Load(),
+                    ),
+                )
+                if (
+                    primitive_receipt is not None
+                    and primitive_receipt.get("storage") == "scalar"
+                    and primitive_receipt.get("dtype")
+                    and int(primitive_receipt.get("rank", 0)) == 0
+                ):
+                    for key in ("storage", "dtype", "rank", "shape", "mutable"):
+                        if primitive_receipt.get(key) is not None:
+                            contract[key] = primitive_receipt[key]
+                    linked_value_type_source_cells_by_graph.setdefault(
+                        id(planned_graph), {},
+                    )[int(subject_id)] = tuple(dict.fromkeys((
+                        *linked_value_type_source_cells_by_graph.get(
+                            id(planned_graph), {},
+                        ).get(int(subject_id), ()),
+                        class_cell,
+                    )))
             if not (
                 contract.get("storage") == "reference"
                 and contract.get("dtype") == "opaque_ref"

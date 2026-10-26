@@ -28940,6 +28940,13 @@ def _post_callsite_loop_element_classes(
                 target_attributes[
                     "callsite_iterable_element_class_fact"
                 ] = class_fact
+                # ``last([1.5])`` keeps this target's canonical identity
+                # while folding changes its numeric specialization scope.
+                # Carry the actual class cell; reconstructing its row from
+                # the later scope reads the generic declaration instead.
+                target_attributes[
+                    "callsite_iterable_element_class_cell"
+                ] = book.latest_ref(SOURCE_VALUE_CLASS, target_row)
                 target_attributes[
                     "callsite_iterable_element_class_cells"
                 ] = tuple(member_cells)

@@ -2531,9 +2531,48 @@ def emit_ssa_module_to_c(
             and instruction.res is not None
         }
 
+        aggregate_constant_types: dict[int, str] = {}
+        constant_uses: dict[int, list[tuple]] = {}
+        for block in function.blocks.values():
+            for consumer in block.instrs:
+                for position, argument in enumerate(consumer.args):
+                    constant_uses.setdefault(int(argument.id), []).append((consumer, position))
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                result = instruction.res
+                payload = instruction.attributes.get("value")
+                if (instruction.op != "Const" or result is None
+                        or str(result.dtype) != "ssa.aggregate"
+                        or not isinstance(payload, (tuple, list))):
+                    continue
+                uses = constant_uses.get(int(result.id), ())
+                if not uses or not all(
+                    consumer.op in {"GetElementPtr", "getelementptr"} and position == 0
+                    for consumer, position in uses
+                ):
+                    continue
+                try:
+                    members = _flatten_numeric_aggregate(payload)
+                except TypeError:
+                    continue
+                kinds = {"bool" if type(item) is bool
+                         else "int64" if type(item) is int
+                         else "float64" if type(item) is float else None
+                         for item in members}
+                dtype = (next(iter(kinds)) if len(kinds) == 1 else
+                         "int64" if kinds == {"bool", "int64"} else None)
+                if dtype is not None:
+                    # A specialized iterable Const is a structural handle,
+                    # not an array of void pointers. Its exact numeric payload
+                    # owns the element type, as in the LLVM Const path. Keep
+                    # this view for both initialization and GEP stride.
+                    aggregate_constant_types[int(result.id)] = _buffer_c_type(dtype)
+
         def buffer_type(value) -> str:
             if int(value.id) in token_value_ids:
                 return "int64_t"
+            if int(value.id) in aggregate_constant_types:
+                return aggregate_constant_types[int(value.id)]
             return solved_buffer_type(fn, value)
 
         def carried_type(value) -> str:
@@ -3934,6 +3973,7 @@ def emit_ssa_module_to_c(
                             len(flattened) == 1
                             and _declared_span_rank(instruction.res) == 0
                             and not tuple(instruction.res.shape or ())
+                            and result_id not in aggregate_constant_types
                         ):
                             # Frontend index construction often preserves a
                             # one-limb tuple payload after shape specialization.
@@ -3943,6 +3983,12 @@ def emit_ssa_module_to_c(
                             held = flattened[0]
                         else:
                             element_type = buffer_type(instruction.res)
+                            if element_type.rstrip().endswith("*"):
+                                shortfalls.append(CEmissionShortfall(
+                                    op, "numeric aggregate has no exact scalar "
+                                    f"element storage contract in {fn}",
+                                ))
+                                continue
                             # ISO C has no zero-length arrays.  An empty authored
                             # aggregate has no legal element load, so one inert
                             # backing limb preserves every observable operation.
