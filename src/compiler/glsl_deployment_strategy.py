@@ -26690,6 +26690,28 @@ def _fold_callsite_structural_values(
                                 ), parent_descriptors[0]["dtype"])
                             ),
                         }
+                        # Program: ``def f(a: bool, b: bool): return a + b``.
+                        # Wrong record: both bool operands made the scalar
+                        # result descriptor bool, so native Add returned a
+                        # predicate (True for 2, or i1 wraparound) instead of
+                        # Python's integer 2. Rule: an exact authored builtin
+                        # int result class plus the planner's proven int64
+                        # scalar ABI owns this scalar result descriptor; bool
+                        # tensor results have a different source class and
+                        # keep their tensor algebra domain.
+                        result_id = int(node_id)
+                        source_class = source_value_class_page.latest((
+                            source_value_class_scope, result_id,
+                        ))
+                        if (
+                            shape == ()
+                            and isinstance(source_class, tuple)
+                            and source_class
+                            and str(source_class[0]) == "builtins.int"
+                            and _planned_scalar_dtypes(graph).get(result_id)
+                            == "int64"
+                        ):
+                            data["tensor"]["dtype"] = "int64"
             if operation in {"indexed", "getitem", "subscript"}:
                 expression = data.get("expr_obj")
                 source_descriptor = None

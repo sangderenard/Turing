@@ -403,6 +403,7 @@ def plan_region_to_ssa_instrs(
     dtype_of = {
         int(value_id): dtype for value_id, _shape, dtype in region.value_shapes
     }
+    source_dtype_of = dict(dtype_of)
     rank_of = {
         int(value_id): int(rank) for value_id, rank in region.value_ranks
     }
@@ -428,6 +429,58 @@ def plan_region_to_ssa_instrs(
     predicate_type_page = current_identity_book().page(
         "operator_result_type_concordance"
     )
+
+    def source_result_class(value_id: int) -> str | None:
+        """Read the source class through this value's exact identity edges."""
+
+        if lexical_read_scope is None:
+            return None
+        from .concordance_declarations import CANONICAL_VALUE, SOURCE_VALUE_CLASS
+
+        book = current_identity_book()
+        fork_ref = book.latest_ref(
+            CANONICAL_VALUE, (tuple(lexical_read_scope), int(value_id)),
+        )
+        if fork_ref is None:
+            return None
+        origins = tuple(
+            source
+            for source, _stage in book.edges_into(fork_ref)
+            if source.page.name == CANONICAL_VALUE.name
+            and isinstance(source.row, tuple)
+            and len(source.row) == 2
+            and int(source.row[1]) == int(value_id)
+        )
+        if len(origins) != 1:
+            return None
+        source_classes = []
+        for target, _stage in book.edges_out_of(origins[0]):
+            if not (
+                target.page.name == SOURCE_VALUE_CLASS.name
+                and isinstance(target.row, tuple)
+                and len(target.row) == 2
+                and int(target.row[1]) == int(value_id)
+            ):
+                continue
+            fact = book.page(SOURCE_VALUE_CLASS).latest(target.row)
+            if isinstance(fact, tuple) and fact:
+                source_classes.append(str(fact[0]))
+        concordant_classes = tuple(dict.fromkeys(source_classes))
+        return concordant_classes[0] if len(concordant_classes) == 1 else None
+
+    def authored_scalar_result_dtype(value_id: int) -> str | None:
+        """Preserve the declared scalar ABI only for its exact source class."""
+
+        dtype = source_dtype_of.get(int(value_id))
+        if (
+            shape_of.get(int(value_id), ()) == ()
+            and rank_of.get(int(value_id), 0) == 0
+            and dtype in {"int", "int32", "int64", "i32", "i64"}
+            and source_result_class(int(value_id)) == "builtins.int"
+        ):
+            return str(dtype)
+        return None
+
     for item in region.items:
         if not (
             isinstance(item, PlanLine)
@@ -594,7 +647,10 @@ def plan_region_to_ssa_instrs(
                     or "float64"
                 )
             elif opcode in dtype_preserving_ops:
-                inferred = promoted_numeric_dtype(semantic_input_ids(item))
+                inferred = (
+                    authored_scalar_result_dtype(output_id)
+                    or promoted_numeric_dtype(semantic_input_ids(item))
+                )
             elif opcode in projection_ops:
                 sources = semantic_input_ids(item)
                 inferred = (

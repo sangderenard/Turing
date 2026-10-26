@@ -5061,6 +5061,16 @@ def _emit_repository_call_module(
                     else max(operand_argument_types, key=lambda t: int(t[1:]))
                     if operand_argument_types else result_type
                 )
+                if (
+                    result_type in _INTEGER_LLVM_TYPES and result_type != "i1"
+                    and operand_argument_types
+                    and all(kind == "i1" for kind in operand_argument_types)
+                ):
+                    # Authored Python bool arithmetic has an integer result:
+                    # True + True is int64 2, not add i1 followed by extension
+                    # of the wrapped zero. The declared result owns this
+                    # arithmetic domain; predicates and logical ops keep i1.
+                    operand_type = result_type
                 # The logical templates are spelled over i1; an operand that
                 # arrives in its double storage type must be coerced to a
                 # boolean, not passed through in whatever width it was
