@@ -756,6 +756,61 @@ def plan_region_to_ssa_instrs(
         values[value_id] = made
         return made
 
+    def cast_comparison_operand(
+        item: PlanLine, source_position: int, operand: SSAValue,
+    ) -> SSAValue:
+        """Widen the exact uint32 side of ``values[0] < scalar``.
+
+        The sequence row is physically uint32 and the scalar is int64. Every
+        uint32 value fits int64, so int64 is their exact common comparison
+        domain. Keep the conversion in repository SSA so the C, LLVM and
+        Fortran emitters all see the same typed operands.
+        """
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CONTROL_CAST, PLANNER_HIERARCHY, SSA_VALUE,
+        )
+        from .identity_concordance import ConcordanceRefusal, current_identity_book
+        from .precompile_to_ssa import _mint_ssa_id
+
+        book = current_identity_book()
+        source = (
+            None if lexical_read_scope is None else
+            book.latest_ref(
+                CANONICAL_VALUE,
+                (tuple(lexical_read_scope), int(operand.id)),
+            )
+        )
+        if source is None:
+            source = book.latest_ref(
+                SSA_VALUE, (function_scope, int(operand.id)),
+            )
+        if source is None:
+            raise ConcordanceRefusal(
+                "planner comparison widening cannot name the exact operand "
+                f"identity for SSA value {operand.id}"
+            )
+        cast_id = _mint_ssa_id(
+            book, function_scope, CONTROL_CAST, (source,),
+            dtype="int64", shape=tuple(operand.shape),
+            stage=PLANNER_HIERARCHY,
+        )
+        converted = SSAValue(
+            cast_id, dtype="int64", shape=tuple(operand.shape),
+            accounting={},
+        )
+        values[cast_id] = converted
+        instructions.append(Instr(
+            "Cast", [operand], converted,
+            arg_roles=["operand"],
+            attributes={
+                "source_operator": str(item.opcode),
+                "target_dtype": "int64",
+            },
+        ))
+        fork_operand_read(item, source_position, converted, "operand", operand)
+        return converted
+
     def fork_operand_read(
         item: PlanLine, source_position: int, consumer: SSAValue,
         role: str, operand: SSAValue,
@@ -959,9 +1014,46 @@ def plan_region_to_ssa_instrs(
             fork_operand_read(item, 2, result, "upper", upper)
             continue
 
+        operands = [value(value_id) for value_id in semantic_inputs]
+        if (
+            opcode.casefold() in {"lt", "le", "gt", "ge", "eq", "ne"}
+            and len(semantic_inputs) == 2
+        ):
+            left_id, right_id = semantic_inputs
+            left_dtype = str(dtype_of.get(left_id) or "")
+            right_dtype = str(dtype_of.get(right_id) or "")
+            def scalar_uint32(value_id: int, dtype: str) -> bool:
+                return (
+                    dtype == "uint32"
+                    and int(value_id) in shape_of
+                    and shape_of.get(int(value_id), ()) == ()
+                    and int(value_id) in rank_of
+                    and rank_of.get(int(value_id), 0) == 0
+                )
+
+            def scalar_int64(value_id: int, dtype: str) -> bool:
+                return (
+                    dtype in {"int64", "i64"}
+                    and int(value_id) in shape_of
+                    and shape_of.get(int(value_id), ()) == ()
+                    and int(value_id) in rank_of
+                    and rank_of.get(int(value_id), 0) == 0
+                )
+
+            if (
+                scalar_uint32(left_id, left_dtype)
+                and scalar_int64(right_id, right_dtype)
+            ):
+                operands[0] = cast_comparison_operand(item, 0, operands[0])
+            elif (
+                scalar_uint32(right_id, right_dtype)
+                and scalar_int64(left_id, left_dtype)
+            ):
+                operands[1] = cast_comparison_operand(item, 1, operands[1])
+
         instructions.append(Instr(
             opcode,
-            [value(value_id) for value_id in semantic_inputs],
+            operands,
             result,
             arg_roles=list(semantic_roles),
             attributes=attributes,
