@@ -8627,6 +8627,19 @@ def _normalize_lexical_values(
                 receiver_class = (
                     receiver_data.get("attributes") or {}
                 ).get("class_ref")
+                stable_method_lookup = False
+                lookup_class = receiver_class_identity(int(receiver))
+                if lookup_class is not None and id(expression) in method_lookup_ids:
+                    try:
+                        declared_member = navigation_table.resolve_dot(
+                            canonical_known_class_identities.get(lookup_class, lookup_class),
+                            expression.attr, lambda _identity, _permissions: True,
+                            receiver_kind="instance",
+                        )
+                    except (KeyError, PermissionError):
+                        pass
+                    else:
+                        stable_method_lookup = declared_member.kind == "method"
                 records = dict(
                     (graph.G.graph.get("program_abi") or {}).get("records")
                     or {}
@@ -8686,6 +8699,7 @@ def _normalize_lexical_values(
                 if (
                     isinstance(receiver_expression, ast.Call)
                     and not call_stored_field
+                    and not stable_method_lookup
                     and len(matching_records) == 1
                     and isinstance(constructed_state, _FieldState)
                     and constructed_state.kind in {
@@ -8724,6 +8738,7 @@ def _normalize_lexical_values(
                 if (
                     isinstance(receiver_expression, ast.Call)
                     and not call_stored_field
+                    and not stable_method_lookup
                     and len(matching_records) == 1
                     and (
                         rewritten_by_enclosing_loop
@@ -8748,6 +8763,7 @@ def _normalize_lexical_values(
                 if (
                     isinstance(receiver_expression, ast.Call)
                     and not call_stored_field
+                    and not stable_method_lookup
                     and len(matching_records) == 1
                     and (
                         constructed_state is None
@@ -9463,7 +9479,7 @@ def _normalize_lexical_values(
                 # this read's own node (plan 70, S3); a later read posts
                 # nothing and the ``after_write`` operand above was ordered
                 # after the cursor cell's effect.
-                if (int(receiver), str(expression.attr)) not in field_state_cursor:
+                if not stable_method_lookup and (int(receiver), str(expression.attr)) not in field_state_cursor:
                     post_field_state(
                         receiver, expression.attr, _FieldStateKind.OBSERVED,
                         int(attribute_id), int(attribute_id),
@@ -9594,7 +9610,7 @@ def _normalize_lexical_values(
                         node_id,
                         (*receiver_inputs, *argument_inputs, *keyword_inputs),
                     )
-            callee = resolve_expression(expression.func)
+            callee = resolved_call_argument(expression.func)
             if isinstance(callee, _StaticPythonReference) and node_id in graph.G:
                 identity_target = (
                     callee.value.__func__
@@ -10579,8 +10595,12 @@ def _normalize_lexical_values(
         for child in children:
             if isinstance(child, ast.expr_context):
                 continue
-            if not isinstance(expression, ast.Call):
-                resolve_expression(child)
+            if isinstance(expression, ast.Call) and (
+                id(child) in argument_values
+                or isinstance(child, ast.keyword) and id(child.value) in argument_values
+            ):
+                continue
+            resolve_expression(child)
         node_id = id(expression)
         if (
             isinstance(expression, ast.Call)

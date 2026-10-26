@@ -62,8 +62,24 @@ def root(n: int):
 ''')
 
 
+def test_structural_range_stop_retains_parameter_binding():
+    from src.compiler.identity_concordance import CorrelationTable
+    module, _, exports = lower_ast_source_to_ssa(
+        'def root(count: int):\n    total = 0\n    for i in range(count):\n        total += i\n    return total\n',
+        'root', name='structural_range_argument', extraction_contract=CONTRACT,
+        progress=lambda _: None, progress_bars=False,
+    )
+    assert CorrelationTable.build(module).findings(module) == []
+    function = module.functions[exports[0]]
+    parameters = dict(function.metadata['parameter_names'])
+    assert set(parameters) == {'count'}
+    formal = next(value for value in function.args if value.id == parameters['count'])
+    assert formal.dtype == 'int64'
+    assert formal.accounting['native_exact_type'] == 'builtins.int'
+
+
 @pytest.mark.parametrize('lane', ['C', 'LLVM', 'Fortran'])
-@pytest.mark.parametrize('surface', ['method', 'direct', 'loop', 'isolation', 'temporal'])
+@pytest.mark.parametrize('surface', ['method', 'direct', 'loop', 'loop_then_call', 'isolation', 'temporal'])
 @pytest.mark.parametrize('imported', [False, True])
 def test_authored_add_method_is_not_dead_tensor_metadata(lane, surface, imported, tmp_path, monkeypatch):
     import numpy as np
@@ -86,9 +102,11 @@ def root(value: int) -> int:
 '''
     if surface == 'direct':
         source = source.replace('return projected.read()', 'return projected.clock')
-    elif surface == 'loop':
+    elif surface in {'loop', 'loop_then_call'}:
         source = source.replace('    projected.add(7)\n    return projected.read()',
-                                '    for index in range(3):\n        projected.add(7)\n    return projected.clock')
+                                '    for index in range(3):\n        projected.add(7)\n' +
+                                ('    projected.add(7)\n' if surface == 'loop_then_call' else '') +
+                                '    return projected.clock')
     elif surface == 'isolation':
         source = source.replace('    projected.add(7)\n    return projected.read()',
                                 '    other = Clock(value)\n    projected.add(7)\n    other.add(9)\n    return projected.clock * 100 + other.clock')
@@ -144,5 +162,5 @@ def root(value: int) -> int:
         actual = prepare({parameter: np.array([value], dtype=np.int64)}).run().buffers[result]
         expected = (101 * value + 709 if surface == 'isolation' else
                     101 * value + 7 if surface == 'temporal' else
-                    value + (21 if surface == 'loop' else 7))
+                    value + (28 if surface == 'loop_then_call' else 21 if surface == 'loop' else 7))
         assert int(np.asarray(actual).reshape(-1)[0]) == expected
