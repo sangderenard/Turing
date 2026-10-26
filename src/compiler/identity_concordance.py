@@ -1495,6 +1495,25 @@ class CorrelationTable:
                             f"field {record_field.storage_identity!r} names absent sequence {record_field.sequence_id}"))
                     elif record_field.sequence_id is not None:
                         sequence = sequences.by_id(record_field.sequence_id)
+                        from ..transmogrifier.ssa import sequence_member_roles
+
+                        # Page.clock's provisional descriptor was retired but
+                        # its field kept the old column/length/capacity IDs.
+                        # A field's physical surface must belong to the SAME
+                        # descriptor its sequence_id names, even when all old
+                        # IDs still have historical alias receipts.
+                        stale_members = sorted(
+                            set(map(int, record_field.value_ids))
+                            - set(sequence_member_roles(sequence))
+                        )
+                        if stale_members:
+                            found.append(Finding(
+                                "record-sequence-member-disagreement", str(name),
+                                int(record.record_id),
+                                f"field {record_field.storage_identity!r} names "
+                                f"nonmembers {stale_members!r} of sequence "
+                                f"{int(sequence.sequence_id)}",
+                            ))
                         owner = sequence.heap_owner_value_id
                         if owner is not None and int(owner) not in record_field.value_ids:
                             found.append(Finding(

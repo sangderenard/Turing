@@ -6401,7 +6401,17 @@ def _program_abi_record_for_type_identity(
         ).items()
         if canonical == str(record_name) or (
             canonical not in _BUILTIN_PRIMITIVE_TYPE_IDENTITIES
-            and canonical == str(dict(record).get("identity") or "")
+            and (
+                canonical == str(dict(record).get("identity") or "")
+                # Page(book: Clock) and its linked Clock() argument carry
+                # the same class declaration under local and defining
+                # spellings. The schema already names that exact row.
+                or (
+                    isinstance(dict(record).get("source_record_view_schema"), (tuple, list))
+                    and len(record["source_record_view_schema"]) == 2
+                    and canonical == ".".join(map(str, record["source_record_view_schema"]))
+                )
+            )
         )
     )
     return matches[0] if len(set(matches)) == 1 else None
@@ -7554,12 +7564,86 @@ def _annotated_parameter_record_identity(
     return identity
 
 
+def _reduced_initializer_list_fields(graph: Any) -> dict:
+    """Read physical list fields from the reducer's existing identity rows."""
+
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from .concordance_declarations import (
+        SOURCE_AGGREGATE_LAYOUT, SOURCE_VALUE_CLASS, SourceAggregateLayout,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    proven = {}
+    unproved = set()
+    for entry in graph.function_table:
+        target = getattr(getattr(entry, "graph", None), "G", None)
+        if target is None or target.graph.get("function_name") != "__init__":
+            continue
+        scope = _source_numeric_scope(target)
+        for _node_id, data in target.nodes(data=True):
+            if str(data.get("op") or "").lower() != "setattr":
+                continue
+            field_cell = (data.get("attributes") or {}).get("field_declaration_cell")
+            if field_cell is None:
+                continue
+            receivers = [source for source, _dest, edge in target.in_edges(_node_id, data=True)
+                         if edge.get("role") == "object"]
+            if len(receivers) != 1 or (
+                target.nodes[receivers[0]].get("attributes") or {}
+            ).get("binding_name") != "self":
+                continue
+            sources = [source for source, _dest, edge in target.in_edges(_node_id, data=True)
+                       if edge.get("role") == "value"]
+            if len(sources) != 1:
+                continue
+            attrs = target.nodes[sources[0]].get("attributes") or {}
+            if attrs.get("aggregate_kind") != "list":
+                continue
+            row = attrs.get("source_aggregate_layout_row")
+            layout_cell = (None if row is None else
+                           book.latest_ref(SOURCE_AGGREGATE_LAYOUT, tuple(row)))
+            layout = (None if layout_cell is None else
+                      book.page(SOURCE_AGGREGATE_LAYOUT).cell(layout_cell.row, layout_cell.column))
+            if not isinstance(layout, SourceAggregateLayout) or not layout.members:
+                unproved.add(field_cell)
+                continue
+            member_cells = tuple(book.latest_ref(
+                SOURCE_VALUE_CLASS, (scope, int(member.value_id)),
+            ) for member in layout.members)
+            facts = tuple(None if cell is None else book.page(SOURCE_VALUE_CLASS).cell(
+                cell.row, cell.column,
+            ) for cell in member_cells)
+            # These are the source scalar contracts already used by linked
+            # ABI settlement; Python bool must remain distinct from int.
+            dtypes = tuple({
+                "builtins.int": "int64", "builtins.float": "float64",
+                "builtins.bool": "bool",
+            }.get(str(fact[0])) if fact is not None and int(fact[1]) == 1 else None
+                for fact in facts)
+            if not dtypes or None in dtypes or len(set(dtypes)) != 1:
+                unproved.add(field_cell)
+                continue
+            receipt = {"storage": "span", "dtype": dtypes[0], "rank": 1,
+                       "mutable": True, "aggregate_kind": "list"}
+            previous = proven.get(field_cell)
+            if previous is not None and previous[0] != receipt:
+                unproved.add(field_cell)
+                continue
+            cells = tuple(dict.fromkeys((
+                *((previous[1]) if previous else ()), layout_cell, *member_cells,
+            )))
+            proven[field_cell] = receipt, cells
+    return {cell: fact for cell, fact in proven.items() if cell not in unproved}
+
+
 def _authored_dataclass_record_views(
     tree: ast.Module,
     *,
     projection_schemas: dict[str, Mapping[str, Any]] | None = None,
     source_module: str | Path | None = None,
     carried_declarations: bool = False,
+    reduced_initializer_fields: Mapping[Any, tuple[Mapping[str, Any], tuple]] | None = None,
 ) -> dict[str, dict[str, Mapping[str, Any]]]:
     """Derive exact per-method record views from authored class fields.
 
@@ -7769,9 +7853,33 @@ def _authored_dataclass_record_views(
         class_fields[class_name] = fields
         class_methods[class_name] = methods
 
+        # Clock.clock = [0] has no annotation. Its element type is known
+        # only after reduction has posted the aggregate layout and each
+        # member's exact class. Join that receipt by the declaration Ref;
+        # never rediscover a field from the initializer's name or position.
+        declaration_row = class_declaration_rows.get(class_name)
+        if declaration_row is not None and reduced_initializer_fields:
+            from .concordance_declarations import CLASS_FIELD_DECLARATION
+            from .identity_concordance import current_identity_book
+
+            book = current_identity_book()
+            for field_name in (
+                attribute["name"] for attribute in
+                _class_schema_from_ast(
+                    definition, carried_declarations=True,
+                ).get("attributes", ())
+            ):
+                field_cell = book.latest_ref(
+                    CLASS_FIELD_DECLARATION,
+                    (*declaration_row, str(field_name)),
+                )
+                proven = reduced_initializer_fields.get(field_cell)
+                if proven is not None and field_name not in fields:
+                    fields[str(field_name)] = dict(proven[0])
+
     if projection_schemas is not None:
         from .concordance_declarations import (
-            CLASS_DECLARATION, CLASS_FIELD_DECLARATION, INGESTION,
+            CLASS_DECLARATION, CLASS_FIELD_DECLARATION, INGESTION, REDUCTION,
             SOURCE_RECORD_VIEW_SCHEMA,
         )
         from .identity_concordance import (
@@ -7841,22 +7949,32 @@ def _authored_dataclass_record_views(
             incumbent_schema_cell = book.latest_ref(
                 SOURCE_RECORD_VIEW_SCHEMA, row,
             )
-            if carried_declarations and incumbent_schema_cell is not None:
+            reduced_cells = tuple(dict.fromkeys(
+                cell for field_cell in field_cells
+                for cell in (reduced_initializer_fields or {}).get(
+                    field_cell, ({}, ()),
+                )[1]
+            ))
+            if carried_declarations and incumbent_schema_cell is not None and not reduced_cells:
                 fact = book.page(SOURCE_RECORD_VIEW_SCHEMA).cell(
                     incumbent_schema_cell.row,
                     incumbent_schema_cell.column,
                 )
             book.post(
                 SOURCE_RECORD_VIEW_SCHEMA, row, fact,
-                stage=INGESTION,
+                stage=REDUCTION if reduced_cells else INGESTION,
                 provenance=Derived(tuple(dict.fromkeys((
                     class_cell, *field_cells,
+                    *reduced_cells,
                     *(cell for cell in nested_class_cells if cell is not None),
                     *((incumbent_schema_cell,)
                       if incumbent_schema_cell is not None
-                      and carried_declarations else ()),
+                      and (carried_declarations or reduced_cells) else ()),
                 )))),
-                mode=Mode.CONCORD,
+                mode=(Mode.REVISE if reduced_cells and incumbent_schema_cell is not None
+                      and book.page(SOURCE_RECORD_VIEW_SCHEMA).cell(
+                          incumbent_schema_cell.row, incumbent_schema_cell.column,
+                      ) != fact else Mode.CONCORD),
             )
             projection_schemas[class_name] = {
                 "identity": class_name,
@@ -20850,13 +20968,24 @@ def _retire_concordant_sequence_aliases(
 
         record_table = all_record_tables.get(str(symbol))
         if record_table is not None:
+            record_member_bindings: dict[int, int] = {}
+            for stale_id, resident_id in replacements.items():
+                _bind_sequence_storage_members(
+                    record_member_bindings,
+                    sequence_table.by_id(int(stale_id)),
+                    sequence_table.by_id(int(resident_id)),
+                )
             for record_id, descriptor in tuple(record_table.records.items()):
                 fields = tuple(
                     SSARecordFieldDescriptor(
                         field.name,
                         field.storage,
                         storage_identity=field.storage_identity,
-                        value_ids=field.value_ids,
+                        # Page.clock's descriptor and physical members are
+                        # one record. Retiring its provisional sequence must
+                        # not leave its field naming the removed counters.
+                        value_ids=tuple(record_member_bindings.get(int(value_id), int(value_id))
+                                        for value_id in field.value_ids),
                         sequence_id=(
                             None if field.sequence_id is None
                             else replacements.get(
@@ -37135,9 +37264,12 @@ def _class_surface_ssa_program(
                         ),
                         writable=mutable,
                     ))
-            if nested_fields and descriptor_id not in table.records:
+            if descriptor_id not in table.records:
                 # The nested record stands on its authored identity's graph
                 # cell and on the cells of the physical leaves it expands to.
+                # Page.__init__ stores book: Clock without reading a leaf.
+                # Its empty projection is still that declared Clock record;
+                # omitting it leaves Page.book naming a nonexistent record.
                 table.register(
                     SSARecordDescriptor(
                         int(descriptor_id), schema_identity,
@@ -42839,6 +42971,12 @@ def _class_surface_ssa_program(
                     successor_data.get("parents") or ()
                 ) if int(parent) == int(receiver_id)
             }
+            # Page(book=clock) in a loop orders a later clock.clock reload
+            # after this call. That after_write edge carries causality, not
+            # the constructed Page as data escaping its iteration.
+            roles.discard("after_write")
+            if not roles:
+                continue
             successor_operation = str(
                 successor_data.get("op")
                 or successor_data.get("type")
@@ -43288,6 +43426,24 @@ def _class_surface_ssa_program(
                             caller_graph.nodes[parent].get("value_id", parent)
                         )
                         constructor_parameter_ids.add(parameter_id)
+                # Page(clock=projected.clock, book=projected) binds an
+                # existing list, not a second descriptor for the same data
+                # column. Carry every physical member across that exact
+                # parameter edge before minting constructor frame storage.
+                if constructor_sequences is not None and caller_sequences is not None:
+                    constructor_aliases = _concordant_function_aliases(constructor)
+                    caller_aliases = _concordant_function_aliases(caller)
+                    for parameter_id in constructor_parameter_ids:
+                        actual_id = int(remap[parameter_id])
+                        _bind_sequence_storage_members(
+                            remap,
+                            constructor_sequences.by_id(int(constructor_aliases.get(
+                                parameter_id, parameter_id,
+                            ))),
+                            caller_sequences.by_id(int(caller_aliases.get(
+                                actual_id, actual_id,
+                            ))),
+                        )
                 referenced_ids = tuple(dict.fromkeys(
                     int(value_id)
                     for record in template_records
@@ -43522,6 +43678,20 @@ def _class_surface_ssa_program(
                                 source_sequence.sequence_id,
                                 SEQUENCE_DESCRIPTOR,
                             ))
+                            # The constructor's list display proved its row
+                            # bound before remapping. Carry that same bound
+                            # with its descriptor, as ordinary call frames do.
+                            source_bound = dict(constructor.metadata.get(
+                                "static_mapping_capacity_bounds", {},
+                            )).get(int(source_sequence.sequence_id))
+                            if source_bound is not None:
+                                bounds = dict(caller.metadata.get(
+                                    "static_mapping_capacity_bounds", {},
+                                ))
+                                bounds[mapped_sequence_id] = max(
+                                    int(source_bound), int(bounds.get(mapped_sequence_id, 0)),
+                                )
+                                caller.metadata["static_mapping_capacity_bounds"] = bounds
                         mapped_fields.append(SSARecordFieldDescriptor(
                             name=field.name,
                             storage=field.storage,
@@ -46501,7 +46671,7 @@ def _class_surface_ssa_program(
                     None if descriptor is None else next((
                         item for item in descriptor.fields
                         if str(item.name) == attribute
-                        and len(item.value_ids) == 1
+                        and (len(item.value_ids) == 1 or item.sequence_id is not None)
                     ), None)
                 )
                 if field is None:
@@ -46515,6 +46685,25 @@ def _class_surface_ssa_program(
                         ))
                     continue
                 projection_id = int(data.get("value_id", node_id))
+                if field.sequence_id is not None:
+                    sequences = all_sequence_tables.get(function_name)
+                    projected = None if sequences is None else sequences.by_id(projection_id)
+                    resident_sequence = (None if sequences is None else
+                                         sequences.by_id(int(field.sequence_id)))
+                    member_bindings = {}
+                    if _bind_sequence_storage_members(member_bindings, projected, resident_sequence):
+                        additions = {old: new for old, new in member_bindings.items()
+                                     if old != new and aliases.get(old) != new}
+                        if additions:
+                            # Clock.clock GetAttr occurrences carry the same
+                            # list descriptor as the constructed receiver's
+                            # exact record field, including its counters.
+                            aliases = _publish_concordant_function_aliases(
+                                function, additions,
+                                provenance="linked_call_record_sequence_projection",
+                            )
+                            changed = True
+                    continue
                 resident_id = int(field.value_ids[0])
                 receiver_data = graph.nodes.get(receiver_origin_id, {})
                 projection_attributes = data.get("attributes") or {}
@@ -61693,6 +61882,11 @@ def _lower_ast_source_to_ssa_impl(
             selected[str(parameter)] = copy.deepcopy(schema)
         return selected
 
+    program_abi_receipt = (
+        {"records": {}, "bindings": (), "values": ()}
+        if extraction_policy is None else
+        extraction_policy.program_abi.receipt()
+    )
     has_authored_tensor_parameters = any(
         authored_tensor_boundary_values(entry, function_graph)
         for entry in graph.function_table
@@ -61718,11 +61912,6 @@ def _lower_ast_source_to_ssa_impl(
         # whose function/parameter rules explicitly match the contract.
         # The compilation's schema receipt is established first: the typed
         # parameter join below (_typed_parameter_record_receipts) reads it.
-        program_abi_receipt = (
-            {"records": {}, "bindings": (), "values": ()}
-            if extraction_policy is None else
-            extraction_policy.program_abi.receipt()
-        )
         # Explicit contracts remain authoritative. Source-derived schemas fill
         # only classes whose complete dataclass layout is present in this
         # authored compilation unit, making their constructors structural SSA
@@ -61858,6 +62047,30 @@ def _lower_ast_source_to_ssa_impl(
     report("ssa-source: reducing source topology")
     reduce_abstract_tensor_topology(graph)
     _install_concorded_type_expectation_vocabularies(graph)
+    reduced_initializer_fields = _reduced_initializer_list_fields(graph)
+    if reduced_initializer_fields:
+        # The first schema pass intentionally cannot type unannotated list
+        # fields. Clock -> Page(book=clock) needs the exact reduced member
+        # receipt before nested record materialization, at this existing ABI
+        # reattachment boundary rather than at the downstream consumer.
+        for declaration_module, declaration_tree in (
+            (source_module, tree), *declared_source_modules,
+        ):
+            reduced_schemas = {}
+            reduced_views = _authored_dataclass_record_views(
+                declaration_tree, projection_schemas=reduced_schemas,
+                source_module=declaration_module, carried_declarations=True,
+                reduced_initializer_fields=reduced_initializer_fields,
+            )
+            inferred_record_views.update(reduced_views)
+            inferred_record_schemas.update(_record_schemas_with_constructors(
+                reduced_schemas, _authored_complete_record_schemas(declaration_tree),
+            ))
+        program_abi_receipt["records"] = {
+            **inferred_record_schemas,
+            **({} if extraction_policy is None else
+               dict(extraction_policy.program_abi.receipt().get("records") or {})),
+        }
     for intrinsic_graph in (
         graph,
         *(getattr(entry, "graph", None) for entry in graph.function_table),
