@@ -7524,11 +7524,36 @@ def _authored_dataclass_record_views(
         """Prove a scalar field from its authored initializer, without guessing."""
 
         scalar_type = None
+        if isinstance(value, ast.Dict) and not value.keys:
+            return {
+                "storage": "reference",
+                "dtype": "opaque_ref",
+                "rank": 0,
+                "mutable": True,
+                "aggregate_kind": "dict",
+            }
         if (
             isinstance(value, ast.Call)
             and isinstance(value.func, ast.Name)
-            and value.func.id in {"int", "float", "bool"}
+            and value.func.id == "array"
+            and len(value.args) >= 1
+            and isinstance(value.args[0], ast.Constant)
+            and isinstance(value.args[0].value, str)
         ):
+            dtype = {
+                "B": "uint8",
+                "I": "uint32",
+                "Q": "uint64",
+            }.get(value.args[0].value)
+
+            if dtype is not None:
+                return {
+                    "storage": "span",
+                    "dtype": dtype,
+                    "rank": 1,
+                    "mutable": True,
+                    "aggregate_kind": "array",
+                }
             scalar_type = value.func.id
         elif isinstance(value, ast.Constant):
             # bool is an int subclass, so order is significant here.
@@ -10874,19 +10899,23 @@ def _field_slot_ops(
                             "tuple", "bytes", "frozenset",
                         }
                     )
-                    sequence_declarations.append((
-                        sequence_id,
-                        "unique" if aggregate_kind in {
-                            "set", "frozenset", "dict",
-                        } else "duplicates",
-                        (
-                            2 if aggregate_kind == "dict" else
-                            max(1, annotated_row_widths.get(
-                                int(sequence_id), 1,
-                            ))
-                        ),
-                        sequence_writable,
-                    ))
+                    if not any(
+                        int(existing_sequence_id) == int(sequence_id)
+                        for existing_sequence_id, *_rest in sequence_declarations
+                    ):
+                        sequence_declarations.append((
+                            sequence_id,
+                            "unique" if aggregate_kind in {
+                                "set", "frozenset", "dict",
+                            } else "duplicates",
+                            (
+                                2 if aggregate_kind == "dict" else
+                                max(1, annotated_row_widths.get(
+                                    int(sequence_id), 1,
+                                ))
+                            ),
+                            sequence_writable,
+                        ))
                 storage_identity = f"{owner}.{canonical_field(str(attribute))}"
                 if storage_identity in retained_storage_identities:
                     retained_sequence_ids.add(sequence_id)
@@ -34403,10 +34432,22 @@ def _class_surface_ssa_program(
                 if sequence is None:
                     continue
                 storage_identity = str(field.storage_identity)
+                receipt = sequence_view_receipt(sequence)
+
+                if storage_identity == "Vocabulary._candidates":
+                    print(
+                        "CANDIDATES_SEQUENCE_VIEW:",
+                        "source_symbol=", source_symbol,
+                        "record_id=", record_id,
+                        "field=", field.name,
+                        "sequence_id=", field.sequence_id,
+                        "receipt=", receipt,
+                    )
+
                 local_sequence_views.setdefault(
                     storage_identity, []
                 ).append((
-                    sequence_view_receipt(sequence),
+                    receipt,
                     _frame_cells(
                         _frame_table_cell(
                             table, int(record_id), RECORD_DESCRIPTOR,
@@ -34429,37 +34470,122 @@ def _class_surface_ssa_program(
                 )
     for storage_identity, receipts in compile_iter(local_sequence_views.items(),
             "record-sequence-evidence", label="Record sequence evidence selected"):
-        candidates = tuple(dict.fromkeys(
-            receipt for receipt, _cells in receipts
-        ))
-        # ``reference`` fields initially expose one unknown placeholder
-        # column.  A complete authored Sequence[Record] annotation is stronger
-        # evidence for that SAME storage identity, so select it before the
-        # concordance is committed.  Multiple non-placeholder layouts remain
-        # a hard disagreement.
+        # Record-field sequence views are method-local observations of one
+        # declared storage identity.  Reconcile complementary evidence here
+        # before publishing the one cross-method physical view.
+        def unresolved_sequence_view(receipt):
+            dtypes, column_count, key_columns, _live, _capacity, child_pool = receipt
+
+            return (
+                (
+                    dtypes == ("unknown",)
+                    and column_count == 1
+                )
+                or
+                (
+                    dtypes == ("unknown", "unknown")
+                    and column_count == 2
+                    and key_columns == (0,)
+                    and not child_pool
+                )
+            )
+
         materialized = tuple(
-            receipt for receipt in candidates
-            if not (
-                receipt[0] == ("unknown",)
-                and receipt[1] == 1
-            )
+            (receipt, receipt_cells)
+            for receipt, receipt_cells in receipts
+            if not unresolved_sequence_view(receipt)
         )
-        decisive = materialized or candidates
-        if len(decisive) != 1:
+        evidence = materialized or tuple(receipts)
+
+        if not evidence:
             raise ValueError(
-                "record field sequence view disagreement for "
-                f"{storage_identity!r}: {decisive!r}"
+                "record field sequence view has no evidence for "
+                f"{storage_identity!r}"
             )
+
+        (
+            first_dtypes,
+            column_count,
+            key_columns,
+            live_flags,
+            capacity_policy,
+            first_child_pool,
+        ) = evidence[0][0]
+
+        resolved_dtypes = list(first_dtypes)
+        child_pool = bool(first_child_pool)
+
+        for receipt, _receipt_cells in evidence[1:]:
+            (
+                candidate_dtypes,
+                candidate_column_count,
+                candidate_key_columns,
+                candidate_live_flags,
+                candidate_capacity_policy,
+                candidate_child_pool,
+            ) = receipt
+
+            # These are structural properties of the same physical table.
+            # Unlike dtype knowledge, they may not silently change between
+            # method-local views.
+            if (
+                candidate_column_count != column_count
+                or candidate_key_columns != key_columns
+                or candidate_live_flags != live_flags
+                or candidate_capacity_policy != capacity_policy
+            ):
+                raise ValueError(
+                    "record field sequence structural disagreement for "
+                    f"{storage_identity!r}: "
+                    f"{tuple(receipt for receipt, _cells in evidence)!r}"
+                )
+
+            if len(candidate_dtypes) != len(resolved_dtypes):
+                raise ValueError(
+                    "record field sequence dtype width disagreement for "
+                    f"{storage_identity!r}: "
+                    f"{tuple(receipt for receipt, _cells in evidence)!r}"
+                )
+
+            for position, candidate_dtype in enumerate(candidate_dtypes):
+                incumbent_dtype = resolved_dtypes[position]
+
+                if incumbent_dtype == "unknown":
+                    resolved_dtypes[position] = candidate_dtype
+                elif candidate_dtype == "unknown":
+                    pass
+                elif incumbent_dtype != candidate_dtype:
+                    raise ValueError(
+                        "record field sequence dtype disagreement for "
+                        f"{storage_identity!r} column {position}: "
+                        f"{incumbent_dtype!r} != {candidate_dtype!r}"
+                    )
+
+            # A method that does not locally require/materialize a child pool
+            # does not disprove another method's positive evidence that this
+            # same record-field storage has one.
+            child_pool = child_pool or bool(candidate_child_pool)
+
+        decisive = (
+            tuple(resolved_dtypes),
+            int(column_count),
+            tuple(key_columns),
+            bool(live_flags),
+            str(capacity_policy),
+            bool(child_pool),
+        )
+
         _frame_post(
             RECORD_FIELD_SEQUENCE_VIEW,
-            (access_scope, storage_identity), decisive[0],
-            stage=RECORD_FORWARDING, mode=Mode.CONCORD,
-            cells=tuple(
+            (access_scope, storage_identity),
+            decisive,
+            stage=RECORD_FORWARDING,
+            mode=Mode.CONCORD,
+            cells=tuple(dict.fromkeys(
                 cell
-                for receipt, receipt_cells in receipts
-                if receipt == decisive[0]
+                for _receipt, receipt_cells in evidence
                 for cell in receipt_cells
-            ),
+            )),
             reason=GRAPH_ID_WITHOUT_CANONICAL_CELL,
         )
 

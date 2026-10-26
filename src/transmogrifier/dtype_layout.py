@@ -147,6 +147,13 @@ _DECLARED: tuple[DTypeLayout, ...] = (
         aliases=("int32", "i32", "int"),
     ),
     DTypeLayout(
+        name="uint32", kind="uint", byte_size=4, alignment=4,
+        c_type="uint32_t", ctypes_name="c_uint32", c_storage_type="uint32_t",
+        llvm_type="i32", wasm_type=None, fortran_kind=None,
+        numpy_dtype="uint32", nodus_code=13,
+        aliases=("uint32", "u32"),
+    ),
+    DTypeLayout(
         name="int64", kind="int", byte_size=8, alignment=8,
         c_type="int64_t", ctypes_name="c_int64", c_storage_type="int64_t",
         llvm_type="i64", wasm_type="i64", fortran_kind="integer(c_int64_t)",
