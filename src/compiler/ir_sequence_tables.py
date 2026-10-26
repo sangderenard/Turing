@@ -4623,7 +4623,12 @@ def lower_sequence_extend(
         if any(destination.column_shapes) or any(source.column_shapes):
             raise ValueError("heap sequence extend requires scalar row columns")
 
-    insert_name = f"ssa_sequence_{destination.sequence_id}_insert"
+    # Two specialized owners can both have local sequence75. Extending each
+    # must not install one global ssa_sequence_75_insert with incompatible
+    # length/capacity/owner identities. The supplied operation identity owns
+    # its nested insert, just as it owns its reserve helpers.
+    insert_name = (f"{function_name}__insert" if function_name is not None
+                   else f"ssa_sequence_{destination.sequence_id}_insert")
     insert_lowering = lower_sequence_insert(
         destination,
         function_name=insert_name,

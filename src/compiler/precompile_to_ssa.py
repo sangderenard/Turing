@@ -30064,6 +30064,15 @@ def lower_control_sections_to_ssa(
     # from (``identity_concordance.shape_scope_of``).
     if shape_scope is not None:
         for _stamped in functions.values():
+            if _stamped.metadata.get("ssa_sequence_operation"):
+                # A returned statuses list is unresolved when its replace
+                # helper is born. The helper's descriptor formals are its
+                # own SSA rows, not graph projection38: inheriting the
+                # owner's shape scope completed them from that projection's
+                # provisional float64 before the int64 return was linked.
+                # Sequence helpers have no graph copy; their descriptor and
+                # exact call bindings own their physical element layout.
+                continue
             _stamped.metadata.setdefault("shape_scope", tuple(shape_scope))
     compile_substage(f"SSA section {control_name}: assemble repository module")
     module = IRModule(
