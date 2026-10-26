@@ -26216,10 +26216,20 @@ def _fold_callsite_structural_values(
 
     def replace(node_id: int, value: Any) -> None:
         nonlocal topology_changed, abi_published
-        abi_published = False
         data = graph.G.nodes[int(node_id)]
-        topology_changed |= bool(data.get("parents"))
         source_attributes = data.get("attributes") or {}
+        if (source_attributes.get("producer_kind") == "sequence_replication"
+                and source_attributes.get("aggregate_kind") == "list"
+                and isinstance(value, list)):
+            # batch(1) returns statuses=[0]*count and tokens=[count]*count.
+            # Folding those lists cut their fill/count edges and erased the
+            # replication birth, so Ret named separate empty arenas (native
+            # n=0 returned0 instead1101). A known mutable list value still
+            # needs its existing fill operation and exact operand identities.
+            # Immutable tuple replication remains a structural constant.
+            return
+        abi_published = False
+        topology_changed |= bool(data.get("parents"))
         if isinstance(data.get("expr_obj"), ast.AST):
             data.setdefault("authored_expr_obj", data["expr_obj"])
         # The cells the fold's ``known`` held for this node: its operands'

@@ -24,6 +24,30 @@ def root(n: int):
 '''
 
 
+def test_immutable_tuple_replication_still_folds(tmp_path):
+    source = '''def extent(count: int):
+    dimensions = (1,) * count
+    return len(dimensions)
+def root():
+    return extent(3)
+'''
+    module, outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="immutable_tuple_replication",
+        extraction_contract=Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml",
+        progress=lambda _: None, progress_bars=False,
+    )
+    assert CorrelationTable.build(module).findings(module) == []
+    assert not any(function.metadata.get("ssa_sequence_operation") == "fill"
+                   for function in module.functions.values())
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path)
+    result = outputs[exports[0]][0].id
+    assert artifact.prepare_execution({}).run().buffers[result].item() == 3
+
+
 def test_registered_replacement_scope_is_independent():
     module, _outputs, _exports = lower_ast_source_to_ssa(
         SOURCE, "root", name="helper_scope_identity",

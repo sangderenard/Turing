@@ -2999,9 +2999,25 @@ class _FunctionEmitter:
                 )
                 if str(target_value.dtype or self.dtype) in _INTEGER_DTYPES:
                     source_expression = f"int({source_expression}, c_int64_t)"
-            prelude.append(
-                f"    {output_argument} = {source_expression}"
+            same_caller_array = (
+                int(source_value.id) == int(target_value.id)
+                and str(source_value.dtype) == str(target_value.dtype)
+                and tuple(source_value.shape or ()) == tuple(target_value.shape or ())
+                and (
+                    bool(source_value.shape)
+                    or int(self.dynamic_array_ranks.get(int(source_value.id), 0)) > 0
+                    or int(source_value.id) in self.array_base_ids
+                )
             )
+            # Both values above are caller actuals: one Call operand and one
+            # aggregate projection in this function's SSA namespace. When a
+            # returned list already is that exact inout arena, the binding
+            # needs no seed copy. Emitting t9=t9 invented a whole assignment
+            # to an assumed-size array before the real batch call.
+            if not same_caller_array:
+                prelude.append(
+                    f"    {output_argument} = {source_expression}"
+                )
             input_arguments[input_index] = output_argument
             aliased_output_indices.add(int(output_index))
         if any(
