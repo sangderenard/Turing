@@ -1,5 +1,6 @@
 """A selected mapping value mutates the resident child pool, not a new list."""
 from pathlib import Path
+import ctypes
 import numpy as np
 import pytest
 import subprocess
@@ -82,7 +83,7 @@ def test_nonempty_child_default_does_not_silently_initialize_an_empty_row():
             progress=lambda _: None, progress_bars=False)
 
 
-def _exercise_caller_owned_child_pool(backend, tmp_path, *, undersized_pool=False, undersized_outer=False):
+def _exercise_caller_owned_child_pool(backend, tmp_path):
     source = (ROOT / "tests/record_view_corpus/c639_caller_mapping_child.py").read_text()
     module, outputs, exports = lower_ast_source_to_ssa(
         source, "root", name="caller_child_pool",
@@ -95,9 +96,9 @@ def _exercise_caller_owned_child_pool(backend, tmp_path, *, undersized_pool=Fals
                  if record.identity == "Index" for field in record.fields if field.name == "table")
     descriptor = module.sequence_tables[root].by_id(field.sequence_id)
     pool = descriptor.child_table_pool
-    # These are declared public Index.table members, not invented private
-    # workspaces. The test supplies four outer rows and four elements per
-    # child. The six transactions below use two rows and at most two elements.
+    assert descriptor.heap_owner_value_id is not None and descriptor.capacity_policy.value == "dynamic"
+    # Python's mutable annotated mapping declares the existing managed pool
+    # ABI. Supply its public context and pointer cells, never raw fixed arenas.
     feeds = {parameters[name]: np.zeros(1, dtype="bool" if name == "write" else "int64")
              for name in ("write", "key", "value", "query")}
     feeds[parameters["index"]] = np.zeros(1, dtype="int64")
@@ -109,23 +110,17 @@ def _exercise_caller_owned_child_pool(backend, tmp_path, *, undersized_pool=Fals
             record = module.record_tables[root].records[value_id]
             feeds[tag_id] = np.array([dict(fact.tags)[record.identity]], dtype="int64")
     for column in descriptor.column_value_ids:
-        feeds[column] = np.zeros(4, dtype="int64")
+        feeds[column] = np.zeros(1, dtype="uint64")
+    feeds[descriptor.heap_owner_value_id] = np.zeros(1, dtype="uint64")
     feeds[descriptor.length_address_id] = np.array([0], dtype="int64")
-    feeds[descriptor.capacity_value_id] = np.array([0 if undersized_outer else 4], dtype="int64")
+    feeds[descriptor.capacity_value_id] = np.zeros(1, dtype="int64")
     feeds[descriptor.status_address_id] = np.zeros(1, dtype="int32")
     for column in pool.column_value_ids:
-        feeds[column] = np.zeros(16, dtype="int64")
-    feeds[pool.length_value_id] = np.zeros(4, dtype="int64")
-    feeds[pool.capacity_value_id] = np.array([3 if undersized_pool else 16], dtype="int64")
-    feeds[pool.row_stride_value_id] = np.array([4], dtype="int64")
-    feeds[pool.status_value_id] = np.zeros(4, dtype="int32")
-    if undersized_pool or undersized_outer:
-        for column in descriptor.column_value_ids:
-            feeds[column][:] = 123
-        for column in pool.column_value_ids:
-            feeds[column][:] = 111
-        feeds[pool.length_value_id][:] = 77
-        feeds[pool.status_value_id][:] = 91
+        feeds[column] = np.zeros(1, dtype="uint64")
+    feeds[pool.length_value_id] = np.zeros(1, dtype="uint64")
+    feeds[pool.capacity_value_id] = np.zeros(1, dtype="int64")
+    feeds[pool.row_stride_value_id] = np.zeros(1, dtype="int64")
+    feeds[pool.status_value_id] = np.zeros(1, dtype="uint64")
     scalar_members = {}
     for record_id, record in module.record_tables[root].records.items():
         if record.identity in {"builtins.int", "builtins.bool"} and record_id in feeds:
@@ -137,6 +132,8 @@ def _exercise_caller_owned_child_pool(backend, tmp_path, *, undersized_pool=Fals
         artifact = emit_ssa_to_c(module, root)
         assert artifact.complete, artifact.shortfalls
         artifact.compile(tmp_path / "native")
+        header = next((tmp_path / "native").glob("*_layout.h")).read_text()
+        assert "TURING_PTR" in header
         execution = artifact.prepare_execution(feeds)
     elif backend == "llvm":
         from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm, compile_artifact, prepare_artifact_execution
@@ -160,21 +157,6 @@ def _exercise_caller_owned_child_pool(backend, tmp_path, *, undersized_pool=Fals
                 if member in execution.buffers:
                     execution.buffers[member][0] = payload
 
-    if undersized_pool or undersized_outer:
-        set_inputs(True, 3, 99, 3)
-        before = {value_id: execution.buffers[value_id].copy() for value_id in field.value_ids}
-        print("BOUNDS_EXECUTION_BEGIN", backend, flush=True)
-        if backend == "fortran":
-            # ERROR STOP must run only in the child process below.
-            execution.run()
-            raise AssertionError("undersized Fortran pool did not stop")
-        with pytest.raises(RuntimeError, match="75"):
-            execution.run()
-        for value_id, snapshot in before.items():
-            assert np.array_equal(execution.buffers[value_id], snapshot), value_id
-        print("BOUNDS_NO_MUTATION", backend, flush=True)
-        return
-
     big = 2**53 + 1
     transactions = [
         (False, 3, 0, 3, 0), (True, 3, big, 3, big),
@@ -186,9 +168,11 @@ def _exercise_caller_owned_child_pool(backend, tmp_path, *, undersized_pool=Fals
         result = execution.run()
         assert result.buffers[outputs[root][0].id].item() == expected
     assert execution.buffers[descriptor.length_address_id].item() == 2
-    assert execution.buffers[pool.length_value_id][:2].tolist() == [2, 1]
-    assert execution.buffers[pool.column_value_ids[0]][:2].tolist() == [big, 7]
-    assert execution.buffers[pool.column_value_ids[0]][4] == 11
+    lengths = (ctypes.c_int64 * int(execution.buffers[descriptor.capacity_value_id][0])).from_address(int(execution.buffers[pool.length_value_id][0]))
+    data = (ctypes.c_int64 * int(execution.buffers[pool.capacity_value_id][0])).from_address(int(execution.buffers[pool.column_value_ids[0]][0]))
+    assert list(lengths)[:2] == [2, 1]
+    assert list(data)[:2] == [big, 7]
+    assert data[int(execution.buffers[pool.row_stride_value_id][0])] == 11
     report = concordance_report(module)
     assert "0 finding(s)" in report, report
 
@@ -203,8 +187,8 @@ def test_caller_owned_child_pool_found_missing_and_repeated_mutations(backend, t
 def test_undersized_flattened_pool_refuses_without_initializing_or_appending(backend, exhaustion, tmp_path):
     probe = (
         "from pathlib import Path\n"
-        "from tests.test_mapping_child_sequence_views import _exercise_caller_owned_child_pool\n"
-        f"_exercise_caller_owned_child_pool({backend!r}, Path({str(tmp_path)!r}), undersized_pool={exhaustion == 'pool'}, undersized_outer={exhaustion == 'outer'})\n"
+        "from tests.test_fixed_child_pool_bounds import _exercise\n"
+        f"_exercise({backend!r}, Path({str(tmp_path)!r}), {exhaustion!r})\n"
     )
     result = subprocess.run([sys.executable, "-u", "-c", probe], cwd=ROOT,
                             capture_output=True, text=True, timeout=60)

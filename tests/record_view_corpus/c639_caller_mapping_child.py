@@ -1,6 +1,5 @@
 class Index:
-    def __init__(self):
-        self.table = {}
+    table: dict[int, list[int]]
 
     def put(self, key: int, value: int):
         self.table.setdefault(key, []).append(value)

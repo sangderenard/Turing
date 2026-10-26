@@ -5953,6 +5953,30 @@ def _authored_annotation_field_receipt(
         value_is_tensor = tensor_annotation_identity(
             value_annotation, python_bindings,
         ) is not None
+        if isinstance(value_annotation, ast.Subscript):
+            child = _authored_annotation_field_receipt(
+                value_annotation, python_bindings, authored_record_identities,
+                authored_scalar_identities,
+            )
+            if (
+                child is not None
+                and child.get("storage") == "span"
+                and child.get("aggregate_kind") == "list"
+                and child.get("dtype") in {"int64", "float64", "bool"}
+            ):
+                # c639 borrowed Index declares table: dict[int, list[int]]
+                # without allocating it.  Omitting that exact field left the
+                # root without a record ABI; late call linking then copied a
+                # sequence field whose descriptor the root never owned.
+                # As for nested sequences below, the field is an incumbent
+                # descriptor reference, expanded through its declared table
+                # roles.  Keep the child's typed layout, not an opaque row.
+                return {
+                    "storage": "reference", "dtype": "opaque_ref", "rank": 0,
+                    "mutable": container in {"dict", "Dict", "MutableMapping"},
+                    "aggregate_kind": "dict", "descriptor_handle": True,
+                    "descriptor_element_dtype": str(child["dtype"]),
+                }
         value_dtype = {
             "bool": "bool", "int": "int64", "float": "float64",
             "str": "int64",

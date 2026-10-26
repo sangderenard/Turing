@@ -11883,9 +11883,18 @@ class _ControlSSABuilder(TiledObject):
             members = (
                 *self.sequence_storage_values[value_id],
                 *((status_address,) if status_address is not None else ()),
+                *child_pool_values,
             )
             arena_ids = {*descriptor.column_value_ids,
                          *((descriptor.live_flags_value_id,) if descriptor.live_flags_value_id is not None else ())}
+            # A fixed caller-owned mapping's selected child row borrows the
+            # same parameter's pool. Omitting these exact descriptor members
+            # classified its row arena as private and refused valid capacity.
+            if child_table_pool is not None:
+                arena_ids.update(child_table_pool.column_value_ids)
+                arena_ids.add(child_table_pool.length_value_id)
+                if child_table_pool.status_value_id is not None:
+                    arena_ids.add(child_table_pool.status_value_id)
             # Program: gen_sort.py (``xs: list[int]`` parameter).  Wrong record:
             # the descriptor members (data arena, length address, capacity,
             # status address, live flags) were given ProgramABI storage/rank
@@ -16147,8 +16156,12 @@ class _ControlSSABuilder(TiledObject):
                     first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
                 )
                 self._register_sequence_lowering(lookup)
+                # A selected child handle is the parent table's declared
+                # value column. Narrowing it to generic int made the fixed
+                # int64 table-store call ill-typed (and truncated large rows).
+                handle_dtype = destination.column_dtypes[pool.handle_column]
                 lookup_handle = self.fresh_value(
-                    dtype="int", transform=TABLE_LOOKUP,
+                    dtype=handle_dtype, transform=TABLE_LOOKUP,
                     operands=(
                         self._sequence_contract_cell(int(destination.sequence_id)),
                         *mutation.argument_value_ids[:key_count],
@@ -16219,11 +16232,11 @@ class _ControlSSABuilder(TiledObject):
                     attributes={"binding": "ssa_mapping_setdefault_handle"},
                 )
                 new_handle = self.fresh_value(
-                    dtype="int", transform=CONTROL_CAST, operands=(outer_length,),
+                    dtype=handle_dtype, transform=CONTROL_CAST, operands=(outer_length,),
                 )
                 self.emit(
                     Handler.Cast, [outer_length], new_handle,
-                    attributes={"target_dtype": "int"},
+                    attributes={"target_dtype": handle_dtype},
                 )
                 self._bind(
                     int(new_handle.id), new_handle, BindingKind.SEQUENCE_RESULT,
@@ -16314,7 +16327,7 @@ class _ControlSSABuilder(TiledObject):
                 self.current = complete
                 result = self.produced_value(
                     int(mutation.effect_node_id),
-                    dtype="int",
+                    dtype=handle_dtype,
                     claim_provisional_definition=True,
                     cause=(lookup_handle, new_handle, found),
                 )
