@@ -1,5 +1,4 @@
-2026-10-26 TITLE (MEASURED, where): 
-# Caller-owned mapping contexts and explicit fixed child bounds
+2026-10-26 CALLER-OWNED MAPPING CONTEXTS AND FIXED CHILD BOUNDS (MEASURED, Windows):
 
 The no-allocation source fixture declares `Index.table: dict[int, list[int]]`.
 Its annotation previously produced no field receipt, so the root had no
