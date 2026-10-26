@@ -1980,7 +1980,7 @@ _RECEIVER_READING_METHODS = frozenset({
     "startswith", "endswith", "find", "rfind",
 })
 
-_MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray"})
+_MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray", "array"})
 
 
 def _receiver_collection_kind(data: Any) -> str | None:
@@ -2454,7 +2454,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         # unexplained function formal for the vanished node id.
         return (ControlExpression("const", literal=literal),)
 
-    sequence_kinds = {"list", "set", "bytes", "bytearray"}
+    sequence_kinds = {"list", "set", "bytes", "bytearray", "array"}
     mutations = []
     from .concordance_declarations import (
         SOURCE_SORT_CONTRACT, SourceSortContract,

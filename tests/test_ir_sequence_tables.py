@@ -1745,12 +1745,14 @@ def test_declared_array_receiver_refines_raw_span_before_method_linking():
         for field in descriptor.fields
         if field.storage_identity == "Vocabulary.exact_begin"
     ]
-    assert field_history[0].storage is SSARecordFieldStorage.SPAN
-    assert field_history[-1].storage is SSARecordFieldStorage.SEQUENCE
+    assert all(field.storage is SSARecordFieldStorage.SEQUENCE
+               for field in field_history)
+    assert len({field.sequence_id for field in field_history}) == 1
     sequence = module.sequence_tables[inspect_name].by_id(
         int(field_history[-1].sequence_id)
     )
-    assert field_history[0].value_ids == (sequence.column_value_ids[0],)
+    assert field_history[0].value_ids == field_history[-1].value_ids
+    assert sequence.column_value_ids[0] in field_history[0].value_ids
     assert sequence.column_dtypes == ("uint64",)
 
 
@@ -1820,6 +1822,42 @@ def test_empty_dict_constructor_keeps_accepted_receiver_table_roles():
         for block in module.functions[constructor].blocks.values()
         for instruction in block.instrs
     )
+
+
+def test_guarded_array_lengths_and_append_keep_one_resident_sequence():
+    from src.compiler.identity_concordance import concordance_report
+
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c632_guarded_record_length.py"
+    ).read_text(encoding="utf-8")
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="guarded_array_lengths",
+        extraction_contract=(Path(__file__).resolve().parents[1]
+                             / "extraction_contracts" / "program_extraction.yaml"),
+        progress=lambda _message: None, progress_bars=False,
+    )
+    function = next(function for function in module.functions.values()
+                    if "__add__specialized" in function.name
+                    and "__planned_region_" not in function.name
+                    and "__ssa_sequence_" not in function.name)
+    instructions = [instruction for block in function.blocks.values()
+                    for instruction in block.instrs]
+    lengths = [instruction for instruction in instructions
+               if instruction.attributes.get("binding") == "ssa_sequence_length_value"]
+    assert len(lengths) == 3
+    addresses = {instruction.res.id: instruction.args[0].id
+                 for instruction in instructions
+                 if instruction.attributes.get("binding") == "ssa_sequence_length_address"}
+    assert len({addresses[instruction.args[0].id] for instruction in lengths}) == 1
+    append = next(instruction for instruction in instructions
+                  if instruction.attributes.get("ssa_sequence_operation") == "append")
+    assert append.args[-1].dtype == "uint8"
+    assert any(instruction.op == "Cast" and instruction.res.dtype == "uint8"
+               and instruction.attributes.get("binding") == "ssa_sequence_uint8_range"
+               for instruction in instructions)
+    report = concordance_report(module)
+    assert "0 finding(s)" in report, report
 
 
 def test_readonly_forwarding_keeps_typed_mutable_sequence_owner():
