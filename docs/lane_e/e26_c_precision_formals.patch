@@ -1,0 +1,136 @@
+From d344388efa43377d1d277fe46d2564c6ea7aeba0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 13:18:56 +0000
+Subject: [PATCH] C module lane publishes Precision-typed formals and refuses
+ unfed buffers (E26)
+
+The precision pipeline lowers a Precision parameter into its leading
+limb, carried by the formal itself, plus member formals for later limbs.
+is_structural_abi_value still read those formals as record descriptors,
+so the C module lane owned and zeroed them and left them out of its
+buffer order (sin core: x, y and all 14 leading coefficient limbs);
+prepare_execution silently ignored their feeds and the native entry
+corrupted the heap.  A precision parameter is now fed storage, the C
+buffer order matches the LLVM lane's, and a feed with no public buffer
+is refused.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HWwupi8vM93bH2qoxo5SMi
+---
+ src/compiler/ssa_c_backend.py            |  8 ++++
+ src/compiler/ssa_storage_requirements.py | 13 ++++++
+ tests/test_c_module_precision_formals.py | 59 ++++++++++++++++++++++++
+ 3 files changed, 80 insertions(+)
+ create mode 100644 tests/test_c_module_precision_formals.py
+
+diff --git a/src/compiler/ssa_c_backend.py b/src/compiler/ssa_c_backend.py
+index d0daf5fc..75fe1589 100644
+--- a/src/compiler/ssa_c_backend.py
++++ b/src/compiler/ssa_c_backend.py
+@@ -1242,6 +1242,14 @@ class CModuleArtifact:
+         import numpy as np
+ 
+         feed_values = {int(key): value for key, value in dict(feeds or {}).items()}
++        # A feed with no public buffer was dropped without a word, and the
++        # entry then ran on zeroed storage it does not own (E26).
++        unknown = sorted(set(feed_values) - {int(item) for item in self.buffer_order})
++        if unknown:
++            raise ValueError(
++                f"feeds {unknown} name no public buffer of {self.name}; "
++                f"its buffers are {tuple(map(int, self.buffer_order))}"
++            )
+         shape_overrides = {
+             int(key): tuple(map(int, value))
+             for key, value in dict(shapes or {}).items()
+diff --git a/src/compiler/ssa_storage_requirements.py b/src/compiler/ssa_storage_requirements.py
+index c74d28bc..ac71058c 100644
+--- a/src/compiler/ssa_storage_requirements.py
++++ b/src/compiler/ssa_storage_requirements.py
+@@ -56,6 +56,19 @@ def is_structural_abi_value(function: Any, value: Any) -> bool:
+         for parameter_name, value_id in metadata.get("parameter_names", ())
+         if str(parameter_name) in records
+     }
++    # Program: the microprecision sin core's ``x``, ``y`` and ``c0..c13``
++    # (E26).  A Precision parameter's record descriptor is lowered by the
++    # precision pipeline into its leading limb, which the formal itself now
++    # carries; it is fed storage like the member formals of its later limbs,
++    # not a cell table the wrapper may own and zero.
++    precision_parameter_ids = {
++        int(descriptor["value_id"])
++        for descriptor in metadata.get("numeric_parameter_descriptors", ())
++        if "precision" in tuple(
++            (descriptor.get("descriptor") or {}).get("features") or ()
++        )
++    }
++    record_parameter_ids -= precision_parameter_ids
+     accounting = dict(getattr(value, "accounting", None) or {})
+     return (
+         int(value.id) in record_parameter_ids
+diff --git a/tests/test_c_module_precision_formals.py b/tests/test_c_module_precision_formals.py
+new file mode 100644
+index 00000000..a1e4e44d
+--- /dev/null
++++ b/tests/test_c_module_precision_formals.py
+@@ -0,0 +1,59 @@
++"""The C module lane publishes Precision-typed formals as buffers (E26).
++
++The microprecision sin core's wrapper takes ``x``, ``y`` and fourteen
++coefficients as Precision values.  The precision pipeline lowers each one to
++its leading limb, which the formal itself carries, plus member formals for
++the later limbs.  The C module lane read the leading-limb formals as record
++descriptors it owns, left them out of ``buffer_order`` and zeroed them, and
++``prepare_execution`` dropped their feeds without a word; the native entry
++then corrupted the heap.  The C lane must publish the same buffers the LLVM
++lane does and refuse a feed it has no buffer for.
++"""
++
++import pathlib
++import sys
++
++import numpy as np
++import pytest
++
++REPO = pathlib.Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(REPO))
++
++
++@pytest.fixture(scope="module")
++def sin_core():
++    from tools import benchmark_microprecision_matrix as matrix
++
++    core = matrix._prepare_core("sin", 2)
++    return core, matrix._wrapper_name("sin", 2, core)
++
++
++def test_c_module_publishes_precision_formals_like_llvm(sin_core):
++    from src.compiler.ssa_c_backend import emit_ssa_to_c
++    from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
++
++    core, wrapper = sin_core
++    c_artifact = emit_ssa_to_c(core.module, wrapper)
++    llvm_artifact = emit_ssa_function_to_llvm(core.module, wrapper)
++    assert not c_artifact.shortfalls
++    assert tuple(map(int, c_artifact.buffer_order)) == tuple(
++        map(int, llvm_artifact.buffer_order)
++    )
++    root = core.module.functions[wrapper]
++    precision = {
++        int(value.id) for value in root.args
++        if (value.accounting or {}).get("native_exact_type") == "Precision"
++    }
++    assert len(precision) == 16
++    assert precision <= set(map(int, c_artifact.buffer_order))
++
++
++def test_c_module_refuses_a_feed_with_no_buffer(sin_core, tmp_path):
++    from src.compiler.ssa_c_backend import emit_ssa_to_c
++
++    core, wrapper = sin_core
++    artifact = emit_ssa_to_c(core.module, wrapper)
++    artifact.compile(tmp_path / "native")
++    unknown = max(map(int, artifact.buffer_order)) + 1
++    with pytest.raises(ValueError, match="name no public buffer"):
++        artifact.prepare_execution({unknown: np.zeros(2)})
+-- 
+2.43.0
+

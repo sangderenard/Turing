@@ -199,7 +199,7 @@ def _propagate_scalar_dtypes(functions) -> None:
     floats = {"float", "float16", "float32", "float64", "double", "f32", "f64"}
     preserving = {
         "Add", "Sub", "Mul", "FloorDiv", "Mod", "Pow", "Min", "Max",
-        "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "Neg", "Abs", "Invert",
+        "BitAnd", "BitOr", "BitXor", "Shl", "Shr", "AShr", "LShr", "Neg", "Abs", "Invert",
     }
     predicates = {
         "Eq", "Ne", "Lt", "Le", "Gt", "Ge", "ULt", "ULe",

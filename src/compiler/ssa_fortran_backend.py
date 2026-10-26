@@ -124,6 +124,7 @@ _BINARY: dict[str, str] = {
     # loop-carried values grow large and can make termination impossible.
     "Shr": "shifta({0}, {1})",
     "AShr": "shifta({0}, {1})",
+    "LShr": "shiftr({0}, {1})",
     "MatMul": "matmul({0}, {1})",
     "Max": "max({0}, {1})",
     "Min": "min({0}, {1})",

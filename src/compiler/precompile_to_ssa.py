@@ -26320,7 +26320,7 @@ def lower_control_sections_to_ssa(
         # t_wait came out 0 instead of 4995.3 s (2026-10-03,
         # docs/concordance_census/CONTINUATION_phasing_regression.md).
         integer_ops = {
-            "And", "Or", "Xor", "Shl", "Shr",
+            "And", "Or", "Xor", "Shl", "Shr", "AShr", "LShr",
             "bitand", "bitor", "bitxor", "shl", "shr",
         }
         arithmetic_ops = {
