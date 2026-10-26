@@ -2469,6 +2469,10 @@ class _ControlSSABuilder(TiledObject):
             int, lexical_table_lookup_result_ids,
         ))
         self.sequence_descriptors: dict[int, SSASequenceDescriptor] = {}
+        self.source_sequence_column_dtypes = {
+            int(sequence_id): tuple(map(str, dtypes))
+            for sequence_id, dtypes in (sequence_column_dtypes or {}).items()
+        }
         self.sequence_record_identities = {
             int(sequence_id): str(identity)
             for sequence_id, identity in (
@@ -11151,6 +11155,11 @@ class _ControlSSABuilder(TiledObject):
         # different sequence representation.
         column_dtypes = tuple(column_dtypes or ())
         column_shapes = tuple(column_shapes or ())
+        if not column_dtypes and value_id not in self.sequence_descriptors:
+            # c626: an array("I") receiver is first materialized by append,
+            # after the local declaration walk.  Use the source field's
+            # uint32 row contract before minting its physical SSA column.
+            column_dtypes = self.source_sequence_column_dtypes.get(value_id, ())
         resolved = self.resolved_sequence_schemas.get(value_id)
         declared_child_layout = self.sequence_child_table_layouts.get(value_id)
         if declared_child_layout is not None:
@@ -16331,6 +16340,55 @@ class _ControlSSABuilder(TiledObject):
                 ) in {"", "unknown", "None"}:
                     value.dtype = literal_dtype
                     self._revise_value(value)
+            converted_values = []
+            for value, row_dtype in zip(
+                mutation_values, destination.column_dtypes, strict=True,
+            ):
+                if str(row_dtype) != "uint32" or str(value.dtype) != "int64":
+                    converted_values.append(value)
+                    continue
+                # c626: array("I") owns a uint32 physical row, while an
+                # indexed Python int source is int64.  Check its range before
+                # narrowing; a silent wrap would change the authored value.
+                zero = self.constant_value(0, value, dtype="int64")
+                maximum = self.constant_value(0xFFFFFFFF, value, dtype="int64")
+                nonnegative = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(value, zero),
+                )
+                self.emit(Handler.Ge, [value, zero], nonnegative)
+                bounded = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(value, maximum),
+                )
+                self.emit(Handler.Le, [value, maximum], bounded)
+                valid = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(nonnegative, bounded),
+                )
+                self.emit(Handler.LAnd, [nonnegative, bounded], valid)
+                accepted = self.new_block("validation_pass")
+                invalid = self.new_block("validation_fail")
+                self.conditional_branch(valid, accepted, invalid)
+                self.current = invalid
+                self.emit(Handler.Call, [], attributes={
+                    "callee": "turing_validation_error",
+                    "error_code": 74,
+                    "binding": "ssa_sequence_uint32_range",
+                })
+                self.branch(accepted)
+                self.current = accepted
+                narrowed = self.fresh_value(
+                    dtype="uint32", transform=CONTROL_CAST,
+                    operands=(value,),
+                )
+                self.emit(
+                    Handler.Cast, [value], narrowed,
+                    attributes={"target_dtype": "uint32",
+                                "binding": "ssa_sequence_uint32_range"},
+                )
+                converted_values.append(narrowed)
+            mutation_values = tuple(converted_values)
             if (
                 deferred_record_row is None and not deferred_record_slots
                 and indexed_record_row_source is None

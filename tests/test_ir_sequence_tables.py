@@ -1822,6 +1822,55 @@ def test_empty_dict_constructor_keeps_accepted_receiver_table_roles():
     )
 
 
+def test_array_u32_receiver_column_keeps_authored_dtype_before_append():
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c626_array_u32_append.py"
+    ).read_text(encoding="utf-8")
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="array_u32_append",
+        extraction_contract=contract,
+        progress=lambda _message: None, progress_bars=False,
+    )
+    put_name = next(
+        name for name in module.functions
+        if "__put__" in name and "planned_region" not in name
+    )
+    table = module.record_tables[put_name]
+    field = next(
+        field for record in table.records.values()
+        for field in record.fields
+        if field.storage_identity == "Vocabulary.exact_atoms"
+    )
+    sequence = module.sequence_tables[put_name].by_id(field.sequence_id)
+    assert sequence.column_dtypes == ("uint32",)
+    column = next(
+        value for value in module.functions[put_name].args
+        if value.id == sequence.column_value_ids[0]
+    )
+    assert column.dtype == "uint32"
+    checked_write = [
+        instruction.attributes
+        for block in module.functions[put_name].blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding")
+        == "ssa_sequence_uint32_range"
+    ]
+    assert any(item.get("callee") == "turing_validation_error"
+               for item in checked_write)
+    assert any(item.get("target_dtype") == "uint32"
+               for item in checked_write)
+    llvm = emit_ssa_function_to_llvm(
+        module, put_name, entry_name="array_u32_append_probe",
+    )
+    assert llvm.shortfalls == ()
+    assert "trunc i64" in llvm.llvm_ir
+
+
 def test_static_program_reference_is_typed_ssa_and_native_handle_storage():
     handle = -734_921
     module, shortfalls, _ = lower_control_sections_to_ssa(
