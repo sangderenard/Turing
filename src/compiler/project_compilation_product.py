@@ -441,7 +441,7 @@ class ProjectCompilationProduct:
         """Load a scalar native unit only after ABI and behavior agree.
 
         This intentionally supports the narrow scalar surface the emitted API
-        can describe completely today.  Arrays, records, workspaces, invented
+        can describe completely today. Public arrays, records, invented
         inputs, missing source parameters, and ambiguous returns are rejected
         rather than guessed.  Successful probes are persisted beside the unit
         and tied to the source, API, and library hashes.
@@ -481,8 +481,9 @@ class ProjectCompilationProduct:
         if entry is None:
             raise ValueError(f"native API does not declare {entry_name!r}")
         parameters = tuple(entry.get("parameters") or ())
-        if any(parameter.get("shape") or parameter.get("extents")
-               or parameter.get("extent") for parameter in parameters):
+        if any((parameter.get("shape") or parameter.get("extents")
+                or parameter.get("extent")) and parameter.get("role") in {"input", "inout", "output"}
+               for parameter in parameters):
             raise ValueError("scalar verifier refuses array-shaped native ABI")
         inputs = tuple(
             parameter for parameter in parameters
@@ -556,8 +557,34 @@ class ProjectCompilationProduct:
                         runtime_handles.append(os.add_dll_directory(parent))
         library = ctypes.CDLL(str(library_path.resolve()))
         native = getattr(library, str(entry.get("symbol") or entry_name))
-        native.argtypes = [*argument_types, ctypes.POINTER(output_type)]
-        native.restype = None
+        workspace_core = None
+        if any(parameter.get("role") in {"workspace", "extent"} for parameter in parameters):
+            # A scalar-public library may construct private records/arenas.
+            # Their published workspaces are not authored record arguments.
+            # Use the same descriptor-driven packed runtime as other native
+            # Fortran executions; it allocates known extents and null context
+            # cells, and refuses any unresolved extent without guessing.
+            from .compiled_program_api import EntryPoint, Parameter
+            from .ssa_fortran_backend import FortranCoreNative
+            from types import SimpleNamespace
+            runtime_parameters = tuple(Parameter(
+                name=str(parameter['name']), role=str(parameter['role']),
+                dtype=str(parameter['dtype']), c_type=str(parameter['c_type']),
+                ctypes_name=str(parameter['ctypes']), passing=str(parameter['passing']),
+                shape=tuple(parameter.get('shape') or ()), extent=parameter.get('extent'),
+                extents=tuple(parameter.get('extents') or ()),
+                source_name=parameter.get('source_name'),
+                source_transform=parameter.get('source_transform'), layout=parameter.get('layout'),
+            ) for parameter in parameters)
+            workspace_core = FortranCoreNative(
+                library_path,
+                EntryPoint(entry_name, str(entry.get('symbol') or entry_name),
+                           str(entry.get('kind') or 'control'), runtime_parameters),
+                SimpleNamespace(metadata=dict(descriptor.get('metadata') or {})),
+            )
+        else:
+            native.argtypes = [*argument_types, ctypes.POINTER(output_type)]
+            native.restype = None
 
         route_counts = {"native": 0, "fallback": 0}
         result_codecs = {
@@ -589,7 +616,18 @@ class ProjectCompilationProduct:
                         return authored(*args, **kwargs)
                 native_inputs.append(converted.value)
             result = output_type()
-            native(*native_inputs, ctypes.byref(result))
+            if workspace_core is None:
+                native(*native_inputs, ctypes.byref(result))
+            else:
+                import numpy as np
+                feeds = {
+                    int(str(parameter['name'])[1:]): np.asarray([value])
+                    for parameter, value in zip(inputs, native_inputs, strict=True)
+                }
+                execution = workspace_core.prepare_execution(feeds).run()
+                result.value = np.asarray(execution.buffers[
+                    int(str(outputs[0]['name'])[1:])
+                ]).reshape(-1)[0].item()
             route_counts["native"] += 1
             return decode_native_result(result.value)
 
@@ -2584,8 +2622,12 @@ def verify_project_product_cases(
                 verifier = product.verify_native_sequence_callable
                 options["capacity"] = specification.get("capacity", 64)
                 options["native_precondition"] = specification.get("native_precondition")
-            elif records:
+            else:
                 output_names = {str(item["name"]) for item in parameters if item.get("role") == "output"}
+                input_names = {str(item["name"]) for item in parameters if item.get("role") in {"input", "inout"}}
+                def record_names(record):
+                    return {f"t{int(value)}" for field in record.get("fields", ())
+                            for value in field.get("value_ids", ())}
                 returned = [record for record in records if {
                     f"t{int(value)}" for field in record.get("fields", ())
                     for value in field.get("value_ids", ())
@@ -2593,12 +2635,13 @@ def verify_project_product_cases(
                 if returned:
                     verifier = product.verify_native_record_return_callable
                     options["native_precondition"] = specification.get("native_precondition")
-                else:
+                elif any(record_names(record) and record_names(record) <= input_names for record in records):
                     verifier = product.verify_native_scalar_record_callable
-            elif any(item.get("shape") or item.get("extent") or item.get("extents") for item in parameters):
-                raise ValueError("unsupported native case ABI: span has no existing sequence return/runtime binding")
-            else:
-                verifier = product.verify_native_scalar_callable
+                elif any((item.get("shape") or item.get("extent") or item.get("extents"))
+                         and item.get("role") in {"input", "inout", "output"} for item in parameters):
+                    raise ValueError("unsupported native case ABI: span has no existing sequence return/runtime binding")
+                else:
+                    verifier = product.verify_native_scalar_callable
             deployed = verifier(*arguments, **options)
             verification = dict(deployed.__turing_native_verification__)
             if (verification["native_probe_count"] != verification["probe_count"]

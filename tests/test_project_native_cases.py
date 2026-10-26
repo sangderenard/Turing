@@ -213,3 +213,62 @@ def test_unsupported_span_abi_refuses_before_native_invocation(native_product, m
         assert not report['verified']
         assert 'unsupported native case ABI' in report['reason']
     assert verify_project_product_cases(native_product, {'recurrence': specification})[0]['verified']
+
+
+def test_scalar_cli_with_private_record_workspace_uses_published_boundary(tmp_path, monkeypatch):
+    import os
+    from src.compiler.compiled_program_api import load_api
+    from src.compiler.compiler_bootstrap_runtime import _activate_descriptor_call
+    from src.compiler.ssa_fortran_backend import fortran_compiler
+    if fortran_compiler() is None:
+        pytest.skip('native Fortran compiler unavailable')
+    monkeypatch.setenv('TURING_COMPILER_BOOTSTRAP_REGISTRY', str(tmp_path / 'registry.json'))
+    monkeypatch.delenv('TURING_COMPILER_BOOTSTRAP_PRODUCTS', raising=False)
+    source = ROOT / 'src/compiler/compiler_counter_benchmark_consumer.py'
+    cases = ROOT / 'tools/compiler_probes/native_counter_cases.json'
+    directory = tmp_path / 'counter-product'
+    completed = subprocess.run([
+        sys.executable, '-u', '-m', 'tools.compile_project_catalogue',
+        '--source', str(source), '--entry', 'counter_checksum', '--output', str(directory),
+        '--jobs', '1', '--emit-native', '--verification-cases', str(cases),
+    ], cwd=ROOT, env=os.environ.copy(), text=True, capture_output=True, timeout=180)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    print(completed.stdout.splitlines()[-1])
+    product = open_project_compilation_product(directory)
+    link = product.links['counter_checksum']
+    api = load_api(directory / link['native_api'])
+    entry = next(item for item in api['entry_points'] if item['name'] == link['native_entrypoint'])
+    parameters = entry['parameters']
+    assert [item['source_name'] for item in parameters if item['role'] == 'input'] == ['rounds']
+    workspaces = {item['name'] for item in parameters if item['role'] == 'workspace'}
+    records = api['metadata']['record_tables'][entry['name']]
+    assert records and all(f't{value}' in workspaces for record in records
+                           for field in record['fields'] for value in field['value_ids'])
+    report = json.loads((directory / 'native-case-verification.json').read_text())['units'][0]
+    assert report['verified'] and report['abi_kind'] == 'scalar'
+    assert report['native_probe_count'] == 3 and report['fallback_probe_count'] == 0
+    _, deployed = _activate_descriptor_call(product, 'counter_checksum')
+    for rounds in (7, 0, 7, 17):
+        assert deployed(rounds) == rounds * (rounds - 1) // 2
+    assert deployed.__turing_native_route_counts__ == {'native': 7, 'fallback': 0}
+    import copy
+    unbound = copy.deepcopy(api)
+    unbound_entry = next(item for item in unbound['entry_points'] if item['name'] == entry['name'])
+    old_extent = next(item['name'] for item in unbound_entry['parameters'] if item['role'] == 'extent')
+    for parameter in unbound_entry['parameters']:
+        if parameter['name'] == old_extent:
+            parameter['name'] = 'extent_private_unbound'
+        if parameter.get('extent') == old_extent:
+            parameter['extent'] = 'extent_private_unbound'
+        if parameter.get('extents'):
+            parameter['extents'] = ['extent_private_unbound' if name == old_extent else name
+                                    for name in parameter['extents']]
+    specification = json.loads(cases.read_text())
+    with monkeypatch.context() as changed:
+        changed.setattr('src.compiler.compiled_program_api.load_api', lambda _: unbound)
+        rejected = verify_project_product_cases(product, specification)[0]
+        assert not rejected['verified']
+        assert 'extent_overrides' in rejected['reason']
+        receipt = Path(rejected['library']).parent / 'native-verification.json'
+        assert json.loads(receipt.read_text())['status'] == 'failed'
+    assert verify_project_product_cases(product, specification)[0]['verified']

@@ -355,3 +355,15 @@ relative to that sheet. This serializes the same selective module-name AND path
 admission as `ExtractionContract.with_sources`, so fresh project workers retain
 the audit's source pursuit. Pass the sheet with `--extraction-contract`; making
 a module importable alone does not admit its implementation.
+
+For a scalar entry that constructs private record state, select verification
+from the published public input/output roles. Local `record_tables` metadata
+does not turn workspace fields into authored record arguments. The scalar
+verifier delegates published workspaces to the incumbent
+`FortranCoreNative.prepare_execution` path, including null managed-context
+cells and known extents. Unresolved extents refuse; verification supplies no
+capacity guesses. A small reproducible example is:
+
+```powershell
+python -u -m tools.compile_project_catalogue --source src/compiler/compiler_counter_benchmark_consumer.py --entry counter_checksum --output build/native-counter-cases --jobs 1 --emit-native --verification-cases tools/compiler_probes/native_counter_cases.json
+```
