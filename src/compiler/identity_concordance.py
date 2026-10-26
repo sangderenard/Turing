@@ -41,6 +41,8 @@ Findings (each is one concrete disagreement, with the two claims):
 ``use-not-dominated``
     an instruction reads a value whose definition does not dominate the
     read (Phi operands exempt; they arrive over predecessor edges).
+``phi-edge-not-predecessor``
+    a Phi names an incoming block that has no CFG edge to its owner.
 ``alias-target-missing``
     a recorded value alias points at neither a physical definition nor an
     owned structural record descriptor.
@@ -4557,6 +4559,10 @@ class CorrelationTable:
         if not dominators:
             return found
         definition_sites: dict[int, list[tuple[str, int]]] = defaultdict(list)
+        predecessors: dict[str, set[str]] = defaultdict(set)
+        for predecessor_name, predecessor in function.blocks.items():
+            for successor in predecessor.successors:
+                predecessors[str(successor)].add(str(predecessor_name))
         for block_name, block in function.blocks.items():
             for index, instruction in enumerate(block.instrs):
                 if instruction.res is not None:
@@ -4568,6 +4574,14 @@ class CorrelationTable:
                 continue
             for index, instruction in enumerate(block.instrs):
                 if instruction.op in {"Phi", "phi"}:
+                    incoming = tuple(map(str, instruction.attributes.get("incoming_blocks") or ()))
+                    invalid = tuple(edge for edge in incoming if edge not in predecessors[str(block_name)])
+                    if invalid:
+                        found.append(Finding(
+                            "phi-edge-not-predecessor", name,
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}#{index} Phi names {invalid!r}; actual CFG predecessors are {tuple(sorted(predecessors[str(block_name)]))!r}",
+                        ))
                     continue
                 for argument in instruction.args:
                     argument_id = getattr(argument, "id", None)

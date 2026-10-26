@@ -10201,6 +10201,16 @@ def _field_slot_ops(
     field_value_aggregate_kinds = dict(
         graph_obj.graph.get("class_field_value_aggregate_kinds") or {}
     )
+    constructor_mapping_contracts = {}
+    for _field_node, field_data in graph_obj.nodes(data=True):
+        if str(field_data.get("op") or field_data.get("type") or "").casefold() != "setattr":
+            continue
+        field_name = str((field_data.get("attributes") or {}).get("attribute"))
+        contract = (graph_obj.graph.get("class_field_mapping_contracts") or {}).get(field_name)
+        if contract:
+            for parent, role in field_data.get("parents") or ():
+                if str(role) == "value" and parent in graph_obj:
+                    constructor_mapping_contracts[int(graph_obj.nodes[parent].get("value_id", parent))] = contract
 
     def node_operation(data: Mapping[str, Any]) -> str:
         """Canonical ProcessGraph operation spelling for field analysis.
@@ -10553,6 +10563,10 @@ def _field_slot_ops(
         if not history or not sequence_record_fields:
             continue
         sequence_id = int(history[0])
+        if (graph_obj.nodes.get(sequence_id, {}).get("attributes") or {}).get("producer_kind") in {"mapping_default_result", "mapping_lookup_result"}:
+            # The record describes the selected rows' payload, not another
+            # caller-owned collection. Keep the mapping's pool as owner.
+            continue
         lexical_sequence_ids.setdefault(
             ("parameter", str(parameter_name)), sequence_id
         )
@@ -10676,6 +10690,10 @@ def _field_slot_ops(
             continue
         if aggregate_kind == "array" and attributes.get("producer_kind") != "sequence_materialization":
             continue
+        if attributes.get("producer_kind") in {"mapping_default_result", "mapping_lookup_result"}:
+            # A setdefault result selects the mapping's child pool. It is
+            # not another list allocation; its mutation uses that row view.
+            continue
         if (
             aggregate_kind == "bytes"
             and attributes.get("producer_kind")
@@ -10704,6 +10722,7 @@ def _field_slot_ops(
             # own. Declaring that scalar id as a sequence turns ordinary
             # parameters such as ``section_id`` into rank-1 arrays.
             continue
+        attributes = {**attributes, **constructor_mapping_contracts.get(sequence_id, {})}
         sequence_declarations.append((
             sequence_id,
             "unique" if aggregate_kind in {"set", "frozenset", "dict"}
@@ -11009,7 +11028,7 @@ def _field_slot_ops(
                                 "set", "frozenset", "dict",
                             } else "duplicates",
                             (
-                                2 if aggregate_kind == "dict" else
+                                int(attributes.get("mapping_key_column_count", 1)) + _mapping_value_column_count(attributes) if aggregate_kind == "dict" else
                                 max(1, annotated_row_widths.get(
                                     int(sequence_id), 1,
                                 ))
@@ -11019,7 +11038,7 @@ def _field_slot_ops(
                 storage_identity = f"{owner}.{canonical_field(str(attribute))}"
                 if storage_identity in retained_storage_identities:
                     retained_sequence_ids.add(sequence_id)
-                if field_value_aggregate_kinds.get(str(attribute)) == "dict":
+                if field_value_aggregate_kinds.get(str(attribute)) in {"dict", "list", "set", "bytearray"}:
                     nested_sequence_ids.add(sequence_id)
             else:
                 field_ops.append((
@@ -11135,12 +11154,12 @@ def _field_slot_ops(
                 sequence_initializations.append((
                     int(source_id),
                     "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
-                    2 if aggregate_kind == "dict" else 1,
+                    int(constructor_mapping_contracts.get(int(source_id), {}).get("mapping_key_column_count", 1)) + _mapping_value_column_count(constructor_mapping_contracts.get(int(source_id), {})) if aggregate_kind == "dict" else 1,
                 ))
                 storage_identity = f"{owner}.{canonical_field(str(attribute))}"
                 if storage_identity in retained_storage_identities:
                     retained_sequence_ids.add(int(source_id))
-                if field_value_aggregate_kinds.get(str(attribute)) == "dict":
+                if field_value_aggregate_kinds.get(str(attribute)) in {"dict", "list", "set", "bytearray"}:
                     nested_sequence_ids.add(int(source_id))
             # A constant field write (``self.x = None`` / ``5`` / ``"s"``) has
             # no producer in the control body, so carry the constant value; the
@@ -11384,6 +11403,10 @@ def _field_slot_ops(
                 # REAL(8) to the helper's INTEGER(8) formal.  Rule: the
                 # default keeps the authored literal's own type.
                 table_lookup_defaults[result_id] = literal
+            elif isinstance(literal, tuple) and not literal or isinstance(default_data.get("expr_obj"), ast.Tuple) and not default_data["expr_obj"].elts:
+                # Keep the authored empty alternative. Integer handle zero
+                # is a valid child row, not the missing tuple.
+                table_lookup_defaults[result_id] = ()
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         if node_operation(data) != "indexedstore":
@@ -18111,6 +18134,7 @@ def _sequence_child_table_layout_contracts(
     silently collapsed into whichever field happened to be visited first.
     """
 
+    sequence_declarations = tuple(sequence_declarations)
     declared = {int(item[0]) for item in sequence_declarations}
     records = dict(
         (graph_obj.graph.get("program_abi") or {}).get("records") or {}
@@ -18128,6 +18152,32 @@ def _sequence_child_table_layout_contracts(
     result: dict[
         int, tuple[int, tuple[str, ...], tuple[int, ...], bool]
     ] = {}
+    declarations = {int(sid): int(width) for sid, _policy, width, _writable in sequence_declarations}
+    field_kinds = dict(graph_obj.graph.get("class_field_value_aggregate_kinds") or {})
+    field_contracts = dict(graph_obj.graph.get("class_field_mapping_contracts") or {})
+    field_value_kinds = {}
+    field_value_contracts = {}
+    for _node_id, data in graph_obj.nodes(data=True):
+        attrs = data.get("attributes") or {}
+        if str(data.get("op") or data.get("type") or "").casefold() == "setattr":
+            kind = field_kinds.get(str(attrs.get("attribute")))
+            for parent, role in data.get("parents") or ():
+                if str(role) == "value" and parent in graph_obj:
+                    field_value_kinds[int(graph_obj.nodes[parent].get("value_id", parent))] = kind
+                    field_value_contracts[int(graph_obj.nodes[parent].get("value_id", parent))] = field_contracts.get(str(attrs.get("attribute")), {})
+    for node_id, data in graph_obj.nodes(data=True):
+        value_id = int(data.get("value_id", node_id))
+        if value_id not in declared:
+            continue
+        attrs = data.get("attributes") or {}
+        kind = attrs.get("mapping_value_aggregate_kind") or field_kinds.get(str(attrs.get("attribute"))) or field_value_kinds.get(value_id)
+        if kind in {"list", "set", "bytearray"}:
+            mapping_contract = field_value_contracts.get(value_id) or field_contracts.get(str(attrs.get("attribute")), {})
+            result[value_id] = (
+                declarations[value_id] - 1,
+                tuple(attrs.get("mapping_child_column_dtypes") or mapping_contract.get("mapping_child_column_dtypes") or ("unknown",)),
+                (0,) if kind == "set" else (), True,
+            )
     for binding, row_record in _graph_sequence_record_abi(graph_obj).items():
         nested_fields = tuple(
             (str(field_name), dict(field))
@@ -28012,6 +28062,10 @@ def _class_surface_ssa_program(
         for result_id, key_ids, sequence_id in table_lookups:
             control_consumed = _control_block_consumes_values(
                 control.root, lookup_dependent_value_ids(int(result_id))
+            )
+            control_consumed = control_consumed or any(
+                int(iterable_id) == int(result_id)
+                for iterable_id, _target_id, _induction in control.iterable_bindings
             )
             if (
                 result_id not in direct_return_ids

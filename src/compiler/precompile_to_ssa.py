@@ -2629,6 +2629,7 @@ class _ControlSSABuilder(TiledObject):
         self.child_table_selections: dict[
             int, tuple[SSAChildTablePoolDescriptor, SSAValue]
         ] = {}
+        self.selected_child_extent_values: dict[int, SSAValue] = {}
         # Exact loop-local element loads retained past loop-scope withdrawal.
         # The binding map correctly forgets a ``for`` target at loop exit,
         # but the child arena descriptor still needs the physical dtype proved
@@ -4064,6 +4065,15 @@ class _ControlSSABuilder(TiledObject):
         from .ir_sequence_tables import lower_table_lookup
 
         default_literal = self.table_lookup_defaults.get(int(result_id))
+        empty_default = isinstance(default_literal, tuple) and not default_literal
+        if empty_default:
+            default_literal = None
+            if int(result_id) in self.region_value_meta:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "ssa-table", "optional-child-index", self.function_name,
+                    "an empty-default child lookup needs exact presence and bounds proof before indexed region use",
+                ))
+                return
         # Program: ``d = {1: n, 2: 5}; return d[n]`` with ``n = 7`` (silent
         # lane, scratch s43/k).  Wrong record: the lookup's absent branch
         # returned 0 where Python raises KeyError (clean audit).  Rule: an
@@ -4090,8 +4100,9 @@ class _ControlSSABuilder(TiledObject):
         pool = descriptor.child_table_pool
         tensor_child = bool(
             pool is not None
-            and not pool.key_columns
-            and len(pool.column_value_ids) == 1
+            and pool.shape_value_id is not None
+            and pool.rank_value_id is not None
+            and pool.shape_stride_value_id is not None
         )
         contract_cell = self._sequence_contract_cell(int(sequence_id))
         query_values = self._table_query_values(query_id, descriptor)
@@ -4205,6 +4216,40 @@ class _ControlSSABuilder(TiledObject):
             self.child_table_selections[int(result_id)] = (
                 pool, result
             )
+            if empty_default:
+                # ``for x in d.get(k, ())``: lookup status owns presence.
+                # A missing key yields the authored empty tuple; it must
+                # never read child row zero's length (zero is a valid handle).
+                status_address = self._sequence_status_address(self.sequence_status_values[int(sequence_id)])
+                status = self.fresh_value(dtype="int", transform=LOAD, operands=(status_address, result))
+                self.emit(Handler.Load, [status_address], status,
+                          attributes={"binding": "selected_child_lookup_status", "source_value_id": int(result_id)})
+                present = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(status,))
+                self.emit(Handler.Eq, [status, self.constant_value(1, status)], present,
+                          attributes={"binding": "selected_child_lookup_presence"})
+                found = self.new_block("if_true")
+                absent = self.new_block("if_false")
+                complete = self.new_block("if_merge")
+                self.conditional_branch(present, found, absent)
+                self.current = found
+                lengths = self.external_value(pool.length_value_id)
+                address = self.fresh_value(dtype="ptr", transform=ADDRESS, operands=(lengths, result))
+                self.emit(Handler.GetElementPtr, [lengths, result], address,
+                          attributes={"binding": "selected_child_length"})
+                length = self.fresh_value(dtype="int64", transform=LOAD, operands=(address,))
+                self.emit(Handler.Load, [address], length,
+                          attributes={"binding": "selected_child_length"})
+                self.branch(complete)
+                self.current = absent
+                empty = self.fresh_value(dtype="int64", transform=CONTROL_CONST, operands=(status,))
+                self.emit(Handler.Const, [], empty, attributes={"value": 0, "binding": "authored_empty_child_length"})
+                self.branch(complete)
+                self.current = complete
+                extent = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION, operands=(length, empty, present))
+                self.emit(Handler.Phi, [length, empty], extent,
+                          attributes={"binding": "selected_child_optional_extent", "incoming_blocks": (found.name, absent.name),
+                                      "source_value_id": int(result_id), "authored_default": ()})
+                self.selected_child_extent_values[int(result_id)] = extent
         if tensor_child:
             # A keyed Tensor value is a child-row handle at the outer lookup
             # boundary and a span at every numerical consumer. Materialize
@@ -9760,6 +9805,9 @@ class _ControlSSABuilder(TiledObject):
         )
         if iterable_extent is not None:
             iterable_id = int(iterable_extent.group(1))
+            selected_extent = self.selected_child_extent_values.get(iterable_id)
+            if selected_extent is not None:
+                return selected_extent
             resident_id = iterable_id
             seen_aliases: set[int] = set()
             while (
@@ -11167,6 +11215,61 @@ class _ControlSSABuilder(TiledObject):
         proposes (a row a writer stores); their cells derive the row
         dtype the proposal refines."""
         value_id = int(value_id)
+        selected = self.child_table_selections.get(value_id)
+        if selected is not None and value_id in self.selected_child_extent_values:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "optional-child-view", location,
+                "an empty-default child lookup is not an unconditional mutable row view",
+            ))
+            return None
+        if selected is not None and selected[0].shape_value_id is None and value_id not in self.sequence_descriptors:
+            # ``d.setdefault(k, []).append(v)``: the returned collection is
+            # exactly the selected pool row. Allocating an arena for this
+            # source identity detached the append from the dictionary.
+            pool, handle = selected
+            stride = self.external_value(pool.row_stride_value_id)
+            offset = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION, operands=(handle, stride))
+            self.emit(Handler.Mul, [handle, stride], offset,
+                      attributes={"binding": "selected_child_row_offset"})
+            columns = []
+            for column_id, dtype in zip(pool.column_value_ids, pool.column_dtypes):
+                base = self.external_value(column_id)
+                address = self.fresh_value(dtype=str(dtype), transform=ADDRESS, operands=(base, offset),
+                                           physical={"arena": True, "storage": "span", "rank": 1})
+                self.emit(Handler.GetElementPtr, [base, offset], address,
+                          attributes={"binding": "selected_child_row_view", "source_value_id": value_id})
+                columns.append(address)
+            lengths = self.external_value(pool.length_value_id)
+            length = self.fresh_value(dtype="ptr", transform=ADDRESS, operands=(lengths, handle), physical={"physical_dtype": "int64"})
+            self.emit(Handler.GetElementPtr, [lengths, handle], length,
+                      attributes={"binding": "selected_child_length_view"})
+            status = None
+            if pool.status_value_id is not None:
+                statuses = self.external_value(pool.status_value_id)
+                status = self.fresh_value(dtype="ptr", transform=ADDRESS, operands=(statuses, handle), physical={"physical_dtype": "int"})
+                self.emit(Handler.GetElementPtr, [statuses, handle], status,
+                          attributes={"binding": "selected_child_status_view"})
+            live = None
+            if pool.live_flags_value_id is not None:
+                flags = self.external_value(pool.live_flags_value_id)
+                live = self.fresh_value(dtype="bool", transform=ADDRESS, operands=(flags, offset),
+                                        physical={"arena": True, "storage": "span", "rank": 1})
+                self.emit(Handler.GetElementPtr, [flags, offset], live,
+                          attributes={"binding": "selected_child_live_view"})
+            descriptor = SSASequenceDescriptor(
+                sequence_id=value_id, column_value_ids=tuple(int(v.id) for v in columns),
+                length_address_id=int(length.id), capacity_value_id=int(stride.id),
+                status_address_id=None if status is None else int(status.id),
+                column_dtypes=tuple(pool.column_dtypes), column_shapes=((),) * len(columns),
+                key_columns=tuple(pool.key_columns), writable=bool(pool.writable),
+                live_flags_value_id=None if live is None else int(live.id),
+                capacity_policy=SSASequenceCapacityPolicy.FIXED,
+            )
+            self.sequence_descriptors[value_id] = descriptor
+            self.sequence_storage_values[value_id] = (*columns, length, stride, *((live,) if live is not None else ()))
+            if status is not None:
+                self.sequence_status_values[value_id] = status
+            return descriptor
         # Literal-table survey uses ``None`` to mean that an empty table has
         # no authored rows from which a column dtype/shape can be inferred.
         # Normalize that absence before the column loop; it is not itself a
@@ -11532,14 +11635,15 @@ class _ControlSSABuilder(TiledObject):
                 storage_cell("int") if child_writable else None
             )
             child_live = (
-                storage_cell("bool") if child_writable else None
+                storage_cell("bool") if child_writable and child_key_columns else None
             )
             child_pool_values = (
                 *child_columns, child_lengths, child_capacity,
                 child_stride,
                 *((child_shapes, child_ranks, child_shape_stride)
                   if nested_tensor else ()),
-                *((child_status, child_live) if child_writable else ()),
+                *((child_status,) if child_status is not None else ()),
+                *((child_live,) if child_live is not None else ()),
             )
             for member, pool_value in enumerate(child_pool_values):
                 pool_value.accounting = {
@@ -12068,6 +12172,10 @@ class _ControlSSABuilder(TiledObject):
             )
 
     def _sequence_status_address(self, status_arena: SSAValue) -> SSAValue:
+        if str(status_arena.dtype) == "ptr":
+            # A selected row already supplies its exact per-child address.
+            # Indexing that address again invents a second arena designator.
+            return status_arena
         zero = self.constant_value(0, status_arena)
         address = self.fresh_value(
             dtype="ptr", transform=ADDRESS, operands=(status_arena, zero),
@@ -12150,6 +12258,19 @@ class _ControlSSABuilder(TiledObject):
             self._emit_sequence_membership(*arguments)
             return
         sequence_id = int(query.sequence_value_id)
+        selected_extent = self.selected_child_extent_values.get(sequence_id)
+        if selected_extent is not None and query.operation in {"length", "truth"}:
+            result = self.produced_value(int(query.result_value_id),
+                dtype="bool" if query.operation == "truth" else "int64",
+                cause=(selected_extent,), claim_provisional_definition=True)
+            if query.operation == "truth":
+                self.emit(Handler.Ne, [selected_extent, self.constant_value(0, selected_extent)], result,
+                          attributes={"binding": "selected_child_optional_truth"})
+            else:
+                self.emit(Handler.Cast, [selected_extent], result,
+                          attributes={"binding": "selected_child_optional_length"})
+            self._bind(int(query.result_value_id), result, BindingKind.SEQUENCE_RESULT, selected_extent)
+            return
         nested_selection = self.nested_row_selections.get(sequence_id)
         if (
             nested_selection is not None
@@ -15806,6 +15927,7 @@ class _ControlSSABuilder(TiledObject):
                         int(mutation.effect_node_id), key_ids, default_id,
                         int(destination.sequence_id),
                     )
+                    missing_exit_name = self.current.name
                     self.branch(complete)
 
                     self.current = complete
@@ -15821,7 +15943,7 @@ class _ControlSSABuilder(TiledObject):
                         result,
                         attributes={
                             "incoming_blocks": (
-                                found_block.name, missing_block.name,
+                                found_block.name, missing_exit_name,
                             ),
                             "binding": "ssa_mapping_setdefault_result",
                         },
@@ -15916,6 +16038,10 @@ class _ControlSSABuilder(TiledObject):
                 outer_length_address = self.sequence_storage_values[
                     int(destination.sequence_id)
                 ][len(destination.column_value_ids)]
+                outer_length_cell = outer_length_address
+                outer_length_address = self.fresh_value(dtype="ptr", transform=ADDRESS, operands=(outer_length_cell,))
+                self.emit(Handler.GetElementPtr, [outer_length_cell, self.constant_value(0, outer_length_cell)], outer_length_address,
+                          attributes={"binding": "ssa_mapping_setdefault_length_address"})
                 outer_length = self.fresh_value(
                     dtype="int64", transform=LOAD, operands=(outer_length_address,),
                 )
@@ -15971,6 +16097,7 @@ class _ControlSSABuilder(TiledObject):
                     int(mutation.effect_node_id), key_ids,
                     int(new_handle.id), int(destination.sequence_id),
                 )
+                missing_exit_name = self.current.name
                 self.branch(complete)
 
                 self.current = complete
@@ -15986,7 +16113,7 @@ class _ControlSSABuilder(TiledObject):
                     result,
                     attributes={
                         "incoming_blocks": (
-                            found_block.name, missing_block.name
+                            found_block.name, missing_exit_name
                         ),
                         "binding": "ssa_mapping_setdefault_result",
                     },

@@ -2528,7 +2528,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         operation = str(record["operator"])
         if operation == "sort":
             continue
-        argument_kind = "value"
+        argument_kind = str(record.get("argument_kind", "value"))
         argument_ids = tuple(map(int, record["argument_value_ids"]))
         key_column = None
         reverse = False

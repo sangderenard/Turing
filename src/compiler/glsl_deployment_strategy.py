@@ -2615,7 +2615,7 @@ def _planned_scalar_dtypes_from(
                     element.get(value) if stored else scalar.get(value)
                 ))
                 continue
-            if op == "get" and is_collection(
+            if op == "get" and attributes.get("producer_kind") != "mapping_lookup_result" and is_collection(
                 (parents(data, "operand") or [-1])[0]
             ) and (
                 G.nodes[parents(data, "operand")[0]].get("attributes") or {}
@@ -9051,21 +9051,42 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
             continue
         destination_data = graph_obj.nodes[destination]
         destination_kind = _receiver_collection_kind(destination_data)
-        if destination_kind not in {"list", "set", "bytes", "bytearray", "array"}:
+        mapping_default = destination_kind == "dict" and expression.func.attr == "setdefault"
+        if destination_kind not in {"list", "set", "bytes", "bytearray", "array"} and not mapping_default:
             continue
+        if mapping_default and len(arguments) == 2:
+            default_attrs = graph_obj.nodes[arguments[1]].get("attributes") or {}
+            if default_attrs.get("aggregate_kind") in {"list", "tuple", "dict", "set", "bytearray", "array"}:
+                default_expression = expression.args[1]
+                empty_default = (
+                    isinstance(default_expression, (ast.List, ast.Set)) and not default_expression.elts
+                    or isinstance(default_expression, ast.Dict) and not default_expression.keys
+                )
+                if not empty_default:
+                    # The incumbent child-pool operation creates an empty row.
+                    # A supplied/nonempty default needs its actual alias/copy
+                    # contract; silently resetting it would lose its contents.
+                    raise ValueError("mapping child setdefault requires a proved empty mutable default; nonempty or supplied child defaults are unsupported")
+        mutation_arguments = tuple(
+            int(graph_obj.nodes[argument].get("value_id", argument))
+            for argument in arguments
+        )
+        if mapping_default and arguments:
+            key_attrs = graph_obj.nodes[arguments[0]].get("attributes") or {}
+            key_leaves = tuple(map(int, key_attrs.get("aggregate_leaf_value_ids") or ()))
+            if key_attrs.get("aggregate_kind") == "tuple" and key_leaves:
+                mutation_arguments = (*key_leaves, *mutation_arguments[1:])
         records[int(node_id)] = {
             "expression": expression,
             "sequence_value_id": int(destination_data.get(
                 "value_id", destination
             )),
-            "argument_value_ids": tuple(
-                int(graph_obj.nodes[argument].get("value_id", argument))
-                for argument in arguments
-            ),
+            "argument_value_ids": mutation_arguments,
             "operator": str(expression.func.attr),
+            "argument_kind": "mapping_setdefault" if mapping_default else "value",
             "policy": (
                 "unique"
-                if expression.func.attr == "add" or destination_kind == "set"
+                if expression.func.attr == "add" or destination_kind in {"set", "dict"}
                 else "duplicates"
             ),
         }

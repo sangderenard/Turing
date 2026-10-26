@@ -1252,6 +1252,50 @@ class _FunctionEmitter:
                 )
             )
         }
+        # c639: setdefault's selected child column is a GEP view of one
+        # pool row. Its descriptor already names that row's capacity (the
+        # pool stride). Publishing a new extent for the local view leaked
+        # an unbindable helper dimension to the public caller. Preserve the
+        # descriptor's exact scalar extent at this signature writer instead.
+        self._local_sequence_extent_expressions: set[str] = set()
+        if sequence_table is not None:
+            address_results = {
+                int(instruction.res.id)
+                for block in self.function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"GetElementPtr", "getelementptr"}
+                and instruction.res is not None
+                and instruction.attributes.get("aggregate_index") is None
+            }
+            formal_ids = {int(argument.id) for argument in self.function.args}
+            capacity_by_column: dict[int, int] = {}
+            for descriptor in sequence_table.sequences.values():
+                capacity_id = int(descriptor.capacity_value_id)
+                capacity = self._value_types.get(capacity_id)
+                if (
+                    capacity is None or tuple(capacity.shape or ())
+                    or capacity_id not in formal_ids
+                ):
+                    continue
+                for column, row_shape in zip(
+                    descriptor.column_value_ids, descriptor.column_shapes,
+                ):
+                    column_id = int(column)
+                    if (
+                        column_id not in address_results or tuple(row_shape)
+                        or self.dynamic_array_ranks.get(column_id) != 1
+                    ):
+                        continue
+                    incumbent = capacity_by_column.setdefault(column_id, capacity_id)
+                    if incumbent != capacity_id:
+                        raise ValueError(
+                            f"sequence view {column_id} has conflicting capacity identities"
+                        )
+                    extent = f"int({_name(capacity)}, c_int)"
+                    self._local_sequence_extent_expressions.add(extent)
+                    self.dynamic_array_leading_extents[column_id] = (extent,)
+                    if column_id in self.dynamic_array_extents:
+                        self.dynamic_array_extents[column_id] = extent
         self._propagate_phi_dynamic_ranks()
         self.runtime_sized_ids = {
             int(value_id) for value_id, rank in dict(
@@ -5227,7 +5271,7 @@ class _FunctionEmitter:
             )
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(extent))
         }
-        extent_names = sorted(
+        extent_names = sorted((
             set(dim_extents.values())
             | called_extent_names
             | set(self.dynamic_array_extents.values())
@@ -5236,7 +5280,7 @@ class _FunctionEmitter:
                 for extents in self.dynamic_array_leading_extents.values()
                 for extent in extents
             }
-        )
+        ) - self._local_sequence_extent_expressions)
         self.extent_names = tuple(extent_names)
         argument_ids = {argument.id for argument in self.function.args}
         output_ids = {value.id for value in self.outputs}

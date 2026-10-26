@@ -10410,6 +10410,24 @@ def _normalize_lexical_values(
                                 "mapping_key_column_count"
                             ] = max(1, len(key_leaves))
 
+                if (
+                    isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr in {"get", "setdefault"}
+                ):
+                    mapping_id = resolve_expression(expression.func.value)
+                    mapping_attrs = (graph.G.nodes[mapping_id].get("attributes") or {}) if isinstance(mapping_id, int) and mapping_id in graph.G else {}
+                    child_dtypes = tuple(mapping_attrs.get("mapping_child_column_dtypes") or ())
+                    child_kind = mapping_attrs.get("mapping_value_aggregate_kind")
+                    if child_kind == "list" and len(child_dtypes) == 1:
+                        element_class = {"int64": "builtins.int", "float64": "builtins.float", "bool": "builtins.bool"}.get(child_dtypes[0])
+                        call_attributes.update({
+                            "producer_kind": "mapping_lookup_result" if expression.func.attr == "get" else "mapping_default_result",
+                            "aggregate_kind": child_kind,
+                            "sequence_column_count": 1,
+                            "sequence_column_dtypes": child_dtypes,
+                            **({"sequence_element_class_ref": element_class} if element_class is not None else {}),
+                        })
+
         # A named callee already represented by a function-table reference is
         # not a runtime value.  Its arguments still are.
         children = tuple(source_child_nodes(expression))
@@ -18967,6 +18985,67 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for statement_member in source_walk(member):
+                if (
+                    isinstance(statement_member, ast.Call)
+                    and isinstance(statement_member.func, ast.Attribute)
+                    and statement_member.func.attr == "append"
+                    and len(statement_member.args) == 1
+                    and isinstance(statement_member.func.value, ast.Call)
+                ):
+                    default_call = statement_member.func.value
+                    if (
+                        isinstance(default_call.func, ast.Attribute)
+                        and default_call.func.attr == "setdefault"
+                        and isinstance(default_call.func.value, ast.Attribute)
+                        and isinstance(default_call.func.value.value, ast.Name)
+                        and default_call.func.value.value.id in {"self", "cls"}
+                        and len(default_call.args) == 2
+                        and isinstance(default_call.args[1], ast.List)
+                        and not default_call.args[1].elts
+                        and isinstance(statement_member.args[0], ast.Name)
+                    ):
+                        arguments = {a.arg: a.annotation for a in (*member.args.posonlyargs, *member.args.args, *member.args.kwonlyargs)}
+                        annotation = arguments.get(statement_member.args[0].id)
+                        row = _annotation_storage(annotation) if annotation is not None else {}
+                        if row.get("dtype") in {"int64", "float64", "bool"} and row.get("aggregate_kind") is None:
+                            if any(isinstance(part, ast.Name) and part.id == statement_member.args[0].id
+                                   and isinstance(part.ctx, (ast.Store, ast.Del)) for part in source_walk(member)):
+                                raise ValueError("mapping child append operand has a reassigned parameter binding; exact value evidence is required")
+                            key = (str(class_name), str(default_call.func.value.attr))
+                            contract = class_field_mapping_contracts.setdefault(key, {})
+                            proposed = (str(row["dtype"]),)
+                            incumbent = contract.get("mapping_child_column_dtypes")
+                            if incumbent is not None and incumbent != proposed:
+                                raise ValueError(f"mapping child writers disagree: {key!r}: {incumbent!r} != {proposed!r}")
+                            contract["mapping_child_column_dtypes"] = proposed
+                            contract["mapping_value_aggregate_kind"] = "list"
+                # ``self.table.setdefault(k, []).append(v)`` writes the
+                # same child-list contract as ``self.table[k] = []``.  The
+                # old survey saw only assignments: readers in another
+                # method therefore reconstructed a keyed child table.
+                if (
+                    isinstance(statement_member, ast.Call)
+                    and isinstance(statement_member.func, ast.Attribute)
+                    and statement_member.func.attr == "setdefault"
+                    and isinstance(statement_member.func.value, ast.Attribute)
+                    and isinstance(statement_member.func.value.value, ast.Name)
+                    and statement_member.func.value.value.id in {"self", "cls"}
+                    and len(statement_member.args) == 2
+                ):
+                    value_kind = aggregate_expression_kind(statement_member.args[1])
+                    value_key = (str(class_name), str(statement_member.func.value.attr))
+                    if value_kind is not None and value_key not in field_value_kind_conflicts:
+                        incumbent = class_field_value_aggregate_kinds.setdefault(value_key, value_kind)
+                        if incumbent != value_kind:
+                            class_field_value_aggregate_kinds.pop(value_key, None)
+                            field_value_kind_conflicts.add(value_key)
+                        if isinstance(statement_member.args[0], ast.Tuple):
+                            width = len(statement_member.args[0].elts)
+                            if width:
+                                contract = class_field_mapping_contracts.setdefault(value_key, {})
+                                incumbent_width = contract.setdefault("mapping_key_column_count", width)
+                                if incumbent_width != width:
+                                    raise ValueError(f"mapping key writers disagree on tuple width: {value_key!r}")
                 if isinstance(statement_member, ast.Assign):
                     targets = tuple(statement_member.targets)
                     value = statement_member.value
@@ -23499,6 +23578,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 field: kind
                 for (owner, field), kind
                 in class_field_value_aggregate_kinds.items()
+                if owner == method_owners.get(node_id)
+            },
+            class_field_mapping_contracts={
+                field: dict(contract)
+                for (owner, field), contract in class_field_mapping_contracts.items()
                 if owner == method_owners.get(node_id)
             },
         )
