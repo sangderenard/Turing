@@ -25381,6 +25381,31 @@ def _fold_callsite_structural_values(
                         "metadata_state": "dynamic",
                     })
                     base_data["tensor"] = base_tensor
+                if result_rank == 0:
+                    # c629: offsets[index] from list[int] feeds count's
+                    # scalar begin/end.  Carrying the list's span storage
+                    # made their region formals span/rank-0 and refused the
+                    # scalar loop feeds.  The reducer's exact result class,
+                    # together with indexing's rank proof, states the value
+                    # carrier; rank zero alone does not scalarize a Tensor.
+                    result_identity = source_value_class_identity(
+                        int(data.get("value_id", node_id)),
+                    )
+                    if result_identity and result_identity.startswith("builtins."):
+                        from .fortran_c_shell import (
+                            _authored_annotation_field_receipt,
+                        )
+                        result_abi = _authored_annotation_field_receipt(
+                            ast.Name(
+                                id=result_identity.removeprefix("builtins."),
+                                ctx=ast.Load(),
+                            ),
+                        )
+                        if result_abi and result_abi["storage"] == "scalar":
+                            return _ProgramABIValueFact(
+                                result_identity, "scalar", result_abi["dtype"],
+                                shape=(), rank=0,
+                            )
                 return _ProgramABIValueFact(
                     base_fact.python_type,
                     "span",
@@ -27192,7 +27217,7 @@ def _fold_callsite_structural_values(
                 continue
             if (
                 isinstance(value, _ProgramABIValueFact)
-                and value.storage == "span"
+                and value.storage in {"span", "scalar"}
             ):
                 # Publish the proved rank before hierarchy freezes values.
                 # A keyed Tensor lookup can have runtime extents and rank one,
@@ -27200,13 +27225,14 @@ def _fold_callsite_structural_values(
                 # without static extents. Zero is not an absent rank: replacing
                 # it with one promotes scalar reads to anonymous dynamic spans.
                 rank = (
-                    len(value.shape)
+                    0 if value.storage == "scalar"
+                    else len(value.shape)
                     if value.shape is not None
                     else int(1 if value.rank is None else value.rank)
                 )
                 attributes = dict(data.get("attributes") or {})
                 attributes.update({
-                    "program_abi_storage": "span",
+                    "program_abi_storage": value.storage,
                     "program_abi_rank": int(rank),
                     "program_abi_dtype": str(value.dtype or "unknown"),
                 })
@@ -27244,7 +27270,8 @@ def _fold_callsite_structural_values(
                         "rank": int(rank),
                         **(
                             {"metadata_state": "dynamic"}
-                            if value.shape is None else {}
+                            if value.shape is None and value.storage == "span"
+                            else {}
                         ),
                     }
             if (
