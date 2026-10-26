@@ -3164,6 +3164,30 @@ def _linked_caller_member(
             continue
         if member[0] == "value":
             caller_values = tuple(map(int, caller_field.value_ids))
+            # A callee may consume the data arena of a declared span while
+            # its caller retains that same field as a sequence view carrying
+            # the arena together with its length and capacity cells.  The
+            # common storage identity proves they name one field; a span has
+            # exactly one data member, which is column zero of that sequence.
+            caller_sequence = (
+                None if caller_field.sequence_id is None
+                or caller_sequences is None
+                else caller_sequences.by_id(int(caller_field.sequence_id))
+            )
+            if (
+                field.storage is SSARecordFieldStorage.SPAN
+                and len(field.value_ids) == 1
+                and caller_sequence is not None
+                and len(caller_sequence.column_value_ids) >= 1
+                and (
+                    str(caller_sequence.column_dtypes[0]) == "unknown"
+                    or str(field.dtype) == str(
+                        caller_sequence.column_dtypes[0]
+                    )
+                )
+            ):
+                resolved.add(int(caller_sequence.column_value_ids[0]))
+                continue
             if len(caller_values) != len(field.value_ids):
                 raise ValueError(
                     f"{caller_symbol} callsite {record.callsite_id}: "
@@ -37127,6 +37151,23 @@ def _class_surface_ssa_program(
                     dtypes = tuple(map(str, column_dtypes))
                     if not dtypes:
                         dtypes = ("unknown",) * column_count
+                    # ``array(typecode)`` is a declared contiguous native
+                    # element layout.  Its append expressions may be ordinary
+                    # Python ``int`` values, but they do not change the
+                    # array's physical column type.
+                    declared_array_dtype = (
+                        str(field.get("dtype"))
+                        if str(field.get("aggregate_kind") or "") == "array"
+                        and field.get("dtype") is not None
+                        else None
+                    )
+                    if declared_array_dtype is not None:
+                        if column_count != 1:
+                            raise ValueError(
+                                f"{symbol}: array field {storage_identity!r} "
+                                f"has {column_count} columns"
+                            )
+                        dtypes = (declared_array_dtype,)
                     # A reference field first encountered as an untyped list
                     # has one provisional arena.  Once the concordance has an
                     # authored Sequence[Record] view, that is not a second
@@ -37142,6 +37183,23 @@ def _class_surface_ssa_program(
                         and not sequence.key_columns
                         and sequence.child_table_pool is None
                     )
+                    if (
+                        sequence is not None
+                        and declared_array_dtype is not None
+                        and tuple(sequence.column_dtypes) != dtypes
+                    ):
+                        if len(sequence.column_value_ids) != 1:
+                            raise ValueError(
+                                f"{symbol}: array field {storage_identity!r} "
+                                "has a non-scalar element view"
+                            )
+                        sequence = replace(
+                            sequence, column_dtypes=dtypes,
+                        )
+                        _frame_register_sequence(
+                            function, sequence_table, sequence,
+                            stage=RECORD_ABI_MATERIALIZATION, revise=True,
+                        )
                     if provisional_sequence and column_count > 1:
                         column_ids = (
                             int(sequence.column_value_ids[0]),
