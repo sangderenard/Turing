@@ -6925,7 +6925,7 @@ def emit_ssa_function_to_llvm(
         rendering, kind = known
         if kind == wanted:
             return rendering
-        if wanted in {"i32", "i64"} and kind in {"i1", "i32", "i64"}:
+        if wanted in {"i32", "i64"} and kind == "i1":
             # A single-leaf Python bool Add has an int64 result just as a
             # repository call does. Preserve that declared domain by extending
             # its bool operands before arithmetic, rather than refusing the
@@ -6933,11 +6933,7 @@ def emit_ssa_function_to_llvm(
             if not rendering.startswith("%"):
                 return str(int(rendering))
             register = f"%conv.{tag}"
-            opcode = (
-                "zext" if kind == "i1" else
-                "sext" if int(kind[1:]) < int(wanted[1:]) else "trunc"
-            )
-            lines.append(f"  {register} = {opcode} {kind} {rendering} to {wanted}")
+            lines.append(f"  {register} = zext {kind} {rendering} to {wanted}")
             return register
         if wanted == "double" and kind in {"i1", "i32", "i64"}:
             if not rendering.startswith("%"):
