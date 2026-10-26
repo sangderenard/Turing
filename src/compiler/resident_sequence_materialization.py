@@ -280,10 +280,12 @@ def _glyph_component_resident_sequence_ids(component: Any) -> tuple[int, ...]:
         )
     )
     formatted = getattr(component, "formatted_sequence_value_id", None)
+    format_spec = getattr(component, "format_spec_value_id", None)
     return tuple(dict.fromkeys((
         *nested,
         *alternatives,
         *(() if formatted is None else (int(formatted),)),
+        *(() if format_spec is None else (int(format_spec),)),
     )))
 
 
@@ -333,30 +335,43 @@ def _compiled_validation_diagnostic_sequence_ids(
     # their operands (for example ``position`` in ``_validate_row``).
     source_page = book.page("source_glyph_sequence")
 
-    # Only the cells published by the ValidationBlock are top-level
-    # diagnostic glyphs.  Members added from one glyph recipe below are
-    # resident formatter sequences, not further JoinedStr owners.  Iterating
-    # the growing set made a later formatter node (``id_space.compose`` value
-    # 36) demand a second ``source_glyph_sequence`` row it cannot own.
-    diagnostic_glyph_ids = frozenset(diagnostic_ids)
-    for node_id, data in graph_obj.nodes(data=True):
-        value_id = int(data.get("value_id", node_id))
-        if value_id not in diagnostic_glyph_ids:
-            continue
-        row = (data.get("attributes") or {}).get(
+    # id_space.compose's diagnostic row 29 owns a formatted component
+    # whose exact format_spec_value_id is JoinedStr 8 ("#x"). The previous
+    # closure omitted that edge, so 8 became an unbounded FIXED arena leased
+    # to the caller, although native validation never consumes its glyphs.
+    # Follow resident recipe edges, and recurse only into graph values that
+    # carry their own source_glyph_sequence row. Formatter result sequences
+    # (compose's value 36) are marked diagnostic too, but cannot be asked to
+    # own a JoinedStr row merely because they belong to that same closure.
+    glyph_rows = {
+        int(data.get("value_id", node_id)): tuple(row)
+        for node_id, data in graph_obj.nodes(data=True)
+        for row in ((data.get("attributes") or {}).get(
             "source_glyph_sequence_row"
-        )
-        fact = None if row is None else source_page.latest(tuple(row))
+        ),)
+        if row is not None
+    }
+    pending = list(diagnostic_ids)
+    visited = set()
+    while pending:
+        value_id = pending.pop()
+        if value_id in visited:
+            continue
+        visited.add(value_id)
+        row = glyph_rows.get(value_id)
+        fact = None if row is None else source_page.latest(row)
         if fact is None:
             raise ValueError(
                 "compiled validation diagnostic has no glyph concordance: "
                 f"value={value_id} row={row!r}"
             )
-        diagnostic_ids.update(
+        members = tuple(
             member
             for component in tuple(getattr(fact, "components", ()) or ())
             for member in _glyph_component_resident_sequence_ids(component)
         )
+        diagnostic_ids.update(members)
+        pending.extend(member for member in members if member in glyph_rows)
     return frozenset(diagnostic_ids)
 
 

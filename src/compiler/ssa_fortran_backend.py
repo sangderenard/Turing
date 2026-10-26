@@ -1722,6 +1722,14 @@ class _FunctionEmitter:
             "repeat",
         ):
             return True
+        if (operation in {"GetElementPtr", "getelementptr"}
+                and consumer.args and int(consumer.args[0].id) == int(value.id)):
+            # id_space.compose's ')' glyph is string_token value 3 with
+            # declared arena shape (1,). Its sole consumer indexes that arena.
+            # Inlining the token produced a literal as the Store destination.
+            # The exact address-base edge requires a named designator, even
+            # when the literal producer is not spelled Const.
+            return True
         if consumer.res is None:
             return False
         if (
@@ -6142,13 +6150,19 @@ def emit_module(
     roots = {
         name for name in explicitly_requested_roots if name in functions
     }
-    if not roots and outputs is None:
+    if not roots and outputs is None and not extra_roots:
         roots.update(str(name) for name in named_outputs if str(name) in functions)
-    roots.update(
-        str(name)
-        for name, function in functions.items()
-        if function.metadata.get("control_ir")
-    )
+    if not explicitly_requested_roots and not extra_roots:
+        # A nested format-spec validation diagnostic can leave an uncalled
+        # decimal formatter in the canonical catalogue. With an explicit root
+        # interface, its control_ir does not make it a standalone heap-return
+        # entry. Follow the selected roots' real call edges below; retain the
+        # implicit whole-control surface only when no interface was selected.
+        roots.update(
+            str(name)
+            for name, function in functions.items()
+            if function.metadata.get("control_ir")
+        )
     roots.update(str(root) for root in extra_roots if str(root) in functions)
     if roots:
         reachable = set()
