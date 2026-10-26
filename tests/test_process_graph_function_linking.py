@@ -5090,6 +5090,35 @@ def test_late_returned_record_with_sequence_publishes_scalar_field_to_caller():
     )
 
 
+def test_returned_lists_after_conditional_fill_keep_linked_result_identities():
+    from src.compiler.identity_concordance import concordance_report
+
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c630_return_two_lists.py"
+    ).read_text(encoding="utf-8")
+    module, outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="returned_lists",
+        extraction_contract=CONTRACT,
+        progress=lambda _message: None, progress_bars=False,
+    )
+    root = module.functions[exports[0]]
+    returned = next(
+        instruction.args for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    )
+    defined = {
+        instruction.res.id for block in root.blocks.values()
+        for instruction in block.instrs if instruction.res is not None
+    }
+    assert len(returned) == 3
+    assert {value.id for value in returned} <= defined
+    assert tuple(outputs[root.name]) == tuple(returned)
+    report = concordance_report(module)
+    assert "0 finding(s)" in report, report
+    assert "0 fact(s), 0 identit(ies)" in report, report
+
+
 def test_loop_carried_call_record_is_expanded_on_public_return():
     module, outputs, _exports = lower_ast_source_to_ssa(
         "def child(value):\n"
