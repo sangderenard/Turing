@@ -2390,7 +2390,33 @@ def _static_sequence_capacity_survey(
         and tuple(role for _parent, role in data.get("parents") or ())
         == ("arg:0",)
     )
-    return bounds, unbounded | owned_empty_arrays
+    # Vocabulary.__init__ hands its empty lookup dictionaries to exact
+    # declared record slots. That handoff transfers the constructor's owned
+    # storage; treating it as an escaped borrowed argument left every later
+    # setdefault at capacity zero. Keep the allocation in its native context,
+    # as for an empty typed array, and let the established heap contract wait
+    # for its proved column layouts before binding pointer cells.
+    from .concordance_declarations import CLASS_FIELD_DECLARATION
+    from .identity_concordance import Ref
+
+    owned_record_initializers = {
+        int(parent)
+        for _node_id, target in graph_obj.nodes(data=True)
+        if str(target.get("type") or target.get("op") or "").casefold() == "setattr"
+        and isinstance((target.get("attributes") or {}).get("field_declaration_cell"), Ref)
+        and (target.get("attributes") or {})["field_declaration_cell"].page
+            == CLASS_FIELD_DECLARATION
+        for parent, role in target.get("parents") or ()
+        if str(role) == "value"
+    }
+    owned_record_dicts = frozenset(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Dict)
+        and not data["expr_obj"].keys
+        and int(node_id) in owned_record_initializers
+    )
+    return bounds, unbounded | owned_empty_arrays | owned_record_dicts
 
 
 def _linked_sequence_propagation_kind(

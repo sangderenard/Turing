@@ -1171,6 +1171,16 @@ class _FunctionEmitter:
         self._heap_views: set[int] = set(self._heap_elements)
         self._heap_indexed: set[int] = set()
         self.release_heap_owners = bool(release_heap_owners)
+        from .compiled_program_api import is_frame_workspace
+        source_parameter_names = {
+            int(value_id): str(name)
+            for name, value_id in self.function.metadata.get("parameter_names", ())
+        }
+        self._frame_heap_owner_ids = {
+            int(value.id) for value in self.function.args
+            if int(value.id) in self._heap_owner_ids
+            and is_frame_workspace(value, source_parameter_names.get(int(value.id)))
+        }
         self.outputs = tuple(self._typed(value) for value in self.outputs)
         self.dynamic_array_extents = {
             int(instr.args[0].id): (
@@ -1671,6 +1681,14 @@ class _FunctionEmitter:
                     )
                     for position in positions
                 )
+                if len(positions) == 1 and (
+                    collection.accounting or {}
+                ).get("heap_owner_value_id") is not None:
+                    # An owned child row is a GEP into a flat heap pointer
+                    # array. Fortran forbids scalar-element sequence
+                    # association for a pointer array actual; the exact tail
+                    # section retains its rank and aliases the same storage.
+                    return f"{self._indexed_base(collection)}({subscripts}:)"
                 return f"{self._indexed_base(collection)}({subscripts})"
         return self._operand(value)
 
@@ -4899,7 +4917,7 @@ class _FunctionEmitter:
                     body.extend(
                         f"    call turing_heap_release({_name(argument)})"
                         for argument in self.function.args
-                        if int(argument.id) in self._heap_owner_ids
+                        if int(argument.id) in self._frame_heap_owner_ids
                     )
                 body.append("    return")
                 continue
@@ -5143,6 +5161,34 @@ class _FunctionEmitter:
         # growth); an allocation result is pointed where it is made.
         for argument in self.function.args:
             body[:0] = self._heap_refresh(argument)
+        if self.release_heap_owners and self.sequence_table is not None:
+            # Prepared Fortran calls reuse their workspace buffers. Releasing
+            # a private frame resets its owner but leaves old capacities and
+            # pointer cells behind; the next activation then treats freed
+            # arenas as live storage. C/LLVM entry wrappers start these same
+            # descriptor members empty on every call. Use the descriptor and
+            # ABI workspace ownership here too; public contexts survive.
+            initializations = {}
+            for descriptor in self.sequence_table.sequences.values():
+                owner = descriptor.heap_owner_value_id
+                if owner not in self._frame_heap_owner_ids:
+                    continue
+                pointer_ids = {int(owner), *map(int, descriptor.column_value_ids)}
+                scalar_ids = {int(descriptor.length_address_id), int(descriptor.capacity_value_id)}
+                if descriptor.status_address_id is not None:
+                    scalar_ids.add(int(descriptor.status_address_id))
+                pool = descriptor.child_table_pool
+                if pool is not None:
+                    pointer_ids.update(map(int, pool.column_value_ids))
+                    pointer_ids.add(int(pool.length_value_id))
+                    if pool.status_value_id is not None:
+                        pointer_ids.add(int(pool.status_value_id))
+                    scalar_ids.update((int(pool.capacity_value_id), int(pool.row_stride_value_id)))
+                for value_id in pointer_ids & self._formal_value_ids:
+                    initializations[value_id] = f"    t{value_id} = c_null_ptr"
+                for value_id in scalar_ids & self._formal_value_ids:
+                    initializations[value_id] = f"    t{value_id} = 0"
+            body[:0] = list(initializations.values())
         call_frame_cells = {
             int(value.id)
             for block in self.function.blocks.values()

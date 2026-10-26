@@ -7267,13 +7267,19 @@ class _ControlSSABuilder(TiledObject):
                 int(pool.column_value_ids[column])
             )
             column_value_dtype = str(column_value.dtype or "unknown")
+            owned_cell = column_value_dtype == "ptr" and (column_value.accounting or {}).get("heap_owner_value_id") is not None
+            if owned_cell:
+                # The context-owned pool column is a pointer CELL.  Its
+                # element layout, not ptr, is the scalar row's type.
+                column_value_dtype = str((column_value.accounting or {}).get("heap_element_dtype") or "unknown")
             if column_value_dtype not in {"", "None", "unknown", dtype}:
                 raise ValueError(
                     "selected child sequence arena changes its physical "
                     f"dtype: values={tuple(sorted(iterable_ids))!r}, "
                     f"arena={column_value_dtype!r}, settled={dtype!r}"
                 )
-            column_value.dtype = dtype
+            if not owned_cell:
+                column_value.dtype = dtype
             if incumbent == dtype:
                 continue
             column_dtypes = list(pool.column_dtypes or (
@@ -11784,7 +11790,11 @@ class _ControlSSABuilder(TiledObject):
             self.sequence_heap_owners[value_id] = incumbent_owner
         elif (
             value_id in self.dynamic_sequence_ids
-            and child_table_pool is None
+            and (child_table_pool is None or (
+                not child_table_pool.key_columns
+                and child_table_pool.live_flags_value_id is None
+                and child_table_pool.shape_value_id is None
+            ))
             and live_flags is None
             and not any(proposed_column_shapes)
         ):
@@ -11837,6 +11847,13 @@ class _ControlSSABuilder(TiledObject):
         self.sequence_storage_values[value_id] = (
             data, *extra_columns, length_address, capacity,
             *((live_flags,) if live_flags is not None else ()),
+            *(tuple(self.ssa_value_objects[member] for member in (
+                *child_table_pool.column_value_ids,
+                child_table_pool.length_value_id,
+                *(() if child_table_pool.status_value_id is None else (child_table_pool.status_value_id,)),
+                child_table_pool.capacity_value_id,
+                child_table_pool.row_stride_value_id,
+            )) if descriptor.heap_owner_value_id is not None and child_table_pool is not None else ()),
             *(
                 (self.sequence_heap_owners[value_id],)
                 if descriptor.heap_owner_value_id is not None else ()
@@ -11942,6 +11959,20 @@ class _ControlSSABuilder(TiledObject):
             self.ssa_value_objects[int(value_id)]
             for value_id in descriptor.column_value_ids
         )
+        if descriptor.child_table_pool is not None:
+            pool = descriptor.child_table_pool
+            if pool.key_columns or pool.live_flags_value_id is not None or pool.shape_value_id is not None:
+                return descriptor
+            pool_ids = (*pool.column_value_ids, pool.length_value_id,
+                        *(() if pool.status_value_id is None else (pool.status_value_id,)))
+            pool_dtypes = (*pool.column_dtypes, "int64",
+                          *(() if pool.status_value_id is None else ("int",)))
+            try:
+                pool_layouts = tuple(layout_for(dtype) for dtype in pool_dtypes)
+            except KeyError:
+                return descriptor
+            columns = (*columns, *(self.ssa_value_objects[value_id] for value_id in pool_ids))
+            layouts = (*layouts, *pool_layouts)
         for column, layout in zip(columns, layouts, strict=True):
             # Program: ``xs = []; for i in range(n): xs.append(i * 3)``
             # lowered with the repository SSA reference.  Wrong record: the
@@ -11970,12 +12001,18 @@ class _ControlSSABuilder(TiledObject):
         # The owner is a storage member, last (``_storage_values``): every
         # helper call that passes the sequence's storage passes its owner.
         sequence_id = int(descriptor.sequence_id)
-        if sequence_id in self.sequence_storage_values and not any(
-            int(value.id) == int(owner.id)
-            for value in self.sequence_storage_values[sequence_id]
-        ):
+        if sequence_id in self.sequence_storage_values:
+            ordinary_count = len(descriptor.column_value_ids) + 2 + (descriptor.live_flags_value_id is not None)
             self.sequence_storage_values[sequence_id] = (
-                *self.sequence_storage_values[sequence_id], owner,
+                *self.sequence_storage_values[sequence_id][:ordinary_count],
+                *(tuple(self.ssa_value_objects[member] for member in (
+                    *descriptor.child_table_pool.column_value_ids,
+                    descriptor.child_table_pool.length_value_id,
+                    *(() if descriptor.child_table_pool.status_value_id is None else (descriptor.child_table_pool.status_value_id,)),
+                    descriptor.child_table_pool.capacity_value_id,
+                    descriptor.child_table_pool.row_stride_value_id,
+                )) if descriptor.child_table_pool is not None else ()),
+                owner,
             )
         return replace(
             descriptor,
@@ -12224,6 +12261,35 @@ class _ControlSSABuilder(TiledObject):
         )
         return address
 
+    def _reserve_owned_child_pool(self, descriptor, required, required_stride, *, location):
+        """Use the incumbent context's typed reserve before deriving views."""
+        from .ir_sequence_tables import lower_sequence_reserve
+        helper_name = self._sequence_helper_name(int(descriptor.sequence_id), "reserve_child_pool")
+        helper = self.sequence_helper_functions.get(helper_name)
+        if helper is None:
+            lowering = lower_sequence_reserve(descriptor, function_name=helper_name)
+            if not lowering.complete:
+                self.shortfalls.extend(SSALoweringShortfall("ssa-sequence", item.code.value, location, item.reason)
+                                       for item in lowering.shortfalls)
+                return self.constant_value(False, required, dtype="bool")
+            self._register_sequence_lowering(lowering)
+            helper = self.sequence_helper_functions[helper_name]
+        status = self.fresh_value(dtype="int", transform=REGION_CALL_RESULT, operands=(required, required_stride))
+        self.emit(Handler.Call, [*self.sequence_storage_values[int(descriptor.sequence_id)], required, required_stride], status,
+                  attributes={"callee": helper.name, "source_linked": True, "ssa_sequence_operation": "reserve", "sequence_id": int(descriptor.sequence_id)})
+        valid = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(status,))
+        self.emit(Handler.Lt, [status, self.constant_value(2, status)], valid)
+        passed, failed, complete = (self.new_block(kind) for kind in ("validation_pass", "validation_fail", "if_merge"))
+        self.conditional_branch(valid, passed, failed)
+        self.current = failed
+        self.emit(Handler.Call, [], attributes={"callee": "turing_validation_error", "error_code": 75,
+                  "failure": "invalid_extent", "binding": "owned_child_pool_reserve"})
+        self.branch(complete)
+        self.current = passed
+        self.branch(complete)
+        self.current = complete
+        return valid
+
     def lower_sequence_mutation(
         self,
         mutation: ControlSequenceMutation,
@@ -12264,6 +12330,38 @@ class _ControlSSABuilder(TiledObject):
         self.current = selected
         if selection_validity is not None:
             self.active_child_selections.add(int(mutation.sequence_value_id))
+        child_selection = self.child_table_selections.get(int(mutation.sequence_value_id))
+        if child_selection is not None:
+            pool, handle = child_selection
+            parents = {(
+                descriptor.column_value_ids, descriptor.length_address_id,
+                descriptor.capacity_value_id, descriptor.heap_owner_value_id,
+            ): descriptor for descriptor in self.sequence_descriptors.values()
+                if descriptor.child_table_pool == pool and descriptor.heap_owner_value_id is not None}
+            if len(parents) == 1:
+                parent = next(iter(parents.values()))
+                if str(mutation.operator) != "append":
+                    self.shortfalls.append(SSALoweringShortfall("ssa-sequence", "owned-child-mutation", path,
+                        "owned child growth requires an exact append extent"))
+                    self.branch(complete)
+                    self.current = complete
+                    return
+                lengths = self.external_value(pool.length_value_id)
+                address = self.fresh_value(dtype="ptr", transform=ADDRESS, operands=(lengths, handle), physical={"physical_dtype": "int64"})
+                self.emit(Handler.GetElementPtr, [lengths, handle], address)
+                length = self.fresh_value(dtype="int64", transform=LOAD, operands=(address,))
+                self.emit(Handler.Load, [address], length)
+                required = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,))
+                self.emit(Handler.Add, [length, self.constant_value(1, length, dtype="int64")], required)
+                # Capacity is already this descriptor's scalar storage
+                # member.  Re-reading its minted id as an external source
+                # value appended a second, untyped formal (c639 borrowed
+                # Index: 18 argument slots for17 identities).
+                capacity = self.sequence_storage_values[int(parent.sequence_id)][len(parent.column_value_ids) + 1]
+                valid = self._reserve_owned_child_pool(parent, capacity, required, location=path)
+                append_block = self.new_block("sequence_mutation_selected")
+                self.conditional_branch(valid, append_block, skipped)
+                self.current = append_block
         self._lower_sequence_mutation_body(mutation, path=path)
         if selection_validity is not None:
             self.active_child_selections.discard(int(mutation.sequence_value_id))
@@ -13228,6 +13326,29 @@ class _ControlSSABuilder(TiledObject):
             if isinstance(fact, Mapping)
             else getattr(fact, "alternatives", ())
         )
+        element_class_fact = tuple(
+            (receipt or {}).get(
+                "subject_callsite_iterable_element_class_fact", ()
+            )
+        )
+        if (
+            len(element_class_fact) >= 4
+            and str(element_class_fact[0]) == "unknown"
+        ):
+            exact_classes = tuple(sorted(set(map(
+                str, element_class_fact[3],
+            ))))
+            tag = self.native_value_type_tags.get(subject_id)
+            if tag is None:
+                tag = self.scheduled_projected_native_type_tag(subject_id)
+            if tuple(map(str, alternatives)) != exact_classes or tag is None:
+                raise ValueError(
+                    "unsupported mixed-element native type ABI: "
+                    f"{self.function_name} value {subject_id} has exact "
+                    f"callsite element classes {exact_classes!r}, while "
+                    f"VALUE_TYPE_ABI declares {tuple(map(str, alternatives))!r}; "
+                    "the sequence ABI has no per-element class tag"
+                )
         tags = dict(
             fact.get("tags", ())
             if isinstance(fact, Mapping)
@@ -16112,13 +16233,17 @@ class _ControlSSABuilder(TiledObject):
                 # handle owns one whole stride, and the outer row must fit.
                 # Error runtime calls return, so the failure edge MUST skip
                 # initialization/store and the dependent append's row view.
+                next_length = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION, operands=(outer_length,))
+                self.emit(Handler.Add, [outer_length, self.constant_value(1, outer_length, dtype="int64")], next_length)
+                reserve_valid = None
+                if destination.heap_owner_value_id is not None:
+                    reserve_valid = self._reserve_owned_child_pool(destination, next_length,
+                        self.constant_value(1, outer_length, dtype="int64"), location=location)
                 outer_capacity = self.sequence_storage_values[int(destination.sequence_id)][len(destination.column_value_ids) + 1]
                 stride = self.external_value(pool.row_stride_value_id)
                 pool_capacity = self.external_value(pool.capacity_value_id)
                 outer_room = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(outer_length, outer_capacity))
                 self.emit(Handler.Lt, [outer_length, outer_capacity], outer_room)
-                next_length = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION, operands=(outer_length,))
-                self.emit(Handler.Add, [outer_length, self.constant_value(1, outer_length, dtype="int64")], next_length)
                 row_end = self.fresh_value(dtype="int64", transform=CONTROL_EXPRESSION, operands=(next_length, stride))
                 self.emit(Handler.Mul, [next_length, stride], row_end)
                 pool_room = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(row_end, pool_capacity))
@@ -16126,6 +16251,11 @@ class _ControlSSABuilder(TiledObject):
                 room = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(outer_room, pool_room))
                 self.emit(Handler.LAnd, [outer_room, pool_room], room,
                           attributes={"binding": "selected_child_allocation_bounds"})
+                if reserve_valid is not None:
+                    checked_room = self.fresh_value(dtype="bool", transform=CONTROL_PREDICATE, operands=(room, reserve_valid))
+                    self.emit(Handler.LAnd, [room, reserve_valid], checked_room,
+                              attributes={"binding": "selected_child_allocation_bounds"})
+                    room = checked_room
                 room_pass = self.new_block("validation_pass")
                 room_fail = self.new_block("validation_fail")
                 missing_join = self.new_block("if_merge")
@@ -23288,6 +23418,7 @@ def _inject_field_slot_access(
     receiver_accounting: Mapping[str, Any] | None = None,
     field_write_state_cells: tuple[Any, ...] = (),
     lexical_read_scope: Any = None,
+    resident_field_locations: Mapping[int, tuple[SSAValue, int, str]] | None = None,
 ) -> tuple[Function, dict[int, tuple[int, int, str]]]:
     """Rewrite a method's control function to pass instance state as a slot arena.
 
@@ -23433,6 +23564,11 @@ def _inject_field_slot_access(
     column_arrays: dict[tuple[str, int | None], SSAValue] = {}
     for index, key in enumerate(column_keys):
         column_dtype = key[0]
+        if resident_field_locations is not None:
+            if key[1] is None or int(key[1]) not in resident_field_locations:
+                raise ValueError("resident record field loads require exact separate slot locations")
+            column_arrays[key] = resident_field_locations[int(key[1])][0]
+            continue
         arena_id = int(self_value_id) if index == 0 else fresh()
         column_arrays[key] = SSAValue(
             arena_id, dtype=column_dtype,
@@ -23476,6 +23612,11 @@ def _inject_field_slot_access(
         )
         for slot, slot_dtype in slot_dtypes.items()
     }
+    if resident_field_locations is not None:
+        field_locations = {
+            int(slot): (int(value.id), int(offset), str(dtype))
+            for slot, (value, offset, dtype) in resident_field_locations.items()
+        }
     # Graph identities are not SSA versions.  A SetAttr result may therefore
     # carry the same numeric id as the receiver column which must receive it
     # (for example ``self.dt_max = computed`` can name both values ``18``).
@@ -23914,7 +24055,8 @@ def _inject_field_slot_access(
 
     # ``self`` first, then the non-self parameters in declared order; the read
     # field values are no longer parameters because the loads produce them.
-    arguments = [column_arrays[key] for key in column_keys]
+    arguments = ([column_arrays[key] for key in column_keys]
+                 if resident_field_locations is None else [])
     seen_argument_ids = {int(argument.id) for argument in arguments}
     for argument in control_function.args:
         argument_id = int(argument.id)
@@ -24007,10 +24149,10 @@ def _inject_field_slot_access(
         metadata={
             **dict(control_function.metadata),
             "parameter_names": tuple(parameter_names),
-            "receiver_field_locations": tuple(sorted(
+            **({"receiver_field_locations": tuple(sorted(
                 (int(slot), *location)
                 for slot, location in field_locations.items()
-            )),
+            ))} if resident_field_locations is None else {}),
         },
     ), field_locations
 

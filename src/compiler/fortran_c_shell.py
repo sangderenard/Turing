@@ -17693,12 +17693,14 @@ def _sequence_column_dtype_contracts(
                     contracts[value_id] = dtypes
     for node_id, data in graph_obj.nodes(data=True):
         value_id = int(data.get("value_id", node_id))
-        if str(data.get("type") or data.get("op") or "").casefold() != "getattr":
+        operation = str(data.get("type") or data.get("op") or "").casefold()
+        if operation not in {"getattr", "setattr"}:
             continue
         receiver_id = next((
             int(parent)
             for parent, role in data.get("parents") or ()
-            if str(role) in {"value", "object", "base", "receiver"}
+            if str(role) in ({"object", "receiver"} if operation == "setattr"
+                             else {"value", "object", "base", "receiver"})
             and int(parent) in graph_obj
         ), None)
         if receiver_id is None:
@@ -17721,6 +17723,59 @@ def _sequence_column_dtype_contracts(
         )
         if not isinstance(field, Mapping):
             continue
+        if operation == "getattr" and field.get("aggregate_kind") == "dict":
+            mapping_attributes = data.get("attributes") or {}
+            key_dtypes = tuple(mapping_attributes.get("mapping_key_column_dtypes") or ())
+            handle_dtype = mapping_attributes.get("mapping_value_dtype")
+            if value_id in declared and key_dtypes and handle_dtype is not None:
+                # A read-only method is a view of the same declared mapping
+                # as its writer. Omitting its key/handle layout at birth
+                # left that method FIXED while the writer was DYNAMIC.
+                dtypes = (*key_dtypes, str(handle_dtype))
+                if len(dtypes) == declared[value_id]:
+                    contracts[value_id] = dtypes
+            continue
+        if operation == "setattr":
+            # Index.__init__: domain=array("B") was born with unknown rows,
+            # so its claimed heap owner never became a bound owner. The
+            # exact SetAttr value edge and receiver field ABI already state
+            # the allocation's element layout; publish it before descriptor
+            # birth, just as a later GetAttr receives the same contract.
+            source_id = next((
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) == "value" and int(parent) in graph_obj
+            ), None)
+            if source_id is None:
+                continue
+            source_data = graph_obj.nodes[source_id]
+            source_attributes = source_data.get("attributes") or {}
+            value_id = int(source_data.get("value_id", source_id))
+            field_attributes = data.get("attributes") or {}
+            if (
+                value_id in declared
+                and field.get("aggregate_kind") == "dict"
+                and isinstance(source_data.get("expr_obj"), ast.Dict)
+                and not source_data["expr_obj"].keys
+            ):
+                # The shared mapping contract is derived from the exact
+                # tuple-member class cells and child-handle role. Unknown
+                # members stay unknown; a field name is no layout proof.
+                key_dtypes = tuple(field_attributes.get("mapping_key_column_dtypes") or ())
+                handle_dtype = field_attributes.get("mapping_value_dtype")
+                if key_dtypes and handle_dtype is not None:
+                    dtypes = (*key_dtypes, str(handle_dtype))
+                    if len(dtypes) == declared[value_id]:
+                        contracts[value_id] = dtypes
+                continue
+            if not (
+                value_id in declared
+                and field.get("aggregate_kind") == "array"
+                and source_attributes.get("aggregate_kind") == "array"
+                and source_attributes.get("producer_kind") == "sequence_materialization"
+                and tuple(role for _parent, role in source_data.get("parents") or ())
+                == ("arg:0",)
+            ):
+                continue
         storage = str(field.get("storage") or "")
         aggregate_kind = str(field.get("aggregate_kind") or "").casefold()
         # Vocabulary.put mutates self.exact_atoms = array("I").  That
@@ -37387,6 +37442,12 @@ def _class_surface_ssa_program(
                         # scalar pointer cells for columns, one owner slot.
                         if retains_heap_owner and role[0] == "column":
                             dtype, shape = "ptr", ()
+                        elif retains_heap_owner and role[0] in {
+                            "child_pool_column", "child_pool_length", "child_pool_status",
+                        }:
+                            # Forwarded nested rows retain their allocating
+                            # context's pointer cells, not element scalars.
+                            dtype, shape = "ptr", ()
                         elif retains_heap_owner and role == ("heap_owner_value_id",):
                             dtype, shape = "ptr", (1,)
                         return accepted_sequence_members.get(
@@ -37883,11 +37944,24 @@ def _class_surface_ssa_program(
                                     if has_live_flags else ()
                                 ),
                             )
+                            child_roles = {
+                                **{int(value): ("child_pool_column", position)
+                                   for position, value in enumerate(child_columns)},
+                                int(child_length): ("child_pool_length",),
+                                int(child_capacity): ("child_pool_capacity",),
+                                int(child_stride): ("child_pool_row_stride",),
+                                **({int(child_status): ("child_pool_status",)}
+                                   if child_status is not None else {}),
+                            }
                             for member_id, member_dtype in child_members:
+                                member_dtype, member_shape = accepted_member_abi(
+                                    child_roles.get(int(member_id), ("child_pool_metadata",)),
+                                    str(member_dtype),
+                                )
                                 value = _adopt_graph_formal(
                                     function, graph, int(member_id),
                                     GLOBAL_MONOTONIC_IDS.declaration,
-                                    dtype=str(member_dtype), shape=(),
+                                    dtype=str(member_dtype), shape=tuple(member_shape),
                                     physical={"storage": "sequence"},
                                 )
                                 function.args.append(value)
@@ -46262,6 +46336,56 @@ def _class_surface_ssa_program(
                     continue
                 projection_id = int(data.get("value_id", node_id))
                 resident_id = int(field.value_ids[0])
+                receiver_data = graph.nodes.get(receiver_origin_id, {})
+                projection_attributes = data.get("attributes") or {}
+                declared_slot = projection_attributes.get("attribute_slot")
+                causal_calls = {
+                    int(parent) for parent, role in data.get("parents") or ()
+                    if role == "after_write" and parent in graph
+                    and isinstance(graph.nodes[parent].get("expr_obj"), ast.Call)
+                }
+                live_call_sites = {
+                    int(instruction.attributes["plan_callsite_id"])
+                    for block in function.blocks.values() for instruction in block.instrs
+                    if instruction.op == "Call"
+                    and instruction.attributes.get("plan_callsite_id") is not None
+                }
+                if (
+                    (receiver_data.get("attributes") or {}).get("class_ref") is not None
+                    and isinstance(receiver_data.get("expr_obj"), ast.Call)
+                    and field.storage is SSARecordFieldStorage.SCALAR
+                    and declared_slot is not None
+                    and projection_attributes.get("field_declaration_cell") is not None
+                    and causal_calls <= live_call_sites
+                    and resident_id in resident_values
+                    and not any(instruction.res is not None
+                                and int(instruction.res.id) == projection_id
+                                for block in function.blocks.values() for instruction in block.instrs)
+                ):
+                    # Clock.add's frame updates its caller-owned field arena.
+                    # A later local GetAttr is a new load from that exact
+                    # descriptor slot, not the constructor's historical value.
+                    # Reuse method slot injection, retaining the resident arena
+                    # identity/type and its already-linked call ordering.
+                    from .precompile_to_ssa import _inject_field_slot_access
+                    slot = int(declared_slot[1])
+                    rebuilt, _locations = _inject_field_slot_access(
+                        function, self_value_id=resident_id,
+                        non_self_param_ids=(),
+                        field_ops=(("read", projection_id, slot),),
+                        field_count=slot + 1, separate_field_storage=True,
+                        field_dtypes={slot: str(field.dtype)},
+                        output_value_ids=tuple(function.metadata.get("source_output_value_ids", ())),
+                        resident_field_locations={slot: (
+                            resident_values[resident_id], int(field.offset or 0), str(field.dtype),
+                        )},
+                    )
+                    function.args = rebuilt.args
+                    function.blocks = rebuilt.blocks
+                    function.metadata = rebuilt.metadata
+                    resident_values = function_values(function)
+                    changed = True
+                    continue
                 produced_residents = tuple(
                     instruction.res
                     for block in function.blocks.values()
@@ -59087,6 +59211,11 @@ def _lower_resolved_process_graph_deployment(
         build_target=build_target,
     )
     stage_boundary("ssa-source: repository SSA lowered")
+    # Derived views of the exact field/class/key-layout cells survive source
+    # graph retirement so concordance can check the shared child contract.
+    module.metadata["mapping_child_contract_evidence"] = tuple(
+        graph.G.graph.get("mapping_child_contract_evidence") or ()
+    )
     if linked_source_region_ssa:
         from .precompile_to_ssa import link_verified_source_region_integrals
 

@@ -1537,6 +1537,7 @@ class CorrelationTable:
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
+        found.extend(self._mapping_child_contract_findings(module))
         found.extend(self._unborn_display_findings(module))
         found.extend(self._unreturned_output_findings(module))
         found.extend(self._live_structure_findings(module))
@@ -3585,6 +3586,61 @@ class CorrelationTable:
                             f"{cell!r} records {field}={posted!r}; resident "
                             f"accounting {key}={resident!r} at {tuple(positions)!r}",
                         ))
+        return found
+
+    @staticmethod
+    def _mapping_child_contract_findings(module: Any) -> list[Finding]:
+        """Check shared child views against their exact source class/layout."""
+        from .concordance_declarations import (
+            CLASS_FIELD_DECLARATION, SOURCE_VALUE_CLASS,
+            SOURCE_AGGREGATE_LAYOUT, SourceAggregateLayout,
+        )
+        metadata = dict(getattr(module, "metadata", {}) or {})
+        book = metadata.get("identity_book")
+        found = []
+        for view in metadata.get("mapping_child_contract_evidence") or ():
+            field, scalar, key = (view.get(name) for name in (
+                "field_cell", "class_cell", "key_layout_cell",
+            ))
+            problem = None
+            if book is None or any(
+                not isinstance(cell, Ref) or cell.page != page
+                for cell, page in ((field, CLASS_FIELD_DECLARATION),
+                                   (scalar, SOURCE_VALUE_CLASS),
+                                   (key, SOURCE_AGGREGATE_LAYOUT))
+            ):
+                problem = "child view lacks its field/class/key-layout authority"
+            else:
+                try:
+                    class_fact = book.page(SOURCE_VALUE_CLASS).cell(scalar.row, scalar.column)
+                    layout = book.page(SOURCE_AGGREGATE_LAYOUT).cell(key.row, key.column)
+                    expected = {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(class_fact[0]))
+                    if expected != view.get("dtype") or int(class_fact[1]) != 1:
+                        problem = f"child dtype {view.get('dtype')!r} disagrees with operand class {class_fact!r}"
+                    elif not isinstance(layout, SourceAggregateLayout) or layout.aggregate_kind != "tuple" or len(layout.members) != view.get("key_width"):
+                        problem = "child key width disagrees with its ordered tuple layout"
+                    elif len(view.get("key_class_cells", ())) != len(layout.members) or len(view.get("key_dtypes", ())) != len(layout.members):
+                        problem = "child key column type view has the wrong member count"
+                    else:
+                        for member, cell, dtype in zip(layout.members, view["key_class_cells"], view["key_dtypes"], strict=True):
+                            if cell is None:
+                                if dtype != "unknown":
+                                    problem = "unproved key member was assigned a physical dtype"
+                                continue
+                            if not isinstance(cell, Ref) or cell.page != SOURCE_VALUE_CLASS or int(cell.row[1]) != int(member.value_id) or cell.row[0] != scalar.row[0]:
+                                problem = "key class does not name its exact ordered member"
+                                break
+                            key_fact = book.page(SOURCE_VALUE_CLASS).cell(cell.row, cell.column)
+                            expected_key = {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]), "unknown")
+                            if dtype != expected_key:
+                                problem = "key dtype disagrees with its exact member class"
+                                break
+                    if book.page(CLASS_FIELD_DECLARATION).cell(field.row, field.column) is None:
+                        problem = "child field declaration is absent"
+                except (KeyError, IndexError, TypeError, ValueError) as error:
+                    problem = f"child authority cannot be read: {error}"
+            if problem is not None:
+                found.append(Finding("mapping-child-contract-disagreement", str(getattr(field, "row", "<source>")), None, problem))
         return found
 
     @staticmethod

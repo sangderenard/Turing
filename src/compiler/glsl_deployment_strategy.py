@@ -24421,9 +24421,16 @@ def _remove_dead_metadata_nodes(
             return False
         attributes = data.get("attributes") or {}
         dead_pure_tensor_call = bool(
-            attributes.get("tensor_candidate") is not None
-            or str(attributes.get("static_python_reference") or "").startswith(
-                "AbstractTensor."
+            # Clock.add stores clock, but its name also marked the call as
+            # a tensor candidate and deleted the unused result here. The
+            # resolved method identity owns this call; a name candidate is
+            # not proof that the source callee is a pure tensor operation.
+            attributes.get("method_ref") is None
+            and (
+                attributes.get("tensor_candidate") is not None
+                or str(attributes.get("static_python_reference") or "").startswith(
+                    "AbstractTensor."
+                )
             )
         )
         # A structurally folded constant is a PROVEN literal standing in
