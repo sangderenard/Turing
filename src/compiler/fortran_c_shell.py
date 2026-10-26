@@ -34020,13 +34020,23 @@ def _class_surface_ssa_program(
     def sequence_view_receipt(descriptor: Any) -> tuple[Any, ...]:
         """The identity-independent physical shape of one sequence view."""
 
+        pool = descriptor.child_table_pool
         return (
             tuple(map(str, descriptor.column_dtypes)),
             len(tuple(descriptor.column_value_ids)),
             tuple(map(int, descriptor.key_columns)),
             bool(descriptor.live_flags_value_id is not None),
             str(descriptor.capacity_policy.value),
-            bool(descriptor.child_table_pool is not None),
+            None if pool is None else (
+                int(pool.handle_column),
+                tuple(map(str, pool.column_dtypes)),
+                len(tuple(pool.column_value_ids)),
+                tuple(map(int, pool.key_columns)),
+                bool(pool.shape_value_id is not None),
+                bool(pool.status_value_id is not None),
+                bool(pool.live_flags_value_id is not None),
+                bool(pool.writable),
+            ),
         )
     # A typed sequence row has one complete, fixed physical ABI.  Once a
     # record identity is used as such a row anywhere in this source closure,
@@ -34513,7 +34523,7 @@ def _class_surface_ssa_program(
         ) = evidence[0][0]
 
         resolved_dtypes = list(first_dtypes)
-        child_pool = bool(first_child_pool)
+        child_pool = first_child_pool
 
         for receipt, _receipt_cells in evidence[1:]:
             (
@@ -34561,10 +34571,17 @@ def _class_surface_ssa_program(
                         f"{incumbent_dtype!r} != {candidate_dtype!r}"
                     )
 
-            # A method that does not locally require/materialize a child pool
-            # does not disprove another method's positive evidence that this
-            # same record-field storage has one.
-            child_pool = child_pool or bool(candidate_child_pool)
+            # A method without a local child view does not disprove the
+            # physical pool observed by another method. Two positive views
+            # must agree on the same identity-independent layout.
+            if candidate_child_pool is not None:
+                if child_pool is not None and child_pool != candidate_child_pool:
+                    raise ValueError(
+                        "record field child-pool view disagreement for "
+                        f"{storage_identity!r}: "
+                        f"{child_pool!r} != {candidate_child_pool!r}"
+                    )
+                child_pool = candidate_child_pool
 
         decisive = (
             tuple(resolved_dtypes),
@@ -34572,7 +34589,7 @@ def _class_surface_ssa_program(
             tuple(key_columns),
             bool(live_flags),
             str(capacity_policy),
-            bool(child_pool),
+            child_pool,
         )
 
         _frame_post(
@@ -37060,7 +37077,7 @@ def _class_surface_ssa_program(
                     (
                         column_dtypes, column_count, key_columns,
                         retains_deleted_rows, capacity_policy,
-                        has_child_table,
+                        child_pool_layout,
                     ) = view
                     accepted_sequence_members = (
                         exact_accepted_sequence_members(storage_identity)
@@ -37096,12 +37113,6 @@ def _class_surface_ssa_program(
                         return GLOBAL_MONOTONIC_IDS.mint(
                             dtype=str(member_dtype),
                             shape=tuple(member_shape),
-                        )
-                    if has_child_table:
-                        raise ValueError(
-                            f"{symbol}: field {storage_identity!r} requires "
-                            "a child-table sequence view whose exact pool "
-                            "descriptor is not present in this frame"
                         )
                     sequence_table = all_sequence_tables.setdefault(
                         symbol, SSASequenceTable(owner=symbol)
@@ -37350,6 +37361,108 @@ def _class_surface_ssa_program(
                             ),
                             stage=RECORD_ABI_MATERIALIZATION,
                         )
+                    if child_pool_layout is not None:
+                        if sequence.child_table_pool is None:
+                            (
+                                handle_column, child_dtypes,
+                                child_column_count, child_key_columns,
+                                has_shape, has_status, has_live_flags,
+                                child_writable,
+                            ) = child_pool_layout
+                            if len(child_dtypes) != child_column_count:
+                                raise ValueError(
+                                    f"{symbol}: field {storage_identity!r} "
+                                    "has an incomplete child-pool layout"
+                                )
+                            child_columns = tuple(
+                                mint_member(("child_pool_column", position), dtype)
+                                for position, dtype in enumerate(child_dtypes)
+                            )
+                            child_length = mint_member(
+                                ("child_pool_length",), "int64",
+                            )
+                            child_capacity = mint_member(
+                                ("child_pool_capacity",), "int64",
+                            )
+                            child_stride = mint_member(
+                                ("child_pool_row_stride",), "int64",
+                            )
+                            child_shape = (
+                                mint_member(("child_pool_shape",), "int64")
+                                if has_shape else None
+                            )
+                            child_rank = (
+                                mint_member(("child_pool_rank",), "int64")
+                                if has_shape else None
+                            )
+                            child_shape_stride = (
+                                mint_member(
+                                    ("child_pool_shape_stride",), "int64",
+                                ) if has_shape else None
+                            )
+                            child_status = (
+                                mint_member(("child_pool_status",), "int")
+                                if has_status else None
+                            )
+                            child_live_flags = (
+                                mint_member(("child_pool_live_flags",), "bool")
+                                if has_live_flags else None
+                            )
+                            child_members = (
+                                *zip(child_columns, child_dtypes),
+                                (child_length, "int64"),
+                                (child_capacity, "int64"),
+                                (child_stride, "int64"),
+                                *(((child_shape, "int64"),) if has_shape else ()),
+                                *(((child_rank, "int64"),) if has_shape else ()),
+                                *(
+                                    ((child_shape_stride, "int64"),)
+                                    if has_shape else ()
+                                ),
+                                *(
+                                    ((child_status, "int"),)
+                                    if has_status else ()
+                                ),
+                                *(
+                                    ((child_live_flags, "bool"),)
+                                    if has_live_flags else ()
+                                ),
+                            )
+                            for member_id, member_dtype in child_members:
+                                value = _adopt_graph_formal(
+                                    function, graph, int(member_id),
+                                    GLOBAL_MONOTONIC_IDS.declaration,
+                                    dtype=str(member_dtype), shape=(),
+                                    physical={"storage": "sequence"},
+                                )
+                                function.args.append(value)
+                                values[int(member_id)] = value
+                            pool = SSAChildTablePoolDescriptor(
+                                handle_column=int(handle_column),
+                                column_value_ids=tuple(map(int, child_columns)),
+                                length_value_id=int(child_length),
+                                capacity_value_id=int(child_capacity),
+                                row_stride_value_id=int(child_stride),
+                                shape_value_id=child_shape,
+                                rank_value_id=child_rank,
+                                shape_stride_value_id=child_shape_stride,
+                                status_value_id=child_status,
+                                live_flags_value_id=child_live_flags,
+                                column_dtypes=tuple(child_dtypes),
+                                key_columns=tuple(map(int, child_key_columns)),
+                                writable=bool(child_writable),
+                            )
+                            sequence = replace(sequence, child_table_pool=pool)
+                            _frame_register_sequence(
+                                function, sequence_table, sequence,
+                                stage=RECORD_ABI_MATERIALIZATION,
+                                revise=True,
+                            )
+                        elif sequence_view_receipt(sequence)[-1] != child_pool_layout:
+                            raise ValueError(
+                                f"{symbol}: field {storage_identity!r} "
+                                "has a child-pool layout disagreement"
+                            )
                     for member_id, role, fallback_dtype in (
                         (
                             sequence.status_address_id,
@@ -37382,6 +37495,24 @@ def _class_surface_ssa_program(
                         *(
                             (int(sequence.live_flags_value_id),)
                             if sequence.live_flags_value_id is not None else ()
+                        ),
+                        *(
+                            (
+                                *map(int, sequence.child_table_pool.column_value_ids),
+                                int(sequence.child_table_pool.length_value_id),
+                                int(sequence.child_table_pool.capacity_value_id),
+                                int(sequence.child_table_pool.row_stride_value_id),
+                                *(
+                                    int(value_id)
+                                    for value_id in (
+                                        sequence.child_table_pool.shape_value_id,
+                                        sequence.child_table_pool.rank_value_id,
+                                        sequence.child_table_pool.shape_stride_value_id,
+                                        sequence.child_table_pool.status_value_id,
+                                        sequence.child_table_pool.live_flags_value_id,
+                                    ) if value_id is not None
+                                ),
+                            ) if sequence.child_table_pool is not None else ()
                         ),
                     )))
                     # An already-materialized sequence is still the complete

@@ -267,11 +267,19 @@ def _frame_register_sequence(
     from .identity_concordance import current_identity_book
     from .precompile_to_ssa import _function_root_cell
 
+    pool = descriptor.child_table_pool
     named = (
         descriptor.sequence_id, *descriptor.column_value_ids,
         descriptor.length_address_id, descriptor.capacity_value_id,
         descriptor.status_address_id, descriptor.live_flags_value_id,
         descriptor.heap_owner_value_id,
+        *(() if pool is None else (
+            *pool.column_value_ids, pool.length_value_id,
+            pool.capacity_value_id, pool.row_stride_value_id,
+            pool.shape_value_id, pool.rank_value_id,
+            pool.shape_stride_value_id, pool.status_value_id,
+            pool.live_flags_value_id,
+        )),
     )
     sources = _frame_cells(
         *extra,
