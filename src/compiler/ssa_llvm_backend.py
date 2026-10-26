@@ -2918,8 +2918,15 @@ def _emit_repository_call_module(
                         len(flattened) == 1
                         and _declared_span_rank(result) == 0
                         and not tuple(result.shape or ())
+                        and _value_llvm_type(result) in (
+                            *_INTEGER_LLVM_TYPES, "float", "double",
+                        )
                     ):
                         # A one-limb index tuple used as a scalar offset.
+                        # A static iterable (1.5,) is instead ssa.aggregate:
+                        # its empty shape names an address carrier, not a
+                        # scalar. Collapsing it discarded its double element
+                        # layout and made the following GEP address i64.
                         payload = flattened[0]
                     else:
                         aggregate_items = tuple(flattened) or (0,)

@@ -954,6 +954,25 @@ def _replace_parent_value(
     ]
 
 
+def loop_requires_iterative_control(graph: Any, plan: LoopPlan) -> bool:
+    """The evaporator's existing terminal/conditional control boundary.
+
+    ``last([1.5])`` folds its isinstance branch out of the graph while the
+    authored loop still contains that If. Evaporation rejects that exact AST
+    boundary; its retained realization must consult the same predicate or an
+    UNROLL plan with no emitted iterations erases the loop's carried value.
+    """
+    return bool(plan.loop.control_sites or plan.loop.return_controls) or any(
+        isinstance(member_expression, ast.If)
+        for loop_expression in (
+            graph.G.nodes.get(int(plan.loop.node_id), {}).get("expr_obj"),
+        )
+        if isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While))
+        for statement in loop_expression.body
+        for member_expression in ast.walk(statement)
+    )
+
+
 def evaporate_unrolled_loops(
     graph: Any,
     plans: Iterable[LoopPlan],
@@ -1124,10 +1143,6 @@ def evaporate_unrolled_loops(
         # publish each occurrence independently.
         # Source returns are terminal edges too: evaporating their loop
         # erases every authored exit it owns (``for ...: if c: return m``).
-        blocked_by_control = any(
-            member.loop.control_sites or member.loop.return_controls
-            for member in selected_plans
-        )
         # Program: ``for x in range(6): if x * 2 > n: total += x`` (scratch
         # c86; also with an else arm, c88).  Wrong record: evaporation
         # emits no control block, but the body's authored ``if`` is a
@@ -1139,15 +1154,9 @@ def evaporate_unrolled_loops(
         # whose body holds an authored ``if`` statement keeps its iterative
         # control; a conditional EXPRESSION (``a if c else b``) is a value
         # select and still evaporates.
-        blocked_by_control = blocked_by_control or any(
-            isinstance(member_expression, ast.If)
+        blocked_by_control = any(
+            loop_requires_iterative_control(graph, member)
             for member in selected_plans
-            for loop_expression in (
-                graph.G.nodes.get(int(member.loop.node_id), {}).get("expr_obj"),
-            )
-            if isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While))
-            for statement in loop_expression.body
-            for member_expression in ast.walk(statement)
         )
         blocked_by_call = any(
             any((graph.G.nodes[node_id].get("attributes") or {}).get(key)
@@ -2097,11 +2106,11 @@ def materialize_retained_loop_ports(
     }
     materialized_plans = []
     from .concordance_declarations import (
-        BindingFact, CANONICAL_VALUE, LOOP_CARRIED_BINDING, LOOP_COMPOSER,
-        LOOP_RESULT_PORT_BINDING, NAME_BINDING,
+        BindingFact, CANONICAL_VALUE, INGESTION_VALUE, LOOP_CARRIED_BINDING, LOOP_COMPOSER,
+        LOOP_RESULT_PORT_BINDING, NAME_BINDING, RETURN_SITE_SLOT, SEMANTIC_OUTPUT,
     )
     from .identity_concordance import (
-        Derived, Mode, current_identity_book,
+        Derived, Mode, Ref, current_identity_book,
     )
 
     book = current_identity_book()
@@ -2392,6 +2401,71 @@ def materialize_retained_loop_ports(
             else int(root)
             for position, root in enumerate(graph.roots)
         ]
+        # ``previous = value`` can leave no numerical body region. The port
+        # then is the only producer after the loop. Moving the graph root
+        # alone left return_site_slot and semantic_output at the loop Input,
+        # so the next fold discarded the port and returned a zeroed formal.
+        # A returned Name's exact ingestion cell owns its binding. Follow
+        # only slot revisions (not the value's unrelated alias/name history)
+        # and keep returns owned by this loop on their iteration value.
+        port_cell = port_rows.get(int(new_value_id))
+        slots = book.pages.get(RETURN_SITE_SLOT.name)
+        owned_return_spans = {
+            tuple(site) for _node, _chain, _values, site in plan.loop.return_controls
+            if site is not None
+        }
+        owned_return_sites = {
+            site for site, span in (graph.G.graph.get("return_site_spans") or {}).items()
+            if tuple(span) in owned_return_spans
+        }
+
+        def returned_name_cells(slot_cell: Any, site: Any) -> tuple[Any, ...]:
+            pending = [slot_cell, site]
+            seen = set()
+            names = []
+            while pending:
+                cell = pending.pop()
+                if cell is None or cell.key in seen:
+                    continue
+                seen.add(cell.key)
+                if cell.page is INGESTION_VALUE:
+                    expression = graph.node_map.get(int(cell.row[1]))
+                    if isinstance(expression, ast.Name) and expression.id == str(binding):
+                        names.append(cell)
+                elif cell.page is RETURN_SITE_SLOT:
+                    pending.extend(source for source, _stage in book.edges_into(cell)
+                                   if source.page in {RETURN_SITE_SLOT, INGESTION_VALUE})
+            return tuple(dict.fromkeys(names))
+
+        if binding is not None and port_cell is not None and slots is not None and read_scope is not None:
+            for row in tuple(slots.scope_rows(read_scope)):
+                fact = slots.latest(row)
+                if (row[1] in owned_return_sites or not isinstance(fact, Ref)
+                        or fact.page is not CANONICAL_VALUE or int(fact.row[1]) != int(old_value_id)):
+                    continue
+                previous = book.latest_ref(RETURN_SITE_SLOT, row)
+                name_cells = returned_name_cells(previous, row[1])
+                if not name_cells:
+                    continue
+                book.post(RETURN_SITE_SLOT, row, port_cell, stage=LOOP_COMPOSER,
+                          provenance=Derived((previous, port_cell, *name_cells)), mode=Mode.REVISE)
+            outputs = book.pages.get(SEMANTIC_OUTPUT.name)
+            if outputs is not None:
+                for row in tuple(outputs.scope_rows(read_scope)):
+                    fact = outputs.latest(row)
+                    position = int(row[1])
+                    if (int(fact[1]) != int(old_value_id)
+                            or position >= len(graph.roots)
+                            or int(graph.roots[position]) != int(new_value_id)
+                            or not reads_binding("return", "root", position)):
+                        continue
+                    previous = book.latest_ref(SEMANTIC_OUTPUT, row)
+                    book.post(SEMANTIC_OUTPUT, row, (str(fact[0]), int(new_value_id)),
+                              stage=LOOP_COMPOSER, provenance=Derived((previous, port_cell)), mode=Mode.REVISE)
+                    output_versions = identities.get(str(fact[0]), [])
+                    if output_versions and int(output_versions[-1]) == int(old_value_id):
+                        output_versions[-1] = int(new_value_id)
+                        post_port_version(str(fact[0]), int(new_value_id))
         # The plan records of loops not yet materialized are the same cache
         # one level up: `state_input_id`, a carried binding's initial, and an
         # iteration output all name graph values whose consumer edges were
@@ -6281,7 +6355,10 @@ def analyze_shader_loop_reductions(
                 )
             )
         )
-        if not region_indices and not sequence_mutations and not source_linked_calls:
+        # ``previous = value`` is a control-owned iterable load and carried
+        # Phi, even when every numerical predicate region folded away. Its
+        # exact carried binding is work; no shader closure is required.
+        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings:
             blockers.append("no-shader-region")
         if (
             loop.source_type == "While"

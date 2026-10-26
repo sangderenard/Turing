@@ -117,6 +117,7 @@ from .loop_composer import (
     analyze_shader_loop_reductions,
     bind_control_deployments_to_regions,
     evaporate_unrolled_loops,
+    loop_requires_iterative_control,
     materialize_retained_loop_ports,
 )
 from .loop_ir import MODELLED_STATE_OPERATORS as _MODELLED_STATE_OPERATORS
@@ -28161,6 +28162,28 @@ def _fold_callsite_structural_values(
         )
         if int(value_id) in graph.G
     } | {
+        # A carried seed is a control-owned operand even when the body's
+        # only update is ``previous = value``. Dropping its otherwise-dead
+        # Constant0 left the loop Phi with an untyped external seed.
+        int(value_id)
+        for _node_id, node_data in graph.G.nodes(data=True)
+        for field in ("loop_carried_bindings", "loop_break_bindings")
+        for pair in ((node_data.get("attributes") or {}).get(field) or {}).values()
+        for value_id in pair
+        if int(value_id) in graph.G
+    } | {
+        int(value_id)
+        for _node_id, node_data in graph.G.nodes(data=True)
+        for value_id in ((node_data.get("attributes") or {}).get("loop_target_initials") or {}).values()
+        if int(value_id) in graph.G
+    } | {
+        int(value_id)
+        for _node_id, node_data in graph.G.nodes(data=True)
+        for site in ((node_data.get("attributes") or {}).get("loop_break_sites") or {}).values()
+        for pair, published in site.items()
+        for value_id in (*pair, published)
+        if int(value_id) in graph.G
+    } | {
         # A return-site slot is a metadata edge from authored control.  The
         # value can have no ordinary graph successor when it is returned by
         # only one arm (``if flag: return limit; return None``), but it is
@@ -33539,14 +33562,15 @@ def strategize_shell_deployment(
                 plan,
                 strategy=LoopStrategy.NATIVE_SOURCE,
                 reason=(
-                    "resident sequence mutation requires iterative SSA "
-                    "memory effects"
+                    "authored conditional or terminal control requires iterative SSA"
+                    if loop_requires_iterative_control(graph, plan) else
+                    "source-owned memory effects require iterative SSA"
                 ),
             )
             if (
                 plan.strategy in {LoopStrategy.UNROLL, LoopStrategy.CONSTANT}
                 and (
-                    bool(plan.loop.control_sites)
+                    loop_requires_iterative_control(graph, plan)
                     or any(
                         effect.mode in {LoopStateEffectMode.SEQUENCE_MUTATION,
                                         LoopStateEffectMode.MAPPING_MUTATION}

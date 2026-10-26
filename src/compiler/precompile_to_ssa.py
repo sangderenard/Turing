@@ -5932,6 +5932,19 @@ class _ControlSSABuilder(TiledObject):
                 self._bind(
                     value_id, value, BindingKind.VERSIONED_WRITE, *producer,
                 )
+            elif (
+                str(value.dtype or "unknown") in {"", "unknown"}
+                and str(dtype or "unknown") not in {"", "unknown"}
+                and not self._defines(value)
+                and getattr(self._binding_fact(value_id), "kind", None) is BindingKind.LOOP_SEED
+            ):
+                # A control-only ``previous = value`` loop reserves its
+                # backedge before the static iterable Load proves int64.
+                # The reservation has no definition/type yet; the exact
+                # producer must resolve its one object AND posted row.
+                value.dtype = str(dtype)
+                revised = self._revise_value(value, *producer)
+                self._bind(value_id, value, BindingKind.REGION_RESULT, *producer, revised)
             return value
         value = self._value_from_meta(value_id, dtype=dtype)
         self._bind(value_id, value, BindingKind.REGION_RESULT, *producer)
