@@ -2387,7 +2387,7 @@ def _static_sequence_capacity_survey(
         for attributes in (data.get("attributes") or {},)
         if attributes.get("aggregate_kind") == "array"
         and attributes.get("producer_kind") == "sequence_materialization"
-        and tuple(role for _parent, role in data.get("parents") or ())
+        and tuple(role for _parent, role in data.get("parents") or () if role != "callee")
         == ("arg:0",)
     )
     # Vocabulary.__init__ hands its empty lookup dictionaries to exact

@@ -17796,7 +17796,7 @@ def _sequence_column_dtype_contracts(
                 and field.get("aggregate_kind") == "array"
                 and source_attributes.get("aggregate_kind") == "array"
                 and source_attributes.get("producer_kind") == "sequence_materialization"
-                and tuple(role for _parent, role in source_data.get("parents") or ())
+                and tuple(role for _parent, role in source_data.get("parents") or () if role != "callee")
                 == ("arg:0",)
             ):
                 continue

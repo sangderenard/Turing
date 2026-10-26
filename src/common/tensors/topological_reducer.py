@@ -24438,39 +24438,45 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     # same compile-time environment.  Join them once after every call has been
     # declared so compiled shells can invoke imported constructors/functions
     # without a second lookup mechanism.
+    from array import array as _source_array_type
+    source_array_external_refs = set()
     for entry in external_function_table:
         target = static_bindings.get(entry.name)
         if callable(target):
             external_function_table.resolve_callable(entry.reference, target)
-            # c632's array constructor is declared by this exact import
-            # reference.  Preserve its collection identity before function
-            # subgraphs lose the external table; a later GetAttr is a view,
-            # not the allocation's birth.
-            from array import array as _source_array_type
             if target is _source_array_type:
-                for source_graph in (graph.G, *(
-                    member.graph.G for member in function_table
-                    if getattr(member, "graph", None) is not None
-                )):
-                    for _node_id, source_data in source_graph.nodes(data=True):
-                        source_attributes = source_data.get("attributes") or {}
-                        if (
-                            str(source_data.get("type") or source_data.get("op") or "").casefold() != "call"
-                            or source_attributes.get("external_callee_ref") != entry.reference.address
-                        ):
-                            continue
-                        # Only the empty allocation participates here. An
-                        # initializer needs its own ordered row/copy birth;
-                        # it cannot be inferred from the array result class.
-                        if tuple(role for _parent, role in source_data.get("parents") or ()) != ("arg:0",):
-                            continue
-                        source_data.setdefault("attributes", {}).update({
-                            "aggregate_kind": "array",
-                            "producer_kind": "sequence_materialization",
-                            "sequence_column_count": 1,
-                            "sequence_key_columns": (),
-                            "sequence_writable": True,
-                        })
+                source_array_external_refs.add(entry.reference.address)
+    # c632's allocation identity belongs to its exact lexical import, which
+    # can live in an ingested constructor rather than the root module. Real
+    # Vocabulary.__init__ retained array's callee edge and local binding, so
+    # the root-only external-reference join missed its owned allocation.
+    for source_wrapper in (graph, *(
+        member.graph for member in function_table
+        if getattr(member, "graph", None) is not None
+    )):
+        source_bindings = getattr(source_wrapper, "python_bindings", {}) or {}
+        for _node_id, source_data in source_wrapper.G.nodes(data=True):
+            source_attributes = source_data.get("attributes") or {}
+            if str(source_data.get("type") or source_data.get("op") or "").casefold() != "call":
+                continue
+            reference = source_attributes.get("static_python_reference")
+            if (
+                source_bindings.get(reference) is not _source_array_type
+                and source_attributes.get("external_callee_ref") not in source_array_external_refs
+            ):
+                continue
+            # The callee edge retains the exact static callable identity;
+            # only argument edges determine whether this is an empty array.
+            if tuple(role for _parent, role in source_data.get("parents") or ()
+                     if role != "callee") != ("arg:0",):
+                continue
+            source_data.setdefault("attributes", {}).update({
+                "aggregate_kind": "array",
+                "producer_kind": "sequence_materialization",
+                "sequence_column_count": 1,
+                "sequence_key_columns": (),
+                "sequence_writable": True,
+            })
     graph.python_bindings = canonicalize_python_static_bindings(
         graph.python_bindings
     )
