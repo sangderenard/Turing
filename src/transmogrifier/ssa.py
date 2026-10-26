@@ -2328,9 +2328,12 @@ def sequence_member_roles(
 ) -> dict[int, set]:
     """member id -> {(sequence id, role)} for one sequence descriptor.
 
-    Roles: ``("handle",)``, ``("column", position)`` and one per extent or
-    status cell (``length_address_id``, ``capacity_value_id``,
-    ``status_address_id``, ``live_flags_value_id``).
+    Roles: ``("handle",)``, ``("column", position)`` and one per outer
+    extent/status cell.  A child-table pool, when present, publishes the
+    corresponding ``("child_pool", ...)`` roles as members of the outer
+    sequence.  The record ABI field is the full physical surface of that
+    sequence, so its nested-pool cells cannot be left as positional record
+    values at a call boundary.
     """
 
     claims: dict[int, set] = {}
@@ -2351,6 +2354,16 @@ def sequence_member_roles(
         "heap_owner_value_id",
     ):
         claim(getattr(descriptor, attribute, None), (attribute,))
+    pool = descriptor.child_table_pool
+    if pool is not None:
+        for position, column in enumerate(pool.column_value_ids):
+            claim(column, ("child_pool", "column", position))
+        for attribute in (
+            "length_value_id", "capacity_value_id", "row_stride_value_id",
+            "shape_value_id", "rank_value_id", "shape_stride_value_id",
+            "status_value_id", "live_flags_value_id",
+        ):
+            claim(getattr(pool, attribute, None), ("child_pool", attribute))
     return claims
 
 

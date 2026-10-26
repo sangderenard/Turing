@@ -2913,11 +2913,24 @@ def _sequence_member_role(descriptor: Any, value_id: int) -> tuple | None:
             return ("column", position)
     for attribute in (
         "length_address_id", "capacity_value_id",
-        "status_address_id", "live_flags_value_id",
+        "status_address_id", "live_flags_value_id", "heap_owner_value_id",
     ):
         member = getattr(descriptor, attribute, None)
         if member is not None and int(member) == value_id:
             return (attribute,)
+    pool = descriptor.child_table_pool
+    if pool is not None:
+        for position, column in enumerate(pool.column_value_ids):
+            if int(column) == value_id:
+                return ("child_pool", "column", position)
+        for attribute in (
+            "length_value_id", "capacity_value_id", "row_stride_value_id",
+            "shape_value_id", "rank_value_id", "shape_stride_value_id",
+            "status_value_id", "live_flags_value_id",
+        ):
+            member = getattr(pool, attribute, None)
+            if member is not None and int(member) == value_id:
+                return ("child_pool", attribute)
     return None
 
 
@@ -2927,6 +2940,15 @@ def _sequence_member_by_role(descriptor: Any, role: tuple) -> int | None:
     if role[0] == "column":
         columns = tuple(descriptor.column_value_ids)
         return int(columns[role[1]]) if role[1] < len(columns) else None
+    if role[0] == "child_pool":
+        pool = descriptor.child_table_pool
+        if pool is None:
+            return None
+        if role[1] == "column":
+            columns = tuple(pool.column_value_ids)
+            return int(columns[role[2]]) if role[2] < len(columns) else None
+        member = getattr(pool, role[1], None)
+        return None if member is None else int(member)
     member = getattr(descriptor, role[0], None)
     return None if member is None else int(member)
 
@@ -3209,6 +3231,19 @@ def _linked_caller_member(
             else _sequence_member_by_role(caller_sequence, member[1])
         )
         if caller_member is None:
+            # Status and live flags are operational storage for one local
+            # sequence view.  A caller which does not declare one has not
+            # omitted data from this field: it has supplied no cell for the
+            # callee to share, so the formal remains call-local frame storage.
+            # Every data, extent, stride, shape, and pool-column role still
+            # refuses below; those are the physical field contract.
+            if member[1] in {
+                ("status_address_id",),
+                ("live_flags_value_id",),
+                ("child_pool", "status_value_id"),
+                ("child_pool", "live_flags_value_id"),
+            }:
+                continue
             raise ValueError(
                 f"{caller_symbol} callsite {record.callsite_id}: callee "
                 f"{record.callee_symbol} formal {callee_id} is sequence "
@@ -37088,16 +37123,34 @@ def _class_surface_ssa_program(
                                 else GLOBAL_MONOTONIC_IDS.mint(),
                             )
                         )
+                # ``array(typecode)`` declares one mutable contiguous arena
+                # at construction.  A constructor normally only writes that
+                # field, so waiting for a later indexed read to mark it a
+                # sequence leaves its owning record with a span alone while
+                # callees correctly require the arena's length/capacity
+                # cells.  Establish the declared one-column view where the
+                # array field is materialized; ordinary spans still require
+                # an authored sequence receipt.
+                declared_array_field = (
+                    str(field.get("aggregate_kind") or "") == "array"
+                    and field.get("dtype") is not None
+                )
                 if (
-                    "sequence" in access_receipts
+                    ("sequence" in access_receipts or declared_array_field)
                     and storage not in {"keyed", "table", "record"}
                 ):
                     view = exact_record_sequence_view(storage_identity)
                     if view is None:
-                        raise ValueError(
-                            f"{symbol}: field {storage_identity!r} requires "
-                            "a sequence view but has no structural receipt"
-                        )
+                        if declared_array_field:
+                            view = (
+                                (str(field["dtype"]),), 1, (), False,
+                                "fixed", None,
+                            )
+                        else:
+                            raise ValueError(
+                                f"{symbol}: field {storage_identity!r} requires "
+                                "a sequence view but has no structural receipt"
+                            )
                     (
                         column_dtypes, column_count, key_columns,
                         retains_deleted_rows, capacity_policy,
