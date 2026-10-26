@@ -2198,17 +2198,19 @@ SEQUENCE_RESIDENCY = declare_page("sequence_residency", (
 ), ResidencyFact)
 
 # -- pages: re-declared (census 75, step 7) ----------------------------------
-#: The callsite moves from the column into the row: one row per binding.
-#: Fact ``ArgumentBindingFact`` or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``.
-#: CONCORD; rows written raw before this step keep ``"binding"`` as their
-#: third element with the callsite as the column.
+#: One row per binding, qualified by the caller as well as the call-local
+#: site. Distinct specialized callers reuse local site IDs and can bind the
+#: same callee shell formal to different literals. Fact ``ArgumentBindingFact``
+#: or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``. Legacy rows written before
+#: this step keep ``"binding"`` as their third element with callsite in column.
 ARGUMENT_BINDING = declare_page("argument_binding", (
-    RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
+    RowField("callee", K.NAME), RowField("caller", K.NAME),
+    RowField("formal", K.VALUE_ID),
     RowField("callsite", K.LABEL),
 ), ArgumentBindingFact)
 ARGUMENT_BINDING_RESOLUTION = declare_page("argument_binding_resolution", (
-    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
-    RowField("source", K.VALUE_ID),
+    RowField("callee", K.SCOPE), RowField("caller", K.SCOPE),
+    RowField("formal", K.VALUE_ID), RowField("source", K.VALUE_ID),
 ), tuple)                              # REVISE (next column)
 #: (callsite, callee, formal); CONCORD, DERIVED(the slot's cell, the formal's cell).
 FRAME_LEASE = declare_page("frame_lease_link", (

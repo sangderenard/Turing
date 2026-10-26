@@ -1,5 +1,6 @@
 from src.compiler.identity_concordance import (
     CorrelationTable,
+    argument_binding_history,
     begin_identity_book,
     end_identity_book,
     materializing_binding_kind,
@@ -55,6 +56,64 @@ def test_precision_operator_concordance_reports_changed_source_identity():
         assert findings[0].value_id == 27
     finally:
         end_identity_book(token)
+
+
+def test_argument_binding_identity_includes_caller_and_local_callsite():
+    class Page:
+        def __init__(self, rows=()):
+            self._history = {row: ((0, fact),) for row, fact in rows}
+
+        def rows(self):
+            return tuple(self._history)
+
+        def scope_rows(self, scope):
+            return tuple(
+                row for row in self._history if str(row[0]) == str(scope)
+            )
+
+        def history(self, row):
+            return self._history.get(row, ())
+
+        def latest(self, row):
+            history = self.history(row)
+            return None if not history else history[-1][1]
+
+    binding_page = Page((
+        (("helper", "caller_a", 2, 7), ("caller_storage", 1)),
+        (("helper", "caller_b", 2, 7), ("caller_value", 1)),
+    ))
+    resolution_a = (
+        "caller_storage", "caller_value", "materializing_binding_kind",
+    )
+    resolution_page = Page((
+        (("helper", "caller_a", 2, 1), resolution_a),
+    ))
+    class Book:
+        pages = {
+            "argument_binding": binding_page,
+            "argument_binding_resolution": resolution_page,
+        }
+
+        def page(self, name):
+            return self.pages[name]
+
+    book = Book()
+    assert argument_binding_history(binding_page, "helper", 2) == (
+        (("caller_a", 7), ("caller_storage", 1)),
+        (("caller_b", 7), ("caller_value", 1)),
+    )
+    assert materializing_binding_kind(
+        book, "helper", 2, 1, "caller_value",
+        caller_symbol="caller_a",
+    ) == "caller_storage"
+    assert materializing_binding_kind(
+        book, "helper", 2, 1, "caller_value",
+        caller_symbol="caller_b",
+    ) == "caller_value"
+    module = type("Module", (), {
+        "metadata": {"identity_book": book},
+    })()
+    assert CorrelationTable._binding_kind_findings(module) == []
 
 
 def test_audit_reads_post_ssa_numeric_concordance_pages():

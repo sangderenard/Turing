@@ -119,6 +119,7 @@ from .authored_parameter_abi import (
 from .frame_identity_book import (
     _RecordAbiMinter as _RecordAbiMinter,
     _argument_binding_fact as _argument_binding_fact,
+    _argument_binding_ref as _argument_binding_ref,
     _frame_binding_value_ids as _frame_binding_value_ids,
     _frame_book_scope as _frame_book_scope,
     _frame_call_cells as _frame_call_cells,
@@ -3749,11 +3750,13 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                         continue
                     fact = _argument_binding_fact(
                         book, callee_name, formal.id, int(callsite_id),
+                        caller_symbol=owner.name,
                     )
                     binding_cells[int(formal.id)] = _frame_cells(
-                        book.latest_ref(ARGUMENT_BINDING, (
-                            str(callee_name), int(formal.id), int(callsite_id),
-                        )),
+                        _argument_binding_ref(
+                            book, callee_name, formal.id, int(callsite_id),
+                            caller_symbol=owner.name,
+                        ),
                     )
                     if isinstance(fact, Unresolved):
                         lease = _result_storage_lease_cell(
@@ -44296,6 +44299,7 @@ def _class_surface_ssa_program(
         # rows, ``result_storage_binding`` cells), and the formals whose
         # storage the final ``else`` leased from absence.
         binding_cells: dict[int, tuple] = {}
+        literal_source_cells: dict[int, tuple] = {}
         absent_bindings: set[int] = set()
 
         def post_binding_input(
@@ -45563,6 +45567,19 @@ def _class_surface_ssa_program(
                             )
                         ),
                     ))
+                    literal_cell = _frame_graph_cell(
+                        caller_graph, caller_value_id,
+                    )
+                    if literal_cell is None:
+                        raise ValueError(
+                            "caller literal argument has no canonical source "
+                            f"cell: caller={caller_symbol!r}, "
+                            f"callsite={planned_call.callsite_id}, "
+                            f"formal={value_id}, actual={caller_value_id}"
+                        )
+                    literal_source_cells[value_id] = _frame_cells(
+                        literal_cell,
+                    )
                 elif (
                     caller_node is not None
                     and str(
@@ -45583,6 +45600,19 @@ def _class_surface_ssa_program(
                             caller_attributes["function_ref"]
                         )),
                     ))
+                    literal_cell = _frame_graph_cell(
+                        caller_graph, caller_value_id,
+                    )
+                    if literal_cell is None:
+                        raise ValueError(
+                            "caller static reference has no canonical source "
+                            f"cell: caller={caller_symbol!r}, "
+                            f"callsite={planned_call.callsite_id}, "
+                            f"formal={value_id}, actual={caller_value_id}"
+                        )
+                    literal_source_cells[value_id] = _frame_cells(
+                        literal_cell,
+                    )
                 else:
                     frame_bindings.append((
                         value_id, "caller_value", caller_value_id
@@ -45663,11 +45693,14 @@ def _class_surface_ssa_program(
                     allocate_result_storage(value_id),
                 ))
         # Record this call's binding decisions onto the shared book: row
-        # ``(callee, formal, callsite)`` on ``argument_binding`` (the callsite
-        # is in the row; one row per binding, history per revisit), fact
+        # ``(callee, caller, formal, callsite)`` on ``argument_binding``.
+        # Callsite ids and formal ids belong to their caller graph; two
+        # specialized callers can reuse both while binding different literal
+        # values. Fact
         # ``ArgumentBindingFact(kind, source)`` DERIVED from the callee
-        # formal's cell, the caller value's cell and the ``call_binding_input``
-        # / ``result_storage_binding`` cell the walk read -- so a value
+        # formal's cell, exact caller source identity, caller value cell and
+        # the ``call_binding_input`` / ``result_storage_binding`` cell the
+        # walk read -- so a value
         # threaded through as frame storage can be read on this page against
         # the shape-enrichment page.  The final ``else`` posts
         # ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``; readers treat it as
@@ -45679,7 +45712,10 @@ def _class_surface_ssa_program(
                 _frame_value_cell(
                     all_functions[caller_symbol], recorded_source,
                 )
-                if isinstance(recorded_source, int)
+                if recorded_kind in {
+                    "caller_value", "caller_alias", "caller_storage",
+                }
+                and isinstance(recorded_source, int)
                 and not isinstance(recorded_source, bool)
                 else None
             )
@@ -45693,11 +45729,12 @@ def _class_surface_ssa_program(
             cells = _frame_cells(
                 formal_cell, source_cell, lease_cell,
                 *binding_cells.get(recorded_value_id, ()),
+                *literal_source_cells.get(recorded_value_id, ()),
             ) or _frame_call_cells(caller_graph, planned_call.callsite_id)
             _frame_post(
                 ARGUMENT_BINDING,
                 (
-                    str(callee_symbol), recorded_value_id,
+                    str(callee_symbol), str(caller_symbol), recorded_value_id,
                     int(planned_call.callsite_id),
                 ),
                 (
@@ -48928,12 +48965,11 @@ def _class_surface_ssa_program(
                                 before=source_id,
                                 after=source_id,
                                 sources=_frame_cells(
-                                    current_identity_book().latest_ref(
-                                        ARGUMENT_BINDING, (
-                                            str(record.callee_symbol),
-                                            int(callee_id),
-                                            int(record.callsite_id),
-                                        ),
+                                    _argument_binding_ref(
+                                        current_identity_book(),
+                                        record.callee_symbol, callee_id,
+                                        record.callsite_id,
+                                        caller_symbol=caller.name,
                                     ),
                                     _frame_value_cell(caller, exact_caller_id),
                                 ),
@@ -50403,6 +50439,7 @@ def _class_surface_ssa_program(
                                 current_identity_book(),
                                 record.callee_symbol or callee.name,
                                 int(argument.id), int(source), kind,
+                                caller_symbol=caller.name,
                             )
                         if kind in {
                             "caller_value", "caller_alias", "caller_storage"
@@ -50542,12 +50579,11 @@ def _class_surface_ssa_program(
                             # instead of allocating an anonymous id whose
                             # later dtype decision has no producer cell.
                             literal_cells = _frame_cells(
-                                current_identity_book().latest_ref(
-                                    ARGUMENT_BINDING, (
-                                        str(record.callee_symbol),
-                                        int(argument.id),
-                                        int(record.callsite_id),
-                                    ),
+                                _argument_binding_ref(
+                                    current_identity_book(),
+                                    record.callee_symbol, argument.id,
+                                    record.callsite_id,
+                                    caller_symbol=caller.name,
                                 ),
                                 _frame_value_cell(callee, int(argument.id)),
                             )
@@ -54940,12 +54976,11 @@ def _class_surface_ssa_program(
                         complete = False
                         break
                     literal_cells = _frame_cells(
-                        current_identity_book().latest_ref(
-                            ARGUMENT_BINDING, (
-                                str(record.callee_symbol),
-                                int(argument.id),
-                                int(record.callsite_id),
-                            ),
+                        _argument_binding_ref(
+                            current_identity_book(),
+                            record.callee_symbol, argument.id,
+                            record.callsite_id,
+                            caller_symbol=caller.name,
                         ),
                         _frame_value_cell(callee, int(argument.id)),
                     )
@@ -55396,12 +55431,11 @@ def _class_surface_ssa_program(
                         refreshed = []
                         break
                     literal_cells = _frame_cells(
-                        current_identity_book().latest_ref(
-                            ARGUMENT_BINDING, (
-                                str(record.callee_symbol),
-                                int(argument.id),
-                                int(record.callsite_id),
-                            ),
+                        _argument_binding_ref(
+                            current_identity_book(),
+                            record.callee_symbol, argument.id,
+                            record.callsite_id,
+                            caller_symbol=caller.name,
                         ),
                         _frame_value_cell(callee, int(argument.id)),
                     )

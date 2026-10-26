@@ -4028,15 +4028,26 @@ class CorrelationTable:
         if page is None:
             return []
         found: list[Finding] = []
-        # Step 7 keys one row per (callee, formal, callsite); rows written
-        # before it key (callee, formal, "binding") with the callsite as the
-        # column.  Both are read per (callee, formal).
+        # Step 7 keys one row per (callee, caller, formal, callsite); older
+        # rows key (callee, formal, callsite), or (callee, formal, "binding")
+        # with callsite in the column. Caller-local ids and callsite ids are
+        # not identities outside their caller.
         formals: dict[tuple, dict[Any, dict[str, list]]] = {}
         for row in page.rows():
-            if not (isinstance(row, tuple) and len(row) >= 2):
+            if not isinstance(row, tuple):
                 continue
-            kinds_by_source = formals.setdefault((row[0], row[1]), {})
-            for callsite, fact in argument_binding_history(page, row[0], row[1], rows=(row,)):
+            if len(row) == 4:
+                caller_symbol, formal_id = str(row[1]), int(row[2])
+            elif len(row) == 3:
+                caller_symbol, formal_id = None, int(row[1])
+            else:
+                continue
+            kinds_by_source = formals.setdefault(
+                (row[0], caller_symbol, formal_id), {},
+            )
+            for callsite, fact in argument_binding_history(
+                page, row[0], formal_id, rows=(row,),
+            ):
                 if not (isinstance(fact, tuple) and len(fact) == 2):
                     continue
                 kind, source = fact
@@ -4045,13 +4056,20 @@ class CorrelationTable:
                 kinds_by_source.setdefault(int(source), {}).setdefault(
                     str(kind), []
                 ).append(callsite)
-        for (function_name, value_id), kinds_by_source in formals.items():
+        for (
+            function_name, caller_symbol, value_id,
+        ), kinds_by_source in formals.items():
             for source, by_kind in sorted(kinds_by_source.items()):
                 if len(by_kind) < 2:
                     continue
+                resolution_row = (
+                    (str(function_name), caller_symbol, int(value_id), int(source))
+                    if caller_symbol is not None
+                    else (str(function_name), int(value_id), int(source))
+                )
                 resolution = book.page(
                     "argument_binding_resolution"
-                ).latest((str(function_name), int(value_id), int(source)))
+                ).latest(resolution_row)
                 if (
                     isinstance(resolution, tuple)
                     and resolution
@@ -9339,39 +9357,58 @@ def concord_program_abi_frame_transitions(module: Any) -> tuple[dict, ...]:
 
 def argument_binding_history(
     page: Any, callee_symbol: Any, formal_id: int, *, rows: Any = None,
+    caller_symbol: Any = None,
 ) -> tuple[tuple[Any, Any], ...]:
-    """Every ``(callsite, fact)`` recorded for one callee formal on the
-    ``argument_binding`` page, in page order.
+    """Every caller-qualified ``(callsite, fact)`` for one callee formal.
 
-    Step 7 keys one row per ``(callee, formal, callsite)``; rows written
-    before it key ``(callee, formal, "binding")`` with the callsite as the
-    column.  ``rows`` restricts the read to those rows (a caller iterating
-    the page); by default the formal's rows are read from the page's scope
-    index.  An ``Unresolved`` fact is returned as such.
+    Current rows key ``(callee, caller, formal, callsite)`` and return
+    ``((caller, callsite), fact)``. Older step-7 rows key
+    ``(callee, formal, callsite)``; pre-step-7 rows key
+    ``(callee, formal, "binding")`` with callsite in the column. ``rows``
+    restricts the read to those rows; an ``Unresolved`` fact is preserved.
     """
 
     callee_symbol = str(callee_symbol)
     formal_id = int(formal_id)
+    caller_filter = None if caller_symbol is None else str(caller_symbol)
     if rows is None:
         rows = tuple(
             row for row in page.scope_rows(callee_symbol)
-            if len(row) == 3 and row[1] == formal_id
+            if (
+                len(row) == 4 and int(row[2]) == formal_id
+                or len(row) == 3 and int(row[1]) == formal_id
+            )
         )
     history: list[tuple[Any, Any]] = []
     for row in rows:
-        if not (isinstance(row, tuple) and len(row) == 3):
+        if not isinstance(row, tuple):
             continue
-        if str(row[0]) != callee_symbol or int(row[1]) != formal_id:
+        if str(row[0]) != callee_symbol:
+            continue
+        if len(row) == 4:
+            if int(row[2]) != formal_id:
+                continue
+            row_caller = str(row[1])
+            if caller_filter is not None and row_caller != caller_filter:
+                continue
+            callsite = (row_caller, row[3])
+        elif len(row) == 3:
+            if int(row[1]) != formal_id:
+                continue
+            row_caller = None
+            callsite = None if row[2] == "binding" else row[2]
+        else:
             continue
         for column, fact in page.history(row):
-            history.append((column if row[2] == "binding" else row[2], fact))
+            history.append((column if row[2] == "binding" else callsite, fact))
     return tuple(history)
 
 
 def materializing_binding_kind(
     book: Any, callee_symbol: Any, formal_id: int, source_id: int, kind: Any,
+    *, caller_symbol: Any = None,
 ) -> str:
-    """The kind that can materialize one caller slot, across every callsite.
+    """The kind that can materialize one caller slot across its callsites.
 
     A frame binding's kind is not a label on the slot; it selects which
     machinery may supply the argument.  ``caller_storage`` can restore a slot
@@ -9382,9 +9419,10 @@ def materializing_binding_kind(
     refuses the call -- after which the callee's output is never written and
     whatever reads it gets uninitialized memory, with no shortfall anywhere.
 
-    The decisions are already written to the shared page precisely so this is
-    answerable.  If any callsite proved the slot is caller storage, that is
-    what it is, and every callsite naming it gets the kind that works.
+    Current rows include caller identity because callsite IDs and local value
+    IDs are scoped to that caller. If any callsite in this caller proved the
+    slot is caller storage, every callsite in this caller naming that exact
+    slot gets the kind that works.
     """
 
     from .concordance_declarations import ARGUMENT_BINDING
@@ -9392,8 +9430,23 @@ def materializing_binding_kind(
 
     page = book.page("argument_binding")
     callee_symbol = str(callee_symbol)
+    caller_filter = None if caller_symbol is None else str(caller_symbol)
     for row in page.scope_rows(callee_symbol):
-        if not (len(row) == 3 and row[1] == int(formal_id)):
+        if len(row) == 4:
+            if int(row[2]) != int(formal_id):
+                continue
+            row_caller = str(row[1])
+            if caller_filter is not None and row_caller != caller_filter:
+                continue
+        elif len(row) == 3:
+            if caller_filter is not None and len(page.row_fields) == 4:
+                # Current pages cannot safely join a caller-blind legacy
+                # row to a caller-qualified physical frame.
+                continue
+            if int(row[1]) != int(formal_id):
+                continue
+            row_caller = None
+        else:
             continue
         for column, fact in page.history(row):
             if not (isinstance(fact, tuple) and len(fact) == 2):
@@ -9405,7 +9458,9 @@ def materializing_binding_kind(
                 continue
             if str(recorded_kind) == "caller_storage":
                 resolution_row = (
-                    callee_symbol, int(formal_id), int(source_id),
+                    (callee_symbol, row_caller, int(formal_id), int(source_id))
+                    if row_caller is not None
+                    else (callee_symbol, int(formal_id), int(source_id))
                 )
                 resolution = (
                     "caller_storage", str(kind), "materializing_binding_kind",
