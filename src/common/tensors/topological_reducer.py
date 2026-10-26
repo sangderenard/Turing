@@ -9098,6 +9098,10 @@ def _normalize_lexical_values(
                 refined_field_cell = declared_field_schema_cell(
                     receiver_class, expression.attr,
                 )
+                if refined_field_cell is not None:
+                    graph.G.nodes[attribute_id].setdefault("attributes", {})[
+                        "field_declaration_cell"
+                    ] = refined_field_cell
                 refined_field_fact = (
                     None if refined_field_cell is None
                     else field_state_book.page(
@@ -13161,6 +13165,18 @@ def _normalize_lexical_values(
             # above -- the field write is already a real, correctly wired
             # SetAttr node; it was just never named, so it never reached
             # ``identity_table`` for anything downstream to select by name.
+            declared_field_cell = declared_field_schema_cell(
+                str(method_owner)
+                if method_owner is not None
+                and isinstance(target.value, ast.Name)
+                and target.value.id in {"self", "cls"}
+                else receiver_class_identity(receiver),
+                target.attr,
+            )
+            if declared_field_cell is not None:
+                node_data.setdefault("attributes", {})[
+                    "field_declaration_cell"
+                ] = declared_field_cell
             if isinstance(target.value, ast.Name):
                 field_identity = f"{target.value.id}.{target.attr}"
                 identity_bindings.setdefault(
@@ -13168,6 +13184,7 @@ def _normalize_lexical_values(
                 ).append(node_id)
                 record_ingestion_definition(field_identity, node_id, target)
                 # ``callee_ref``/``method_ref``/``class_ref`` each let a
+                    declared_field_cell,
                 # dependency walk recurse into the thing a node depends on --
                 # a real node reference grounded in the class's own layout,
                 # not a label invented at this call site.  ``attribute_slot``
@@ -24139,3 +24156,32 @@ __all__ = [
     "reduce_abstract_tensor_topology",
     "specialize_python_precision_widths",
 ]
+            # c632's array constructor is declared by this exact import
+            # reference.  Preserve its collection identity before function
+            # subgraphs lose the external table; a later GetAttr is a view,
+            # not the allocation's birth.
+            from array import array as _source_array_type
+            if target is _source_array_type:
+                for source_graph in (graph.G, *(
+                    member.graph.G for member in function_table
+                    if getattr(member, "graph", None) is not None
+                )):
+                    for _node_id, source_data in source_graph.nodes(data=True):
+                        source_attributes = source_data.get("attributes") or {}
+                        if (
+                            str(source_data.get("type") or source_data.get("op") or "").casefold() != "call"
+                            or source_attributes.get("external_callee_ref") != entry.reference.address
+                        ):
+                            continue
+                        # Only the empty allocation participates here. An
+                        # initializer needs its own ordered row/copy birth;
+                        # it cannot be inferred from the array result class.
+                        if tuple(role for _parent, role in source_data.get("parents") or ()) != ("arg:0",):
+                            continue
+                        source_data.setdefault("attributes", {}).update({
+                            "aggregate_kind": "array",
+                            "producer_kind": "sequence_materialization",
+                            "sequence_column_count": 1,
+                            "sequence_key_columns": (),
+                            "sequence_writable": True,
+                        })

@@ -10671,13 +10671,15 @@ def _field_slot_ops(
             )
         ))
         if not snapshot and aggregate_kind not in {
-            "list", "set", "frozenset", "dict", "bytes", "bytearray"
+            "list", "set", "frozenset", "dict", "bytes", "bytearray", "array"
         }:
             continue
         if (
             aggregate_kind == "bytes"
             and attributes.get("producer_kind")
             == "aggregate_materialization"
+        if aggregate_kind == "array" and attributes.get("producer_kind") != "sequence_materialization":
+            continue
         ):
             # ``bytes(local_sequence)`` is a result view over the local arena,
             # not a second independently allocated sequence.  Root authority
@@ -11095,7 +11097,7 @@ def _field_slot_ops(
             )
             if (
                 aggregate_kind in {
-                    "list", "set", "dict", "tuple", "bytearray",
+                    "list", "set", "dict", "tuple", "bytearray", "array",
                 }
                 and attribute not in field_aliases
             ):
@@ -11128,6 +11130,16 @@ def _field_slot_ops(
                 storage_identity = f"{owner}.{canonical_field(str(attribute))}"
                 if storage_identity in retained_storage_identities:
                     retained_sequence_ids.add(int(source_id))
+                if aggregate_kind == "array":
+                    # c632's SetAttr is the exact edge from the constructor
+                    # allocation to its declared typed field.  Its source
+                    # must own that layout before the heap descriptor birth,
+                    # not first acquire it from a later GetAttr view.
+                    declared_dtype = attributes.get("program_abi_dtype")
+                    if declared_dtype is not None:
+                        source_data.setdefault("attributes", {})[
+                            "sequence_column_dtypes"
+                        ] = (str(declared_dtype),)
                 if field_value_aggregate_kinds.get(str(attribute)) == "dict":
                     nested_sequence_ids.add(int(source_id))
             # A constant field write (``self.x = None`` / ``5`` / ``"s"``) has
@@ -21348,6 +21360,50 @@ def _settle_linked_dynamic_sequences(
         # full and the caller read an empty list.  Rule: a list one return
         # site returns while another site returns a different list is
         # filled at run time from whichever site returned; it is DYNAMIC.
+    # c632: constructor SetAttr and method GetAttr are two views of the
+    # same instance slot.  Project only recorded field declaration cells
+    # through the exact receiver call bindings.  A class field declaration
+    # alone never joins separate instance components.
+    from .concordance_declarations import CLASS_FIELD_DECLARATION
+    from .identity_concordance import Ref, current_identity_book
+
+    field_views = {}
+    book = current_identity_book()
+    for graph_obj in graphs:
+        for node_id, data in graph_obj.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            declaration = attributes.get("field_declaration_cell")
+            if not isinstance(declaration, Ref):
+                continue
+            if declaration.page != CLASS_FIELD_DECLARATION:
+                raise ValueError("field access names a non-field declaration")
+            page = book.pages.get(CLASS_FIELD_DECLARATION.name)
+            if page is None or page.cell(declaration.row, declaration.column) is None:
+                raise ValueError("field access names an absent field declaration")
+            operation = str(data.get("type") or data.get("op") or "").casefold()
+            parents = tuple(data.get("parents") or ())
+            receiver_roles = {"object", "base", "receiver"} if operation == "setattr" else {"value", "object", "base", "receiver"}
+            receivers = tuple(int(value) for value, role in parents if role in receiver_roles)
+            if len(receivers) != 1:
+                continue
+            receiver = (id(graph_obj), int(graph_obj.nodes[receivers[0]].get("value_id", receivers[0])))
+            if receiver not in parent:
+                continue
+            if operation == "setattr":
+                values = tuple(int(value) for value, role in parents if role == "value")
+                if len(values) != 1:
+                    continue
+                value_id = int(graph_obj.nodes[values[0]].get("value_id", values[0]))
+            elif operation == "getattr":
+                value_id = int(data.get("value_id", node_id))
+            else:
+                continue
+            field_views.setdefault((find(receiver), declaration), []).append((id(graph_obj), value_id))
+    for views in field_views.values():
+        for view in views[1:]:
+            left, right = find(views[0]), find(view)
+            if left != right:
+                parent[left] = right
         returned_by_slot: dict[int, set[int]] = {}
         for site_values in (graph_obj.graph.get("return_slot_values") or {}).values():
             for slot, value_id in enumerate(site_values or ()):
@@ -34223,6 +34279,7 @@ def _class_surface_ssa_program(
         "source_numeric_record_abi_concordance"
     )
     public_record_return_symbols = {
+            descriptor.heap_owner_value_id is not None,
         function_symbols[int(reference)]
         for reference in getattr(compilation.deployment, "activation_root_references", ())
         if int(reference) in function_symbols
@@ -34628,7 +34685,7 @@ def _class_surface_ssa_program(
         # declared storage identity.  Reconcile complementary evidence here
         # before publishing the one cross-method physical view.
         def unresolved_sequence_view(receipt):
-            dtypes, column_count, key_columns, _live, _capacity, child_pool = receipt
+            dtypes, column_count, key_columns, _live, _capacity, child_pool, _owner = receipt
 
             return (
                 (
@@ -34706,6 +34763,7 @@ def _class_surface_ssa_program(
 
                 if incumbent_dtype == "unknown":
                     resolved_dtypes[position] = candidate_dtype
+            heap_owner_present,
                 elif candidate_dtype == "unknown":
                     pass
                 elif incumbent_dtype != candidate_dtype:
@@ -34719,6 +34777,7 @@ def _class_surface_ssa_program(
             # physical pool observed by another method. Two positive views
             # must agree on the same identity-independent layout.
             if candidate_child_pool is not None:
+                candidate_heap_owner_present,
                 if child_pool is not None and child_pool != candidate_child_pool:
                     raise ValueError(
                         "record field child-pool view disagreement for "
@@ -34729,6 +34788,7 @@ def _class_surface_ssa_program(
 
         decisive = (
             tuple(resolved_dtypes),
+                or candidate_heap_owner_present != heap_owner_present
             int(column_count),
             tuple(key_columns),
             bool(live_flags),
@@ -34776,6 +34836,7 @@ def _class_surface_ssa_program(
         )
 
     # An edge's caller side is either a declared parameter key
+            bool(heap_owner_present),
     # ``(symbol, parameter)`` or a row-handle key ``(symbol, parameter,
     # path prefix)``: the callee's field ``f`` is then the caller's field
     # ``<prefix>.f`` of that same declared parameter.  Every binding that
@@ -37239,7 +37300,7 @@ def _class_surface_ssa_program(
                         if declared_array_field:
                             view = (
                                 (str(field["dtype"]),), 1, (), False,
-                                "fixed", None,
+                                "fixed", None, False,
                             )
                         else:
                             raise ValueError(
@@ -37249,7 +37310,7 @@ def _class_surface_ssa_program(
                     (
                         column_dtypes, column_count, key_columns,
                         retains_deleted_rows, capacity_policy,
-                        child_pool_layout,
+                        child_pool_layout, retains_heap_owner,
                     ) = view
                     accepted_sequence_members = (
                         exact_accepted_sequence_members(storage_identity)
@@ -37309,6 +37370,13 @@ def _class_surface_ssa_program(
                         and field.get("dtype") is not None
                         else None
                     )
+                        # An owner-bearing field forwards the existing heap
+                        # ABI even in a method that only passes the record:
+                        # scalar pointer cells for columns, one owner slot.
+                        if retains_heap_owner and role[0] == "column":
+                            dtype, shape = "ptr", ()
+                        elif retains_heap_owner and role == ("heap_owner_value_id",):
+                            dtype, shape = "ptr", (1,)
                     if declared_array_dtype is not None:
                         if column_count != 1:
                             raise ValueError(
@@ -37337,6 +37405,20 @@ def _class_surface_ssa_program(
                     # The literal has no rows, so the sole old key column can
                     # become key column 0; the sole old value column remains
                     # the unique non-key value column of the accepted view.
+                    if retains_heap_owner and sequence is not None and (
+                        sequence.heap_owner_value_id is None
+                    ):
+                        raise ValueError(
+                            f"{symbol}: field {storage_identity!r} requires its "
+                            "declared heap owner but has no bound sequence owner"
+                        )
+                    if sequence is not None and (
+                        sequence.heap_owner_value_id is not None
+                    ) != bool(retains_heap_owner):
+                        raise ValueError(
+                            f"{symbol}: field {storage_identity!r} heap owner "
+                            "presence disagrees with its structural receipt"
+                        )
                     # Both physical column identities survive this revision.
                     source_node = graph.nodes.get(int(sequence_id), {})
                     source_literal = source_node.get("expr_obj")
@@ -37587,6 +37669,10 @@ def _class_surface_ssa_program(
                                         ("live_flags_value_id",), "bool",
                                     ),
                                 ),)
+                        heap_owner_id = (
+                            mint_member(("heap_owner_value_id",), "ptr")
+                            if retains_heap_owner else None
+                        )
                                 if live_flags_id is not None else ()
                             )
                         )
@@ -37631,6 +37717,11 @@ def _class_surface_ssa_program(
                                 "program_abi_mutable": mutable,
                                 "record_field_sequence_view": True,
                             }, _frame_physical_fields(function, int(member_id)))
+                            + (
+                                ((heap_owner_id, *accepted_member_abi(
+                                    ("heap_owner_value_id",), "ptr",
+                                )),) if heap_owner_id is not None else ()
+                            )
                         sequence = _frame_register_sequence(
                             function, sequence_table,
                             SSASequenceDescriptor(
@@ -37665,8 +37756,19 @@ def _class_surface_ssa_program(
                                 handle_column, child_dtypes,
                                 child_column_count, child_key_columns,
                                 has_shape, has_status, has_live_flags,
+                            heap_fields = {}
+                            if heap_owner_id is not None:
+                                if int(member_id) == int(heap_owner_id):
+                                    heap_fields = {"heap_owner": True}
+                                elif int(member_id) in column_ids:
+                                    position = column_ids.index(int(member_id))
+                                    heap_fields = {
+                                        "heap_element_dtype": dtypes[position],
+                                        "heap_owner_value_id": int(heap_owner_id),
+                                    }
                                 child_writable,
                             ) = child_pool_layout
+                                **heap_fields,
                             if len(child_dtypes) != child_column_count:
                                 raise ValueError(
                                     f"{symbol}: field {storage_identity!r} "
@@ -37697,6 +37799,7 @@ def _class_surface_ssa_program(
                                 mint_member(
                                     ("child_pool_shape_stride",), "int64",
                                 ) if has_shape else None
+                                heap_owner_value_id=heap_owner_id,
                             )
                             child_status = (
                                 mint_member(("child_pool_status",), "int")
@@ -37756,7 +37859,7 @@ def _class_surface_ssa_program(
                                 stage=RECORD_ABI_MATERIALIZATION,
                                 revise=True,
                             )
-                        elif sequence_view_receipt(sequence)[-1] != child_pool_layout:
+                        elif sequence_view_receipt(sequence)[5] != child_pool_layout:
                             raise ValueError(
                                 f"{symbol}: field {storage_identity!r} "
                                 "has a child-pool layout disagreement"
@@ -37836,6 +37939,10 @@ def _class_surface_ssa_program(
                             )
                         column_dtype = column_types.get(int(member_id))
                         if (
+                        *(
+                            (int(sequence.heap_owner_value_id),)
+                            if sequence.heap_owner_value_id is not None else ()
+                        ),
                             member.dtype in {None, "", "unknown"}
                             and column_dtype not in {None, "", "unknown"}
                         ):
@@ -43009,6 +43116,8 @@ def _class_surface_ssa_program(
                     value = clone_value(source, new_id, accounting={
                         "record_instance": str(class_identity),
                         "constructor_callsite_id": int(node_id),
+                            *((canonical.heap_owner_value_id,)
+                              if canonical.heap_owner_value_id is not None else ()),
                     })
                     # A bound caller id (the receiver, when the constructor's
                     # ``self`` is its field slot) already has a caller row,
@@ -43032,6 +43141,8 @@ def _class_surface_ssa_program(
                         publish_ssa_value_type(
                             caller, value, dtype=slot_structure.dtype,
                             shape=slot_structure.shape,
+                                *((local.heap_owner_value_id,)
+                                  if local.heap_owner_value_id is not None else ()),
                             sources=_frame_cells(
                                 slot_cell, caller_cell,
                                 _frame_value_cell(constructor, old_id),
@@ -43049,6 +43160,11 @@ def _class_surface_ssa_program(
                 # c423).  Wrong record: each slot (and the receiver standing
                 # for ``self``) carried the constructor formal's
                 # ``program_abi_parameter`` ``self``, so the entry ABI
+                        **_accounting_across_call(
+                            getattr(source, "accounting", None), remap,
+                            unbound_owner_is_error=True,
+                            describe=f"constructor {constructor.name} -> {caller.name}",
+                        ),
                 # published ``self.scale`` as an input; C zero-filled it, the
                 # Fortran entry refused "missing Fortran feed 3".  Rule: a
                 # caller formal bound to a constructor slot, and not one of

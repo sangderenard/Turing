@@ -2377,7 +2377,20 @@ def _static_sequence_capacity_survey(
         key for key in copies_unbounded
         if key not in _call_escaped_argument_ids(graph_obj)
     )
-    return bounds, unbounded
+    # c632: the exact imported array constructor was concorded to a local
+    # sequence materializer before extraction.  Its empty allocation owns
+    # storage even when the next operation stores it into a record field;
+    # the field read is a borrowed view and must not mint another owner.
+    owned_empty_arrays = frozenset(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in (data.get("attributes") or {},)
+        if attributes.get("aggregate_kind") == "array"
+        and attributes.get("producer_kind") == "sequence_materialization"
+        and tuple(role for _parent, role in data.get("parents") or ())
+        == ("arg:0",)
+    )
+    return bounds, unbounded | owned_empty_arrays
 
 
 def _linked_sequence_propagation_kind(

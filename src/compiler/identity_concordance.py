@@ -1488,6 +1488,16 @@ class CorrelationTable:
                             sequences is None or sequences.by_id(record_field.sequence_id) is None):
                         found.append(Finding("record-sequence-unknown", str(name), int(record.record_id),
                             f"field {record_field.storage_identity!r} names absent sequence {record_field.sequence_id}"))
+                    elif record_field.sequence_id is not None:
+                        sequence = sequences.by_id(record_field.sequence_id)
+                        owner = sequence.heap_owner_value_id
+                        if owner is not None and int(owner) not in record_field.value_ids:
+                            found.append(Finding(
+                                "record-sequence-owner-missing", str(name),
+                                int(record.record_id),
+                                f"field {record_field.storage_identity!r} omits "
+                                f"sequence heap owner {int(owner)} from its physical members",
+                            ))
         found.extend(self._native_interface_findings(module))
         found.extend(self._region_instruction_residency_findings(module))
         found.extend(self._repository_ssa_signature_findings(module))

@@ -9646,6 +9646,11 @@ class _ControlSSABuilder(TiledObject):
 
             local_id = (
                 str(result.id)
+            elif int(read_id) in self.sequence_length_values:
+                # c632's row=len(field) precedes append but its scalar is
+                # consumed at return.  Freeze that exact temporal read at
+                # the same pre-effect boundary as an indexed row load.
+                self.external_value(int(read_id))
                 if result is not None
                 else f"{self.current.name}:{self._evolution_instruction}:{op.value}"
             )
@@ -26483,7 +26488,8 @@ def lower_control_sections_to_ssa(
     }
     effect_preceding_row_reads: dict[int, tuple[int, ...]] = {}
     for reader, effect in sequence_read_before_effects:
-        if int(reader) in row_load_by_result:
+        if (int(reader) in row_load_by_result
+                or int(reader) in (sequence_length_values or {})):
             effect_preceding_row_reads[int(effect)] = (
                 *effect_preceding_row_reads.get(int(effect), ()), int(reader),
             )
