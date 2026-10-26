@@ -3353,6 +3353,34 @@ def _lease_source(formal: Any) -> Any:
     )
 
 
+def _posted_lease_source(callee: Any, formal: Any) -> tuple[Any, Any]:
+    """The lease's value and physical layout from the callee's own row.
+
+    c627's batch loop calls an inner loop that appends to an array field.
+    Distinct-owner replacement minted a dtype-None row but cloned an int
+    formal into its resident slot; result settlement then correctly refused
+    to erase that int.  A replacement slot is typed at its mint, from the
+    same posted formal row that proves the lease.
+    """
+
+    from .structural_concordance import function_value_structure
+
+    source = _lease_source(formal)
+    structure, _cell = function_value_structure(callee, int(formal.id))
+    # A heap owner is leased as a pointer cell by _lease_source.  Every
+    # other clone takes its dtype and shape from the formal's posted row,
+    # including an explicitly unresolved row; the SSA object is a view.
+    dtype = (
+        "ptr"
+        if source.dtype == "ptr" and formal.dtype != "ptr"
+        else structure.dtype
+    )
+    return (
+        replace(source, dtype=dtype, shape=tuple(structure.shape)),
+        _frame_physical_fields(callee, int(formal.id)),
+    )
+
+
 def _link_frame_lease(
     caller_symbol: str, slot_id: int, callsite_id: Any,
     callee_symbol: str, callee_id: int, *,
@@ -48264,8 +48292,17 @@ def _class_surface_ssa_program(
                                 ),
                                 _frame_value_cell(callee, callee_id),
                             )
+                            argument = callee_values.get(
+                                int(callee_id), SSAValue(int(callee_id))
+                            )
+                            lease_source, lease_physical = (
+                                _posted_lease_source(callee, argument)
+                            )
                             replacement_id = mint_compiler_value_id(
                                 caller, REPLACEMENT_SLOT, proposal_cells,
+                                dtype=lease_source.dtype,
+                                shape=lease_source.shape,
+                                physical=lease_physical,
                             )
                             if not frame_ledger.propose(
                                 (str(caller_symbol), int(record.callsite_id), str(record.callee_symbol), int(callee_id)),
@@ -48278,11 +48315,8 @@ def _class_surface_ssa_program(
                                 )
                                 refreshed_bindings.append((callee_id, kind, int(incumbent)))
                                 continue
-                            argument = callee_values.get(
-                                int(callee_id), SSAValue(int(callee_id))
-                            )
                             replacement = clone_value(
-                                _lease_source(argument),
+                                lease_source,
                                 replacement_id,
                                 accounting={
                                     "linked_call_frame_storage": str(
@@ -48468,9 +48502,18 @@ def _class_surface_ssa_program(
                             ),
                             _frame_value_cell(caller, source_id),
                         )
+                        argument = callee_values.get(
+                            int(callee_id), SSAValue(int(callee_id))
+                        )
+                        lease_source, lease_physical = (
+                            _posted_lease_source(callee, argument)
+                        )
                         proposed_replacement_id = (
                             mint_compiler_value_id(
                                 caller, REPLACEMENT_SLOT, owner_cells,
+                                dtype=lease_source.dtype,
+                                shape=lease_source.shape,
+                                physical=lease_physical,
                             )
                             if replacement_id is None else replacement_id
                         )
@@ -48489,11 +48532,8 @@ def _class_surface_ssa_program(
                             distinct_bindings.append((callee_id, kind, int(incumbent)))
                             continue
                         if replacement_id is None:
-                            argument = callee_values.get(
-                                int(callee_id), SSAValue(int(callee_id))
-                            )
                             replacement = clone_value(
-                                _lease_source(argument),
+                                lease_source,
                                 proposed_replacement_id,
                                 accounting={
                                     "linked_call_frame_storage": str(

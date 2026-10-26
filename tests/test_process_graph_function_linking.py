@@ -4465,6 +4465,50 @@ def test_exact_record_span_shape_reaches_callee_before_region_lowering():
     assert gathers[0].args[0].shape == (2, 3)
 
 
+def test_loop_call_replacement_lease_posts_its_callee_type(monkeypatch):
+    from src.compiler.structural_concordance import function_value_structure
+    from src.compiler import ssa_result_type_resolution
+
+    settled = ssa_result_type_resolution.settle_call_result_types
+
+    class LeaseChecked(Exception):
+        pass
+
+    def check_leases(functions, emit_outputs, function_values):
+        settled(functions, emit_outputs, function_values)
+        leases = [
+            (function, argument)
+            for function in functions.values()
+            for argument in function.args
+            if (argument.accounting or {}).get("split_from_unproven_alias")
+            is not None
+        ]
+        assert leases
+        for function, argument in leases:
+            recorded, _cell = function_value_structure(
+                function, argument.id,
+            )
+            assert recorded.dtype == argument.dtype
+            assert recorded.shape == tuple(argument.shape or ())
+        raise LeaseChecked
+
+    monkeypatch.setattr(
+        ssa_result_type_resolution, "settle_call_result_types",
+        check_leases,
+    )
+
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c627_loop_call_lease.py"
+    ).read_text(encoding="utf-8")
+    with pytest.raises(LeaseChecked):
+        lower_ast_source_to_ssa(
+            source, "root", name="loop_call_lease",
+            extraction_contract=CONTRACT,
+            progress=lambda _message: None, progress_bars=False,
+        )
+
+
 def test_indexed_record_field_write_keeps_one_resident_call_frame():
     """A post-IndexedStore field read is the mutated resident span."""
 
