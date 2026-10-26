@@ -10524,16 +10524,26 @@ def _normalize_lexical_values(
                 )
         if isinstance(expression, ast.Subscript) and node_id in graph.G:
             base_id = resolve_expression(expression.value)
+            # c636: a helper fills result[i] in a loop, then returns
+            # result[:i]; its caller appends len(returned) to array("I").
+            # The immediate base is the last IndexedStore effect, whose
+            # attributes do not declare a collection. Its existing base-edge
+            # storage identity owns that declaration. Read it for the slice
+            # contract while retaining base_id as the ordered dataflow edge.
+            base_contract_id = (
+                _indexed_store_source(graph, base_id)
+                if isinstance(expression.slice, ast.Slice) else base_id
+            )
             base_attributes = (
-                graph.G.nodes[base_id].get("attributes") or {}
-                if isinstance(base_id, int) and base_id in graph.G else {}
+                graph.G.nodes[base_contract_id].get("attributes") or {}
+                if isinstance(base_contract_id, int) and base_contract_id in graph.G else {}
             )
             base_class_cell = (
                 current_identity_book().latest_ref(
                     _SOURCE_VALUE_CLASS,
-                    (value_class_scope, int(base_id)),
+                    (value_class_scope, int(base_contract_id)),
                 )
-                if isinstance(base_id, int) else None
+                if isinstance(base_contract_id, int) else None
             )
             base_class_fact = (
                 None if base_class_cell is None else

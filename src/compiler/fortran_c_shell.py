@@ -25268,6 +25268,7 @@ def _class_surface_ssa_program(
             for item in sequence_schema_shortfalls
         )
     lowered_symbol_contracts: dict[str, Any] = {}
+    source_graphs_by_symbol: dict[str, Any] = {}
     for shell_index, shell in compile_iter(
         enumerate(planned_shells, 1), "functions", total=len(planned_shells),
         label="SSA lowering: shells completed",
@@ -26193,6 +26194,14 @@ def _class_surface_ssa_program(
                 )
             continue
         lowered_symbol_contracts[symbol] = shell_contract
+        # c637: two caller methods reach the same _atom_token specialization.
+        # Only this accepted shell lowers the executable and revises its
+        # semantic_output to the exit Phi. A later equivalent shell is skipped
+        # above; indexing its unlowered graph replaced that Phi with branch
+        # value 14 in Ret. Publish the source owner at the same acceptance
+        # point, so recovery reads the exact graph that produced this Function.
+        if graph_obj.graph.get("function_name") is not None:
+            source_graphs_by_symbol[symbol] = graph_obj
         # Instance fields flow through the object's field arena: ``self`` is a
         # slot array, a field read is a load from its slot, a field write a
         # store. In whole-program precompile mode the field-op region is never
@@ -29852,17 +29861,6 @@ def _class_surface_ssa_program(
         SSAValue,
     )
 
-    source_graphs_by_symbol = {
-        shell_symbols.get(
-            id(shell),
-            f"{artifact_name}__{graph.graph.get('function_name')}",
-        ): graph
-        for shell in planned_shells
-        for graph in (
-            getattr(getattr(shell, "process_graph", None), "G", None),
-        )
-        if graph is not None and graph.graph.get("function_name") is not None
-    }
     for repository_symbol, source_graph in compile_iter(tuple(source_graphs_by_symbol.items()),
             "source-graph-index", label="Source graph spellings indexed"):
         _index_source_graph_spellings(
