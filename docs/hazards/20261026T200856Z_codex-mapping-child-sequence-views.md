@@ -42,3 +42,5 @@ refusals/mappingviews/fixedbounds/returnpruning/boolnumeric/mixedcomparison):
 manager4's failure remains a separate observed result, not a native success.
 
 Clean integration checkout C:/dev/tg-child-review at1dda48ca: imported array birth, owned array native, constructed child pool, project native cases, and extraction source sheet suites completed31passed129.46s. Manager5 was running separately at this checkpoint; no full-manager native result is claimed.
+
+Root manager5 completed with failure (no native library): argument_binding row (repeated_manager___validate_atom_span__specialized_e6b7b2650d63,0,20) incumbent caller_literal [55296], proposed caller_literal [65], refused REVISE without a changed source at fortran_c_shell.py argument binding publication. The imported owner refusal was cleared; this is a distinct callsite identity frontier. Full failure receipt: C:/dev/Powershell/string_core/build/native_manager_declared_product_5/units/repeated_manager/failure.json. A bounded writer repro is assigned before another long run.
