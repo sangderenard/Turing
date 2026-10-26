@@ -38828,6 +38828,76 @@ def _class_surface_ssa_program(
                                 int(parameter_id), incumbent, sources=sources,
                                 stage=RECORD_ABI_MATERIALIZATION,
                             )
+                        # Vocabulary._intern_validated_span's authored
+                        # exact_begin is array('Q').  Its graph read had
+                        # already posted a raw SPAN field for value 54, while
+                        # this declared view materialized the same value as
+                        # sequence column 0 with length/capacity cells.  Keep
+                        # the one declared storage identity and advance that
+                        # field here; retaining the first field by name below
+                        # discarded the sequence contract before _cover_span.
+                        declared_by_storage = {
+                            field.storage_identity: field for field in fields
+                        }
+                        refined_fields = []
+                        sequence_sources = []
+                        for resident in incumbent.fields:
+                            declared = declared_by_storage.get(
+                                resident.storage_identity
+                            )
+                            if not (
+                                resident.storage is SSARecordFieldStorage.SPAN
+                                and declared is not None
+                                and declared.storage
+                                is SSARecordFieldStorage.SEQUENCE
+                            ):
+                                refined_fields.append(resident)
+                                continue
+                            sequence_table = all_sequence_tables.get(symbol)
+                            sequence = (
+                                None if sequence_table is None
+                                or declared.sequence_id is None
+                                else sequence_table.by_id(
+                                    int(declared.sequence_id)
+                                )
+                            )
+                            if (
+                                sequence is None
+                                or not sequence.column_value_ids
+                                or not sequence.column_dtypes
+                                or resident.name != declared.name
+                                or tuple(resident.value_ids)
+                                != (int(sequence.column_value_ids[0]),)
+                                or str(resident.dtype)
+                                != str(sequence.column_dtypes[0])
+                            ):
+                                raise ValueError(
+                                    f"{symbol}: declared sequence field "
+                                    f"{resident.storage_identity!r} "
+                                    "disagrees with its resident span"
+                                )
+                            refined_fields.append(declared)
+                            sequence_sources.append(_frame_table_cell(
+                                sequence_table, int(declared.sequence_id),
+                                SEQUENCE_DESCRIPTOR,
+                            ))
+                        if tuple(refined_fields) != incumbent.fields:
+                            sources = _frame_cells(
+                                _frame_table_cell(
+                                    table, int(parameter_id),
+                                    RECORD_DESCRIPTOR,
+                                ),
+                                GLOBAL_MONOTONIC_IDS.declaration,
+                                *sequence_sources,
+                            )
+                            incumbent = replace(
+                                incumbent, fields=tuple(refined_fields),
+                            )
+                            table.records.assign(
+                                int(parameter_id), incumbent,
+                                sources=sources,
+                                stage=RECORD_ABI_MATERIALIZATION,
+                            )
                     incumbent_names = {
                         field.name for field in (
                             () if incumbent is None else incumbent.fields
