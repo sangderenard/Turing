@@ -73,7 +73,7 @@ def _source_name(parameter: Any) -> str:
 
 def _fortran_storage_index(
     parameter: Any,
-    extents: Mapping[str, int],
+    extents: Mapping[str, int | str],
     linear_index: str,
 ) -> str:
     """Map one C-row-major logical index to Fortran array storage.
@@ -84,34 +84,48 @@ def _fortran_storage_index(
     Resident feedback arenas stay in Fortran order and require no copies.
     """
 
+    if str(getattr(parameter, "layout", "") or "") == "dense-row-major":
+        return linear_index
+
     dynamic_dimensions = tuple(getattr(parameter, "extents", ()) or ())
     shape = (
-        tuple(int(extents[str(name)]) for name in dynamic_dimensions)
+        tuple(extents[str(name)] for name in dynamic_dimensions)
         if dynamic_dimensions
         else tuple(
-            int(extents.get(f"extent_{int(size)}", size))
+            extents.get(f"extent_{int(size)}", int(size))
             for size in tuple(parameter.shape or ())
         )
     )
     if len(shape) <= 1:
         return linear_index
+
+    def stride(sizes: tuple[int | str, ...]) -> int | str:
+        if all(isinstance(size, int) for size in sizes):
+            count = 1
+            for size in sizes:
+                count *= size
+            return count
+        return " * ".join(f"({size})" for size in sizes)
+
     terms = []
     for dimension, size in enumerate(shape):
-        c_stride = 1
-        for following in shape[dimension + 1:]:
-            c_stride *= int(following)
-        fortran_stride = 1
-        for preceding in shape[:dimension]:
-            fortran_stride *= int(preceding)
+        c_stride = stride(shape[dimension + 1:])
+        fortran_stride = stride(shape[:dimension])
+        divisor = str(c_stride) if isinstance(c_stride, int) else f"({c_stride})"
+        multiplier = (
+            str(fortran_stride)
+            if isinstance(fortran_stride, int) else f"({fortran_stride})"
+        )
+        modulus = str(size) if isinstance(size, int) else f"({size})"
         coordinate = (
-            f"(({linear_index}) / {c_stride}) % {size}"
+            f"(({linear_index}) / {divisor}) % {modulus}"
             if c_stride != 1
-            else f"({linear_index}) % {size}"
+            else f"({linear_index}) % {modulus}"
         )
         terms.append(
             coordinate
             if fortran_stride == 1
-            else f"({coordinate}) * {fortran_stride}"
+            else f"({coordinate}) * {multiplier}"
         )
     return " + ".join(terms)
 

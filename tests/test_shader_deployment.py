@@ -843,3 +843,101 @@ def test_runtime_sized_deployable_spirv_matches_python_on_vulkan(tmp_path):
     got = np.fromfile(paths[output["binding"]], dtype=np.float32)
     np.testing.assert_allclose(got[:count], ((a + b) * s[0]).reshape(-1), rtol=1e-6)
     assert (got[count:] == 12345).all()
+
+
+def _run_record(tmp_path, probe, product, fed, count, groups, written=None):
+    """Bind ``fed`` (by value id) and a sentinel output, run, return the
+    ``written`` (default ``count``) output elements."""
+
+    written = count if written is None else written
+    record = product.deployment
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = fed[view["value_id"]].reshape(-1)
+        else:
+            buffers[resource["binding"]] = np.full(count + 4, 12345, dtype=np.float32)
+    for control in record["launch"]["controls"]:
+        buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(groups), "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    output = next(item for item in record["resources"] if item["access"] == "read_write")
+    got = np.fromfile(paths[output["binding"]], dtype=np.float32)
+    assert (got[written:] == 12345).all()
+    return got[:written]
+
+
+def _same_floats(got, want):
+    got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+    return bool(np.all(
+        (np.isnan(got) & np.isnan(want))
+        | ((got == want) & (np.signbit(got) == np.signbit(want)))
+    ))
+
+
+_NAN = float("nan")
+
+
+@pytest.mark.parametrize("semantics", ["scan", "reduce"])
+@pytest.mark.parametrize("op", ["max", "min"])
+@pytest.mark.parametrize("row", [
+    [_NAN, 1.0, 5.0], [1.0, _NAN, 5.0], [1.0, 5.0, _NAN], [0.0, -0.0, 0.0],
+])
+def test_runtime_sized_max_follows_its_stamped_rule_on_vulkan(
+    tmp_path, semantics, op, row,
+):
+    """``max(x)`` (scan: Python's builtin over the elements) and ``x.max()``
+    (reduce: numpy's NaN propagation) fold differently on the device."""
+
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _runtime_reduction(op)
+    function.blocks["entry"].instrs[0].attributes["max_semantics"] = semantics
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    product = publish_spirv_product(tmp_path / "product", shader)
+    x = np.array(row, dtype=np.float32).reshape(1, 3)
+    (got,) = _run_record(tmp_path, probe, product, {0: x}, 3, 1, written=1)
+    if semantics == "scan":
+        want = (max if op == "max" else min)(x.reshape(-1).tolist())
+    else:
+        want = getattr(np, op)(x)
+    assert _same_floats(got, want), (got, want)
+
+
+@pytest.mark.parametrize("method", ["emax", "emin", "maximum", "minimum"])
+def test_runtime_sized_elementwise_max_follows_its_name_on_vulkan(tmp_path, method):
+    """``x.emax(y)`` is the builtin rule per element; ``x.maximum(y)``
+    is numpy's."""
+
+    probe = _vulkan_probe(tmp_path)
+    a, b, r = _spans(1, 0, 1, 2)
+    op = "max" if method in ("emax", "maximum") else "min"
+    instr = Instr(op, [a, b], r)
+    instr.attributes["max_semantics"] = "emax" if method.startswith("e") else "elementwise"
+    function = Function(method, [a, b], {"entry": BasicBlock("entry", [
+        instr, Instr("Ret", [], None),
+    ])})
+    shader = emit_deployable_compute_shader(function, outputs=[r])
+    assert shader.complete, shader.shortfalls
+    product = publish_spirv_product(tmp_path / "product", shader)
+    x = np.array([_NAN, 1.0, 2.0, _NAN, 0.0, -0.0], dtype=np.float32)
+    y = np.array([1.0, _NAN, 3.0, _NAN, -0.0, 0.0], dtype=np.float32)
+    got = _run_record(tmp_path, probe, product, {0: x, 1: y}, 6, 1)
+    if method.startswith("e"):
+        pick = max if method == "emax" else min
+        # x.emax(y) == max(x, y) per element: y replaces x only when better.
+        want = [pick(float(p), float(q)) for p, q in zip(x, y)]
+    else:
+        want = getattr(np, method)(x, y)
+    assert _same_floats(got, want), (got, want)

@@ -8,6 +8,8 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
+import re
 
 
 def is_gnu_fortran(compiler: str) -> bool:
@@ -58,6 +60,47 @@ def aggressive_fortran_flags(
     if "flang" in name:
         return ("-O3", "-march=native", "-flto", *contract)
     return ("-O3",)
+
+
+def native_fortran_flags(
+    compiler: str, source: str, flags: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Enable a generated native feature only after this compiler accepts it.
+
+    The native literal/call regression's U64_MAX is unsigned, not a signed
+    storage disguise. GNU requires -funsigned. Probe the exact compiler and
+    compile flags instead of assuming that its executable name/version proves
+    support. Ordinary modules do not require or pay for this feature.
+    """
+    if re.search(r"(?im)^\s*unsigned\s*\(|\buint\s*\(", source) is None:
+        return tuple(flags)
+    if not is_gnu_fortran(compiler):
+        raise ValueError(
+            "native unsigned Fortran requires a compiler supporting -funsigned; "
+            f"selected compiler is {compiler!r}"
+        )
+    enabled = tuple(flags) + (() if "-funsigned" in flags else ("-funsigned",))
+    environment = dict(os.environ)
+    environment["PATH"] = str(Path(compiler).resolve().parent) + os.pathsep + environment.get("PATH", "")
+    with tempfile.TemporaryDirectory(prefix="turing-fortran-unsigned-") as directory:
+        probe = Path(directory) / "native_unsigned.f90"
+        probe.write_text(
+            "subroutine native_unsigned(x) bind(C)\n"
+            "use iso_c_binding\n"
+            "unsigned(c_int64_t), intent(out) :: x\n"
+            "x = 18446744073709551615u_c_int64_t\n"
+            "end subroutine\n", encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [compiler, *enabled, "-c", str(probe), "-o", str(probe.with_suffix(".o"))],
+            capture_output=True, text=True, env=environment,
+        )
+    if completed.returncode != 0:
+        raise ValueError(
+            "selected Fortran compiler/flags do not support exact native unsigned "
+            f"ISO C storage with -funsigned: {compiler!r}: {completed.stderr.strip()}"
+        )
+    return enabled
 
 
 def aggressive_c_flags(fortran_compiler: str) -> tuple[str, ...]:
@@ -298,6 +341,7 @@ __all__ = [
     "GNU_RUNTIME_SONAME_PREFIXES",
     "aggressive_c_flags",
     "aggressive_fortran_flags",
+    "native_fortran_flags",
     "GNU_RUNTIME_DLLS",
     "is_gnu_fortran",
     "stage_fortran_runtime_dependencies",

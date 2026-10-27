@@ -1,3 +1,17 @@
+# Test baseline and hazards log
+
+**New entries do not go in this file.** Each entry is its own file in
+[docs/hazards/](docs/hazards/), named `YYYYMMDDTHHMMSSZ_<branch>.md` (UTC time
+of writing, then the branch with `/` spelled `-`), so two PRs never edit the
+same lines. Create one with `python tools/hazards_log.py new`.
+
+**Read order: newest first.** Read the files in `docs/hazards/` from the
+newest name down, then the entries below, which were written before the split
+and are kept unchanged. `python tools/hazards_log.py` prints them in that
+order, so "read the top of the log" is still one step.
+
+<!-- end of header: entries written before the split follow -->
+
 2026-10-24 WINDOWS LLVM ROW EXPORT (MEASURED, Windows, base a6fdb31a):
 linking the explicitly exported validation runtime disabled MinGW's automatic
 export of the plain LLVM row entry, so Nodus correctly refused the retained

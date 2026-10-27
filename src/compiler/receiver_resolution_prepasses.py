@@ -610,6 +610,21 @@ def _resolve_grounded_method_references(graph: Any) -> None:
     # resolve. Apply the reducer's source-linked-call rule again now: the
     # resolved callee owns its effects, rather than a second opaque mutation
     # at the callsite. Unresolved external calls keep their original effects.
+    from .glsl_deployment_strategy import _stored_callable_field_call
+
+    def host_callback_call(data: Any) -> bool:
+        # A call through a callable slot (class table ``field_callables``)
+        # runs host code given only its arguments: it is not a mutation of
+        # the receiver whose field names it.
+        field = _stored_callable_field_call(graph.G, data)
+        if field is None:
+            return False
+        owner, name = field
+        return name in dict(
+            dict((graph.G.graph.get("class_table") or {}).get(owner) or {})
+            .get("field_callables") or {}
+        )
+
     linked_calls = {
         int(node_id) for node_id, data in graph.G.nodes(data=True)
         if any((data.get("attributes") or {}).get(key) is not None
@@ -617,6 +632,7 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                    "method_ref", "callee_ref", "resolved_ast_parent",
                    "indirect_callable_id",
                ))
+        or host_callback_call(data)
     }
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
@@ -632,6 +648,69 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         )
         if len(retained) != len(effects):
             data["attributes"] = {**attributes, "loop_state_effects": retained}
+
+
+#: ``max_semantics`` values (docs: "What max means in Turing").  Each names
+#: one authored meaning of ``max``/``min``; backends spell exactly that one.
+MAX_SEMANTICS = (
+    "select", "scan", "reduce", "reduce_axis", "elementwise", "emax",
+)
+
+
+def max_semantics_of_call(expression: Any) -> str | None:
+    """The meaning of ``max``/``min`` the authored call states, or ``None``.
+
+    Program: ``max(x, y)``, ``max(xs)``, ``y.max()``, ``y.max(axis=0)`` and
+    ``x.maximum(y)`` all reach the backends as one op name, and each backend
+    guessed between them from the operand count and shapes.  Rule: the call
+    FORM decides, never a name or a shape.  A builtin ``max`` with two or
+    more positional arguments is Python's ``select`` scan over them; with
+    one it is a ``scan`` over that iterable; a ``.max()``/``.amax()`` method
+    with no positional argument is a whole ``reduce``, or ``reduce_axis``
+    when an axis is named; ``maximum``/``minimum`` is ``elementwise`` (numpy's
+    rule) and ``emax``/``emin`` is ``emax`` (the builtin's rule per element).
+    Any other form is left unstamped.
+    """
+
+    if not isinstance(expression, ast.Call):
+        return None
+    function = expression.func
+    keywords = {str(item.arg) for item in expression.keywords if item.arg}
+    positional = [item for item in expression.args if not isinstance(item, ast.Starred)]
+    if len(positional) != len(expression.args):
+        return None
+    if isinstance(function, ast.Name) and function.id in {"max", "min"}:
+        if keywords:  # ``key=``/``default=`` are not spelled
+            return None
+        if len(positional) >= 2:
+            return "select"
+        if len(positional) == 1:
+            return "scan"
+        return None
+    if not isinstance(function, ast.Attribute):
+        return None
+    if function.attr in {"maximum", "minimum"}:
+        return "elementwise"
+    if function.attr in {"emax", "emin"}:
+        return "emax"
+    if function.attr in {"max", "min", "amax", "amin"} and not positional:
+        if keywords & {"axis", "dim"}:
+            return "reduce_axis"
+        if not keywords - {"keepdims", "keepdim"}:
+            return "reduce"
+    return None
+
+
+def _stamp_max_semantics(graph: Any) -> None:
+    """Post ``max_semantics`` on every ``max``/``min`` call node it states."""
+
+    for _node_id, data in graph.G.nodes(data=True):
+        semantics = max_semantics_of_call(data.get("expr_obj"))
+        if semantics is None:
+            continue
+        attributes = dict(data.get("attributes") or {})
+        attributes["max_semantics"] = semantics
+        data["attributes"] = attributes
 
 
 def _resolve_grounded_tensor_operations(graph: Any) -> None:

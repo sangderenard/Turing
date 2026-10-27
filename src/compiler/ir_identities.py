@@ -225,7 +225,7 @@ _PURE_REGION_OPS = frozenset({
 })
 
 
-def _post_dead_structural_retirement(function, instruction) -> None:
+def _post_dead_structural_retirement(function, instruction, *, sources=()) -> None:
     """Post one ``dead_structural_retirement`` row for a swept value.
 
     DERIVED(the value's ``ssa_value`` cell; the function's root cell when
@@ -242,7 +242,7 @@ def _post_dead_structural_retirement(function, instruction) -> None:
     from .ssa_record_return_state import function_scope_of, identity_cells
 
     book = current_identity_book()
-    cells = identity_cells(function, instruction.res)
+    cells = tuple(dict.fromkeys((*identity_cells(function, instruction.res), *sources)))
     if not cells:
         root = book.latest_ref(CELL_SET, (function_scope_of(function), 0))
         cells = () if root is None else (root,)
