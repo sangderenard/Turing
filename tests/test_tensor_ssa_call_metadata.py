@@ -1447,7 +1447,18 @@ def test_aggregate_output_view_of_formal_rebinds_to_caller_actual():
         tensor_tables={callee.name: table},
     )
 
-    assert legalize_aggregate_output_views(module)
+    # This is a standalone SSA unit, so admit its values through the same
+    # incumbent unit producer that supplies the legalizer's authoritative
+    # SSA cells. Bare object construction supplies no concordance identity.
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+    from src.compiler.precompile_to_ssa import _post_built_function_rows
+    _book, token = begin_identity_book()
+    try:
+        _post_built_function_rows(callee)
+        _post_built_function_rows(caller)
+        assert legalize_aggregate_output_views(module)
+    finally:
+        end_identity_book(token)
     assert call.attributes["output_ids"] == ()
     assert call.attributes["callee_output_ids"] == ()
     assert call.attributes["aggregate_output_passthrough_bindings"] == ((

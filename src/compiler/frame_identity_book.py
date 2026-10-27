@@ -267,11 +267,19 @@ def _frame_register_sequence(
     from .identity_concordance import current_identity_book
     from .precompile_to_ssa import _function_root_cell
 
+    pool = descriptor.child_table_pool
     named = (
         descriptor.sequence_id, *descriptor.column_value_ids,
         descriptor.length_address_id, descriptor.capacity_value_id,
         descriptor.status_address_id, descriptor.live_flags_value_id,
         descriptor.heap_owner_value_id,
+        *(() if pool is None else (
+            *pool.column_value_ids, pool.length_value_id,
+            pool.capacity_value_id, pool.row_stride_value_id,
+            pool.shape_value_id, pool.rank_value_id,
+            pool.shape_stride_value_id, pool.status_value_id,
+            pool.live_flags_value_id,
+        )),
     )
     sources = _frame_cells(
         *extra,
@@ -520,24 +528,51 @@ def _post_result_storage_lease(
     )
 
 
-def _argument_binding_fact(book: Any, callee_symbol: Any, formal_id: Any, callsite_id: Any) -> Any:
-    """The ``argument_binding`` fact for one callee formal at one callsite:
-    the step-7 row ``(callee, formal, callsite)`` first, else the pre-step-7
-    row ``(callee, formal, "binding")`` at column ``callsite``.  None when
-    neither exists; an ``Unresolved`` is returned as such."""
+def _argument_binding_ref(
+    book: Any, callee_symbol: Any, formal_id: Any, callsite_id: Any,
+    *, caller_symbol: Any = None,
+) -> Any:
+    """The exact caller-qualified binding cell, with legacy-row support."""
 
     from .concordance_declarations import ARGUMENT_BINDING
+    from .identity_concordance import Ref
 
     page = book.pages.get(ARGUMENT_BINDING.name)
     if page is None or callsite_id is None:
         return None
-    row = (str(callee_symbol), int(formal_id), callsite_id)
-    fact = page.latest(row)
-    if fact is not None:
-        return fact
-    return page.cells.get(
-        ((str(callee_symbol), int(formal_id), "binding"), int(callsite_id)),
+    callee = str(callee_symbol)
+    if caller_symbol is not None:
+        row = (callee, str(caller_symbol), int(formal_id), callsite_id)
+        ref = book.latest_ref(ARGUMENT_BINDING, row)
+        if ref is not None:
+            return ref
+        # A current four-field page with no exact caller row is a missing
+        # binding. Do not recover it from an old caller-blind projection.
+        if len(page.row_fields) == 4:
+            return None
+    row = (callee, int(formal_id), callsite_id)
+    ref = book.latest_ref(ARGUMENT_BINDING, row)
+    if ref is not None:
+        return ref
+    legacy = (callee, int(formal_id), "binding")
+    if (legacy, int(callsite_id)) in page.cells:
+        return Ref(ARGUMENT_BINDING, legacy, int(callsite_id))
+    return None
+
+
+def _argument_binding_fact(
+    book: Any, callee_symbol: Any, formal_id: Any, callsite_id: Any,
+    *, caller_symbol: Any = None,
+) -> Any:
+    """The exact caller-qualified binding fact, with legacy-row support."""
+
+    ref = _argument_binding_ref(
+        book, callee_symbol, formal_id, callsite_id,
+        caller_symbol=caller_symbol,
     )
+    if ref is None:
+        return None
+    return book.pages[ref.page.name].cell(ref.row, ref.column)
 
 
 def _rebind_linked_storage_alias(

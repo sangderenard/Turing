@@ -442,6 +442,7 @@ def validate_precompile_ssa_compatibility(
     semantic = labelled_programs[0][1]
     compatible_locations: dict[tuple[str, str], list[str]] = {}
     shortfall_locations: dict[str, list[str]] = {}
+    policy_shortfalls: list[SSACompatibilityShortfall] = []
     if isinstance(semantic, FusedProgram) and isinstance(
         semantic.steps, list
     ):
@@ -451,8 +452,23 @@ def validate_precompile_ssa_compatibility(
             ):
                 continue
             location = f"program:step[{index}]"
-            compatibility_name = ssa_compatibility_name_for_precompile(
-                step.op_name
+            if step.op_name == "scatter" and isinstance(step.attrs, dict):
+                reduction = step.attrs.get("reduce", "sum")
+            else:
+                reduction = "sum"
+            if step.op_name == "scatter" and reduction not in {
+                "sum", "mean", "max", "min",
+            }:
+                policy_shortfalls.append(SSACompatibilityShortfall(
+                    "scatter", 1, (location,),
+                    f"scatter reduce={reduction!r} is not one of "
+                    "('sum', 'mean', 'max', 'min')",
+                ))
+                continue
+            compatibility_name = (
+                f"Call[scatter_{reduction}_double]"
+                if step.op_name == "scatter"
+                else ssa_compatibility_name_for_precompile(step.op_name)
             )
             if compatibility_name is None:
                 shortfall_locations.setdefault(step.op_name, []).append(
@@ -497,7 +513,7 @@ def validate_precompile_ssa_compatibility(
         for (precompile_name, ssa_name), locations
         in sorted(compatible_locations.items())
     )
-    shortfalls = tuple(
+    shortfalls = tuple(policy_shortfalls) + tuple(
         SSACompatibilityShortfall(
             operation_name,
             len(locations),
