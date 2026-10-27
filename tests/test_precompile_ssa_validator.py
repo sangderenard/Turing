@@ -74,10 +74,49 @@ def test_scan_reports_sign_and_scatter_as_real_llvm_algorithm_calls():
         for item in result.compatible_operations
     }
     assert compatibility == {
-        "scatter": "Call[index_assign_double]",
-        "sign": "Call[sign_double]",
+        "scatter": "Call[scatter_sum_double]",
+        "sign": "Call[unary_double|sign_double]",
     }
     assert require_precompile_ssa_compatible(program) is program
+
+
+@pytest.mark.parametrize("reduce", ["sum", "mean", "max", "min"])
+def test_validator_names_exact_scatter_reduction_kernel(reduce):
+    program = FusedProgram(
+        version=1,
+        feeds={0},
+        steps=[OpStep(0, "scatter", [0], {"reduce": reduce}, 1)],
+        outputs={"result": 1},
+        meta=_meta(0, 1),
+    )
+
+    result = validate_precompile_ssa_compatibility(program)
+
+    assert result.valid_precompile
+    assert result.ssa_compatible
+    assert result.compatibility_shortfalls == ()
+    assert result.compatible_operations[0].ssa_name == (
+        f"Call[scatter_{reduce}_double]"
+    )
+    assert require_precompile_ssa_compatible(program) is program
+
+
+def test_validator_refuses_invalid_scatter_reduction_policy():
+    program = FusedProgram(
+        version=1,
+        feeds={0},
+        steps=[OpStep(0, "scatter", [0], {"reduce": "median"}, 1)],
+        outputs={"result": 1},
+        meta=_meta(0, 1),
+    )
+
+    result = validate_precompile_ssa_compatibility(program)
+
+    assert result.valid_precompile
+    assert not result.ssa_compatible
+    assert "scatter reduce='median'" in result.compatibility_shortfalls[0].reason
+    with pytest.raises(PrecompileSSAValidationError, match="reduce='median'"):
+        require_precompile_ssa_compatible(program)
 
 
 def test_format_scan_finds_unproduced_values_duplicate_writers_and_metadata():

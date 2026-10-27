@@ -40,8 +40,8 @@ def root(n: int) -> int:
 ''', "refusal_unslotted_field")
 
 
-@pytest.mark.parametrize("source", [
-    '''
+@pytest.mark.parametrize("source,has_slot", [
+    ('''
 class Acc:
     def __init__(self, start: int):
         self.total = start
@@ -52,8 +52,8 @@ def root(a: int, b: int) -> int:
     acc = Acc(a)
     acc.add(b)
     return acc.total
-''',
-    '''
+''', True),
+    ('''
 from dataclasses import dataclass
 @dataclass
 class Acc:
@@ -65,10 +65,19 @@ def root(a: int, b: int) -> int:
     acc = Acc(a)
     add(acc, b)
     return acc.total
-''',
+''', False),
 ], ids=["method", "dataclass_free_function"])
-def test_record_field_read_after_storing_call_is_refused(source):
+def test_record_field_read_after_storing_call_uses_declared_slot(source, has_slot):
     # Both answered ``a`` (the construction's value) at main dd340a1: the
     # call's store into the record was dropped with the call.
-    with pytest.raises(Exception, match="record_stored_by_call"):
-        _lower(source, "refusal_stored_by_call")
+    from src.compiler.identity_concordance import CorrelationTable
+    if not has_slot:
+        # The dataclass constructor currently has no class-navigation slot.
+        # Its conceptual handle is not a sanctioned mutable field arena.
+        with pytest.raises(ValueError, match='record_stored_by_call'):
+            _lower(source, 'undeclared_dataclass_reload')
+        return
+    module, _, exports = _lower(source, "reloaded_stored_by_call")
+    assert CorrelationTable.build(module).findings(module) == []
+    assert all(instruction.args for block in module.functions[exports[0]].blocks.values()
+               for instruction in block.instrs if instruction.op == 'Ret')

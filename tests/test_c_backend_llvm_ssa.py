@@ -33,12 +33,17 @@ _REAL_TRANSLATED_SYMBOLS = {
     "binary_value",
     "binary_double",
     "binary_scalar_double",
+    "binary_int64_value",
+    "binary_int64",
+    "binary_scalar_int64",
     "unary_double",
     "matmul_double",
     "batched_matmul_indexed_double",
     "where_double",
     "broadcast_double",
+    "broadcast_int64",
     "reduce_dim_double",
+    "mean_dim",
     "transpose_double",
     "cumsum_dim_double",
     "stack_double",
@@ -47,6 +52,11 @@ _REAL_TRANSLATED_SYMBOLS = {
     "slice_copy_double",
     "index_select_double",
     "gather_values_double",
+    "scatter_reduce_double",
+    "scatter_sum_double",
+    "scatter_mean_double",
+    "scatter_max_double",
+    "scatter_min_double",
     "index_assign_double",
     "index_set_double",
     "unfold2d_double",
@@ -65,8 +75,10 @@ _REAL_TRANSLATED_SYMBOLS = {
     "cast_double_to_float_values",
     "cast_double_to_bool_values",
     "cast_double_to_double_values",
+    "cast_int64_to_double_values",
     "sum_double",
     "create_arange",
+    "create_arange_int64",
 }
 
 
@@ -97,7 +109,7 @@ def test_translation_table_uses_only_real_c_function_definitions():
 
     defined = set(
         re.findall(
-            r"(?m)^define(?:\s+internal)?\s+(?:void|double|i32)\s+@([A-Za-z0-9_]+)",
+            r"(?m)^define(?:\s+internal)?\s+(?:void|double|i32|i64)\s+@([A-Za-z0-9_]+)",
             LLVM_SSA_MODULE,
         )
     )
@@ -125,6 +137,15 @@ def test_translation_operations_are_real_abstract_tensor_names():
     assert [entry.c_symbol for entry in translations_for_operation("matmul")] == [
         "matmul_double",
         "batched_matmul_indexed_double",
+    ]
+    assert [entry.c_symbol for entry in translations_for_operation("scatter")] == [
+        "scatter_sum_double",
+        "scatter_mean_double",
+        "scatter_max_double",
+        "scatter_min_double",
+    ]
+    assert [entry.c_symbol for entry in translations_for_operation("IndexedStore")] == [
+        "index_assign_double",
     ]
 
 
@@ -593,6 +614,62 @@ def test_handwritten_index_select_ssa_matches_real_c_kernel(llvm_engine):
     assert list(llvm_output) == [
         c_output[index] for index in range(output_count)
     ]
+
+
+@pytest.mark.parametrize("reduce", ["sum", "mean", "max", "min"])
+def test_handwritten_scatter_ssa_matches_real_c_kernel(llvm_engine, reduce):
+    input_values = [10.0, 0.0, 0.0]
+    shape = [3]
+    indices = [0, 0, 1, 1]
+    values = [2.0, 6.0, 5.0, 4.0]
+    expected = {
+        "sum": [18.0, 9.0, 0.0],
+        "mean": [6.0, 3.0, 0.0],
+        "max": [10.0, 5.0, 0.0],
+        "min": [2.0, 0.0, 0.0],
+    }[reduce]
+    symbol = f"scatter_{reduce}_double"
+
+    c_output = _c_array([0.0] * len(input_values))
+    getattr(C, symbol)(
+        _c_array(input_values),
+        c_output,
+        ffi.new("int[]", shape),
+        len(shape),
+        0,
+        ffi.new("long long[]", indices),
+        len(indices),
+        _c_array(values),
+    )
+
+    llvm_output = (ctypes.c_double * len(input_values))()
+    _llvm_function(
+        llvm_engine,
+        symbol,
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_double),
+    )(
+        (ctypes.c_double * len(input_values))(*input_values),
+        llvm_output,
+        (ctypes.c_int32 * len(shape))(*shape),
+        len(shape),
+        0,
+        (ctypes.c_int64 * len(indices))(*indices),
+        len(indices),
+        (ctypes.c_double * len(values))(*values),
+    )
+
+    np.testing.assert_array_equal(np.asarray(llvm_output), expected)
+    np.testing.assert_array_equal(
+        np.asarray([c_output[index] for index in range(len(input_values))]),
+        expected,
+    )
 
 
 @pytest.mark.parametrize("value_count", [1, 4])

@@ -6,6 +6,38 @@ from src.compiler.identity_concordance import concordance_report
 from src.compiler.identity_concordance import CorrelationTable
 
 
+def test_sequence_status_lease_is_distinct_but_duplicate_column_is_reported():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    root = Path(__file__).resolve().parents[1]
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        (root / "tests" / "record_view_corpus" / "c631_record_sequence_status.py").read_text(),
+        "root", name="sequence_status",
+        extraction_contract=root / "extraction_contracts" / "program_extraction.yaml",
+        progress=lambda _message: None, progress_bars=False,
+    )
+    findings = CorrelationTable.build(module).findings(module)
+    assert not [finding for finding in findings
+                if finding.kind == "duplicate-storage-across-call"]
+    callee_name = next(name for name in module.record_tables
+                       if "__append_span__" in name)
+    field = next(field for record in module.record_tables[callee_name].records.values()
+                 for field in record.fields if field.storage_identity == "Pool.atoms")
+    sequence = module.sequence_tables[callee_name].by_id(field.sequence_id)
+    call = next(instruction for function in module.functions.values()
+                for block in function.blocks.values() for instruction in block.instrs
+                if instruction.op == "Call"
+                and instruction.attributes.get("callee") == callee_name)
+    formal_ids = tuple(call.attributes["callee_input_ids"])
+    status = call.args[formal_ids.index(sequence.status_address_id)]
+    # Deliberately feed the private status lease where the already-owned
+    # column is required. The same-role duplication must still be detected.
+    call.args[formal_ids.index(sequence.column_value_ids[0])] = status
+    findings = CorrelationTable.build(module).findings(module)
+    assert any(finding.kind == "duplicate-storage-across-call"
+               and finding.value_id == status.id for finding in findings)
+
+
 def test_record_handle_alias_is_owned_but_not_a_physical_operand():
     from src.transmogrifier.ssa import (
         SSAValue, Instr, Function, BasicBlock, IRModule,
