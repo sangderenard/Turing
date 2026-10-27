@@ -6279,7 +6279,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 and isinstance(payload, (int, float))
                                 and not isinstance(payload, bool)
                                 and str(operand.dtype or "").casefold()
-                                not in {"double", "float64"}
+                                != "float64"
                             ):
                                 respelled, respelled_def = constant(
                                     float(payload), "float64"
@@ -6300,7 +6300,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 isinstance(payload, (int, float))
                                 and not isinstance(payload, bool)
                                 and str(operand.dtype or "").casefold()
-                                not in {"double", "float64"}
+                                != "float64"
                             ):
                                 scalar, scalar_def = constant(
                                     float(payload), "float64"
@@ -6814,7 +6814,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     if (
                                         not int64_binary
                                         and str(scalar.dtype or "").casefold()
-                                        not in {"double", "float64"}
+                                        != "float64"
                                     ):
                                         promoted = fresh(shape=(), dtype="float64")
                                         prefix.append(Instr(
