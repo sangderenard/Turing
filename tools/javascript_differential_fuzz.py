@@ -4,8 +4,8 @@ The JavaScript counterpart of ``differential_fuzz.py``.  Each program is a
 random function over two Number parameters (``a``, ``b``) and two Boolean
 parameters (``p``, ``q``) built from ``const``/``let`` bindings,
 reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``
-and bounded ``for``/``while`` loops (with guarded ``break``/``continue``
-and early ``return``),
+and bounded ``for``/``while`` loops (with guarded ``break``/``continue``,
+labeled ones to enclosing loops, and early ``return``),
 an optional early-return ``if`` and typed expression snippets.  It is lowered with
 ``lower_javascript_source_to_ssa``, compiled through the C backend and run on
 rows of ordinary and special values (``NaN``, ``-0``, ``Infinity``), and
@@ -158,9 +158,18 @@ class Generator:
             if self.loops and choice < 0.12:
                 # ``continue`` would skip a while loop's trailing counter
                 # increment, so only a ``for`` loop gets one.
-                exit_ = "break" if self.loops[-1] == "while" or (
+                # The innermost loop, or (named) an enclosing labeled one.
+                targets = [self.loops[-1]] + [
+                    loop for loop in self.loops if loop[1] is not None
+                ]
+                kind, label = rng.choice(targets)
+                if (kind, label) == self.loops[-1] and rng.random() < 0.6:
+                    label = None
+                exit_ = "break" if kind == "while" or (
                     rng.random() < 0.5
                 ) else "continue"
+                if label is not None:
+                    exit_ += f" {label}"
                 if rng.random() < 0.3:
                     exit_ = f"return {self.result(1)}"
                 lines.append(f"{indent}if ({self.condition(1)}) {{ {exit_}; }}")
@@ -188,18 +197,24 @@ class Generator:
         if rng.random() < 0.4:
             guard += f" && {counter} < {rng.choice(('a', 'b'))}"
         self.numbers.append(counter)
+        label = f"L{self.loop_index}" if rng.random() < 0.35 else None
+        prefix = f"{label}: " if label else ""
         if rng.random() < 0.7:
-            lines = [f"{indent}for (let {counter} = 0; {guard}; {counter}++) {{"]
-            self.loops.append("for")
+            lines = [
+                f"{indent}{prefix}for (let {counter} = 0; {guard}; {counter}++) {{"
+            ]
+            self.loops.append(("for", label))
             lines.extend(self.block(depth, indent + "  "))
         else:
-            lines = [f"{indent}let {counter} = 0;", f"{indent}while ({guard}) {{"]
-            self.loops.append("while")
+            lines = [
+                f"{indent}let {counter} = 0;", f"{indent}{prefix}while ({guard}) {{",
+            ]
+            self.loops.append(("while", label))
             lines.extend(self.block(depth, indent + "  "))
             lines.append(f"{indent}  {counter}++;")
         self.loops.pop()
         lines.append(f"{indent}}}")
-        if lines[0].lstrip().startswith("for"):
+        if "for (" in lines[0]:
             # A for-head let is scoped to the loop.
             self.numbers.remove(counter)
         return lines
@@ -220,7 +235,7 @@ class Generator:
         self.mutable_numbers = ["a", "b"] if rng.random() < 0.3 else []
         self.mutable_booleans = []
         self.loop_index = 0
-        self.loops: list[str] = []
+        self.loops: list[tuple[str, str | None]] = []
         self.returns_number = rng.random() < 0.7
         for index in range(rng.randint(0, 4)):
             binding = "let" if rng.random() < 0.5 else "const"
