@@ -31,6 +31,9 @@ def test_shared_source_entry_refuses_actual_final_discordance(monkeypatch):
             extraction_contract=CONTRACT, progress=lambda _: None,
         )
     assert "987654321" in str(raised.value)
+    rejected, _outputs, exports = raised.value.rejected_source_result
+    assert rejected.metadata["identity_book"] is not None
+    assert exports and rejected.functions
 
 
 def test_shared_source_entry_accepts_concordant_program():

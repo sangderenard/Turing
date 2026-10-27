@@ -6681,27 +6681,52 @@ def compile_project_call(
             "unit: available verified source regions "
             + str(len(linked_source_region_ssa))
         )
-    with authored_source_realization(targets=(
-        call.qualified_name for call in discover_authored_calls(compile_source)
-    )):
-        module, outputs, exports = lower_ast_source_to_ssa(
-            compile_source,
-            qualified_name,
-            name=artifact_name,
-            source_module=source_module_name,
-            python_package=source_package_name,
-            runtime_closure_only=True,
-            progress=report,
-            extraction_contract=extraction_policy,
-            external_class_field_aggregate_kinds=authored_record_contracts,
-            linked_repository_ssa=linked_repository_ssa,
-            linked_source_region_ssa=linked_source_region_ssa,
-            compilation_unit_plan_sink=publish_process_graph_plan,
-            resolved_process_graph_sink=publish_resolved_process_graph,
-            stop_after_compilation_unit_plan=bool(plan_only),
-            progress_bars=progress_bars,
-            compile_progress_state_sink=report_compiler_progress,
-        )
+    try:
+        with authored_source_realization(targets=(
+            call.qualified_name for call in discover_authored_calls(compile_source)
+        )):
+            module, outputs, exports = lower_ast_source_to_ssa(
+                compile_source,
+                qualified_name,
+                name=artifact_name,
+                source_module=source_module_name,
+                python_package=source_package_name,
+                runtime_closure_only=True,
+                progress=report,
+                extraction_contract=extraction_policy,
+                external_class_field_aggregate_kinds=authored_record_contracts,
+                linked_repository_ssa=linked_repository_ssa,
+                linked_source_region_ssa=linked_source_region_ssa,
+                compilation_unit_plan_sink=publish_process_graph_plan,
+                resolved_process_graph_sink=publish_resolved_process_graph,
+                stop_after_compilation_unit_plan=bool(plan_only),
+                progress_bars=progress_bars,
+                compile_progress_state_sink=report_compiler_progress,
+            )
+    except Exception as error:
+        rejected = getattr(error, "rejected_source_result", None)
+        if rejected is not None:
+            from uuid import uuid4
+
+            # Manager finalization refused a real module after an eight-minute
+            # run, leaving only its text log. Preserve that exact IR/book via
+            # the incumbent atomic artifact writer, with an immutable path.
+            # Neither the accepted artifact nor a successful unit is published.
+            rejected_path = root / f"rejected-repository-ssa-{uuid4().hex}.pkl"
+            try:
+                _dump_pickle_artifact(rejected_path, rejected)
+                error.compiler_failure_artifacts = {
+                    "rejected_repository_ssa": rejected_path.name,
+                    "rejected_repository_ssa_sha256": _file_sha256(rejected_path),
+                    "rejected_repository_ssa_linkable": False,
+                }
+                report(f"unit: rejected SSA/concordance retained: {rejected_path.name}")
+            except Exception as artifact_error:
+                error.compiler_failure_artifacts = {
+                    "rejected_repository_ssa_error": str(artifact_error),
+                }
+                report(f"unit: rejected SSA capture failed: {artifact_error}")
+        raise
     if plan_only:
         receipt = {
             "schema": "turing.project-compilation-unit-plan.v1",

@@ -4,6 +4,13 @@ from tools import compile_project_catalogue as catalogue
 
 
 def test_cli_repeats_real_lowering_failure_after_catalogue_summary(monkeypatch, tmp_path, capsys):
+    failure = tmp_path / "units/manager/failure.json"
+    failure.parent.mkdir(parents=True)
+    failure.write_text(json.dumps({
+        "error_type": "ConcordanceRefusal", "error": "producer 73 lacks physical rank",
+        "rejected_repository_ssa": "rejected-ssa-unique.pkl",
+        "rejected_repository_ssa_sha256": "diagnostic-sha256",
+    }))
     manifest = {"units": [{
         "qualified_name": "manager", "status": "failed",
         "error_type": "ConcordanceRefusal", "error": "producer 73 lacks physical rank",
@@ -17,6 +24,9 @@ def test_cli_repeats_real_lowering_failure_after_catalogue_summary(monkeypatch, 
     assert report["error"] == "producer 73 lacks physical rank"
     assert report["error_type"] == "ConcordanceRefusal"
     assert report["phase"] == "lowering"
+    assert report["rejected_repository_ssa"] == str(failure.parent / "rejected-ssa-unique.pkl")
+    assert report["rejected_repository_ssa_sha256"] == "diagnostic-sha256"
+    assert report["rejected_repository_ssa_linkable"] is False
 
 
 def test_cli_native_build_failure_is_visible_and_fails_without_cases(monkeypatch, tmp_path, capsys):

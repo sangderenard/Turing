@@ -1658,7 +1658,7 @@ def _declared_physical_dtype(dtype: Any) -> dict[str, Any]:
 
 
 def _contract_physical(
-    book: Any, value: Any, *cells: Any,
+    book: Any, value: Any, *cells: Any, dtype: str | None = None,
 ) -> tuple[dict[str, Any], Ref] | None:
     """The physical fields of ``value`` read from its ProgramABI contract row.
 
@@ -1693,7 +1693,8 @@ def _contract_physical(
         if len(views) != 1 or arms[0].storage == "none":
             return None
         arm = arms[0]
-        if str(arm.dtype) != str(value.dtype):
+        selected_dtype = value.dtype if dtype is None else dtype
+        if str(arm.dtype) != str(selected_dtype):
             return None
         if arm.storage == "scalar" and tuple(value.shape or ()):
             return None
@@ -6022,6 +6023,7 @@ class _ControlSSABuilder(TiledObject):
         attributes: dict[str, Any],
         claim_provisional_definition: bool = False,
         element_dtype: str | None = None,
+        element_dtype_cell: Ref | None = None,
     ) -> SSAValue:
         indices = (
             tuple(index)
@@ -6099,13 +6101,52 @@ class _ControlSSABuilder(TiledObject):
         )
         if dtype == "ssa.aggregate":
             declared = self._value_from_meta(int(result_id))
-            dtype = str(declared.dtype or element_dtype or "unknown")
+            # Program: three calls validate([0, 1]), validate([False, True]),
+            # validate([0, 2]) against ``offsets: list[int]``.  Wrong record:
+            # the bool call's Load inherited int64 from generic target meta
+            # while its exact resident descriptor column and target ABI were
+            # bool.  Rule: when the exact descriptor cell is present, its
+            # element dtype owns this Load; generic metadata cannot override
+            # the column, and the target ABI must confirm the same view.
+            dtype = str(
+                element_dtype
+                if element_dtype_cell is not None and element_dtype
+                else declared.dtype or element_dtype or "unknown"
+            )
         result = self.produced_value(
             result_id,
             dtype=dtype,
             claim_provisional_definition=claim_provisional_definition,
             cause=(address,),
         )
+        if element_dtype_cell is not None:
+            canonical = self._canonical_cell(int(result_id))
+            if canonical is None:
+                raise ValueError(
+                    "descriptor-typed static iterable Load has no exact "
+                    f"canonical target identity: {int(result_id)}"
+                )
+            physical = _contract_physical(
+                self._book(), result, canonical, dtype=dtype,
+            )
+            if physical is None:
+                raise ValueError(
+                    "descriptor-typed static iterable Load has no matching "
+                    f"target ABI physical view: {int(result_id)} as {dtype}"
+                )
+            # Keep the resident object and its authoritative SSA_VALUE row in
+            # step.  The exact descriptor and target ABI cells are the causes
+            # of this physical Load; without a matching target contract the
+            # Load has no proven native element view and lowering must refuse.
+            result.dtype = dtype
+            physical_fields, target_abi = physical
+            self._revise_value(
+                result, address, element_dtype_cell, canonical, target_abi,
+                physical={
+                    **_declared_physical_dtype(dtype),
+                    **physical_fields,
+                },
+            )
         self.emit(Handler.Load, [address], result, attributes=attributes)
         return result
 
@@ -19466,6 +19507,41 @@ class _ControlSSABuilder(TiledObject):
                 static_element_dtype = literal_kinds[0]
             else:
                 static_element_dtype = None
+            # Use the already-published physical column when this static
+            # iterable is a resident sequence.  Its descriptor is the exact
+            # storage contract for the Load; Python literal payloads remain
+            # only the existing fallback for an uncontracted static value.
+            resident_sequence_id = int(iterable_id)
+            descriptor_seen: set[int] = set()
+            while (
+                resident_sequence_id in self.value_aliases
+                and resident_sequence_id not in descriptor_seen
+            ):
+                descriptor_seen.add(resident_sequence_id)
+                resident_sequence_id = int(
+                    self.value_aliases[resident_sequence_id]
+                )
+            static_descriptor = self.sequence_descriptors.get(
+                resident_sequence_id
+            )
+            static_descriptor_cell = self._sequence_contract_cell(
+                resident_sequence_id
+            )
+            if (
+                static_descriptor is not None
+                and static_descriptor_cell is not None
+                and len(static_descriptor.column_dtypes) == 1
+                and len(static_descriptor.column_value_ids) == 1
+                and len(static_descriptor.column_shapes) == 1
+                and tuple(static_descriptor.column_shapes[0] or ()) == ()
+                and str(static_descriptor.column_dtypes[0])
+                not in {"", "unknown", "None"}
+            ):
+                static_element_dtype = str(
+                    static_descriptor.column_dtypes[0]
+                )
+            else:
+                static_descriptor_cell = None
             self.indexed_load(
                 aggregate,
                 induction,
@@ -19475,6 +19551,7 @@ class _ControlSSABuilder(TiledObject):
                     "induction": loop.induction,
                 },
                 element_dtype=static_element_dtype,
+                element_dtype_cell=static_descriptor_cell,
             )
         for aggregate_id, target_id, induction_name, source_ids in (
             self.program.closure_iterable_bindings

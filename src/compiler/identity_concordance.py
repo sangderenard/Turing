@@ -5714,6 +5714,10 @@ class ConcordanceRefusal(ValueError):
     Raised at the call; nothing is recorded.
     """
 
+    def to_failure_mapping(self) -> dict[str, Any]:
+        """Expose retained diagnostic artifacts through the product's existing hook."""
+        return dict(getattr(self, "compiler_failure_artifacts", {}))
+
 
 class ProjectedScopeRead(LookupError):
     """A row of a node the reading scope's declared projection does not hold.

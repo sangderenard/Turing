@@ -23551,6 +23551,34 @@ def _class_surface_ssa_program(
         STATIC_SYMBOL_DEFINITION as _ABI_STATIC_SYMBOL_DEFINITION,
         SourcePageFactClass as _ABISourcePageFactClass,
     )
+    def current_source_class_cell(owner, value_id, attributes):
+        current = shape_identity_book.latest_ref(
+            _ABI_VALUE_CLASS, (_source_numeric_scope(owner), int(value_id)),
+        )
+        if current is not None:
+            return current
+        receipt = attributes.get("callsite_iterable_element_class_cell")
+        if receipt is None:
+            return None
+        from .identity_concordance import _canonical_identity_base
+        subject = _identity_cell(owner, int(value_id))
+        if (not isinstance(receipt, _ABIRef) or receipt.page != _ABI_VALUE_CLASS
+                or subject is None):
+            raise ValueError("callsite class receipt has no exact value subject")
+        base = _canonical_identity_base(shape_identity_book, subject)
+        pending, seen = [receipt], set()
+        while pending:
+            cell = pending.pop()
+            if cell in seen:
+                continue
+            seen.add(cell)
+            if (cell.page.name in {"canonical_value", "ingestion_value"}
+                    and _canonical_identity_base(shape_identity_book, cell) == base):
+                return receipt
+            if cell.page.name in {"source_value_class_concordance", "cell_set"}:
+                pending.extend(parent for parent, _ in shape_identity_book.edges_into(cell))
+        raise ValueError("callsite class receipt belongs to a different canonical subject")
+
     deferred_type_expectations = []
     for planned_graph in planned_graphs_by_shell.values():
         contracts = linked_value_abi_by_graph.setdefault(id(planned_graph), {})
@@ -23642,11 +23670,12 @@ def _class_surface_ssa_program(
                     )[value_id] = tuple(dict.fromkeys((
                         page_cell, *class_cells, *builtin_class_cells,
                     )))
-            class_cell = attributes.get(
-                "callsite_iterable_element_class_cell"
-            ) or shape_identity_book.latest_ref(
-                _ABI_VALUE_CLASS, (numeric_scope, value_id),
-            )
+            # Three calls validate([0,1]), validate([False,True]),
+            # validate([0,2]) retain their pre-specialization receipt Refs.
+            # Their complete numeric domains already project those receipts
+            # to distinct current class rows. The current projection owns
+            # this copy; its earlier receipt is a cause, not a competing view.
+            class_cell = current_source_class_cell(planned_graph, value_id, attributes)
             class_fact = None if class_cell is None else _cell_fact(class_cell)
             if not (
                 isinstance(class_fact, tuple)
@@ -23892,11 +23921,7 @@ def _class_surface_ssa_program(
             # absent, mixed, or non-primitive class keeps the reference/tag
             # path below.
             class_row = (numeric_scope, int(subject_id))
-            class_cell = subject_attributes.get(
-                "callsite_iterable_element_class_cell"
-            ) or shape_identity_book.latest_ref(
-                _ABI_VALUE_CLASS, class_row,
-            )
+            class_cell = current_source_class_cell(planned_graph, subject_id, subject_attributes)
             class_fact = None if class_cell is None else _cell_fact(class_cell)
             class_identity = (
                 str(class_fact[0])
@@ -25604,7 +25629,24 @@ def _class_surface_ssa_program(
                 incumbent_fact = (
                     None if incumbent is None else _cell_fact(incumbent)
                 )
-                if incumbent is not None and incumbent_fact == fact:
+                # Linked physical arms can arrive before a later copy's
+                # semantic projection. Preserve that existing current class
+                # Ref on the ABI itself, even when its physical fact repeats.
+                current_class = shape_identity_book.latest_ref(
+                    _ABI_VALUE_CLASS, (_source_numeric_scope(planned_graph), int(value_id)),
+                )
+                if current_class is not None:
+                    current_fact = _cell_fact(current_class)
+                    identity = str(current_fact[0]) if current_fact else ""
+                    if identity and _canonical_program_abi_type_identity(identity, program_abi) not in alternatives:
+                        raise ValueError("current source class disagrees with linked native ABI alternatives")
+                    if not identity:
+                        current_class = None
+                prior_sources = () if incumbent is None else tuple(
+                    cell for cell, _ in shape_identity_book.edges_into(incumbent)
+                )
+                if (incumbent is not None and incumbent_fact == fact
+                        and (current_class is None or current_class in prior_sources)):
                     continue
                 source_cell = _identity_cell(planned_graph, int(value_id))
                 if source_cell is None:
@@ -25619,6 +25661,7 @@ def _class_surface_ssa_program(
                     provenance=_ShapeDerived(tuple(dict.fromkeys((
                         *((incumbent,) if incumbent is not None else ()),
                         source_cell,
+                        *((current_class,) if current_class is not None else ()),
                         *(
                             cell
                             for arm in physical_alternatives
@@ -33756,8 +33799,15 @@ def _class_surface_ssa_program(
                 or ""
             ).casefold() in recoverable_structural_operations
         }
+        # ``pending_call_feed_ids`` includes the DCE dependency closure,
+        # not additional source boundaries. Reconstructing every ancestor of
+        # ``return before + clock.epoch * scale`` duplicated the region-owned
+        # Mul in function_exit; slot injection then placed its epoch Load
+        # there although the real region Call consumed it earlier. Recover
+        # only the exact authored boundaries already recorded before closure
+        # expansion, plus the independent control/formal roots below.
         for required_id in sorted(
-            set(pending_call_feed_ids.get(symbol, ()))
+            set(map(int, function.metadata.get("required_source_value_ids", ())))
             | planned_bool_feeds
             | recoverable_formals
         ):
@@ -63584,7 +63634,7 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
         if _unresolved:
             from .identity_concordance import ConcordanceRefusal
 
-            raise ConcordanceRefusal(
+            refusal = ConcordanceRefusal(
                 f"final concordance refused {len(_unresolved)} finding(s):\n"
                 + "\n".join(
                     f"{getattr(f, 'function', '?')} value "
@@ -63593,6 +63643,12 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
                     for f in _unresolved
                 )
             )
+            # Keep the exact rejected work available to the existing product
+            # artifact writer. This is diagnostic data, never an admitted
+            # compilation result; the same refusal still leaves this entry.
+            if module is not None:
+                refusal.rejected_source_result = result
+            raise refusal
         ok = True
         if module is not None and _regulator.live_arena is not None:
             _bars.substage("publish live storage receipts")

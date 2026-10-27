@@ -900,10 +900,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         failure_path = unit.get("failure")
         if native_failure:
             failure_path = unit.get("native_failure")
-            if failure_path:
-                detail = json.loads(
-                    (arguments.output / failure_path).read_text(encoding="utf-8")
-                )
+        if failure_path and (arguments.output / failure_path).is_file():
+            detail = json.loads(
+                (arguments.output / failure_path).read_text(encoding="utf-8")
+            )
         error = str(detail.get("error") or "")
         print(json.dumps({
             "stage": "failure_summary",
@@ -913,6 +913,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "error": error[:2000],
             "error_truncated": len(error) > 2000,
             "failure": str(arguments.output / failure_path) if failure_path else None,
+            **({
+                "rejected_repository_ssa": str(
+                    (arguments.output / failure_path).parent / detail["rejected_repository_ssa"]
+                ),
+                "rejected_repository_ssa_sha256": detail.get("rejected_repository_ssa_sha256"),
+                "rejected_repository_ssa_linkable": False,
+            } if failure_path and detail.get("rejected_repository_ssa") else {}),
+            **({"rejected_repository_ssa_error": detail["rejected_repository_ssa_error"]}
+               if detail.get("rejected_repository_ssa_error") else {}),
         }, sort_keys=True), flush=True)
     for verification in manifest.get("native_case_verification", ()):
         print(json.dumps(verification, sort_keys=True), flush=True)

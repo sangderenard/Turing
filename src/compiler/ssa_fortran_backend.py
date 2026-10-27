@@ -3148,9 +3148,12 @@ class _FunctionEmitter:
                 # the caller.  Treat the exact callee output operand as that
                 # local; dynamic-rank propagation has already copied the
                 # formal's array contract onto this identity.
-                self._locals[instr.res.id] = self._typed(
-                    instr.args[position]
-                )
+                # The exact frame output operand is the physical local.
+                # Keying it by the semantic Call result registered one value
+                # under two identities (Const6 plus result7 -> operand6), so
+                # an identity-returning method declared t6 twice.
+                output_value = self._typed(instr.args[position])
+                self._locals[int(output_value.id)] = output_value
             elif not aliases_frame:
                 self._locals[instr.res.id] = self._typed(instr.res)
         elif output_count == 1 and instr.res is not None:

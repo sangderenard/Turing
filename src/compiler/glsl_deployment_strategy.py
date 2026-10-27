@@ -28856,7 +28856,11 @@ def _post_callsite_loop_element_classes(
     book = current_identity_book()
     class_page = book.page(SOURCE_VALUE_CLASS)
     caller_scope = _source_numeric_scope(caller.G)
-    callee_scope = _source_numeric_scope(specialized.G)
+    # The per-callsite target class belongs to the clean subgraph's existing
+    # copy-on-read lexical scope. The source numeric scope is shared by the
+    # int and bool variants: revising its declared-int loop row for one
+    # callsite rewrites the cause read by every other variant.
+    callee_scope = specialized.G.graph.get("lexical_read_scope")
     program_abi_values = tuple(
         (caller.G.graph.get("program_abi") or {}).get("values") or ()
     )
@@ -29078,6 +29082,11 @@ def _post_callsite_loop_element_classes(
                 if target_attributes.get("binding_kind") != "loop":
                     continue
                 target_value_id = int(target_data.get("value_id", target_id))
+                if callee_scope is None:
+                    raise ValueError(
+                        "callsite loop class requires the existing forked "
+                        "lexical read scope"
+                    )
                 target_row = (callee_scope, target_value_id)
                 previous = book.latest_ref(SOURCE_VALUE_CLASS, target_row)
                 try:
@@ -29123,6 +29132,48 @@ def _post_callsite_loop_element_classes(
                     target_attributes["result_class_ref"] = exact_class
                 else:
                     target_attributes.pop("result_class_ref", None)
+
+
+def _callsite_return_shape_sources(caller, original, specialized, call_id, return_id, descriptor):
+    """Read the selected return's shape through its existing exact call edge."""
+    from ..common.tensors.topological_reducer import node_identity_cell, _source_numeric_scope
+    from .identity_concordance import (
+        current_identity_book, shape_scope_of, SHAPE_STATE_PAGE, PROVEN_SHAPE_PAGE,
+    )
+    from .concordance_declarations import SOURCE_FUNCTION_REACHABILITY
+
+    book = current_identity_book()
+    caller_scope = caller.G.graph.get("authored_function_identity") or _source_numeric_scope(caller.G)
+    callee_scope = original.G.graph.get("authored_function_identity") or _source_numeric_scope(original.G)
+    selected_scope = specialized.G.graph.get("authored_function_identity") or _source_numeric_scope(specialized.G)
+    if selected_scope != callee_scope:
+        raise ValueError("selected return belongs to a different source callee")
+    call_value = int(caller.G.nodes[int(call_id)].get("value_id", call_id))
+    binding = book.latest_ref(SOURCE_FUNCTION_REACHABILITY, (caller_scope, call_value, callee_scope))
+    if binding is None or book.page(SOURCE_FUNCTION_REACHABILITY).cell(binding.row, binding.column) is not True:
+        raise ValueError("selected return has no exact source call reachability authority")
+    outputs = tuple(specialized.G.graph.get("function_outputs") or ())
+    identities = specialized.G.graph.get("identity_table") or {}
+    if len(outputs) != 1 or int(return_id) not in tuple(identities.get(str(outputs[0]), ())):
+        raise ValueError("selected shape is not an exact callee return identity")
+    row = (shape_scope_of(specialized), int(return_id))
+    cells = []
+    expected = (tuple(descriptor.get("shape") or ()), str(descriptor.get("dtype")))
+    for page in (SHAPE_STATE_PAGE, PROVEN_SHAPE_PAGE):
+        cell = book.latest_ref(page, row)
+        if cell is None:
+            continue
+        fact = book.page(page).cell(cell.row, cell.column)
+        if page == SHAPE_STATE_PAGE:
+            observed = (tuple(fact[1][0]), str(fact[1][1])) if fact[0] == "resolved" else None
+        else:
+            observed = (tuple(fact[1]), str(fact[2])) if fact[0] == "proven" else None
+        if observed != expected:
+            raise ValueError("selected return descriptor disagrees with its exact shape authority")
+        cells.append(cell)
+    if not cells:
+        raise ValueError("selected return has no recorded shape authority")
+    return tuple(dict.fromkeys((node_identity_cell(caller, int(call_id)), binding, *cells)))
 
 
 def _callsite_specialized_shell_type(
@@ -29476,6 +29527,12 @@ def _callsite_specialized_shell_type(
             extents,
             descriptor.get("dtype"),
             int(_dependency_levels(caller).get(int(node_id), 0)),
+            # penalties(spans) calls judged(spans): the selected return3
+            # already has exact shape cells, while caller Call4 has none.
+            # The old publication dropped those cells and posted Derived(()).
+            sources=_callsite_return_shape_sources(
+                caller, original, specialized_graph, int(node_id), int(candidate), descriptor,
+            ),
         )
         # A Precision operation may have been identified before this callee's
         # exact return extents existed.  The concordance publication above is
