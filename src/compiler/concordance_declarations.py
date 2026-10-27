@@ -1626,7 +1626,7 @@ PHYSICAL_CALL_INPUT_ADAPTATION_ROUND = declare_page(
 CALL_INPUT_CONVERSION = declare_page("call_input_conversion", (
     RowField("caller", K.SCOPE), RowField("actual", K.VALUE_ID),
     RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
-), tuple)                              # mode REVISE
+), tuple)                              # (converted,source dtype,target dtype,kind[,source callsite,block]); REVISE
 CALL_INPUT_STORAGE = declare_page("call_input_storage_concordance", (
     RowField("caller", K.SCOPE), RowField("actual", K.VALUE_ID),
 ), str)                                # mode CONCORD

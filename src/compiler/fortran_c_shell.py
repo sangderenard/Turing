@@ -54682,6 +54682,7 @@ def _class_surface_ssa_program(
     module_metadata["physical_region_input_conversions"] = (
         adapt_physical_call_inputs(
             all_functions,
+            call_records=call_records,
             progress=report,
             defer_unsettled_region_call_results=True,
         )
@@ -59191,6 +59192,7 @@ def _class_surface_ssa_program(
     # read-only edges gain casts, and an immediate repeat makes zero changes.
     late_physical_conversions = adapt_physical_call_inputs(
         lowered_module.functions, progress=report,
+        call_records=lowered_module.call_table,
     )
     if late_physical_conversions:
         lowered_module.metadata[

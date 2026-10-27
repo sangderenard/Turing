@@ -1564,6 +1564,7 @@ class CorrelationTable:
         found.extend(self._value_type_abi_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
         found.extend(self._frame_aliased_result_findings(module))
+        found.extend(self._physical_call_input_conversion_findings(module))
         found.extend(self._formal_actual_occurrence_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
         found.extend(self._source_precision_operator_findings(module))
@@ -3078,6 +3079,107 @@ class CorrelationTable:
                             None if instruction.res is None else int(instruction.res.id),
                             f"{block_name}: {detail}",
                         ))
+        return found
+
+    @staticmethod
+    def _physical_call_input_conversion_findings(module: Any) -> list[Finding]:
+        """A converted native argument retains its exact activation and cause."""
+        from .concordance_declarations import CALL_RECORD, CALL_INPUT_CONVERSION, CELL_SET, SSA_VALUE
+        from .ssa_record_return_state import ssa_value_identity_cell
+        table = getattr(module, "call_table", None)
+        if table is None:
+            return []
+        book = table.book
+        functions = getattr(module, "functions", {}) or {}
+        conversion_index = defaultdict(list)
+        page = book.pages.get(CALL_INPUT_CONVERSION.name)
+        if page is not None:
+            for row in page.rows():
+                for column, fact in page.history(row):
+                    if len(fact) == 6:
+                        conversion_index[(str(row[0]), str(row[2]), int(fact[4]))].append(
+                            (Ref(CALL_INPUT_CONVERSION, row, column), fact))
+        found = []
+        for caller_name, records in table.items():
+            caller = functions.get(str(caller_name))
+            if caller is None:
+                continue
+            definitions = {int(ins.res.id): (str(label), index, ins)
+                           for label, block in caller.blocks.items()
+                           for index, ins in enumerate(block.instrs) if ins.res is not None}
+            dominance = CorrelationTable._dominators(caller)
+            for record in records:
+                # A cloned table cites its original exact row. Follow only
+                # those record revisions/cell sets, never a latest conversion
+                # selected from another call sharing the same source/formal.
+                pending, causes = [record.cell], set()
+                while pending:
+                    cell = pending.pop()
+                    if cell is None or cell in causes:
+                        continue
+                    causes.add(cell)
+                    for parent, _stage in book.edges_into(cell):
+                        if parent.page in {CALL_RECORD, CELL_SET}:
+                            pending.append(parent)
+                        else:
+                            causes.add(parent)
+                conversions = conversion_index.get((str(caller_name), str(record.callee_symbol), int(record.callsite_id)), ())
+                if not conversions:
+                    continue
+                sites = tuple((str(label), index, ins)
+                              for label, block in caller.blocks.items()
+                              for index, ins in enumerate(block.instrs)
+                              if ins.op in {"Call", "call"}
+                              and ins.attributes.get("plan_callsite_id") == record.callsite_id
+                              and ins.attributes.get("callee") == record.callee_symbol)
+                if not sites:
+                    continue  # Existing dead-call accounting owns removed calls.
+                callee = functions.get(str(record.callee_symbol))
+                if len(sites) != 1 or callee is None:
+                    found.append(Finding("physical-call-conversion-frame", str(caller_name), None,
+                                         "converted frame has no unique current native call"))
+                    continue
+                block, call_index, call = sites[0]
+                inputs = tuple(map(int, call.attributes.get("callee_input_ids", ())))
+                frame = {int(formal): (kind, source) for formal, kind, source in record.frame_bindings}
+                formals = {int(value.id): value for value in callee.args}
+                for formal_id in {int(cell.row[3]) for cell, _fact in conversions}:
+                    formal = formals.get(formal_id)
+                    if formal is None:
+                        continue  # Existing formal-pruning audit owns retirement.
+                    target = (formal.accounting or {}).get("physical_dtype") or formal.dtype
+                    candidates = tuple((cell, fact) for cell, fact in conversions
+                                       if int(cell.row[3]) == formal_id and str(fact[2]) == str(target))
+                    if not candidates:
+                        continue
+                    binding = frame.get(formal_id)
+                    matching = tuple((cell, fact) for cell, fact in candidates
+                                     if binding is not None and binding[0] == "caller_value"
+                                     and int(binding[1]) == int(fact[0]))
+                    detail = None
+                    if len(matching) != 1 or inputs.count(formal_id) != 1:
+                        detail = "physical frame discarded its exact recorded input conversion"
+                    else:
+                        cell, fact = matching[0]
+                        converted = int(fact[0])
+                        position = inputs.index(formal_id)
+                        producer = definitions.get(converted)
+                        value_cell = ssa_value_identity_cell(caller, converted, book=book)
+                        sourced = value_cell is not None and any(
+                            ref.page == SSA_VALUE and ref.row == value_cell.row for ref in causes)
+                        valid = (cell in causes and position < len(call.args) and int(call.args[position].id) == converted
+                                 and producer is not None and producer[2].op == "Cast"
+                                 and len(producer[2].args) == 1
+                                 and int(producer[2].args[0].id) == int(cell.row[1])
+                                 and producer[0] == str(fact[5]) and sourced
+                                 and producer[0] in dominance.get(block, set())
+                                 and (producer[0] != block or producer[1] < call_index))
+                        if not valid:
+                            detail = "native argument disagrees with its sourced, control-owned Cast"
+                    if detail is not None:
+                        found.append(Finding("physical-call-conversion-frame", str(caller_name),
+                                             None if call.res is None else int(call.res.id),
+                                             f"callsite {record.callsite_id}, formal {formal_id}: {detail}"))
         return found
 
     @staticmethod
