@@ -35271,16 +35271,6 @@ def _class_surface_ssa_program(
                 storage_identity = str(field.storage_identity)
                 receipt = sequence_view_receipt(sequence)
 
-                if storage_identity == "Vocabulary._candidates":
-                    print(
-                        "CANDIDATES_SEQUENCE_VIEW:",
-                        "source_symbol=", source_symbol,
-                        "record_id=", record_id,
-                        "field=", field.name,
-                        "sequence_id=", field.sequence_id,
-                        "receipt=", receipt,
-                    )
-
                 local_sequence_views.setdefault(
                     storage_identity, []
                 ).append((
