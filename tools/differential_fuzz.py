@@ -88,6 +88,9 @@ EXTENDED = [
     # a call whose argument is a dict display runs after the display's
     # member stores (corpus c377, dict formal)
     (["c{v} = bump_key({{0: {a}, 1: {b}}}, n)"], "c{v}"),
+    # a module table of known functions, indexed and called (corpus c378,
+    # plan C25), and a module table read at a computed key (corpus c379)
+    (["c{v} = FN_TABLE[(n + {a}) % 2](n) + KEY_TABLE[(n + {b}) % 3]"], "c{v}"),
     # a dict row stored from its own read (corpus c374, plan C6)
     (["d{v} = {{0: {a}, 1: {b}}}", "d{v}[n % 2] += n * {c}", "d{v}[1] = d{v}[0] + d{v}[1]"], "d{v}[0] * 10 + d{v}[1]"),
     (["xs{v} = []", "k{v} = n % 5 + 2", "while k{v} > 0:", "    xs{v}.append(k{v})", "    k{v} -= 2"], "len(xs{v}) * 10 + xs{v}[0]"),
@@ -221,6 +224,18 @@ def first_over(x: int, y: int) -> int:
 def bump_alt(xs: list[int], n: int) -> None:
     for i in range(3):
         xs[i % 2] += n
+
+
+def fn_inc(x):
+    return x + 1
+
+
+def fn_neg(x):
+    return -x
+
+
+FN_TABLE = {0: fn_inc, 1: fn_neg}
+KEY_TABLE = [5, 9, 4]
 
 
 def bump_key(d: dict[int, int], n: int) -> int:

@@ -25784,6 +25784,7 @@ def _materialize_control_constants(
         for sequence_id in getattr(sequence_table, "sequences", {})
     }
     argument_ids = {int(argument.id) for argument in function.args}
+    argument_records = {int(argument.id): argument for argument in function.args}
     existing: dict[int, Instr] = {}
     for block in function.blocks.values():
         retained = []
@@ -25863,6 +25864,12 @@ def _materialize_control_constants(
             continue
         literal = constant_values[value_id]
         is_none = literal is None
+        # The formal this literal replaces is the same value's record: a
+        # module table ``TABLE = [4, 1]`` read by a region arrives as an
+        # ``int64[2]`` formal.  Materialized as a float64 scalar instead (no
+        # proven dtype, and a list is not an int), its row read back as
+        # float64 and a call passing it to an int formal refused.
+        formal = argument_records.get(value_id)
         if isinstance(literal, bool):
             authored_dtype = "bool"
         elif type(literal) is int:
@@ -25885,8 +25892,13 @@ def _materialize_control_constants(
                     "none" if is_none
                     else str(
                         value_dtypes.get(value_id)
+                        or (None if formal is None else formal.dtype)
                         or authored_dtype
                     )
+                ),
+                shape=(
+                    () if formal is None or is_none
+                    else tuple(formal.shape or ())
                 ),
                 accounting={"authored_constant": True},
             ),

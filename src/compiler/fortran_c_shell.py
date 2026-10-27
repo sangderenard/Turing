@@ -28667,6 +28667,17 @@ def _class_surface_ssa_program(
             int(mutation.sequence_value_id)
             for mutation in _control_sequence_mutations(control.root)
         }
+        # The same holds for the key: a read may stay at entry only when its
+        # key is there too.  ``OPS = {0: 5, 1: 9}`` read as ``OPS[i % 2]`` (a
+        # module table, never mutated) was emitted at entry, before the region
+        # computing ``i % 2``, and read key 0 for every i.
+        def entry_available(value_id: int) -> bool:
+            nodes = source_nodes_by_value_id.get(int(value_id), ())
+            return bool(nodes) and all(
+                graph_obj.nodes[node_id].get("type") in {"Input", "Constant"}
+                for node_id in nodes
+            )
+
         for result_id, key_ids, sequence_id in table_lookups:
             control_consumed = _control_block_consumes_values(
                 control.root, lookup_dependent_value_ids(int(result_id))
@@ -28679,6 +28690,12 @@ def _class_surface_ssa_program(
                 result_id not in direct_return_ids
                 and not control_consumed
                 and int(sequence_id) not in lookup_mutated_sequence_ids
+                and all(
+                    entry_available(key_id)
+                    for key_id in (
+                        key_ids if isinstance(key_ids, tuple) else (key_ids,)
+                    )
+                )
             ) or result_id in region_owned_nodes:
                 continue
             query = SequenceQueryBlock(
@@ -28771,7 +28788,11 @@ def _class_surface_ssa_program(
             # lexical path is required when every component is owned by one
             # exact retained loop—the case that cannot legally be emitted at
             # entry and the only placement proved by this map.
-            if int(sequence_id) not in mutated_sequence_ids and (
+            # A key computed in the function is not there at entry either
+            # (``i % 3 in OPS`` for a module table; see ``entry_available``).
+            if int(sequence_id) not in mutated_sequence_ids and all(
+                entry_available(query_id) for query_id in exact_query_ids
+            ) and (
                 len(owners) != 1
                 or any(
                     query_id not in table_lookup_loop_owners

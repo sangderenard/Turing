@@ -2311,6 +2311,13 @@ def _planned_scalar_dtypes_from(
                     settle(element, node_id, join([
                         literal_dtype(member) for member in literal
                     ]))
+                # A folded mapping's rows are its values: ``OPS = {0: 5,
+                # 1: 9}`` read as ``OPS[i] * 10`` entered its region at the
+                # float64 default (a TYPE answer).
+                if isinstance(literal, dict) and literal:
+                    settle(element, node_id, join([
+                        literal_dtype(member) for member in literal.values()
+                    ]))
                 # Program: ``sum(i * k for i in range(6))`` (corpus c27).
                 # Lane D, D2.  A folded ``range`` is a constant whose rows
                 # are Python ints by construction; nobody read that, so the
