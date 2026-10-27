@@ -8,4 +8,3 @@
 - Fresh admitted two-call StringCore source: lowering71.30s, audit0, C native7, LLVM native7, Fortran emission complete but compilation fails on generated internal helper symbols `t39` lacking a declaration at lines2299 and13377. Snapshot: `build/real_two_batch_after_dynamic_slice.pkl`; generated source: `build/real_two_batch_after_dynamic_slice_fortran/turing_fortran_c_shell.f90`.
 - The full `tests/test_ir_sequence_tables.py` gate returned 40 passed and 15 failures on the shared dirty repair tree. Failures include unrelated constructor-schema, concordance, unknown-dtype and Fortran API cases; no clean baseline was run for those failures.
 - No full manager acceptance is claimed.
-
