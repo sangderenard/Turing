@@ -2055,7 +2055,24 @@ def _emit_repository_call_module(
 
         seen: set[tuple[str, int]] = set()
         current = (str(name), int(value_id))
-        while current[0] != function_name:
+        root_formals = {
+            int(value.id) for value in module.functions[function_name].args
+        }
+        while True:
+            if current[0] == function_name:
+                if current[1] in root_formals:
+                    return current[1]
+                # Program: ``(x * y).sum()`` over runtime-sized spans.  The
+                # product is a region's result that the root projects under
+                # the same id and feeds to the reducing region: its extents
+                # are its producer's, so follow the producing region's edge.
+                produced = next((
+                    key for key in shape_extent_origin
+                    if key[1] == current[1] and key[0] != function_name
+                ), None)
+                if produced is None:
+                    return current[1]
+                current = produced
             if current in seen:
                 return None
             seen.add(current)
@@ -2065,7 +2082,6 @@ def _emit_repository_call_module(
             if origin is None:
                 return None
             current = origin
-        return current[1]
 
     # Functions that address a span across more than one axis need the extents
     # vector, and so does every function that calls one.
@@ -2081,6 +2097,13 @@ def _emit_repository_call_module(
     # extents vector. Such a function needs %extents even when it never
     # addresses an element itself -- region_4 does exactly this: four
     # whole-array assignments and not one GetElementPtr.
+    # A reduction of a runtime-sized span counts it from the extents vector.
+    extent_users.update(
+        name for name in reachable
+        for block in module.functions[name].blocks.values()
+        for instruction in block.instrs
+        if instruction.args and _runtime_sized_span(instruction.args[0])
+    )
     extent_users.update(
         name for name in reachable
         for block in module.functions[name].blocks.values()
@@ -2260,6 +2283,9 @@ def _emit_repository_call_module(
                     count = max(count, int(requirement.element_count))
             if value_id not in allocated and (
                 (str(name), value_id) in elementwise_runtime_results
+                # A region's runtime-sized span result, projected here and
+                # fed on to its consumer (``(x * y).sum()``).
+                or _runtime_sized_span(value)
             ):
                 # Program: ``x + y * 2.0`` over runtime-sized rank-2 spans.
                 # Wrong record: the intermediate ``y * 2.0`` is a local span
@@ -5078,6 +5104,17 @@ def _emit_repository_call_module(
                         ) or lengths
                     if len(lengths) == 1:
                         count = load_as(lengths[0], "i64", f"red.n.{tag}")
+                if count is None and _runtime_sized_span(source):
+                    # ``(x * y).sum()`` over runtime-sized spans: the span
+                    # reduces over its element count, read from the extents
+                    # vector as its elementwise producer is sized.
+                    measured = _span_element_count(
+                        name, source, f"red.{tag}", body,
+                        public_span_value, module_extent_slot,
+                    )
+                    if measured is not None:
+                        body.append(f"  %red.n64.{tag} = sext i32 {measured} to i64")
+                        count = f"%red.n64.{tag}"
                 if count is None:
                     shortfalls.append(LLVMEmissionShortfall(
                         name, operation,

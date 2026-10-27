@@ -2376,6 +2376,21 @@ def emit_ssa_module_to_c(
         )) is not None
     )
 
+    # Program: ``def f(x, y): return (x * y).sum()`` over runtime-sized
+    # spans.  The product crosses a region boundary as a runtime-sized span:
+    # its producer's caller sizes it, and its reducer counts it, from the
+    # extents array, so both carry it.
+    extent_users.update(
+        owner for owner in reachable
+        for block in module.functions[owner].blocks.values()
+        for instruction in block.instrs
+        if any(
+            _runtime_sized_span(value)
+            for value in (*instruction.args, instruction.res)
+            if value is not None
+        )
+    )
+
     def _extent_needs_runtime(owner: str, instruction) -> bool:
         """Whether an ``extent`` op will read the runtime extents array.
 
@@ -3024,7 +3039,21 @@ def emit_ssa_module_to_c(
                     # typed a double callee result as one byte).
                     element_type = solved_buffer_type(record.callee, output)
                     shape = tuple(output.shape or ())
-                    if shape:
+                    runtime_slot = (
+                        extent_slot(
+                            record.callee, int(output.id), "element_count", None,
+                        )
+                        if not shape and _runtime_sized_span(output) else None
+                    )
+                    if runtime_slot is not None:
+                        # A runtime-sized span result is owned storage of
+                        # its element count, never one scalar slot.
+                        storage = runtime_activation_array(
+                            element_type, f"extents[{runtime_slot}]",
+                        )
+                        projected_expression = storage
+                        projected_address = storage
+                    elif shape:
                         count = math.prod(shape)
                         requirement = storage_requirements_by_function.get(
                             record.callee, {}
@@ -4399,6 +4428,18 @@ def emit_ssa_module_to_c(
                         parts = sequence_extent_parts(source)
                         if parts is not None and not tuple(parts[1]):
                             count = f"(ptrdiff_t)({parts[0]})"
+                            if op in {"max", "min"}:
+                                empty_guard = count
+                    if count is None and _runtime_sized_span(source):
+                        # Program: ``def f(x, y): return (x * y).sum()``
+                        # over rank-1 spans of runtime length.  Rule: a
+                        # runtime-sized span reduces over its element count,
+                        # the extent slot its elementwise producer is sized by.
+                        slot = extent_slot(
+                            fn, int(source.id), "element_count", None,
+                        )
+                        if slot is not None:
+                            count = f"(ptrdiff_t)(extents[{slot}])"
                             if op in {"max", "min"}:
                                 empty_guard = count
                     if count is None:

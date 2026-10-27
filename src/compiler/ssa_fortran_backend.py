@@ -1432,16 +1432,25 @@ class _FunctionEmitter:
         no new extent crosses the ABI, and the declaration is never scalar.
         """
 
+        formal_ids = {int(value.id) for value in self.function.args}
+        adopted: set[int] = set()
         changed = True
         while changed:
             changed = False
             for value_id, source_id in aliases.items():
                 value_id, source_id = int(value_id), int(source_id)
-                if value_id in self.dynamic_array_ranks:
+                # A local (``t2 = region_0(...)`` fed on to a reducing
+                # region) may already hold extent symbols of its own, which
+                # no caller supplies; its alias's symbols replace them.
+                if value_id in adopted or (
+                    value_id in self.dynamic_array_ranks
+                    and value_id in formal_ids
+                ):
                     continue
                 extents = self.dynamic_array_leading_extents.get(source_id)
                 if source_id not in self.dynamic_array_ranks or not extents:
                     continue
+                adopted.add(value_id)
                 self.dynamic_array_ranks[value_id] = (
                     self.dynamic_array_ranks[source_id]
                 )
@@ -1955,6 +1964,9 @@ class _FunctionEmitter:
             operation in _REDUCTION
             and len(args) == 1
             and len(instr.args[0].shape) == 0
+            # A runtime-sized span (rank stated, extents at the call) is an
+            # explicit-shape array here, not a scalar: ``(x * y).sum()``.
+            and not int((instr.args[0].accounting or {}).get("program_abi_rank") or 0)
         ):
             # Reducing a scalar is the identity.  NumPy permits it (and may
             # retain a singleton result shape); Fortran's reduction
@@ -4790,7 +4802,15 @@ class _FunctionEmitter:
             rule = max_step_rule(instr)
             if (
                 rule is not None and op in ("max", "min")
-                and len(tuple(instr.args[0].shape or ())) == 1
+                and (
+                    len(tuple(instr.args[0].shape or ())) == 1
+                    or (
+                        not tuple(instr.args[0].shape or ())
+                        and int((instr.args[0].accounting or {}).get(
+                            "program_abi_rank"
+                        ) or 0) == 1
+                    )
+                )
             ):
                 return fortran_reduction(rule, op == "max", args[0])
             return _REDUCTION[op].format(*args)
