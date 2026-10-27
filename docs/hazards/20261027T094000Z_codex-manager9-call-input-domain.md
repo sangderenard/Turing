@@ -1,0 +1,8 @@
+2026-10-27 Full native manager9 call-input domain refusal (MEASURED)
+
+- Clean review checkout was verified clean and moved to checkpoint383170ab. Canonical CLI ran the real repeated_manager source with extraction.yaml and supplied-result cases.json, jobs1, emit-native, output C:/dev/Powershell/string_core/build/native_manager_declared_product_9.
+- Actual exit1 after447.65s. Lowered691functions before refusal in late physical-call validation (fortran_c_shell.py59208). The earlier value73 physical-domain refusal was cleared.
+- Four conflicts remain: caller repeated_manager__intern_batch__specialized_b7c15f9fc172 values15 and18 are bool, while exact callee _validate_atom_span__specialized_bb8e37972511 and _intern_validated_span__specialized_39b080422f0d formals1 and3 are int64. This is the workload's invalid boolean-offset request. Authored validation/rejection must remain intact.
+- Failure: C:/dev/Powershell/string_core/build/native_manager_declared_product_9/units/repeated_manager/failure.json. CLI terminal summary explicitly printed all four conflicts; manifest records0linkable,1failed. No native library, golden native result, or speedup was produced.
+- Next investigation is the existing call-input/conversion concordance and its exact scalar/storage authority. No dtype relaxation, source-specific exception, or callee-name repair is authorized by this result.
+- Separately, fresh bounded actual two-call source verification at the same production checkpoint passed audit0 and native C7/LLVM7/Fortran7. That covers two invalid request paths, not the full manager's boolean-offset or positive minting/growth paths.

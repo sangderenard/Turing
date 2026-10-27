@@ -1564,6 +1564,7 @@ class CorrelationTable:
         found.extend(self._value_type_abi_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
         found.extend(self._frame_aliased_result_findings(module))
+        found.extend(self._formal_actual_occurrence_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
         found.extend(self._source_precision_operator_findings(module))
         found.extend(self._source_precision_region_findings(module))
@@ -2807,6 +2808,44 @@ class CorrelationTable:
                         if mismatch:
                             issue("resident native cell type/owner/layout disagrees with its descriptor view", member_id)
                             break
+        return found
+
+    @staticmethod
+    def _formal_actual_occurrence_findings(module: Any) -> list[Finding]:
+        """A changed occurrence must retain its exact control transition."""
+        from .concordance_declarations import FORMAL_ACTUAL_OCCURRENCE, LOOP_RESULT_USE_REBINDING, SSA_VALUE
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = None if book is None else book.pages.get(FORMAL_ACTUAL_OCCURRENCE.name)
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            if len(row) != 7:
+                continue
+            _callee, formal, caller, block, index, position, scope = row
+            history = page.history(row)
+            for (old_column, old), (column, current) in zip(history, history[1:]):
+                if old == current:
+                    continue
+                cell = Ref(FORMAL_ACTUAL_OCCURRENCE, row, column)
+                causes = tuple(parent for parent, _stage in book.edges_into(cell))
+                previous = Ref(FORMAL_ACTUAL_OCCURRENCE, row, old_column)
+                transition_key = (scope, block, index, position)
+                transitions = tuple(parent for parent in causes
+                    if parent.page == LOOP_RESULT_USE_REBINDING and parent.row == transition_key)
+                valid_transition = any(
+                    isinstance((fact := book.page(parent.page).cell(parent.row, parent.column)), tuple)
+                    and len(fact) == 3 and fact[:2] == (old, current)
+                    for parent in transitions
+                )
+                actual_sources = tuple(parent for parent in causes
+                    if parent.page == SSA_VALUE and parent.row == (scope, current))
+                if previous not in causes or not valid_transition or not actual_sources:
+                    found.append(Finding(
+                        "formal-actual-transition-disagreement", str(caller), int(formal),
+                        f"occurrence {(block, index, position)!r} changed {old!r}->{current!r} "
+                        "without its prior occurrence, exact loop-use transition and actual SSA causes",
+                    ))
         return found
 
     @staticmethod
@@ -9549,20 +9588,35 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                                 CALL_RECORD,
                                 (call_table.owner, str(caller_name)),
                             )
+                    occurrence_row = (
+                        callee_name, int(formal.id), str(caller_name),
+                        str(block_name), int(instruction_index), int(position), scope,
+                    )
+                    occurrence_sources = () if actual_cell is None else (actual_cell,)
+                    occurrence_mode = Mode.CONCORD
+                    previous = book.latest_ref(occurrence_page, occurrence_row)
+                    if previous is not None and incoming_page.latest(occurrence_row) != int(actual.id):
+                        # The storage-effects bootstrap's targets span is
+                        # rebound to its control-owned loop header Phi after
+                        # the first formal/actual census. The transition is
+                        # already authoritative; retain this occurrence as
+                        # its derived current view, not an immutable old id.
+                        from .concordance_declarations import LOOP_RESULT_USE_REBINDING
+                        transition_row = (scope, str(block_name), int(instruction_index), int(position))
+                        transition_ref = book.latest_ref(LOOP_RESULT_USE_REBINDING, transition_row)
+                        transition = book.page(LOOP_RESULT_USE_REBINDING).latest(transition_row)
+                        if (actual_cell is not None and actual_cell.page == SSA_VALUE
+                                and transition_ref is not None and isinstance(transition, tuple)
+                                and len(transition) == 3
+                                and transition[0] == incoming_page.latest(occurrence_row)
+                                and transition[1] == int(actual.id)):
+                            occurrence_mode = Mode.REVISE
+                            occurrence_sources = (previous, transition_ref, actual_cell)
                     book.post(
-                        occurrence_page,
-                        (
-                            callee_name, int(formal.id), str(caller_name),
-                            str(block_name), int(instruction_index),
-                            int(position), scope,
-                        ),
-                        int(actual.id),
-                        stage=FRAME_BINDING,
-                        provenance=(
-                            Derived((actual_cell,)) if actual_cell is not None
-                            else Unsourced(FRAME_SOURCE_CELL_ABSENT)
-                        ),
-                        mode=Mode.CONCORD,
+                        occurrence_page, occurrence_row, int(actual.id), stage=FRAME_BINDING,
+                        provenance=(Derived(occurrence_sources) if occurrence_sources
+                                    else Unsourced(FRAME_SOURCE_CELL_ABSENT)),
+                        mode=occurrence_mode,
                     )
 
     receipts: list[dict] = []

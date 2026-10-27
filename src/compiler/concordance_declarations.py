@@ -2311,7 +2311,7 @@ FORMAL_ACTUAL_OCCURRENCE = declare_page("formal_actual_occurrence_concordance", 
     RowField("caller", K.NAME), RowField("block", K.NAME),
     RowField("instruction", K.INDEX), RowField("position", K.INDEX),
     RowField("caller_scope", K.SCOPE),
-), int)                                # DERIVED(actual ssa_value); CONCORD
+), int)                                # DERIVED(actual SSA); exact control rebind REVISE
 FORMAL_STORAGE_RESOLUTION = declare_page("formal_storage_resolution", (
     RowField("function", K.SCOPE), RowField("formal", K.VALUE_ID),
 ), tuple)                              # DERIVED(incoming occurrences); REVISE
