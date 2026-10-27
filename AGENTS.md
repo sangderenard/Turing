@@ -224,56 +224,7 @@ per-test timeout; never baseline with stash or `checkout -- <path>`).
 
 ## Mandatory: everything goes through the concordance
 
-How much of the work goes into a concordance? Some? Enough to keep track?
-
-**No. Everything.**
-
-**A concordance is a complete data structure that has been organized in a
-correlatory sense. Everything in the work is in that data structure.**
-
-Compilation operates on that data structure. The concordance is not an
-audit trail kept alongside some other working structure.
-
-Every entity, relationship, representation, decision, transformation, and
-its provenance belongs in it. The word **complete** is
-doing some work here. Do not quietly redefine it as "the parts I remembered
-to record."
-
-**You cannot make an alteration during compilation that does not go through
-the concordance. If you do, it is no longer a concordance.** You have made
-the compiler's account of its own work incomplete. A plausible result does
-not excuse that.
-
-This applies to ingestion, reduction, SSA, types, shapes, control flow,
-storage, heap ownership, aliases, call frames, ABI layout, backend lowering,
-emission, and the harnesses that compile or test them. "Internal detail,"
-"temporary value," "backend convenience," and "test-only" are not exemptions.
-
-- Read the existing authoritative concordance identity and its current
-  derived views. Do not reconstruct it from a name, position, dtype,
-  Python-object identity, or a private lookup table.
-- Every mint, rewrite, fold, alias, retirement, and representation or
-  ownership change must use the concordance's declared operations and
-  retain its exact causal references before a consumer observes it.
-- Descriptors, resident objects, caches, and generated code are views of
-  that authority. Do not mutate them independently and promise to
-  reconcile the records later.
-- If a required relationship is missing, extend the existing concordance
-  mechanism and its audit, then make the compiler consume it. Do not
-  build a parallel resolver, ledger, wrapper, or repair system beside it.
-- Serialization, checkpoints, imports, and replay must preserve the
-  concordance book, exact owners, identities, and provenance. Rebuilding
-  a table from descriptor copies and an owner label is not preservation.
-- Compilation and native publication must refuse unresolved required
-  facts or concordance disagreements. Logging a finding and returning
-  success is a bypass, not enforcement.
-- Fix a general relationship in the concordance once, exercise it through
-  the existing compile harnesses, and add a regression that prevents
-  bypassing it. Do not keep patching individual writers for the same
-  missing rule.
-
-Everything means everything. If your proposed shortcut leaves work outside
-the concordance, the shortcut is the bug.
+> How much of a work goes in to a concordance? Some? Enough to keep track? NO. EVERYTHING IN A WORK IS IN A CONCORDANCE. IT IS A COMPLETE DATA STRUCTURE THAT HAS BEEN ORGANIZED IN A CORRELATORY SENSE. YOU CANNOT MAKE ALTERATIONS IN COMPILING THAT ARE NOT GOING THROUGH THE CONCORDANCE BECAUSE THEN IT'S NOT A CONCORDANCE
 
 ## Agents: you will not out-design what is already here
 
