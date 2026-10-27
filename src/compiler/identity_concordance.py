@@ -1552,6 +1552,7 @@ class CorrelationTable:
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._source_numeric_component_findings(module))
+        found.extend(self._source_numeric_specialization_findings(module))
         found.extend(self._source_numeric_intrinsic_findings(module))
         found.extend(self._source_numeric_type_dependency_findings(module))
         found.extend(self._source_numeric_operator_specialization_findings(module))
@@ -3747,6 +3748,84 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_numeric_specialization_findings(module: Any) -> list[Finding]:
+        """Check the exact target/class causes of iterable specialization keys."""
+        import hashlib
+        from .concordance_declarations import (
+            SOURCE_NUMERIC_SPECIALIZATION_PAGE, SOURCE_VALUE_CLASS, CELL_SET,
+            FUNCTION_ADDRESS,
+        )
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = None if book is None else book.pages.get(SOURCE_NUMERIC_SPECIALIZATION_PAGE.name)
+        if page is None:
+            return []
+
+        def unpack(cells):
+            result, pending = set(), list(cells)
+            while pending:
+                cell = pending.pop()
+                if cell in result:
+                    continue
+                result.add(cell)
+                if cell.page == CELL_SET:
+                    parents = tuple(parent for parent, _ in book.edges_into(cell))
+                    fact = book.page(CELL_SET).cell(cell.row, cell.column)
+                    if set(fact) != {parent.key for parent in parents}:
+                        raise ValueError("CELL_SET members disagree with its exact source edges")
+                    pending.extend(parents)
+            return result
+
+        found = []
+        for row in page.rows():
+            scope, receipt = page.latest(row)
+            entries = [entry for entry in receipt if isinstance(entry, tuple)
+                       and len(entry) == 2 and isinstance(entry[0], tuple)
+                       and entry[0] and entry[0][0] == "iterated_class"]
+            if not entries:
+                continue
+            try:
+                digest = hashlib.sha256(repr(receipt).encode()).hexdigest()[:16]
+                if row != (scope[0], digest) or scope != (row[0], "specialization", digest):
+                    raise ValueError("receipt does not identify its recorded specialization")
+                ref = book.latest_ref(SOURCE_NUMERIC_SPECIALIZATION_PAGE, row)
+                mint = book.mint_of(ref)
+                direct = () if mint is None else mint[1]
+                if not any(parent.page == CELL_SET for parent in direct):
+                    raise ValueError("iterable domain has no exact CELL_SET cause")
+                causes = unpack(direct)
+                if not any(parent.page == FUNCTION_ADDRESS for parent in causes):
+                    raise ValueError("specialization has no authored function authority")
+                for key, domain in entries:
+                    if len(key) != 2 or not isinstance(key[1], tuple) or len(key[1]) != 3:
+                        raise ValueError("iterable target is not a complete canonical Ref key")
+                    targets = [cell for cell in causes if cell.key == key[1]
+                               and cell.page.name in _IDENTITY_PAGES]
+                    if len(targets) != 1 or _canonical_identity_base(book, targets[0]) != targets[0]:
+                        raise ValueError("iterable target has no exact canonical subject cause")
+                    target = targets[0]
+                    if (not isinstance(domain, tuple) or len(domain) != 2
+                            or not isinstance(domain[0], str) or type(domain[1]) is not int
+                            or domain[1] < 1):
+                        raise ValueError("invalid iterable class/precision domain")
+                    matches = []
+                    for cell in causes:
+                        if cell.page != SOURCE_VALUE_CLASS:
+                            continue
+                        fact = book.page(SOURCE_VALUE_CLASS).cell(cell.row, cell.column)
+                        if tuple(fact[:2]) != domain:
+                            continue
+                        subjects = unpack(parent for parent, _ in book.edges_into(cell))
+                        if any(parent.page.name in _IDENTITY_PAGES
+                               and _canonical_identity_base(book, parent) == target
+                               for parent in subjects):
+                            matches.append(cell)
+                    if not matches:
+                        raise ValueError("iterable class has no matching exact subject/class cause")
+            except (ValueError, TypeError, KeyError, IndexError) as error:
+                found.append(Finding("source-numeric-specialization-disagreement", str(scope), None, str(error)))
+        return found
+
+    @staticmethod
     def _source_numeric_intrinsic_findings(module: Any) -> list[Finding]:
         """Report a numeric intrinsic whose structural results changed."""
 
@@ -4593,8 +4672,186 @@ class CorrelationTable:
         from ..transmogrifier.dtype_layout import layout_for
         from .concordance_declarations import CALL_RECORD, SEQUENCE_DESCRIPTOR, RESULT_STORAGE_BINDING
         from .ssa_record_return_state import map_sequence_descriptor, map_child_pool
+        from .ssa_record_return_state import ssa_value_identity_cell
+        from .concordance_declarations import (
+            SSA_VALUE, CELL_SET, CANONICAL_VALUE, INGESTION_VALUE, VALUE_TYPE_ABI,
+            SOURCE_AGGREGATE_LAYOUT, SOURCE_VALUE_CLASS,
+        )
+        from ..transmogrifier.dtype_layout import resolve
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+
+        def numeric_dtype(dtype):
+            layout = resolve(dtype)
+            return (layout.name if layout is not None
+                    and layout.kind in {"bool", "int", "uint", "float"} else None)
+
+        def sequence_source_type(function, value_id, owner):
+            """Read this SSA identity's lexical ABI, never a same-number row.
+
+            validate_batch_envelope's static iterable names source2. Its
+            adopted SSA row was int64, but its exact lexical ABI was a bool
+            span. The old audit checked each page independently and missed
+            the int64 Load through that iterable's concrete bool column.
+            """
+            start = ssa_value_identity_cell(function, int(value_id), book=owner)
+            if start is None:
+                return None, None, (), ()
+            pending, seen, abis, lexical_abis, products = [start], set(), set(), set(), set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                if cell.page in {SSA_VALUE, CANONICAL_VALUE, INGESTION_VALUE}:
+                    abi = owner.latest_ref(VALUE_TYPE_ABI, cell.row)
+                    if abi is not None:
+                        (lexical_abis if cell.page in {CANONICAL_VALUE, INGESTION_VALUE} else abis).add(abi)
+                        if owner.page(SOURCE_AGGREGATE_LAYOUT).latest(cell.row) is not None:
+                            products.add(abi)
+                if cell.page == VALUE_TYPE_ABI:
+                    abis.add(cell)
+                    continue
+                if cell.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                    continue
+                for parent, _stage in owner.edges_into(cell):
+                    if (parent.page in {CELL_SET, CANONICAL_VALUE, INGESTION_VALUE, VALUE_TYPE_ABI}
+                            or (parent.page == SSA_VALUE and parent.row == start.row)):
+                        pending.append(parent)
+            dtypes, evidence = set(), []
+            for abi in lexical_abis or abis:
+                # source_structure defines an aggregate as its member
+                # product before considering its outer ABI carrier. That
+                # carrier's integer type is not a row-element declaration.
+                if abi in products:
+                    continue
+                fact = owner.page(VALUE_TYPE_ABI).cell(abi.row, abi.column)
+                arms = tuple(getattr(fact, "physical_alternatives", ()))
+                if not arms or any(arm.storage not in {"span", "sequence"} or arm.rank < 1 for arm in arms):
+                    continue
+                types = tuple(numeric_dtype(arm.dtype) for arm in arms)
+                if all(dtype is not None for dtype in types):
+                    dtypes.update(types)
+                    evidence.append(abi)
+            fact = owner.page(SSA_VALUE).cell(start.row, start.column)
+            # Explicit physical views (including packed storage and a
+            # recorded input conversion) own native representation. A
+            # provisional resident dtype alone cannot override lexical ABI.
+            physical = numeric_dtype(getattr(fact, "physical_dtype", None))
+            return (next(iter(dtypes)) if len(dtypes) == 1 else None,
+                    physical, tuple(evidence), tuple(lexical_abis or abis))
+
+        def static_member_class(owner, abi_refs):
+            claims = set()
+            for abi_ref in abi_refs:
+                abi = owner.page(VALUE_TYPE_ABI).cell(abi_ref.row, abi_ref.column)
+                for arm in getattr(abi, "physical_alternatives", ()):
+                    classes = tuple(cell for cell in arm.source_cells if cell.page == SOURCE_VALUE_CLASS)
+                    for source in arm.source_cells:
+                        if source.page not in {CANONICAL_VALUE, INGESTION_VALUE}:
+                            continue
+                        layout = owner.page(SOURCE_AGGREGATE_LAYOUT).latest(source.row)
+                        if layout is None or layout.aggregate_kind not in {"list", "tuple"} or not layout.members:
+                            continue
+                        members = []
+                        for member in layout.members:
+                            anchors = {_canonical_identity_base(owner, cell)
+                                       for cell in (member.value_cell, *member.source_cells)
+                                       if cell.page in {CANONICAL_VALUE, INGESTION_VALUE}}
+                            identities = set()
+                            for cls in classes:
+                                pending, seen = [cls], set()
+                                while pending:
+                                    cell = pending.pop()
+                                    if cell in seen:
+                                        continue
+                                    seen.add(cell)
+                                    for parent, _stage in owner.edges_into(cell):
+                                        if parent.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                                            if _canonical_identity_base(owner, parent) in anchors:
+                                                fact = owner.page(cls.page).cell(cls.row, cls.column)
+                                                identities.add(str(fact[0]))
+                                        else:
+                                            pending.append(parent)
+                            if len(identities) != 1:
+                                break
+                            members.append(next(iter(identities)))
+                        if len(members) == len(layout.members) and len(set(members)) == 1:
+                            claims.add(members[0])
+            return next(iter(claims)) if len(claims) == 1 else None
+
+        def column_and_load_findings(function_name, table):
+            function = (getattr(module, "functions", {}) or {}).get(function_name)
+            if function is None:
+                return []
+            owner = table.book
+            issues, column_types = [], {}
+            for descriptor in table.sequences.values():
+                for column, dtype in zip(descriptor.column_value_ids, descriptor.column_dtypes):
+                    declared = numeric_dtype(dtype)
+                    if declared is not None:
+                        column_types.setdefault(int(column), set()).add(declared)
+                # A scalar-row ABI describes one payload column. Multi-column
+                # records/unions retain their existing per-member audits.
+                if len(descriptor.column_value_ids) != 1:
+                    continue
+                column = int(descriptor.column_value_ids[0])
+                lexical, physical, sources, _abis = sequence_source_type(function, column, owner)
+                if not sources and int(descriptor.sequence_id) != column:
+                    lexical, physical, sources, _abis = sequence_source_type(function, descriptor.sequence_id, owner)
+                expected = {dtype for dtype in (lexical, physical) if dtype is not None}
+                declared = numeric_dtype(descriptor.column_dtypes[0]) if descriptor.column_dtypes else None
+                if sources and expected and declared is not None and declared not in expected:
+                    issues.append(Finding(
+                        "sequence-column-abi-disagreement", str(function_name), int(descriptor.sequence_id),
+                        f"column {column} descriptor={declared}, exact incoming ABI/native views={tuple(sorted(expected))}; sources={sources!r}",
+                    ))
+            definitions = {int(ins.res.id): ins for block in function.blocks.values()
+                           for ins in block.instrs if ins.res is not None}
+            for label, block in function.blocks.items():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Load", "load"} or instruction.res is None or len(instruction.args) != 1:
+                        continue
+                    address = definitions.get(int(instruction.args[0].id))
+                    if address is None or address.op not in {"GetElementPtr", "getelementptr"} or not address.args:
+                        continue
+                    base = address.args[0]
+                    producer = definitions.get(int(base.id))
+                    expected, evidence = None, ()
+                    if (producer is not None and producer.op in {"Const", "const"}
+                            and producer.attributes.get("binding") == "static_iterable"
+                            and producer.attributes.get("source_value_id") is not None):
+                        lexical, _source_physical, evidence, abis = sequence_source_type(
+                            function, int(producer.attributes["source_value_id"]), owner)
+                        materialized = ssa_value_identity_cell(function, int(base.id), book=owner)
+                        fact = None if materialized is None else owner.page(SSA_VALUE).cell(materialized.row, materialized.column)
+                        expected = numeric_dtype(getattr(fact, "physical_dtype", None)) or lexical
+                        kind = "static-iterable-load-type-disagreement"
+                        member_class = static_member_class(owner, abis)
+                        _dtype, _physical, _sources, result_abis = sequence_source_type(function, instruction.res.id, owner)
+                        alternatives = {identity for cell in result_abis
+                                        for identity in owner.page(VALUE_TYPE_ABI).cell(cell.row, cell.column).alternatives}
+                        materialized = dict(function.metadata.get("native_value_type_abi", {}) or {}).get(int(instruction.res.id))
+                        materialized_alternatives = tuple(getattr(materialized, "alternatives", ()))
+                        disagreement = (alternatives and member_class not in alternatives) or (
+                            materialized_alternatives and member_class not in materialized_alternatives)
+                        if member_class is not None and disagreement:
+                            issues.append(Finding(
+                                "static-iterable-element-class-disagreement", str(function_name), int(instruction.res.id),
+                                f"{label}: exact aggregate members are {member_class}, current loop ABI={tuple(sorted(alternatives))}, materialized loop ABI={materialized_alternatives}; source ABI={abis!r}",
+                            ))
+                    elif len(column_types.get(int(base.id), ())) == 1:
+                        expected = next(iter(column_types[int(base.id)]))
+                        kind = "sequence-column-load-type-disagreement"
+                    else:
+                        continue
+                    actual = numeric_dtype(instruction.res.dtype)
+                    if expected is not None and actual is not None and expected != actual:
+                        issues.append(Finding(
+                            kind, str(function_name), int(instruction.res.id),
+                            f"{label}: Load {actual} from column {int(base.id)} whose exact native element is {expected}; sources={evidence!r}",
+                        ))
+            return issues
 
         def returned_frame_findings(function_name, table, sequence_id, descriptor):
             if book is None:
@@ -4679,6 +4936,7 @@ class CorrelationTable:
         for function_name, table in (
             getattr(module, "sequence_tables", {}) or {}
         ).items():
+            found.extend(column_and_load_findings(function_name, table))
             for sequence_id, descriptor in sorted(
                 getattr(table, "sequences", {}).items()
             ):

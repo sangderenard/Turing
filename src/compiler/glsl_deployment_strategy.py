@@ -4101,7 +4101,43 @@ def _build_shell_hierarchy_plan(
         captured = set(region_captures)
         const_lines = []
         materialised: set[int] = set()
+        def publish_materialised_scalar(value_id, literal):
+            # ``return True != n`` materialises True outside the region node
+            # set. Its exact Const birth must publish rank zero before the
+            # existing common-integer promotion can prove bool -> int64.
+            # A tensor constant's declared view remains authoritative.
+            if type(literal) not in (bool, int, float):
+                return
+            if planned_descriptor(int(value_id)) is not None:
+                return
+            from .identity_concordance import (
+                SHAPE_STATE_PAGE, current_identity_book,
+                record_shape_transformation, shape_scope_of,
+            )
+            from ..common.tensors.topological_reducer import node_identity_cell
+            from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+            scope = shape_scope_of(graph)
+            if current_identity_book().latest_ref(
+                SHAPE_STATE_PAGE, (scope, int(value_id)),
+            ) is not None:
+                return
+            dtype = (
+                "bool" if type(literal) is bool else
+                python_int_literal_dtype(literal) if type(literal) is int else
+                "float64"
+            )
+            record_shape_transformation(
+                scope, int(value_id), scope, int(value_id),
+                stage="hierarchy_constant_materialization", operation="Const",
+                source_state=None,
+                target_state={"shape": (), "rank": 0, "dtype": dtype},
+                role="scalar_literal",
+                source_cells=(node_identity_cell(graph, int(value_id)),),
+            )
+
         for value_id, value in capture_constants.items():
+            publish_materialised_scalar(value_id, value)
             materialised.add(int(value_id))
             const_lines.append(PlanLine.create(
                 "Const",
@@ -4123,6 +4159,9 @@ def _build_shell_hierarchy_plan(
                     parent_data.get("op") or parent_data.get("type")
                 ) not in ("const", "Constant"):
                     continue
+                publish_materialised_scalar(
+                    parent, (parent_data.get("attributes") or {}).get("value"),
+                )
                 materialised.add(parent)
                 const_lines.append(PlanLine.create(
                     "Const",
@@ -4624,7 +4663,11 @@ def _build_shell_hierarchy_plan(
                 if int(value_id) not in produced
                 and int(value_id) not in captured
             )
-            if record[1]
+            if record[1] or (
+                (descriptor := planned_descriptor(int(record[0]))) is not None
+                and int(descriptor.get("rank", -1)) == 0
+                and descriptor.get("metadata_state", "static") == "static"
+            )
         )
         value_ranks = tuple(
             (
@@ -4633,7 +4676,7 @@ def _build_shell_hierarchy_plan(
                     "rank", len(tuple((descriptor or {}).get("shape") or ()))
                 )),
             )
-            for value_id in (*region_nodes, *region_captures)
+            for value_id in (*region_nodes, *region_captures, *sorted(materialised))
             for descriptor in (planned_descriptor(int(value_id)),)
             if descriptor is not None
         )
@@ -28938,6 +28981,33 @@ def _post_callsite_loop_element_classes(
                 break
             member_classes.append(str(fact[0]))
             member_cells.append(cell)
+        actual_attributes = caller.G.nodes[int(actual_id)].get(
+            "attributes"
+        ) or {}
+        inherited_class_fact = actual_attributes.get(
+            "callsite_sequence_element_class_fact"
+        )
+        inherited_class_cells = tuple(actual_attributes.get(
+            "callsite_sequence_element_class_cells"
+        ) or ())
+        inherited_class_view = bool(
+            not member_classes
+            and abi_element_class is None
+            and isinstance(inherited_class_fact, tuple)
+            and len(inherited_class_fact) >= 3
+            and inherited_class_cells
+        )
+        if inherited_class_view:
+            # Program: a public call passes offsets=[False, True] to
+            # intern_batch(offsets: list[int]), which forwards that exact
+            # formal to validate_batch_envelope(offsets: list[int]). The
+            # first specialization already records the bool member class
+            # cells on its input; rebuilding the next call from the generic
+            # annotation changed the loop target back to int and folded the
+            # explicit ``isinstance(offset, bool)`` rejection away. Keep the
+            # existing callsite class view and its exact source cells while
+            # it crosses this forwarded-aggregate edge.
+            member_cells.extend(inherited_class_cells)
         exact_class = (
             member_classes[0]
             if member_classes and len(set(member_classes)) == 1 else None
@@ -28945,14 +29015,25 @@ def _post_callsite_loop_element_classes(
         if exact_class is None and abi_element_class is not None:
             exact_class, abi_cells = abi_element_class
             member_cells.extend(abi_cells)
-        if exact_class is None and not member_classes:
+        if exact_class is None and inherited_class_view:
+            inherited_identity = inherited_class_fact[0]
+            if inherited_identity != "unknown":
+                exact_class = str(inherited_identity)
+        if (
+            exact_class is None and not member_classes
+            and not inherited_class_view
+        ):
             continue
         class_fact = (
-            (exact_class, 1, "callsite iterable element class")
-            if exact_class is not None
+            inherited_class_fact
+            if inherited_class_view
             else (
-                "unknown", 1, "callsite iterable element class",
-                tuple(sorted(set(member_classes))),
+                (exact_class, 1, "callsite iterable element class")
+                if exact_class is not None
+                else (
+                    "unknown", 1, "callsite iterable element class",
+                    tuple(sorted(set(member_classes))),
+                )
             )
         )
         formal_data = specialized.G.nodes[formal_id]

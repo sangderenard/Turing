@@ -903,12 +903,53 @@ def specialize_python_precision_widths(graph: Any) -> bool:
     parameter_class_cells = dict(
         metadata.get("planner_parameter_class_cells") or {}
     )
+    # An exact iterable domain is part of this specialization, not an
+    # annotation to inherit from the generic function. Normalize the existing
+    # target identity through read-scope copies, so equal domains share a
+    # variant while bool/int/unknown domains cannot collide in one scope.
+    from ...compiler.identity_concordance import _canonical_identity_base
+    from ...compiler.concordance_declarations import CANONICAL_VALUE, INGESTION_VALUE, CELL_SET
+    class_book = current_identity_book()
+    exact_iterated_classes = {}
+    iterable_domains = {}
+    for node_id, data in target.nodes(data=True):
+        actual_class = (data.get("attributes") or {}).get("callsite_iterable_element_class_cell")
+        if actual_class is None:
+            continue
+        value_id = int(data.get("value_id", node_id))
+        if (not isinstance(actual_class, _Ref) or actual_class.page != _SOURCE_VALUE_CLASS
+                or actual_class.row[1] != value_id):
+            raise ValueError("callsite iterable class Ref does not name its canonical target")
+        fact = class_book.page(_SOURCE_VALUE_CLASS).cell(actual_class.row, actual_class.column)
+        if not isinstance(fact, tuple) or len(fact) < 2:
+            raise ValueError("callsite iterable class Ref has no class fact")
+        canonical_target = _canonical_identity_base(class_book, node_identity_cell(target_wrapper, int(node_id)))
+        pending, visited, related = [actual_class], set(), False
+        while pending:
+            source = pending.pop()
+            if source in visited:
+                continue
+            visited.add(source)
+            if source.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                related |= _canonical_identity_base(class_book, source) == canonical_target
+            elif source.page in {_SOURCE_VALUE_CLASS, CELL_SET}:
+                pending.extend(parent for parent, _stage in class_book.edges_into(source))
+        if not related:
+            raise ValueError("callsite iterable class Ref does not derive from its canonical target")
+        domain = (_canonical_source_class_identity(fact[0]), int(fact[1]))
+        prior = iterable_domains.setdefault(canonical_target.key, domain)
+        if prior != domain:
+            raise ValueError("one canonical iterable target has conflicting class domains")
+        exact_iterated_classes[value_id] = (actual_class, fact, canonical_target)
     receipt = tuple(sorted(
         (str(name), stable(value))
         for name, value in specializations.items()
     )) + tuple(
         (f"class:{name}", stable(value))
         for name, value in sorted(parameter_classes.items())
+    ) + tuple(
+        (("iterated_class", identity), domain)
+        for identity, domain in sorted(iterable_domains.items(), key=lambda item: repr(item[0]))
     )
     digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
     scope = (authored_scope, "specialization", digest)
@@ -951,10 +992,19 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 f"{identity_row!r} -- the graph's function_ref has no "
                 "function_address row on the book"
             )
+        causes = tuple(dict.fromkeys((authored_cell, *(cell for actual, _fact, target_cell
+                     in exact_iterated_classes.values() for cell in (actual, target_cell)))))
+        source = authored_cell
+        if len(causes) > 1:
+            source = specialization_book.post(
+                CELL_SET, (scope, specialization_book.page(CELL_SET).scope_row_count(scope) + 1),
+                tuple(cell.key for cell in causes), stage=_REDUCTION,
+                provenance=_Derived(causes), mode=_Mode.CONCORD,
+            )
         specialization_book.post(
             _SPECIALIZATION_PAGE, identity_row, identity_fact,
             stage=_REDUCTION,
-            provenance=_Novel(_SOURCE_NUMERIC_SPECIALIZATION, (authored_cell,)),
+            provenance=_Novel(_SOURCE_NUMERIC_SPECIALIZATION, (source,)),
             mode=_Mode.CONCORD,
         )
     metadata["source_numeric_scope"] = scope
@@ -966,29 +1016,48 @@ def specialize_python_precision_widths(graph: Any) -> bool:
     class_page = specialization_book.page(
         "source_value_class_concordance"
     )
+    # worst_penalty(spans: StepSpans) is called with Metrics, which exposes
+    # the same declared publication view. The annotation is still a view;
+    # the actual object is Metrics. Its exact caller class is already on
+    # this specialization's receipt, so copying StepSpans into the fresh
+    # Input identity would create a false conflict before the actual below.
+    exact_parameter_ids = {
+        int(node_id) for node_id, data in target.nodes(data=True)
+        if data.get("type") == "Input"
+        and (name := (data.get("attributes") or {}).get("binding_name")) is not None
+        and str(name) in parameter_classes
+        and tuple(parameter_class_cells.get(str(name)) or ())
+    }
     if authored_scope != scope:
+        inherited_classes = {}
         for row in tuple(class_page.rows()):
             if (
                 isinstance(row, tuple) and len(row) == 2
                 and row[0] == authored_scope
                 and row[1] in target
-                and class_page.latest((scope, row[1])) is None
+                and row[1] not in exact_parameter_ids
             ):
                 history = class_page.history(row)
-                specialization_cell = specialization_book.latest_ref(
-                    _SPECIALIZATION_PAGE, identity_row,
+                inherited_classes[int(row[1])] = (
+                    history[-1][1], tuple(_Ref(_SOURCE_VALUE_CLASS, row, column)
+                                          for column, _fact in history),
                 )
-                sources = tuple(dict.fromkeys((
-                    *(
-                        _Ref(_SOURCE_VALUE_CLASS, row, column)
-                        for column, _fact in history
-                    ),
-                    specialization_cell,
-                )))
+        # last([False, True]) can keep its canonical loop target while
+        # folding changes the numeric specialization scope. The existing
+        # callsite producer retains the exact target class Ref for precisely
+        # that handoff. It owns this projection, including an explicit
+        # unknown class; the generic list[int] declaration does not.
+        for value_id, (actual_class, fact, _target_cell) in exact_iterated_classes.items():
+            inherited_classes[value_id] = (fact, (actual_class,))
+        specialization_cell = specialization_book.latest_ref(_SPECIALIZATION_PAGE, identity_row)
+        for value_id, (fact, sources) in inherited_classes.items():
+            current = class_page.latest((scope, value_id))
+            if current is None or value_id in exact_iterated_classes:
+                proposed = current if current is not None and current[:2] == fact[:2] else fact
                 specialization_book.post(
-                    _SOURCE_VALUE_CLASS, (scope, row[1]), history[-1][1],
+                    _SOURCE_VALUE_CLASS, (scope, value_id), proposed,
                     stage=_REDUCTION,
-                    provenance=_Derived(sources),
+                    provenance=_Derived(tuple(dict.fromkeys((*sources, specialization_cell)))),
                     mode=_Mode.CONCORD,
                 )
     # The parameters are what the call passed: concord them in this scope.
@@ -1003,6 +1072,7 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             _SPECIALIZATION_PAGE, identity_row,
         )
         class_sources = tuple(dict.fromkeys((
+            node_identity_cell(target_wrapper, int(node_id)),
             *tuple(parameter_class_cells.get(str(name)) or ()),
             specialization_cell,
         )))
