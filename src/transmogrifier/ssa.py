@@ -683,14 +683,11 @@ class SSARecordTable:
         )
 
     def __reduce__(self):
-        # The book scope's serial is not content; a pickle carries the label
-        # and the descriptors and is rebuilt on the book current at load.
-        return (SSARecordTable, (dict(self.records),), {"owner": self.owner[0]})
+        return (_restore_concordance_table, (type(self), self.book, self.owner, {}))
 
     def __setstate__(self, state: dict) -> None:
-        # A table pickled before ``__reduce__`` existed arrives with no
-        # ``__init__`` run and ``{"records": ...}`` as its state (see
-        # ``SSASequenceTable.__setstate__``).
+        # Compatibility for descriptor-only artifacts. Current artifacts
+        # restore the exact book view through _restore_concordance_table.
         records = (self.records if "records" in self.__dict__
                    else state.get("records", {}))
         self.__init__(dict(records), owner=state.get("owner"))
@@ -947,10 +944,7 @@ class SSAValueUnionTable:
         )
 
     def __reduce__(self):
-        # The book scope's serial is not content; a pickle carries the label
-        # and the descriptors and is rebuilt on the book current at load
-        # (same contract as ``SSARecordTable.__reduce__``).
-        return (SSAValueUnionTable, (dict(self.unions),), {"owner": self.owner[0]})
+        return (_restore_concordance_table, (type(self), self.book, self.owner, {}))
 
     def __setstate__(self, state: dict) -> None:
         unions = (self.unions if "unions" in self.__dict__
@@ -1700,14 +1694,11 @@ class _SSALayoutTable:
         return type(self)(dict(self._rows), owner=memo[key], book=self.book)
 
     def __reduce__(self):
-        # The book scope's serial is not content; a pickle carries the label
-        # and the descriptors and is rebuilt on the book current at load.
-        return (type(self), (dict(self._rows),), {"owner": self.owner[0]})
+        return (_restore_concordance_table, (type(self), self.book, self.owner, {}))
 
     def __setstate__(self, state: dict) -> None:
-        # A table pickled before ``__reduce__`` existed arrives with no
-        # ``__init__`` run and ``{"_rows": ...}`` as its state (see
-        # ``SSASequenceTable.__setstate__``).
+        # Compatibility for descriptor-only artifacts; current views retain
+        # their concordance owner through _restore_concordance_table.
         rows = (self._rows if "_rows" in self.__dict__
                 else state.get("_rows", {}))
         self.__init__(dict(rows), owner=state.get("owner"))
@@ -2328,9 +2319,12 @@ def sequence_member_roles(
 ) -> dict[int, set]:
     """member id -> {(sequence id, role)} for one sequence descriptor.
 
-    Roles: ``("handle",)``, ``("column", position)`` and one per extent or
-    status cell (``length_address_id``, ``capacity_value_id``,
-    ``status_address_id``, ``live_flags_value_id``).
+    Roles: ``("handle",)``, ``("column", position)`` and one per outer
+    extent/status cell.  A child-table pool, when present, publishes the
+    corresponding ``("child_pool", ...)`` roles as members of the outer
+    sequence.  The record ABI field is the full physical surface of that
+    sequence, so its nested-pool cells cannot be left as positional record
+    values at a call boundary.
     """
 
     claims: dict[int, set] = {}
@@ -2351,6 +2345,16 @@ def sequence_member_roles(
         "heap_owner_value_id",
     ):
         claim(getattr(descriptor, attribute, None), (attribute,))
+    pool = descriptor.child_table_pool
+    if pool is not None:
+        for position, column in enumerate(pool.column_value_ids):
+            claim(column, ("child_pool", "column", position))
+        for attribute in (
+            "length_value_id", "capacity_value_id", "row_stride_value_id",
+            "shape_value_id", "rank_value_id", "shape_stride_value_id",
+            "status_value_id", "live_flags_value_id",
+        ):
+            claim(getattr(pool, attribute, None), ("child_pool", attribute))
     return claims
 
 
@@ -2513,14 +2517,11 @@ class SSASequenceTable:
         )
 
     def __reduce__(self):
-        return (
-            SSASequenceTable, (dict(self.sequences),),
-            {"owner": self.owner[0]},
-        )
+        return (_restore_concordance_table, (type(self), self.book, self.owner, {}))
 
     def __setstate__(self, state: dict) -> None:
-        # ``__reduce__`` hands the sequences to ``__init__`` and only the
-        # owner here.  A table pickled before ``__reduce__`` existed (the
+        # The old descriptor-only reduction handed rows to ``__init__`` and
+        # only the owner label here. Earlier legacy tables (the
         # durable artifacts/llvm_pieces of 2026-09-17) arrives through the
         # default protocol instead: no ``__init__`` ran, and its state is
         # ``{"sequences": ...}``.  Read them from the state in that case, or
@@ -2728,7 +2729,7 @@ class _BookCallList(__import__("collections.abc").abc.MutableSequence):
         return repr(list(self._records()))
 
     def __reduce__(self):
-        return (list, (list(self._records()),))
+        return (_restore_concordance_call_list, (self._page.book, self._row))
 
 
 class SSACallTable(__import__("collections.abc").abc.MutableMapping):
@@ -2880,11 +2881,8 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
 
     def __reduce__(self):
         return (
-            _rebuild_call_table,
-            (
-                {k: tuple(v) for k, v in self.items()},
-                self.owner[0], self.mutable,
-            ),
+            _restore_concordance_table,
+            (type(self), self.book, self.owner, {"mutable": self.mutable}),
         )
 
     def __deepcopy__(self, memo: dict) -> "SSACallTable":
@@ -2896,6 +2894,22 @@ class SSACallTable(__import__("collections.abc").abc.MutableMapping):
 
 def _rebuild_call_table(records: Any, label: Any, mutable: bool) -> SSACallTable:
     return SSACallTable(records, owner=label, mutable=mutable)
+
+
+def _restore_concordance_table(table_type, book, owner, options):
+    """Restore a view of the saved authority without publishing new facts.
+
+    Native project artifacts contain both their identity book and its table
+    views. Rebuilding from descriptor copies on the ambient book gave those
+    views different identities and lost their causal records. Pickle's memo
+    preserves the shared book; the complete saved owner selects its rows.
+    The older descriptor-only readers remain solely for legacy artifacts.
+    """
+    return table_type(book=book, owner=owner, **options)
+
+
+def _restore_concordance_call_list(book, row):
+    return _BookCallList(book.page("call_record"), row)
 
 
 @dataclass(frozen=True)

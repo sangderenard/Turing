@@ -14,7 +14,8 @@ import sys
 import sysconfig
 import threading
 from typing import Any, Iterable, Mapping
-
+import types
+from importlib.machinery import BuiltinImporter
 import yaml
 
 
@@ -329,6 +330,28 @@ class ProgramABIField:
             raise ExtractionContractError(
                 f"{location}.dtype is required for {storage} storage"
             )
+        if dtype is not None:
+            from src.transmogrifier.dtype_layout import resolve as resolve_dtype
+
+            layout = resolve_dtype(dtype)
+            if layout is not None and str(dtype) != "opaque_ref":
+                # c621's u64 contract is the catalogue's uint64 type. Publish
+                # that identity here, before tensor laws call NumPy dtype
+                # promotion; carrying the alias as a second type key made
+                # the static-span remainder fail while uint64 worked.
+                # opaque_ref retains its existing semantic handle spelling.
+                dtype = layout.name
+            # Program c621: a uint64 span remainder kept uint64 in SSA, but
+            # C allocated double and LLVM emitted frem double. All native
+            # lanes now consume the declared unsigned layout; Fortran's
+            # actual compiler capability is checked at compilation. Keep a
+            # future unsigned layout without a native kind refused rather
+            # than silently replacing it with a floating default.
+            if layout is not None and layout.kind == "uint" and layout.fortran_kind is None:
+                raise ExtractionContractError(
+                    f"{location}.dtype {dtype!r} has no exact native "
+                    "C/LLVM/Fortran unsigned lane"
+                )
         if storage == "reference" and dtype is None:
             # ``reference`` has one repository-level physical type.  Publish
             # it in the normalized contract so source-derived record fields
@@ -439,6 +462,10 @@ class ProgramABIField:
                     raise ExtractionContractError(
                         f"{column_location} requires name and dtype"
                     )
+                from src.transmogrifier.dtype_layout import resolve as resolve_dtype
+                column_layout = resolve_dtype(column_dtype)
+                if column_layout is not None and str(column_dtype) != "opaque_ref":
+                    column_dtype = column_layout.name
                 column_vocabulary = raw_column.get("token_vocabulary")
                 if column_vocabulary is not None and (
                     not isinstance(column_vocabulary, (list, tuple))
@@ -740,6 +767,23 @@ class ProgramABIValueBinding:
         return receipt
 
 
+def binding_names_function(
+    pattern: str, function_name: str, method_owner: str | None = None,
+) -> bool:
+    """Whether a contract binding's ``function`` pattern names this function.
+
+    A method is named either bare (``_value``) or qualified by its owning
+    class (``SSAReferenceEvaluator._value``); the qualified spelling is the
+    only one that does not also select every same-named function elsewhere.
+    """
+
+    if fnmatchcase(str(function_name), str(pattern)):
+        return True
+    return method_owner is not None and fnmatchcase(
+        f"{method_owner}.{function_name}", str(pattern)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramABIContract:
     """Typed host/native boundary independent of Python object identity."""
@@ -1004,7 +1048,9 @@ class ProgramABIContract:
     ) -> dict[str, ProgramABIRecord]:
         result = {}
         for binding in self.bindings:
-            if fnmatchcase(str(function_name), binding.function):
+            if binding_names_function(
+                binding.function, function_name, method_owner,
+            ):
                 result[binding.parameter] = self.records[binding.record]
         # An instance method's receiver already has an exact source-level
         # class identity.  Let that identity select the matching record ABI
@@ -1032,11 +1078,13 @@ class ProgramABIContract:
         return result
 
     def values_for_function(
-        self, function_name: str,
+        self, function_name: str, *, method_owner: str | None = None,
     ) -> dict[str, ProgramABIValueBinding]:
         result = {}
         for binding in self.values:
-            if fnmatchcase(str(function_name), binding.function):
+            if binding_names_function(
+                binding.function, function_name, method_owner,
+            ):
                 result[binding.parameter] = binding
         return result
 
@@ -1117,6 +1165,24 @@ class ExtractionContract:
         self._source_availability: dict[
             tuple[int, str, str, str], tuple[Any, bool]
         ] = {}
+        # The project worker receives a sheet path, not the audit's in-memory
+        # with_sources object. Preserve those same exact module/path admissions
+        # when Token Orchard's authored entry crosses that fresh-process seam.
+        sources = raw.get("sources", ())
+        if not isinstance(sources, (list, tuple)):
+            raise ExtractionContractError("sources must be a list")
+        if sources:
+            resolved_sources = []
+            for entry in sources:
+                if not isinstance(entry, Mapping):
+                    raise ExtractionContractError("each declared source must be a name/path mapping")
+                path = entry.get("path")
+                if path is not None:
+                    path = Path(str(path))
+                    if not path.is_absolute():
+                        path = self.path.parent / path
+                resolved_sources.append({"name": entry.get("name"), "path": path})
+            self._declare_sources(resolved_sources)
 
     def with_program_abi(
         self, program_abi: ProgramABIContract | Mapping[str, Any],
@@ -1179,6 +1245,12 @@ class ExtractionContract:
         """
 
         derived = self._derive()
+        derived.fingerprint = self.fingerprint
+        derived._declare_sources(sources)
+        return derived
+
+    def _declare_sources(self, sources) -> None:
+        """Normalize and fingerprint the incumbent exact source admission."""
         declared = dict(self.declared_sources)
         for entry in sources:
             if isinstance(entry, Mapping):
@@ -1201,14 +1273,13 @@ class ExtractionContract:
                     f"{previous!r} and {str(name)!r}"
                 )
             declared[resolved] = str(name)
-        derived.declared_sources = declared
+        self.declared_sources = declared
         receipt = json.dumps(
-            derived.sources_receipt(), sort_keys=True, separators=(",", ":"),
+            self.sources_receipt(), sort_keys=True, separators=(",", ":"),
         )
-        derived.fingerprint = hashlib.sha256(
+        self.fingerprint = hashlib.sha256(
             f"{self.fingerprint}:sources:{receipt}".encode("utf-8")
         ).hexdigest()
-        return derived
 
     def sources_receipt(self) -> list[dict[str, str]]:
         """The foreign source files this contract admits, by name and path."""
@@ -1353,11 +1424,25 @@ class ExtractionContract:
                 or inspect.ismethod(value)
                 or inspect.isbuiltin(target)
                 or inspect.ismodule(target)
+                or isinstance(target, (
+                    types.MethodDescriptorType,
+                    types.WrapperDescriptorType,
+                    types.ClassMethodDescriptorType,
+                    types.MethodWrapperType,
+                    types.GetSetDescriptorType,
+                    types.MemberDescriptorType,
+                ))
             )
             else "instance"
         )
         definition_target = type(target) if occurrence == "instance" else target
-        module = str(getattr(definition_target, "__module__", ""))
+
+        owner = getattr(definition_target, "__objclass__", None)
+
+        module = str(
+            getattr(definition_target, "__module__", None)
+            or getattr(owner, "__module__", "")
+        )
         qualname = str(getattr(
             definition_target,
             "__qualname__",
@@ -1408,6 +1493,16 @@ class ExtractionContract:
                 )
         else:
             source_available = availability[1]
+
+        # A native module compiled into Python has no separate module file.
+        # Use the loaded module's declared origin and loader as evidence.
+        loaded_module = sys.modules.get(module)
+        module_spec = getattr(loaded_module, "__spec__", None)
+        native_builtin_module = (
+            getattr(module_spec, "origin", None) == "built-in"
+            and getattr(module_spec, "loader", None) is BuiltinImporter
+        )
+
         resolved = Path(origin).resolve() if origin else None
         if module == "builtins":
             classification = "builtin"
@@ -1416,6 +1511,8 @@ class ExtractionContract:
         elif suffix in {".pyd", ".so", ".dylib"}:
             classification = "native_extension"
         elif inspect.isbuiltin(target):
+            classification = "native_extension"
+        elif not origin and native_builtin_module:
             classification = "native_extension"
         elif (
             resolved is not None

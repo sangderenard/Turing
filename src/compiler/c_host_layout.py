@@ -8,8 +8,9 @@ the book and the compiled entry cannot name different buffers.
 
 The header carries
 
-* ``enum turing_dtype`` -- the C lane's storage classes
-  (``dtype_layout.C_LANE_STORAGE_CLASSES``), in that order;
+* ``enum turing_dtype`` -- the C lane's numeric storage classes
+  (``dtype_layout.C_LANE_STORAGE_CLASSES``), in that order, followed by the
+  canonical ``ptr`` context-cell layout;
 * ``turing_layout_entry <entry>_layout[]`` and ``<entry>_layout_count`` -- one
   entry per public buffer in ``void **buffers`` order;
 * ``<ENTRY>_BUFFER_COUNT``, ``<ENTRY>_BATCH`` (when the host declared one)
@@ -70,7 +71,12 @@ def layout_header_source(
     buffers = tuple(buffers)
     symbol = _identifier(entry)
     upper = symbol.upper()
-    dtype_enum = {name: index for index, name in enumerate(C_LANE_STORAGE_CLASSES)}
+    # Public managed collection contexts carry address CELLS alongside numeric
+    # columns. The API contract already distinguishes ptr from integer data;
+    # print its canonical layout rather than rejecting that declared buffer
+    # or describing the address as int64. Preserve existing numeric enum IDs.
+    storage_classes = (*C_LANE_STORAGE_CLASSES, 'ptr')
+    dtype_enum = {name: index for index, name in enumerate(storage_classes)}
     constants: dict[str, str] = {}
     for buffer in buffers:
         name = column_name(buffer)
@@ -88,7 +94,7 @@ def layout_header_source(
             raise ValueError(
                 f"layout header of {entry!r}: buffer {buffer.buffer_index} has "
                 f"dtype {buffer.dtype!r}, which is not a C lane storage class "
-                f"{C_LANE_STORAGE_CLASSES!r}"
+                f"{storage_classes!r}"
             )
         if buffer.itemsize != DTYPES[buffer.dtype].byte_size:
             raise ValueError(

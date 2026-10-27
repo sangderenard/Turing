@@ -96,7 +96,11 @@ def _authored_source_sequence_ids(
                 records = schemas.get(str(receiver_attributes.get("program_abi_record_identity") or ""), ())
                 if len(records) == 1:
                     field = (records[0].get("fields") or {}).get(str(attributes.get("attribute") or "")) or {}
-                    if field.get("storage") in {"span", "table", "keyed"}:
+                    if field.get("storage") in {"span", "table", "keyed"} or field.get("aggregate_kind") in {"dict", "list", "set", "array", "bytearray"}:
+                        # An inferred builtin collection field still arrives
+                        # populated on this exact caller-owned receiver. Its
+                        # reference receipt is not a local constructor: read
+                        # methods must not reset the resident length to zero.
                         source_ids.add(value_id)
         if (
             operation == "getattr"

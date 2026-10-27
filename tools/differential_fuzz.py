@@ -147,6 +147,9 @@ EXTENDED = [
     # a list rebound on one branch to a list of another length (corpus
     # c440-c443, the tire's ``metrics.unresolved_report = list(lines)``)
     (["r{v} = [{a}, {c}]", "if n > {a}:", "    r{v} = [n, {b}, {c}, 1]"], "sum(r{v}) * 10 + len(r{v}) + max(r{v})"),
+    # builtin max/min keep a NaN only when it comes first, and a NaN is
+    # unequal to itself (c570, c571)
+    (["f{v} = n * 1e308 * 10.0", "g{v} = f{v} - f{v}"], "int(max(g{v}, {a}) == {a}) * 100 + int(max({a}, g{v}) == {a}) * 10 + int(min(g{v}, {b}) != min(g{v}, {b}))"),
     (["r{v} = [{c}]", "if n % 2 == 0:", "    w{v} = [n]", "    for i{v} in range({a}):", "        w{v}.append(i{v} + {b})", "    r{v} = list(w{v})"], "len(r{v}) * 10 + r{v}[-1]"),
     # a copied name (``b = a``) rebound after the copy, in straight code,
     # in one arm of an if/else, and as the seed of a loop that reads the
@@ -655,19 +658,22 @@ def run_one(text):
     return "PASS", ""
 
 
+def _isolated_entry(child, text):
+    try:
+        child.send(run_one(text))
+    except Exception as error:  # noqa: BLE001
+        child.send(("CRASH", signature(f"{type(error).__name__}: {error}")))
+
+
 def isolated(text, limit=300):
     """run_one in a forked child: a native segfault or hang is a result."""
     import multiprocessing as mp
-    context = mp.get_context("fork")
+    # Windows has no ``fork`` context (as in native_corpus_typed_check's
+    # Windows parity receipt): spawn a module-level child there.  Unix keeps
+    # fork.  The child receives only the program text.
+    context = mp.get_context("spawn" if os.name == "nt" else "fork")
     parent, child = context.Pipe(duplex=False)
-
-    def target():
-        try:
-            child.send(run_one(text))
-        except Exception as error:  # noqa: BLE001
-            child.send(("CRASH", signature(f"{type(error).__name__}: {error}")))
-
-    process = context.Process(target=target)
+    process = context.Process(target=_isolated_entry, args=(child, text))
     process.start()
     process.join(limit)
     if process.is_alive():

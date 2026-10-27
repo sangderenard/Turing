@@ -1001,7 +1001,8 @@ def test_fortran_shortens_internal_procedure_names_but_preserves_bind_symbol():
     assert len(symbols[caller_name]) <= 63
     assert f'bind(C, name="{callee_name}")' in emitted.source
     assert f"call {symbols[callee_name]}()" in emitted.source
-    assert emitted.api.entry_point(callee_name).symbol == callee_name
+    assert emitted.api.entry_point(caller_name).symbol == caller_name
+    assert [entry.name for entry in emitted.api.entry_points] == [caller_name]
 
 
 def test_inout_region_load_and_phi_retain_resident_arena_rank():

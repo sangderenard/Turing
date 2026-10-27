@@ -381,11 +381,15 @@ def _post_control_specialization(
 
 def _post_pruned_return_sites(
     graph: Any, selected_sites: Mapping[Any, Any], control_id: int,
+    *, rejected_sites: Any = None,
 ) -> None:
     """The structural fold proved one top-level arm terminal and kept only
     its return site: every other site's ``return_site_slot`` rows revise to
     ``Unresolved(RETURN_SITE_UNREACHABLE)`` reading the previous slot cell
-    and the folded control's identity cell (plan 80, A2.7; plan 70, 4)."""
+    and the folded control's identity cell (plan 80, A2.7; plan 70, 4).
+    ``rejected_sites`` selects exact source-site Refs when a nonterminal
+    structural arm is removed; otherwise ``selected_sites`` retains the
+    established span-keyed terminal-return behavior."""
 
     from ..common.tensors.topological_reducer import node_identity_cell
     from .concordance_declarations import (
@@ -412,6 +416,10 @@ def _post_pruned_return_sites(
     selected_spans = {
         tuple(site) for site in selected_sites if isinstance(site, tuple)
     }
+    exact_rejected_sites = (
+        None if rejected_sites is None else frozenset(rejected_sites)
+    )
+    return_site_spans = graph.G.graph.get("return_site_spans") or {}
     for row in tuple(slots.scope_rows(tuple(scope))):
         fact = slots.latest(row)
         if not isinstance(fact, Ref):
@@ -419,19 +427,37 @@ def _post_pruned_return_sites(
         site = row[1]
         # The return-site key is the ``source_span`` row of the returned
         # expression (a PAGE_REF); the ledger keys sites by its positions.
-        if not isinstance(site, Ref) or site.page.name != "source_span":
+        if not isinstance(site, Ref):
             continue
-        site_page = book.pages.get(site.page.name)
-        span = None if site_page is None else site_page.latest(site.row)
-        if span is None:
-            continue
-        positions = tuple(
-            getattr(span, name, None) for name in (
-                "lineno", "col_offset", "end_lineno", "end_col_offset",
-            )
-        )
-        if positions in selected_spans:
-            continue
+        if exact_rejected_sites is not None:
+            # Callsite specialization supplies exact source-site Refs. Keep
+            # this arm site-local even if another contextual graph has the
+            # same source span.
+            if site not in exact_rejected_sites:
+                continue
+        else:
+            # The exact return-site Ref may still point into ingestion while
+            # a callsite-specialized graph is folded. Its reducer-authored
+            # return_site_spans entry is the source-span receipt for that Ref.
+            # Canonical rows can instead point directly at source_span; both
+            # paths resolve the same exact site key.
+            positions = return_site_spans.get(site)
+            if positions is None:
+                if site.page.name != "source_span":
+                    continue
+                site_page = book.pages.get(site.page.name)
+                span = None if site_page is None else site_page.latest(site.row)
+                if span is None:
+                    continue
+                positions = tuple(
+                    getattr(span, name, None) for name in (
+                        "lineno", "col_offset", "end_lineno", "end_col_offset",
+                    )
+                )
+            else:
+                positions = tuple(map(int, positions))
+            if positions in selected_spans:
+                continue
         previous = book.latest_ref(RETURN_SITE_SLOT, row)
         cells = tuple(cell for cell in (previous, control_cell) if cell is not None)
         book.post(
