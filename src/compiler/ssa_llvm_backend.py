@@ -2067,8 +2067,9 @@ def _emit_repository_call_module(
                 # the same id and feeds to the reducing region: its extents
                 # are its producer's, so follow the producing region's edge.
                 produced = next((
-                    key for key in shape_extent_origin
+                    key for key in elementwise_runtime_results
                     if key[1] == current[1] and key[0] != function_name
+                    and key in shape_extent_origin
                 ), None)
                 if produced is None:
                     return current[1]
@@ -2285,7 +2286,10 @@ def _emit_repository_call_module(
                 (str(name), value_id) in elementwise_runtime_results
                 # A region's runtime-sized span result, projected here and
                 # fed on to its consumer (``(x * y).sum()``).
-                or _runtime_sized_span(value)
+                or (_runtime_sized_span(value) and any(
+                    key[1] == value_id and key[0] != str(name)
+                    for key in elementwise_runtime_results
+                ))
             ):
                 # Program: ``x + y * 2.0`` over runtime-sized rank-2 spans.
                 # Wrong record: the intermediate ``y * 2.0`` is a local span
