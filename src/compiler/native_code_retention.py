@@ -368,6 +368,11 @@ IOS_ARM64_NATIVE_LINKER = NativeTargetContext(
     sdk="iphoneos",
     minimum_os_version="15.0",
 )
+LINUX_AMD64_NATIVE_LINKER = NativeTargetContext(
+    "amd64", "linux", "sysv", frozenset({"elf-object"}),
+    accepts_loadable_images=False, name="linux-amd64",
+    llvm_triple="x86_64-linux-gnu", toolchain_target="x86_64-linux-gnu",
+)
 ANDROID_ARM64_NATIVE_LINKER = NativeTargetContext(
     "arm64", "android", "aapcs64", frozenset({"elf-object"}),
     accepts_loadable_images=False, name="android-arm64-v8a",
@@ -385,8 +390,29 @@ _BUILD_TARGETS = MappingProxyType({
         X86_64_PORTABLE_EXECUTOR,
         IOS_ARM64_NATIVE_LINKER,
         ANDROID_ARM64_NATIVE_LINKER,
+        LINUX_AMD64_NATIVE_LINKER,
     )
 })
+
+
+def host_build_target() -> NativeTargetContext:
+    """The target a build names when its caller names none: this host.
+
+    Program: any lowering on a Linux host with no ``build_target``.  The
+    default was the Windows linker on every host, so once the LLVM lane read
+    the receipt (``_module_target_lines``, ``compile_artifact``) a Linux host
+    built ``x86_64-windows-gnu`` PE images it could not load.  Windows hosts
+    keep the Windows linker; a host with no registered target keeps it too,
+    as before, rather than inventing one.
+    """
+
+    import platform
+    import sys
+
+    machine = platform.machine().casefold()
+    if sys.platform.startswith("linux") and machine in {"x86_64", "amd64"}:
+        return LINUX_AMD64_NATIVE_LINKER
+    return WINDOWS_AMD64_NATIVE_LINKER
 
 
 def build_targets() -> Mapping[str, NativeTargetContext]:
@@ -443,8 +469,10 @@ __all__ = [
     "HostImplementationDecision", "HostImplementationKind",
     "NativeRetentionMode", "NativeTargetContext", "RetainedNativeModule",
     "ANDROID_ARM64_NATIVE_LINKER", "IOS_ARM64_NATIVE_LINKER",
+    "LINUX_AMD64_NATIVE_LINKER",
     "PORTABLE_AMD64_MACHINE_SSA_VM", "WINDOWS_AMD64_NATIVE_LINKER",
     "WINDOWS_AMD64_NATIVE_LOADER", "X86_64_PORTABLE_EXECUTOR",
-    "build_target_from_metadata", "build_targets", "resolve_build_target",
+    "build_target_from_metadata", "build_targets", "host_build_target",
+    "resolve_build_target",
     "retain_elf_image", "retain_pe_image", "select_host_implementation",
 ]

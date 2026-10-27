@@ -211,7 +211,50 @@ alias such as `j = k` binds the same value), the later use is the record
 and still continues to the merge (c426, c552). c551 runs field merges in a
 loop whose arms read the arguments; c553 is a one-field dataclass.
 
+## F6. Record programs on the Fortran backend
+
+Lane E's backend parity run found the C-passing record programs refused by
+Fortran. Both refusals were loud; neither was a wrong answer.
+
+**Program 1.** `s = S(0); if c > 0: s.n = c * 2 else: s.n = 7 - c; return
+s.n` (c397; c399 is the same shape). Fortran refused with "record 'S' field
+'n' names absent SSA values [2]". The record is a compile-time correlation
+only: neither its id nor any field value is an SSA value of `root`, because
+the constructor's `0` is overwritten on both arms and never emitted. The C
+backend reads record tables only for record parameters, so it never looked.
+
+**Rule.** `emit_module` checks and exports a record descriptor only when the
+record, or one of its field values, is resident in the function. A resident
+record with an absent field still refuses. So does a record with any field
+that names storage (a span, sequence, nested record or reference), since
+those name arenas the function must hold
+(`test_record_table_rejects_storage_references_absent_from_function`).
+
+**Program 2.** `k = K(n); return k.get() + n` (c423; c422 and c424-c429
+too). Fortran refused with "missing Fortran feed 3". The constructor frame
+link (`_class_surface_ssa_program`) clones `__init__`'s formals into the
+caller as frame slots. The clones kept `program_abi_parameter` and
+`program_abi_field`, so the API classified them as public parameters with
+no feed. `concord_program_abi_frame_transitions` re-leased any slot still
+marked `program_abi_field`.
+
+**Rule.** A cloned formal that is not one of the caller's own parameters is
+`linked_call_frame_storage` of the constructor. Both program ABI keys are
+dropped from it.
+
 ## Measured
+
+F6, at main 830aa1d9: the typed corpus is 380/381 on C, the same as main,
+and 373/381 on Fortran, against main's 363. Fortran gains c397, c399,
+c422-c427, c429 and c552, and loses nothing. The
+one failure on both trees and both backends is c428, which #879 made wrong
+and Lane C's #896 fixes. Gate at 8fb85e7b (llvmlite installed): aa and ac
+failure names identical to main's. Main's own ab and rec parts were killed
+for memory, so those two were read against `tools/gate/baseline_*.txt`: the
+only new names were the record-table refusal test (now passing, see F6) and
+`test_project_unit_recognizes_exact_lowered_closure_formals`, which fails
+the same way on main 8fb85e7b (it loads a `.dll` on Linux). Fuzz seed 101
+at `FUZZ_EXT=4`, 60 programs: 55 PASS, 5 LOUD, 0 WRONG.
 
 F4 and F5, rebased onto main ae46579: the typed corpus is 372/373 PASS
 and main ae46579 is 358/359. The one failure on both is c428, which #879

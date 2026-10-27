@@ -107,7 +107,7 @@ _declare("exponent",
          "mul", "truediv", "pow", "sqrt", "cbrt", "inv", "inverse", "prod", "det",
          "matmul", "dot", "outer", "cross", "einsum", "solve", "cholesky")
 _declare("align",
-         "add", "sub", "maximum", "minimum", "clamp", "clamp_min", "clamp_max", "clip",
+         "add", "sub", "maximum", "minimum", "emax", "emin", "clamp", "clamp_min", "clamp_max", "clip",
          "where", "cat", "concat", "concatenate", "stack", "pad_cat",
          "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
          "allclose", "searchsorted")
@@ -156,7 +156,7 @@ def _matrix_order(receiver) -> int:
     return int(tuple(raw_view(receiver).shape)[-1])
 
 #: Arithmetic whose result exponent follows exactly from the operands'.
-_ALIGNED = frozenset({"add", "sub", "maximum", "minimum"})
+_ALIGNED = frozenset({"add", "sub", "maximum", "minimum", "emax", "emin"})
 _COMPARE = frozenset({"less", "less_equal", "greater", "greater_equal",
                       "equal", "not_equal", "lt", "le", "gt", "ge", "eq", "ne"})
 

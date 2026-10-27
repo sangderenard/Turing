@@ -63,6 +63,34 @@ class NativeInstallationRequiredError(RuntimeError):
         )
 
 
+def _native_scalar_ctypes() -> dict[str, Any]:
+    """ctypes factories are a view of the canonical scalar ABI catalogue."""
+    import ctypes
+    from ..transmogrifier.dtype_layout import c_abi_type_table
+    return {name: getattr(ctypes, name) for _c_type, name in c_abi_type_table().values()}
+
+
+def _native_scalar_probe_domains() -> dict[str, tuple[Any, ...]]:
+    """Conservative exact probes clipped to each declared storage domain."""
+    from ..transmogrifier.dtype_layout import c_abi_type_table, layout_for
+    domains = {}
+    for spelling, (_c_type, name) in c_abi_type_table().items():
+        layout = layout_for(spelling)
+        if layout.kind == "bool":
+            values = (False, True, True)
+        elif layout.kind in {"int", "uint"}:
+            bits = 8 * layout.byte_size
+            lower = 0 if layout.kind == "uint" else -(1 << (bits - 1))
+            upper = (1 << (bits - (layout.kind == "int"))) - 1
+            values = tuple(max(lower, min(upper, value)) for value in (-3, 1, 5))
+        elif layout.kind == "float":
+            values = (-3.25, 1.25, 4.5)
+        else:
+            continue
+        domains[name] = values
+    return domains
+
+
 def compiler_toolchain_fingerprint() -> dict[str, Any]:
     """Hash the authored compiler implementation that gives a frozen plan meaning.
 
@@ -413,7 +441,7 @@ class ProjectCompilationProduct:
         """Load a scalar native unit only after ABI and behavior agree.
 
         This intentionally supports the narrow scalar surface the emitted API
-        can describe completely today.  Arrays, records, workspaces, invented
+        can describe completely today. Public arrays, records, invented
         inputs, missing source parameters, and ambiguous returns are rejected
         rather than guessed.  Successful probes are persisted beside the unit
         and tied to the source, API, and library hashes.
@@ -453,8 +481,9 @@ class ProjectCompilationProduct:
         if entry is None:
             raise ValueError(f"native API does not declare {entry_name!r}")
         parameters = tuple(entry.get("parameters") or ())
-        if any(parameter.get("shape") or parameter.get("extents")
-               or parameter.get("extent") for parameter in parameters):
+        if any((parameter.get("shape") or parameter.get("extents")
+                or parameter.get("extent")) and parameter.get("role") in {"input", "inout", "output"}
+               for parameter in parameters):
             raise ValueError("scalar verifier refuses array-shaped native ABI")
         inputs = tuple(
             parameter for parameter in parameters
@@ -508,14 +537,7 @@ class ProjectCompilationProduct:
                 "unused-source proof: "
                 f"omitted={omitted_source_parameters!r}, proven={ignored!r}"
             )
-        ctypes_types = {
-            "c_int32": ctypes.c_int32,
-            "c_int64": ctypes.c_int64,
-            "c_float": ctypes.c_float,
-            "c_double": ctypes.c_double,
-            "c_bool": ctypes.c_bool,
-            "c_uint8": ctypes.c_uint8,
-        }
+        ctypes_types = _native_scalar_ctypes()
         try:
             argument_types = [
                 ctypes_types[str(parameter["ctypes"])] for parameter in inputs
@@ -535,8 +557,34 @@ class ProjectCompilationProduct:
                         runtime_handles.append(os.add_dll_directory(parent))
         library = ctypes.CDLL(str(library_path.resolve()))
         native = getattr(library, str(entry.get("symbol") or entry_name))
-        native.argtypes = [*argument_types, ctypes.POINTER(output_type)]
-        native.restype = None
+        workspace_core = None
+        if any(parameter.get("role") in {"workspace", "extent"} for parameter in parameters):
+            # A scalar-public library may construct private records/arenas.
+            # Their published workspaces are not authored record arguments.
+            # Use the same descriptor-driven packed runtime as other native
+            # Fortran executions; it allocates known extents and null context
+            # cells, and refuses any unresolved extent without guessing.
+            from .compiled_program_api import EntryPoint, Parameter
+            from .ssa_fortran_backend import FortranCoreNative
+            from types import SimpleNamespace
+            runtime_parameters = tuple(Parameter(
+                name=str(parameter['name']), role=str(parameter['role']),
+                dtype=str(parameter['dtype']), c_type=str(parameter['c_type']),
+                ctypes_name=str(parameter['ctypes']), passing=str(parameter['passing']),
+                shape=tuple(parameter.get('shape') or ()), extent=parameter.get('extent'),
+                extents=tuple(parameter.get('extents') or ()),
+                source_name=parameter.get('source_name'),
+                source_transform=parameter.get('source_transform'), layout=parameter.get('layout'),
+            ) for parameter in parameters)
+            workspace_core = FortranCoreNative(
+                library_path,
+                EntryPoint(entry_name, str(entry.get('symbol') or entry_name),
+                           str(entry.get('kind') or 'control'), runtime_parameters),
+                SimpleNamespace(metadata=dict(descriptor.get('metadata') or {})),
+            )
+        else:
+            native.argtypes = [*argument_types, ctypes.POINTER(output_type)]
+            native.restype = None
 
         route_counts = {"native": 0, "fallback": 0}
         result_codecs = {
@@ -563,10 +611,23 @@ class ProjectCompilationProduct:
                 if isinstance(value, int) and not isinstance(value, bool):
                     if int(converted.value) != int(value):
                         route_counts["fallback"] += 1
+                        if expected_probe_results is not None:
+                            raise ValueError("supplied-result verification forbids authored fallback")
                         return authored(*args, **kwargs)
                 native_inputs.append(converted.value)
             result = output_type()
-            native(*native_inputs, ctypes.byref(result))
+            if workspace_core is None:
+                native(*native_inputs, ctypes.byref(result))
+            else:
+                import numpy as np
+                feeds = {
+                    int(str(parameter['name'])[1:]): np.asarray([value])
+                    for parameter, value in zip(inputs, native_inputs, strict=True)
+                }
+                execution = workspace_core.prepare_execution(feeds).run()
+                result.value = np.asarray(execution.buffers[
+                    int(str(outputs[0]['name'])[1:])
+                ]).reshape(-1)[0].item()
             route_counts["native"] += 1
             return decode_native_result(result.value)
 
@@ -605,6 +666,7 @@ class ProjectCompilationProduct:
             "ignored_source_parameters": list(omitted_source_parameters),
             "native_result_codec": native_result_codec,
             "probe_count": len(probe_records),
+            "verification_oracle": "supplied-results" if expected_probe_results is not None else "authored-callable",
             "native_probe_count": int(route_counts["native"]),
             "fallback_probe_count": int(route_counts["fallback"]),
             "probes": probe_records,
@@ -631,6 +693,7 @@ class ProjectCompilationProduct:
         *,
         capacity: int = 64,
         native_precondition: Callable[..., bool] | None = None,
+        expected_probe_results: Sequence[Any] | None = None,
     ) -> Callable[..., Any]:
         """Load a one-column sequence unit after exact ABI/behavior proof.
 
@@ -649,6 +712,8 @@ class ProjectCompilationProduct:
 
         if not probes:
             raise ValueError("native verification requires at least one probe")
+        if expected_probe_results is not None and len(expected_probe_results) != len(probes):
+            raise ValueError("expected native probe results must align one-to-one with probes")
         if int(capacity) <= 0:
             raise ValueError("sequence verification capacity must be positive")
         name = str(qualified_name)
@@ -803,14 +868,7 @@ class ProjectCompilationProduct:
                 f"authored={authored_parameters!r}, "
                 f"native={native_source_parameters!r}"
             )
-        ctypes_types = {
-            "c_int32": ctypes.c_int32,
-            "c_int64": ctypes.c_int64,
-            "c_float": ctypes.c_float,
-            "c_double": ctypes.c_double,
-            "c_bool": ctypes.c_bool,
-            "c_uint8": ctypes.c_uint8,
-        }
+        ctypes_types = _native_scalar_ctypes()
         try:
             native_types = {
                 parameter_name: ctypes_types[str(parameter["ctypes"])]
@@ -1009,6 +1067,8 @@ class ProjectCompilationProduct:
             def fallback(reason: str | None = None) -> Any:
                 route_counts["fallback"] += 1
                 route_counts["last_fallback"] = reason
+                if expected_probe_results is not None:
+                    raise ValueError("supplied-result verification forbids authored fallback")
                 return authored(*bound.args, **bound.kwargs)
 
             if native_precondition is not None and not bool(
@@ -1382,7 +1442,7 @@ class ProjectCompilationProduct:
             )
 
         probe_records = []
-        for probe in probes:
+        for probe_index, probe in enumerate(probes):
             if isinstance(probe, Mapping):
                 arguments, keywords = (), dict(probe)
             else:
@@ -1392,7 +1452,8 @@ class ProjectCompilationProduct:
                 actual_arguments, actual_keywords,
             ) = independent_probe_values(arguments, keywords)
             try:
-                expected = authored(*expected_arguments, **expected_keywords)
+                expected = (authored(*expected_arguments, **expected_keywords)
+                            if expected_probe_results is None else expected_probe_results[probe_index])
             except Exception as expected_error:
                 try:
                     deployed(*actual_arguments, **actual_keywords)
@@ -1447,6 +1508,7 @@ class ProjectCompilationProduct:
             "entrypoint": entry_name,
             "authored_parameters": list(authored_parameters),
             "probe_count": len(probe_records),
+            "verification_oracle": "supplied-results" if expected_probe_results is not None else "authored-callable",
             "native_probe_count": int(route_counts["native"]),
             "fallback_probe_count": int(route_counts["fallback"]),
             "probes": probe_records,
@@ -1456,6 +1518,7 @@ class ProjectCompilationProduct:
         _atomic_json(receipt_path, verification)
         deployed.__turing_native_verification__ = verification
         deployed.__turing_native_library__ = library
+        deployed.__turing_native_route_counts__ = route_counts
         deployed.__turing_native_runtime_handles__ = tuple(runtime_handles)
         return deployed
 
@@ -1467,6 +1530,7 @@ class ProjectCompilationProduct:
         *,
         native_precondition: Callable[..., bool] | None = None,
         activation_adapter: str | None = None,
+        expected_probe_results: Sequence[Any] | None = None,
     ) -> Callable[..., Any]:
         """Verify a free function returning one descriptor-defined record.
 
@@ -1487,6 +1551,8 @@ class ProjectCompilationProduct:
 
         if not probes:
             raise ValueError("native verification requires at least one probe")
+        if expected_probe_results is not None and len(expected_probe_results) != len(probes):
+            raise ValueError("expected native probe results must align one-to-one with probes")
         name = str(qualified_name)
         try:
             link = dict(self.links[name])
@@ -1606,14 +1672,7 @@ class ProjectCompilationProduct:
                 f"{return_record.get('identity')!r}"
             )
 
-        ctypes_types = {
-            "c_int32": ctypes.c_int32,
-            "c_int64": ctypes.c_int64,
-            "c_float": ctypes.c_float,
-            "c_double": ctypes.c_double,
-            "c_bool": ctypes.c_bool,
-            "c_uint8": ctypes.c_uint8,
-        }
+        ctypes_types = _native_scalar_ctypes()
         try:
             native_types = {
                 str(parameter["name"]): ctypes_types[str(parameter["ctypes"])]
@@ -1688,6 +1747,8 @@ class ProjectCompilationProduct:
             ):
                 route_counts["fallback"] += 1
                 route_counts["last_route"] = "fallback"
+                if expected_probe_results is not None:
+                    raise ValueError("supplied-result verification forbids authored fallback")
                 return authored(*args, **kwargs)
             keepalive: list[Any] = []
             source_storage: dict[tuple[str, str], Any] = {}
@@ -1720,6 +1781,8 @@ class ProjectCompilationProduct:
                     if len(shape) != 1 or len(source) != shape[0]:
                         route_counts["fallback"] += 1
                         route_counts["last_route"] = "fallback"
+                        if expected_probe_results is not None:
+                            raise ValueError("supplied-result verification forbids authored fallback")
                         return authored(*args, **kwargs)
                     resident = source_storage.get(key)
                     if resident is None:
@@ -1731,6 +1794,8 @@ class ProjectCompilationProduct:
                         ):
                             route_counts["fallback"] += 1
                             route_counts["last_route"] = "fallback"
+                            if expected_probe_results is not None:
+                                raise ValueError("supplied-result verification forbids authored fallback")
                             return authored(*args, **kwargs)
                         resident = (native_type * shape[0])(*(
                             cell.value for cell in converted
@@ -1746,6 +1811,8 @@ class ProjectCompilationProduct:
                     ):
                         route_counts["fallback"] += 1
                         route_counts["last_route"] = "fallback"
+                        if expected_probe_results is not None:
+                            raise ValueError("supplied-result verification forbids authored fallback")
                         return authored(*args, **kwargs)
                     keepalive.append(resident)
                     native_arguments.append(
@@ -1774,7 +1841,7 @@ class ProjectCompilationProduct:
             return return_type(**result_fields)
 
         probe_records = []
-        for probe in probes:
+        for probe_index, probe in enumerate(probes):
             if isinstance(probe, Mapping):
                 arguments, keywords = (), dict(probe)
             else:
@@ -1782,7 +1849,8 @@ class ProjectCompilationProduct:
             expected_arguments = copy.deepcopy(arguments)
             expected_keywords = copy.deepcopy(keywords)
             try:
-                expected = authored(*expected_arguments, **expected_keywords)
+                expected = (authored(*expected_arguments, **expected_keywords)
+                            if expected_probe_results is None else expected_probe_results[probe_index])
             except Exception as expected_error:
                 before = route_counts["fallback"]
                 try:
@@ -1839,6 +1907,7 @@ class ProjectCompilationProduct:
             "entrypoint": entry_name,
             "authored_parameters": list(authored_parameters),
             "probe_count": len(probe_records),
+            "verification_oracle": "supplied-results" if expected_probe_results is not None else "authored-callable",
             "native_probe_count": int(route_counts["native"]),
             "fallback_probe_count": int(route_counts["fallback"]),
             "probes": probe_records,
@@ -1850,6 +1919,7 @@ class ProjectCompilationProduct:
         _atomic_json(library_path.parent / "native-verification.json", verification)
         deployed.__turing_native_verification__ = verification
         deployed.__turing_native_library__ = library
+        deployed.__turing_native_route_counts__ = route_counts
         deployed.__turing_native_runtime_handles__ = tuple(runtime_handles)
         deployed.__turing_native_precondition__ = native_precondition
         # The mutable counter is diagnostic state, not compiler identity. It
@@ -1864,6 +1934,8 @@ class ProjectCompilationProduct:
         qualified_name: str,
         authored_callable: Callable[..., Any],
         probes: Sequence[Sequence[Any] | Mapping[str, Any]],
+        *,
+        expected_probe_results: Sequence[Any] | None = None,
     ) -> Callable[..., Any]:
         """Verify a method whose receiver is a typed scalar-record layout.
 
@@ -1882,6 +1954,8 @@ class ProjectCompilationProduct:
 
         if not probes:
             raise ValueError("native verification requires at least one probe")
+        if expected_probe_results is not None and len(expected_probe_results) != len(probes):
+            raise ValueError("expected native probe results must align one-to-one with probes")
         name = str(qualified_name)
         try:
             link = dict(self.links[name])
@@ -1943,14 +2017,7 @@ class ProjectCompilationProduct:
             raise ValueError(
                 "scalar-record verifier requires one scalar return output"
             )
-        ctypes_types = {
-            "c_int32": ctypes.c_int32,
-            "c_int64": ctypes.c_int64,
-            "c_float": ctypes.c_float,
-            "c_double": ctypes.c_double,
-            "c_bool": ctypes.c_bool,
-            "c_uint8": ctypes.c_uint8,
-        }
+        ctypes_types = _native_scalar_ctypes()
         try:
             receiver_types = {
                 value_id: ctypes_types[str(receiver["ctypes"])]
@@ -2037,6 +2104,7 @@ class ProjectCompilationProduct:
         native.argtypes = [parameter_ctype(parameter) for parameter in parameters]
         native.restype = None
 
+        route_counts = {"native": 0, "fallback": 0}
         def deployed(*args: Any, **kwargs: Any) -> Any:
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
@@ -2087,6 +2155,7 @@ class ProjectCompilationProduct:
                         f"unsupported native record parameter {parameter_name!r}"
                     )
             native(*native_arguments)
+            route_counts["native"] += 1
             for index, field in enumerate(fields):
                 if field.get("writable"):
                     value_id = int(field["value_ids"][0])
@@ -2098,7 +2167,7 @@ class ProjectCompilationProduct:
             return result.value
 
         probe_records = []
-        for probe in probes:
+        for probe_index, probe in enumerate(probes):
             if isinstance(probe, Mapping):
                 arguments, keywords = (), dict(probe)
             else:
@@ -2107,7 +2176,8 @@ class ProjectCompilationProduct:
             expected_keywords = copy.deepcopy(keywords)
             native_arguments = copy.deepcopy(arguments)
             native_keywords = copy.deepcopy(keywords)
-            expected = authored(*expected_arguments, **expected_keywords)
+            expected = (authored(*expected_arguments, **expected_keywords)
+                            if expected_probe_results is None else expected_probe_results[probe_index])
             actual = deployed(*native_arguments, **native_keywords)
             if type(actual) is not type(expected) or actual != expected:
                 raise ValueError(
@@ -2129,6 +2199,7 @@ class ProjectCompilationProduct:
             "entrypoint": entry_name,
             "record_identity": str(record.get("identity") or ""),
             "probe_count": len(probe_records),
+            "verification_oracle": "supplied-results" if expected_probe_results is not None else "authored-callable",
             "native_probe_count": len(probe_records),
             "fallback_probe_count": 0,
             "probes": probe_records,
@@ -2137,6 +2208,7 @@ class ProjectCompilationProduct:
         _atomic_json(library_path.parent / "native-verification.json", verification)
         deployed.__turing_native_verification__ = verification
         deployed.__turing_native_library__ = library
+        deployed.__turing_native_route_counts__ = route_counts
         deployed.__turing_native_runtime_handles__ = tuple(runtime_handles)
         return deployed
 
@@ -2319,14 +2391,7 @@ def verify_project_unit_automatically(
     import inspect
     from .compiled_program_api import load_api
 
-    sample_values = {
-        "c_bool": (False, True, True),
-        "c_int32": (-3, 1, 5),
-        "c_int64": (-3, 1, 5),
-        "c_uint8": (0, 1, 5),
-        "c_float": (-3.25, 1.25, 4.5),
-        "c_double": (-3.25, 1.25, 4.5),
-    }
+    sample_values = _native_scalar_probe_domains()
     name = str(qualified_name)
     link = dict(product.links[name])
     source_module = str(link.get("source_module") or "")
@@ -2480,6 +2545,234 @@ def verify_project_unit_automatically(
         native_result_codec=result_codec,
         expected_probe_results=authored_probe_results,
     )
+
+
+def verify_project_product_cases(
+    product: ProjectCompilationProduct | str | Path,
+    cases: Mapping[str, Mapping[str, Any]],
+    *,
+    _verified_callables: dict[str, Callable[..., Any]] | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Verify supplied golden cases through the product's emitted ABI.
+
+    Each named case set supplies the existing verifier arguments ``probes``
+    and ``expected_probe_results``. No authored implementation is an oracle
+    or fallback in this mode, and verification never installs a callable.
+    """
+    from .compiled_program_api import load_api
+
+    if not isinstance(product, ProjectCompilationProduct):
+        product = open_project_compilation_product(product)
+    if not isinstance(cases, Mapping) or not cases:
+        raise ValueError("native cases must be a nonempty mapping of authored entry names to verifier arguments")
+    results = []
+    for qualified_name, specification in cases.items():
+        name = str(qualified_name)
+        link = dict(product.links.get(name) or {})
+        unit_record = next((item for item in product.manifest.get("units", ())
+                            if str(item.get("qualified_name")) == name), {})
+        library = product.root / str(link.get("native_library") or "")
+        api_path = product.root / str(link.get("native_api") or "")
+        record = {
+            "qualified_name": name,
+            "status": "failed",
+            "lowered": bool(link.get("artifact") and (product.root / str(link["artifact"])).is_file()),
+            "native_built": library.is_file() and api_path.is_file(),
+            "verified": False,
+            "lowering_status": unit_record.get("status", "not-lowered"),
+            "native_status": unit_record.get("native_status", "not-built"),
+            "verification_oracle": "supplied-results",
+            "library": library.as_posix() if library.is_file() else None,
+            "api": api_path.as_posix() if api_path.is_file() else None,
+        }
+        try:
+            if not isinstance(specification, Mapping):
+                raise ValueError("case set must be a mapping of verifier arguments")
+            unknown = set(specification) - {"probes", "expected_probe_results", "capacity", "native_precondition", "warmups", "repetitions", "work_iterations"}
+            if unknown:
+                raise ValueError(f"unknown native case options {sorted(unknown)!r}")
+            if "probes" not in specification or "expected_probe_results" not in specification:
+                raise ValueError("native cases require probes and supplied expected_probe_results")
+            warmups = specification.get("warmups", 0)
+            repetitions = specification.get("repetitions", 0)
+            if (type(warmups) is not int or type(repetitions) is not int
+                    or warmups < 0 or repetitions < 0 or (warmups and not repetitions)):
+                raise ValueError("timing requires nonnegative integer counts and repetitions when warming up")
+            if not specification["probes"] or len(specification["probes"]) != len(specification["expected_probe_results"]):
+                raise ValueError("native cases require nonempty probes and one supplied result per probe")
+            if not record["lowered"] or not record["native_built"]:
+                raise ValueError("native cases require a lowered and built library product")
+            source_path = Path(str(product.manifest.get("source") or ""))
+            if not source_path.is_file() or hashlib.sha256(source_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() != product.manifest.get("source_sha256"):
+                raise ValueError("authored source changed after the product was built")
+            descriptor = load_api(api_path)
+            entry_name = str(link.get("native_entrypoint") or "")
+            entry = next((item for item in descriptor.get("entry_points", ())
+                          if str(item.get("name")) == entry_name), None)
+            if entry is None:
+                raise ValueError("native entrypoint is absent from its emitted API")
+            metadata = dict(descriptor.get("metadata") or {})
+            surfaces = tuple((metadata.get("sequence_output_surfaces") or {}).get(entry_name, ()))
+            records = tuple((metadata.get("record_tables") or {}).get(entry_name, ()))
+            parameters = tuple(entry.get("parameters") or ())
+            _, authored = _resolve_product_callable(str(link.get("source_module") or ""), name)
+            arguments = (name, authored, specification["probes"])
+            options = {"expected_probe_results": specification["expected_probe_results"]}
+            if surfaces:
+                verifier = product.verify_native_sequence_callable
+                options["capacity"] = specification.get("capacity", 64)
+                options["native_precondition"] = specification.get("native_precondition")
+            else:
+                output_names = {str(item["name"]) for item in parameters if item.get("role") == "output"}
+                input_names = {str(item["name"]) for item in parameters if item.get("role") in {"input", "inout"}}
+                def record_names(record):
+                    return {f"t{int(value)}" for field in record.get("fields", ())
+                            for value in field.get("value_ids", ())}
+                returned = [record for record in records if {
+                    f"t{int(value)}" for field in record.get("fields", ())
+                    for value in field.get("value_ids", ())
+                } == output_names]
+                if returned:
+                    verifier = product.verify_native_record_return_callable
+                    options["native_precondition"] = specification.get("native_precondition")
+                elif any(record_names(record) and record_names(record) <= input_names for record in records):
+                    verifier = product.verify_native_scalar_record_callable
+                elif any((item.get("shape") or item.get("extent") or item.get("extents"))
+                         and item.get("role") in {"input", "inout", "output"} for item in parameters):
+                    raise ValueError("unsupported native case ABI: span has no existing sequence return/runtime binding")
+                else:
+                    verifier = product.verify_native_scalar_callable
+            deployed = verifier(*arguments, **options)
+            verification = dict(deployed.__turing_native_verification__)
+            if (verification["native_probe_count"] != verification["probe_count"]
+                    or verification["fallback_probe_count"] != 0):
+                raise ValueError("every supplied-result probe must execute the native library")
+            if repetitions:
+                import copy
+                import statistics
+                from contextlib import nullcontext
+                from ..common.tensors.source_realization import authored_source_realization
+                from .compiler_bootstrap_runtime import compiler_bootstrap_runtime_state
+
+                routes = deployed.__turing_native_route_counts__
+                source_callable = getattr(authored, "__turing_authored_source_callable__", authored)
+                source_targets = tuple(dict.fromkeys((
+                    *product.links,
+                    *(str(item["qualified_name"]) for item in compiler_bootstrap_runtime_state()),
+                )))
+                if hashlib.sha256(source_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() != verification["source_sha256"]:
+                    raise ValueError("authored source changed before native timing")
+                measurements = {"native": [], "authored": []}
+                before = dict(routes)
+                for iteration in range(warmups + repetitions):
+                    for route, callable_value in (("native", deployed), ("authored", source_callable)):
+                        elapsed = 0.0
+                        for index, probe in enumerate(specification["probes"]):
+                            args, kwargs = ((), copy.deepcopy(dict(probe))) if isinstance(probe, Mapping) else (copy.deepcopy(tuple(probe)), {})
+                            native_before = int(routes["native"])
+                            fallback_before = int(routes["fallback"])
+                            with authored_source_realization(targets=source_targets) if route == "authored" else nullcontext():
+                                started = time.perf_counter()
+                                actual = callable_value(*args, **kwargs)
+                                elapsed += time.perf_counter() - started
+                            expected = specification["expected_probe_results"][index]
+                            if type(actual) is not type(expected) or actual != expected:
+                                raise ValueError(f"{route} timing result disagrees with supplied golden")
+                            if route == "native" and (
+                                int(routes["native"]) != native_before + 1
+                                or int(routes["fallback"]) != fallback_before
+                            ):
+                                raise ValueError("timing invocation did not execute exactly one native call without fallback")
+                        if iteration >= warmups:
+                            measurements[route].append(elapsed)
+                native_seconds = statistics.median(measurements["native"])
+                authored_seconds = statistics.median(measurements["authored"])
+                record["timing"] = {
+                    "scope": "direct-native-library", "warmups": warmups,
+                    "repetitions": repetitions,
+                    "logical_iterations": specification.get("work_iterations"),
+                    "authored_route": "authored-source-realization",
+                    "native_warm_median_seconds": native_seconds,
+                    "authored_warm_median_seconds": authored_seconds,
+                    "native_speedup": authored_seconds / native_seconds if native_seconds else None,
+                    "native_call_count": int(routes["native"]) - int(before["native"]),
+                    "fallback_call_count": int(routes["fallback"]) - int(before["fallback"]),
+                }
+            record.update({
+                "status": "verified", "verified": True,
+                "abi_kind": verification["abi_kind"],
+                "probe_count": verification["probe_count"],
+                "native_probe_count": verification["native_probe_count"],
+                "fallback_probe_count": verification["fallback_probe_count"],
+                "verification_receipt": (library.parent / "native-verification.json").as_posix(),
+                **{field: verification[field] for field in ("source_sha256", "api_sha256", "library_sha256")},
+                "product_build_seconds": product.manifest.get("product_build_seconds"),
+                "ssa_compile_seconds": next((item.get("elapsed_seconds") for item in product.manifest.get("units", ())
+                                              if str(item.get("qualified_name")) == name), None),
+                "native_build_seconds": next((item.get("native_build_seconds") for item in product.manifest.get("units", ())
+                                               if str(item.get("qualified_name")) == name), None),
+            })
+            # Reuse the existing descriptor-call activation adapter. Only
+            # literal-safe cases can be replayed in a fresh compiler; record
+            # objects/callable preconditions need an existing codec first.
+            def literal_value(value):
+                if type(value) in {tuple, list, set}:
+                    for member in value:
+                        literal_value(member)
+                elif type(value) is dict:
+                    for key, member in value.items():
+                        literal_value(key)
+                        literal_value(member)
+                elif value is not None and type(value) not in {bool, int, float, complex, str, bytes}:
+                    raise ValueError("golden replay requires builtin literal values")
+                parsed = ast.literal_eval(repr(value))
+                if type(parsed) is not type(value) or parsed != value:
+                    raise ValueError("golden replay literal does not round-trip exactly")
+                return repr(value)
+            try:
+                replay_probes = []
+                for probe, expected in zip(specification["probes"], specification["expected_probe_results"]):
+                    args, kwargs = ((), dict(probe)) if isinstance(probe, Mapping) else (tuple(probe), {})
+                    replay_probes.append({
+                        "arguments": literal_value(args), "keywords": literal_value(kwargs),
+                        "expected_result": literal_value(expected),
+                    })
+                replay_options = {key: value for key, value in specification.items()
+                                  if key not in {"probes", "expected_probe_results", "warmups", "repetitions", "work_iterations"}}
+                replay = {"qualified_name": name, "probes": replay_probes,
+                          "options": literal_value(replay_options)}
+            except (ValueError, SyntaxError, TypeError):
+                record["replay_status"] = "unsupported"
+                record["replay_reason"] = "golden cases require nonliteral values; no existing replay codec"
+            else:
+                case_path = library.parent / "native-cases.json"
+                _atomic_json(case_path, replay)
+                verification.update({
+                    "activation_adapter": "descriptor-call-v1",
+                    "golden_cases_sha256": hashlib.sha256(case_path.read_bytes()).hexdigest(),
+                })
+                _atomic_json(library.parent / "native-verification.json", verification)
+                deployed.__turing_native_verification__ = verification
+                record["golden_cases"] = case_path.as_posix()
+                record["replay_status"] = "available"
+            if _verified_callables is not None:
+                _verified_callables[name] = deployed
+        except Exception as error:
+            record.update({"status": "failed", "verified": False})
+            record["reason"] = f"{type(error).__name__}: {error}"
+            if library.is_file():
+                _atomic_json(library.parent / "native-verification.json", {
+                    "schema": "turing.native-callable-verification.v1",
+                    "qualified_name": name, "status": "failed",
+                    "verification_oracle": "supplied-results",
+                    "reason": record["reason"],
+                })
+        results.append(record)
+    if _verified_callables is None:
+        _atomic_json(product.root / "native-case-verification.json", {
+            "schema": "turing.project-native-case-verification.v1", "units": results,
+        })
+    return tuple(results)
 
 
 def verify_project_units_automatically(
@@ -3577,6 +3870,21 @@ def _require_native_root_semantics(module: Any, entrypoint: str) -> Any:
             f"values as public inputs {unexplained_arguments}; "
             f"source execution receipts={details!r}"
         )
+    from .identity_concordance import ConcordanceRefusal, CorrelationTable
+    from .structural_concordance import publish_module_structures
+
+    if module.metadata.get("identity_book") is None:
+        raise ConcordanceRefusal("native product lacks its owning concordance book")
+    publish_module_structures(module)
+    findings = tuple(CorrelationTable.build(module).findings(module))
+    if findings:
+        raise ConcordanceRefusal(
+            f"native product concordance refused {len(findings)} finding(s):\n"
+            + "\n".join(
+                f"{finding.function} value {finding.value_id}: {finding.detail}"
+                for finding in findings
+            )
+        )
     return root_function
 
 
@@ -4306,14 +4614,7 @@ def _verify_native_scalar_source_region(
         raise ValueError("native source-region input ABI changed during emission")
     if tuple(str(item.get("name")) for item in native_outputs) != expected_output_names:
         raise ValueError("native source-region output ABI changed during emission")
-    ctypes_types = {
-        "c_int32": ctypes.c_int32,
-        "c_int64": ctypes.c_int64,
-        "c_float": ctypes.c_float,
-        "c_double": ctypes.c_double,
-        "c_bool": ctypes.c_bool,
-        "c_uint8": ctypes.c_uint8,
-    }
+    ctypes_types = _native_scalar_ctypes()
     try:
         input_types = tuple(
             ctypes_types[str(item["ctypes"])] for item in native_inputs
@@ -6324,10 +6625,25 @@ def compile_project_call(
     for dependency_name, (artifact, root_symbol) in sorted(
         linked_units.items()
     ):
-        with Path(artifact).resolve().open("rb") as stream:
-            dependency_module, dependency_outputs, _dependency_exports = (
-                pickle.load(stream)
-            )
+        artifact_bytes = Path(artifact).resolve().read_bytes()
+        dependency_module, dependency_outputs, _dependency_exports = (
+            pickle.loads(artifact_bytes)
+        )
+        # A linked body is a completed product whose blocks, values and
+        # output identities are owned by the dependency's own identity book,
+        # which travels with the artifact.  Record that owner exactly as SSA
+        # composition does, so passes that revisit the body read and revise
+        # it in the book that holds its facts, not the enclosing unit's.
+        owner_book = dependency_module.metadata.get("identity_book")
+        if owner_book is not None:
+            artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+            for function in dependency_module.functions.values():
+                function.metadata.setdefault("accepted_ssa_component", {
+                    "schema": "turing.accepted-ssa-component.v1",
+                    "artifact_sha256": artifact_sha256,
+                    "linked_unit": str(dependency_name),
+                    "identity_book": owner_book,
+                })
         linked_repository_ssa[str(dependency_name)] = (
             dependency_module, str(root_symbol), dependency_outputs,
         )
@@ -6365,27 +6681,52 @@ def compile_project_call(
             "unit: available verified source regions "
             + str(len(linked_source_region_ssa))
         )
-    with authored_source_realization(targets=(
-        call.qualified_name for call in discover_authored_calls(compile_source)
-    )):
-        module, outputs, exports = lower_ast_source_to_ssa(
-            compile_source,
-            qualified_name,
-            name=artifact_name,
-            source_module=source_module_name,
-            python_package=source_package_name,
-            runtime_closure_only=True,
-            progress=report,
-            extraction_contract=extraction_policy,
-            external_class_field_aggregate_kinds=authored_record_contracts,
-            linked_repository_ssa=linked_repository_ssa,
-            linked_source_region_ssa=linked_source_region_ssa,
-            compilation_unit_plan_sink=publish_process_graph_plan,
-            resolved_process_graph_sink=publish_resolved_process_graph,
-            stop_after_compilation_unit_plan=bool(plan_only),
-            progress_bars=progress_bars,
-            compile_progress_state_sink=report_compiler_progress,
-        )
+    try:
+        with authored_source_realization(targets=(
+            call.qualified_name for call in discover_authored_calls(compile_source)
+        )):
+            module, outputs, exports = lower_ast_source_to_ssa(
+                compile_source,
+                qualified_name,
+                name=artifact_name,
+                source_module=source_module_name,
+                python_package=source_package_name,
+                runtime_closure_only=True,
+                progress=report,
+                extraction_contract=extraction_policy,
+                external_class_field_aggregate_kinds=authored_record_contracts,
+                linked_repository_ssa=linked_repository_ssa,
+                linked_source_region_ssa=linked_source_region_ssa,
+                compilation_unit_plan_sink=publish_process_graph_plan,
+                resolved_process_graph_sink=publish_resolved_process_graph,
+                stop_after_compilation_unit_plan=bool(plan_only),
+                progress_bars=progress_bars,
+                compile_progress_state_sink=report_compiler_progress,
+            )
+    except Exception as error:
+        rejected = getattr(error, "rejected_source_result", None)
+        if rejected is not None:
+            from uuid import uuid4
+
+            # Manager finalization refused a real module after an eight-minute
+            # run, leaving only its text log. Preserve that exact IR/book via
+            # the incumbent atomic artifact writer, with an immutable path.
+            # Neither the accepted artifact nor a successful unit is published.
+            rejected_path = root / f"rejected-repository-ssa-{uuid4().hex}.pkl"
+            try:
+                _dump_pickle_artifact(rejected_path, rejected)
+                error.compiler_failure_artifacts = {
+                    "rejected_repository_ssa": rejected_path.name,
+                    "rejected_repository_ssa_sha256": _file_sha256(rejected_path),
+                    "rejected_repository_ssa_linkable": False,
+                }
+                report(f"unit: rejected SSA/concordance retained: {rejected_path.name}")
+            except Exception as artifact_error:
+                error.compiler_failure_artifacts = {
+                    "rejected_repository_ssa_error": str(artifact_error),
+                }
+                report(f"unit: rejected SSA capture failed: {artifact_error}")
+        raise
     if plan_only:
         receipt = {
             "schema": "turing.project-compilation-unit-plan.v1",
@@ -9246,6 +9587,7 @@ def compile_project_product(
     extraction_contract: str | Path | None = DEFAULT_PROJECT_EXTRACTION_CONTRACT,
     expansion_policy: Mapping[str, Any] | None = None,
     emit_native: bool = False,
+    verification_cases: Mapping[str, Mapping[str, Any]] | None = None,
     seed_product: str | Path | None = None,
     bootstrap_products: Iterable[str | Path] = (),
     progress: Callable[[Mapping[str, Any]], None] | None = None,
@@ -9262,6 +9604,10 @@ def compile_project_product(
     coordinator-imposed memory or elapsed-time termination boundary.
     """
 
+    if verification_cases is not None and (not emit_native or not isinstance(verification_cases, Mapping) or not verification_cases):
+        raise ValueError("verification_cases requires native emission and a nonempty case mapping")
+
+    product_build_started = time.perf_counter()
     from .work_contract import (active_contract, with_expansion_policy,
                                 EXPANSION_ENV)
     from .work_contract import expansion_policy as describe_expansion
@@ -9861,6 +10207,7 @@ def compile_project_product(
                 (unit_root / "unit.json").read_text(encoding="utf-8")
             )
             artifact_path = unit_root / str(unit_receipt["artifact"])
+            native_build_started = time.perf_counter()
             try:
                 with artifact_path.open("rb") as stream:
                     module, outputs, exports = pickle.load(stream)
@@ -9905,6 +10252,7 @@ def compile_project_product(
                     library=True,
                 )
                 record["native_status"] = "complete"
+                record["native_build_seconds"] = time.perf_counter() - native_build_started
                 record["native_library"] = executable.executable_path.relative_to(
                     root
                 ).as_posix()
@@ -10041,6 +10389,7 @@ def compile_project_product(
             else extraction_contract_path.as_posix()
         ),
         "native_emission_requested": bool(emit_native),
+        "product_build_seconds": time.perf_counter() - product_build_started,
         "seed_product": None if seed_root is None else seed_root.as_posix(),
         "bootstrap_products": [
             path.as_posix() for path in inherited_bootstrap_products
@@ -10113,8 +10462,14 @@ def compile_project_product(
         "links": links,
     })
     if emit_native:
-        automatic_verification = list(verify_project_units_automatically(root))
-        manifest["automatic_native_verification"] = automatic_verification
+        automatic_verification = list(
+            verify_project_units_automatically(root) if verification_cases is None
+            else verify_project_product_cases(root, verification_cases)
+        )
+        manifest[
+            "automatic_native_verification" if verification_cases is None
+            else "native_case_verification"
+        ] = automatic_verification
         verified_by_name = {
             str(item["qualified_name"]): dict(item)
             for item in automatic_verification
@@ -10149,6 +10504,7 @@ def compile_project_bootstrap_creep(
     bootstrap_products: Iterable[str | Path] = (),
     seed_product: str | Path | None = None,
     max_rounds: int = 16,
+    verification_cases: Mapping[str, Mapping[str, Any]] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Compile, prove, install for later workers, and repeat to a fixed point.
@@ -10220,6 +10576,7 @@ def compile_project_bootstrap_creep(
             max_worker_memory_bytes=max_worker_memory_bytes,
             extraction_contract=extraction_contract,
             emit_native=True,
+            verification_cases=verification_cases,
             seed_product=prior_seed,
             bootstrap_products=active_products,
             progress=lambda event, round_index=round_index: report(
@@ -10234,7 +10591,7 @@ def compile_project_bootstrap_creep(
         }
         verification_by_name = {
             str(record["qualified_name"]): dict(record)
-            for record in product.get("automatic_native_verification") or ()
+            for record in product.get("automatic_native_verification" if verification_cases is None else "native_case_verification") or ()
         }
         continuation_failures = []
         native_completion_failures = []
@@ -10374,7 +10731,7 @@ def compile_project_bootstrap_creep(
         }
         verified_names = {
             str(record["qualified_name"])
-            for record in product.get("automatic_native_verification") or ()
+            for record in product.get("automatic_native_verification" if verification_cases is None else "native_case_verification") or ()
             if record.get("status") == "verified"
         } & activated_names
         verified_regions = {
@@ -10461,7 +10818,7 @@ def compile_project_bootstrap_creep(
             })
         verification_frontier = [
             dict(record)
-            for record in product.get("automatic_native_verification") or ()
+            for record in product.get("automatic_native_verification" if verification_cases is None else "native_case_verification") or ()
             if record.get("status") != "verified"
         ]
         round_record = {
@@ -10571,6 +10928,7 @@ __all__ = [
     "system_available_memory_bytes",
     "verify_structural_resident_table_integral",
     "verify_project_unit_automatically",
+    "verify_project_product_cases",
     "verify_project_units_automatically",
     "verify_project_scalar_units_automatically",
 ]

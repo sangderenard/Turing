@@ -1,0 +1,30 @@
+{
+  "recurrence": {
+    "probes": [
+      [
+        12345,
+        0
+      ],
+      [
+        12345,
+        7
+      ],
+      [
+        12345,
+        1000000
+      ]
+    ],
+    "expected_probe_results": [
+      12345,
+      2105850065,
+      2135221737
+    ],
+    "warmups": 1,
+    "repetitions": 5,
+    "work_iterations": [
+      0,
+      7,
+      1000000
+    ]
+  }
+}

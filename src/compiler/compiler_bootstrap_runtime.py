@@ -400,7 +400,7 @@ def _activate_descriptor_call(product, qualified_name: str):
 
     from .project_compilation_product import (
         _resolve_product_callable,
-        verify_project_unit_automatically,
+        verify_project_unit_automatically, verify_project_product_cases,
     )
 
     link = dict(product.links[str(qualified_name)])
@@ -410,9 +410,33 @@ def _activate_descriptor_call(product, qualified_name: str):
     owner, _authored = _resolve_product_callable(
         source_module, str(qualified_name),
     )
-    deployed = verify_project_unit_automatically(
-        product, str(qualified_name),
-    )
+    library = product.root / str(link.get("native_library") or "")
+    receipt = json.loads((library.parent / "native-verification.json").read_text(encoding="utf-8"))
+    if receipt.get("verification_oracle") == "supplied-results":
+        cases_path = library.parent / "native-cases.json"
+        if (not cases_path.is_file() or _file_sha256(cases_path) != receipt.get("golden_cases_sha256")):
+            raise ValueError("verified golden cases are missing or changed")
+        for field, path in (("source_sha256", Path(str(product.manifest.get("source") or ""))),
+                            ("api_sha256", product.root / str(link.get("native_api") or "")),
+                            ("library_sha256", library)):
+            digest = (hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
+                      if field == "source_sha256" and path.is_file() else _file_sha256(path) if path.is_file() else None)
+            if digest != receipt.get(field):
+                raise ValueError(f"golden replay {field} changed after verification")
+        replay = json.loads(cases_path.read_text(encoding="utf-8"))
+        if replay.get("qualified_name") != str(qualified_name):
+            raise ValueError("golden cases name another authored unit")
+        specification = ast.literal_eval(replay["options"])
+        specification["probes"] = [ast.literal_eval(probe["keywords"]) if ast.literal_eval(probe["keywords"])
+                                   else ast.literal_eval(probe["arguments"]) for probe in replay["probes"]]
+        specification["expected_probe_results"] = [ast.literal_eval(probe["expected_result"]) for probe in replay["probes"]]
+        callables = {}
+        results = verify_project_product_cases(product, {str(qualified_name): specification}, _verified_callables=callables)
+        if not results[0].get("verified"):
+            raise ValueError(f"golden native replay failed: {results[0].get('reason')}")
+        deployed = callables[str(qualified_name)]
+    else:
+        deployed = verify_project_unit_automatically(product, str(qualified_name))
     return owner, deployed
 
 
