@@ -44,18 +44,33 @@ def _post_value_roots(scope, *values):
     )
 
 
-def _post_caller_storage_binding(callee, formal, callsite, caller, storage):
-    """The binding the walk records for a caller-storage formal: DERIVED from
-    the callee formal's cell and the caller storage's cell, as the producer
-    (``_frame_post(ARGUMENT_BINDING, ...)`` in the frame linker) posts it."""
+def _post_caller_storage_binding(callee, formal, callsite, caller, storage, actual):
+    """Publish the exact call record and its caller-qualified storage edge."""
 
     book = current_identity_book()
-    cells = (
-        book.latest_ref(SSA_VALUE, (callee, formal.id)),
-        book.latest_ref(SSA_VALUE, (caller, storage.id)),
+    formal_cell = book.latest_ref(SSA_VALUE, (callee, formal.id))
+    storage_cell = book.latest_ref(SSA_VALUE, (caller, storage.id))
+    actual_cell = book.latest_ref(SSA_VALUE, (caller, actual.id))
+    call_table = SSACallTable(owner='caller-storage-fixture', mutable=True)
+    call_record = SSACallRecord(
+        caller=caller,
+        callsite_id=callsite,
+        callee_reference=None,
+        callee_name=callee,
+        callee_symbol=callee,
+        argument_bindings=((actual.id, formal.id),),
+        callee_storage_value_ids=(formal.id,),
+        frame_bindings=((formal.id, 'caller_storage', storage.id),),
+        resolution='native_call',
     )
+    record_cell = call_table.assign(
+        caller, (call_record,),
+        sources=(formal_cell, storage_cell, actual_cell),
+        stage=FRAME_BINDING,
+    )
+    cells = (formal_cell, storage_cell, actual_cell, record_cell)
     return book.post(
-        ARGUMENT_BINDING, (callee, formal.id, callsite),
+        ARGUMENT_BINDING, (callee, caller, formal.id, callsite),
         ArgumentBindingFact('caller_storage', storage.id),
         stage=FRAME_BINDING, provenance=Derived(cells), mode=Mode.CONCORD,
     )
@@ -139,7 +154,7 @@ def test_exact_binding_reuses_concorded_late_sequence_storage():
     _post_value_roots('callee', value, sequence_column)
     _post_value_roots('caller', actual, caller_storage)
     _post_caller_storage_binding(
-        'callee', sequence_column, 9, 'caller', caller_storage,
+        'callee', sequence_column, 9, 'caller', caller_storage, actual,
     )
 
     assert _complete_propagated_frame_tails({
@@ -177,7 +192,7 @@ def test_exact_binding_restores_removed_caller_storage_identity():
     _post_value_roots('callee', value, sequence_length)
     _post_value_roots('caller', actual, removed_storage)
     _post_caller_storage_binding(
-        'callee', sequence_length, 9, 'caller', removed_storage,
+        'callee', sequence_length, 9, 'caller', removed_storage, actual,
     )
 
     assert _complete_propagated_frame_tails({

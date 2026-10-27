@@ -540,6 +540,8 @@ def _runtime_reduction(
     op = str(instr.attributes.get("tensor_operation") or instr.op)
     if op not in _REDUCTION_OPS or not instr.args or not _runtime_sized(instr.args[0]):
         return None, None
+    if op in ("max", "min") and len(instr.args) > 1:
+        return None, None  # max(x, y): elementwise, not a fold
     source = instr.args[0]
     arguments = {int(value.id) for value in function.args}
     if (
@@ -888,6 +890,44 @@ class _FunctionEmitter:
         )
         body.append(f"    OpStore {access} {value_id}")
 
+    def _max_step(
+        self, rule: str, greatest: bool, running: str, value: str,
+        value_type: str, floating: bool, body: list[str],
+        result_id: str | None = None,
+    ) -> str:
+        """One ``max``/``min`` step under ``rule`` (see ``max_semantics``).
+
+        ``PYTHON``: ``value`` replaces ``running`` only when strictly
+        better, so a NaN never wins and a tie keeps ``running``. ``NUMPY``:
+        a NaN on either side is the result (``running``'s first), otherwise
+        the better, with a tie taking ``value``. ``FMax`` is not used: its
+        NaN result is undefined by GLSL.std.450.
+        """
+
+        from .max_semantics import PYTHON
+
+        bool_type = self.builder.scalar_type("bool")
+        if floating:
+            compare = "OpFOrdGreaterThan" if greatest else "OpFOrdLessThan"
+        else:
+            compare = "OpSGreaterThan" if greatest else "OpSLessThan"
+        out = result_id or self.builder.fresh("v")
+        if rule == PYTHON or not floating:
+            wins = self.builder.fresh("v")
+            body.append(f"    {wins} = {compare} {bool_type} {value} {running}")
+            body.append(f"    {out} = OpSelect {value_type} {wins} {value} {running}")
+            return out
+        keeps, pick = self.builder.fresh("v"), self.builder.fresh("v")
+        nan_value, after = self.builder.fresh("v"), self.builder.fresh("v")
+        nan_running = self.builder.fresh("v")
+        body.append(f"    {keeps} = {compare} {bool_type} {running} {value}")
+        body.append(f"    {pick} = OpSelect {value_type} {keeps} {running} {value}")
+        body.append(f"    {nan_value} = OpIsNan {bool_type} {value}")
+        body.append(f"    {after} = OpSelect {value_type} {nan_value} {value} {pick}")
+        body.append(f"    {nan_running} = OpIsNan {bool_type} {running}")
+        body.append(f"    {out} = OpSelect {value_type} {nan_running} {running} {after}")
+        return out
+
     def _convert(
         self, value_id: str, source: str, target: str, body: list[str]
     ) -> str | None:
@@ -910,6 +950,51 @@ class _FunctionEmitter:
             f"    {converted} = {opcode} {self.builder.scalar_type(target)} {value_id}"
         )
         return converted
+
+    def _emit_max_pair(
+        self, instr: Instr, block: BasicBlock, body: list[str],
+        rule: str, greatest: bool,
+    ) -> None:
+        """A stamped two-operand ``max``/``min``, per element over arrays."""
+
+        result_dtype = instr.res.dtype or self.dtype
+        result_type = self.builder.scalar_type(result_dtype)
+        floating = _DTYPE_KIND.get(result_dtype) == "float"
+        result_shape = tuple(int(size) for size in instr.res.shape)
+        if not result_shape:
+            self._max_step(
+                rule, greatest, self._name(instr.args[0]), self._name(instr.args[1]),
+                result_type, floating, body, result_id=self._name(instr.res),
+            )
+            return
+        pointer = self._array_pointer.get(instr.res.id)
+        if pointer is None:
+            self._shortfall(
+                instr.op, block.name, "internal: no storage allocated for this array result"
+            )
+            return
+        for index in itertools.product(*(range(size) for size in result_shape)):
+            operands = []
+            for argument in instr.args:
+                shape = tuple(int(size) for size in argument.shape)
+                if not shape:
+                    operands.append(self._name(argument))
+                    continue
+                at = self._broadcast_index(shape, result_shape, index)
+                source = self._array_pointer.get(argument.id)
+                if at is None or source is None:
+                    self._shortfall(
+                        instr.op, block.name,
+                        "operand shape does not broadcast to the result shape",
+                    )
+                    return
+                operands.append(self._load_element(
+                    source, at, self.builder.scalar_type(argument.dtype or self.dtype), body,
+                ))
+            value = self._max_step(
+                rule, greatest, operands[0], operands[1], result_type, floating, body,
+            )
+            self._store_element(pointer, index, result_type, value, body)
 
     def _emit_reduction(
         self, op: str, instr: Instr, block: BasicBlock, body: list[str]
@@ -1008,26 +1093,15 @@ class _FunctionEmitter:
             elements.append(converted)
 
         if op in ("max", "min"):
-            bool_type = self.builder.scalar_type("bool")
-            if result_kind == "float":
-                compare = "OpFOrdGreaterThan" if op == "max" else "OpFOrdLessThan"
-            else:
-                compare = "OpSGreaterThan" if op == "max" else "OpSLessThan"
+            from .max_semantics import NUMPY, max_step_rule
+
+            rule = max_step_rule(instr) or NUMPY
             accumulator = elements[0]
             for value in elements[1:]:
-                wins = self.builder.fresh("v")
-                body.append(f"    {wins} = {compare} {bool_type} {value} {accumulator}")
-                if result_kind == "float":
-                    nan = self.builder.fresh("v")
-                    body.append(f"    {nan} = OpIsNan {bool_type} {value}")
-                    either = self.builder.fresh("v")
-                    body.append(f"    {either} = OpLogicalOr {bool_type} {wins} {nan}")
-                    wins = either
-                chosen = self.builder.fresh("v")
-                body.append(
-                    f"    {chosen} = OpSelect {result_type} {wins} {value} {accumulator}"
+                accumulator = self._max_step(
+                    rule, op == "max", accumulator, value, result_type,
+                    result_kind == "float", body,
                 )
-                accumulator = chosen
             body.append(f"    {name} = OpCopyObject {result_type} {accumulator}")
             return
 
@@ -1172,6 +1246,20 @@ class _FunctionEmitter:
 
         if not result_shape and any(a.shape for a in instr.args) and op in _REDUCTION_OPS:
             self._emit_reduction(op, instr, block, body)
+            return
+
+        from .max_semantics import is_max, max_step_rule
+
+        greatest = is_max(op)
+        rule = max_step_rule(instr)
+        if (
+            greatest is not None and rule is not None and len(instr.args) == 2
+            and not any(
+                instr.attributes.get(key) is not None
+                for key in ("right_scalar", "left_scalar")
+            )
+        ):
+            self._emit_max_pair(instr, block, body, rule, greatest)
             return
 
         operand_dtype = instr.args[0].dtype if instr.args else result_dtype
@@ -2077,18 +2165,12 @@ def _emit_runtime_reduction_shader(
         folded = "OpLogicalAnd" if op == "all" else "OpLogicalOr"
         body.append(f"%next_acc = {folded} {boolean} %acc {value}")
     elif op in ("max", "min"):
-        compare = (
-            ("OpFOrdGreaterThan" if op == "max" else "OpFOrdLessThan")
-            if result_kind == "float"
-            else ("OpSGreaterThan" if op == "max" else "OpSLessThan")
+        from .max_semantics import NUMPY, max_step_rule
+
+        folding._max_step(
+            max_step_rule(instr) or NUMPY, op == "max", "%acc", value,
+            result_type, result_kind == "float", body, result_id="%next_acc",
         )
-        body.append(f"%wins = {compare} {boolean} {value} %acc")
-        wins = "%wins"
-        if result_kind == "float":
-            body.append(f"%nan = OpIsNan {boolean} {value}")
-            body.append(f"%wins_or_nan = OpLogicalOr {boolean} %wins %nan")
-            wins = "%wins_or_nan"
-        body.append(f"%next_acc = OpSelect {result_type} {wins} {value} %acc")
     else:
         kind, payload = folding._resolve(
             "mul" if op == "prod" else "add", result_dtype, 2,

@@ -759,6 +759,9 @@ class MetadataRule(Enum):
     CATALOGUED_BUILTIN_CALL = "catalogued_builtin_call"
     GROUNDED_TENSOR_PROPERTY = "grounded_tensor_property"
     SCALAR_INTRINSIC = "scalar_intrinsic"
+    #: A call through a host-supplied callable slot, or its presence test
+    #: (``turing-host-callback-v1``): native work (``EXECUTABLE``).
+    HOST_CALLBACK = "host_callback"
     COORDINATOR_SHORT_CIRCUIT = "coordinator_short_circuit"
     LINKED_REFERENCE = "linked_reference"
     STATIC_PYTHON_REFERENCE = "static_python_reference"
@@ -1623,7 +1626,7 @@ PHYSICAL_CALL_INPUT_ADAPTATION_ROUND = declare_page(
 CALL_INPUT_CONVERSION = declare_page("call_input_conversion", (
     RowField("caller", K.SCOPE), RowField("actual", K.VALUE_ID),
     RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
-), tuple)                              # mode REVISE
+), tuple)                              # (converted,source dtype,target dtype,kind[,source callsite,block]); REVISE
 CALL_INPUT_STORAGE = declare_page("call_input_storage_concordance", (
     RowField("caller", K.SCOPE), RowField("actual", K.VALUE_ID),
 ), str)                                # mode CONCORD
@@ -2195,17 +2198,19 @@ SEQUENCE_RESIDENCY = declare_page("sequence_residency", (
 ), ResidencyFact)
 
 # -- pages: re-declared (census 75, step 7) ----------------------------------
-#: The callsite moves from the column into the row: one row per binding.
-#: Fact ``ArgumentBindingFact`` or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``.
-#: CONCORD; rows written raw before this step keep ``"binding"`` as their
-#: third element with the callsite as the column.
+#: One row per binding, qualified by the caller as well as the call-local
+#: site. Distinct specialized callers reuse local site IDs and can bind the
+#: same callee shell formal to different literals. Fact ``ArgumentBindingFact``
+#: or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``. Legacy rows written before
+#: this step keep ``"binding"`` as their third element with callsite in column.
 ARGUMENT_BINDING = declare_page("argument_binding", (
-    RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
+    RowField("callee", K.NAME), RowField("caller", K.NAME),
+    RowField("formal", K.VALUE_ID),
     RowField("callsite", K.LABEL),
 ), ArgumentBindingFact)
 ARGUMENT_BINDING_RESOLUTION = declare_page("argument_binding_resolution", (
-    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
-    RowField("source", K.VALUE_ID),
+    RowField("callee", K.SCOPE), RowField("caller", K.SCOPE),
+    RowField("formal", K.VALUE_ID), RowField("source", K.VALUE_ID),
 ), tuple)                              # REVISE (next column)
 #: (callsite, callee, formal); CONCORD, DERIVED(the slot's cell, the formal's cell).
 FRAME_LEASE = declare_page("frame_lease_link", (
@@ -2306,7 +2311,7 @@ FORMAL_ACTUAL_OCCURRENCE = declare_page("formal_actual_occurrence_concordance", 
     RowField("caller", K.NAME), RowField("block", K.NAME),
     RowField("instruction", K.INDEX), RowField("position", K.INDEX),
     RowField("caller_scope", K.SCOPE),
-), int)                                # DERIVED(actual ssa_value); CONCORD
+), int)                                # DERIVED(actual SSA); exact control rebind REVISE
 FORMAL_STORAGE_RESOLUTION = declare_page("formal_storage_resolution", (
     RowField("function", K.SCOPE), RowField("formal", K.VALUE_ID),
 ), tuple)                              # DERIVED(incoming occurrences); REVISE
@@ -4069,9 +4074,10 @@ ASSIGNMENT_PROJECTION_SOURCE = declare_page(
 )
 
 # -- operation-owned result domains and scalar kernel operands ---------------
-#: ``plan_region_to_ssa_instrs``: the truth type a predicate operation owns,
-#: ``(function scope, closure, region name, output value)`` -> ``(opcode,
-#: "bool")``, CONCORD, DERIVED(the output's ``canonical_value`` cell).
+#: ``plan_region_to_ssa_instrs``: the domain an operation owns after the
+#: existing numeric promotion/conversion law. ``(function scope, closure,
+#: region name, output value)`` -> ``(opcode, dtype)``, CONCORD, DERIVED
+#: from the exact output identity and consumed operand/conversion identities.
 OPERATOR_RESULT_TYPE = declare_page("operator_result_type_concordance", (
     RowField("function_scope", K.SCOPE), RowField("closure", K.INDEX),
     RowField("region", K.NAME), RowField("output", K.VALUE_ID),

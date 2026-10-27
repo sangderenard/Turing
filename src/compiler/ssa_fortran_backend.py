@@ -40,7 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..transmogrifier.dtype_layout import fortran_kind_table
+from ..transmogrifier.dtype_layout import fortran_kind_table, resolve as resolve_dtype_layout, DTYPES as DTYPE_LAYOUTS
+from .runtime_abi import HOST_CALLBACK_SCHEMA
 from ..transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -50,6 +51,7 @@ from ..transmogrifier.ssa import (
     SSASequenceTable,
     SSATensorTable,
 )
+from .max_semantics import fortran_reduction, fortran_step, is_max, max_step_rule
 from .string_table import NONE_TOKEN as _NONE_TOKEN, string_token as _string_token
 
 
@@ -133,6 +135,8 @@ _BINARY: dict[str, str] = {
     "pow": "({0} ** {1})",
     "maximum": "max({0}, {1})",
     "minimum": "min({0}, {1})",
+    "emax": "max({0}, {1})",
+    "emin": "min({0}, {1})",
     "matmul": "matmul({0}, {1})",
     "mod": "modulo({0}, {1})",
     "floordiv": "floor({0} / {1})",
@@ -359,8 +363,24 @@ _REAL_OPERAND = frozenset(
 )
 
 _INTEGER_DTYPES = frozenset(
-    {"int", "int8", "int16", "int32", "int64", "i32", "i64", "i1", "bool", "logical"}
+    {alias for layout in DTYPE_LAYOUTS.values()
+     if layout.kind in {"int", "uint", "bool"} for alias in layout.aliases}
 )
+
+
+def _native_integer_conversion(expression: str, dtype: str) -> str:
+    layout = resolve_dtype_layout(dtype)
+    if layout is None or layout.kind not in {"int", "uint"}:
+        raise FortranEmissionError(f"no native integer conversion for dtype {dtype!r}")
+    # The kind and signedness are both read from the same physical layout.
+    kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")")
+    intrinsic = "uint" if layout.kind == "uint" else "int"
+    return f"{intrinsic}({expression}, {kind})"
+
+
+def _unsigned_dtype(dtype: str) -> bool:
+    layout = resolve_dtype_layout(dtype)
+    return layout is not None and layout.kind == "uint"
 
 _LOGICAL_DTYPES = frozenset({"i1", "bool", "logical"})
 
@@ -825,6 +845,22 @@ def _literal(value: Any, dtype: str | None = None) -> str:
     So the declared type decides the spelling, and the payload only decides
     the value.
     """
+    layout = resolve_dtype_layout(dtype) if dtype else None
+    if (layout is not None and layout.kind == "int"
+            and isinstance(value, int) and not isinstance(value, bool)):
+        width = 8 * layout.byte_size
+        if not -(1 << (width - 1)) <= value < (1 << (width - 1)):
+            raise FortranEmissionError(f"constant {value} is outside {layout.name}")
+        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")").removeprefix("kind=")
+        if value == -(1 << (width - 1)):
+            return f"(-huge(0_{kind}) - 1_{kind})"
+        return f"{value}_{kind}"
+    if layout is not None and layout.kind == "uint" and isinstance(value, int) and not isinstance(value, bool):
+        width = 8 * layout.byte_size
+        if not 0 <= value < (1 << width):
+            raise FortranEmissionError(f"constant {value} is outside {layout.name}")
+        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")").removeprefix("kind=")
+        return f"{value}u_{kind}"
     if (
         dtype
         and isinstance(value, int)
@@ -833,17 +869,6 @@ def _literal(value: Any, dtype: str | None = None) -> str:
         and str(_DTYPE_KIND.get(str(dtype), "")).startswith("real")
     ):
         value = float(value)
-    if (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and str(dtype) in {"int64", "i64", "opaque_ref"}
-    ):
-        if value == -(2**63):
-            # A literal is a negated positive constant in Fortran, and 2**63
-            # does not fit int64 (gfortran: "Integer too big for its kind";
-            # the integer formatting helpers carry this bound, c57).
-            return "(-huge(0_c_int64_t) - 1_c_int64_t)"
-        return f"{value}_c_int64_t"
     return _literal_payload(value)
 
 
@@ -1109,6 +1134,41 @@ class _FunctionEmitter:
         self._heap_elements: dict[int, str] = {}
         self._heap_owner_ids: set[int] = set()
         heap_occurrences: dict[int, SSAValue] = {}
+        # Returned/forwarded record pools retain their complete storage
+        # descriptor even when a formal occurrence has no resident heap
+        # labels. Read that same concordance view as the allocator: the
+        # validate_atom_span child cells are pointers, not REAL(8) scalars.
+        if sequence_table is not None:
+            from .structural_concordance import storage_structure
+            for descriptor in sequence_table.sequences.values():
+                structure, _cell = storage_structure(
+                    "sequence", sequence_table.owner, descriptor.sequence_id,
+                    book=sequence_table.book,
+                )
+                native = dict(structure.children).get("native_storage")
+                if descriptor.heap_owner_value_id is not None and (
+                    native is None or native.kind == "unresolved"
+                ):
+                    raise FortranEmissionError(
+                        "owned sequence lacks a resolved concordance native-storage view"
+                    )
+                if native is None:
+                    continue
+                for _member, member in native.children:
+                    value_id = int(member.value_id)
+                    if value_id not in self._value_types:
+                        continue
+                    if member.storage == "heap_owner":
+                        if value_id in self._heap_elements:
+                            raise FortranEmissionError("heap storage identity is both owner and cell")
+                        self._heap_owner_ids.add(value_id)
+                    elif member.storage == "heap_cell":
+                        if value_id in self._heap_owner_ids:
+                            raise FortranEmissionError("heap storage identity is both owner and cell")
+                        element = dict(member.children)["element"]
+                        prior = self._heap_elements.setdefault(value_id, str(element.dtype))
+                        if prior != element.dtype:
+                            raise FortranEmissionError("heap cell has conflicting descriptor element layouts")
         for value in (
             *function.args,
             *(
@@ -1123,12 +1183,17 @@ class _FunctionEmitter:
             if str(value.dtype or "").casefold() != "ptr":
                 continue
             if accounting.get("heap_owner"):
+                if int(value.id) in self._heap_elements:
+                    raise FortranEmissionError("heap owner occurrence disagrees with storage descriptor")
                 self._heap_owner_ids.add(int(value.id))
             elif accounting.get("heap_element_dtype") is not None:
-                self._heap_elements[int(value.id)] = str(
-                    accounting["heap_element_dtype"]
-                )
-            else:
+                if int(value.id) in self._heap_owner_ids:
+                    raise FortranEmissionError("heap cell occurrence disagrees with storage descriptor")
+                element = str(accounting["heap_element_dtype"])
+                prior = self._heap_elements.setdefault(int(value.id), element)
+                if prior != element:
+                    raise FortranEmissionError("heap cell occurrence disagrees with descriptor element layout")
+            elif int(value.id) not in self._heap_elements and int(value.id) not in self._heap_owner_ids:
                 continue
             heap_occurrences.setdefault(int(value.id), value)
         for value_id, occurrence in heap_occurrences.items():
@@ -1144,6 +1209,16 @@ class _FunctionEmitter:
         self._heap_views: set[int] = set(self._heap_elements)
         self._heap_indexed: set[int] = set()
         self.release_heap_owners = bool(release_heap_owners)
+        from .compiled_program_api import is_frame_workspace
+        source_parameter_names = {
+            int(value_id): str(name)
+            for name, value_id in self.function.metadata.get("parameter_names", ())
+        }
+        self._frame_heap_owner_ids = {
+            int(value.id) for value in self.function.args
+            if int(value.id) in self._heap_owner_ids
+            and is_frame_workspace(value, source_parameter_names.get(int(value.id)))
+        }
         self.outputs = tuple(self._typed(value) for value in self.outputs)
         self.dynamic_array_extents = {
             int(instr.args[0].id): (
@@ -1225,6 +1300,50 @@ class _FunctionEmitter:
                 )
             )
         }
+        # c639: setdefault's selected child column is a GEP view of one
+        # pool row. Its descriptor already names that row's capacity (the
+        # pool stride). Publishing a new extent for the local view leaked
+        # an unbindable helper dimension to the public caller. Preserve the
+        # descriptor's exact scalar extent at this signature writer instead.
+        self._local_sequence_extent_expressions: set[str] = set()
+        if sequence_table is not None:
+            address_results = {
+                int(instruction.res.id)
+                for block in self.function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"GetElementPtr", "getelementptr"}
+                and instruction.res is not None
+                and instruction.attributes.get("aggregate_index") is None
+            }
+            formal_ids = {int(argument.id) for argument in self.function.args}
+            capacity_by_column: dict[int, int] = {}
+            for descriptor in sequence_table.sequences.values():
+                capacity_id = int(descriptor.capacity_value_id)
+                capacity = self._value_types.get(capacity_id)
+                if (
+                    capacity is None or tuple(capacity.shape or ())
+                    or capacity_id not in formal_ids
+                ):
+                    continue
+                for column, row_shape in zip(
+                    descriptor.column_value_ids, descriptor.column_shapes,
+                ):
+                    column_id = int(column)
+                    if (
+                        column_id not in address_results or tuple(row_shape)
+                        or self.dynamic_array_ranks.get(column_id) != 1
+                    ):
+                        continue
+                    incumbent = capacity_by_column.setdefault(column_id, capacity_id)
+                    if incumbent != capacity_id:
+                        raise ValueError(
+                            f"sequence view {column_id} has conflicting capacity identities"
+                        )
+                    extent = f"int({_name(capacity)}, c_int)"
+                    self._local_sequence_extent_expressions.add(extent)
+                    self.dynamic_array_leading_extents[column_id] = (extent,)
+                    if column_id in self.dynamic_array_extents:
+                        self.dynamic_array_extents[column_id] = extent
         self._propagate_phi_dynamic_ranks()
         self.runtime_sized_ids = {
             int(value_id) for value_id, rank in dict(
@@ -1600,6 +1719,14 @@ class _FunctionEmitter:
                     )
                     for position in positions
                 )
+                if len(positions) == 1 and (
+                    collection.accounting or {}
+                ).get("heap_owner_value_id") is not None:
+                    # An owned child row is a GEP into a flat heap pointer
+                    # array. Fortran forbids scalar-element sequence
+                    # association for a pointer array actual; the exact tail
+                    # section retains its rank and aliases the same storage.
+                    return f"{self._indexed_base(collection)}({subscripts}:)"
                 return f"{self._indexed_base(collection)}({subscripts})"
         return self._operand(value)
 
@@ -1694,6 +1821,14 @@ class _FunctionEmitter:
             "slice", "gather", "scatter", "index_set", "pad", "cumsum",
             "repeat",
         ):
+            return True
+        if (operation in {"GetElementPtr", "getelementptr"}
+                and consumer.args and int(consumer.args[0].id) == int(value.id)):
+            # id_space.compose's ')' glyph is string_token value 3 with
+            # declared arena shape (1,). Its sole consumer indexes that arena.
+            # Inlining the token produced a literal as the Store destination.
+            # The exact address-base edge requires a named designator, even
+            # when the literal producer is not spelled Const.
             return True
         if consumer.res is None:
             return False
@@ -2078,6 +2213,8 @@ class _FunctionEmitter:
         """Return a zero with the kind of ``value``'s emitted expression."""
 
         typed = self._typed(value)
+        if _unsigned_dtype(str(typed.dtype or self.dtype)):
+            return _literal(0, str(typed.dtype))
         producer = self._producers.get(typed.id)
         if producer is not None and typed.id in self._inlined:
             operation = (
@@ -2091,6 +2228,8 @@ class _FunctionEmitter:
                 # at every nesting level by _expression.
                 return "0_c_int64_t"
         dtype = str(typed.dtype or self.dtype).casefold()
+        if _unsigned_dtype(dtype):
+            return _literal(0, dtype)
         if dtype.endswith("int64"):
             return "0_c_int64_t"
         if dtype.endswith(("int32", "int")):
@@ -2314,12 +2453,33 @@ class _FunctionEmitter:
         result_dtype = str(self._typed(target).dtype or self.dtype)
         target_logical = result_dtype in _LOGICAL_DTYPES
         source_logical = self._is_logical(value)
+        target_layout = resolve_dtype_layout(result_dtype)
+        # The checked array(float32) extend helper inlines its int64 Cast at
+        # the insert call. The old writer stated float32 but returned
+        # real(value,c_double), so the callee's REAL(c_float) formal refused.
+        # The expression's kind must be the exact target layout at the Cast.
+        if target_layout is not None and target_layout.kind == "float":
+            source_dtype = str(self._typed(value).dtype or self.dtype)
+            if source_dtype == result_dtype and not source_logical:
+                return expression
+            kind = str(target_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            if source_logical:
+                expression = "merge(1_c_int64_t, 0_c_int64_t, " + expression + ")"
+            return f"real({expression}, {kind})"
+        if target_layout is not None and target_layout.kind in {"int", "uint"}:
+            source_dtype = str(self._typed(value).dtype or self.dtype)
+            if source_logical:
+                expression = "merge(1_c_int64_t, 0_c_int64_t, " + expression + ")"
+            if source_dtype == result_dtype and not source_logical:
+                return expression
+            return _native_integer_conversion(expression, result_dtype)
         if target_logical:
             if source_logical:
                 return expression
             source_dtype = str(getattr(value, "dtype", None) or self.dtype)
             zero = (
-                "0_c_int64_t" if source_dtype.endswith("int64")
+                _literal(0, source_dtype) if _unsigned_dtype(source_dtype)
+                else "0_c_int64_t" if source_dtype.endswith("int64")
                 else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
                 else "0.0_c_double"
             )
@@ -2379,12 +2539,21 @@ class _FunctionEmitter:
         target_dtype = str(target.dtype or self.dtype)
         source_logical = source_dtype in _LOGICAL_DTYPES
         target_logical = target_dtype in _LOGICAL_DTYPES
+        target_layout = resolve_dtype_layout(target_dtype)
+        if target_layout is not None and target_layout.kind == "float":
+            if source_dtype == target_dtype and not source_logical:
+                return expression
+            kind = str(target_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            if source_logical:
+                expression = "merge(1_c_int64_t, 0_c_int64_t, " + expression + ")"
+            return f"real({expression}, {kind})"
         if source_logical and target_logical:
             return f"logical({expression}, kind=c_bool)"
         if source_logical != target_logical:
             if target_logical:
                 zero = (
-                    "0_c_int64_t" if source_dtype.endswith("int64")
+                    _literal(0, source_dtype) if _unsigned_dtype(source_dtype)
+                else "0_c_int64_t" if source_dtype.endswith("int64")
                     else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
                     else "0.0_c_double"
                 )
@@ -2400,6 +2569,9 @@ class _FunctionEmitter:
             )
         source_integer = source_dtype in _INTEGER_DTYPES
         target_integer = target_dtype in _INTEGER_DTYPES
+        if target_integer and target_dtype not in _LOGICAL_DTYPES:
+            return (expression if source_dtype == target_dtype else
+                    _native_integer_conversion(expression, target_dtype))
         if target_integer:
             kind = (
                 "c_int64_t" if target_dtype.endswith("64")
@@ -2853,7 +3025,8 @@ class _FunctionEmitter:
             if target_logical and not source_logical:
                 source_dtype = str(source_value.dtype or self.dtype)
                 zero = (
-                    "0_c_int64_t" if source_dtype.endswith("int64")
+                    _literal(0, source_dtype) if _unsigned_dtype(source_dtype)
+                else "0_c_int64_t" if source_dtype.endswith("int64")
                     else "0_c_int32_t" if source_dtype.endswith(("int32", "int"))
                     else "0.0_c_double"
                 )
@@ -2864,9 +3037,25 @@ class _FunctionEmitter:
                 )
                 if str(target_value.dtype or self.dtype) in _INTEGER_DTYPES:
                     source_expression = f"int({source_expression}, c_int64_t)"
-            prelude.append(
-                f"    {output_argument} = {source_expression}"
+            same_caller_array = (
+                int(source_value.id) == int(target_value.id)
+                and str(source_value.dtype) == str(target_value.dtype)
+                and tuple(source_value.shape or ()) == tuple(target_value.shape or ())
+                and (
+                    bool(source_value.shape)
+                    or int(self.dynamic_array_ranks.get(int(source_value.id), 0)) > 0
+                    or int(source_value.id) in self.array_base_ids
+                )
             )
+            # Both values above are caller actuals: one Call operand and one
+            # aggregate projection in this function's SSA namespace. When a
+            # returned list already is that exact inout arena, the binding
+            # needs no seed copy. Emitting t9=t9 invented a whole assignment
+            # to an assumed-size array before the real batch call.
+            if not same_caller_array:
+                prelude.append(
+                    f"    {output_argument} = {source_expression}"
+                )
             input_arguments[input_index] = output_argument
             aliased_output_indices.add(int(output_index))
         if any(
@@ -2959,14 +3148,22 @@ class _FunctionEmitter:
                 # the caller.  Treat the exact callee output operand as that
                 # local; dynamic-rank propagation has already copied the
                 # formal's array contract onto this identity.
-                self._locals[instr.res.id] = self._typed(
-                    instr.args[position]
-                )
+                # The exact frame output operand is the physical local.
+                # Keying it by the semantic Call result registered one value
+                # under two identities (Const6 plus result7 -> operand6), so
+                # an identity-returning method declared t6 twice.
+                output_value = self._typed(instr.args[position])
+                self._locals[int(output_value.id)] = output_value
             elif not aliases_frame:
                 self._locals[instr.res.id] = self._typed(instr.res)
         elif output_count == 1 and instr.res is not None:
             self._locals[instr.res.id] = self._typed(instr.res)
             arguments.append(_name(instr.res))
+        elif instr.res is None and {
+            output for _input, output in self.callee_inout_pairs.get(callee, ())
+        } == set(range(output_count)):
+            # Every result is already carried by an explicit inout operand.
+            pass
         elif output_count != 0 or instr.res is not None:
             return None
         native_callee = self.callee_native_symbols.get(str(callee), str(callee))
@@ -3084,6 +3281,106 @@ class _FunctionEmitter:
         return [
             f"    call {symbol}({', '.join((*operands, _name(instr.res)))})"
         ]
+
+    def _host_callback_instructions(self) -> list[Instr]:
+        return [
+            instr
+            for block in self.function.blocks.values()
+            for instr in block.instrs
+            if instr.op == "HostCallback"
+        ]
+
+    def _host_callback_interfaces(self) -> list[str]:
+        """One bind(C) abstract interface and procedure pointer per call.
+
+        ``turing-host-callback-v1``: the host supplies ``R (*)(void *context,
+        A0, ...)`` and the context.  Both cross the entry as pointer-sized
+        integers; the interface states the exact C signature the call uses.
+        """
+
+        lines = []
+        for instr in self._host_callback_instructions():
+            signature = dict(instr.attributes.get("host_callback_signature") or {})
+            arguments = tuple(signature.get("arguments") or ())
+            if len(instr.args) != len(arguments) + 2:
+                raise FortranEmissionError(
+                    "host callback call does not match its signature: "
+                    f"value={instr.res.id} signature={signature!r}"
+                )
+            kinds = []
+            for position, dtype in enumerate(arguments):
+                kind = _DTYPE_KIND.get(str(dtype))
+                actual = str(self._typed(instr.args[position + 2]).dtype)
+                if kind is None or _DTYPE_KIND.get(actual) != kind:
+                    raise FortranEmissionError(
+                        "host callback argument has no exact native type: "
+                        f"value={instr.res.id} position={position} "
+                        f"declared={dtype!r} actual={actual!r}"
+                    )
+                kinds.append(kind)
+            result = signature.get("result")
+            interface = f"turing_host_callback_{int(instr.res.id)}"
+            dummies = ", ".join(
+                ("context", *(f"a{index}" for index in range(len(kinds))))
+            )
+            header = (
+                f"subroutine {interface}({dummies}) bind(C)"
+                if result is None else
+                f"function {interface}({dummies}) bind(C)"
+            )
+            body = [
+                "        import :: c_bool, c_double, c_int64_t, c_intptr_t",
+                "        integer(c_intptr_t), value :: context",
+                *(
+                    f"        {kind}, value :: a{index}"
+                    for index, kind in enumerate(kinds)
+                ),
+            ]
+            if result is not None:
+                kind = _DTYPE_KIND.get(str(result))
+                if kind is None or kind != _DTYPE_KIND.get(
+                    str(self._typed(instr.res).dtype)
+                ):
+                    raise FortranEmissionError(
+                        "host callback result has no exact native type: "
+                        f"value={instr.res.id} declared={result!r}"
+                    )
+                body.append(f"        {kind} :: {interface}")
+            lines.extend((
+                "    abstract interface",
+                f"      {header}",
+                *body,
+                "      end " + (
+                    "subroutine" if result is None else "function"
+                ) + f" {interface}",
+                "    end interface",
+                f"    procedure({interface}), pointer :: {interface}_pointer",
+            ))
+        return lines
+
+    def _host_callback_call(self, instr: Instr) -> list[str] | None:
+        if instr.op != "HostCallback":
+            return None
+        interface = f"turing_host_callback_{int(instr.res.id)}"
+        function, context, *arguments = instr.args
+        lines = [
+            "    call c_f_procpointer(transfer(int("
+            f"{self._operand(function)}, c_intptr_t), c_null_funptr), "
+            f"{interface}_pointer)",
+        ]
+        operands = ", ".join((
+            f"int({self._operand(context)}, c_intptr_t)",
+            *(self._operand(argument) for argument in arguments),
+        ))
+        signature = dict(instr.attributes.get("host_callback_signature") or {})
+        if signature.get("result") is None:
+            lines.append(f"    call {interface}_pointer({operands})")
+        else:
+            self._locals[int(instr.res.id)] = self._typed(instr.res)
+            lines.append(
+                f"    {_name(instr.res)} = {interface}_pointer({operands})"
+            )
+        return lines
 
     def _external_reference_interfaces(self) -> list[str]:
         from .shell_external_references import external_reference_thunk_symbol
@@ -4034,6 +4331,17 @@ class _FunctionEmitter:
 
     def _expression(self, instr: Instr) -> str | None:
         op = instr.op
+        if op == "HostCallbackPresent" and len(instr.args) == 1:
+            # ``self.trace is not None``: the host passes a null function
+            # pointer for an absent callable (turing-host-callback-v1).
+            present = (
+                "c_associated(transfer(int("
+                f"{self._operand(instr.args[0])}, c_intptr_t), "
+                "c_null_funptr))"
+            )
+            if instr.attributes.get("host_callback_present_when", True):
+                return f"logical({present}, kind=c_bool)"
+            return f"logical(.not. {present}, kind=c_bool)"
         if op in ("Call", "call"):
             # precompile_to_ssa.lower_fused_program_to_ssa wraps almost
             # every tensor op in Handler.Call (it names the C/LLVM kernel
@@ -4080,6 +4388,33 @@ class _FunctionEmitter:
                     return f"(ieee_is_nan({left}) .or. ieee_is_nan({right}))"
         args = [self._operand(a) for a in instr.args]
         constant = instr.attributes.get("constant", None)
+
+        # c634: uint64 values above INT64_MAX must stay native unsigned
+        # across every operator, not int(..., c_int64_t) or REAL storage.
+        # GNU's -funsigned kind owns the same width as the C uint buffer.
+        unsigned_values = [value for value in instr.args
+                           if _unsigned_dtype(str(self._typed(value).dtype or self.dtype))]
+        unsigned_op = {"BitAnd": "bitand", "BitOr": "bitor", "BitXor": "bitxor"}.get(op, op)
+        if unsigned_values and unsigned_op in _BINARY and len(args) == 2:
+            shift = unsigned_op in {"Shl", "Shr", "shl", "shr"}
+            operand_dtypes = {str(self._typed(value).dtype) for value in instr.args}
+            if not shift and len(operand_dtypes) != 1:
+                # Promotions must be explicit SSA Casts: the printer does not
+                # get to choose a signed/unsigned mixed-domain value contract.
+                return None
+            if unsigned_op in {"ULt", "ULe", "UGt", "UGe"}:
+                return {"ULt": "({0} < {1})", "ULe": "({0} <= {1})",
+                        "UGt": "({0} > {1})", "UGe": "({0} >= {1})"}[unsigned_op].format(*args)
+            if shift:
+                intrinsic = "shiftr" if unsigned_op in {"Shr", "shr"} else "shiftl"
+                return f"{intrinsic}({args[0]}, int({args[1]}, c_int64_t))"
+            if unsigned_op in {"FloorDiv", "floordiv"}:
+                return f"({args[0]} / {args[1]})"
+            if unsigned_op in {"Div", "truediv"} and str(instr.res.dtype or self.dtype) not in _INTEGER_DTYPES:
+                return f"(real({args[0]}, c_double) / real({args[1]}, c_double))"
+            return _BINARY[unsigned_op].format(*args)
+        if unsigned_values and op in {"Abs", "abs"} and len(args) == 1:
+            return args[0]
 
         if op in {"SiToFp", "UiToFp"} and len(instr.args) == 1 and self._is_logical(instr.args[0]):
             return _UNARY["bool_to_float64"].format(args[0])
@@ -4404,9 +4739,24 @@ class _FunctionEmitter:
                     return _REDUCTION[op].format(f"({args[0]} /= 0)")
                 return _REDUCTION[op].format(args[0])
             args = self._numeric(instr, args)
+            rule = max_step_rule(instr)
+            if (
+                rule is not None and op in ("max", "min")
+                and len(tuple(instr.args[0].shape or ())) == 1
+            ):
+                return fortran_reduction(rule, op == "max", args[0])
             return _REDUCTION[op].format(*args)
         if op in _TERNARY and len(args) == 3:
             return _TERNARY[op].format(*self._numeric(instr, args))
+        if op in ("max", "min") and len(args) == 2 and max_step_rule(instr):
+            # Builtin ``max(a, b)`` of one-element tensors: kept out of
+            # ``_BINARY``, whose membership other sites read as "elementwise
+            # with two operands" for the one-operand reduction too.
+            conformed = self._conform(instr, args)
+            if conformed is None:
+                return None
+            a, b = self._numeric(instr, conformed)
+            return fortran_step(max_step_rule(instr), op == "max", a, b)
         if op in _BINARY and len(args) == 2:
             template = _BINARY[op]
             # Shape first, then type. Conforming subscripts an operand to
@@ -4422,6 +4772,26 @@ class _FunctionEmitter:
                 args = conformed
             if op not in _LOGICAL_BINARY:
                 args = self._numeric(instr, args)
+            result_layout = resolve_dtype_layout(str(instr.res.dtype or self.dtype))
+            if (op in {"Add", "Sub", "Mul"} and result_layout is not None
+                    and result_layout.kind == "int"):
+                # Signed integer SSA uses the same fixed-width arithmetic
+                # at every catalogue width, as C/LLVM do. Plain signed
+                # Fortran overflow lets GNU fold ``MAX + runtime_one == MIN``
+                # to false.
+                # Perform the operation in the catalogue's matching unsigned
+                # domain, then convert the resulting bits to the signed kind.
+                unsigned_dtype = f"uint{8 * result_layout.byte_size}"
+                unsigned_args = [
+                    _native_integer_conversion(argument, unsigned_dtype)
+                    for argument in args
+                ]
+                return _native_integer_conversion(
+                    template.format(*unsigned_args), result_layout.name,
+                )
+            rule = max_step_rule(instr)
+            if rule is not None and is_max(op) is not None:
+                return fortran_step(rule, bool(is_max(op)), args[0], args[1])
             if op in {"FloorDiv", "floordiv"} and str(
                 instr.res.dtype or self.dtype
             ) in _INTEGER_DTYPES:
@@ -4459,6 +4829,38 @@ class _FunctionEmitter:
                 return f"(.not. {args[0]})"
             zero = self._truth_zero(instr.args[0])
             return f"({args[0]} == {zero})"
+        if op in {"SiToFp", "UiToFp"} and len(args) == 1:
+            source_dtype = str(self._typed(instr.args[0]).dtype or self.dtype)
+            source_layout = resolve_dtype_layout(source_dtype)
+            target_layout = resolve_dtype_layout(str(instr.res.dtype or self.dtype))
+            if source_layout is None or source_layout.kind not in {"int", "uint"} or target_layout is None or target_layout.kind != "float":
+                return None
+            source_kind = str(source_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            target_kind = str(target_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            source_conversion = "uint" if op == "UiToFp" else "int"
+            # UiToFp(int64 -1) means the unsigned 64-bit word, not -1.0.
+            # The explicit opcode owns interpretation even when its storage
+            # value's dtype has the opposite signedness.
+            return f"real({source_conversion}({args[0]}, {source_kind}), {target_kind})"
+        if op in {"SExt", "ZExt"} and len(args) == 1:
+            source_layout = resolve_dtype_layout(str(self._typed(instr.args[0]).dtype or self.dtype))
+            if source_layout is None or source_layout.kind not in {"int", "uint"}:
+                return None
+            source_kind = str(source_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+            source_conversion = "uint" if op == "ZExt" else "int"
+            interpreted = f"{source_conversion}({args[0]}, {source_kind})"
+            return _native_integer_conversion(interpreted, str(instr.res.dtype or self.dtype))
+        if op in {"Trunc", "FpToSi", "FpToUi"} and len(args) == 1:
+            target_dtype = str(instr.res.dtype or self.dtype)
+            target_layout = resolve_dtype_layout(target_dtype)
+            if target_layout is None or target_layout.kind not in {"int", "uint"}:
+                return None
+            if op in {"FpToSi", "FpToUi"}:
+                target_kind = str(target_layout.fortran_kind).split("(", 1)[1].rstrip(")")
+                intrinsic = "uint" if op == "FpToUi" else "int"
+                converted = f"{intrinsic}({args[0]}, {target_kind})"
+                return _native_integer_conversion(converted, target_dtype)
+            return _native_integer_conversion(args[0], target_dtype)
         if op in _UNARY and len(args) == 1:
             if op not in _LOGICAL_UNARY and op not in _LOGICAL_RESULT_UNARY:
                 args = self._numeric(instr, args)
@@ -4589,7 +4991,7 @@ class _FunctionEmitter:
                     body.extend(
                         f"    call turing_heap_release({_name(argument)})"
                         for argument in self.function.args
-                        if int(argument.id) in self._heap_owner_ids
+                        if int(argument.id) in self._frame_heap_owner_ids
                     )
                 body.append("    return")
                 continue
@@ -4629,6 +5031,11 @@ class _FunctionEmitter:
             cast = self._cast_kernel_call(instr)
             if cast is not None:
                 body.extend(cast)
+                continue
+
+            host_callback = self._host_callback_call(instr)
+            if host_callback is not None:
+                body.extend(host_callback)
                 continue
 
             call = self._ssa_call(instr)
@@ -4828,6 +5235,48 @@ class _FunctionEmitter:
         # growth); an allocation result is pointed where it is made.
         for argument in self.function.args:
             body[:0] = self._heap_refresh(argument)
+        if self.release_heap_owners and self.sequence_table is not None:
+            # Prepared Fortran calls reuse their workspace buffers. Releasing
+            # a private frame resets its owner but leaves old capacities and
+            # pointer cells behind; the next activation then treats freed
+            # arenas as live storage. C/LLVM entry wrappers start these same
+            # descriptor members empty on every call. Use the descriptor and
+            # ABI workspace ownership here too; public contexts survive.
+            initializations = {}
+            for descriptor in self.sequence_table.sequences.values():
+                owner = descriptor.heap_owner_value_id
+                if owner not in self._frame_heap_owner_ids:
+                    continue
+                pointer_ids = {int(owner), *map(int, descriptor.column_value_ids)}
+                scalar_ids = {int(descriptor.length_address_id), int(descriptor.capacity_value_id)}
+                if descriptor.status_address_id is not None:
+                    scalar_ids.add(int(descriptor.status_address_id))
+                pool = descriptor.child_table_pool
+                if pool is not None:
+                    pointer_ids.update(map(int, pool.column_value_ids))
+                    pointer_ids.add(int(pool.length_value_id))
+                    if pool.status_value_id is not None:
+                        pointer_ids.add(int(pool.status_value_id))
+                    scalar_ids.update((int(pool.capacity_value_id), int(pool.row_stride_value_id)))
+                for value_id in pointer_ids & self._formal_value_ids:
+                    initializations[value_id] = f"    t{value_id} = c_null_ptr"
+                for value_id in scalar_ids & self._formal_value_ids:
+                    # A private list's length/status is one scalar CELL,
+                    # also when the interoperable dummy is assumed-size.
+                    # ``values=[]; ...; selected=values[:end]`` previously
+                    # assigned zero to the entire assumed-size formal and
+                    # gfortran correctly refused its absent upper bound.
+                    # Address the existing one-element physical cell, rather
+                    # than inventing a whole-array extent for initialization.
+                    value = self._value_types[value_id]
+                    shape = tuple(value.shape or ())
+                    target = f"t{value_id}"
+                    if shape:
+                        if _element_count(shape) != 1:
+                            raise FortranEmissionError("sequence scalar cell has a nonscalar physical extent")
+                        target += "(" + ", ".join("1" for _ in shape) + ")"
+                    initializations[value_id] = f"    {target} = 0"
+            body[:0] = list(initializations.values())
         call_frame_cells = {
             int(value.id)
             for block in self.function.blocks.values()
@@ -4956,7 +5405,7 @@ class _FunctionEmitter:
             )
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(extent))
         }
-        extent_names = sorted(
+        extent_names = sorted((
             set(dim_extents.values())
             | called_extent_names
             | set(self.dynamic_array_extents.values())
@@ -4965,7 +5414,7 @@ class _FunctionEmitter:
                 for extents in self.dynamic_array_leading_extents.values()
                 for extent in extents
             }
-        )
+        ) - self._local_sequence_extent_expressions)
         self.extent_names = tuple(extent_names)
         argument_ids = {argument.id for argument in self.function.args}
         output_ids = {value.id for value in self.outputs}
@@ -4988,6 +5437,7 @@ class _FunctionEmitter:
             for extent in extent_names
         ]
         declarations.extend(self._external_reference_interfaces())
+        declarations.extend(self._host_callback_interfaces())
         # A referenced table must also be declared. Rendering the body sets
         # this flag, and the body is rendered before this point.
         if self.uses_sin_table:
@@ -5561,6 +6011,42 @@ def emit_module(
         if isinstance(module, IRModule)
         else {}
     )
+
+    def _published_tensor_layout(
+        function_name: str, value_id: int, seen: set[tuple[str, int]] | None = None,
+    ) -> str | None:
+        """Follow the exact SSA result identity to its tensor descriptor."""
+
+        identity = (str(function_name), int(value_id))
+        visited = set() if seen is None else seen
+        if identity in visited:
+            return None
+        visited.add(identity)
+        table = module_tensor_tables.get(str(function_name))
+        if table is not None:
+            for descriptor in table.tensors.values():
+                if int(descriptor.data_value_id) == int(value_id):
+                    return str(descriptor.layout)
+        function = functions.get(str(function_name))
+        if function is None:
+            return None
+        values = [*function.args]
+        values.extend(
+            instruction.res
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        )
+        value = next(
+            (candidate for candidate in values if int(candidate.id) == int(value_id)),
+            None,
+        )
+        if value is None:
+            return None
+        hop = (value.accounting or {}).get("ssa_call_result_from")
+        if hop and len(hop) == 2:
+            return _published_tensor_layout(str(hop[0]), int(hop[1]), visited)
+        return None
     module_sequence_tables = (
         dict(getattr(module, "sequence_tables", {}))
         if isinstance(module, IRModule)
@@ -5668,6 +6154,8 @@ def emit_module(
             if instruction.res is not None
         )
         for descriptor in table.records.values():
+            if _conceptual_record(descriptor, available_value_ids):
+                continue
             for field in descriptor.fields:
                 missing_values = set(field.value_ids) - available_value_ids
                 if missing_values:
@@ -5840,14 +6328,34 @@ def emit_module(
     roots = {
         name for name in explicitly_requested_roots if name in functions
     }
-    if not roots and outputs is None:
+    if not roots and outputs is None and not extra_roots:
         roots.update(str(name) for name in named_outputs if str(name) in functions)
-    roots.update(
-        str(name)
-        for name, function in functions.items()
-        if function.metadata.get("control_ir")
-    )
+    if not explicitly_requested_roots and not extra_roots:
+        # A nested format-spec validation diagnostic can leave an uncalled
+        # decimal formatter in the canonical catalogue. With an explicit root
+        # interface, its control_ir does not make it a standalone heap-return
+        # entry. Follow the selected roots' real call edges below; retain the
+        # implicit whole-control surface only when no interface was selected.
+        roots.update(
+            str(name)
+            for name, function in functions.items()
+            if function.metadata.get("control_ir")
+        )
     roots.update(str(root) for root in extra_roots if str(root) in functions)
+    from .ssa_storage_requirements import is_compiler_owned_storage
+    for root_name in roots:
+        public_values = (
+            *(value for value in functions[root_name].args
+              if not is_compiler_owned_storage(value)),
+            *named_outputs.get(root_name, ()),
+        )
+        for value in public_values:
+            layout = resolve_dtype_layout(value.dtype)
+            if (layout is not None and layout.kind in {"int", "uint"}
+                    and layout.numpy_dtype is None):
+                raise FortranEmissionError(
+                    f"internal dtype {layout.name!r} has no public Fortran buffer ABI"
+                )
     if roots:
         reachable = set()
         pending = list(sorted(roots))
@@ -7004,6 +7512,12 @@ def emit_module(
     entry_points = []
     subroutine_by_name = {item.name: item for item in subroutines}
     for function_name, function in functions.items():
+        if function_name not in roots:
+            # Reachable Fortran procedures use the native Fortran signature
+            # catalogue above. Only the already selected exports cross the
+            # foreign/public ABI; internal i128 operands do not acquire a
+            # ctypes/NumPy representation merely because a helper is called.
+            continue
         kind = _kind(function_name)
         note = None
         if kind == "control":
@@ -7114,6 +7628,16 @@ def emit_module(
                         (function.args, subroutine_by_name[function_name].argument_shapes),
                         (named_outputs.get(function_name, ()), subroutine_by_name[function_name].output_shapes))
                     for value, shape in zip(values, resolved_shapes, strict=True)},
+                value_layouts={
+                    int(value.id): layout
+                    for value in (
+                        *function.args,
+                        *named_outputs.get(function_name, ()),
+                    )
+                    if (layout := _published_tensor_layout(
+                        function_name, int(value.id),
+                    )) is not None
+                },
             )
         )
     control_entries = [e.name for e in entry_points if e.kind == "control"]
@@ -7387,6 +7911,31 @@ def emit_module(
                 ),
                 "external_reference_thunks": external_reference_thunks,
                 **({
+                    "host_callback_schema": HOST_CALLBACK_SCHEMA,
+                    "host_callbacks": {
+                        str(function_name): [
+                            dict(entry)
+                            for entry in function.metadata["host_callbacks"]
+                        ]
+                        for function_name, function in functions.items()
+                        if function.metadata.get("host_callbacks")
+                    },
+                    "host_callback_bindings": {
+                        str(function_name): [
+                            dict(entry)
+                            for entry in function.metadata[
+                                "host_callback_bindings"
+                            ]
+                        ]
+                        for function_name, function in functions.items()
+                        if function.metadata.get("host_callback_bindings")
+                    },
+                } if any(
+                    function.metadata.get("host_callbacks")
+                    or function.metadata.get("host_callback_bindings")
+                    for function in functions.values()
+                ) else {}),
+                **({
                     "host_linear_region_inlining": list(
                         host_linear_region_inlining
                     ),
@@ -7519,12 +8068,17 @@ def emit_module(
             ],
             "record_table_schema": "turing.repository-ssa-record-table.v1",
             "record_tables": {
-                function_name: [
+                function_name: records
+                for function_name, table in module_record_tables.items()
+                if function_name in functions
+                for records in ([
                     descriptor.to_mapping()
                     for descriptor in table.records.values()
-                ]
-                for function_name, table in module_record_tables.items()
-                if function_name in functions and table.records
+                    if not _conceptual_record(
+                        descriptor, _function_value_ids(functions[function_name]),
+                    )
+                ],)
+                if records
             },
             "value_union_table_schema": (
                 "turing.repository-ssa-value-union-table.v1"
@@ -7543,6 +8097,50 @@ def emit_module(
     return FortranModule(
         name, "\n".join(lines) + "\n", subroutines, api=api,
         precision_sections=module_precision_sections,
+    )
+
+
+def _function_value_ids(function: Any) -> set[int]:
+    """Every SSA id a function defines: its formals and instruction results."""
+
+    value_ids = {int(value.id) for value in function.args}
+    value_ids.update(
+        int(instruction.res.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+    )
+    return value_ids
+
+
+def _conceptual_record(descriptor: Any, available_value_ids: set[int]) -> bool:
+    """A record descriptor with no physical presence in its function.
+
+    Program: ``s = S(0); if c > 0: s.n = c * 2 else: s.n = 7 - c; return
+    s.n`` (corpus c397).  The record is a compile-time correlation: neither
+    its id nor any field value is an SSA value of ``root`` (the constructor's
+    ``0`` is overwritten on both arms and never emitted).  The C backend reads
+    record tables only for record parameters; Fortran refused the module with
+    "record 'S' field 'n' names absent SSA values [2]".  Rule: a descriptor
+    is checked (and exported) only when the record or one of its field values
+    is resident; a resident record with an absent field still refuses, and so
+    does any record with a field naming storage (a span, sequence, nested
+    record or reference): those name arenas the function must hold.
+    """
+
+    if int(descriptor.record_id) in available_value_ids:
+        return False
+    if any(
+        str(getattr(field.storage, "value", field.storage)) != "scalar"
+        or field.sequence_id is not None
+        or field.record_id is not None
+        for field in descriptor.fields
+    ):
+        return False
+    return not any(
+        int(value_id) in available_value_ids
+        for field in descriptor.fields
+        for value_id in field.value_ids
     )
 
 
@@ -7606,6 +8204,7 @@ def compile_module(
         stage_standalone_fortran_runtime,
         standalone_fortran_link_flags,
         standalone_runtime_shim_sources,
+        native_fortran_flags,
     )
 
     workdir = Path(
@@ -7620,6 +8219,7 @@ def compile_module(
         precision_sections=bool(getattr(module, "precision_sections", False)),
     ))
     try:
+        compile_flags = native_fortran_flags(compiler, module.source, compile_flags)
         link_flags = (
             standalone_fortran_link_flags(compiler, shared=True)
             if standalone else ()
@@ -7794,9 +8394,15 @@ class FortranCoreNative:
     #: cannot happen, and repeated loads of the same artifact stop
     #: happening too.
     _LIBRARIES: dict = {}
+    # ``os.add_dll_directory`` search handles are active only while the handle
+    # lives.  The compiled API already publishes the exact runtime dependency
+    # paths selected by the producer; retain one handle per published directory
+    # alongside the process-lifetime library cache.
+    _DLL_DIRECTORIES: dict = {}
 
     def __init__(self, library_path: Path, entry_record, api=None):
         import ctypes
+        import os
 
         self._entry_record = entry_record
         self._api = api
@@ -7804,6 +8410,28 @@ class FortranCoreNative:
         resolved = str(Path(library_path).resolve())
         library = FortranCoreNative._LIBRARIES.get(resolved)
         if library is None:
+            if os.name == "nt" and hasattr(os, "add_dll_directory"):
+                metadata = {} if api is None else dict(api.metadata)
+                # Compilation appends its selected runtime paths to the API it
+                # publishes beside the DLL.  Callers often still hold the
+                # emitter's pre-build API object, so the artifact's own exact
+                # contract is authoritative for loader dependencies.
+                published_path = Path(resolved).with_suffix(".api.yaml")
+                if published_path.is_file():
+                    from .compiled_program_api import load_api
+
+                    published = load_api(published_path)
+                    metadata = {
+                        **metadata,
+                        **dict(published.get("metadata") or {}),
+                    }
+                for dependency in metadata.get("runtime_dependencies", ()):
+                    dependency_path = Path(str(dependency["path"])).resolve()
+                    directory = str(dependency_path.parent)
+                    if directory not in FortranCoreNative._DLL_DIRECTORIES:
+                        FortranCoreNative._DLL_DIRECTORIES[directory] = (
+                            os.add_dll_directory(directory)
+                        )
             library = ctypes.CDLL(resolved)
             FortranCoreNative._LIBRARIES[resolved] = library
         self._library = library

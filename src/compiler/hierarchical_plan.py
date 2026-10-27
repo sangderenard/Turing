@@ -104,6 +104,7 @@ TENSOR_OPERATION_SCALAR_SPELLING: dict[str, str] = {
     "less_equal": "Le", "greater": "Gt", "greater_equal": "Ge",
     "logical_and": "LAnd", "logical_or": "LOr",
     "logical_not": "LNot", "maximum": "Max", "minimum": "Min",
+    "emax": "Max", "emin": "Min",
     "bitand": "BitAnd", "bitor": "BitOr", "bitxor": "BitXor",
     "shl": "Shl", "shr": "Shr", "invert": "Invert",
     "sqrt": "Sqrt", "exp": "Exp", "log": "Log",
@@ -150,7 +151,7 @@ REGION_SCALAR_CAST_DTYPES = {
 }
 REGION_DTYPE_PRESERVING_OPS = frozenset({
     "add", "sub", "mul", "floordiv", "mod", "pow", "neg", "abs",
-    "min", "max", "minimum", "maximum", "bitand", "bitor",
+    "min", "max", "minimum", "maximum", "emax", "emin", "bitand", "bitor",
     "bitxor", "shl", "shr", "invert",
 })
 
@@ -187,6 +188,7 @@ def expand_plan_regions(
     plan: PlanClosure, *, first_free_value_id: int = 0,
     function_scope: str = "<plan>",
     lexical_read_scope: tuple | None = None,
+    shape_scope: tuple | None = None,
     resident_limit: int | None = None,
 ) -> Mapping[tuple[str, int], tuple[Instr, ...]]:
     """Lower every top-level ``region_*`` closure of ``plan`` exactly once.
@@ -217,7 +219,7 @@ def expand_plan_regions(
         with compile_work("deployment regions", label=f"SSA region {item.name}"):
             return plan_region_to_ssa_instrs(
                 item, first_free_value_id=watermark,
-                function_scope=function_scope, lexical_read_scope=lexical_read_scope,
+                function_scope=function_scope, lexical_read_scope=lexical_read_scope, shape_scope=shape_scope,
             )
 
     def publish(_ordinal, item, instructions):
@@ -241,7 +243,7 @@ def expand_plan_regions(
             item,
             first_free_value_id=watermark,
             function_scope=function_scope,
-            lexical_read_scope=lexical_read_scope,
+            lexical_read_scope=lexical_read_scope, shape_scope=shape_scope,
         )
         publish(0, item, instructions)
     return expanded
@@ -387,6 +389,7 @@ def plan_region_to_ssa_instrs(
     region: PlanClosure, *, first_free_value_id: int = 0,
     function_scope: str = "<plan>",
     lexical_read_scope: tuple | None = None,
+    shape_scope: tuple | None = None,
 ) -> tuple[Instr, ...]:
     """Lower one planner-owned flat region to repository SSA instructions.
 
@@ -402,6 +405,7 @@ def plan_region_to_ssa_instrs(
     dtype_of = {
         int(value_id): dtype for value_id, _shape, dtype in region.value_shapes
     }
+    source_dtype_of = dict(dtype_of)
     rank_of = {
         int(value_id): int(rank) for value_id, rank in region.value_ranks
     }
@@ -427,50 +431,6 @@ def plan_region_to_ssa_instrs(
     predicate_type_page = current_identity_book().page(
         "operator_result_type_concordance"
     )
-    for item in region.items:
-        if not (
-            isinstance(item, PlanLine)
-            and item.outputs
-            and str(item.opcode).casefold() in predicate_ops
-        ):
-            continue
-        row = (
-            str(function_scope), int(region.closure_id), str(region.name),
-            int(item.outputs[0]),
-        )
-        claim = (str(item.opcode).casefold(), "bool")
-        incumbent = predicate_type_page.latest(row)
-        if incumbent is None:
-            from .concordance_declarations import (
-                CANONICAL_VALUE, OPERATOR_RESULT_TYPE, PLANNER_HIERARCHY,
-            )
-            from .identity_concordance import Derived, Mode
-
-            output_cell = (
-                None if lexical_read_scope is None else
-                current_identity_book().latest_ref(
-                    CANONICAL_VALUE,
-                    (tuple(lexical_read_scope), int(item.outputs[0])),
-                )
-            )
-            if output_cell is None:
-                # A planned program the reducer never saw: the claim stands
-                # on the control function's root, as its regions do.
-                from .precompile_to_ssa import _function_root_cell
-
-                output_cell = _function_root_cell(
-                    current_identity_book(), str(function_scope),
-                )
-            current_identity_book().post(
-                OPERATOR_RESULT_TYPE, row, claim, stage=PLANNER_HIERARCHY,
-                provenance=Derived((output_cell,)),
-                mode=Mode.CONCORD,
-            )
-        elif incumbent != claim:
-            raise ValueError(
-                "operator result-type concordance disagreement: "
-                f"row={row!r}, incumbent={incumbent!r}, candidate={claim!r}"
-            )
 
     def semantic_input_ids(item: PlanLine) -> tuple[int, ...]:
         if len(item.input_roles) != len(item.inputs):
@@ -485,6 +445,57 @@ def plan_region_to_ssa_instrs(
                 "operator", "operator_reference",
             }
         )
+
+    def source_result_class(value_id: int) -> str | None:
+        """Read the source class through this value's exact identity edges."""
+
+        if lexical_read_scope is None:
+            return None
+        from .concordance_declarations import CANONICAL_VALUE, SOURCE_VALUE_CLASS
+
+        book = current_identity_book()
+        fork_ref = book.latest_ref(
+            CANONICAL_VALUE, (tuple(lexical_read_scope), int(value_id)),
+        )
+        if fork_ref is None:
+            return None
+        origins = tuple(
+            source
+            for source, _stage in book.edges_into(fork_ref)
+            if source.page.name == CANONICAL_VALUE.name
+            and isinstance(source.row, tuple)
+            and len(source.row) == 2
+            and int(source.row[1]) == int(value_id)
+        )
+        if len(origins) != 1:
+            return None
+        source_classes = []
+        for target, _stage in book.edges_out_of(origins[0]):
+            if not (
+                target.page.name == SOURCE_VALUE_CLASS.name
+                and isinstance(target.row, tuple)
+                and len(target.row) == 2
+                and int(target.row[1]) == int(value_id)
+            ):
+                continue
+            fact = book.page(SOURCE_VALUE_CLASS).latest(target.row)
+            if isinstance(fact, tuple) and fact:
+                source_classes.append(str(fact[0]))
+        concordant_classes = tuple(dict.fromkeys(source_classes))
+        return concordant_classes[0] if len(concordant_classes) == 1 else None
+
+    def authored_scalar_result_dtype(value_id: int) -> str | None:
+        """Preserve the declared scalar ABI only for its exact source class."""
+
+        dtype = source_dtype_of.get(int(value_id))
+        if (
+            shape_of.get(int(value_id), ()) == ()
+            and rank_of.get(int(value_id), 0) == 0
+            and dtype in {"int", "int32", "int64", "i32", "i64"}
+            and source_result_class(int(value_id)) == "builtins.int"
+        ):
+            return str(dtype)
+        return None
 
     # An authored Python scalar literal is a weak operand: it names a value,
     # not an element width, so beside a typed float operand it does not widen
@@ -526,6 +537,19 @@ def plan_region_to_ssa_instrs(
             "f16", "f32", "f64",
         }):
             return promoted_float_dtype(value_ids) or "float64"
+        from ..transmogrifier.dtype_layout import (
+            common_integer_dtype, resolve as resolve_dtype,
+        )
+
+        layouts = tuple(resolve_dtype(dtype) for dtype in candidates)
+        kinds = {
+            layout.kind for layout in layouts if layout is not None
+        }
+        if "int" in kinds and "uint" in kinds:
+            return common_integer_dtype(candidates)
+        # Preserve the incumbent same-signed source result rules. The new
+        # common-domain join is needed when a signed and unsigned source
+        # operand meet; it does not replace the established int32/int64 law.
         if candidates.intersection({"int64", "i64"}):
             return "int64"
         if candidates.intersection({"int", "int32", "i32"}):
@@ -573,12 +597,18 @@ def plan_region_to_ssa_instrs(
                 inferred = str(declared_columns[0])
             elif opcode in {"const", "constant"}:
                 literal = dict(item.attributes).get("value")
-                inferred = (
-                    "bool" if isinstance(literal, bool)
-                    else "int64" if isinstance(literal, int)
-                    else "float64" if isinstance(literal, float)
-                    else None
-                )
+                if isinstance(literal, int) and not isinstance(literal, bool):
+                    from ..transmogrifier.dtype_layout import (
+                        python_int_literal_dtype,
+                    )
+
+                    inferred = python_int_literal_dtype(literal)
+                else:
+                    inferred = (
+                        "bool" if isinstance(literal, bool)
+                        else "float64" if isinstance(literal, float)
+                        else None
+                    )
             elif opcode in predicate_ops:
                 inferred = "bool"
             elif opcode in integer_result_ops:
@@ -593,7 +623,10 @@ def plan_region_to_ssa_instrs(
                     or "float64"
                 )
             elif opcode in dtype_preserving_ops:
-                inferred = promoted_numeric_dtype(semantic_input_ids(item))
+                inferred = (
+                    authored_scalar_result_dtype(output_id)
+                    or promoted_numeric_dtype(semantic_input_ids(item))
+                )
             elif opcode in projection_ops:
                 sources = semantic_input_ids(item)
                 inferred = (
@@ -614,7 +647,13 @@ def plan_region_to_ssa_instrs(
             if isinstance(literal, bool):
                 dtype_of[int(item.outputs[0])] = "bool"
             elif isinstance(literal, int):
-                dtype_of[int(item.outputs[0])] = "int64"
+                from ..transmogrifier.dtype_layout import (
+                    python_int_literal_dtype,
+                )
+
+                dtype_of[int(item.outputs[0])] = python_int_literal_dtype(
+                    literal,
+                )
             elif isinstance(literal, float):
                 dtype_of[int(item.outputs[0])] = "float64"
         if item.outputs and opcode in predicate_ops:
@@ -698,6 +737,56 @@ def plan_region_to_ssa_instrs(
         )
         values[value_id] = made
         return made
+
+    def cast_integer_operand(
+        item: PlanLine, source_position: int, operand: SSAValue,
+        target_dtype: str,
+    ) -> SSAValue:
+        """Convert one scalar operand to its exact common integer domain."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CONTROL_CAST, PLANNER_HIERARCHY, SSA_VALUE,
+        )
+        from .identity_concordance import ConcordanceRefusal, current_identity_book
+        from .precompile_to_ssa import _mint_ssa_id
+
+        book = current_identity_book()
+        source = (
+            None if lexical_read_scope is None else
+            book.latest_ref(
+                CANONICAL_VALUE,
+                (tuple(lexical_read_scope), int(operand.id)),
+            )
+        )
+        if source is None:
+            source = book.latest_ref(
+                SSA_VALUE, (function_scope, int(operand.id)),
+            )
+        if source is None:
+            raise ConcordanceRefusal(
+                "planner integer widening cannot name the exact operand "
+                f"identity for SSA value {operand.id}"
+            )
+        cast_id = _mint_ssa_id(
+            book, function_scope, CONTROL_CAST, (source,),
+            dtype=str(target_dtype), shape=tuple(operand.shape),
+            stage=PLANNER_HIERARCHY,
+        )
+        converted = SSAValue(
+            cast_id, dtype=str(target_dtype), shape=tuple(operand.shape),
+            accounting={},
+        )
+        values[cast_id] = converted
+        instructions.append(Instr(
+            "Cast", [operand], converted,
+            arg_roles=["operand"],
+            attributes={
+                "source_operator": str(item.opcode),
+                "target_dtype": str(target_dtype),
+            },
+        ))
+        fork_operand_read(item, source_position, converted, "operand", operand)
+        return converted
 
     def fork_operand_read(
         item: PlanLine, source_position: int, consumer: SSAValue,
@@ -902,13 +991,182 @@ def plan_region_to_ssa_instrs(
             fork_operand_read(item, 2, result, "upper", upper)
             continue
 
+        operands = [value(value_id) for value_id in semantic_inputs]
+        if len(semantic_inputs) == 2 and (
+            opcode.casefold() in {"lt", "le", "gt", "ge", "eq", "ne"}
+            or opcode.casefold() in dtype_preserving_ops
+        ):
+            from ..transmogrifier.dtype_layout import (
+                common_integer_dtype, resolve as resolve_dtype,
+            )
+
+            input_dtypes = tuple(
+                str(dtype_of.get(int(value_id)) or "")
+                for value_id in semantic_inputs
+            )
+            # The two-intern span path produces a scalar Add with an exact
+            # ``()`` value-shape row but no separate rank row for that
+            # intermediate.  Requiring a rank row suppressed the proven
+            # int64/uint64 common-domain Casts and left Gt mixed-typed.  The
+            # explicit shape row establishes rank zero; a present conflicting
+            # rank still refuses the integer conversion.
+            scalar_integer_inputs = all(
+                resolve_dtype(dtype) is not None
+                and resolve_dtype(dtype).kind in {"int", "uint", "bool"}
+                and dtype.casefold() != "opaque_ref"
+                and int(value_id) in shape_of
+                and shape_of.get(int(value_id), ()) == ()
+                and rank_of.get(int(value_id), 0) == 0
+                for value_id, dtype in zip(semantic_inputs, input_dtypes, strict=True)
+            )
+            common_dtype = (
+                common_integer_dtype(input_dtypes)
+                if scalar_integer_inputs else None
+            )
+            if common_dtype is not None:
+                for position, (value_id, dtype) in enumerate(
+                    zip(semantic_inputs, input_dtypes, strict=True)
+                ):
+                    layout = resolve_dtype(dtype)
+                    if layout is not None and layout.name != common_dtype:
+                        operands[position] = cast_integer_operand(
+                            item, position, operands[position], common_dtype,
+                        )
+
         instructions.append(Instr(
             opcode,
-            [value(value_id) for value_id in semantic_inputs],
+            operands,
             result,
             arg_roles=list(semantic_roles),
             attributes=attributes,
         ))
+    # The operation's domain is recorded after the existing promotion law
+    # and its explicit operand casts have run. In the real Vocabulary bool
+    # offset specialization, atom_index += 1 has a bool source shape but an
+    # int64 Add domain. The shape and physical views consume this exact
+    # operation record, rather than choosing whichever dtype fits a callee.
+    from .concordance_declarations import (
+        CANONICAL_VALUE, OPERATOR_RESULT_TYPE, PLANNER_HIERARCHY, SSA_VALUE,
+    )
+    from .identity_concordance import Derived, Mode
+    from ..transmogrifier.dtype_layout import resolve as resolve_dtype
+
+    book = current_identity_book()
+    domain_ops = (predicate_ops | integer_result_ops | dtype_preserving_ops
+                  | {"truediv", "div", "cast"})
+    authored_outputs = {
+        int(output): str(item.opcode).casefold()
+        for item in region.items if isinstance(item, PlanLine)
+        for output in item.outputs
+    }
+    for instruction in instructions:
+        result = instruction.res
+        if result is None or int(result.id) not in authored_outputs:
+            continue
+        operation = authored_outputs[int(result.id)]
+        if operation not in (domain_ops | scalar_cast_dtypes.keys()):
+            continue
+        layout = resolve_dtype(result.dtype)
+        if (int(result.id) not in dtype_of or layout is None
+                or layout.kind not in {"bool", "int", "uint", "float"}):
+            continue
+        if operation in (dtype_preserving_ops | {"truediv", "div"}) and any(
+            (operand_layout := resolve_dtype(
+                dtype_of.get(int(operand.id)) or getattr(
+                    book.page(SSA_VALUE).latest((str(function_scope), int(operand.id))),
+                    "dtype", None,
+                )
+            )) is None or operand_layout.kind not in {"bool", "int", "uint", "float"}
+            for operand in instruction.args
+        ):
+            continue
+        row = (str(function_scope), int(region.closure_id), str(region.name), int(result.id))
+        claim = (operation, str(result.dtype))
+        sources = []
+        if lexical_read_scope is not None:
+            cell = book.latest_ref(CANONICAL_VALUE, (tuple(lexical_read_scope), int(result.id)))
+            if cell is not None:
+                sources.append(cell)
+        for operand in instruction.args:
+            # A conversion's minted SSA identity is stronger than its source
+            # spelling: it is the actual operand consumed by this operation.
+            cell = book.latest_ref(SSA_VALUE, (str(function_scope), int(operand.id)))
+            if cell is None and lexical_read_scope is not None:
+                cell = book.latest_ref(CANONICAL_VALUE, (tuple(lexical_read_scope), int(operand.id)))
+            if cell is not None:
+                sources.append(cell)
+        if not sources:
+            from .precompile_to_ssa import _function_root_cell
+            sources.append(_function_root_cell(book, str(function_scope)))
+        incumbent = predicate_type_page.latest(row)
+        if incumbent is not None and incumbent != claim:
+            raise ValueError(
+                "operator result-type concordance disagreement: "
+                f"row={row!r}, incumbent={incumbent!r}, candidate={claim!r}"
+            )
+        operation_ref = book.post(
+            OPERATOR_RESULT_TYPE, row, claim, stage=PLANNER_HIERARCHY,
+            provenance=Derived(tuple(dict.fromkeys(sources))), mode=Mode.CONCORD,
+        )
+        # The graph's geometry and the operation's representation are views
+        # of the same value. Follow the recorded operand-to-result edges;
+        # equal numeric ids in another lexical fork are not an identity join.
+        from .concordance_declarations import CELL_SET
+        from .identity_concordance import (
+            SHAPE_EDGE_PAGE, SHAPE_STATE_PAGE, record_shape_transformation,
+            shape_transformation_state,
+        )
+        pending = list(sources)
+        seen = set()
+        shape_edges = {}
+        while pending:
+            source = pending.pop()
+            if source in seen:
+                continue
+            seen.add(source)
+            if source.page == CANONICAL_VALUE:
+                # The storage-effects kernel's edge += 1 is planned from
+                # read-scope fork 1 while its shape edge was recorded by
+                # sibling fork 0. Both copy the same exact original cell.
+                # Traverse only recorded copy relations, never a matching
+                # spelling/id in an independently owned scope.
+                pending.extend(parent for parent, edge_stage in book.edges_into(source)
+                               if parent.page == CANONICAL_VALUE
+                               and parent.row[1] == source.row[1]
+                               and edge_stage.name == "read_scope_fork")
+                for edge, _stage in book.edges_out_of(source):
+                    if (edge.page == CANONICAL_VALUE and edge.row[1] == source.row[1]
+                            and _stage.name == "read_scope_fork"):
+                        pending.append(edge)
+                    if edge.page != SHAPE_EDGE_PAGE:
+                        continue
+                    target_scope, target_id, _scope, _value, _stage, edge_op, _role = edge.row
+                    if (target_id == int(result.id) and str(edge_op).casefold() == operation
+                            and (shape_scope is None or target_scope == tuple(shape_scope))):
+                        shape_edges.setdefault((target_scope, target_id), []).append(edge)
+            elif source.page in {SSA_VALUE, CELL_SET}:
+                pending.extend(parent for parent, _stage in book.edges_into(source))
+        if len(shape_edges) > 1:
+            from .identity_concordance import ConcordanceRefusal
+            raise ConcordanceRefusal(
+                f"operation domain has ambiguous shape identities: {row!r}: {tuple(shape_edges)!r}"
+            )
+        for shape_row, edges in shape_edges.items():
+            prior_ref = book.latest_ref(SHAPE_STATE_PAGE, shape_row)
+            prior = book.page(SHAPE_STATE_PAGE).latest(shape_row)
+            if not (isinstance(prior, tuple) and prior and prior[0] == "resolved"):
+                continue
+            geometry = shape_transformation_state(prior[1])
+            if geometry is None or str(geometry[1]) == str(result.dtype):
+                continue
+            extents, _dtype, rank, metadata, row_shape = geometry
+            target = (extents, str(result.dtype), rank, metadata, row_shape)
+            record_shape_transformation(
+                shape_row[0], shape_row[1], shape_row[0], shape_row[1],
+                stage=PLANNER_HIERARCHY.name, operation=operation,
+                source_state=geometry, target_state=target, role="operation_domain",
+                source_cells=tuple(dict.fromkeys((operation_ref, prior_ref, *sources, *edges))),
+            )
     return tuple(instructions)
 
 

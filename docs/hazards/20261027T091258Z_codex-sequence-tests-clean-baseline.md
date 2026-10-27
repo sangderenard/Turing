@@ -1,0 +1,23 @@
+2026-10-27 Full sequence-table test comparison against clean review HEAD (MEASURED)
+
+- Read the clean review checkout's latest hazard receipt before testing. Verified `C:/dev/tg-child-review` is clean at `1c6a04ad55de0efd0ca7b5e75069f2057d4a914c`; no files were edited there.
+- Ran `python -m pytest -q --tb=no tests/test_ir_sequence_tables.py` in both worktrees. Clean review: 15 failed, 39 passed in 10.23s. Shared repair tree: 15 failed, 40 passed in 10.71s. The repair tree has one additional passing dynamic-append-slice test.
+- The exact 15 failing test names are identical in both runs:
+  - `test_authored_ordinary_class_infers_only_proven_receiver_state`
+  - `test_authored_constructor_schema_keeps_tuple_slots_and_object_references`
+  - `test_bare_tuple_constructor_field_is_an_opaque_native_reference`
+  - `test_keyed_record_value_derives_nested_enum_row_table_columns`
+  - `test_authored_schema_keeps_literal_vocabulary_and_optional_scalar_tag`
+  - `test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table`
+  - `test_compiled_retained_loop_mutates_caller_sequence_record`
+  - `test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it`
+  - `test_empty_aggregate_const_becomes_explicit_sequence_arena_argument`
+  - `test_retained_field_sequence_populates_typed_record_from_lowered_storage`
+  - `test_declared_array_receiver_refines_raw_span_before_method_linking`
+  - `test_empty_dict_constructor_keeps_accepted_receiver_table_roles`
+  - `test_readonly_forwarding_keeps_typed_mutable_sequence_owner`
+  - `test_array_u32_receiver_column_keeps_authored_dtype_before_append`
+  - `test_static_program_reference_is_typed_ssa_and_native_handle_storage`
+- No failure is unique to the repair tree. The append-slice helper tests pass in both; the new owner-backed dynamic append-slice test passes in repair.
+- Failure causes match by test: missing `Builder.fresh` surface; added `python_type` schema fields; `keyed` versus `sequence` storage concordance; unknown dtype in Fortran API or extend; extra/missing sequence member IDs; unresolved call/Ret concordance; pointer dtype `ptr` where the test expected `uint32`; and changed static-reference literal emission.
+- The exact two baseline/repair result logs are in the tool output for this task. No attempt was made to fix unrelated failures.
