@@ -388,3 +388,25 @@ def test_a_nested_early_return_with_no_return_after_it_stays_refused():
         "function root(n, p) { if (p) { if (n > 1) return 1; } }"
     )
     assert not lower_javascript_source_to_ssa(source).complete
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    "let s = 0; let i = 0; do { s += n; i++; if (s > 9) break; } while (i < 3); return s;",
+    "let s = 0; switch (n) { case 1: s = 1; case 2: s += 2; break; default: s = 7; case 3: s += 3; } return s;",
+])
+def test_do_and_switch_become_the_loops_and_ifs_they_mean(body):
+    source = f"/** @param {{number}} n */ function root(n) {{ {body} }}"
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(source, "[[0], [1], [2], [3], [5], [NaN], [-0]]") == "PASS"
+
+
+@needs_node
+def test_a_switch_whose_cases_declare_a_let_stays_refused():
+    # Every case shares one scope; per-case blocks would split it.
+    source = (
+        "/** @param {number} n */ function root(n) { switch (n) "
+        "{ case 1: let t = 2; return t; default: return 0; } }"
+    )
+    assert not lower_javascript_source_to_ssa(source).complete
