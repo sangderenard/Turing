@@ -4,7 +4,7 @@ The JavaScript counterpart of ``differential_fuzz.py``.  Each program is a
 random function over two Number parameters (``a``, ``b``) and two Boolean
 parameters (``p``, ``q``) built from ``const``/``let`` bindings,
 reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``
-and bounded ``for``/``while`` loops,
+and bounded ``for``/``while`` loops (with guarded ``break``/``continue``),
 an optional early-return ``if`` and typed expression snippets.  It is lowered with
 ``lower_javascript_source_to_ssa``, compiled through the C backend and run on
 rows of ordinary and special values (``NaN``, ``-0``, ``Infinity``), and
@@ -149,9 +149,16 @@ class Generator:
         visible = list(self.numbers)
         for _ in range(rng.randint(1, 2)):
             choice = rng.random()
-            if depth > 0 and choice < 0.15:
+            if self.loops and choice < 0.12:
+                # ``continue`` would skip a while loop's trailing counter
+                # increment, so only a ``for`` loop gets one.
+                exit_ = "break" if self.loops[-1] == "while" or (
+                    rng.random() < 0.5
+                ) else "continue"
+                lines.append(f"{indent}if ({self.condition(1)}) {{ {exit_}; }}")
+            elif depth > 0 and choice < 0.25:
                 lines.extend(self.loop_statement(depth - 1, indent))
-            elif depth > 0 and choice < 0.4:
+            elif depth > 0 and choice < 0.5:
                 lines.extend(self.if_statement(depth - 1, indent))
             else:
                 lines.append(f"{indent}{self.assignment(2)}")
@@ -175,11 +182,14 @@ class Generator:
         self.numbers.append(counter)
         if rng.random() < 0.7:
             lines = [f"{indent}for (let {counter} = 0; {guard}; {counter}++) {{"]
+            self.loops.append("for")
             lines.extend(self.block(depth, indent + "  "))
         else:
             lines = [f"{indent}let {counter} = 0;", f"{indent}while ({guard}) {{"]
+            self.loops.append("while")
             lines.extend(self.block(depth, indent + "  "))
             lines.append(f"{indent}  {counter}++;")
+        self.loops.pop()
         lines.append(f"{indent}}}")
         if lines[0].lstrip().startswith("for"):
             # A for-head let is scoped to the loop.
@@ -202,6 +212,7 @@ class Generator:
         self.mutable_numbers = ["a", "b"] if rng.random() < 0.3 else []
         self.mutable_booleans = []
         self.loop_index = 0
+        self.loops: list[str] = []
         for index in range(rng.randint(0, 4)):
             binding = "let" if rng.random() < 0.5 else "const"
             if rng.random() < 0.7:
