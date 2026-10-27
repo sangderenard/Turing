@@ -228,9 +228,14 @@ How much of the work goes into a concordance? Some? Enough to keep track?
 
 **No. Everything.**
 
-A concordance is the complete data structure for the work, organized in a
-correlatory sense. Every entity, relationship, representation, decision,
-transformation, and its provenance belongs in it. The word **complete** is
+**A concordance is a complete data structure that has been organized in a
+correlatory sense. Everything in the work is in that data structure.**
+
+Compilation operates on that data structure. The concordance is not an
+audit trail kept alongside some other working structure.
+
+Every entity, relationship, representation, decision, transformation, and
+its provenance belongs in it. The word **complete** is
 doing some work here. Do not quietly redefine it as "the parts I remembered
 to record."
 
