@@ -887,10 +887,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{arguments.output.resolve() / 'manifest.json'}",
         flush=True,
     )
+    # The manager's late transport exception was buried in worker telemetry;
+    # the final verification only said that no library existed. Repeat the
+    # actual recorded failure here so copying the terminal's end retains it.
+    native_failed = 0
+    for unit in manifest["units"]:
+        native_failure = unit.get("native_status") == "failed"
+        native_failed += int(native_failure)
+        if unit.get("status") != "failed" and not native_failure:
+            continue
+        detail = unit
+        failure_path = unit.get("failure")
+        if native_failure:
+            failure_path = unit.get("native_failure")
+            if failure_path:
+                detail = json.loads(
+                    (arguments.output / failure_path).read_text(encoding="utf-8")
+                )
+        error = str(detail.get("error") or "")
+        print(json.dumps({
+            "stage": "failure_summary",
+            "qualified_name": unit["qualified_name"],
+            "phase": "native" if native_failure else "lowering",
+            "error_type": detail.get("error_type"),
+            "error": error[:2000],
+            "error_truncated": len(error) > 2000,
+            "failure": str(arguments.output / failure_path) if failure_path else None,
+        }, sort_keys=True), flush=True)
     for verification in manifest.get("native_case_verification", ()):
         print(json.dumps(verification, sort_keys=True), flush=True)
     case_failure = any(not item.get("verified") for item in manifest.get("native_case_verification", ()))
-    return 1 if failed or partial or blocked or case_failure else 0
+    return 1 if failed or partial or blocked or native_failed or case_failure else 0
 
 
 if __name__ == "__main__":
