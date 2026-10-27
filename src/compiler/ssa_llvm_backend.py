@@ -769,7 +769,7 @@ _INTEGER_COMPARISON: dict[str, str] = {
 _INTEGER_SELECTION: dict[str, str] = {"Max": "sgt", "Min": "slt"}
 
 
-_INTEGER_LLVM_TYPES = frozenset({"i1", "i8", "i16", "i32", "i64"})
+_INTEGER_LLVM_TYPES = frozenset({"i1", "i8", "i16", "i32", "i64", "i128"})
 
 
 def _unsigned_value(value: _Any) -> bool:
@@ -1097,8 +1097,8 @@ def _align(llvm_type: _Any) -> int:
     alignment on an under-aligned address is a miscompile waiting for the
     right optimisation pass, not a cosmetic wart.
 
-    Over-aligning an ``alloca`` is a different case and stays at 8: there the
-    number is a request for the allocation, and asking for more is safe.
+    An ``alloca`` requests at least this alignment (and retains the historical
+    minimum of 8). Internal i128 cells require 16 before a load may promise 16.
     """
 
     return _LLVM_TYPE_BYTES.get(str(llvm_type), 8)
@@ -1122,7 +1122,7 @@ def _frame_slot(
 
     byte_count = int(count) * _LLVM_TYPE_BYTES.get(str(llvm_type), 8)
     if byte_count <= _FRAME_HEAP_BYTES:
-        allocas.append(f"  {register} = alloca {llvm_type}, i64 {count}, align 8")
+        allocas.append(f"  {register} = alloca {llvm_type}, i64 {count}, align {max(8, _align(llvm_type))}")
         return
     allocas.append(f"  {register} = call ptr @malloc(i64 {byte_count})")
     frees.append(f"  call void @free(ptr {register})")
@@ -1150,6 +1150,8 @@ def _public_numpy_dtype(value: _Any) -> str:
     if llvm_type == "ptr":
         return "uintp"
     if layout is not None and layout.kind in {"int", "uint", "bool"}:
+        if layout.numpy_dtype is None:
+            raise ValueError(f"internal dtype {layout.name!r} has no public buffer ABI")
         return str(layout.numpy_dtype)
     return _llvm_abi_numpy_table()[llvm_type]
 
@@ -3991,7 +3993,7 @@ def _emit_repository_call_module(
                             )
                             body.append(
                                 f"  {temporary} = alloca {llvm_type}, "
-                                f"i64 {count}, align 8"
+                                f"i64 {count}, align {max(8, _align(llvm_type))}"
                             )
                             result_ptrs.append(temporary)
                     elif (
@@ -4026,7 +4028,7 @@ def _emit_repository_call_module(
                                 )
                                 body.append(
                                     f"  {temporary} = alloca {llvm_type}, "
-                                    f"i64 {count}, align 8"
+                                    f"i64 {count}, align {max(8, _align(llvm_type))}"
                                 )
                                 result_ptrs.append(temporary)
                     elif declared_ids:
@@ -4085,7 +4087,7 @@ def _emit_repository_call_module(
                                 )
                                 body.append(
                                     f"  {temporary} = alloca {llvm_type}, "
-                                    f"i64 {count}, align 8"
+                                    f"i64 {count}, align {max(8, _align(llvm_type))}"
                                 )
                                 result_ptrs.append(temporary)
                     else:
@@ -4098,7 +4100,7 @@ def _emit_repository_call_module(
                                 count = _value_element_count(value)
                                 temporary = f"%call.output.{tag}.{output_index}"
                                 body.append(
-                                    f"  {temporary} = alloca {llvm_type}, i64 {count}, align 8"
+                                    f"  {temporary} = alloca {llvm_type}, i64 {count}, align {max(8, _align(llvm_type))}"
                                 )
                                 result_ptrs.append(temporary)
                     semantic_arguments = list(instruction.args)
@@ -5272,6 +5274,19 @@ def _emit_repository_call_module(
         )
     )
     public_values = [*root_public_args, *root_outputs]
+    # Internal exact arithmetic may use wider integers, but the host buffer
+    # contract has no NumPy/ctypes 128-bit integer cell. Refuse that boundary
+    # explicitly; internal calls retain their existing pointer-only ABI.
+    unsupported_public = [value for value in public_values
+                          if _value_llvm_type(value) == "i128"]
+    if unsupported_public:
+        return LLVMFunctionArtifact(
+            name=entry_name, llvm_ir="", buffer_order=(), buffer_shapes=(),
+            extent_order=(), shortfalls=tuple(LLVMEmissionShortfall(
+                function_name, "ProgramABI",
+                f"internal dtype {value.dtype!r} value {value.id} has no public 128-bit buffer ABI",
+            ) for value in unsupported_public),
+        )
     buffer_order: list[int] = []
     buffer_shapes: list[tuple[_Any, ...]] = []
     buffer_dtypes: list[str] = []
@@ -6780,7 +6795,7 @@ def emit_ssa_function_to_llvm(
         or any(_value_llvm_type(value) == "float" for value in function.args)
         # The repository module emitter owns exact physical integer widths
         # and signedness; the legacy register-only leaf path has no such ABI.
-        or any(_value_llvm_type(v) in {"i8", "i16"}
+        or any(_value_llvm_type(v) in {"i8", "i16", "i128"}
                or (_unsigned_value(v) and _value_llvm_type(v) != "i1")
                for v in (*function.args, *(v
                    for b in function.blocks.values() for i in b.instrs

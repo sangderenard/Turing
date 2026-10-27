@@ -885,6 +885,22 @@ def _c_numeric_literal(value: bool | int | float, c_type: str) -> str:
                else dtype_layout(c_lane_dtype_for_storage(c_type)))
     if integer.kind in {"int", "uint", "bool"}:
         numeric = int(value)
+        if integer.byte_size == 16:
+            # C has no 128-bit literal suffix. Build the exact internal
+            # value from two uint64 limbs before converting its signedness.
+            width = 8 * integer.byte_size
+            lower = 0 if integer.kind == "uint" else -(1 << (width - 1))
+            upper = (1 << width) - 1 if integer.kind == "uint" else (1 << (width - 1)) - 1
+            if not lower <= numeric <= upper:
+                raise ValueError(f"constant {numeric} is outside {integer.name}")
+            magnitude = numeric if numeric >= 0 else -numeric - 1
+            unsigned = _unsigned_c_type(integer.name)
+            limbs = (
+                f"((({unsigned}){magnitude >> 64}ULL << 64) | "
+                f"({unsigned}){magnitude & ((1 << 64) - 1)}ULL)"
+            )
+            return (f"(({c_type})({limbs}))" if numeric >= 0 else
+                    f"(-(({c_type})({limbs})) - 1)")
         if integer.kind == "uint":
             return f"{numeric}ULL"
         if numeric == -(1 << 63):
@@ -908,6 +924,14 @@ def _numpy_dtype(dtype) -> str:
     if str(dtype).casefold() in {"ptr", "ptrptr_float64"}:
         return "uintp"
     return c_lane_numpy_dtype(dtype)
+
+
+def _public_buffer_dtype(dtype: str) -> str:
+    """Internal integer registers are not a NumPy/ProgramABI buffer ABI."""
+    layout = resolve_dtype(dtype)
+    if layout is not None and layout.kind in {"int", "uint"} and layout.numpy_dtype is None:
+        raise ValueError(f"internal dtype {layout.name!r} has no public C buffer ABI")
+    return dtype
 
 
 def _dtype_for_c_storage(c_type: str) -> str:
@@ -6616,7 +6640,7 @@ def emit_ssa_module_to_c(
             requirement.shape if requirement is not None else formal.shape or ()
         ))
         held = solved_buffer_type(function_name, formal)
-        buffer_dtypes.append(solved_buffer_dtype(function_name, formal, held))
+        buffer_dtypes.append(_public_buffer_dtype(solved_buffer_dtype(function_name, formal, held)))
         index = len(buffer_order) - 1
         entry_lines.append(
             f"    {held} *b{index} = "
@@ -6679,7 +6703,7 @@ def emit_ssa_module_to_c(
             if output_id in storage_requirements else output.shape or ()
         ))
         element_type = solved_buffer_type(function_name, output)
-        buffer_dtypes.append(solved_buffer_dtype(function_name, output, element_type))
+        buffer_dtypes.append(_public_buffer_dtype(solved_buffer_dtype(function_name, output, element_type)))
         index = len(buffer_order) - 1
         entry_lines.append(
             f"    {element_type} *b{index} = "

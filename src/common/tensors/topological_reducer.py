@@ -171,6 +171,27 @@ from ...transmogrifier.graph.node_special_cases import tensor_annotation_identit
 logger = logging.getLogger(__name__)
 
 
+def _sequence_mutation_argument_ids(
+    operation: str, edges: Iterable[tuple[int, str]],
+) -> tuple[int, ...]:
+    """Return the argument occurrences retained by the mutation fact.
+
+    This is the existing SOURCE_SEQUENCE_MUTATION contract: positional
+    arguments, plus ``sort(key=...)`` because that callable controls the
+    mutation order. Keep the ordinary call writer and loop-effect writer on
+    this one projection so their same source call cannot publish competing
+    facts. Keyword mutation options not represented by the incumbent page
+    shape remain outside this fact.
+    """
+
+    return tuple(
+        int(value_id)
+        for value_id, role in edges
+        if str(role).startswith("arg")
+        or (str(operation) == "sort" and str(role) == "kw:key")
+    )
+
+
 _NUMERIC_FEATURE_TYPES = {
     frozenset({"precision"}): "Precision",
     frozenset({"complex", "precision"}): "ComplexPrecision",
@@ -9183,18 +9204,6 @@ def _normalize_lexical_values(
                     ))
                     if receiver_class is not None else None
                 )
-                if expression.attr == "exact_atoms":
-                    print(
-                        "EXACT_ATOMS_FIELD:",
-                        "receiver_class=", repr(receiver_class),
-                        "field_kind=", repr(field_kind),
-                        "entries=", {
-                            key: kind
-                            for key, kind in (class_field_aggregate_kinds or {}).items()
-                            if key[1] == "exact_atoms"
-                        },
-                        flush=True,
-                    )
                 field_storage = (
                     dict((class_field_storage_contracts or {}).get((
                         str(receiver_class), str(expression.attr)
@@ -9610,6 +9619,102 @@ def _normalize_lexical_values(
                         node_id,
                         (*receiver_inputs, *argument_inputs, *keyword_inputs),
                     )
+                # Sequence mutation receipts used to be emitted only while
+                # collecting loop state effects below. That omitted a field
+                # append outside a loop, such as
+                # ``self.offsets.append(len(self.items))``. Resolve the
+                # receiver through the same source binding used by call
+                # lowering, so a local alias (``offsets = self.offsets;
+                # offsets.append(...)``) retains the field-read identity too.
+                # The loop collector still owns loop-state semantics; its
+                # identical field fact concords with this row.
+                if (
+                    isinstance(expression.func, ast.Attribute)
+                    and isinstance(receiver_value, int)
+                    and receiver_value in graph.G
+                    and node_id in graph.G
+                ):
+                    receiver_attributes = dict(
+                        graph.G.nodes[receiver_value].get("attributes") or {}
+                    )
+                    aggregate_kind = str(
+                        receiver_attributes.get("aggregate_kind") or ""
+                    ).casefold()
+                    operation_name = str(expression.func.attr)
+                    writable = bool(receiver_attributes.get(
+                        "sequence_writable", True,
+                    ))
+                    sequence_policy = (
+                        "unique" if aggregate_kind in {"set", "dict"}
+                        else "duplicates" if aggregate_kind in {
+                            "list", "tuple", "bytes", "bytearray", "array",
+                        }
+                        else None
+                    )
+                    sequence_method_call = (
+                        sequence_policy is not None
+                        and aggregate_kind not in {"tuple", "bytes"}
+                        and writable
+                    )
+                    mapping_method_call = (
+                        aggregate_kind == "dict" and writable
+                    )
+                    if sequence_method_call or mapping_method_call:
+                        from ...compiler.concordance_declarations import (
+                            SOURCE_SEQUENCE_MUTATION,
+                        )
+                        argument_ids = _sequence_mutation_argument_ids(
+                            operation_name,
+                            (*argument_inputs, *keyword_inputs),
+                        )
+                        known_mutation = (
+                            operation_name in _SEQUENCE_MUTATION_OPERATORS
+                            and not (
+                                aggregate_kind == "dict"
+                                and operation_name == "pop"
+                            )
+                        ) or operation_name in _MAPPING_MUTATION_OPERATORS
+                        mutation_operation = (
+                            operation_name if known_mutation
+                            else f"unclassified_call:{operation_name}"
+                        )
+                        mutation_fact = (
+                            int(receiver_value), mutation_operation,
+                            str(sequence_policy), argument_ids,
+                            "mapping" if aggregate_kind == "dict" else "sequence",
+                        )
+                        mutation_row = (value_class_scope, int(node_id))
+                        mutation_page = current_identity_book().page(
+                            SOURCE_SEQUENCE_MUTATION
+                        )
+                        incumbent = mutation_page.latest(mutation_row)
+                        if incumbent is not None and tuple(incumbent) != mutation_fact:
+                            raise ValueError(
+                                "source sequence mutation concordance "
+                                f"disagreement for {mutation_row!r}: "
+                                f"recorded={incumbent!r}, "
+                                f"proposed={mutation_fact!r}"
+                            )
+                        if incumbent is None:
+                            mutation_sources = [
+                                node_identity_cell(graph, int(node_id)),
+                                node_identity_cell(graph, int(receiver_value)),
+                            ]
+                            mutation_sources.extend(
+                                node_identity_cell(graph, int(argument_id))
+                                for argument_id in argument_ids
+                            )
+                            current_identity_book().post(
+                                SOURCE_SEQUENCE_MUTATION,
+                                mutation_row,
+                                mutation_fact,
+                                stage=_REDUCTION,
+                                provenance=_Derived(tuple(dict.fromkeys(
+                                    cell for cell in mutation_sources
+                                    if cell is not None
+                                ))),
+                                mode=_Mode.CONCORD,
+                            )
             callee = resolved_call_argument(expression.func)
             if isinstance(callee, _StaticPythonReference) and node_id in graph.G:
                 identity_target = (
@@ -13463,6 +13568,67 @@ def _normalize_lexical_values(
                     if isinstance(value_occurrence, ast.Name) else None
                 ),
             )
+            # Preserve indexed writes on the exact resolved sequence value.
+            # Calls such as ``items.append(v)`` already post
+            # SOURCE_SEQUENCE_MUTATION above; without this writer,
+            # ``items[i] = v`` could be an unrecorded store in a later
+            # owned-column proof. The receipt is deliberately generic: a
+            # setitem is evidence of a writer, never evidence that its value
+            # fits any narrower logical domain.
+            base_attributes = dict(
+                graph.G.nodes[base].get("attributes") or {}
+            )
+            aggregate_kind = str(
+                base_attributes.get("aggregate_kind") or ""
+            ).casefold()
+            sequence_policy = (
+                "unique" if aggregate_kind in {"set", "dict"}
+                else "duplicates" if aggregate_kind in {
+                    "list", "tuple", "bytes", "bytearray", "array",
+                }
+                else None
+            )
+            if sequence_policy is not None:
+                from ...compiler.concordance_declarations import (
+                    SOURCE_SEQUENCE_MUTATION,
+                )
+                mutation_values = tuple(map(int, (*indices, value)))
+                mutation_fact = (
+                    int(base), "setitem", str(sequence_policy),
+                    mutation_values,
+                    "mapping" if aggregate_kind == "dict" else "sequence",
+                )
+                mutation_row = (value_class_scope, int(node_id))
+                mutation_page = current_identity_book().page(
+                    SOURCE_SEQUENCE_MUTATION
+                )
+                incumbent = mutation_page.latest(mutation_row)
+                if incumbent is not None and tuple(incumbent) != mutation_fact:
+                    raise ValueError(
+                        "source sequence mutation concordance disagreement "
+                        f"for {mutation_row!r}: recorded={incumbent!r}, "
+                        f"proposed={mutation_fact!r}"
+                    )
+                if incumbent is None:
+                    mutation_sources = [
+                        node_identity_cell(graph, int(node_id)),
+                        node_identity_cell(graph, int(base)),
+                    ]
+                    mutation_sources.extend(
+                        node_identity_cell(graph, int(value_id))
+                        for value_id in mutation_values
+                    )
+                    current_identity_book().post(
+                        SOURCE_SEQUENCE_MUTATION,
+                        mutation_row,
+                        mutation_fact,
+                        stage=_REDUCTION,
+                        provenance=_Derived(tuple(dict.fromkeys(
+                            cell for cell in mutation_sources
+                            if cell is not None
+                        ))),
+                        mode=_Mode.CONCORD,
+                    )
             # A keyed store authors one runtime mapping-entry layout.  Keep
             # the exact ordered index operands followed by the stored value
             # on the source aggregate page while those operand-position
@@ -13656,6 +13822,55 @@ def _normalize_lexical_values(
                     *((index, "index") for index in resolved_indices),
                 ),
             )
+            container = dict(
+                graph.G.nodes[base].get("attributes") or {}
+            )
+            aggregate_kind = str(
+                container.get("aggregate_kind") or ""
+            ).casefold()
+            sequence_policy = (
+                "unique" if aggregate_kind in {"set", "dict"}
+                else "duplicates" if aggregate_kind in {
+                    "list", "tuple", "bytes", "bytearray", "array",
+                }
+                else None
+            )
+            if sequence_policy is not None:
+                from ...compiler.concordance_declarations import (
+                    SOURCE_SEQUENCE_MUTATION,
+                )
+                arguments = tuple(map(int, resolved_indices))
+                fact = (
+                    int(base), "delitem", sequence_policy, arguments,
+                    "mapping" if aggregate_kind == "dict" else "sequence",
+                )
+                row = (value_class_scope, int(node_id))
+                page = current_identity_book().page(
+                    SOURCE_SEQUENCE_MUTATION
+                )
+                incumbent = page.latest(row)
+                if incumbent is not None and tuple(incumbent) != fact:
+                    raise ValueError(
+                        "source sequence mutation concordance disagreement "
+                        f"for {row!r}: recorded={incumbent!r}, proposed={fact!r}"
+                    )
+                if incumbent is None:
+                    sources = [
+                        node_identity_cell(graph, int(node_id)),
+                        node_identity_cell(graph, int(base)),
+                    ]
+                    sources.extend(
+                        node_identity_cell(graph, value_id)
+                        for value_id in arguments
+                    )
+                    current_identity_book().post(
+                        SOURCE_SEQUENCE_MUTATION, row, fact,
+                        stage=_REDUCTION,
+                        provenance=_Derived(tuple(dict.fromkeys(
+                            cell for cell in sources if cell is not None
+                        ))),
+                        mode=_Mode.CONCORD,
+                    )
             return node_id
         if isinstance(target, (ast.Tuple, ast.List)):
             effects = [delete_target(element) for element in target.elts]
@@ -15762,12 +15977,8 @@ def _normalize_lexical_values(
                         )
                     ):
                         continue
-                    argument_ids = tuple(
-                        int(parent)
-                        for parent, role in call_parents
-                        if str(role).startswith("arg") or (
-                            call.func.attr == "sort" and str(role) == "kw:key"
-                        )
+                    argument_ids = _sequence_mutation_argument_ids(
+                        str(call.func.attr), call_parents,
                     )
                     if isinstance(receiver_expression, ast.Name):
                         environment[name] = initial
@@ -15779,8 +15990,6 @@ def _normalize_lexical_values(
                     )
                     aggregate_kind = state_attributes.get("aggregate_kind")
 
-                    if name == "self.exact_atoms" and call.func.attr == "append":
-                        print("EXACT_ATOMS_KIND:", repr(aggregate_kind), flush=True)
                     sequence_policy = (
                         "unique"
                         if aggregate_kind in {"set", "dict"}

@@ -12,6 +12,7 @@ from .concordance_declarations import (
     STRUCTURAL_CONCORDANCE, STRUCTURAL_VALUE, OPTIONAL_VALUE_STRUCTURE, BoundaryTransport,
     SourceAggregateLayout, StructuralValue, RETURN_SITE_SLOT, RETURN_OUTPUT_ARMS, CALL_EDGE,
     AGGREGATE_RETURN_LAYOUT, RECORD_SCALAR_SHAPE, SSAValueFact,
+    VALUE_TYPE_ABI, CELL_SET, SSA_VALUE_PHYSICAL_FIELDS, INGESTION_VALUE,
 )
 from .identity_concordance import ConcordanceRefusal, Ref, current_identity_book
 
@@ -78,12 +79,143 @@ def return_slot_structure(scope, site, slot, *, book=None):
     return book.page(STRUCTURAL_VALUE).cell(cell.row, cell.column), cell
 
 
+def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=()):
+    """The current physical view of existing concordance authorities.
+
+    A source annotation, a shape state and a semantic mint are views of one
+    identity. None is a fallback selected by a downstream callee's needs.
+    """
+    from .identity_concordance import SHAPE_STATE_PAGE, MINT_PAGE, shape_transformation_state
+    from ..transmogrifier.dtype_layout import resolve
+
+    fields = {}
+
+    def merge(proposed):
+        for name, value in proposed.items():
+            if value is None or value is False:
+                continue
+            if name in fields and fields[name] != value:
+                raise ConcordanceRefusal(
+                    f"physical concordance disagreement for {(scope, value_id)!r}/{name}: "
+                    f"{fields[name]!r} versus {value!r}"
+                )
+            fields[name] = value
+
+    merge({name: getattr(fact, name) for name in SSA_VALUE_PHYSICAL_FIELDS})
+    key = (scope, int(value_id))
+    if key in active:
+        return fields
+    active = (*active, key)
+    cell = read.ref(SSA_VALUE, key)
+    pending = [cell]
+    seen = set()
+    origins = []
+    while pending:
+        source = pending.pop()
+        if source is None or source in seen:
+            continue
+        seen.add(source)
+        if source.page in (CANONICAL_VALUE, INGESTION_VALUE):
+            if source.row[1] == int(value_id):
+                abi = read(VALUE_TYPE_ABI, source.row)
+                arms = tuple(getattr(abi, "physical_alternatives", ()))
+                views = {(arm.storage, arm.dtype, tuple(arm.shape), arm.rank) for arm in arms}
+                if len(views) == 1:
+                    storage, dtype, shape, rank = next(iter(views))
+                    if (storage != "none" and str(dtype) == str(fact.dtype)
+                            and tuple(shape) == tuple(fact.shape or ())):
+                        merge({"physical_dtype": str(dtype), "storage": storage, "rank": rank})
+            continue
+        # Revisions retain historical origin edges. Follow those exact refs,
+        # not a guessed column zero or an unrelated equal numeric identifier.
+        if source.page == SSA_VALUE and source.row == key:
+            origins.append(source)
+            pending.extend(read.sources(source))
+        elif source.page == CELL_SET:
+            read(CELL_SET, source.row)
+            pending.extend(read.sources(source))
+    if shape_scope is not None:
+        state = read(SHAPE_STATE_PAGE, (tuple(shape_scope), int(value_id)))
+        state = (shape_transformation_state(state[1]) if isinstance(state, tuple)
+                 and state and state[0] == "resolved" else None)
+        if state is not None:
+            shape, dtype, rank, metadata, _row_shape = state
+            layout = resolve(dtype)
+            if (str(dtype) == str(fact.dtype) and layout is not None
+                    and layout.kind in {"bool", "int", "uint", "float"}
+                    and str(dtype) != "opaque_ref"
+                    and fields.get("storage") in (None, "scalar", "span")):
+                if (metadata == "static" and rank == len(shape)
+                        and (tuple(shape) == tuple(fact.shape or ()) or not fact.shape)
+                        and not (rank == 0 and fields.get("arena"))):
+                    merge({"physical_dtype": str(dtype), "storage": "span" if rank else "scalar",
+                           "rank": rank})
+                elif metadata == "dynamic" and not shape and rank > 0 and not fact.shape:
+                    merge({"physical_dtype": str(dtype), "storage": "span", "rank": rank})
+    for origin in origins:
+        mint = read(MINT_PAGE, (origin.key, int(value_id)))
+        if not (isinstance(mint, tuple) and len(mint) == 2):
+            continue
+        transform, operands = mint
+        name = getattr(transform, "name", "")
+        if name == "control_const":
+            layout = resolve(fact.dtype)
+            if (not fact.shape and layout is not None
+                    and layout.kind in {"bool", "int", "uint", "float"}
+                    and str(fact.dtype) != "opaque_ref"
+                    and fields.get("storage") in (None, "scalar")):
+                merge({"physical_dtype": str(fact.dtype), "storage": "scalar", "rank": 0})
+        elif name in {"phi_conditional", "phi_loop_header", "phi_loop_exit", "phi_return_merge"}:
+            pending = list(operands)
+            seen = set()
+            incoming = []
+            while pending:
+                operand = pending.pop()
+                if operand in seen:
+                    continue
+                seen.add(operand)
+                if operand.page == CELL_SET:
+                    read(CELL_SET, operand.row)
+                    pending.extend(read.sources(operand))
+                elif operand.page == SSA_VALUE:
+                    value = read(SSA_VALUE, operand.row)
+                    if isinstance(value, SSAValueFact):
+                        physical = _ssa_physical_view(
+                            read, *operand.row, value, shape_scope=shape_scope, active=active,
+                        )
+                        incoming.append((value, physical))
+                        # The existing Phi law inherits storage/rank, not a
+                        # numeric promotion. Before control pruning a rejected
+                        # branch can still carry bool beside an integer seed.
+                        # Such a mixed Phi has no inferred element contract;
+                        # it requires settlement/edge conversion if it lives.
+                        merge({field: item for field, item in physical.items()
+                               if field != "physical_dtype"})
+            if incoming and all(
+                value.dtype == fact.dtype and tuple(value.shape) == tuple(fact.shape)
+                for value, _physical in incoming
+            ):
+                for _value, physical in incoming:
+                    merge({"physical_dtype": physical.get("physical_dtype")})
+            # A typed scalar Phi declares its result slot's representation.
+            # This does not admit mixed incoming edges: the emitter still
+            # checks each edge's physical layout and requires explicit casts.
+            # Storage/rank must already be proved independently above.
+            layout = resolve(fact.dtype)
+            if (fields.get("storage") == "scalar" and fields.get("rank") == 0
+                    and layout is not None and layout.kind in {"bool", "int", "uint", "float"}
+                    and str(fact.dtype) != "opaque_ref"):
+                merge({"physical_dtype": str(fact.dtype)})
+    return fields
+
+
 def _ssa_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
     row = (scope, int(value_id))
     fact = read(SSA_VALUE, row)
     cell = read.ref(SSA_VALUE, row)
     if cell is None or not isinstance(fact, SSAValueFact):
         raise ConcordanceRefusal(f"physical structure lacks SSA identity: {row!r}")
+    physical = _ssa_physical_view(read, scope, value_id, fact, shape_scope)
     dtype = None if fact.dtype in (None, "", "unknown") else str(fact.dtype)
     shape = tuple(fact.shape or ())
     if shape_scope is not None:
@@ -108,7 +240,7 @@ def _ssa_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
             if (
                 not shape and metadata_state == "static"
                 and rank == len(extents)
-                and getattr(fact, "storage", None) != "reference"
+                and physical.get("storage") != "reference"
             ):
                 shape = extents
             if dtype is None and element_type not in ("", "unknown"):
@@ -125,19 +257,19 @@ def _ssa_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
     # extent is known for it.
     kind = ("unresolved" if dtype is None or dtype == "ssa.aggregate"
             else "reference" if dtype in {"opaque_ref", "ptr"}
-            else "span" if shape or bool(getattr(fact, "arena", False))
+            else "span" if shape or bool(physical.get("arena", False))
             else "scalar")
     # Rule: the view reads the posted row.  A declared storage of scalar/span/
     # reference overrides the derived kind of a resolved leaf; sequence/table/
     # keyed/record are never reinterpreted from ``declared_storage``.
-    declared = getattr(fact, "storage", None)
+    declared = physical.get("storage")
     if kind != "unresolved" and declared in {"scalar", "span", "reference"}:
         kind = declared
     return StructuralValue(kind, int(value_id), cell, dtype=dtype,
                            shape=shape, storage=kind,
-                           physical_dtype=getattr(fact, "physical_dtype", None),
-                           rank=getattr(fact, "rank", None),
-                           arena=bool(getattr(fact, "arena", False)),
+                           physical_dtype=physical.get("physical_dtype"),
+                           rank=physical.get("rank"),
+                           arena=bool(physical.get("arena", False)),
                            declared_storage=declared)
 
 
@@ -479,6 +611,22 @@ def publish_module_structures(module):
         if accepted_ssa_component(function):
             continue
         if module_book is not None:
+            # Every live SSA identity enters the same concordance process.
+            # Previously only optional values and storage tables were visited;
+            # an ordinary scalar could reach emission without its shared
+            # physical view ever being derived or its authorities compared.
+            values = {
+                int(value.id)
+                for value in function.args
+            }
+            values.update(
+                int(instruction.res.id)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            )
+            for value_id in sorted(values):
+                function_value_structure(function, value_id, book=module_book)
             for row in module_book.page(OPTIONAL_VALUE_STRUCTURE).scope_rows(function_scope_of(function)):
                 optional_structure(*row, shape_scope=shape_scope_of(function),
                                    storage_scope=str(function.name), book=module_book)

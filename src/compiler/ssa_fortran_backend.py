@@ -846,11 +846,20 @@ def _literal(value: Any, dtype: str | None = None) -> str:
     the value.
     """
     layout = resolve_dtype_layout(dtype) if dtype else None
+    if (layout is not None and layout.kind == "int"
+            and isinstance(value, int) and not isinstance(value, bool)):
+        width = 8 * layout.byte_size
+        if not -(1 << (width - 1)) <= value < (1 << (width - 1)):
+            raise FortranEmissionError(f"constant {value} is outside {layout.name}")
+        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")").removeprefix("kind=")
+        if value == -(1 << (width - 1)):
+            return f"(-huge(0_{kind}) - 1_{kind})"
+        return f"{value}_{kind}"
     if layout is not None and layout.kind == "uint" and isinstance(value, int) and not isinstance(value, bool):
         width = 8 * layout.byte_size
         if not 0 <= value < (1 << width):
             raise FortranEmissionError(f"constant {value} is outside {layout.name}")
-        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")")
+        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")").removeprefix("kind=")
         return f"{value}u_{kind}"
     if (
         dtype
@@ -860,17 +869,6 @@ def _literal(value: Any, dtype: str | None = None) -> str:
         and str(_DTYPE_KIND.get(str(dtype), "")).startswith("real")
     ):
         value = float(value)
-    if (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and str(dtype) in {"int64", "i64", "opaque_ref"}
-    ):
-        if value == -(2**63):
-            # A literal is a negated positive constant in Fortran, and 2**63
-            # does not fit int64 (gfortran: "Integer too big for its kind";
-            # the integer formatting helpers carry this bound, c57).
-            return "(-huge(0_c_int64_t) - 1_c_int64_t)"
-        return f"{value}_c_int64_t"
     return _literal_payload(value)
 
 
@@ -4731,6 +4729,23 @@ class _FunctionEmitter:
                 args = conformed
             if op not in _LOGICAL_BINARY:
                 args = self._numeric(instr, args)
+            result_layout = resolve_dtype_layout(str(instr.res.dtype or self.dtype))
+            if (op in {"Add", "Sub", "Mul"} and result_layout is not None
+                    and result_layout.kind == "int"):
+                # Signed integer SSA uses the same fixed-width arithmetic
+                # at every catalogue width, as C/LLVM do. Plain signed
+                # Fortran overflow lets GNU fold ``MAX + runtime_one == MIN``
+                # to false.
+                # Perform the operation in the catalogue's matching unsigned
+                # domain, then convert the resulting bits to the signed kind.
+                unsigned_dtype = f"uint{8 * result_layout.byte_size}"
+                unsigned_args = [
+                    _native_integer_conversion(argument, unsigned_dtype)
+                    for argument in args
+                ]
+                return _native_integer_conversion(
+                    template.format(*unsigned_args), result_layout.name,
+                )
             rule = max_step_rule(instr)
             if rule is not None and is_max(op) is not None:
                 return fortran_step(rule, bool(is_max(op)), args[0], args[1])
@@ -6270,6 +6285,20 @@ def emit_module(
             if function.metadata.get("control_ir")
         )
     roots.update(str(root) for root in extra_roots if str(root) in functions)
+    from .ssa_storage_requirements import is_compiler_owned_storage
+    for root_name in roots:
+        public_values = (
+            *(value for value in functions[root_name].args
+              if not is_compiler_owned_storage(value)),
+            *named_outputs.get(root_name, ()),
+        )
+        for value in public_values:
+            layout = resolve_dtype_layout(value.dtype)
+            if (layout is not None and layout.kind in {"int", "uint"}
+                    and layout.numpy_dtype is None):
+                raise FortranEmissionError(
+                    f"internal dtype {layout.name!r} has no public Fortran buffer ABI"
+                )
     if roots:
         reachable = set()
         pending = list(sorted(roots))

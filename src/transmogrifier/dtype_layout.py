@@ -125,6 +125,24 @@ _DECLARED: tuple[DTypeLayout, ...] = (
         numpy_dtype="uint64", nodus_code=14,
         aliases=("uint64", "u64"),
     ),
+    # Internal arithmetic domain for an exact join of uint64 and int64.
+    # These native scalar spellings are not a public buffer/ctypes contract:
+    # NumPy has no corresponding integer dtype, and their host ABI is not
+    # portable.  The public layout views below therefore omit both rows.
+    DTypeLayout(
+        name="int128", kind="int", byte_size=16, alignment=16,
+        c_type="__int128", ctypes_name="", c_storage_type="__int128",
+        llvm_type="i128", wasm_type=None, fortran_kind="integer(kind=16)",
+        numpy_dtype=None, nodus_code=None,
+        aliases=("int128",),
+    ),
+    DTypeLayout(
+        name="uint128", kind="uint", byte_size=16, alignment=16,
+        c_type="__uint128_t", ctypes_name="", c_storage_type="__uint128_t",
+        llvm_type="i128", wasm_type=None, fortran_kind="unsigned(kind=16)",
+        numpy_dtype=None, nodus_code=None,
+        aliases=("uint128",),
+    ),
     DTypeLayout(
         name="float32", kind="float", byte_size=4, alignment=4,
         c_type="float", ctypes_name="c_float", c_storage_type="float",
@@ -182,19 +200,80 @@ def layout_for(name: object) -> DTypeLayout:
     return layout
 
 
+def common_integer_dtype(dtypes) -> str | None:
+    """Return the narrowest declared integer layout covering every operand.
+
+    This is a mathematical value-domain join, not NumPy's dtype promotion.
+    A signed layout must represent both the negative extent of every signed
+    input and the full positive extent of every unsigned input.  In
+    particular, ``uint64`` plus ``int64`` joins at the internal ``int128``
+    layout; it never passes through binary64 or a narrowing cast.
+
+    The internal 128-bit layouts are not public NumPy/ctypes buffer types.
+    Callers still have to respect that boundary when publishing a result.
+    """
+
+    names = tuple(str(dtype or "").casefold() for dtype in dtypes)
+    if not names or any(name == "opaque_ref" for name in names):
+        return None
+    layouts = tuple(resolve(name) for name in names)
+    if any(layout is None or layout.kind not in {"int", "uint", "bool"}
+           for layout in layouts):
+        return None
+    if all(layout.kind == "bool" for layout in layouts):
+        return "bool"
+
+    minimum = 0
+    maximum = 0
+    for layout in layouts:
+        if layout.kind == "bool":
+            value_min, value_max = 0, 1
+        elif layout.kind == "uint":
+            bits = 8 * layout.byte_size
+            value_min, value_max = 0, (1 << bits) - 1
+        else:
+            bits = 8 * layout.byte_size
+            value_min, value_max = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+        minimum = min(minimum, value_min)
+        maximum = max(maximum, value_max)
+
+    candidates = []
+    for layout in _SCALAR_LAYOUTS:
+        if layout.kind == "uint":
+            bits = 8 * layout.byte_size
+            lower, upper = 0, (1 << bits) - 1
+        elif layout.kind == "int":
+            bits = 8 * layout.byte_size
+            lower, upper = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+        else:
+            continue
+        if lower <= minimum and maximum <= upper:
+            candidates.append((layout.byte_size, layout.name))
+    return min(candidates)[1] if candidates else None
+
+
 # --------------------------------------------------------------------------
 # Layout views. Native backend support is a property of the same record.
 # --------------------------------------------------------------------------
 
 _SCALAR_LAYOUTS = tuple(layout for layout in _DECLARED if layout.kind != "ptr")
 _SCALAR_NAMES = tuple(alias for layout in _SCALAR_LAYOUTS for alias in layout.aliases)
+_PUBLIC_SCALAR_LAYOUTS = tuple(
+    layout for layout in _SCALAR_LAYOUTS
+    if layout.numpy_dtype is not None and layout.ctypes_name
+)
+_PUBLIC_SCALAR_NAMES = tuple(
+    alias for layout in _PUBLIC_SCALAR_LAYOUTS for alias in layout.aliases
+)
 
-C_ABI_NAMES: tuple[str, ...] = _SCALAR_NAMES
-C_LANE_NAMES: tuple[str, ...] = _SCALAR_NAMES
-SHELL_NUMPY_NAMES: tuple[str, ...] = _SCALAR_NAMES
-LLVM_LANE_NAMES: tuple[str, ...] = tuple(ALIASES)
+C_ABI_NAMES: tuple[str, ...] = _PUBLIC_SCALAR_NAMES
+C_LANE_NAMES: tuple[str, ...] = _PUBLIC_SCALAR_NAMES
+SHELL_NUMPY_NAMES: tuple[str, ...] = _PUBLIC_SCALAR_NAMES
+LLVM_LANE_NAMES: tuple[str, ...] = (*_PUBLIC_SCALAR_NAMES, "ptr")
 BYTE_SIZE_NAMES: tuple[str, ...] = tuple(ALIASES)
-C_LANE_STORAGE_CLASSES: tuple[str, ...] = tuple(layout.name for layout in _SCALAR_LAYOUTS)
+C_LANE_STORAGE_CLASSES: tuple[str, ...] = tuple(
+    layout.name for layout in _PUBLIC_SCALAR_LAYOUTS
+)
 
 # LLVM integer spelling states width, not sign. These representative layouts
 # are used only by width/byte views. Call and buffer code must retain its exact
@@ -228,7 +307,14 @@ def c_abi_type_table() -> dict[str, tuple[str, str]]:
 def c_abi_type(dtype: object) -> tuple[str, str]:
     """Exact C ABI spelling and ctypes name; refuse an undeclared name."""
 
-    layout = layout_for(str(dtype or DEFAULT_DTYPE).casefold())
+    spelling = str(dtype or DEFAULT_DTYPE).casefold()
+    layout = layout_for(spelling)
+    # ``ptr`` is an internal direct-call ABI value with an established
+    # ``void *``/``c_void_p`` spelling, but it is not a scalar buffer dtype.
+    # Preserve that direct-call contract while refusing the internal 128-bit
+    # arithmetic layouts, which have no ctypes representation.
+    if spelling not in C_ABI_NAMES and layout.kind != "ptr":
+        raise KeyError(f"no public C ABI layout declared for {dtype!r}")
     return (layout.c_type, layout.ctypes_name)
 
 
@@ -313,9 +399,17 @@ def llvm_abi_numpy_table() -> dict[str, str]:
 
 
 def llvm_type_bytes_table() -> dict[str, int]:
-    """``{LLVM spelling: element bytes}`` for the types the LLVM lane emits."""
+    """``{LLVM spelling: element bytes}`` for internal LLVM storage types.
 
-    return {DTYPES[name].llvm_type: DTYPES[name].byte_size for name in LLVM_LANE_TYPES}
+    Public buffer spellings remain governed by ``LLVM_LANE_TYPES`` and its
+    NumPy ABI table. Internal scalar widths such as i128 still need exact
+    alloca/copy sizes without becoming public buffer types.
+    """
+
+    return {
+        layout.llvm_type: layout.byte_size
+        for layout in _DECLARED
+    }
 
 
 # --------------------------------------------------------------------------
@@ -404,6 +498,7 @@ __all__ = [
     "ALIASES",
     "resolve",
     "layout_for",
+    "common_integer_dtype",
     "by_llvm_type",
     "llvm_abi_numpy_table",
     "C_ABI_NAMES",

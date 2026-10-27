@@ -3589,20 +3589,35 @@ class CorrelationTable:
                 fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
                 if not isinstance(fact, SSAValueFact):
                     continue
+                from .structural_concordance import ssa_structure
+                try:
+                    physical, physical_cell = ssa_structure(
+                        scope, value_id, shape_scope=shape_scope_of(function),
+                        storage_scope=str(function.name), book=book,
+                    )
+                except ConcordanceRefusal as error:
+                    found.append(Finding(
+                        "ssa-publication-type-disagreement", str(name), value_id,
+                        str(error),
+                    ))
+                    continue
                 for (key, field), resident in zip(fields, view):
-                    posted = getattr(fact, field, None)
+                    posted = getattr(physical, "declared_storage" if field == "storage"
+                                     else field, None)
+                    if field == "device":
+                        posted = fact.device
                     if _physical_unset(key, resident):
                         continue
                     if _physical_unset(key, posted):
                         found.append(Finding(
                             "ssa-physical-unposted", str(name), value_id,
-                            f"{cell!r} has no {field}; resident accounting "
+                            f"{physical_cell!r} has no {field}; resident accounting "
                             f"{key}={resident!r} at {tuple(positions)!r}",
                         ))
                     elif posted != resident:
                         found.append(Finding(
                             "ssa-publication-type-disagreement", str(name), value_id,
-                            f"{cell!r} records {field}={posted!r}; resident "
+                            f"{physical_cell!r} records {field}={posted!r}; resident "
                             f"accounting {key}={resident!r} at {tuple(positions)!r}",
                         ))
         return found
@@ -5199,6 +5214,7 @@ class DerivationSnapshot:
     stage: Stage
     target: Ref
     reads: tuple  # (Page, row, Ref | None), including observed absence
+    edge_reads: tuple = ()  # (exact historical Ref, incoming Refs)
 
 
 class Registry:
@@ -6437,10 +6453,16 @@ class IdentityBook:
                     (source_page, source_row, self.current_ref(source_page, source_row))
                     for source_page, source_row, _cell in previous.reads
                 )
+                current_edges = tuple(
+                    (source, tuple(parent for parent, _stage in self.edges_into(source)))
+                    for source, _parents in getattr(previous, "edge_reads", ())
+                )
                 if (current_reads == previous.reads
+                        and current_edges == getattr(previous, "edge_reads", ())
                         and self.latest_ref(page, row) == previous.target):
                     return previous.target
             reads = {}
+            edge_reads = {}
 
             def read(source_page, source_row, default=None):
                 cell = self.current_ref(source_page, source_row)
@@ -6453,6 +6475,29 @@ class IdentityBook:
                 return reads[(source_page, source_row)]
 
             read.ref = read_ref
+
+            def read_sources(source_page, source_row=None):
+                """The current claim's exact incoming identities.
+
+                A concordance recipe must follow the recorded trajectory,
+                rather than reconstruct a value from an id or dtype. Reading
+                the owning row also tracks a changed generation; the recipe
+                reads any selected authority through this same reader.
+                """
+                if isinstance(source_page, Ref):
+                    source = source_page
+                    read(source.page, source.row)
+                else:
+                    source = read_ref(source_page, source_row)
+                if source is None:
+                    return ()
+                parents = tuple(
+                    parent for parent, _source_stage in self.edges_into(source)
+                )
+                edge_reads[source] = parents
+                return parents
+
+            read.sources = read_sources
 
             fact = recipe(read, *arguments)
             cells = tuple(dict.fromkeys(cell for cell in reads.values() if cell is not None))
@@ -6469,6 +6514,7 @@ class IdentityBook:
                 recipe, tuple(arguments), stage, target,
                 tuple((source_page, source_row, cell)
                       for (source_page, source_row), cell in reads.items()),
+                tuple(edge_reads.items()),
             )
             self.post(
                 LIVE_DERIVATION, key, snapshot, stage=stage,
@@ -6508,6 +6554,9 @@ class IdentityBook:
                     (page.name, source_row) in stale
                     or self.latest_ref(page, source_row) != cell
                     for page, source_row, cell in snapshot.reads
+                ) or any(
+                    tuple(parent for parent, _stage in self.edges_into(source)) != parents
+                    for source, parents in getattr(snapshot, "edge_reads", ())
                 )):
                     stale.add(row)
                     changed = True

@@ -1,4 +1,4 @@
-"""Canonical source comparisons widen only the exactly representable u32 side."""
+"""Canonical source operations use exact integer common domains."""
 
 from pathlib import Path
 
@@ -356,7 +356,10 @@ def test_all_integer_comparisons_cast_only_the_uint32_operand(operation, reverse
     ).complete
 
 
-def test_canonical_uint64_int64_comparison_remains_refused():
+@pytest.mark.parametrize("backend", ["c", "llvm", "fortran"])
+def test_canonical_uint64_int64_comparison_uses_exact_internal_domain(
+    backend, tmp_path,
+):
     module, outputs, exports = _lower("uint64", name="u64_i64_refusal")
     entry = exports[0]
     region = module.functions[f"{entry}__planned_region_1"]
@@ -365,21 +368,82 @@ def test_canonical_uint64_int64_comparison_remains_refused():
         for block in region.blocks.values()
         for instruction in block.instrs
     ]
-    assert not any(instruction.op == "Cast" for instruction in instructions)
-    assert next(
+    comparison = next(
         instruction for instruction in instructions if instruction.op == "Lt"
-    ).args[0].dtype == "uint64"
+    )
+    assert tuple(argument.dtype for argument in comparison.args) == (
+        "int128", "int128",
+    )
+    widening = [
+        instruction for instruction in instructions
+        if instruction.op == "Cast" and instruction.res is not None
+        and instruction.res.dtype == "int128" and instruction.args
+    ]
+    assert {instruction.args[0].dtype for instruction in widening} >= {
+        "uint64", "int64",
+    }
+    from src.compiler.identity_concordance import concordance_report
 
-    from src.compiler.ssa_c_backend import emit_ssa_to_c
-    from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
-    from src.compiler.ssa_fortran_backend import emit_module
+    assert concordance_report(module).splitlines()[0].endswith("0 finding(s)")
+    parameters = dict(module.functions[entry].metadata["parameter_names"])
+    result = outputs[entry][0]
+    cases = (
+        (0, 1, True),
+        (0, 0, False),
+        (1, 0, False),
+        (2**63 + 2, -(2**63), False),
+        (2**64 - 1, 2**63 - 1, False),
+    )
+    def feed(unsigned_value: int, signed_value: int):
+        return {
+            parameters["values"]: np.array([unsigned_value], dtype=np.uint64),
+            parameters["scalar"]: np.array([signed_value], dtype=np.int64),
+        }
 
-    assert not emit_ssa_to_c(module, entry).complete
-    assert not emit_ssa_function_to_llvm(module, entry).complete
-    assert not emit_module(
-        module, name="u64_i64_refusal", outputs=outputs,
-        extra_roots=exports, progress=lambda _message: None,
-    ).complete
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, entry)
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "c")
+        prepare = artifact.prepare_execution
+    elif backend == "llvm":
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact,
+            emit_ssa_function_to_llvm,
+            prepare_artifact_execution,
+        )
+
+        emitted = emit_ssa_function_to_llvm(module, entry)
+        assert emitted.complete, emitted.shortfalls
+        artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+        prepare = lambda values: prepare_artifact_execution(artifact, values)
+    else:
+        from src.compiler.ssa_fortran_backend import (
+            FortranCoreNative, emit_module, fortran_compiler,
+        )
+
+        compiler = fortran_compiler()
+        if compiler is None:
+            pytest.skip("native Fortran compiler unavailable")
+        emitted = emit_module(
+            module, name="u64_i64_internal_domain", outputs=outputs,
+            extra_roots=exports, progress=lambda _message: None,
+        )
+        assert emitted.complete, emitted.shortfalls
+        built = compile_fortran_module_c_shell(
+            emitted, {}, tmp_path / "fortran", entrypoint=entry,
+            library=True,
+        )
+        core = FortranCoreNative(
+            built.executable_path, emitted.api.entry_point(entry), emitted.api,
+        )
+        prepare = core.prepare_execution
+    for unsigned_value, signed_value, expected in cases:
+        actual = prepare(feed(unsigned_value, signed_value)).run().buffers[
+            result.id
+        ].item()
+        assert bool(actual) is expected
 
 
 @pytest.mark.parametrize("backend", ["c", "llvm", "fortran"])
@@ -494,7 +558,7 @@ def test_int64_uint32_add_uses_exact_int64_inputs_and_existing_wrap_law(
             assert execution.buffers[result.id].item() == expected
 
 
-def test_canonical_uint64_int64_add_remains_refused():
+def test_canonical_uint64_int64_add_uses_internal_exact_domain():
     module, outputs, exports = _lower_integer_add(
         "uint64", "int64", name="u64_i64_add_refusal",
     )
@@ -505,18 +569,18 @@ def test_canonical_uint64_int64_add_remains_refused():
         for block in region.blocks.values()
         for instruction in block.instrs
     ]
-    assert not any(instruction.op == "Cast" for instruction in instructions)
-    assert next(
+    addition = next(
         instruction for instruction in instructions if instruction.op == "Add"
-    ).args[0].dtype == "uint64"
-
-    from src.compiler.ssa_c_backend import emit_ssa_to_c
-    from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
-    from src.compiler.ssa_fortran_backend import emit_module
-
-    assert not emit_ssa_to_c(module, entry).complete
-    assert not emit_ssa_function_to_llvm(module, entry).complete
-    assert not emit_module(
-        module, name="u64_i64_add_refusal", outputs=outputs,
-        extra_roots=exports, progress=lambda _message: None,
-    ).complete
+    )
+    assert addition.res.dtype == "int128"
+    assert tuple(argument.dtype for argument in addition.args) == (
+        "int128", "int128",
+    )
+    widening = [
+        instruction for instruction in instructions
+        if instruction.op == "Cast" and instruction.res is not None
+        and instruction.res.dtype == "int128" and instruction.args
+    ]
+    assert {instruction.args[0].dtype for instruction in widening} >= {
+        "uint64", "int64",
+    }

@@ -430,6 +430,20 @@ def plan_region_to_ssa_instrs(
         "operator_result_type_concordance"
     )
 
+    def semantic_input_ids(item: PlanLine) -> tuple[int, ...]:
+        if len(item.input_roles) != len(item.inputs):
+            return tuple(map(int, item.inputs))
+        return tuple(
+            int(value_id)
+            for value_id, role in zip(
+                item.inputs, item.input_roles, strict=True,
+            )
+            if str(role).casefold() not in {
+                "callee", "func", "function", "definition",
+                "operator", "operator_reference",
+            }
+        )
+
     def source_result_class(value_id: int) -> str | None:
         """Read the source class through this value's exact identity edges."""
 
@@ -526,20 +540,6 @@ def plan_region_to_ssa_instrs(
                 f"row={row!r}, incumbent={incumbent!r}, candidate={claim!r}"
             )
 
-    def semantic_input_ids(item: PlanLine) -> tuple[int, ...]:
-        if len(item.input_roles) != len(item.inputs):
-            return tuple(map(int, item.inputs))
-        return tuple(
-            int(value_id)
-            for value_id, role in zip(
-                item.inputs, item.input_roles, strict=True,
-            )
-            if str(role).casefold() not in {
-                "callee", "func", "function", "definition",
-                "operator", "operator_reference",
-            }
-        )
-
     # An authored Python scalar literal is a weak operand: it names a value,
     # not an element width, so beside a typed float operand it does not widen
     # the result (``float32 * 2.0`` is float32, as in the eager lane).
@@ -580,6 +580,19 @@ def plan_region_to_ssa_instrs(
             "f16", "f32", "f64",
         }):
             return promoted_float_dtype(value_ids) or "float64"
+        from ..transmogrifier.dtype_layout import (
+            common_integer_dtype, resolve as resolve_dtype,
+        )
+
+        layouts = tuple(resolve_dtype(dtype) for dtype in candidates)
+        kinds = {
+            layout.kind for layout in layouts if layout is not None
+        }
+        if "int" in kinds and "uint" in kinds:
+            return common_integer_dtype(candidates)
+        # Preserve the incumbent same-signed source result rules. The new
+        # common-domain join is needed when a signed and unsigned source
+        # operand meet; it does not replace the established int32/int64 law.
         if candidates.intersection({"int64", "i64"}):
             return "int64"
         if candidates.intersection({"int", "int32", "i32"}):
@@ -756,18 +769,11 @@ def plan_region_to_ssa_instrs(
         values[value_id] = made
         return made
 
-    def cast_u32_integer_operand(
+    def cast_integer_operand(
         item: PlanLine, source_position: int, operand: SSAValue,
+        target_dtype: str,
     ) -> SSAValue:
-        """Embed the exact uint32 operand in an int64 SSA operation.
-
-        Every uint32 value fits int64. Comparisons therefore use an exact
-        common domain. For Add, use it only when the existing result rule has
-        already selected int64; this reuses the repository's typed int64 Add
-        behavior instead of choosing a separate overflow policy. Keep each
-        conversion in repository SSA so all native emitters see the same
-        explicitly converted operands.
-        """
+        """Convert one scalar operand to its exact common integer domain."""
 
         from .concordance_declarations import (
             CANONICAL_VALUE, CONTROL_CAST, PLANNER_HIERARCHY, SSA_VALUE,
@@ -794,11 +800,11 @@ def plan_region_to_ssa_instrs(
             )
         cast_id = _mint_ssa_id(
             book, function_scope, CONTROL_CAST, (source,),
-            dtype="int64", shape=tuple(operand.shape),
+            dtype=str(target_dtype), shape=tuple(operand.shape),
             stage=PLANNER_HIERARCHY,
         )
         converted = SSAValue(
-            cast_id, dtype="int64", shape=tuple(operand.shape),
+            cast_id, dtype=str(target_dtype), shape=tuple(operand.shape),
             accounting={},
         )
         values[cast_id] = converted
@@ -807,7 +813,7 @@ def plan_region_to_ssa_instrs(
             arg_roles=["operand"],
             attributes={
                 "source_operator": str(item.opcode),
-                "target_dtype": "int64",
+                "target_dtype": str(target_dtype),
             },
         ))
         fork_operand_read(item, source_position, converted, "operand", operand)
@@ -1017,63 +1023,41 @@ def plan_region_to_ssa_instrs(
             continue
 
         operands = [value(value_id) for value_id in semantic_inputs]
-        def scalar_uint32(value_id: int, dtype: str) -> bool:
-            return (
-                dtype == "uint32"
-                and int(value_id) in shape_of
-                and shape_of.get(int(value_id), ()) == ()
-                and int(value_id) in rank_of
-                and rank_of.get(int(value_id), 0) == 0
-            )
-
-        def scalar_int64(value_id: int, dtype: str) -> bool:
-            return (
-                dtype in {"int64", "i64"}
-                and int(value_id) in shape_of
-                and shape_of.get(int(value_id), ()) == ()
-                and int(value_id) in rank_of
-                and rank_of.get(int(value_id), 0) == 0
-            )
-
-        if (
+        if len(semantic_inputs) == 2 and (
             opcode.casefold() in {"lt", "le", "gt", "ge", "eq", "ne"}
-            and len(semantic_inputs) == 2
+            or opcode.casefold() in dtype_preserving_ops
         ):
-            left_id, right_id = semantic_inputs
-            left_dtype = str(dtype_of.get(left_id) or "")
-            right_dtype = str(dtype_of.get(right_id) or "")
-            if (
-                scalar_uint32(left_id, left_dtype)
-                and scalar_int64(right_id, right_dtype)
-            ):
-                operands[0] = cast_u32_integer_operand(item, 0, operands[0])
-            elif (
-                scalar_uint32(right_id, right_dtype)
-                and scalar_int64(left_id, left_dtype)
-            ):
-                operands[1] = cast_u32_integer_operand(item, 1, operands[1])
-        elif (
-            opcode.casefold() == "add"
-            and len(semantic_inputs) == 2
-            and str(dtype_of.get(int(item.outputs[0])) or "") == "int64"
-        ):
-            # The existing numeric result law selects int64 when one operand
-            # is int64. Convert only a scalar uint32 side, whose full source
-            # range embeds exactly in that domain. uint64/int64 and every
-            # unproved/ranked pair continue to the backend's honest refusal.
-            left_id, right_id = semantic_inputs
-            left_dtype = str(dtype_of.get(left_id) or "")
-            right_dtype = str(dtype_of.get(right_id) or "")
-            if (
-                scalar_uint32(left_id, left_dtype)
-                and scalar_int64(right_id, right_dtype)
-            ):
-                operands[0] = cast_u32_integer_operand(item, 0, operands[0])
-            elif (
-                scalar_uint32(right_id, right_dtype)
-                and scalar_int64(left_id, left_dtype)
-            ):
-                operands[1] = cast_u32_integer_operand(item, 1, operands[1])
+            from ..transmogrifier.dtype_layout import (
+                common_integer_dtype, resolve as resolve_dtype,
+            )
+
+            input_dtypes = tuple(
+                str(dtype_of.get(int(value_id)) or "")
+                for value_id in semantic_inputs
+            )
+            scalar_integer_inputs = all(
+                resolve_dtype(dtype) is not None
+                and resolve_dtype(dtype).kind in {"int", "uint", "bool"}
+                and dtype.casefold() != "opaque_ref"
+                and int(value_id) in shape_of
+                and shape_of.get(int(value_id), ()) == ()
+                and int(value_id) in rank_of
+                and rank_of.get(int(value_id), 0) == 0
+                for value_id, dtype in zip(semantic_inputs, input_dtypes, strict=True)
+            )
+            common_dtype = (
+                common_integer_dtype(input_dtypes)
+                if scalar_integer_inputs else None
+            )
+            if common_dtype is not None:
+                for position, (value_id, dtype) in enumerate(
+                    zip(semantic_inputs, input_dtypes, strict=True)
+                ):
+                    layout = resolve_dtype(dtype)
+                    if layout is not None and layout.name != common_dtype:
+                        operands[position] = cast_integer_operand(
+                            item, position, operands[position], common_dtype,
+                        )
 
         instructions.append(Instr(
             opcode,

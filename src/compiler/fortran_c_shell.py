@@ -63470,6 +63470,18 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
                     )
                 )
             )
+        if _unresolved:
+            from .identity_concordance import ConcordanceRefusal
+
+            raise ConcordanceRefusal(
+                f"final concordance refused {len(_unresolved)} finding(s):\n"
+                + "\n".join(
+                    f"{getattr(f, 'function', '?')} value "
+                    f"{getattr(f, 'value_id', '?')}: "
+                    f"{getattr(f, 'detail', f)}"
+                    for f in _unresolved
+                )
+            )
         ok = True
         if module is not None and _regulator.live_arena is not None:
             _bars.substage("publish live storage receipts")
