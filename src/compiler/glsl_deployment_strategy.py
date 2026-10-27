@@ -4268,15 +4268,21 @@ def _build_shell_hierarchy_plan(
                         and not tuple(described.get("shape") or ())
                     ):
                         described_dtype = str(described["dtype"])
-                dtype = str(
+                dtype = (
                     tensor.get("dtype")
                     or getattr(specialization, "dtype", None)
                     or node.get("dtype")
                     or described_dtype
                     or planned_scalar_dtypes().get(int(current))
                     or getattr(domain, "dtype", None)
-                    or "float64"
                 )
+                if not dtype:
+                    raise ValueError(
+                        f"region input {int(current)} has no settled dtype "
+                        "in the tensor, specialization, node, descriptor, "
+                        "planned scalar types or domain"
+                    )
+                dtype = str(dtype)
                 field_name = attributes.get("attribute")
                 if (
                     not logical
