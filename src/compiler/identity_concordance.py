@@ -1550,6 +1550,7 @@ class CorrelationTable:
         found.extend(self._tile_storage_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
+        found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._source_numeric_component_findings(module))
         found.extend(self._source_numeric_intrinsic_findings(module))
         found.extend(self._source_numeric_type_dependency_findings(module))
@@ -3633,6 +3634,46 @@ class CorrelationTable:
                 f"field {field!r} changed identity across source stages: "
                 f"{distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _annotation_class_admission_findings(module: Any) -> list[Finding]:
+        """Imported annotation classes retain callable, declaration and field causes."""
+        from .concordance_declarations import (
+            PARAMETER_ANNOTATION, FUNCTION_RETURN_ANNOTATION, CLASS_DECLARATION,
+            CLASS_FIELD_DECLARATION, SOURCE_SPAN, STATIC_SYMBOL_DEFINITION,
+        )
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        fields = book.pages.get(CLASS_FIELD_DECLARATION.name)
+        found = []
+        for authority in (PARAMETER_ANNOTATION, FUNCTION_RETURN_ANNOTATION):
+            page = book.pages.get(authority.name)
+            for row in (() if page is None else page.rows()):
+                cell = book.latest_ref(authority, row)
+                causes = tuple(source for source, _stage in book.edges_into(cell))
+                callables = tuple(source for source in causes if source.page == STATIC_SYMBOL_DEFINITION)
+                if not callables:
+                    continue
+                declarations = tuple(source for source in causes if source.page == CLASS_DECLARATION)
+                spans = tuple(source for source in causes if source.page == SOURCE_SPAN and source.row[:2] == row[:2])
+                problems = []
+                if not declarations or not spans or any(source.row[:2] != row[:2] for source in callables):
+                    problems.append("annotation lacks its exact callable, source occurrence or class declaration")
+                for declaration in declarations:
+                    parents = {source for source, _stage in book.edges_into(declaration)}
+                    if not set(callables).issubset(parents) or not parents.intersection(spans):
+                        problems.append("class admission lacks the annotation's callable and occurrence causes")
+                    for field_row in (() if fields is None else fields.scope_rows(declaration.row[0])):
+                        if field_row[:2] != declaration.row or fields.latest(field_row) is None:
+                            continue
+                        field_cell = book.latest_ref(CLASS_FIELD_DECLARATION, field_row)
+                        if declaration not in {source for source, _stage in book.edges_into(field_cell)}:
+                            problems.append(f"field {field_row[-1]!r} lacks its exact admitted class cause")
+                if problems:
+                    found.append(Finding("annotation-class-admission-disagreement", str(row[1]), None,
+                                         "; ".join(dict.fromkeys(problems))))
         return found
 
     @staticmethod
