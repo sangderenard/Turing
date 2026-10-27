@@ -1367,6 +1367,13 @@ def _source_sequence_slices(graph_obj: Any):
         return value is None or (isinstance(value, int) and not isinstance(value, bool))
 
     mutations = []
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
+    nodes_by_value: dict[int, list[int]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        nodes_by_value.setdefault(
+            int(data.get("value_id", node_id)), [],
+        ).append(int(node_id))
+
     for node_id, data in graph_obj.nodes(data=True):
         attrs = data.get("attributes") or {}
         if (attrs.get("aggregate_kind") != "list"
@@ -1376,11 +1383,32 @@ def _source_sequence_slices(graph_obj: Any):
         source, selector = roles.get("base"), roles.get("index")
         if source is None or selector is None or source not in graph_obj or selector not in graph_obj:
             continue
-        if (graph_obj.nodes[source].get("attributes") or {}).get("aggregate_kind") != "list":
+        source_value_id = value_id(source)
+        storage_value_id = source_value_id
+        seen_storage_ids = set()
+        cyclic_storage_alias = False
+        while storage_value_id in storage_aliases:
+            if storage_value_id in seen_storage_ids:
+                cyclic_storage_alias = True
+                break
+            seen_storage_ids.add(storage_value_id)
+            storage_value_id = int(storage_aliases[storage_value_id])
+        if cyclic_storage_alias:
+            continue
+        storage_nodes = nodes_by_value.get(storage_value_id, ())
+        if len(storage_nodes) != 1:
+            continue
+        storage_node = graph_obj.nodes[storage_nodes[0]]
+        if (storage_node.get("attributes") or {}).get("aggregate_kind") != "list":
             continue
         selector_data = graph_obj.nodes[selector]
         folded, selector_literal = literal_of(selector)
-        arguments, spellings = [value_id(source)], []
+        # A slice after an in-place loop update can name an IndexedStore or
+        # LoopResult as its base.  The exact graph storage-alias chain maps
+        # that version to the resident sequence descriptor; use that identity
+        # for the slice operation so its row type and storage come from the
+        # same existing sequence contract.
+        arguments, spellings = [storage_value_id], []
         if folded:
             if not (isinstance(selector_literal, slice) and selector_literal.step is None
                     and integer_or_none(selector_literal.start)

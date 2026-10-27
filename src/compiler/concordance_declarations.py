@@ -4074,9 +4074,10 @@ ASSIGNMENT_PROJECTION_SOURCE = declare_page(
 )
 
 # -- operation-owned result domains and scalar kernel operands ---------------
-#: ``plan_region_to_ssa_instrs``: the truth type a predicate operation owns,
-#: ``(function scope, closure, region name, output value)`` -> ``(opcode,
-#: "bool")``, CONCORD, DERIVED(the output's ``canonical_value`` cell).
+#: ``plan_region_to_ssa_instrs``: the domain an operation owns after the
+#: existing numeric promotion/conversion law. ``(function scope, closure,
+#: region name, output value)`` -> ``(opcode, dtype)``, CONCORD, DERIVED
+#: from the exact output identity and consumed operand/conversion identities.
 OPERATOR_RESULT_TYPE = declare_page("operator_result_type_concordance", (
     RowField("function_scope", K.SCOPE), RowField("closure", K.INDEX),
     RowField("region", K.NAME), RowField("output", K.VALUE_ID),

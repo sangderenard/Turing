@@ -55,7 +55,7 @@ class AggregateABIAnalysis:
         return next((item for item in self.calls if item.call is instruction), None)
 
 
-def is_storage_view(value: SSAValue, storage: SSAValue) -> bool:
+def is_storage_view(value: SSAValue, storage: SSAValue, *, function=None, book=None) -> bool:
     """Whether ``value`` is an explicitly correlated view of ``storage``.
 
     Ordered call views are distinct objects so they may carry per-position
@@ -63,9 +63,42 @@ def is_storage_view(value: SSAValue, storage: SSAValue) -> bool:
     domains can collide; the ``ssa_storage_alias`` receipt is authoritative.
     """
 
-    return value is storage or (
+    if value is storage or (
         (value.accounting or {}).get("ssa_storage_alias") == int(storage.id)
-    )
+    ):
+        return True
+    if function is None:
+        return False
+    from .ssa_record_return_state import ssa_value_identity_cell
+    from .structural_concordance import function_value_structure
+    from ..transmogrifier.dtype_layout import resolve
+
+    value_cell = ssa_value_identity_cell(function, value.id, book=book)
+    storage_cell = ssa_value_identity_cell(function, storage.id, book=book)
+    if value_cell is None or value_cell != storage_cell:
+        return False
+    # Distinct Python occurrences may be views of one posted SSA identity.
+    # A declared reshape remains a distinct view, even of the same storage.
+    if tuple(value.shape or ()) != tuple(storage.shape or ()):
+        return False
+    left, right = resolve(value.dtype), resolve(storage.dtype)
+    if left is None or right is None or left.name != right.name:
+        return False
+    for occurrence in (value, storage):
+        declared = (occurrence.accounting or {}).get("ssa_storage_view")
+        if declared and tuple(declared["view_shape"]) != tuple(storage.shape or ()):
+            return False
+    structure, _cell = function_value_structure(function, value.id, book=book)
+    for occurrence in (value, storage):
+        accounting = occurrence.accounting or {}
+        for label, authoritative in (
+            ("physical_dtype", structure.physical_dtype),
+            ("program_abi_storage", structure.declared_storage or structure.storage),
+            ("program_abi_rank", structure.rank),
+        ):
+            if label in accounting and accounting[label] != authoritative:
+                return False
+    return structure.dtype == left.name and tuple(structure.shape) == tuple(value.shape or ())
 
 
 def _function_values(function: Function) -> dict[int, SSAValue]:
@@ -345,7 +378,7 @@ def _aggregate_projections(
 
 def _post_passthrough_rebinding(
     function: Function, source: SSAValue, replacement: SSAValue,
-    via: tuple[str, int],
+    via: tuple[str, int], *, sources=(),
 ) -> int:
     """Post ``aggregate_passthrough_rebinding`` for one folded projection and
     return the replacement id THE ROW states.
@@ -372,7 +405,7 @@ def _post_passthrough_rebinding(
             (tuple(int(extent) for extent in declared_view["view_shape"]),)
             if declared_view else ()
         )),
-        identity_cells(function, source, replacement),
+        (*identity_cells(function, source, replacement), *sources),
         stage=AGGREGATE_ABI_LEGALIZATION, mode=Mode.REVISE,
     )
     # Folding advance's returned publication spans retired their projection
@@ -396,7 +429,7 @@ def _post_passthrough_rebinding(
 
 def _replace_exact_uses(
     function: Function, source: SSAValue, replacement: SSAValue,
-    *, via: tuple[str, int],
+    *, via: tuple[str, int], sources=(),
 ) -> None:
     """Rebind every use of ``source`` to ``replacement`` (the fold removes
     ``source``'s definition), as one row on the book.
@@ -409,12 +442,12 @@ def _replace_exact_uses(
     ``pub_limits`` / ``pub_limits_present`` of ``step_with_dt_control_used``).
     """
 
-    rebound_id = _post_passthrough_rebinding(function, source, replacement, via)
+    rebound_id = _post_passthrough_rebinding(function, source, replacement, via, sources=sources)
     for block in function.blocks.values():
         for instruction in block.instrs:
             instruction.args[:] = [
                 replacement
-                if argument is source or is_storage_view(argument, source)
+                if is_storage_view(argument, source, function=function)
                 else argument
                 for argument in instruction.args
             ]
@@ -736,7 +769,145 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
     """
 
     changed = False
+    from .concordance_declarations import (
+        CALL_RECORD, ARGUMENT_BINDING, RESULT_STORAGE_BINDING,
+        SEQUENCE_DESCRIPTOR, AGGREGATE_ABI_LEGALIZATION,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+
+    def returned_formal_cells(function, call, callee_id, caller_id, actual):
+        """The exact callsite's incumbent formal/result/storage relation."""
+        site = call.attributes.get("plan_callsite_id")
+        if site is None:
+            return ()
+        callee = str(call.attributes.get("callee") or "")
+        page = book.page(CALL_RECORD)
+        cells = []
+        for row in page.rows():
+            if len(row) != 2 or row[1] != function.name:
+                continue
+            for record in page.latest(row) or ():
+                if (record.caller != function.name or record.callee_symbol != callee
+                        or int(record.callsite_id) != int(site)):
+                    continue
+                bindings = [binding for binding in record.frame_bindings
+                            if int(binding[0]) == int(callee_id)]
+                if (len(bindings) != 1
+                        or bindings[0][1] not in {"caller_value", "caller_alias", "caller_storage"}
+                        or int(bindings[0][2]) != int(actual.id)
+                        or (int(callee_id), int(caller_id)) not in record.result_bindings):
+                    return ()
+                cells.append(book.latest_ref(CALL_RECORD, row))
+        if not cells:
+            return ()
+        # A compiler-owned actual may have an Unresolved argument binding
+        # whose dependency is its exact result-storage allocation. Keep both
+        # existing cells; no name or signature-position proxy replaces them.
+        cells.extend((
+            book.latest_ref(ARGUMENT_BINDING, (callee, function.name, int(callee_id), int(site))),
+            book.latest_ref(RESULT_STORAGE_BINDING, (function.name, int(site), int(callee_id), 0)),
+        ))
+        return tuple(dict.fromkeys(cell for cell in cells if cell is not None))
+
+    def transport_returned_sequence(function, call, callee_id, caller_id, cells):
+        """Project the whole returned frame through its existing call record.
+
+        A sequence's column alias alone is not its storage identity. Length,
+        capacity, status, live flags, owner and nested pool travel together,
+        using the same incumbent remapper as record-return materialization.
+        """
+        nonlocal changed
+        from .ssa_record_return_state import map_sequence_descriptor, map_child_pool
+        from .frame_identity_book import _frame_register_sequence, _frame_table_cell
+        from ..transmogrifier.ssa import sequence_member_roles
+
+        callee_name = str(call.attributes.get("callee") or "")
+        source_table = module.sequence_tables.get(callee_name)
+        target_table = module.sequence_tables.get(function.name)
+        source = None if source_table is None else source_table.by_id(int(callee_id))
+        if source is None:
+            return True
+        if target_table is None or not cells:
+            return False
+        incumbent = target_table.by_id(int(caller_id))
+        if incumbent is None:
+            return False
+        frame = {}
+        for cell in cells:
+            if cell.page != CALL_RECORD:
+                continue
+            for record in book.page(CALL_RECORD).cell(cell.row, cell.column) or ():
+                if (record.caller != function.name or record.callee_symbol != callee_name
+                        or int(record.callsite_id) != int(call.attributes["plan_callsite_id"])):
+                    continue
+                for formal, kind, actual in record.frame_bindings:
+                    if kind in {"caller_value", "caller_alias", "caller_storage"}:
+                        old = frame.setdefault(int(formal), int(actual))
+                        if old != int(actual):
+                            return False
+        # Incumbent result-storage rows also name members materialized from
+        # authored constants rather than passed as native formals.
+        result_page = book.page(RESULT_STORAGE_BINDING)
+        for row in result_page.rows():
+            if row[:2] != (function.name, int(call.attributes["plan_callsite_id"])):
+                continue
+            ref = result_page.latest(row)
+            if not hasattr(ref, "page") or ref.page.name != "ssa_value":
+                continue
+            old = frame.setdefault(int(row[2]), int(ref.row[1]))
+            if old != int(ref.row[1]):
+                return False
+        if not set(sequence_member_roles(source)).issubset(frame):
+            return False
+        mapped = map_sequence_descriptor(
+            source, frame, sequence_id=int(caller_id),
+            child_table_pool=map_child_pool(source.child_table_pool, frame),
+        )
+        descriptor_cell = _frame_table_cell(
+            source_table, source.sequence_id, SEQUENCE_DESCRIPTOR,
+            function=module.functions.get(callee_name),
+        )
+        if descriptor_cell is None:
+            return False
+        proof = (*cells, descriptor_cell)
+        # Match physical members by their declared role, never by field names
+        # or allocation positions. The semantic handle keeps its caller ID.
+        old_roles = {role: value for value, claims in sequence_member_roles(incumbent).items()
+                     for _sequence, role in claims if role != ("handle",)}
+        new_roles = {role: value for value, claims in sequence_member_roles(mapped).items()
+                     for _sequence, role in claims if role != ("handle",)}
+        if not set(old_roles).issubset(new_roles):
+            return False
+        resident = _function_values(function)
+        for role, old_id in old_roles.items():
+            new_id = new_roles[role]
+            if old_id == new_id or old_id == caller_id:
+                continue
+            original, replacement = resident.get(old_id), resident.get(new_id)
+            if original is None or replacement is None:
+                return False
+        if incumbent != mapped:
+            _frame_register_sequence(
+                function, target_table, mapped, *proof,
+                stage=AGGREGATE_ABI_LEGALIZATION, revise=True,
+            )
+            changed = True
+        for role, old_id in old_roles.items():
+            new_id = new_roles[role]
+            if old_id != new_id and old_id != caller_id:
+                _replace_exact_uses(
+                    function, resident[old_id], resident[new_id],
+                    via=(callee_name, old_id), sources=proof,
+                )
+        return True
     for function in module.functions.values():
+        from .ssa_record_return_state import accepted_ssa_component
+        if accepted_ssa_component(function):
+            # An accepted body and its descriptor proof remain on their
+            # verified owner book. Only the enclosing caller's views link.
+            continue
         for block in function.blocks.values():
             for call in block.instrs:
                 if (
@@ -767,8 +938,26 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     )
                 callee_name = str(call.attributes.get("callee") or "")
                 table = module.tensor_tables.get(callee_name)
-                if table is None:
-                    continue
+                # Native output ports may already have folded their column
+                # projections. The complete semantic return relation remains
+                # the call record; project its whole sequence frames before
+                # materializing the remaining native-output view below.
+                native_inputs = dict(zip(
+                    map(int, call.attributes.get("callee_input_ids", ())),
+                    call.args,
+                ))
+                for row in book.page(CALL_RECORD).rows():
+                    if len(row) != 2 or row[1] != function.name:
+                        continue
+                    for record in book.page(CALL_RECORD).latest(row) or ():
+                        if (record.caller != function.name or record.callee_symbol != callee_name
+                                or int(record.callsite_id) != int(call.attributes.get("plan_callsite_id", -1))):
+                            continue
+                        for callee_id, caller_id in record.result_bindings:
+                            actual = native_inputs.get(int(callee_id))
+                            if actual is not None:
+                                cells = returned_formal_cells(function, call, callee_id, caller_id, actual)
+                                transport_returned_sequence(function, call, callee_id, caller_id, cells)
                 authored = tuple(map(
                     int,
                     call.attributes.get("callee_output_ids", caller_ids),
@@ -782,11 +971,11 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                 output_descriptors: list[Any] = []
                 for output_id in authored:
                     current = int(output_id)
-                    output_descriptors.append(table.by_id(current))
+                    output_descriptors.append(None if table is None else table.by_id(current))
                     seen: set[int] = set()
                     while current not in seen:
                         seen.add(current)
-                        descriptor = table.by_id(current)
+                        descriptor = None if table is None else table.by_id(current)
                         if descriptor is None:
                             break
                         storage = int(descriptor.data_value_id)
@@ -835,10 +1024,20 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                         # whose uses are concretely rebound below.
                         retained.append(index)
                         continue
+                    binding_cells = returned_formal_cells(
+                        function, call, callee_id, caller_id, actual,
+                    )
+                    # Posted occurrences can share the projection's identity
+                    # only across this exact recorded caller/callee binding.
+                    # Raw standalone SSA retains the incumbent object path.
+                    allow_posted_views = bool(binding_cells)
                     has_direct_consumer = any(
                         int(argument.id) == int(caller_id)
                         and argument is not projection.value
-                        and not is_storage_view(argument, projection.value)
+                        and not is_storage_view(
+                            argument, projection.value,
+                            function=function if allow_posted_views else None,
+                        )
                         for consumer_block in function.blocks.values()
                         for consumer in consumer_block.instrs
                         if consumer is not projection.address
@@ -851,6 +1050,11 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                         # aggregate at the same position.  The projection can
                         # be folded only if doing so does not erase that
                         # independent call result from the ABI.
+                        retained.append(index)
+                        continue
+                    if not transport_returned_sequence(
+                        function, call, callee_id, caller_id, binding_cells,
+                    ):
                         retained.append(index)
                         continue
                     # Program: ``valid.reshape((-1, 1, 1))`` planned as a call
@@ -868,7 +1072,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     # view) and the rebinding row states the view shape.
                     view_accounting: dict[str, Any] = {}
                     output_descriptor = output_descriptors[index]
-                    storage_descriptor = table.by_id(int(callee_id))
+                    storage_descriptor = None if table is None else table.by_id(int(callee_id))
                     if (
                         output_descriptor is not None
                         and storage_descriptor is not None
@@ -908,6 +1112,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     _replace_exact_uses(
                         function, projection.value, replacement,
                         via=(callee_name, int(caller_id)),
+                        sources=binding_cells,
                     )
                     passthrough_bindings.append((
                         int(output_position), int(caller_id),
@@ -942,6 +1147,31 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                             call.attributes[key] = tuple(
                                 values[index] for index in retained
                             )
+                    if not retained and not any(
+                        argument is call.res
+                        for consumer_block in function.blocks.values()
+                        for consumer in consumer_block.instrs
+                        for argument in consumer.args
+                    ):
+                        # Every semantic result is now the recorded actual
+                        # storage. The empty abstract tuple has no consumer;
+                        # retaining it invents an output parameter on the
+                        # native call after its callee's outputs were folded.
+                        from .ir_identities import _post_dead_structural_retirement
+                        from .concordance_declarations import AGGREGATE_PASSTHROUGH_REBINDING
+                        from .ssa_record_return_state import function_scope_of
+
+                        _post_dead_structural_retirement(
+                            function, call, sources=tuple(
+                                cell for binding in passthrough_bindings
+                                for cell in (book.latest_ref(
+                                    AGGREGATE_PASSTHROUGH_REBINDING,
+                                    (function_scope_of(function), int(binding[1])),
+                                ),) if cell is not None
+                            ),
+                        )
+                        call.res = None
+                        call.attributes["result_convention"] = "void"
                 elif settled != authored:
                     call.attributes["callee_output_ids"] = settled
                     changed = True

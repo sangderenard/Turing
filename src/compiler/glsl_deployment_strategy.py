@@ -4317,15 +4317,18 @@ def _build_shell_hierarchy_plan(
                     if isinstance(literal, bool):
                         dtype = "bool"
                     elif isinstance(literal, int):
-                        # A Python integer literal is the same signed int64
-                        # scalar published for this identity by control SSA.
-                        # In Vocabulary._aggregate_matches, the loop seed
-                        # ``i = 0`` had no graph tensor descriptor, so this
-                        # fallback stamped the planned comparison input as
-                        # ``int`` (the int32 storage alias) while the retained
-                        # loop Phi's posted SSA_VALUE was int64. Keep the
-                        # planner closure on that existing primitive contract.
-                        dtype = "int64"
+                        # PlanClosure is a projection of the exact graph value
+                        # into the region feed view.  Use the shared layout
+                        # law for a Python integer's mathematical range; the
+                        # previous unconditional int64 spelling made a
+                        # large imported constant disagree with its control
+                        # SSA materialization and prevented the planner from
+                        # inserting its existing exact common-domain Cast.
+                        from ..transmogrifier.dtype_layout import (
+                            python_int_literal_dtype,
+                        )
+
+                        dtype = python_int_literal_dtype(literal)
                     elif isinstance(literal, float):
                         dtype = "float64"
                 # Callable/operator-reference edges are provenance, not
@@ -23194,12 +23197,16 @@ def _tensor_descriptor_rule(
                             literal = ast.literal_eval(member.get("expr_obj"))
                         except (ValueError, TypeError, SyntaxError):
                             return None
-                    dtype = (
-                        "bool" if isinstance(literal, bool)
-                        else "int64" if isinstance(literal, int)
-                        else "float64" if isinstance(literal, float)
-                        else None
-                    )
+                    if isinstance(literal, bool):
+                        dtype = "bool"
+                    elif type(literal) is int:
+                        from ..transmogrifier.dtype_layout import (
+                            python_int_literal_dtype,
+                        )
+
+                        dtype = python_int_literal_dtype(literal)
+                    else:
+                        dtype = "float64" if isinstance(literal, float) else None
                     return (
                         None if dtype is None
                         else {"shape": (), "dtype": dtype, "rank": 0}
@@ -23650,11 +23657,21 @@ def _tensor_descriptor_rule(
                                 # the literal's descriptor is its Python
                                 # type; against a floating tensor it stays a
                                 # weak scalar (``_promoting_sides``).
-                                side = {"shape": (), "dtype": (
-                                    "bool" if isinstance(literal, bool)
-                                    else "int64" if isinstance(literal, int)
-                                    else "float64"
-                                )}
+                                if isinstance(literal, bool):
+                                    literal_dtype = "bool"
+                                elif type(literal) is int:
+                                    from ..transmogrifier.dtype_layout import (
+                                        python_int_literal_dtype,
+                                    )
+
+                                    literal_dtype = python_int_literal_dtype(
+                                        literal,
+                                    )
+                                else:
+                                    literal_dtype = "float64"
+                                side = {
+                                    "shape": (), "dtype": literal_dtype,
+                                }
                     sides.append(side)
                 # A HOST SCALAR broadcasts against anything.  ``index >= k``
                 # compares a vector with an ordinary Python ``int`` argument,
@@ -26490,13 +26507,19 @@ def _fold_callsite_structural_values(
                         "Constant", "Const", "const",
                     } and isinstance(literal, (bool, int, float)):
                         # A scalar literal operand is an exact rank-0 value.
+                        if isinstance(literal, bool):
+                            literal_dtype = "bool"
+                        elif type(literal) is int:
+                            from ..transmogrifier.dtype_layout import (
+                                python_int_literal_dtype,
+                            )
+
+                            literal_dtype = python_int_literal_dtype(literal)
+                        else:
+                            literal_dtype = "float64"
                         descriptor = {
                             "shape": (),
-                            "dtype": (
-                                "bool" if isinstance(literal, bool)
-                                else "int64" if isinstance(literal, int)
-                                else "float64"
-                            ),
+                            "dtype": literal_dtype,
                         }
                 if descriptor is None:
                     # One undescribed numerical operand makes the result

@@ -1134,6 +1134,41 @@ class _FunctionEmitter:
         self._heap_elements: dict[int, str] = {}
         self._heap_owner_ids: set[int] = set()
         heap_occurrences: dict[int, SSAValue] = {}
+        # Returned/forwarded record pools retain their complete storage
+        # descriptor even when a formal occurrence has no resident heap
+        # labels. Read that same concordance view as the allocator: the
+        # validate_atom_span child cells are pointers, not REAL(8) scalars.
+        if sequence_table is not None:
+            from .structural_concordance import storage_structure
+            for descriptor in sequence_table.sequences.values():
+                structure, _cell = storage_structure(
+                    "sequence", sequence_table.owner, descriptor.sequence_id,
+                    book=sequence_table.book,
+                )
+                native = dict(structure.children).get("native_storage")
+                if descriptor.heap_owner_value_id is not None and (
+                    native is None or native.kind == "unresolved"
+                ):
+                    raise FortranEmissionError(
+                        "owned sequence lacks a resolved concordance native-storage view"
+                    )
+                if native is None:
+                    continue
+                for _member, member in native.children:
+                    value_id = int(member.value_id)
+                    if value_id not in self._value_types:
+                        continue
+                    if member.storage == "heap_owner":
+                        if value_id in self._heap_elements:
+                            raise FortranEmissionError("heap storage identity is both owner and cell")
+                        self._heap_owner_ids.add(value_id)
+                    elif member.storage == "heap_cell":
+                        if value_id in self._heap_owner_ids:
+                            raise FortranEmissionError("heap storage identity is both owner and cell")
+                        element = dict(member.children)["element"]
+                        prior = self._heap_elements.setdefault(value_id, str(element.dtype))
+                        if prior != element.dtype:
+                            raise FortranEmissionError("heap cell has conflicting descriptor element layouts")
         for value in (
             *function.args,
             *(
@@ -1148,12 +1183,17 @@ class _FunctionEmitter:
             if str(value.dtype or "").casefold() != "ptr":
                 continue
             if accounting.get("heap_owner"):
+                if int(value.id) in self._heap_elements:
+                    raise FortranEmissionError("heap owner occurrence disagrees with storage descriptor")
                 self._heap_owner_ids.add(int(value.id))
             elif accounting.get("heap_element_dtype") is not None:
-                self._heap_elements[int(value.id)] = str(
-                    accounting["heap_element_dtype"]
-                )
-            else:
+                if int(value.id) in self._heap_owner_ids:
+                    raise FortranEmissionError("heap cell occurrence disagrees with storage descriptor")
+                element = str(accounting["heap_element_dtype"])
+                prior = self._heap_elements.setdefault(int(value.id), element)
+                if prior != element:
+                    raise FortranEmissionError("heap cell occurrence disagrees with descriptor element layout")
+            elif int(value.id) not in self._heap_elements and int(value.id) not in self._heap_owner_ids:
                 continue
             heap_occurrences.setdefault(int(value.id), value)
         for value_id, occurrence in heap_occurrences.items():
@@ -5218,7 +5258,21 @@ class _FunctionEmitter:
                 for value_id in pointer_ids & self._formal_value_ids:
                     initializations[value_id] = f"    t{value_id} = c_null_ptr"
                 for value_id in scalar_ids & self._formal_value_ids:
-                    initializations[value_id] = f"    t{value_id} = 0"
+                    # A private list's length/status is one scalar CELL,
+                    # also when the interoperable dummy is assumed-size.
+                    # ``values=[]; ...; selected=values[:end]`` previously
+                    # assigned zero to the entire assumed-size formal and
+                    # gfortran correctly refused its absent upper bound.
+                    # Address the existing one-element physical cell, rather
+                    # than inventing a whole-array extent for initialization.
+                    value = self._value_types[value_id]
+                    shape = tuple(value.shape or ())
+                    target = f"t{value_id}"
+                    if shape:
+                        if _element_count(shape) != 1:
+                            raise FortranEmissionError("sequence scalar cell has a nonscalar physical extent")
+                        target += "(" + ", ".join("1" for _ in shape) + ")"
+                    initializations[value_id] = f"    {target} = 0"
             body[:0] = list(initializations.values())
         call_frame_cells = {
             int(value.id)
@@ -7455,6 +7509,12 @@ def emit_module(
     entry_points = []
     subroutine_by_name = {item.name: item for item in subroutines}
     for function_name, function in functions.items():
+        if function_name not in roots:
+            # Reachable Fortran procedures use the native Fortran signature
+            # catalogue above. Only the already selected exports cross the
+            # foreign/public ABI; internal i128 operands do not acquire a
+            # ctypes/NumPy representation merely because a helper is called.
+            continue
         kind = _kind(function_name)
         note = None
         if kind == "control":

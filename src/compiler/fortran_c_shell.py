@@ -35,6 +35,7 @@ import numpy as np
 import networkx as nx
 from .live_tiles import live_digraph
 from .ssa_record_return_state import (
+    refresh_frame_aliased_result as _refresh_frame_aliased_result,
     record_return_layouts as _concordant_record_return_layouts,
     post_record_return_layout as _publish_record_return_layout,
     posted_ssa_value_fact as _posted_ssa_value_fact,
@@ -43,6 +44,7 @@ from .ssa_record_return_state import (
     ssa_value_identity_cell as _ssa_value_identity_cell,
     record_descriptor_cell as _record_descriptor_cell,
     record_member_cell as _record_member_cell,
+    map_sequence_descriptor, map_child_pool,
 )
 from .concordance_declarations import (
     FRAME_LINK as _FRAME_LINK,
@@ -1499,6 +1501,50 @@ def _recover_late_source_literals(
     authored_constants.update(dict(
         (function.metadata or {}).get("authored_constant_values", ())
     ))
+    from .concordance_declarations import SSA_CONSTANT_MATERIALIZATION
+    from .identity_concordance import current_identity_book
+    from .ssa_record_return_state import function_scope_of
+
+    identity_book = current_identity_book()
+    function_scope = function_scope_of(function)
+    entry_label = next(iter(function.blocks))
+    constant_page = identity_book.page(SSA_CONSTANT_MATERIALIZATION)
+
+    def authored_constant_dtype(value_id: int, literal: Any) -> tuple[str, Any]:
+        """Read the already-concorded native representation of this value."""
+        if isinstance(literal, int) and not isinstance(literal, bool):
+            row = (
+                function_scope, str(function.name), str(entry_label),
+                int(value_id),
+            )
+            cell = identity_book.latest_ref(
+                SSA_CONSTANT_MATERIALIZATION, row,
+            )
+            fact = (
+                None if cell is None else
+                constant_page.cell(cell.row, cell.column)
+            )
+            if isinstance(fact, tuple) and len(fact) == 3:
+                if fact[2] != repr(literal):
+                    raise ValueError(
+                        "authored constant materialization disagrees with "
+                        f"the exact literal identity {value_id}"
+                    )
+                return str(fact[1]), cell
+            # Standalone late-recovery users have no prior source compiler
+            # materialization row.  They use the same integer layout law;
+            # normal source lowering always takes the exact row above.
+            from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+            return python_int_literal_dtype(literal), None
+        return (
+            "bool" if isinstance(literal, bool) else
+            "float64" if isinstance(literal, float) else
+            "none" if literal is None else
+            "int64",
+            None,
+        )
+
     source_candidates: dict[int, list[tuple[int, Mapping[str, Any]]]] = {}
     if graph_obj is not None:
         for node_id, data in graph_obj.nodes(data=True):
@@ -1555,6 +1601,7 @@ def _recover_late_source_literals(
             if isinstance(expression, ast.Constant)
             else (data.get("attributes") or {}).get("value", data.get("constant"))
         )
+        _materialization_ref = None
         if isinstance(literal, str):
             formal.dtype = "int64"
             instruction = Instr(
@@ -1565,10 +1612,8 @@ def _recover_late_source_literals(
             formal.dtype = "none"
             instruction = Instr("NoneValue", [], formal)
         elif isinstance(literal, (bool, int, float)):
-            formal.dtype = (
-                "bool" if isinstance(literal, bool)
-                else "int64" if isinstance(literal, int)
-                else "float64"
+            formal.dtype, _materialization_ref = authored_constant_dtype(
+                value_id, literal,
             )
             instruction = Instr("Const", [], formal, attributes={"value": literal})
         else:
@@ -1578,7 +1623,7 @@ def _recover_late_source_literals(
             **dict(formal.accounting or {}), "authored_constant": True,
         }
         instructions.append(instruction)
-        recovered.append((value_id, literal))
+        recovered.append((value_id, literal, _materialization_ref))
     if instructions:
         entry_label, entry = next(iter(function.blocks.items()))
         entry.instrs[0:0] = instructions
@@ -1588,7 +1633,7 @@ def _recover_late_source_literals(
         # SSA value/formal it replaces; a later dominance pass must not be
         # asked to infer that cause from the newly shaped instruction list.
         from .concordance_declarations import (
-            CONTROL_SSA_FINISH, SSA_BLOCK_GEOMETRY,
+            CONTROL_SSA_FINISH, KEEP_PHYSICAL, SSA_BLOCK_GEOMETRY,
             SSA_CONSTANT_MATERIALIZATION,
         )
         from .identity_concordance import Derived, Mode, current_identity_book
@@ -1602,30 +1647,50 @@ def _recover_late_source_literals(
             SSA_BLOCK_GEOMETRY,
             (scope, str(function.name), str(entry_label)),
         )
-        recovered_by_id = dict(recovered)
+        recovered_by_id = {
+            int(value_id): (literal, materialization_ref)
+            for value_id, literal, materialization_ref in recovered
+        }
         for instruction in instructions:
             value_id = int(instruction.res.id)
+            literal, materialization_ref = recovered_by_id[value_id]
             sources = tuple(dict.fromkeys(cell for cell in (
                 _frame_graph_cell(graph_obj, value_id)
                 if graph_obj is not None else None,
                 ssa_value_identity_cell(function, value_id, book=book),
                 prior_geometry,
+                materialization_ref,
             ) if cell is not None))
             if not sources:
                 continue
-            literal = recovered_by_id[value_id]
-            book.post(
-                SSA_CONSTANT_MATERIALIZATION,
-                (scope, str(function.name), str(entry_label), value_id),
-                (
-                    str(instruction.op),
-                    str(instruction.res.dtype),
-                    repr(literal),
-                ),
-                stage=CONTROL_SSA_FINISH,
-                provenance=Derived(sources),
-                mode=Mode.CONCORD,
+            materialization_row = (
+                scope, str(function.name), str(entry_label), value_id,
             )
+            materialization_fact = (
+                str(instruction.op), str(instruction.res.dtype), repr(literal),
+            )
+            prior_materialization = book.latest_ref(
+                SSA_CONSTANT_MATERIALIZATION, materialization_row,
+            )
+            prior_materialization_fact = (
+                None if prior_materialization is None else
+                book.page(SSA_CONSTANT_MATERIALIZATION).cell(
+                    prior_materialization.row, prior_materialization.column,
+                )
+            )
+            materialization_source = prior_materialization
+            if prior_materialization_fact != materialization_fact:
+                post_sources = tuple(
+                    cell for cell in sources if cell != prior_materialization
+                )
+                materialization_source = book.post(
+                    SSA_CONSTANT_MATERIALIZATION,
+                    materialization_row, materialization_fact,
+                    stage=CONTROL_SSA_FINISH,
+                    provenance=Derived(post_sources),
+                    mode=Mode.REVISE if prior_materialization is not None
+                    else Mode.CONCORD,
+                )
             # Program: any late-exposed authored literal formal (None, str,
             # bool, int, float).  Wrong record: the formal's dtype was set
             # on the resident above ("none"/"int64"/...) but its
@@ -1636,7 +1701,18 @@ def _recover_late_source_literals(
             revise_ssa_value(
                 function, value_id, dtype=instruction.res.dtype,
                 shape=tuple(instruction.res.shape or ()),
-                stage=CONTROL_SSA_FINISH, sources=sources, book=book,
+                stage=CONTROL_SSA_FINISH,
+                sources=tuple(dict.fromkeys((
+                    *sources, materialization_source,
+                ))),
+                book=book,
+                physical=(
+                    {
+                        "physical_dtype": str(instruction.res.dtype),
+                        "storage": "scalar", "rank": 0, "arena": False,
+                    }
+                    if type(literal) is int else KEEP_PHYSICAL
+                ),
             )
     return tuple(recovered)
 
@@ -2070,11 +2146,16 @@ def _recover_late_source_pure_expressions(
                     if not isinstance(literal, (bool, int, float)):
                         failed[0] = True
                         return None
-                    dtype = (
-                        "bool" if isinstance(literal, bool)
-                        else "int64" if isinstance(literal, int)
-                        else "float64"
-                    )
+                    if isinstance(literal, bool):
+                        dtype = "bool"
+                    elif type(literal) is int:
+                        from ..transmogrifier.dtype_layout import (
+                            python_int_literal_dtype,
+                        )
+
+                        dtype = python_int_literal_dtype(literal)
+                    else:
+                        dtype = "float64"
                     result = result_value(value_id, dtype)
                     result.dtype = dtype
                     result.shape = ()
@@ -3731,6 +3812,7 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                     live = [formal for formal in callee.args if int(formal.id) in bound]
                     call.args = [bound[int(formal.id)] for formal in live]
                     call.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in live)
+                    _refresh_frame_aliased_result(call, callee)
                     tail = [formal for formal in callee.args if int(formal.id) not in bound]
                 else:
                     tail = callee.args[len(call.args):]
@@ -3916,6 +3998,7 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                     bound = dict(zip(call.attributes["callee_input_ids"], call.args))
                     call.args = [bound[int(formal.id)] for formal in callee.args]
                     call.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in callee.args)
+                    _refresh_frame_aliased_result(call, callee)
     return appended
 
 
@@ -4408,6 +4491,7 @@ def _prune_unused_callee_formals_once(
                         int(output_formal_id),
                         "pruned_callee_formal_concordance",
                     )
+            _refresh_frame_aliased_result(call, callee)
         callee.args = [callee.args[index] for index in keep_indices]
         integral = dict(metadata.get("source_region_integral") or {})
         if integral.get("capture_value_ids") is not None:
@@ -18693,6 +18777,7 @@ def _propagate_record_field_demand(
                         if declared is not None:
                             declared = (*declared, int(formal.id))
                             instruction.attributes["callee_input_ids"] = declared
+                            _refresh_frame_aliased_result(instruction, callee)
                         supplied.add(key)
                         grew = True
 
@@ -19094,6 +19179,7 @@ def _propagate_native_type_tag_demand(
                     instruction.attributes["callee_input_ids"] = tuple(
                         map(int, declared)
                     )
+                    _refresh_frame_aliased_result(instruction, callee)
                 additions = []
                 for formal in callee.args:
                     accounting = dict(formal.accounting or {})
@@ -19456,6 +19542,7 @@ def _propagate_native_type_tag_demand(
                     instruction.attributes["callee_input_ids"] = tuple(
                         map(int, declared)
                     )
+                    _refresh_frame_aliased_result(instruction, callee)
                 rewritten.append(instruction)
             block.instrs = rewritten
 
@@ -20212,6 +20299,7 @@ def _harmonize_call_argument_shapes(all_functions: Mapping[str, Any]) -> None:
                 if all(value_id in bound for value_id in formal_ids):
                     instruction.args = [bound[value_id] for value_id in formal_ids]
                     instruction.attributes["callee_input_ids"] = formal_ids
+                    _refresh_frame_aliased_result(instruction, callee)
                 # An incomplete exact binding cannot be repaired from names.
                 continue
             if ambiguous_formal:
@@ -20616,6 +20704,7 @@ def _drop_formals_and_call_operands(
                         value_id for position, value_id in enumerate(declared)
                         if position not in dropped
                     )
+                    _refresh_frame_aliased_result(instruction, function)
 
 
 def _strip_dead_cell_bookkeeping(function: Any, members: set[int]) -> set[int]:
@@ -27646,10 +27735,14 @@ def _class_surface_ssa_program(
             if isinstance(fact, bool):
                 return "bool"
             if isinstance(fact, int):
-                # An observed Python integer refines type, not machine width.
-                # Keep it aligned with the authored ``int`` annotation and
-                # the repository's fixed-width Python-integer ABI.
-                return "int64"
+                # Python integer constants are weakly typed by class, but
+                # their exact value determines the narrowest native domain
+                # that can represent them.  Keep this decision in the shared
+                # dtype authority; never route an out-of-range literal through
+                # int64 or floating point.
+                from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+                return python_int_literal_dtype(fact)
             if isinstance(fact, float):
                 return "float64"
             return None
@@ -27771,6 +27864,79 @@ def _class_surface_ssa_program(
                 constant_values[materialized_value_id] = (
                     _copy_literal_payload(literal)
                 )
+                # Keep the exact source value and any existing authored
+                # reference/literal evidence attached to the control
+                # materialization. Imported constants such as U64_MAX have a
+                # STATIC_REFERENCE_USE edge, not a SOURCE_LITERAL_VALUE row;
+                # this joins only through the exact ingestion Ref shared by
+                # the canonical identity and the existing source fact.
+                from .concordance_declarations import (
+                    SOURCE_LITERAL_VALUE, STATIC_REFERENCE_USE,
+                )
+
+                source_identity = _identity_cell(
+                    graph_obj, materialized_value_id,
+                )
+                evidence = []
+                pending = [source_identity] if source_identity is not None else []
+                seen_source_refs = set()
+                while pending:
+                    current_source = pending.pop()
+                    if current_source in seen_source_refs:
+                        continue
+                    seen_source_refs.add(current_source)
+                    for parent_ref, _source_stage in shape_identity_book.edges_into(
+                        current_source,
+                    ):
+                        pending.append(parent_ref)
+                        if parent_ref.page.name != "ingestion_value":
+                            continue
+                        source_node_id = int(parent_ref.row[-1])
+                        source_edge_targets = {
+                            target_ref
+                            for target_ref, _target_stage
+                            in shape_identity_book.edges_out_of(parent_ref)
+                        }
+                        static_page = shape_identity_book.pages.get(
+                            STATIC_REFERENCE_USE.name
+                        )
+                        if static_page is not None:
+                            for use_row in static_page.rows():
+                                if (
+                                    isinstance(use_row, tuple)
+                                    and len(use_row) == 3
+                                    and int(use_row[2]) == source_node_id
+                                ):
+                                    use_cell = shape_identity_book.latest_ref(
+                                        STATIC_REFERENCE_USE, use_row,
+                                    )
+                                    if use_cell in source_edge_targets:
+                                        evidence.append(use_cell)
+                        literal_page = shape_identity_book.pages.get(
+                            SOURCE_LITERAL_VALUE.name
+                        )
+                        if literal_page is not None:
+                            for literal_row in literal_page.rows():
+                                if (
+                                    isinstance(literal_row, tuple)
+                                    and len(literal_row) == 2
+                                    and int(literal_row[1]) == source_node_id
+                                ):
+                                    literal_cell = shape_identity_book.latest_ref(
+                                        SOURCE_LITERAL_VALUE, literal_row,
+                                    )
+                                    if literal_cell in source_edge_targets:
+                                        evidence.append(literal_cell)
+                if source_identity is not None or evidence:
+                    constant_source_cells[materialized_value_id] = tuple(
+                        dict.fromkeys((
+                            *constant_source_cells.get(
+                                materialized_value_id, (),
+                            ),
+                            *((source_identity,) if source_identity is not None else ()),
+                            *evidence,
+                        ))
+                    )
             if str(data.get("type") or "").casefold() != "input":
                 continue
             parameter_name = str(
@@ -28884,7 +29050,7 @@ def _class_surface_ssa_program(
         for value_id, literal in constant_values.items():
             literal_dtype = scalar_fact_dtype(literal)
             if literal_dtype is not None:
-                parameter_value_dtypes.setdefault(int(value_id), literal_dtype)
+                parameter_value_dtypes[int(value_id)] = literal_dtype
 
         # A schema-known record constructor only packages its field
         # residents. It cannot mutate a keyed/list field while doing so,
@@ -29021,12 +29187,19 @@ def _class_surface_ssa_program(
         # refused it as dynamic-growth-unavailable).  Rule: a sequence an
         # ``extend``/``replace`` fills from a DYNAMIC source holds as many
         # rows as that source, so it is DYNAMIC too.
+        # A source slice is a fresh sequence whose runtime length is bounded
+        # by its source.  When a loop-built source has no static capacity, the
+        # copied result also needs the existing DYNAMIC owner path; otherwise
+        # the slice descriptor is born fixed and cannot reserve its rows.
         copied_from = tuple(
             (int(mutation.sequence_value_id), tuple(map(
-                int, mutation.argument_value_ids,
+                int,
+                mutation.argument_value_ids[:1]
+                if str(mutation.operator) == "slice"
+                else mutation.argument_value_ids,
             )))
             for mutation in _control_sequence_mutations(control.root)
-            if str(mutation.operator) in {"extend", "replace"}
+            if str(mutation.operator) in {"extend", "replace", "slice"}
         ) + _optional_glyph_payload_copies(control.root)
         # Program: ``xs = [5, n, 2, 9]; ys = sorted(xs)`` (scratch c120).
         # Wrong record: the private result was caller-provided workspace
@@ -32327,12 +32500,16 @@ def _class_surface_ssa_program(
                     insertions.append(Instr("NoneValue", [], result))
                     values[value_id] = result
                     return result
-                dtype = (
-                    "bool" if isinstance(literal, bool)
-                    else "int64" if isinstance(literal, int)
-                    else "float64" if isinstance(literal, float)
-                    else None
-                )
+                if isinstance(literal, bool):
+                    dtype = "bool"
+                elif type(literal) is int:
+                    from ..transmogrifier.dtype_layout import (
+                        python_int_literal_dtype,
+                    )
+
+                    dtype = python_int_literal_dtype(literal)
+                else:
+                    dtype = "float64" if isinstance(literal, float) else None
                 result = SSAValue(value_id, dtype=dtype)
                 insertions.append(Instr(
                     "Const", [], result, attributes={"value": literal},
@@ -42940,75 +43117,7 @@ def _class_surface_ssa_program(
             },
         )
 
-    def map_sequence_descriptor(
-        descriptor: Any, remap: Mapping[int, int], *,
-        sequence_id: int, child_table_pool: Any,
-    ):
-        """One descriptor re-keyed into another frame through ``remap``.
 
-        Program: ``ys = make(n)`` and ``fill(xs, n)`` with DYNAMIC lists.
-        Wrong record: five linker sites rebuilt the caller's descriptor field
-        by field and silently dropped every field they did not name -- the
-        heap owner among them -- so the caller's view of a DYNAMIC arena was
-        FIXED.  Rule: re-keying maps EVERY identity member (columns, counters,
-        status, live flags, heap owner, child pool) through the same map and
-        carries every other field unchanged; an unmapped member refuses.
-        """
-
-        from dataclasses import replace as _replace
-
-        def mapped(value_id):
-            return None if value_id is None else remap[int(value_id)]
-
-        return _replace(
-            descriptor,
-            sequence_id=int(sequence_id),
-            column_value_ids=tuple(
-                remap[int(value_id)] for value_id in descriptor.column_value_ids
-            ),
-            length_address_id=remap[int(descriptor.length_address_id)],
-            capacity_value_id=remap[int(descriptor.capacity_value_id)],
-            status_address_id=mapped(descriptor.status_address_id),
-            live_flags_value_id=mapped(descriptor.live_flags_value_id),
-            heap_owner_value_id=mapped(descriptor.heap_owner_value_id),
-            child_table_pool=child_table_pool,
-        )
-
-    def map_child_pool(pool: Any, remap: Mapping[int, int]):
-        if pool is None:
-            return None
-        return SSAChildTablePoolDescriptor(
-            handle_column=int(pool.handle_column),
-            column_value_ids=tuple(
-                remap[int(value_id)] for value_id in pool.column_value_ids
-            ),
-            length_value_id=remap[int(pool.length_value_id)],
-            capacity_value_id=remap[int(pool.capacity_value_id)],
-            row_stride_value_id=remap[int(pool.row_stride_value_id)],
-            shape_value_id=(
-                None if pool.shape_value_id is None
-                else remap[int(pool.shape_value_id)]
-            ),
-            rank_value_id=(
-                None if pool.rank_value_id is None
-                else remap[int(pool.rank_value_id)]
-            ),
-            shape_stride_value_id=(
-                None if pool.shape_stride_value_id is None
-                else remap[int(pool.shape_stride_value_id)]
-            ),
-            status_value_id=(
-                None if pool.status_value_id is None
-                else remap[int(pool.status_value_id)]
-            ),
-            live_flags_value_id=(
-                None if pool.live_flags_value_id is None
-                else remap[int(pool.live_flags_value_id)]
-            ),
-            column_dtypes=tuple(pool.column_dtypes),
-            key_columns=tuple(pool.key_columns),
-            writable=bool(pool.writable),
-        )
 
     def loop_constructor_requires_instance_pool(
         graph: Any, receiver_id: int, enclosing_loop_ids: tuple[int, ...]
@@ -51265,6 +51374,7 @@ def _class_surface_ssa_program(
                                 ].id),
                                 "result_aliases_frame": True,
                                 "semantic_result_id": int(caller_result_id),
+                                "ssa_output_call_record": record.cell,
                             } if aliased_return_argument_index is not None else {}),
                             **({
                                 "result_convention": "ssa.aggregate",
@@ -51309,6 +51419,7 @@ def _class_surface_ssa_program(
                         },
                     )
                     forwarded_frame_result = _retain_forwarded_aggregate_storage(native_call, callee)
+                    _refresh_frame_aliased_result(native_call, callee, record=record)
                     aggregate_unpack = []
                     if returns_aggregate and result is not None and not forwarded_frame_result:
                         selected_outputs = (
@@ -55260,6 +55371,7 @@ def _class_surface_ssa_program(
                 block.instrs[index:index] = constants
             instruction.args = refreshed
             instruction.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in callee.args)
+            _refresh_frame_aliased_result(instruction, callee, record=record)
 
     # Native call linking can create a caller-owned record descriptor and its
     # aggregate-unpack values after the earlier source-output recovery pass.
@@ -55715,6 +55827,7 @@ def _class_surface_ssa_program(
                 block.instrs[index:index] = constants
             instruction.args = refreshed
             instruction.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in callee.args)
+            _refresh_frame_aliased_result(instruction, callee, record=record)
 
     # A planned region may expose ``record.sequence_field`` as an aggregate
     # scalar result even though the record/sequence tables have already proved
@@ -56145,6 +56258,7 @@ def _class_surface_ssa_program(
                     call.attributes["callee_input_ids"] = tuple(
                         int(argument.id) for argument in callee.args
                     )
+                    _refresh_frame_aliased_result(call, callee, record=record)
                     call.attributes[
                         "returned_record_sequence_reconciled"
                     ] = tuple(sorted(exact_members.items()))
@@ -57539,7 +57653,8 @@ def _class_surface_ssa_program(
         recovered_literals = _recover_late_source_literals(function, graph)
         if recovered_literals:
             function.metadata["recovered_late_source_literals"] = tuple(
-                value_id for value_id, _literal in recovered_literals
+                value_id for value_id, _literal, _materialization_ref
+                in recovered_literals
             )
         recovered_reductions = _recover_late_source_unary_operations(
             function, graph,
@@ -58222,7 +58337,11 @@ def _class_surface_ssa_program(
             function.metadata["recovered_late_source_literals"] = tuple(
                 dict.fromkeys((
                     *function.metadata.get("recovered_late_source_literals", ()),
-                    *(value_id for value_id, _literal in recovered_literals),
+                    *(
+                        value_id
+                        for value_id, _literal, _materialization_ref
+                        in recovered_literals
+                    ),
                 ))
             )
 

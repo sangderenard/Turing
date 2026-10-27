@@ -177,3 +177,65 @@ def test_uint64_int64_add_and_comparison_use_internal_i128(
             right_id: np.array([right], dtype=np.int64),
         }).run()
         assert bool(execution.buffers[result_id].item()) is expected
+
+
+def test_scalar_shaped_add_result_joins_against_unsigned_comparison_operand():
+    source = (
+        "def compare(left, right, limit):\n"
+        "    total = left + right\n"
+        "    return total > limit\n"
+    )
+    policy = ExtractionContract(CONTRACT).with_program_abi({
+        "records": {},
+        "bindings": [],
+        "values": [
+            {
+                "function": "compare", "parameter": "left",
+                "storage": "scalar", "dtype": "int64", "rank": 0,
+                "python_type": "builtins.int",
+            },
+            {
+                "function": "compare", "parameter": "right",
+                "storage": "scalar", "dtype": "int64", "rank": 0,
+                "python_type": "builtins.int",
+            },
+            {
+                "function": "compare", "parameter": "limit",
+                "storage": "scalar", "dtype": "uint64", "rank": 0,
+                "python_type": "builtins.int",
+            },
+        ],
+    })
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "compare", name="scalar_shaped_add_comparison",
+        extraction_contract=policy, progress=lambda _message: None,
+    )
+    from src.compiler.identity_concordance import concordance_report
+
+    assert concordance_report(module).splitlines()[0].endswith("0 finding(s)")
+    instructions = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    ]
+    add = next(
+        instruction for instruction in instructions
+        if instruction.op == "Add" and instruction.res is not None
+    )
+    comparison = next(
+        instruction for instruction in instructions
+        if instruction.op == "Gt" and instruction.res is not None
+    )
+    assert add.res.dtype == "int64"
+    assert tuple(argument.dtype for argument in comparison.args) == (
+        "int128", "int128",
+    )
+    assert any(
+        instruction.op == "Cast"
+        and instruction.res is not None
+        and instruction.res.dtype == "int128"
+        and instruction.args
+        and instruction.args[0].id == add.res.id
+        for instruction in instructions
+    )

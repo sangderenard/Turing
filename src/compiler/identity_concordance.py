@@ -1563,6 +1563,7 @@ class CorrelationTable:
         found.extend(self._ssa_publication_findings(module))
         found.extend(self._value_type_abi_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
+        found.extend(self._frame_aliased_result_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
         found.extend(self._source_precision_operator_findings(module))
         found.extend(self._source_precision_region_findings(module))
@@ -1571,6 +1572,7 @@ class CorrelationTable:
         found.extend(self._tensor_reduction_domain_findings(module))
         found.extend(self._callable_identity_findings(module))
         found.extend(self._post_ssa_numeric_identity_findings(module))
+        found.extend(self._constant_materialization_findings(module))
         found.extend(self._table_member_findings(module))
         found.extend(self._layout_table_findings(module))
         found.extend(self._operand_position_orphan_findings(module))
@@ -2710,6 +2712,101 @@ class CorrelationTable:
                         f"{descriptor_page} implies "
                         f"{sorted(expected.get(member, ()), key=repr)!r}",
                     ))
+        found.extend(CorrelationTable._native_heap_storage_findings(module))
+        return found
+
+    @staticmethod
+    def _native_heap_storage_findings(module: Any) -> list[Finding]:
+        """Native cells and resident views must agree with their descriptor.
+
+        The real forwarded StringCore child pool kept the descriptor but
+        lost optional resident heap labels. Missing labels are not missing
+        authority; contradictory owner/layout labels are a disagreement.
+        """
+        from .structural_concordance import storage_structure
+        from .concordance_declarations import SEQUENCE_DESCRIPTOR
+        from .ir_sequence_tables import _storage_values
+
+        found = []
+        for function_name, table in (getattr(module, "sequence_tables", {}) or {}).items():
+            function = module.functions.get(function_name)
+            if function is None:
+                continue
+            occurrences = {}
+            for value in (*function.args, *(candidate
+                    for block in function.blocks.values() for instruction in block.instrs
+                    for candidate in (*instruction.args, instruction.res) if candidate is not None)):
+                occurrences.setdefault(int(value.id), []).append(value)
+            native_claims = {}
+            for descriptor in table.sequences.values():
+                if descriptor.heap_owner_value_id is None:
+                    continue
+                sequence_id = int(descriptor.sequence_id)
+                def issue(detail, member=sequence_id):
+                    found.append(Finding("native-heap-storage-disagreement", str(function_name),
+                                         int(member), detail))
+                try:
+                    view, _cell = storage_structure("sequence", table.owner, sequence_id, book=table.book)
+                except ConcordanceRefusal as error:
+                    issue(str(error))
+                    continue
+                source = table.book.latest_ref(SEQUENCE_DESCRIPTOR, (table.owner, sequence_id))
+                native = dict(view.children).get("native_storage")
+                if (native is None or native.kind != "product" or native.source != source
+                        or native.value_id != sequence_id or native.storage != "native_storage"):
+                    issue("owned sequence lacks its resolved exact descriptor native-storage view")
+                    continue
+                expected = {int(value.id): value for value in _storage_values(descriptor)}
+                members = dict(native.children)
+                if set(members) != set(expected):
+                    issue(f"native members {tuple(members)!r} differ from descriptor members {tuple(expected)!r}")
+                for member_id, declared in expected.items():
+                    member = members.get(member_id)
+                    if member is None:
+                        continue
+                    labels = dict(declared.accounting or {})
+                    if member.value_id != member_id or member.source != source:
+                        issue("native member does not retain its exact descriptor identity", member_id)
+                    if (member.dtype != str(declared.dtype) or member.physical_dtype != str(declared.dtype)
+                            or tuple(member.shape) != tuple(declared.shape) or member.rank != len(declared.shape)):
+                        issue("native member physical type/shape differs from its descriptor storage", member_id)
+                    role = ("heap_owner" if labels.get("heap_owner") else
+                            "heap_cell" if labels.get("heap_element_dtype") is not None else None)
+                    if role is None:
+                        continue
+                    claim = (role, labels.get("heap_element_dtype"), labels.get("heap_owner_value_id"))
+                    prior = native_claims.setdefault(member_id, claim)
+                    if prior != claim:
+                        issue(f"one native identity has conflicting descriptor roles/layouts/owners: {prior!r} versus {claim!r}", member_id)
+                    if (member.kind != "reference" or member.storage != role
+                            or member.dtype != "ptr" or member.physical_dtype != "ptr"):
+                        issue(f"native member is not its declared {role} pointer cell", member_id)
+                    if role == "heap_cell":
+                        children = dict(member.children)
+                        element, owner = children.get("element"), children.get("owner")
+                        if (element is None or element.source != source or element.value_id != member_id
+                                or element.kind != "scalar" or element.rank != 0 or element.shape != ()
+                                or element.dtype != labels["heap_element_dtype"]
+                                or element.physical_dtype != labels["heap_element_dtype"]):
+                            issue("heap cell element layout differs from its exact descriptor", member_id)
+                        if (owner is None or owner.source != source or owner.storage != "heap_owner"
+                                or owner.value_id != labels["heap_owner_value_id"]
+                                or owner.kind != "reference" or owner.shape != (1,) or owner.rank != 1
+                                or owner.dtype != "ptr" or owner.physical_dtype != "ptr"
+                                or owner.value_id not in members
+                                or members[owner.value_id].storage != "heap_owner"):
+                            issue("heap cell context owner differs from its exact descriptor", member_id)
+                    for occurrence in occurrences.get(member_id, ()):
+                        resident = dict(occurrence.accounting or {})
+                        mismatch = str(occurrence.dtype) != "ptr"
+                        mismatch |= bool(resident.get("heap_owner")) and role != "heap_owner"
+                        if resident.get("heap_element_dtype") is not None:
+                            mismatch |= role != "heap_cell" or resident["heap_element_dtype"] != labels.get("heap_element_dtype")
+                        if resident.get("heap_owner_value_id") is not None:
+                            mismatch |= role != "heap_cell" or resident["heap_owner_value_id"] != labels.get("heap_owner_value_id")
+                        if mismatch:
+                            issue("resident native cell type/owner/layout disagrees with its descriptor view", member_id)
+                            break
         return found
 
     @staticmethod
@@ -2776,6 +2873,91 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _constant_materialization_findings(module: Any) -> list[Finding]:
+        """Keep a materialized integer's exact native domain on its identity.
+
+        ``ssa_constant_materialization`` is the incumbent record of the
+        literal value and selected dtype.  Its consumers may not reclassify
+        that identity from a generic Python ``int`` spelling or leave the
+        corresponding SSA value at a different width.
+        """
+
+        from .concordance_declarations import (
+            SSA_CONSTANT_MATERIALIZATION, SSA_VALUE,
+        )
+        from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None:
+            return []
+        pages = getattr(book, "pages", {}) or {}
+        materializations = pages.get(SSA_CONSTANT_MATERIALIZATION.name)
+        values = pages.get(SSA_VALUE.name)
+        if materializations is None or values is None:
+            return []
+        found: list[Finding] = []
+        for row in materializations.rows():
+            if not (isinstance(row, tuple) and len(row) == 4):
+                continue
+            scope, function_name, _block, value_id = row
+            latest = materializations.latest(row)
+            if not (isinstance(latest, tuple) and len(latest) == 3):
+                continue
+            operation, dtype, literal_repr = latest
+            if str(operation).casefold() not in {"const", "constant"}:
+                continue
+            try:
+                literal = ast.literal_eval(str(literal_repr))
+            except (ValueError, SyntaxError, TypeError):
+                continue
+            if type(literal) is not int:
+                continue
+            try:
+                expected_dtype = python_int_literal_dtype(literal)
+            except (TypeError, OverflowError):
+                expected_dtype = None
+            discrepancies = []
+            if expected_dtype is None or str(dtype) != expected_dtype:
+                discrepancies.append(
+                    f"materialization dtype={dtype!r}, exact integer domain="
+                    f"{expected_dtype!r}"
+                )
+            value_row = (scope, int(value_id))
+            value_fact = values.latest(value_row)
+            if value_fact is None or str(
+                getattr(value_fact, "dtype", None)
+            ) != str(dtype):
+                discrepancies.append(
+                    f"ssa_value={value_fact!r}, materialization dtype={dtype!r}"
+                )
+            function = (getattr(module, "functions", {}) or {}).get(
+                str(function_name)
+            )
+            if function is not None:
+                occurrences = tuple(
+                    instruction.res
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.res is not None
+                    and int(instruction.res.id) == int(value_id)
+                    and str(instruction.op).casefold() in {"const", "constant"}
+                    and (instruction.attributes or {}).get("value") == literal
+                )
+                if any(str(value.dtype) != str(dtype) for value in occurrences):
+                    discrepancies.append(
+                        "resident Const occurrence dtype differs from the "
+                        f"materialization: {tuple(value.dtype for value in occurrences)!r}"
+                    )
+            if discrepancies:
+                found.append(Finding(
+                    "constant-materialization-domain-disagreement",
+                    str(function_name), int(value_id), "; ".join(discrepancies),
+                ))
+        return found
+
+    @staticmethod
     def _source_callsite_activation_findings(module: Any) -> list[Finding]:
         """Report a source callsite resolved to multiple function identities."""
 
@@ -2808,6 +2990,55 @@ class CorrelationTable:
                 "source callsite changed function-table identity across "
                 f"planning stages: {distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _frame_aliased_result_findings(module: Any) -> list[Finding]:
+        """A frame-result index is a view of one exact call's storage edge."""
+        from .ssa_record_return_state import frame_aliased_result_binding
+        functions = getattr(module, "functions", {}) or {}
+        table = getattr(module, "call_table", None)
+        book = getattr(table, "book", None) or identity_book(module)
+        found = []
+        for caller_name, caller in functions.items():
+            records = () if table is None else table.get(str(caller_name), ())
+            for block_name, block in caller.blocks.items():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Call", "call"} or not instruction.attributes.get("result_aliases_frame"):
+                        continue
+                    callee_name = str(instruction.attributes.get("callee") or "")
+                    callee = functions.get(callee_name)
+                    matching = tuple(record for record in records
+                                     if record.callsite_id == instruction.attributes.get("plan_callsite_id")
+                                     and str(record.callee_symbol) == callee_name)
+                    detail = None
+                    try:
+                        if callee is None or len(matching) != 1:
+                            raise ConcordanceRefusal("frame result lacks its unique callee/call record")
+                        formal, position, actual, _cell = frame_aliased_result_binding(
+                            instruction, callee, book=book, record=matching[0],
+                        )
+                        if (instruction.attributes.get("ssa_output_formal_id") != formal
+                                or instruction.attributes.get("ssa_output_argument") != position):
+                            detail = (f"record binds callee formal {formal} to caller {actual.id} "
+                                      f"at position {position}; emitted formal/index are "
+                                      f"{instruction.attributes.get('ssa_output_formal_id')!r}/"
+                                      f"{instruction.attributes.get('ssa_output_argument')!r}")
+                        else:
+                            # The emitted projection cites the same activation,
+                            # not another call's equal-looking storage ids.
+                            proof = instruction.attributes.get("ssa_output_call_record")
+                            if not isinstance(proof, Ref) or proof.row[1] != str(caller_name):
+                                raise ConcordanceRefusal("frame result proof belongs to another caller scope")
+                            frame_aliased_result_binding(instruction, callee, book=book)
+                    except ConcordanceRefusal as error:
+                        detail = str(error)
+                    if detail is not None:
+                        found.append(Finding(
+                            "frame-aliased-result-disagreement", str(caller_name),
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}: {detail}",
+                        ))
         return found
 
     @staticmethod
@@ -4178,6 +4409,90 @@ class CorrelationTable:
         # Native identity-keyed tables legitimately compare these handles;
         # a second spelling inventory incorrectly called them float keys.
         from ..transmogrifier.dtype_layout import layout_for
+        from .concordance_declarations import CALL_RECORD, SEQUENCE_DESCRIPTOR, RESULT_STORAGE_BINDING
+        from .ssa_record_return_state import map_sequence_descriptor, map_child_pool
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+
+        def returned_frame_findings(function_name, table, sequence_id, descriptor):
+            if book is None:
+                return []
+            current = book.latest_ref(SEQUENCE_DESCRIPTOR, (table.owner, int(sequence_id)))
+            if current is None:
+                return []
+            # Revisions retain the original derivation. Follow this view's
+            # own descriptor history/cell sets, stopping at the exact source
+            # descriptor and call-record authorities rather than following
+            # unrelated value ancestry or schema names.
+            pending, seen, calls, sources = [current], set(), set(), set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                for parent, _stage in book.edges_into(cell):
+                    if parent.page == CALL_RECORD:
+                        calls.add(parent.row)
+                    elif parent.page == SEQUENCE_DESCRIPTOR:
+                        if parent.row == current.row:
+                            pending.append(parent)
+                        else:
+                            sources.add((book, parent.row))
+                    elif parent.page.name == "imported_cell":
+                        receipt = book.page(parent.page).cell(parent.row, parent.column)
+                        if receipt.source.page == SEQUENCE_DESCRIPTOR:
+                            sources.add((receipt.owner, receipt.source.row))
+                    elif parent.page.name == "cell_set":
+                        pending.append(parent)
+            issues = []
+            for row in calls:
+                for record in book.page(CALL_RECORD).latest(row) or ():
+                    if record.caller != function_name:
+                        continue
+                    source_table = (getattr(module, "sequence_tables", {}) or {}).get(record.callee_symbol)
+                    if source_table is None:
+                        continue
+                    for source_id, target_id in record.result_bindings:
+                        if (int(target_id) != int(sequence_id)
+                                or (source_table.book, (source_table.owner, int(source_id))) not in sources):
+                            continue
+                        source = source_table.by_id(int(source_id))
+                        if source is None:
+                            continue
+                        frame = {}
+                        contradictory = False
+                        for formal, kind, actual in record.frame_bindings:
+                            if kind in {"caller_value", "caller_alias", "caller_storage"}:
+                                prior = frame.setdefault(int(formal), int(actual))
+                                contradictory |= prior != int(actual)
+                        result_page = book.pages.get(RESULT_STORAGE_BINDING.name)
+                        for binding_row in (() if result_page is None else result_page.rows()):
+                            if binding_row[:2] != (function_name, int(record.callsite_id)):
+                                continue
+                            ref = result_page.latest(binding_row)
+                            if not isinstance(ref, Ref) or ref.page.name != "ssa_value":
+                                continue
+                            prior = frame.setdefault(int(binding_row[2]), int(ref.row[1]))
+                            contradictory |= prior != int(ref.row[1])
+                        try:
+                            expected = map_sequence_descriptor(
+                                source, frame, sequence_id=int(sequence_id),
+                                child_table_pool=map_child_pool(source.child_table_pool, frame),
+                            )
+                        except KeyError as error:
+                            issues.append(Finding(
+                                "returned-sequence-frame-disagreement", str(function_name), int(sequence_id),
+                                f"callsite {record.callsite_id} has no binding for sequence member {error}",
+                            ))
+                            continue
+                        if contradictory or descriptor != expected:
+                            issues.append(Finding(
+                                "returned-sequence-frame-disagreement", str(function_name), int(sequence_id),
+                                f"callsite {record.callsite_id} sequence view differs from its exact callee frame: "
+                                f"observed={descriptor!r}; expected={expected!r}",
+                            ))
+            return issues
+
         found: list[Finding] = []
         for function_name, table in (
             getattr(module, "sequence_tables", {}) or {}
@@ -4185,6 +4500,7 @@ class CorrelationTable:
             for sequence_id, descriptor in sorted(
                 getattr(table, "sequences", {}).items()
             ):
+                found.extend(returned_frame_findings(function_name, table, sequence_id, descriptor))
                 dtypes = tuple(getattr(descriptor, "column_dtypes", ()) or ())
                 for column in getattr(descriptor, "key_columns", ()) or ():
                     if int(column) >= len(dtypes):
@@ -5246,6 +5562,7 @@ class DerivationSnapshot:
     target: Ref
     reads: tuple  # (Page, row, Ref | None), including observed absence
     edge_reads: tuple = ()  # (exact historical Ref, incoming Refs)
+    dependent_reads: tuple = ()  # (exact Ref, authority Page, outgoing Refs)
 
 
 class Registry:
@@ -6488,12 +6805,21 @@ class IdentityBook:
                     (source, tuple(parent for parent, _stage in self.edges_into(source)))
                     for source, _parents in getattr(previous, "edge_reads", ())
                 )
+                current_dependents = tuple(
+                    (source, authority, tuple(dict.fromkeys(
+                        child for child, _stage in self.edges_out_of(source)
+                        if child.page == authority
+                    )))
+                    for source, authority, _children in getattr(previous, "dependent_reads", ())
+                )
                 if (current_reads == previous.reads
                         and current_edges == getattr(previous, "edge_reads", ())
+                        and current_dependents == getattr(previous, "dependent_reads", ())
                         and self.latest_ref(page, row) == previous.target):
                     return previous.target
             reads = {}
             edge_reads = {}
+            dependent_reads = {}
 
             def read(source_page, source_row, default=None):
                 cell = self.current_ref(source_page, source_row)
@@ -6530,6 +6856,25 @@ class IdentityBook:
 
             read.sources = read_sources
 
+            def read_dependents(source, authority):
+                """Exact outgoing claims on a declared authority page.
+
+                Selecting the authority is essential: the derived view's own
+                publication must not become one of its inputs merely because
+                it also cites the source. No scope or numeric id is rebuilt.
+                """
+                if not isinstance(source, Ref) or not isinstance(authority, Page):
+                    raise ConcordanceRefusal("dependent read requires a source Ref and authority Page")
+                read(source.page, source.row)
+                children = tuple(dict.fromkeys(
+                    child for child, _source_stage in self.edges_out_of(source)
+                    if child.page == authority
+                ))
+                dependent_reads[(source, authority)] = children
+                return children
+
+            read.dependents = read_dependents
+
             fact = recipe(read, *arguments)
             cells = tuple(dict.fromkeys(cell for cell in reads.values() if cell is not None))
             if not cells:
@@ -6546,6 +6891,8 @@ class IdentityBook:
                 tuple((source_page, source_row, cell)
                       for (source_page, source_row), cell in reads.items()),
                 tuple(edge_reads.items()),
+                tuple((source, authority, children)
+                      for (source, authority), children in dependent_reads.items()),
             )
             self.post(
                 LIVE_DERIVATION, key, snapshot, stage=stage,
@@ -6588,6 +6935,10 @@ class IdentityBook:
                 ) or any(
                     tuple(parent for parent, _stage in self.edges_into(source)) != parents
                     for source, parents in getattr(snapshot, "edge_reads", ())
+                ) or any(
+                    tuple(dict.fromkeys(child for child, _stage in self.edges_out_of(source)
+                                        if child.page == authority)) != children
+                    for source, authority, children in getattr(snapshot, "dependent_reads", ())
                 )):
                     stale.add(row)
                     changed = True

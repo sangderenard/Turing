@@ -252,6 +252,30 @@ def common_integer_dtype(dtypes) -> str | None:
     return min(candidates)[1] if candidates else None
 
 
+def python_int_literal_dtype(value: object) -> str:
+    """Select an exact native layout for one authored Python ``int``.
+
+    Ordinary values retain the compiler's established int64 literal layout.
+    Positive values above INT64_MAX use uint64 while they fit; values outside
+    either 64-bit domain use the internal signed int128 layout when possible.
+    No floating conversion or truncation is permitted.  Python integers
+    outside the declared native layouts are refused by the caller.
+    """
+
+    if type(value) is not int:
+        raise TypeError("integer literal layout requires an exact Python int")
+    integer = int(value)
+    if -(1 << 63) <= integer <= (1 << 63) - 1:
+        return "int64"
+    if 0 <= integer <= (1 << 64) - 1:
+        return "uint64"
+    if -(1 << 127) <= integer <= (1 << 127) - 1:
+        return "int128"
+    raise OverflowError(
+        f"Python integer literal {integer} is outside declared native layouts"
+    )
+
+
 # --------------------------------------------------------------------------
 # Layout views. Native backend support is a property of the same record.
 # --------------------------------------------------------------------------
@@ -499,6 +523,7 @@ __all__ = [
     "resolve",
     "layout_for",
     "common_integer_dtype",
+    "python_int_literal_dtype",
     "by_llvm_type",
     "llvm_abi_numpy_table",
     "C_ABI_NAMES",

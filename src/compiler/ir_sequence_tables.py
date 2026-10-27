@@ -2238,7 +2238,15 @@ def lower_sequence_append_slice(
     arenas; no temporary sequence or runtime iterator is materialized.
     """
 
-    unsupported = _unsupported_destination(destination, "append_slice")
+    # Program: ``values=[]; for i in range(n): values.append(i); selected=values[:end]``.
+    # Wrong record: the slice is a fresh DYNAMIC sequence with a proven owner,
+    # yet append_slice refused before copying any rows because it had only a
+    # fixed-capacity branch. Rule: reserve ``old_length + clipped_count``
+    # through the descriptor's existing checked owner protocol before copying,
+    # and publish the new length only after the copy completes.
+    unsupported = _unsupported_destination(
+        destination, "append_slice", allow_dynamic=True,
+    )
     if unsupported is not None:
         return unsupported
     if (
@@ -2250,12 +2258,49 @@ def lower_sequence_append_slice(
             "sequence append-slice requires one duplicate-policy column"
         )
 
+    if destination.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC and (
+        destination.child_table_pool is not None
+        or destination.live_flags_value_id is not None
+        or any(destination.column_shapes)
+    ):
+        return SSASequenceLowering(shortfalls=(SSASequenceLoweringShortfall(
+            SSASequenceShortfallCode.DYNAMIC_GROWTH_UNAVAILABLE,
+            destination.sequence_id,
+            "append_slice",
+            "dynamic append-slice requires dense scalar rows without live "
+            "flags or child pools",
+        ),))
+
     destination_storage = _storage_values(destination)
     source_storage = _storage_values(source)
     all_storage = tuple({
         value.id: value
         for value in (*destination_storage, *source_storage)
     }.values())
+    name = function_name or (
+        f"ssa_sequence_{destination.sequence_id}_append_slice_"
+        f"{source.sequence_id}"
+    )
+    reserve_function = None
+    if destination.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+        reserve_lowering = lower_sequence_reserve(
+            destination, function_name=name + "__reserve",
+        )
+        if not reserve_lowering.complete:
+            return reserve_lowering
+        reserve_function = reserve_lowering.functions[0]
+        reserve_ids = {
+            int(value.id)
+            for value in reserve_function.args
+        } | {
+            int(instruction.res.id)
+            for block in reserve_function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+        first_value_id = max(
+            int(first_value_id or 0), max(reserve_ids, default=-1) + 1,
+        )
     builder = _Builder(_first_fresh_identity(
         destination, source, values=all_storage, minimum=first_value_id
     ))
@@ -2278,6 +2323,10 @@ def lower_sequence_append_slice(
     bounds_merge = builder.block("bounds_merge")
     empty = builder.block("empty")
     capacity = builder.block("capacity")
+    reserve_block = (
+        builder.block("append_slice_reserve")
+        if reserve_function is not None else None
+    )
     header = builder.block("append_slice_header")
     body = builder.block("append_slice_body")
     latch = builder.block("append_slice_latch")
@@ -2394,16 +2443,35 @@ def lower_sequence_append_slice(
     new_length = builder.fresh("int64")
     builder.emit(capacity, "Sub", [normalized_upper, normalized_lower], requested)
     builder.emit(capacity, "Add", [old_length, requested], new_length)
-    within_capacity = builder.fresh("bool")
-    builder.emit(capacity, "Le", [new_length, SSAValue(
-        destination.capacity_value_id, dtype="int64"
-    )], within_capacity)
-    builder.cond(capacity, within_capacity, header, full)
+    if reserve_function is not None:
+        storage_by_id = {int(value.id): value for value in destination_storage}
+        reserve_status = builder.fresh("int")
+        builder.emit(reserve_block, "Call", [
+            *(storage_by_id[int(value.id)] for value in reserve_function.args[:-1]),
+            new_length,
+        ], reserve_status, attributes={
+            "callee": reserve_function.name,
+            "source_linked": True,
+        })
+        reserve_succeeded = builder.fresh("bool")
+        builder.emit(reserve_block, "Lt", [
+            reserve_status, builder.const(reserve_block, 2),
+        ], reserve_succeeded)
+        builder.cond(reserve_block, reserve_succeeded, header, full)
+        builder.branch(capacity, reserve_block)
+        capacity_predecessor = reserve_block.name
+    else:
+        within_capacity = builder.fresh("bool")
+        builder.emit(capacity, "Le", [new_length, SSAValue(
+            destination.capacity_value_id, dtype="int64"
+        )], within_capacity)
+        builder.cond(capacity, within_capacity, header, full)
+        capacity_predecessor = capacity.name
     index = builder.fresh("int64")
     next_index = builder.fresh("int64")
     builder.emit(
         header, "Phi", [zero, next_index], index,
-        attributes={"incoming_blocks": (capacity.name, latch.name)},
+        attributes={"incoming_blocks": (capacity_predecessor, latch.name)},
     )
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, requested], continues)
@@ -2428,7 +2496,8 @@ def lower_sequence_append_slice(
     builder.branch(latch, header)
     builder.emit(complete, "Store", [new_length, destination_length_slot])
     complete_status = _status_branch(builder, complete, 1, result)
-    _raise_fixed_capacity_exhausted(builder, full, "append_slice")
+    if reserve_function is None:
+        _raise_fixed_capacity_exhausted(builder, full, "append_slice")
     full_status = _status_branch(builder, full, 2, result)
     status = builder.fresh("int")
     builder.emit(
@@ -2441,10 +2510,6 @@ def lower_sequence_append_slice(
         )},
     )
     builder.emit(result, "Ret", [status])
-    name = function_name or (
-        f"ssa_sequence_{destination.sequence_id}_append_slice_"
-        f"{source.sequence_id}"
-    )
     function = Function(
         name,
         [*all_storage, lower, upper],
@@ -2459,11 +2524,18 @@ def lower_sequence_append_slice(
                 int(destination.length_address_id),
                 int(source.column_value_ids[0]),
                 int(source.length_address_id),
+                *((int(destination.heap_owner_value_id),)
+                  if destination.heap_owner_value_id is not None else ()),
+                *((int(source.heap_owner_value_id),)
+                  if source.heap_owner_value_id is not None else ()),
             )),
             "named_outputs": (("status", int(status.id)),),
         },
     )
-    return SSASequenceLowering((function,))
+    return SSASequenceLowering((
+        function,
+        *((reserve_function,) if reserve_function is not None else ()),
+    ))
 
 
 def lower_sequence_pack_bits(

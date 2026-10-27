@@ -3474,13 +3474,18 @@ class _ControlSSABuilder(TiledObject):
                 fill_literal = ast.literal_eval(
                     str(policy).split(";", 1)[0].split("=", 1)[1]
                 )
-                element_dtype = (
-                    "bool" if isinstance(fill_literal, bool)
-                    else "int" if isinstance(fill_literal, int)
-                    else "float64" if isinstance(fill_literal, float)
-                    else "int64" if fill_literal is None
-                    else None
-                )
+                if isinstance(fill_literal, bool):
+                    element_dtype = "bool"
+                elif type(fill_literal) is int:
+                    from ..transmogrifier.dtype_layout import (
+                        python_int_literal_dtype,
+                    )
+
+                    element_dtype = python_int_literal_dtype(fill_literal)
+                elif isinstance(fill_literal, float):
+                    element_dtype = "float64"
+                else:
+                    element_dtype = "int64" if fill_literal is None else None
                 if isinstance(fill_literal, tuple):
                     # Program: ``xs = [n] * 3; xs[1] = 3``.  Wrong record:
                     # a runtime member left the rows unclassed, so the
@@ -3503,19 +3508,28 @@ class _ControlSSABuilder(TiledObject):
                     str(policy).split("=", 1)[1]
                 ))
                 columns = tuple(zip(*literal_table_rows)) if literal_table_rows else ()
-                column_dtypes = tuple(
-                    "bool" if all(isinstance(value, bool) for value in column)
-                    else "int64" if all(
-                        isinstance(value, int) and not isinstance(value, bool)
-                        for value in column
-                    )
-                    else "float64" if all(
+                def literal_column_dtype(column):
+                    if all(isinstance(value, bool) for value in column):
+                        return "bool"
+                    if all(type(value) is int for value in column):
+                        from ..transmogrifier.dtype_layout import (
+                            common_integer_dtype, python_int_literal_dtype,
+                        )
+
+                        return common_integer_dtype(tuple(
+                            python_int_literal_dtype(value)
+                            for value in column
+                        )) or "unknown"
+                    if all(
                         isinstance(value, (int, float))
                         and not isinstance(value, bool)
                         for value in column
-                    )
-                    else "unknown"
-                    for column in columns
+                    ):
+                        return "float64"
+                    return "unknown"
+
+                column_dtypes = tuple(
+                    literal_column_dtype(column) for column in columns
                 ) or None
             descriptor = self._sequence_descriptor(
                 int(sequence_id),
@@ -12101,12 +12115,18 @@ class _ControlSSABuilder(TiledObject):
                     and str(value.dtype or "unknown") in {"", "unknown", "None"}
                 ):
                     literal = expression.literal
-                    proposed = (
-                        "bool" if isinstance(literal, bool)
-                        else "int64" if isinstance(literal, int)
-                        else "float64" if isinstance(literal, float)
-                        else None
-                    )
+                    if type(literal) is int:
+                        from ..transmogrifier.dtype_layout import (
+                            python_int_literal_dtype,
+                        )
+
+                        proposed = python_int_literal_dtype(literal)
+                    else:
+                        proposed = (
+                            "bool" if isinstance(literal, bool)
+                            else "float64" if isinstance(literal, float)
+                            else None
+                        )
                     if proposed is not None:
                         value.dtype = proposed
                         self._revise_value(value)
@@ -16713,15 +16733,24 @@ class _ControlSSABuilder(TiledObject):
             # under one helper name (refused: the call binds 4 of 5
             # formals).  Rule: a literal a writer stores proposes its
             # Python class's dtype, as an SSA value proposes its own.
-            literal_dtypes = tuple(
-                (
-                    "bool" if isinstance(expression.literal, bool)
-                    else "int64" if isinstance(expression.literal, int)
-                    else "float64" if isinstance(expression.literal, float)
+            def static_literal_dtype(expression):
+                if expression is None or expression.op != "const":
+                    return None
+                literal = expression.literal
+                if type(literal) is int:
+                    from ..transmogrifier.dtype_layout import (
+                        python_int_literal_dtype,
+                    )
+
+                    return python_int_literal_dtype(literal)
+                return (
+                    "bool" if isinstance(literal, bool)
+                    else "float64" if isinstance(literal, float)
                     else None
                 )
-                if expression is not None and expression.op == "const"
-                else None
+
+            literal_dtypes = tuple(
+                static_literal_dtype(expression)
                 for expression in (
                     *mutation.argument_expressions,
                     *(None for _ in range(
@@ -18647,9 +18676,16 @@ class _ControlSSABuilder(TiledObject):
             seed_id = int(seed_id)
             if seed_id in self.external_values:
                 continue
+            if isinstance(seed_literal, bool):
+                seed_dtype = "bool"
+            elif type(seed_literal) is int:
+                from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+                seed_dtype = python_int_literal_dtype(seed_literal)
+            else:
+                seed_dtype = "float64"
             seed_value = self.fresh_value(
-                dtype=("bool" if isinstance(seed_literal, bool) else
-                       "int64" if isinstance(seed_literal, int) else "float64"),
+                dtype=seed_dtype,
                 transform=CONTROL_CONST,
                 operands=(seed_id, loop.source_loop_node_id),
             )
@@ -19401,19 +19437,35 @@ class _ControlSSABuilder(TiledObject):
             # of its literals, the planner's join (``_planned_scalar_dtypes``):
             # one kind is itself, ints with bools are int64, any other mix
             # proves nothing.
-            literal_kinds = {
-                "bool" if isinstance(value, bool)
-                else "int64" if isinstance(value, int)
-                else "float64" if isinstance(value, float)
-                else None
-                for value in values
-            }
-            static_element_dtype = (
-                None if not literal_kinds or None in literal_kinds
-                else next(iter(literal_kinds)) if len(literal_kinds) == 1
-                else "int64" if literal_kinds <= {"int64", "bool"}
-                else None
-            )
+            def static_element_dtype_of(value):
+                if isinstance(value, bool):
+                    return "bool"
+                if type(value) is int:
+                    from ..transmogrifier.dtype_layout import (
+                        python_int_literal_dtype,
+                    )
+
+                    return python_int_literal_dtype(value)
+                return "float64" if isinstance(value, float) else None
+
+            literal_kinds = tuple(static_element_dtype_of(value) for value in values)
+            if not literal_kinds or None in literal_kinds:
+                static_element_dtype = None
+            elif all(
+                kind in {
+                    "bool", "int8", "int16", "int32", "int64",
+                    "uint8", "uint16", "uint32", "uint64",
+                    "int128", "uint128",
+                }
+                for kind in literal_kinds
+            ):
+                from ..transmogrifier.dtype_layout import common_integer_dtype
+
+                static_element_dtype = common_integer_dtype(literal_kinds)
+            elif len(set(literal_kinds)) == 1:
+                static_element_dtype = literal_kinds[0]
+            else:
+                static_element_dtype = None
             self.indexed_load(
                 aggregate,
                 induction,
@@ -19826,9 +19878,16 @@ class _ControlSSABuilder(TiledObject):
             seed_id = int(seed_id)
             if seed_id in self.external_values:
                 continue
+            if isinstance(seed_literal, bool):
+                seed_dtype = "bool"
+            elif type(seed_literal) is int:
+                from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+                seed_dtype = python_int_literal_dtype(seed_literal)
+            else:
+                seed_dtype = "float64"
             seed_value = self.fresh_value(
-                dtype=("bool" if isinstance(seed_literal, bool) else
-                       "int64" if isinstance(seed_literal, int) else "float64"),
+                dtype=seed_dtype,
                 transform=CONTROL_CONST,
                 operands=(seed_id, loop.source_loop_node_id),
             )
@@ -22236,6 +22295,8 @@ class _ControlSSABuilder(TiledObject):
                 *function.metadata['sequence_array_argument_ids'],
                 *(cell.id for cell in context_values(context) if cell.shape),
             )))
+        from .structural_concordance import register_sequence_row_projections
+        register_sequence_row_projections(function, sequence_table, book=self._book())
         return function, tuple(self.shortfalls)
 
 
@@ -25681,6 +25742,19 @@ def _materialize_control_constants(
                     instruction.attributes = {}
                     if instruction.res is not None:
                         instruction.res.dtype = "none"
+                elif instruction.res is not None:
+                    # Program: an imported module integer such as U64_MAX
+                    # reaches a control Const after scalar_fact_dtype has
+                    # selected uint64, while the resident graph Const still
+                    # carries the provisional int64.  Wrong record: the
+                    # materialization and SSA_VALUE then preserve that stale
+                    # dtype, so the exact integer cannot reach the native
+                    # operator.  Rule: this materialization consumes the
+                    # already-published value_dtypes decision for its exact
+                    # identity before either concordance row is written.
+                    selected_dtype = value_dtypes.get(value_id)
+                    if selected_dtype not in (None, "", "unknown"):
+                        instruction.res.dtype = str(selected_dtype)
                 existing.setdefault(value_id, instruction)
                 continue
             retained.append(instruction)
@@ -25707,6 +25781,16 @@ def _materialize_control_constants(
             continue
         literal = constant_values[value_id]
         is_none = literal is None
+        if isinstance(literal, bool):
+            authored_dtype = "bool"
+        elif type(literal) is int:
+            from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+            authored_dtype = python_int_literal_dtype(literal)
+        elif isinstance(literal, float):
+            authored_dtype = "float64"
+        else:
+            authored_dtype = None
         materializations.append(Instr(
             "NoneValue" if is_none else "Const", [],
             SSAValue(
@@ -25719,11 +25803,7 @@ def _materialize_control_constants(
                     "none" if is_none
                     else str(
                         value_dtypes.get(value_id)
-                        or (
-                            "bool" if isinstance(literal, bool)
-                            else "int64" if isinstance(literal, int)
-                            else "float64"
-                        )
+                        or authored_dtype
                     )
                 ),
                 accounting={"authored_constant": True},
@@ -25757,7 +25837,7 @@ def _materialize_control_constants(
             # rewrite there; a source compile reaches this point with either
             # the value cell or the geometry it is revising.
             continue
-        book.post(
+        materialization_cell = book.post(
             SSA_CONSTANT_MATERIALIZATION,
             (scope, str(function.name), str(entry_label), value_id),
             (
@@ -25780,15 +25860,32 @@ def _materialize_control_constants(
         # REVISE of the existing row, a post when the id has none.
         _row = (scope, value_id)
         _shape = tuple(instruction.res.shape or ())
+        physical = (
+            {
+                "physical_dtype": str(instruction.res.dtype),
+                "storage": "scalar",
+                "rank": 0,
+                "arena": False,
+            }
+            if type((instruction.attributes or {}).get("value")) is int
+            else KEEP_PHYSICAL
+        )
+        publication_sources = tuple(dict.fromkeys((
+            *sources, materialization_cell,
+        )))
         if book.latest_ref(SSA_VALUE, _row) is None:
             book.post(
                 SSA_VALUE, _row,
                 SSAValueFact(
                     instruction.res.dtype, _shape,
                     SSAValueOrigin.ADOPTED_GRAPH_ID,
+                    **({
+                        "physical_dtype": str(instruction.res.dtype),
+                        "storage": "scalar", "rank": 0,
+                    } if physical is not KEEP_PHYSICAL else {}),
                 ),
                 stage=CONTROL_SSA_FINISH,
-                provenance=Derived(sources),
+                provenance=Derived(publication_sources),
                 mode=Mode.REVISE,
             )
         else:
@@ -25796,7 +25893,9 @@ def _materialize_control_constants(
 
             revise_ssa_value(
                 function, value_id, dtype=instruction.res.dtype,
-                shape=_shape, stage=CONTROL_SSA_FINISH, sources=sources,
+                shape=_shape, stage=CONTROL_SSA_FINISH,
+                sources=publication_sources,
+                physical=physical,
                 book=book,
             )
     materialized = set(materialized_ids)
@@ -26362,6 +26461,7 @@ def lower_control_sections_to_ssa(
             first_free_value_id=max(known_value_ids) + 1,
             function_scope=control_name,
             lexical_read_scope=lexical_read_scope,
+            shape_scope=shape_scope,
             resident_limit=active_contract().ssa_resident_regions,
         )
         if hierarchy_plan is not None else {}

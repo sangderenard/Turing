@@ -518,7 +518,7 @@ def aggregate_return_source(function, output_id, *, book=None):
     return next(iter(sources), None)
 
 
-def _storage_structure(read, authority, owner, value_id, sequence_owner, active=()):
+def _storage_structure(read, authority, owner, value_id, sequence_owner, active=(), column_scope=None):
     key = (authority, owner, value_id)
     if key in active:
         raise ConcordanceRefusal(f"recursive by-value storage descriptor: {key!r}")
@@ -549,13 +549,15 @@ def _storage_structure(read, authority, owner, value_id, sequence_owner, active=
                     if nested is not None and (storage, nested_owner, nested_id) not in active:
                         linked = (("target", _storage_structure(
                             read, storage, nested_owner, nested_id, sequence_owner, active,
+                            column_scope=column_scope,
                         )),)
                     child = StructuralValue(
                         "record_link", int(nested_id), cell, linked,
                         dtype=field.dtype, storage="record", mutable=field.writable,
                     )
                 else:
-                    child = _storage_structure(read, storage, nested_owner, nested_id, sequence_owner, active)
+                    child = _storage_structure(read, storage, nested_owner, nested_id, sequence_owner, active,
+                                               column_scope=column_scope)
             else:
                 members = tuple((index, StructuralValue(
                     "reference" if storage in {"reference", "function_table", "class_table"}
@@ -568,12 +570,39 @@ def _storage_structure(read, authority, owner, value_id, sequence_owner, active=
                                          storage=storage, mutable=field.writable))
             fields.append((field.name, child))
         return StructuralValue("record", int(value_id), cell, tuple(fields), storage="record")
-    columns = tuple((index, StructuralValue(
-        "span", int(member), cell,
-        dtype=(str(descriptor.column_dtypes[index]) if descriptor.column_dtypes else None),
-        shape=(tuple(descriptor.column_shapes[index]) if descriptor.column_shapes else ()),
-        storage="span", mutable=descriptor.writable,
-    )) for index, member in enumerate(descriptor.column_value_ids))
+    columns = []
+    for index, member in enumerate(descriptor.column_value_ids):
+        dtype = str(descriptor.column_dtypes[index]) if descriptor.column_dtypes else None
+        dtype = None if dtype in (None, "", "unknown", "None") else dtype
+        source = cell
+        if column_scope is not None:
+            # A sequence's column is this exact SSA storage identity. Its
+            # descriptor may predate a returned call's settled element type;
+            # reading that old unknown as float64 made integer rows floating
+            # Loads. Keep the schema and the current column as one live view.
+            column = read(SSA_VALUE, (column_scope, int(member)))
+            if isinstance(column, SSAValueFact):
+                from ..transmogrifier.dtype_layout import resolve
+                layout = resolve(column.dtype)
+                current = (str(column.dtype) if layout is not None
+                           and layout.kind in {"int", "uint", "bool", "float"}
+                           else None)
+                if dtype is not None and current is not None and dtype != current:
+                    raise ConcordanceRefusal(
+                        f"sequence column type disagreement for {(owner, value_id, index)!r}: "
+                        f"descriptor={dtype!r}, column={current!r}"
+                    )
+                if current is not None:
+                    dtype = current
+                    source = read.ref(SSA_VALUE, (column_scope, int(member)))
+        row_shape = tuple(descriptor.column_shapes[index]) if descriptor.column_shapes else ()
+        columns.append((index, StructuralValue(
+            "span", int(member), source, dtype=dtype, shape=row_shape,
+            storage="span", mutable=descriptor.writable,
+            physical_dtype=dtype, rank=1 + len(row_shape), arena=True,
+            declared_storage="span",
+        )))
+    columns = tuple(columns)
     controls = tuple((role, StructuralValue(
         "unresolved", int(member), cell, storage=storage,
         mutable=descriptor.writable,
@@ -584,20 +613,125 @@ def _storage_structure(read, authority, owner, value_id, sequence_owner, active=
         ("live_flags", descriptor.live_flags_value_id, "span"),
         ("heap_owner", descriptor.heap_owner_value_id, "reference"),
     ) if member is not None)
-    return StructuralValue("sequence", int(value_id), cell, (*columns, *controls),
+    # Native heap members are a separate view of the same descriptor. In
+    # the real two-batch caller, child-pool pointer formals lost resident
+    # heap_element_dtype flags, although their exact descriptor retained
+    # every member and owner. Consumers read this incumbent storage recipe,
+    # rather than treating a bare ptr formal as a floating numeric column.
+    from .ir_sequence_tables import _storage_values
+    from ..transmogrifier.dtype_layout import resolve
+
+    element_dtypes = tuple(descriptor.column_dtypes or ())
+    if descriptor.child_table_pool is not None:
+        element_dtypes += tuple(descriptor.child_table_pool.column_dtypes)
+    known_heap_layout = (
+        descriptor.heap_owner_value_id is None
+        or (len(descriptor.column_dtypes or ()) == len(descriptor.column_value_ids)
+            and (descriptor.child_table_pool is None or
+                 len(descriptor.child_table_pool.column_dtypes) == len(descriptor.child_table_pool.column_value_ids))
+            and all(resolve(dtype) is not None for dtype in element_dtypes))
+    )
+    native_members = []
+    if known_heap_layout:
+        for member in _storage_values(descriptor):
+            accounting = dict(member.accounting or {})
+            if accounting.get("heap_owner"):
+                native = StructuralValue(
+                    "reference", int(member.id), cell, dtype="ptr", shape=tuple(member.shape),
+                    storage="heap_owner", physical_dtype="ptr", rank=len(member.shape),
+                    declared_storage="reference", mutable=descriptor.writable,
+                )
+            elif accounting.get("heap_element_dtype") is not None:
+                owner_id = accounting.get("heap_owner_value_id")
+                if owner_id != descriptor.heap_owner_value_id:
+                    raise ConcordanceRefusal("native sequence member has a different heap owner")
+                element = StructuralValue(
+                    "scalar", int(member.id), cell, dtype=str(accounting["heap_element_dtype"]),
+                    physical_dtype=str(accounting["heap_element_dtype"]), rank=0,
+                    storage="scalar", declared_storage="scalar",
+                )
+                owner_view = StructuralValue(
+                    "reference", int(owner_id), cell, dtype="ptr", shape=(1,),
+                    storage="heap_owner", physical_dtype="ptr", rank=1,
+                    declared_storage="reference", mutable=descriptor.writable,
+                )
+                native = StructuralValue(
+                    "reference", int(member.id), cell, (("element", element), ("owner", owner_view)),
+                    dtype="ptr", shape=tuple(member.shape), storage="heap_cell",
+                    physical_dtype="ptr", rank=len(member.shape),
+                    declared_storage="reference", mutable=descriptor.writable,
+                )
+            else:
+                layout = resolve(member.dtype)
+                native = StructuralValue(
+                    "unresolved" if layout is None else "span" if member.shape else "scalar",
+                    int(member.id), cell, dtype=None if layout is None else str(member.dtype),
+                    shape=tuple(member.shape), storage="span" if member.shape else "scalar",
+                    physical_dtype=None if layout is None else str(member.dtype),
+                    rank=len(member.shape), mutable=descriptor.writable,
+                )
+            native_members.append((int(member.id), native))
+    native_storage = StructuralValue(
+        "product" if known_heap_layout else "unresolved", int(value_id), cell,
+        tuple(native_members), storage="native_storage", mutable=descriptor.writable,
+    )
+    return StructuralValue("sequence", int(value_id), cell,
+                           (*columns, *controls, ("native_storage", native_storage)),
                            storage="sequence", mutable=descriptor.writable)
 
 
-def storage_structure(authority, owner, value_id, *, sequence_owner=None, book=None):
+def storage_structure(authority, owner, value_id, *, sequence_owner=None, column_scope=None, book=None):
     if authority not in {"record", "sequence"}:
         raise ConcordanceRefusal(f"unknown descriptor authority {authority!r}")
     book = current_identity_book() if book is None else book
-    row = ((authority, owner), int(value_id))
+    row = ((authority, owner) if column_scope is None else
+           (authority, owner, "ssa_columns", column_scope), int(value_id))
     cell = book.derive_current(
         STRUCTURAL_VALUE, row, _storage_structure,
-        (authority, owner, int(value_id), sequence_owner), stage=STRUCTURAL_CONCORDANCE,
+        ((authority, owner, int(value_id), sequence_owner) if column_scope is None else
+         (authority, owner, int(value_id), sequence_owner, (), column_scope)), stage=STRUCTURAL_CONCORDANCE,
     )
     return book.page(STRUCTURAL_VALUE).cell(cell.row, cell.column), cell
+
+
+def _sequence_row_value(read, storage_row, column, origin):
+    """An element Load is a projection, never an implicit conversion."""
+    sequence = read(STRUCTURAL_VALUE, storage_row)
+    element = dict(sequence.children).get(int(column))
+    if element is None:
+        raise ConcordanceRefusal(f"sequence row projection lacks column {column!r}")
+    dtype = element.dtype
+    return SSAValueFact(
+        dtype, tuple(element.shape), origin,
+        physical_dtype=element.physical_dtype,
+        storage="span" if element.shape else "scalar", rank=len(element.shape),
+    )
+
+
+def register_sequence_row_projections(function, table, *, book=None):
+    """Register the producer's exact element relation once, at construction."""
+    from .ssa_record_return_state import function_scope_of
+    book = table.book if book is None else book
+    if table.book is not book:
+        raise ConcordanceRefusal("sequence projection requires its registered descriptor book")
+    scope = function_scope_of(function)
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            attrs = instruction.attributes or {}
+            if instruction.op != "Load" or instruction.res is None or attrs.get("binding") != "ssa_sequence_row_load":
+                continue
+            sequence_id, column = int(attrs["sequence_id"]), int(attrs["column"])
+            _storage, storage = storage_structure(
+                "sequence", table.owner, sequence_id, column_scope=scope, book=book,
+            )
+            row = (scope, int(instruction.res.id))
+            fact = book.page(SSA_VALUE).latest(row)
+            if not isinstance(fact, SSAValueFact):
+                raise ConcordanceRefusal(f"sequence Load lacks SSA identity: {row!r}")
+            book.derive_current(
+                SSA_VALUE, row, _sequence_row_value,
+                (storage.row, column, fact.origin), stage=STRUCTURAL_CONCORDANCE,
+            )
 
 
 def publish_module_structures(module):

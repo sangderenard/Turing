@@ -22,6 +22,33 @@ def _seed(book, name, value):
                      provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD)
 
 
+def _dependents(read, source):
+    return tuple((child.row, read(child.page, child.row))
+                 for child in read.dependents(source, SOURCE))
+
+
+def test_new_authoritative_dependent_invalidates_view_without_self_dependency():
+    book, token = begin_identity_book()
+    try:
+        source = _seed(book, "origin", 1)
+        book.post(SOURCE, ("first",), 2, stage=INGESTION,
+                  provenance=Derived((source,)), mode=Mode.CONCORD)
+        view = book.derive_current(VIEW, ("outgoing",), _dependents,
+                                   (source,), stage=INGESTION)
+        assert book.page(VIEW).latest(view.row) == ((("first",), 2),)
+        assert not book.stale_derivations()
+        restored = pickle.loads(pickle.dumps(book))
+        restored.post(SOURCE, ("second",), 3, stage=INGESTION,
+                      provenance=Derived((source,)), mode=Mode.CONCORD)
+        assert restored.stale_derivations()
+        current = restored.current_ref(VIEW, view.row)
+        assert restored.page(VIEW).latest(current.row) == (
+            (("first",), 2), (("second",), 3))
+        assert not restored.stale_derivations()
+    finally:
+        end_identity_book(token)
+
+
 def test_new_cause_invalidates_live_view_even_when_claim_generation_is_unchanged():
     book, token = begin_identity_book()
     try:
