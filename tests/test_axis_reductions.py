@@ -32,3 +32,19 @@ def test_axis_reduction_matches_numpy(tmp_path, backend, op, data, axis):
     np.testing.assert_allclose(
         np.asarray(got).reshape(-1), want.reshape(-1), equal_nan=True,
     )
+
+
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+@pytest.mark.parametrize("n", [0, 2, 7])
+def test_builtin_min_of_a_scalar_and_a_constant_is_not_an_axis(tmp_path, backend, n):
+    """``min(n, 3)`` reaches the backends carrying ``dim=3``; a scalar
+    source has no axis, so it stays the two-operand builtin (corpus c469).
+    Fortran is left out only because this harness's gfortran cannot build
+    integer feeds (``-funsigned``)."""
+
+    got = _compile_and_run(
+        tmp_path, backend,
+        "def f(n: int) -> int:\n    return min(n, 3) * 100 + max(n, 1)\n",
+        f"ax_scalar_{backend}_{n}", 1, None, {"n": n},
+    )
+    assert int(np.asarray(got).reshape(-1)[0]) == min(n, 3) * 100 + max(n, 1)

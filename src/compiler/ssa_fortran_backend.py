@@ -4720,6 +4720,8 @@ class _FunctionEmitter:
             and axis is not None
             and instr.res is not None
             and instr.args
+            # builtin ``min(n, 3)`` carries its second operand as ``dim``.
+            and tuple(instr.args[0].shape or ())
         ):
             # Program: ``def f(y): return y.max(axis=0)`` with y (2, 3).
             # Rule: the DIM= form of the intrinsic over the same logical

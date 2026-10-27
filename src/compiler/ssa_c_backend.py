@@ -3390,6 +3390,12 @@ def emit_ssa_module_to_c(
                 return False
             source_value = instruction.args[0]
             shape = tuple(source_value.shape or ())
+            if not shape and not int(
+                (source_value.accounting or {}).get("program_abi_rank") or 0
+            ):
+                # builtin ``min(n, 3)`` carries its second operand as
+                # ``dim``; a scalar has no axis to reduce.
+                return False
             result = instruction.res
             if isinstance(axis, (list, tuple)) or not shape or not all(
                 isinstance(item, int) for item in shape

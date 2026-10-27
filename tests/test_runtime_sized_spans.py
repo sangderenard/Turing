@@ -585,12 +585,11 @@ def test_builtin_max_of_one_static_tensor_is_its_largest_element(
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("source", [
     "def f(x, y):\n    return max(y)\n",
-    "def f(x, y):\n    return y.max(axis=0)\n",
 ])
 def test_rank_two_max_reductions_are_refused_not_guessed(tmp_path, backend, source):
-    """``max(y)`` of a (2, 3) tensor raises in Python, and no backend spells
-    ``y.max(axis=0)`` yet: each is refused by name, never one row or a
-    broadcast whole-array maximum."""
+    """``max(y)`` of a (2, 3) tensor raises in Python: it is refused by
+    name, never one row or a broadcast whole-array maximum. (``y.max(axis=0)``
+    is now spelled; tests/test_axis_reductions.py checks it.)"""
 
     module, entry, parameters, _result = _lower(
         tmp_path, source, f"two_max_{backend}", 2, shape=(2, 3),

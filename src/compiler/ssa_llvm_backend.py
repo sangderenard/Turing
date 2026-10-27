@@ -4546,6 +4546,14 @@ def _emit_repository_call_module(
                 and axis is not None
                 and result is not None
                 and instruction.args
+                # builtin ``min(n, 3)`` carries its second operand as
+                # ``dim``; a scalar has no axis to reduce.
+                and (
+                    tuple(instruction.args[0].shape or ())
+                    or int((instruction.args[0].accounting or {}).get(
+                        "program_abi_rank"
+                    ) or 0)
+                )
             ):
                 # Program: ``def f(y): return y.max(axis=0)`` with y (2, 3).
                 # Rule (as in C): one result per lane of the kept axes,
