@@ -342,6 +342,19 @@ def _storage_values(
     ]
     if descriptor.live_flags_value_id is not None:
         values.append(SSAValue(descriptor.live_flags_value_id, dtype="bool"))
+    if descriptor.heap_owner_value_id is not None and descriptor.child_table_pool is not None:
+        pool = descriptor.child_table_pool
+        for value_id, dtype in (
+            *zip(pool.column_value_ids, pool.column_dtypes),
+            (pool.length_value_id, "int64"),
+            *(() if pool.status_value_id is None else ((pool.status_value_id, "int"),)),
+        ):
+            values.append(SSAValue(value_id, "ptr", accounting={
+                "heap_element_dtype": layout_for(dtype).name,
+                "heap_owner_value_id": int(descriptor.heap_owner_value_id),
+            }))
+        values.extend((SSAValue(pool.capacity_value_id, "int64"),
+                       SSAValue(pool.row_stride_value_id, "int64")))
     if descriptor.heap_owner_value_id is not None:
         # The owner travels with its heap cells.  Program: ``s += tokens``
         # where ``tokens`` is a DYNAMIC list (f"a@{n}").  Wrong record: the
@@ -371,8 +384,11 @@ def lower_sequence_allocate(
 
     if descriptor.heap_owner_value_id is None:
         raise ValueError("sequence allocation requires an explicit heap owner")
-    if not descriptor.writable or descriptor.live_flags_value_id is not None or descriptor.child_table_pool is not None:
-        raise ValueError("heap initialization currently requires writable columns without live flags or child pools")
+    if not descriptor.writable or descriptor.live_flags_value_id is not None:
+        raise ValueError("heap initialization requires writable scalar columns without live flags")
+    pool = descriptor.child_table_pool
+    if pool is not None and (pool.key_columns or pool.live_flags_value_id is not None or pool.shape_value_id is not None):
+        raise ValueError("owned child pools require unkeyed scalar rows")
     if any(descriptor.column_shapes):
         raise ValueError("heap initialization of shaped rows requires checked capacity multiplication")
     storage = _storage_values(descriptor)
@@ -384,7 +400,15 @@ def lower_sequence_allocate(
     for index, column_id in enumerate(descriptor.column_value_ids):
         entry.instrs.append(heap_allocate(capacity, owner, values[int(column_id)],
             element_dtype=descriptor.column_dtypes[index], zero_initialize=True))
-    zero = builder.const(entry, 0)
+    zero = builder.const(entry, 0, dtype="int64")
+    if pool is not None:
+        for value_id, dtype in (*zip(pool.column_value_ids, pool.column_dtypes),
+                                (pool.length_value_id, "int64"),
+                                *(() if pool.status_value_id is None else ((pool.status_value_id, "int"),))):
+            entry.instrs.append(heap_allocate(zero, owner, values[value_id],
+                element_dtype=dtype, zero_initialize=True))
+        builder.emit(entry, "Store", [zero, values[pool.capacity_value_id]])
+        builder.emit(entry, "Store", [zero, values[pool.row_stride_value_id]])
     slot = builder.fresh("ptr")
     builder.emit(entry, "GetElementPtr", [values[int(descriptor.length_address_id)], zero], slot)
     builder.emit(entry, "Store", [zero, slot])
@@ -392,7 +416,7 @@ def lower_sequence_allocate(
     function = Function(function_name or f"ssa_sequence_{descriptor.sequence_id}_allocate",
                         [*storage], builder.blocks, metadata={
         "ssa_sequence_operation": "allocate", "sequence_id": descriptor.sequence_id,
-        "sequence_array_argument_ids": tuple(descriptor.column_value_ids) + (descriptor.length_address_id, owner.id),
+        "sequence_array_argument_ids": _storage_array_ids(descriptor, storage),
     })
     return SSASequenceLowering((function,))
 
@@ -411,9 +435,13 @@ def _storage_array_ids(
     to run.  Rule: every storage formal except the capacity cell.
     """
 
+    scalar_ids = {int(descriptor.capacity_value_id)}
+    if descriptor.heap_owner_value_id is not None and descriptor.child_table_pool is not None:
+        scalar_ids.update((descriptor.child_table_pool.capacity_value_id,
+                           descriptor.child_table_pool.row_stride_value_id))
     return tuple(
         int(value.id) for value in storage
-        if int(value.id) != int(descriptor.capacity_value_id)
+        if int(value.id) not in scalar_ids
     )
 
 
@@ -441,14 +469,18 @@ def _unsupported_destination(
     if descriptor.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC and (
         not allow_dynamic or descriptor.heap_owner_value_id is None
         or descriptor.live_flags_value_id is not None
-        or descriptor.child_table_pool is not None or any(descriptor.column_shapes)
+        or (descriptor.child_table_pool is not None and (
+            descriptor.child_table_pool.key_columns
+            or descriptor.child_table_pool.live_flags_value_id is not None
+            or descriptor.child_table_pool.shape_value_id is not None
+        )) or any(descriptor.column_shapes)
     ):
         return SSASequenceLowering(shortfalls=(SSASequenceLoweringShortfall(
             SSASequenceShortfallCode.DYNAMIC_GROWTH_UNAVAILABLE,
             descriptor.sequence_id,
             operation,
             "dynamic sequence growth requires typed scalar native pointer cells, "
-            "an explicit heap owner, and no live flags or child pools; "
+            "an explicit heap owner, no live flags, and scalar unkeyed child pools; "
             "this operation must support arena replacement",
         ),))
     return None
@@ -473,6 +505,8 @@ def lower_sequence_reserve(
         return unsupported
     if descriptor.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC:
         raise ValueError("reserve requires a dynamic sequence capacity contract")
+    if descriptor.child_table_pool is not None:
+        return _lower_sequence_child_pool_reserve(descriptor, function_name=function_name)
     storage = _storage_values(descriptor)
     values = {int(value.id): value for value in storage}
     owner = values[int(descriptor.heap_owner_value_id)]
@@ -567,6 +601,193 @@ def lower_sequence_reserve(
     return SSASequenceLowering((function,))
 
 
+def _lower_sequence_child_pool_reserve(descriptor, *, function_name):
+    """Reserve both existing pool dimensions under the enclosing context.
+
+    c640's constructor owns empty dictionaries, so setdefault reached error75
+    at its first row.  A pool's capacity is flattened, while handles name
+    parent rows and row_stride is each list's capacity.  Keep those identities
+    and the incumbent checked geometric policy; move each live row to its new
+    stride before publishing any replacement pointer cell.
+    """
+    from .ssa_heap_allocation import heap_allocate, heap_copy
+    from ..transmogrifier.dtype_layout import layout_for
+
+    pool = descriptor.child_table_pool
+    storage = _storage_values(descriptor)
+    values = {value.id: value for value in storage}
+    owner = values[descriptor.heap_owner_value_id]
+    builder = _Builder(_first_fresh_identity(descriptor, values=storage))
+    required, required_stride = builder.fresh("int64"), builder.fresh("int64")
+    entry, old_stride_check, old_limit_check, old_flat_check, check, dimensions, stride_check, product_check, allocate, row_header, row_body, item_header, item_body, item_latch, row_latch, publish, unchanged, invalid, result = (
+        builder.block(name) for name in ("entry", "old_stride_check", "old_limit_check", "old_flat_check", "capacity_check", "dimensions", "stride_check", "product_check", "allocate", "row_header", "row_body", "item_header", "item_body", "item_latch", "row_latch", "publish", "unchanged", "invalid_extent", "result")
+    )
+    zero = builder.const(entry, 0, dtype="int64")
+    one = builder.const(entry, 1, dtype="int64")
+    capacity = values[descriptor.capacity_value_id]
+    stride = values[pool.row_stride_value_id]
+    pool_capacity = values[pool.capacity_value_id]
+    slot, length = builder.fresh("ptr"), builder.fresh("int64")
+    builder.emit(entry, "GetElementPtr", [values[descriptor.length_address_id], zero], slot)
+    builder.emit(entry, "Load", [slot], length)
+    maximum = min((2**63 - 1 - 8) // layout_for(dtype).byte_size
+                  for dtype in (*descriptor.column_dtypes, *pool.column_dtypes, "int64", "int"))
+    maximum_value = builder.const(entry, maximum, dtype="int64")
+    valid = None
+    for op, left, right in (("Ge", required, zero), ("Ge", required_stride, zero),
+                            ("Ge", length, zero), ("Le", length, capacity),
+                            ("Ge", stride, zero), ("Le", capacity, maximum_value),
+                            ("Ge", pool_capacity, zero), ("Le", pool_capacity, maximum_value),
+                            ("Le", stride, maximum_value), ("Le", required, maximum_value),
+                            ("Le", required_stride, maximum_value)):
+        predicate = builder.fresh("bool")
+        builder.emit(entry, op, [left, right], predicate)
+        if valid is None:
+            valid = predicate
+        else:
+            both = builder.fresh("bool")
+            builder.emit(entry, "LAnd", [valid, predicate], both)
+            valid = both
+    builder.cond(entry, valid, old_stride_check, invalid)
+    old_positive_stride = builder.fresh("bool")
+    builder.emit(old_stride_check, "Gt", [stride, zero], old_positive_stride)
+    builder.cond(old_stride_check, old_positive_stride, old_limit_check, check)
+    old_outer_limit, old_product_fits = builder.fresh("int64"), builder.fresh("bool")
+    builder.emit(old_limit_check, "Div", [maximum_value, stride], old_outer_limit)
+    builder.emit(old_limit_check, "Le", [capacity, old_outer_limit], old_product_fits)
+    builder.cond(old_limit_check, old_product_fits, old_flat_check, invalid)
+    old_flat_count, old_pool_fits = builder.fresh("int64"), builder.fresh("bool")
+    builder.emit(old_flat_check, "Mul", [capacity, stride], old_flat_count)
+    builder.emit(old_flat_check, "Le", [old_flat_count, pool_capacity], old_pool_fits)
+    builder.cond(old_flat_check, old_pool_fits, check, invalid)
+    outer_fits, stride_fits, fits = (builder.fresh("bool") for _ in range(3))
+    builder.emit(check, "Le", [required, capacity], outer_fits)
+    builder.emit(check, "Le", [required_stride, stride], stride_fits)
+    builder.emit(check, "LAnd", [outer_fits, stride_fits], fits)
+    builder.cond(check, fits, unchanged, dimensions)
+
+    def geometric(block, current, requested, label):
+        """The same checked doubling/required choice as scalar reserve."""
+        double, capped, candidate_block, exact, grown, merged = (
+            builder.block(label + suffix) for suffix in ("_double", "_capped", "_candidate", "_exact", "_grown", "_merged")
+        )
+        may_double = builder.fresh("bool")
+        builder.emit(block, "Le", [current, builder.const(block, maximum // 2, dtype="int64")], may_double)
+        builder.cond(block, may_double, double, capped)
+        doubled = builder.fresh("int64")
+        builder.emit(double, "Mul", [current, builder.const(double, 2, dtype="int64")], doubled)
+        builder.branch(double, candidate_block)
+        builder.branch(capped, candidate_block)
+        candidate = builder.fresh("int64")
+        builder.emit(candidate_block, "Phi", [doubled, maximum_value], candidate,
+                     attributes={"incoming_blocks": (double.name, capped.name)})
+        use_required = builder.fresh("bool")
+        builder.emit(candidate_block, "Gt", [requested, candidate], use_required)
+        builder.cond(candidate_block, use_required, exact, grown)
+        builder.branch(exact, merged)
+        builder.branch(grown, merged)
+        proposed = builder.fresh("int64")
+        builder.emit(merged, "Phi", [requested, candidate], proposed,
+                     attributes={"incoming_blocks": (exact.name, grown.name)})
+        # A dimension that already fits keeps its capacity: growing another
+        # dimension does not consume geometric growth in this one.
+        keep, expand, done = (builder.block(label + suffix) for suffix in ("_keep", "_expand", "_done"))
+        already_fits = builder.fresh("bool")
+        builder.emit(merged, "Le", [requested, current], already_fits)
+        builder.cond(merged, already_fits, keep, expand)
+        builder.branch(keep, done)
+        builder.branch(expand, done)
+        value = builder.fresh("int64")
+        builder.emit(done, "Phi", [current, proposed], value,
+                     attributes={"incoming_blocks": (keep.name, expand.name)})
+        return done, value
+
+    tail, new_capacity = geometric(dimensions, capacity, required, "outer")
+    tail, new_stride = geometric(tail, stride, required_stride, "child")
+    positive_stride = builder.fresh("bool")
+    builder.emit(tail, "Gt", [new_stride, zero], positive_stride)
+    builder.cond(tail, positive_stride, product_check, stride_check)
+    builder.branch(stride_check, allocate)
+    outer_limit, product_fits = builder.fresh("int64"), builder.fresh("bool")
+    builder.emit(product_check, "Div", [maximum_value, new_stride], outer_limit)
+    builder.emit(product_check, "Le", [new_capacity, outer_limit], product_fits)
+    builder.cond(product_check, product_fits, allocate, invalid)
+    flattened = builder.fresh("int64")
+    builder.emit(allocate, "Mul", [new_capacity, new_stride], flattened)
+    replacements = {}
+    allocation_specs = (
+        *((column, dtype, new_capacity, length) for column, dtype in zip(descriptor.column_value_ids, descriptor.column_dtypes)),
+        (pool.length_value_id, "int64", new_capacity, length),
+        *(() if pool.status_value_id is None else ((pool.status_value_id, "int", new_capacity, length),)),
+        *((column, dtype, flattened, None) for column, dtype in zip(pool.column_value_ids, pool.column_dtypes)),
+    )
+    for column, dtype, count, copy_count in allocation_specs:
+        fresh = builder.fresh("ptr")
+        allocate.instrs.append(heap_allocate(count, owner, fresh, element_dtype=dtype, zero_initialize=True))
+        replacements[column] = fresh
+        if copy_count is not None:
+            allocate.instrs.append(heap_copy(copy_count, values[column], fresh))
+    builder.branch(allocate, row_header)
+    row, row_next = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(row_header, "Phi", [zero, row_next], row,
+                 attributes={"incoming_blocks": (allocate.name, row_latch.name)})
+    more_rows = builder.fresh("bool")
+    builder.emit(row_header, "Lt", [row, length], more_rows)
+    builder.cond(row_header, more_rows, row_body, publish)
+    length_address, row_length = builder.fresh("ptr"), builder.fresh("int64")
+    builder.emit(row_body, "GetElementPtr", [values[pool.length_value_id], row], length_address)
+    builder.emit(row_body, "Load", [length_address], row_length)
+    nonnegative, within_stride, row_valid = (builder.fresh("bool") for _ in range(3))
+    builder.emit(row_body, "Ge", [row_length, zero], nonnegative)
+    builder.emit(row_body, "Le", [row_length, stride], within_stride)
+    builder.emit(row_body, "LAnd", [nonnegative, within_stride], row_valid)
+    builder.cond(row_body, row_valid, item_header, invalid)
+    item, item_next = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(item_header, "Phi", [zero, item_next], item,
+                 attributes={"incoming_blocks": (row_body.name, item_latch.name)})
+    more_items = builder.fresh("bool")
+    builder.emit(item_header, "Lt", [item, row_length], more_items)
+    builder.cond(item_header, more_items, item_body, row_latch)
+    old_base, new_base, old_index, new_index = (builder.fresh("int64") for _ in range(4))
+    builder.emit(item_body, "Mul", [row, stride], old_base)
+    builder.emit(item_body, "Mul", [row, new_stride], new_base)
+    builder.emit(item_body, "Add", [old_base, item], old_index)
+    builder.emit(item_body, "Add", [new_base, item], new_index)
+    for column, dtype in zip(pool.column_value_ids, pool.column_dtypes):
+        old_address, new_address, value = builder.fresh("ptr"), builder.fresh("ptr"), builder.fresh(dtype)
+        builder.emit(item_body, "GetElementPtr", [values[column], old_index], old_address)
+        builder.emit(item_body, "Load", [old_address], value)
+        builder.emit(item_body, "GetElementPtr", [replacements[column], new_index], new_address)
+        builder.emit(item_body, "Store", [value, new_address])
+    builder.branch(item_body, item_latch)
+    builder.emit(item_latch, "Add", [item, one], item_next)
+    builder.branch(item_latch, item_header)
+    builder.emit(row_latch, "Add", [row, one], row_next)
+    builder.branch(row_latch, row_header)
+    for column, fresh in replacements.items():
+        builder.emit(publish, "Store", [fresh, values[column]])
+    builder.emit(publish, "Store", [new_capacity, capacity])
+    builder.emit(publish, "Store", [flattened, values[pool.capacity_value_id]])
+    builder.emit(publish, "Store", [new_stride, stride])
+    outcomes = [(block, _status_branch(builder, block, status, result))
+                for block, status in ((unchanged, 0), (publish, 1), (invalid, 2))]
+    status = builder.fresh("int")
+    builder.emit(result, "Phi", [value for _, value in outcomes], status,
+                 attributes={"incoming_blocks": tuple(block.name for block, _ in outcomes)})
+    builder.emit(result, "Ret", [status])
+    function = Function(function_name or f"ssa_sequence_{descriptor.sequence_id}_reserve",
+                        [*storage, required, required_stride], builder.blocks, metadata={
+        "ssa_sequence_operation": "reserve", "sequence_id": descriptor.sequence_id,
+        "required_capacity_value_id": required.id,
+        "required_child_capacity_value_id": required_stride.id,
+        "heap_owner_value_id": owner.id,
+        "sequence_array_argument_ids": _storage_array_ids(descriptor, storage),
+        "growth_policy": "checked_geometric", "retired_arena_lifetime": "owner_release",
+        "named_outputs": (("status", status.id),),
+    })
+    return SSASequenceLowering((function,))
+
+
 def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, first_value_id):
     """Use incumbent insertion/store, reserving only when it reports full."""
     is_store = operation == "table_store"
@@ -611,6 +832,8 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
     validation_zero = builder.const(entry, 0, dtype="int64")
     validation_values = {**values, owner.id: owner,
                          reserve.metadata["required_capacity_value_id"]: validation_zero}
+    if descriptor.child_table_pool is not None:
+        validation_values[reserve.metadata["required_child_capacity_value_id"]] = values[descriptor.child_table_pool.row_stride_value_id]
     validation_status = builder.fresh("int")
     builder.emit(entry, "Call", [validation_values[value.id] for value in reserve.args], validation_status,
                  attributes={"callee": reserve.name})
@@ -645,6 +868,8 @@ def _lower_dynamic_sequence_mutation(descriptor, *, function_name, operation, fi
                                    else builder.const(grow, 1, dtype="int64")], required)
     reserve_values = {**values, owner.id: owner,
                       reserve.metadata["required_capacity_value_id"]: required}
+    if descriptor.child_table_pool is not None:
+        reserve_values[reserve.metadata["required_child_capacity_value_id"]] = values[descriptor.child_table_pool.row_stride_value_id]
     reserve_status = builder.fresh("int")
     builder.emit(grow, "Call", [reserve_values[value.id] for value in reserve.args], reserve_status,
                  attributes={"callee": reserve.name})
@@ -2013,7 +2238,15 @@ def lower_sequence_append_slice(
     arenas; no temporary sequence or runtime iterator is materialized.
     """
 
-    unsupported = _unsupported_destination(destination, "append_slice")
+    # Program: ``values=[]; for i in range(n): values.append(i); selected=values[:end]``.
+    # Wrong record: the slice is a fresh DYNAMIC sequence with a proven owner,
+    # yet append_slice refused before copying any rows because it had only a
+    # fixed-capacity branch. Rule: reserve ``old_length + clipped_count``
+    # through the descriptor's existing checked owner protocol before copying,
+    # and publish the new length only after the copy completes.
+    unsupported = _unsupported_destination(
+        destination, "append_slice", allow_dynamic=True,
+    )
     if unsupported is not None:
         return unsupported
     if (
@@ -2025,12 +2258,49 @@ def lower_sequence_append_slice(
             "sequence append-slice requires one duplicate-policy column"
         )
 
+    if destination.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC and (
+        destination.child_table_pool is not None
+        or destination.live_flags_value_id is not None
+        or any(destination.column_shapes)
+    ):
+        return SSASequenceLowering(shortfalls=(SSASequenceLoweringShortfall(
+            SSASequenceShortfallCode.DYNAMIC_GROWTH_UNAVAILABLE,
+            destination.sequence_id,
+            "append_slice",
+            "dynamic append-slice requires dense scalar rows without live "
+            "flags or child pools",
+        ),))
+
     destination_storage = _storage_values(destination)
     source_storage = _storage_values(source)
     all_storage = tuple({
         value.id: value
         for value in (*destination_storage, *source_storage)
     }.values())
+    name = function_name or (
+        f"ssa_sequence_{destination.sequence_id}_append_slice_"
+        f"{source.sequence_id}"
+    )
+    reserve_function = None
+    if destination.capacity_policy is SSASequenceCapacityPolicy.DYNAMIC:
+        reserve_lowering = lower_sequence_reserve(
+            destination, function_name=name + "__reserve",
+        )
+        if not reserve_lowering.complete:
+            return reserve_lowering
+        reserve_function = reserve_lowering.functions[0]
+        reserve_ids = {
+            int(value.id)
+            for value in reserve_function.args
+        } | {
+            int(instruction.res.id)
+            for block in reserve_function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+        first_value_id = max(
+            int(first_value_id or 0), max(reserve_ids, default=-1) + 1,
+        )
     builder = _Builder(_first_fresh_identity(
         destination, source, values=all_storage, minimum=first_value_id
     ))
@@ -2053,6 +2323,10 @@ def lower_sequence_append_slice(
     bounds_merge = builder.block("bounds_merge")
     empty = builder.block("empty")
     capacity = builder.block("capacity")
+    reserve_block = (
+        builder.block("append_slice_reserve")
+        if reserve_function is not None else None
+    )
     header = builder.block("append_slice_header")
     body = builder.block("append_slice_body")
     latch = builder.block("append_slice_latch")
@@ -2169,16 +2443,35 @@ def lower_sequence_append_slice(
     new_length = builder.fresh("int64")
     builder.emit(capacity, "Sub", [normalized_upper, normalized_lower], requested)
     builder.emit(capacity, "Add", [old_length, requested], new_length)
-    within_capacity = builder.fresh("bool")
-    builder.emit(capacity, "Le", [new_length, SSAValue(
-        destination.capacity_value_id, dtype="int64"
-    )], within_capacity)
-    builder.cond(capacity, within_capacity, header, full)
+    if reserve_function is not None:
+        storage_by_id = {int(value.id): value for value in destination_storage}
+        reserve_status = builder.fresh("int")
+        builder.emit(reserve_block, "Call", [
+            *(storage_by_id[int(value.id)] for value in reserve_function.args[:-1]),
+            new_length,
+        ], reserve_status, attributes={
+            "callee": reserve_function.name,
+            "source_linked": True,
+        })
+        reserve_succeeded = builder.fresh("bool")
+        builder.emit(reserve_block, "Lt", [
+            reserve_status, builder.const(reserve_block, 2),
+        ], reserve_succeeded)
+        builder.cond(reserve_block, reserve_succeeded, header, full)
+        builder.branch(capacity, reserve_block)
+        capacity_predecessor = reserve_block.name
+    else:
+        within_capacity = builder.fresh("bool")
+        builder.emit(capacity, "Le", [new_length, SSAValue(
+            destination.capacity_value_id, dtype="int64"
+        )], within_capacity)
+        builder.cond(capacity, within_capacity, header, full)
+        capacity_predecessor = capacity.name
     index = builder.fresh("int64")
     next_index = builder.fresh("int64")
     builder.emit(
         header, "Phi", [zero, next_index], index,
-        attributes={"incoming_blocks": (capacity.name, latch.name)},
+        attributes={"incoming_blocks": (capacity_predecessor, latch.name)},
     )
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, requested], continues)
@@ -2203,7 +2496,8 @@ def lower_sequence_append_slice(
     builder.branch(latch, header)
     builder.emit(complete, "Store", [new_length, destination_length_slot])
     complete_status = _status_branch(builder, complete, 1, result)
-    _raise_fixed_capacity_exhausted(builder, full, "append_slice")
+    if reserve_function is None:
+        _raise_fixed_capacity_exhausted(builder, full, "append_slice")
     full_status = _status_branch(builder, full, 2, result)
     status = builder.fresh("int")
     builder.emit(
@@ -2216,10 +2510,6 @@ def lower_sequence_append_slice(
         )},
     )
     builder.emit(result, "Ret", [status])
-    name = function_name or (
-        f"ssa_sequence_{destination.sequence_id}_append_slice_"
-        f"{source.sequence_id}"
-    )
     function = Function(
         name,
         [*all_storage, lower, upper],
@@ -2234,11 +2524,18 @@ def lower_sequence_append_slice(
                 int(destination.length_address_id),
                 int(source.column_value_ids[0]),
                 int(source.length_address_id),
+                *((int(destination.heap_owner_value_id),)
+                  if destination.heap_owner_value_id is not None else ()),
+                *((int(source.heap_owner_value_id),)
+                  if source.heap_owner_value_id is not None else ()),
             )),
             "named_outputs": (("status", int(status.id)),),
         },
     )
-    return SSASequenceLowering((function,))
+    return SSASequenceLowering((
+        function,
+        *((reserve_function,) if reserve_function is not None else ()),
+    ))
 
 
 def lower_sequence_pack_bits(
@@ -4379,14 +4676,31 @@ def lower_sequence_extend(
         return unsupported
     if len(destination.column_value_ids) != len(source.column_value_ids):
         raise ValueError("sequence extend requires matching row widths")
+    from ..transmogrifier.dtype_layout import layout_for
+    source_layouts = tuple(map(layout_for, source.column_dtypes))
+    destination_layouts = tuple(map(layout_for, destination.column_dtypes))
+    for source_layout, destination_layout in zip(source_layouts, destination_layouts, strict=True):
+        if source_layout == destination_layout:
+            continue
+        # c634: array("Q").extend(list[int]) copies rows; it does not
+        # identify the source arena with the array's physical storage. The
+        # existing insert loop must convert each loaded row before insertion.
+        if (source_layout.kind not in {"bool", "int", "uint", "float"}
+                or destination_layout.kind not in {"int", "uint", "float"}
+                or (source_layout.kind == "float" and destination_layout.kind != "float")
+                or any(destination.column_shapes) or any(source.column_shapes)):
+            raise ValueError("sequence extend has no declared scalar row conversion: "
+                             f"{source_layout.name} -> {destination_layout.name}")
     if destination.heap_owner_value_id is not None or source.heap_owner_value_id is not None:
-        from ..transmogrifier.dtype_layout import layout_for
-        if tuple(map(layout_for, destination.column_dtypes)) != tuple(map(layout_for, source.column_dtypes)):
-            raise ValueError("heap sequence extend requires matching element layouts")
         if any(destination.column_shapes) or any(source.column_shapes):
             raise ValueError("heap sequence extend requires scalar row columns")
 
-    insert_name = f"ssa_sequence_{destination.sequence_id}_insert"
+    # Two specialized owners can both have local sequence75. Extending each
+    # must not install one global ssa_sequence_75_insert with incompatible
+    # length/capacity/owner identities. The supplied operation identity owns
+    # its nested insert, just as it owns its reserve helpers.
+    insert_name = (f"{function_name}__insert" if function_name is not None
+                   else f"ssa_sequence_{destination.sequence_id}_insert")
     insert_lowering = lower_sequence_insert(
         destination,
         function_name=insert_name,
@@ -4507,19 +4821,67 @@ def lower_sequence_extend(
     else:
         builder.branch(body, call_insert)
 
+    # Use the same checked integer-row conversion contract as append. Bounds
+    # are compared in the loaded source's domain; a bound outside that domain
+    # cannot fail and must not itself be encoded in a too-narrow constant.
+    insert_block = call_insert
+    converted_rows = []
+    for value, source_layout, destination_layout in zip(
+        row_values, source_layouts, destination_layouts, strict=True,
+    ):
+        if source_layout == destination_layout:
+            converted_rows.append(value)
+            continue
+        if destination_layout.kind in {"int", "uint"}:
+            source_bits, target_bits = 8 * source_layout.byte_size, 8 * destination_layout.byte_size
+            source_min = (0 if source_layout.kind in {"uint", "bool"} else -(1 << (source_bits - 1)))
+            source_max = ((1 << source_bits) - 1 if source_layout.kind == "uint" else
+                          1 if source_layout.kind == "bool" else (1 << (source_bits - 1)) - 1)
+            target_min = (0 if destination_layout.kind == "uint" else -(1 << (target_bits - 1)))
+            target_max = ((1 << target_bits) - 1 if destination_layout.kind == "uint" else
+                          (1 << (target_bits - 1)) - 1)
+            for operation, bound, needed in (
+                ("Ge", target_min, target_min > source_min),
+                ("Le", target_max, target_max < source_max),
+            ):
+                if not needed:
+                    continue
+                valid = builder.fresh("bool")
+                builder.emit(insert_block, operation,
+                             [value, builder.const(insert_block, bound, dtype=source_layout.name)], valid)
+                accepted = builder.block(f"row_{value.id}_{operation}_accepted")
+                invalid = builder.block(f"row_{value.id}_{operation}_invalid")
+                builder.cond(insert_block, valid, accepted, invalid)
+                builder.emit(invalid, "Call", [], attributes={
+                    "callee": "turing_validation_error", "error_code": 74,
+                    "binding": f"ssa_sequence_{destination_layout.name}_range",
+                    "source_linked": True,
+                })
+                builder.emit(invalid, "Ret", [builder.const(invalid, 3)])
+                insert_block = accepted
+        converted = builder.fresh(destination_layout.name)
+        builder.emit(insert_block, "Cast", [value], converted, attributes={
+            "target_dtype": destination_layout.name,
+            "binding": (f"ssa_sequence_{destination_layout.name}_range"
+                        if destination_layout.kind in {"int", "uint"} else
+                        f"ssa_sequence_{destination_layout.name}_conversion"),
+            "source_dtype": source_layout.name,
+        })
+        converted_rows.append(converted)
+    row_values = converted_rows
     insert_status = builder.fresh("int")
     insert_values = {value.id: value for value in all_storage}
     insert_values.update(zip(insert_function.metadata["sequence_row_argument_ids"], row_values))
     builder.emit(
-        call_insert,
+        insert_block,
         "Call",
         [insert_values[value.id] for value in insert_function.args],
         insert_status,
         attributes={"callee": insert_name, "source_linked": True},
     )
     is_full = builder.fresh("bool")
-    builder.emit(call_insert, "Eq", [insert_status, full_status], is_full)
-    builder.cond(call_insert, is_full, exhausted, latch)
+    builder.emit(insert_block, "Eq", [insert_status, full_status], is_full)
+    builder.cond(insert_block, is_full, exhausted, latch)
     builder.emit(latch, "Add", [index, one], next_index)
     builder.branch(latch, header)
     completed_status = _status_branch(builder, complete, 1, result_block)

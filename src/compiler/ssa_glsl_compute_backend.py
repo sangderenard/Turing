@@ -474,6 +474,142 @@ def _find_region_call(wrapper: Function, module: IRModule):
     return None
 
 
+def _region_calls(block) -> list:
+    return [
+        instruction for instruction in block.instrs
+        if str(instruction.op) in ("Call", "call")
+    ]
+
+
+def _fuse_loop_body(wrapper: Function, module: IRModule):
+    """One straight-line region equal to the wrapper's whole loop body.
+
+    The lowering plans a pack core's body as several regions: one loads
+    ``x[i]``, one computes, one stores ``y[i]``, and the wrapper threads
+    their results through ``GetElementPtr``/``Load`` projections of each
+    call's returned aggregate (field ``k`` of a call is its region's ``k``-th
+    ``Ret`` operand). This inlines every call in body order, substitutes
+    each formal by its actual, and resolves each projection to the value the
+    region returned, so the one-region emitter below reads the result
+    unchanged. Returns ``(call, region, callee_names)`` with a synthesized
+    call whose actuals are exactly the outside values the body reads, or a
+    reason string when the body holds anything else.
+    """
+
+    from ..transmogrifier.ssa import BasicBlock, Instr
+
+    bodies = [
+        block for block in wrapper.blocks.values()
+        if any(
+            str(call.attributes.get("callee") or "") in module.functions
+            for call in _region_calls(block)
+        )
+    ]
+    if len(bodies) != 1:
+        return f"region calls sit in {len(bodies)} wrapper blocks, not one loop body"
+    body = bodies[0]
+    substitute: dict[int, Any] = {}
+    returned: dict[int, list] = {}
+    projection: dict[int, tuple[int, int]] = {}
+    constants: dict[int, Any] = {}
+    for block in wrapper.blocks.values():
+        for instruction in block.instrs:
+            if str(instruction.op) == "Const" and instruction.res is not None:
+                constants[int(instruction.res.id)] = instruction.attributes.get(
+                    "constant", instruction.attributes.get("value")
+                )
+    fused: list = []
+    defined: set[int] = set()
+    callees: list[str] = []
+
+    def resolved(value):
+        return substitute.get(int(value.id), value)
+
+    for instruction in body.instrs:
+        op = str(instruction.op)
+        if op in ("Br", "br"):
+            continue
+        if op == "Const":
+            fused.append(instruction)
+            defined.add(int(instruction.res.id))
+            continue
+        if op in ("Call", "call"):
+            callee = str(instruction.attributes.get("callee") or "")
+            region = module.functions.get(callee)
+            if region is None:
+                return f"loop body calls {callee!r}, which this module does not define"
+            if callee in callees:
+                return f"loop body calls {callee!r} twice; its values would collide"
+            if set(region.blocks) != {"entry"}:
+                return f"planned region {callee!r} is not one straight-line entry block"
+            if len(region.args) != len(instruction.args):
+                return (
+                    f"loop body passes {len(instruction.args)} actuals but region "
+                    f"{callee!r} declares {len(region.args)} formals"
+                )
+            callees.append(callee)
+            for formal, actual in zip(region.args, instruction.args):
+                substitute[int(formal.id)] = resolved(actual)
+            for inner in region.blocks["entry"].instrs:
+                if str(inner.op) == "Ret":
+                    if instruction.res is not None:
+                        returned[int(instruction.res.id)] = [
+                            resolved(value) for value in inner.args
+                        ]
+                    continue
+                fused.append(Instr(
+                    inner.op, [resolved(value) for value in inner.args], inner.res,
+                    arg_roles=list(inner.arg_roles),
+                    attributes=dict(inner.attributes),
+                ))
+                if inner.res is not None:
+                    defined.add(int(inner.res.id))
+            continue
+        if op == "GetElementPtr" and instruction.args and int(instruction.args[0].id) in returned:
+            index = constants.get(int(instruction.args[1].id)) if len(instruction.args) > 1 else None
+            if index is None:
+                return "a projection of a region result has no constant field index"
+            projection[int(instruction.res.id)] = (int(instruction.args[0].id), int(index))
+            continue
+        if op == "Load" and instruction.args and int(instruction.args[0].id) in projection:
+            aggregate, index = projection[int(instruction.args[0].id)]
+            fields = returned[aggregate]
+            if not 0 <= index < len(fields):
+                return f"projection of field {index} from a region returning {len(fields)}"
+            substitute[int(instruction.res.id)] = fields[index]
+            continue
+        return f"loop body holds {op}, which is neither a region call nor a projection of one"
+
+    outside: dict[int, Any] = {}
+    for instruction in fused:
+        for value in instruction.args:
+            if int(value.id) not in defined:
+                outside.setdefault(int(value.id), value)
+    name = f"{wrapper.name}__fused_body"
+    region = Function(
+        name, list(outside.values()),
+        {"entry": BasicBlock("entry", [*fused, Instr("Ret", [], None)])},
+    )
+    call = Instr("Call", list(outside.values()), None, attributes={"callee": name})
+    return call, region, tuple(callees)
+
+
+def _through_casts(wrapper: Function, value_id: int) -> int:
+    """Follow ``Cast`` results back to the value they convert."""
+
+    casts = {
+        int(instruction.res.id): int(instruction.args[0].id)
+        for block in wrapper.blocks.values()
+        for instruction in block.instrs
+        if str(instruction.op) == "Cast" and instruction.res is not None and instruction.args
+    }
+    seen = set()
+    while value_id in casts and value_id not in seen:
+        seen.add(value_id)
+        value_id = casts[value_id]
+    return value_id
+
+
 def emit_ssa_module_to_glsl_compute(
     module: IRModule, function_name: str, *, entry_name: str | None = None,
 ) -> GLSLComputeArtifact:
@@ -511,6 +647,20 @@ def emit_ssa_module_to_glsl_compute(
         )
     call, region_name = found
     region: Function = module.functions[region_name]
+    checked_functions: tuple[str, ...] = (function_name, region_name)
+    body_calls = [
+        instruction
+        for block in wrapper.blocks.values()
+        for instruction in _region_calls(block)
+        if str(instruction.attributes.get("callee") or "") in module.functions
+    ]
+    if len(body_calls) > 1:
+        fused = _fuse_loop_body(wrapper, module)
+        if isinstance(fused, str):
+            return refuse("Call", fused)
+        call, region, callees = fused
+        region_name = region.name
+        checked_functions = (function_name, *callees)
 
     # The capability table declares GLSL able to honour both precision
     # obligations; this consult is what keeps that a checked fact. Any miss
@@ -523,7 +673,7 @@ def emit_ssa_module_to_glsl_compute(
             + repr(item["missing"]) + f" in {item['function']}",
         )
         for item in precision_backend_shortfalls(
-            module, "glsl", (function_name, region_name),
+            module, "glsl", checked_functions,
         )
     )
 
@@ -568,7 +718,9 @@ def emit_ssa_module_to_glsl_compute(
                 if phi_id in ids:
                     others = [held for held in ids if held != phi_id]
                     if others:
-                        count_id = others[0]
+                        # The lowering widens the bound to the induction's
+                        # int64 with a Cast; the count is what it converts.
+                        count_id = _through_casts(wrapper, others[0])
     if count_id is None:
         return refuse(
             "Lt", "wrapper has no Lt comparing the loop Phi against a bound; "

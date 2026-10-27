@@ -1,4 +1,6 @@
 import json
+import runpy
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -9,6 +11,51 @@ from src.compiler.perforated_network_llvm import (
 )
 from src.compiler.compiled_perforated_adam import CompiledPerforatedAdam
 from src.compiler.ssa_llvm_backend import prepare_artifact_execution
+
+
+def test_tanh_vjp_uses_each_row_of_the_settled_span(tmp_path):
+    corpus = runpy.run_path(str(
+        Path(__file__).parent / "nn_vjp_corpus" / "c622_tanh_vjp_two_rows.py"
+    ))
+    compiled = compile_perforated_network(
+        tmp_path, batch=2, in_dim=1, out_dim=1, dendrites_per_neuron=1,
+    )
+    ids = {port.name: port.value_id for port in compiled.contract.inputs}
+    x = np.asarray([[0.0], [1.0]])
+    weight = np.asarray([[20.0]])
+    bias = np.asarray([[0.0]])
+    gain = np.asarray([[1.0]])
+    route = np.asarray([[1.0]])
+    seed = np.ones((2, 1))
+    values = {
+        ids["x"]: x,
+        ids["base_weight"]: np.zeros((1, 1)),
+        ids["base_bias"]: np.zeros((1, 1)),
+        ids["dendrite_weight"]: weight,
+        ids["dendrite_bias"]: bias,
+        ids["dendrite_gain"]: gain,
+        ids["dendrite_route"]: route,
+        ids["dendrite_mask"]: np.ones((1, 1)),
+        ids["network_authority"]: np.ones((2, 1)),
+        ids["simulator_delta"]: np.zeros((2, 1)),
+        compiled.contract.prediction_adjoint.value_id: seed,
+    }
+    expected_prediction, expected_gradients = corpus["forward_and_vjp"](
+        x, weight, bias, gain, route, seed,
+    )
+    execution = prepare_artifact_execution(
+        compiled.forward_vjp.artifact, values,
+    ).run()
+    gradient_ids = {
+        port.name.removeprefix("grad_"): port.value_id
+        for port in compiled.contract.gradients
+    }
+    np.testing.assert_array_equal(
+        execution.buffers[compiled.forward_vjp.output_value_ids[0]],
+        expected_prediction,
+    )
+    for name, expected in expected_gradients.items():
+        np.testing.assert_array_equal(execution.buffers[gradient_ids[name]], expected)
 
 
 def test_perforated_network_compiles_and_executes_forward_and_vjp(tmp_path):

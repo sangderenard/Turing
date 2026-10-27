@@ -61,6 +61,34 @@ def test_scalar_integer_type_evidence_is_not_weakened():
     assert graph.G.nodes[1]['attributes']['value'] is False
 
 
+def test_rank_zero_index_without_scalar_class_keeps_tensor_storage():
+    process = nx.DiGraph()
+    process.graph['function_name'] = 'indexed_tensor_kind'
+    process.graph['identity_table'] = {'values': (0,), 'index': (1,)}
+    process.graph['linked_value_abi'] = {
+        0: {'storage': 'span', 'dtype': 'float64', 'rank': 1,
+            'python_type': 'src.common.tensors.abstraction.AbstractTensor'},
+        1: {'storage': 'scalar', 'dtype': 'int64', 'rank': 0,
+            'python_type': 'builtins.int'},
+    }
+    for node_id, name in ((0, 'values'), (1, 'index')):
+        process.add_node(
+            node_id, type='Input', op='input', value_id=node_id, parents=(),
+            attributes={'binding_name': name, 'binding_kind': 'parameter'},
+        )
+    process.add_node(
+        2, type='Indexed', op='Indexed', value_id=2,
+        parents=((0, 'base'), (1, 'index')), attributes={},
+        expr_obj=ast.parse('values[index]', mode='eval').body,
+    )
+    process.add_edge(0, 2, role='base')
+    process.add_edge(1, 2, role='index')
+    _fold_callsite_structural_values(SimpleNamespace(G=process, roots=[2]))
+    attributes = process.nodes[2]['attributes']
+    assert attributes['program_abi_storage'] == 'span'
+    assert attributes['program_abi_rank'] == 0
+
+
 def test_reference_contract_overrules_weaker_tensor_type_hint():
     graph = kind_graph()
     graph.G.nodes[0]['tensor']['python_type'] = 'builtins.int'

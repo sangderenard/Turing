@@ -287,7 +287,12 @@ def scatter(x: Any, index: Any, src: Any, dim: int = 0, *, reduce: str = "sum"):
     nd = x.ndims()
     axis = dim if dim >= 0 else nd + dim
     from ..abstraction import AbstractTensor
-    finalize = AbstractTensor._pre_autograd('scatter', [x, index, src], params={'dim': dim})
+    # ``reduce`` is numerical identity, not dispatch decoration.  Omitting it
+    # made every captured scatter indistinguishable from the default sum and
+    # allowed a compiler target to silently emit scatter-add for authored
+    # mean/max/min programs.
+    finalize = AbstractTensor._pre_autograd(
+        'scatter', [x, index, src], params={'dim': dim, 'reduce': reduce})
     # A summing scatter over an integer index tensor goes to the backend's own
     # accumulation when it has one (torch ``index_add_``, NumPy ``np.add.at``):
     # one device pass, no host round trip.  The rounds below read the index
