@@ -201,7 +201,8 @@ class Generator:
         prefix = f"{label}: " if label else ""
         if rng.random() < 0.7:
             lines = [
-                f"{indent}{prefix}for (let {counter} = 0; {guard}; {counter}++) {{"
+                f"{indent}{prefix}for ({rng.choice(('let', 'let', 'var'))} "
+                f"{counter} = 0; {guard}; {counter}++) {{"
             ]
             self.loops.append(("for", label))
             lines.extend(self.block(depth, indent + "  "))
@@ -215,7 +216,7 @@ class Generator:
         self.loops.pop()
         lines.append(f"{indent}}}")
         if "for (" in lines[0]:
-            # A for-head let is scoped to the loop.
+            # A for-head let is scoped to the loop (a var is not read after).
             self.numbers.remove(counter)
         return lines
 
@@ -238,18 +239,19 @@ class Generator:
         self.loops: list[tuple[str, str | None]] = []
         self.returns_number = rng.random() < 0.7
         for index in range(rng.randint(0, 4)):
-            binding = "let" if rng.random() < 0.5 else "const"
+            # A var declared up front with an initializer reads like a let.
+            binding = rng.choice(("let", "let", "const", "const", "var"))
             if rng.random() < 0.7:
                 name = f"n{index}"
                 lines.append(f"  {binding} {name} = {self.number(3)};")
                 self.numbers.append(name)
-                if binding == "let":
+                if binding != "const":
                     self.mutable_numbers.append(name)
             else:
                 name = f"t{index}"
                 lines.append(f"  {binding} {name} = {self.boolean(3)};")
                 self.booleans.append(name)
-                if binding == "let":
+                if binding != "const":
                     self.mutable_booleans.append(name)
             if (self.mutable_numbers or self.mutable_booleans) and rng.random() < 0.5:
                 form = rng.random()
