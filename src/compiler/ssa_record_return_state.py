@@ -1,5 +1,7 @@
 """Resolve an immutable scalar field version for a physical return edge."""
 
+from typing import Any, Mapping
+
 import networkx as nx
 from .concordance_declarations import KEEP_PHYSICAL
 
@@ -26,6 +28,64 @@ def function_scope_of(function):
     else the function's name (a function no control lowering built)."""
     metadata = getattr(function, "metadata", None) or {}
     return str(metadata.get("tensor_shape_concordance_scope") or function.name)
+
+
+def frame_aliased_result_binding(instruction, callee, *, book=None, record=None, require_complete=True):
+    """Project an emitted output position from its exact call/frame record."""
+    if not instruction.attributes.get("result_aliases_frame"):
+        return None
+    from .identity_concordance import current_identity_book, Ref, ConcordanceRefusal
+    from .concordance_declarations import CALL_RECORD
+    book = current_identity_book() if book is None else book
+    cell = getattr(record, "cell", None) if record is not None else instruction.attributes.get("ssa_output_call_record")
+    if not isinstance(cell, Ref) or cell.page != CALL_RECORD:
+        raise ConcordanceRefusal("frame-aliased result lacks its exact call record")
+    current = book.latest_ref(CALL_RECORD, cell.row)
+    records = () if current is None else book.page(CALL_RECORD).cell(current.row, current.column) or ()
+    matching = tuple(item for item in records
+                     if int(item.callsite_id) == int(instruction.attributes.get("plan_callsite_id", -1))
+                     and str(item.callee_symbol) == str(callee.name))
+    if len(matching) != 1:
+        raise ConcordanceRefusal("frame-aliased result has no unique current call record")
+    record = matching[0]
+    result_id = instruction.attributes.get("semantic_result_id")
+    if result_id is None and instruction.res is not None:
+        result_id = int(instruction.res.id)
+    outputs = tuple(int(formal) for formal, result in record.result_bindings if int(result) == result_id)
+    if len(outputs) != 1:
+        raise ConcordanceRefusal("frame-aliased result has no unique recorded result binding")
+    formal_id = outputs[0]
+    inputs = tuple(map(int, instruction.attributes.get("callee_input_ids", ())))
+    formal_ids = tuple(int(formal.id) for formal in callee.args)
+    if (len(inputs) != len(instruction.args) or len(set(inputs)) != len(inputs)
+            or inputs.count(formal_id) != 1 or not set(inputs).issubset(formal_ids)
+            or (require_complete and inputs != formal_ids)):
+        raise ConcordanceRefusal("frame-aliased result does not have an aligned current formal frame")
+    position = inputs.index(formal_id)
+    bindings = tuple((kind, source) for formal, kind, source in record.frame_bindings if int(formal) == formal_id)
+    if len(bindings) != 1 or bindings[0][0] not in {"caller_value", "caller_alias", "caller_storage"}:
+        raise ConcordanceRefusal("frame-aliased result has no exact recorded caller storage")
+    actual = instruction.args[position]
+    if int(actual.id) != int(bindings[0][1]):
+        raise ConcordanceRefusal("frame-aliased result operand disagrees with recorded caller storage")
+    return formal_id, position, actual, current
+
+
+def refresh_frame_aliased_result(instruction, callee, *, book=None, record=None):
+    """Keep a call's emitted view current in the operand writer's transaction.
+
+    The returned cover-list frame moved when its callee acquired/pruned
+    storage formals. Keeping the old index made Fortran declare the length
+    cell under the result's key. The call record owns both identities; an
+    operand rewrite must project its output spelling from that same record.
+    """
+    binding = frame_aliased_result_binding(instruction, callee, book=book, record=record, require_complete=False)
+    if binding is not None:
+        formal_id, position, _actual, cell = binding
+        instruction.attributes.update(ssa_output_formal_id=formal_id,
+                                      ssa_output_argument=position,
+                                      ssa_output_call_record=cell)
+    return binding
 
 
 def accepted_ssa_component(function):
@@ -1499,6 +1559,36 @@ def reconcile_nondominating_identity_cast_results(module):
                         actual, target_block, int(instruction_index), phi_edge
                     ):
                         continue
+                    # Program: ``SSAReferenceEvaluator._value`` (its error
+                    # message formats ``int(value.id)`` from a branch-local
+                    # region).  Wrong record: the forward rewrote the use and
+                    # posted nothing, so the next ``ssa_block_geometry``
+                    # REVISE of this block had no changed source and was
+                    # refused.  Rule: a forwarded use is a dominance
+                    # rebinding on the book, the same row the loop-result
+                    # canonicalization posts, which the geometry reads as
+                    # its cause.
+                    from .concordance_declarations import (
+                        CONTROL_SSA_FINISH, LOOP_RESULT_USE_REBINDING,
+                    )
+                    from .identity_concordance import Mode
+
+                    post_dominance_rebinding(
+                        function, LOOP_RESULT_USE_REBINDING, (
+                            str(function.metadata.get(
+                                "tensor_shape_concordance_scope"
+                            ) or function.name),
+                            str(block_name), int(instruction_index),
+                            int(position),
+                        ), (
+                            int(incumbent.id), int(actual.id),
+                            "exact_physical_identity_cast_result",
+                            str(callee), int(slot), str(call_block),
+                        ),
+                        original=incumbent, replacement=actual,
+                        blocks=(target_block, str(call_block)),
+                        stage=CONTROL_SSA_FINISH, mode=Mode.REVISE,
+                    )
                     arguments[position] = actual
                     receipts.append({
                         "function": str(symbol),
@@ -2732,3 +2822,77 @@ def scalar_return_field_versions(function, source_graph, functions=None):
         return exit_with(VERSION_DOES_NOT_DOMINATE_RETURN, read)
 
     return lookup
+
+
+def map_sequence_descriptor(
+    descriptor: Any, remap: Mapping[int, int], *,
+    sequence_id: int, child_table_pool: Any,
+):
+    """One descriptor re-keyed into another frame through ``remap``.
+
+    Program: ``ys = make(n)`` and ``fill(xs, n)`` with DYNAMIC lists.
+    Wrong record: five linker sites rebuilt the caller's descriptor field
+    by field and silently dropped every field they did not name -- the
+    heap owner among them -- so the caller's view of a DYNAMIC arena was
+    FIXED.  Rule: re-keying maps EVERY identity member (columns, counters,
+    status, live flags, heap owner, child pool) through the same map and
+    carries every other field unchanged; an unmapped member refuses.
+    """
+
+    from dataclasses import replace as _replace
+
+    def mapped(value_id):
+        return None if value_id is None else remap[int(value_id)]
+
+    return _replace(
+        descriptor,
+        sequence_id=int(sequence_id),
+        column_value_ids=tuple(
+            remap[int(value_id)] for value_id in descriptor.column_value_ids
+        ),
+        length_address_id=remap[int(descriptor.length_address_id)],
+        capacity_value_id=remap[int(descriptor.capacity_value_id)],
+        status_address_id=mapped(descriptor.status_address_id),
+        live_flags_value_id=mapped(descriptor.live_flags_value_id),
+        heap_owner_value_id=mapped(descriptor.heap_owner_value_id),
+        child_table_pool=child_table_pool,
+    )
+
+
+def map_child_pool(pool: Any, remap: Mapping[int, int]):
+    from ..transmogrifier.ssa import SSAChildTablePoolDescriptor
+
+    if pool is None:
+        return None
+    return SSAChildTablePoolDescriptor(
+        handle_column=int(pool.handle_column),
+        column_value_ids=tuple(
+            remap[int(value_id)] for value_id in pool.column_value_ids
+        ),
+        length_value_id=remap[int(pool.length_value_id)],
+        capacity_value_id=remap[int(pool.capacity_value_id)],
+        row_stride_value_id=remap[int(pool.row_stride_value_id)],
+        shape_value_id=(
+            None if pool.shape_value_id is None
+            else remap[int(pool.shape_value_id)]
+        ),
+        rank_value_id=(
+            None if pool.rank_value_id is None
+            else remap[int(pool.rank_value_id)]
+        ),
+        shape_stride_value_id=(
+            None if pool.shape_stride_value_id is None
+            else remap[int(pool.shape_stride_value_id)]
+        ),
+        status_value_id=(
+            None if pool.status_value_id is None
+            else remap[int(pool.status_value_id)]
+        ),
+        live_flags_value_id=(
+            None if pool.live_flags_value_id is None
+            else remap[int(pool.live_flags_value_id)]
+        ),
+        column_dtypes=tuple(pool.column_dtypes),
+        key_columns=tuple(pool.key_columns),
+        writable=bool(pool.writable),
+    )

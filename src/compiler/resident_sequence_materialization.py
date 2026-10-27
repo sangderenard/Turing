@@ -280,10 +280,12 @@ def _glyph_component_resident_sequence_ids(component: Any) -> tuple[int, ...]:
         )
     )
     formatted = getattr(component, "formatted_sequence_value_id", None)
+    format_spec = getattr(component, "format_spec_value_id", None)
     return tuple(dict.fromkeys((
         *nested,
         *alternatives,
         *(() if formatted is None else (int(formatted),)),
+        *(() if format_spec is None else (int(format_spec),)),
     )))
 
 
@@ -333,30 +335,43 @@ def _compiled_validation_diagnostic_sequence_ids(
     # their operands (for example ``position`` in ``_validate_row``).
     source_page = book.page("source_glyph_sequence")
 
-    # Only the cells published by the ValidationBlock are top-level
-    # diagnostic glyphs.  Members added from one glyph recipe below are
-    # resident formatter sequences, not further JoinedStr owners.  Iterating
-    # the growing set made a later formatter node (``id_space.compose`` value
-    # 36) demand a second ``source_glyph_sequence`` row it cannot own.
-    diagnostic_glyph_ids = frozenset(diagnostic_ids)
-    for node_id, data in graph_obj.nodes(data=True):
-        value_id = int(data.get("value_id", node_id))
-        if value_id not in diagnostic_glyph_ids:
-            continue
-        row = (data.get("attributes") or {}).get(
+    # id_space.compose's diagnostic row 29 owns a formatted component
+    # whose exact format_spec_value_id is JoinedStr 8 ("#x"). The previous
+    # closure omitted that edge, so 8 became an unbounded FIXED arena leased
+    # to the caller, although native validation never consumes its glyphs.
+    # Follow resident recipe edges, and recurse only into graph values that
+    # carry their own source_glyph_sequence row. Formatter result sequences
+    # (compose's value 36) are marked diagnostic too, but cannot be asked to
+    # own a JoinedStr row merely because they belong to that same closure.
+    glyph_rows = {
+        int(data.get("value_id", node_id)): tuple(row)
+        for node_id, data in graph_obj.nodes(data=True)
+        for row in ((data.get("attributes") or {}).get(
             "source_glyph_sequence_row"
-        )
-        fact = None if row is None else source_page.latest(tuple(row))
+        ),)
+        if row is not None
+    }
+    pending = list(diagnostic_ids)
+    visited = set()
+    while pending:
+        value_id = pending.pop()
+        if value_id in visited:
+            continue
+        visited.add(value_id)
+        row = glyph_rows.get(value_id)
+        fact = None if row is None else source_page.latest(row)
         if fact is None:
             raise ValueError(
                 "compiled validation diagnostic has no glyph concordance: "
                 f"value={value_id} row={row!r}"
             )
-        diagnostic_ids.update(
+        members = tuple(
             member
             for component in tuple(getattr(fact, "components", ()) or ())
             for member in _glyph_component_resident_sequence_ids(component)
         )
+        diagnostic_ids.update(members)
+        pending.extend(member for member in members if member in glyph_rows)
     return frozenset(diagnostic_ids)
 
 
@@ -1352,6 +1367,13 @@ def _source_sequence_slices(graph_obj: Any):
         return value is None or (isinstance(value, int) and not isinstance(value, bool))
 
     mutations = []
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
+    nodes_by_value: dict[int, list[int]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        nodes_by_value.setdefault(
+            int(data.get("value_id", node_id)), [],
+        ).append(int(node_id))
+
     for node_id, data in graph_obj.nodes(data=True):
         attrs = data.get("attributes") or {}
         if (attrs.get("aggregate_kind") != "list"
@@ -1361,11 +1383,32 @@ def _source_sequence_slices(graph_obj: Any):
         source, selector = roles.get("base"), roles.get("index")
         if source is None or selector is None or source not in graph_obj or selector not in graph_obj:
             continue
-        if (graph_obj.nodes[source].get("attributes") or {}).get("aggregate_kind") != "list":
+        source_value_id = value_id(source)
+        storage_value_id = source_value_id
+        seen_storage_ids = set()
+        cyclic_storage_alias = False
+        while storage_value_id in storage_aliases:
+            if storage_value_id in seen_storage_ids:
+                cyclic_storage_alias = True
+                break
+            seen_storage_ids.add(storage_value_id)
+            storage_value_id = int(storage_aliases[storage_value_id])
+        if cyclic_storage_alias:
+            continue
+        storage_nodes = nodes_by_value.get(storage_value_id, ())
+        if len(storage_nodes) != 1:
+            continue
+        storage_node = graph_obj.nodes[storage_nodes[0]]
+        if (storage_node.get("attributes") or {}).get("aggregate_kind") != "list":
             continue
         selector_data = graph_obj.nodes[selector]
         folded, selector_literal = literal_of(selector)
-        arguments, spellings = [value_id(source)], []
+        # A slice after an in-place loop update can name an IndexedStore or
+        # LoopResult as its base.  The exact graph storage-alias chain maps
+        # that version to the resident sequence descriptor; use that identity
+        # for the slice operation so its row type and storage come from the
+        # same existing sequence contract.
+        arguments, spellings = [storage_value_id], []
         if folded:
             if not (isinstance(selector_literal, slice) and selector_literal.step is None
                     and integer_or_none(selector_literal.start)
@@ -1980,7 +2023,7 @@ _RECEIVER_READING_METHODS = frozenset({
     "startswith", "endswith", "find", "rfind",
 })
 
-_MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray"})
+_MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray", "array"})
 
 
 def _receiver_collection_kind(data: Any) -> str | None:
@@ -2362,7 +2405,46 @@ def _static_sequence_capacity_survey(
         key for key in copies_unbounded
         if key not in _call_escaped_argument_ids(graph_obj)
     )
-    return bounds, unbounded
+    # c632: the exact imported array constructor was concorded to a local
+    # sequence materializer before extraction.  Its empty allocation owns
+    # storage even when the next operation stores it into a record field;
+    # the field read is a borrowed view and must not mint another owner.
+    owned_empty_arrays = frozenset(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in (data.get("attributes") or {},)
+        if attributes.get("aggregate_kind") == "array"
+        and attributes.get("producer_kind") == "sequence_materialization"
+        and tuple(role for _parent, role in data.get("parents") or () if role != "callee")
+        == ("arg:0",)
+    )
+    # Vocabulary.__init__ hands its empty lookup dictionaries to exact
+    # declared record slots. That handoff transfers the constructor's owned
+    # storage; treating it as an escaped borrowed argument left every later
+    # setdefault at capacity zero. Keep the allocation in its native context,
+    # as for an empty typed array, and let the established heap contract wait
+    # for its proved column layouts before binding pointer cells.
+    from .concordance_declarations import CLASS_FIELD_DECLARATION
+    from .identity_concordance import Ref
+
+    owned_record_initializers = {
+        int(parent)
+        for _node_id, target in graph_obj.nodes(data=True)
+        if str(target.get("type") or target.get("op") or "").casefold() == "setattr"
+        and isinstance((target.get("attributes") or {}).get("field_declaration_cell"), Ref)
+        and (target.get("attributes") or {})["field_declaration_cell"].page
+            == CLASS_FIELD_DECLARATION
+        for parent, role in target.get("parents") or ()
+        if str(role) == "value"
+    }
+    owned_record_dicts = frozenset(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Dict)
+        and not data["expr_obj"].keys
+        and int(node_id) in owned_record_initializers
+    )
+    return bounds, unbounded | owned_empty_arrays | owned_record_dicts
 
 
 def _linked_sequence_propagation_kind(
@@ -2454,7 +2536,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         # unexplained function formal for the vanished node id.
         return (ControlExpression("const", literal=literal),)
 
-    sequence_kinds = {"list", "set", "bytes", "bytearray"}
+    sequence_kinds = {"list", "set", "bytes", "bytearray", "array"}
     mutations = []
     from .concordance_declarations import (
         SOURCE_SORT_CONTRACT, SourceSortContract,
@@ -2500,7 +2582,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         operation = str(record["operator"])
         if operation == "sort":
             continue
-        argument_kind = "value"
+        argument_kind = str(record.get("argument_kind", "value"))
         argument_ids = tuple(map(int, record["argument_value_ids"]))
         key_column = None
         reverse = False

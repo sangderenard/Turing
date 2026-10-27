@@ -1,0 +1,10 @@
+2026-10-26 BUILTIN BOOL INTEGER RESULTS (MEASURED, Windows):
+
+Canonical source def f(a: bool,b: bool): return a+b,a-b,a*b already carries builtin int result class and int64 native ABI. Structural folding copied operand bool into the result descriptor; hierarchical planning repeated that weaker promotion. Both writers now consult the existing exact source class and scalar ABI. The planner follows canonical identity edges to the source-class record; bool Tensor output descriptors retain their distinct domain.
+
+Once those source results were int64, LLVM still performed arithmetic at i1 operand width before extending the result. The repository module emitter now uses the declared integer result width when all arithmetic operands are i1. Logical templates and predicates retain their boolean domain.
+
+Verified: tests/test_python_bool_numeric_add.py: 4 passed. Three native backends each execute Add/Sub/Mul on all four bool pairs with exact int64 buffers (including 2 and -1); the fourth test checks bool Tensor output dtype and shape only, not Tensor numerical execution. Six bounded concordance audits (view, toplevel, energy, controller, mapping, oscillator) report zero findings. controller_untyped refuses missing pi_update.dt_pen ABI identically on untouched main; it is not claimed repaired. The clean whole-core 149-function/zero-finding checkpoint precedes this bool follow-up. Whole-core native emission and full bootstrap remain incomplete. No full suite, corpus, fuzz, Linux or GPU gate was run.
+
+Follow-up within this change: the direct single-function LLVM emitter chose the declared int64 arithmetic domain but lacked its existing scalar conversion for i1 operands. An accepted typed SSA leaf therefore refused Add as an unavailable operand. Boolean zero-extension now follows the declared integer domain. A fifth regression executes leaf Add/Sub/Mul on all four bool pairs with exact int64 outputs. All five focused tests pass; the earlier four-test receipt above describes the first checkpoint.
+

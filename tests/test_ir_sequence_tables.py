@@ -1026,6 +1026,51 @@ def test_sequence_append_slice_normalizes_bounds_and_copies_between_arenas():
     assert "capacity_exhausted" in function.blocks
 
 
+def test_dynamic_sequence_append_slice_reserves_clipped_result_before_copy():
+    destination = SSASequenceDescriptor(
+        sequence_id=23,
+        column_value_ids=(230,),
+        length_address_id=231,
+        capacity_value_id=232,
+        status_address_id=233,
+        column_dtypes=("int64",),
+        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
+        heap_owner_value_id=234,
+    )
+    source = SSASequenceDescriptor(
+        sequence_id=24,
+        column_value_ids=(240,),
+        length_address_id=241,
+        capacity_value_id=242,
+        status_address_id=243,
+        column_dtypes=("int64",),
+        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
+        heap_owner_value_id=244,
+        writable=False,
+    )
+
+    lowering = lower_sequence_append_slice(
+        destination, source, function_name="dynamic_slice_copy",
+    )
+
+    assert lowering.complete, lowering.shortfalls
+    function, reserve = lowering.functions
+    assert function.metadata["ssa_sequence_operation"] == "append_slice"
+    assert reserve.metadata["ssa_sequence_operation"] == "reserve"
+    calls = [
+        instruction for block in function.blocks.values()
+        for instruction in block.instrs if instruction.op == "Call"
+    ]
+    assert [call.attributes.get("callee") for call in calls] == [reserve.name]
+    assert "append_slice_reserve" in function.blocks
+    assert "capacity_exhausted" in function.blocks
+    assert not any(
+        instruction.attributes.get("failure") == "fixed_capacity_exhausted"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+
 def test_sequence_pack_bits_is_nested_iterative_memory_ssa():
     destination = _sequence(15, 150)
     source = SSASequenceDescriptor(
@@ -1713,6 +1758,259 @@ def test_retained_field_sequence_populates_typed_record_from_lowered_storage():
     assert emitted.api.metadata["record_tables"]["planned_control"] == [
         record.to_mapping()
     ]
+
+
+def test_declared_array_receiver_refines_raw_span_before_method_linking():
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c624_array_receiver_relay.py"
+    ).read_text(encoding="utf-8")
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="array_receiver_relay",
+        extraction_contract=contract,
+        progress=lambda _message: None, progress_bars=False,
+    )
+
+    inspect_name = next(
+        name for name in module.record_tables
+        if "__inspect__" in name
+    )
+    table = module.record_tables[inspect_name]
+    (record,) = tuple(table.records.values())
+    history = module.metadata["identity_book"].page(
+        "record_descriptor"
+    ).history((table.owner, int(record.record_id)))
+    field_history = [
+        field
+        for _column, descriptor in history
+        for field in descriptor.fields
+        if field.storage_identity == "Vocabulary.exact_begin"
+    ]
+    assert all(field.storage is SSARecordFieldStorage.SEQUENCE
+               for field in field_history)
+    assert len({field.sequence_id for field in field_history}) == 1
+    sequence = module.sequence_tables[inspect_name].by_id(
+        int(field_history[-1].sequence_id)
+    )
+    assert field_history[0].value_ids == field_history[-1].value_ids
+    assert sequence.column_value_ids[0] in field_history[0].value_ids
+    assert sequence.column_dtypes == ("uint64",)
+
+
+def test_empty_dict_constructor_keeps_accepted_receiver_table_roles():
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c625_dict_constructor_forwarding.py"
+    ).read_text(encoding="utf-8-sig")
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="dict_constructor_forwarding",
+        extraction_contract=contract,
+        progress=lambda _message: None, progress_bars=False,
+    )
+
+    receiver_views = {}
+    for symbol, table in module.record_tables.items():
+        fields = (
+            field for record in table.records.values()
+            for field in record.fields
+            if field.storage_identity == "Index._candidates"
+        )
+        for field in fields:
+            sequence = module.sequence_tables[symbol].by_id(
+                int(field.sequence_id)
+            )
+            assert field.storage is SSARecordFieldStorage.SEQUENCE
+            assert sequence is not None
+            assert sequence.key_columns == (0, 1, 2, 3)
+            assert len(sequence.column_value_ids) == 5
+            assert sequence.child_table_pool is not None
+            assert sequence.child_table_pool.handle_column == 4
+            assert sequence.child_table_pool.key_columns == ()
+            assert len(sequence.child_table_pool.column_value_ids) == 1
+            assert sequence.child_table_pool.live_flags_value_id is None
+            assert set(field.value_ids) == {
+                *sequence.column_value_ids,
+                sequence.length_address_id,
+                sequence.capacity_value_id,
+                sequence.status_address_id,
+                *sequence.child_table_pool.column_value_ids,
+                sequence.child_table_pool.length_value_id,
+                sequence.child_table_pool.capacity_value_id,
+                sequence.child_table_pool.row_stride_value_id,
+                sequence.child_table_pool.status_value_id,
+                *((sequence.child_table_pool.live_flags_value_id,)
+                  if sequence.child_table_pool.live_flags_value_id is not None else ()),
+            }
+            receiver_views[symbol] = sequence
+
+    constructor = next(
+        symbol for symbol in receiver_views if symbol.endswith("____init__")
+    )
+    assert any(symbol.endswith("__root") for symbol in receiver_views)
+    assert any("__batch__" in symbol for symbol in receiver_views)
+    sequence = receiver_views[constructor]
+    history = module.metadata["identity_book"].page(
+        "sequence_descriptor"
+    ).history((module.sequence_tables[constructor].owner, sequence.sequence_id))
+    generic = history[0][1]
+    assert generic.column_value_ids[0] == sequence.column_value_ids[0]
+    (value_role,) = tuple(
+        set(range(len(sequence.column_value_ids))) - set(sequence.key_columns)
+    )
+    (generic_value_role,) = tuple(
+        set(range(len(generic.column_value_ids))) - set(generic.key_columns)
+    )
+    assert generic_value_role == generic.child_table_pool.handle_column
+    assert generic.column_value_ids[generic_value_role] == sequence.column_value_ids[value_role]
+    assert not any(
+        instruction.attributes.get("binding")
+        == "scalar_record_field_assignment"
+        for block in module.functions[constructor].blocks.values()
+        for instruction in block.instrs
+    )
+
+
+def test_guarded_array_lengths_and_append_keep_one_resident_sequence():
+    from src.compiler.identity_concordance import concordance_report
+
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c632_guarded_record_length.py"
+    ).read_text(encoding="utf-8")
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="guarded_array_lengths",
+        extraction_contract=(Path(__file__).resolve().parents[1]
+                             / "extraction_contracts" / "program_extraction.yaml"),
+        progress=lambda _message: None, progress_bars=False,
+    )
+    function = next(function for function in module.functions.values()
+                    if "__add__specialized" in function.name
+                    and "__planned_region_" not in function.name
+                    and "__ssa_sequence_" not in function.name)
+    instructions = [instruction for block in function.blocks.values()
+                    for instruction in block.instrs]
+    lengths = [instruction for instruction in instructions
+               if instruction.attributes.get("binding") == "ssa_sequence_length_value"]
+    assert len(lengths) == 3
+    addresses = {instruction.res.id: instruction.args[0].id
+                 for instruction in instructions
+                 if instruction.attributes.get("binding") == "ssa_sequence_length_address"}
+    assert len({addresses[instruction.args[0].id] for instruction in lengths}) == 1
+    append = next(instruction for instruction in instructions
+                  if instruction.attributes.get("ssa_sequence_operation") == "append")
+    assert append.args[-1].dtype == "uint8"
+    assert any(instruction.op == "Cast" and instruction.res.dtype == "uint8"
+               and instruction.attributes.get("binding") == "ssa_sequence_uint8_range"
+               for instruction in instructions)
+    report = concordance_report(module)
+    assert "0 finding(s)" in report, report
+
+
+def test_readonly_forwarding_keeps_typed_mutable_sequence_owner():
+    from dataclasses import replace
+
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c628_dict_readonly_forwarding.py"
+    ).read_text(encoding="utf-8")
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="dict_readonly_forwarding",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts" / "program_extraction.yaml"
+        ),
+        progress=lambda _message: None, progress_bars=False,
+    )
+    batch = next(name for name in module.functions if "__batch__" in name)
+    field = next(
+        field for record in module.record_tables[batch].records.values()
+        for field in record.fields
+        if field.storage_identity == "Index._candidates"
+    )
+    table = module.sequence_tables[batch]
+    owner = table.by_id(field.sequence_id)
+    assert owner.column_dtypes == ("int64",) * 4 + ("unknown",)
+    assert owner.writable
+    assert owner.status_address_id is not None
+    assert owner.child_table_pool is not None
+    history = module.metadata["identity_book"].page(
+        "sequence_descriptor"
+    ).history((table.owner, owner.sequence_id))
+    original = history[0][1]
+    assert original.column_dtypes == (
+        "unknown", "int64", "unknown", "unknown", "unknown",
+    )
+    assert replace(original, column_dtypes=owner.column_dtypes) == owner
+    relay = next(name for name in module.functions if "__relay__" in name)
+    forwarded_field = next(
+        field for record in module.record_tables[relay].records.values()
+        for field in record.fields
+        if field.storage_identity == "Index._candidates"
+    )
+    forwarded = module.sequence_tables[relay].by_id(
+        forwarded_field.sequence_id
+    )
+    assert forwarded.column_dtypes == owner.column_dtypes
+    assert not forwarded.writable
+    assert forwarded.status_address_id is None
+
+
+def test_array_u32_receiver_column_keeps_authored_dtype_before_append():
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c626_array_u32_append.py"
+    ).read_text(encoding="utf-8")
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts" / "program_extraction.yaml"
+    )
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="array_u32_append",
+        extraction_contract=contract,
+        progress=lambda _message: None, progress_bars=False,
+    )
+    put_name = next(
+        name for name in module.functions
+        if "__put__" in name and "planned_region" not in name
+    )
+    table = module.record_tables[put_name]
+    field = next(
+        field for record in table.records.values()
+        for field in record.fields
+        if field.storage_identity == "Vocabulary.exact_atoms"
+    )
+    sequence = module.sequence_tables[put_name].by_id(field.sequence_id)
+    assert sequence.column_dtypes == ("uint32",)
+    column = next(
+        value for value in module.functions[put_name].args
+        if value.id == sequence.column_value_ids[0]
+    )
+    assert column.dtype == "uint32"
+    checked_write = [
+        instruction.attributes
+        for block in module.functions[put_name].blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get("binding")
+        == "ssa_sequence_uint32_range"
+    ]
+    assert any(item.get("callee") == "turing_validation_error"
+               for item in checked_write)
+    assert any(item.get("target_dtype") == "uint32"
+               for item in checked_write)
+    llvm = emit_ssa_function_to_llvm(
+        module, put_name, entry_name="array_u32_append_probe",
+    )
+    assert llvm.shortfalls == ()
+    assert llvm.buffer_element_dtypes[llvm.buffer_order.index(column.id)] == "uint32"
+    assert "trunc i64" in llvm.llvm_ir
 
 
 def test_static_program_reference_is_typed_ssa_and_native_handle_storage():

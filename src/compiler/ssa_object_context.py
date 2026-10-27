@@ -274,6 +274,46 @@ def source_native_type_tests(graph):
     identity_page = book.page("source_python_identity_concordance")
     tests = {}
 
+    def loop_element_class_evidence(subject_value_id):
+        """Read the exact callsite member-class receipt on a loop binding."""
+
+        for loop_node_id, loop_data in graph.nodes(data=True):
+            attributes = loop_data.get("attributes") or {}
+            if str(attributes.get("source_type") or "") != "For":
+                continue
+            target_ids = tuple(map(int, dict(
+                attributes.get("loop_target_bindings") or {}
+            ).values()))
+            for target_id in target_ids:
+                target = graph.nodes.get(int(target_id), {})
+                target_value_id = int(target.get("value_id", target_id))
+                target_attributes = target.get("attributes") or {}
+                fact = target_attributes.get(
+                    "callsite_iterable_element_class_fact"
+                )
+                cells = tuple(target_attributes.get(
+                    "callsite_iterable_element_class_cells", ()
+                ))
+                if (
+                    target_value_id == int(subject_value_id)
+                    and isinstance(fact, tuple)
+                    and len(fact) >= 3
+                    and cells
+                ):
+                    return fact, cells
+        return None
+
+    def with_loop_element_class(receipt, subject_value_id):
+        evidence = loop_element_class_evidence(subject_value_id)
+        if evidence is None:
+            return receipt
+        fact, cells = evidence
+        return {
+            **receipt,
+            "subject_callsite_iterable_element_class_fact": fact,
+            "subject_callsite_iterable_element_class_cells": cells,
+        }
+
     def authored_class_target(target_node_id):
         """Resolve a same-source class input through its declaration cell."""
 
@@ -376,7 +416,7 @@ def source_native_type_tests(graph):
             ]
             if dynamic_target is not None and len(operands) == 1:
                 value_id = int(data.get("value_id", node_id))
-                tests[value_id] = {
+                tests[value_id] = with_loop_element_class({
                     "source_value_id": value_id,
                     "subject_value_id": operands[0],
                     **dynamic_target,
@@ -385,7 +425,7 @@ def source_native_type_tests(graph):
                         SOURCE_PYTHON_IDENTITY, tuple(identity_row),
                     ),
                     "predicate_kind": "dynamic_subtype",
-                }
+                }, operands[0])
                 continue
             authored_target = (
                 authored_class_target(target_nodes[0])
@@ -394,7 +434,7 @@ def source_native_type_tests(graph):
             if authored_target is not None and len(operands) == 1:
                 accepted, declaration_cell = authored_target
                 value_id = int(data.get("value_id", node_id))
-                tests[value_id] = {
+                tests[value_id] = with_loop_element_class({
                     "source_value_id": value_id,
                     "subject_value_id": operands[0],
                     "accepted_types": canonical_python_subtype_identities(
@@ -406,7 +446,7 @@ def source_native_type_tests(graph):
                     ),
                     "target_definition_cell": declaration_cell,
                     "predicate_kind": "subtype",
-                }
+                }, operands[0])
             continue
         definition_page = book.pages.get(target_cell.page.name)
         if definition_page is None:
@@ -428,7 +468,7 @@ def source_native_type_tests(graph):
         if len(operands) != 1:
             continue
         value_id = int(data.get("value_id", node_id))
-        tests[value_id] = {
+        tests[value_id] = with_loop_element_class({
             "source_value_id": value_id,
             "subject_value_id": operands[0],
             "accepted_types": canonical_python_subtype_identities(
@@ -440,7 +480,7 @@ def source_native_type_tests(graph):
             ),
             "target_definition_cell": target_cell,
             "predicate_kind": "subtype",
-        }
+        }, operands[0])
 
     # Exact ``type(value) is T`` uses the StaticReference use edge of T.  The
     # target's spelling is not consulted: the definition cell is the same
