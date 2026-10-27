@@ -1287,6 +1287,7 @@ def test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table():
     module, shortfalls, _outputs = lower_control_sections_to_ssa(
         program,
         identity_table={"items": (10,), "value": (11,)},
+        value_dtypes={11: "int64"},
     )
 
     assert shortfalls == ()
@@ -1433,6 +1434,7 @@ def test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it():
     add_module, add_shortfalls, _ = lower_control_sections_to_ssa(
         add_program,
         identity_table={"seen": (20,), "value": (21,)},
+        value_dtypes={21: "int64"},
     )
     assert add_shortfalls == ()
     add_helper = next(function for function in add_module.functions.values()
@@ -1451,6 +1453,7 @@ def test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it():
     extend_module, extend_shortfalls, _ = lower_control_sections_to_ssa(
         extend_program,
         identity_table={"seen": (30,), "incoming": (31,)},
+        sequence_column_dtypes={30: ("int64",), 31: ("int64",)},
     )
     assert extend_shortfalls == ()
     insert = next(function for function in extend_module.functions.values()
@@ -1728,6 +1731,7 @@ def test_retained_field_sequence_populates_typed_record_from_lowered_storage():
     module, shortfalls, _ = lower_control_sections_to_ssa(
         program,
         identity_table={"self": (5,), "self.items": (10,), "value": (11,)},
+        value_dtypes={11: "int64"},
         self_value_id=5,
         field_ops=(("read", 10, 0),),
         field_count=1,
