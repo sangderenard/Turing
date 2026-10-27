@@ -164,12 +164,19 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 and recorded[0] not in {None, '', 'unknown'}
                 and complete_shape
             )
-            ledger.propose((function.name, int(value.id)),
-                'physical_storage' if physical else 'provisional',
-                ('initial', recorded), after=recorded,
-                sources=_value_cells((function, value)))
-            _publish_type(function, value, recorded,
-                          ledger.decision_cell((function.name, int(value.id))))
+            identity = (function.name, int(value.id))
+            sources = _value_cells((function, value))
+
+            ledger.propose(
+                identity,
+                'provisional',
+                ('existing_concordance_state', recorded),
+                after=recorded,
+                sources=sources,
+            )
+
+            # Do not republish the resident state here.
+            # It is already the concordance-backed state of this value.
 
     capture_planning_cells = {}
     # The posted storage/rank/arena of each identity's accepted callee-output
