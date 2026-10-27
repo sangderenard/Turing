@@ -3870,6 +3870,21 @@ def _require_native_root_semantics(module: Any, entrypoint: str) -> Any:
             f"values as public inputs {unexplained_arguments}; "
             f"source execution receipts={details!r}"
         )
+    from .identity_concordance import ConcordanceRefusal, CorrelationTable
+    from .structural_concordance import publish_module_structures
+
+    if module.metadata.get("identity_book") is None:
+        raise ConcordanceRefusal("native product lacks its owning concordance book")
+    publish_module_structures(module)
+    findings = tuple(CorrelationTable.build(module).findings(module))
+    if findings:
+        raise ConcordanceRefusal(
+            f"native product concordance refused {len(findings)} finding(s):\n"
+            + "\n".join(
+                f"{finding.function} value {finding.value_id}: {finding.detail}"
+                for finding in findings
+            )
+        )
     return root_function
 
 

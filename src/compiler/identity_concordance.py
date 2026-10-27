@@ -2645,6 +2645,37 @@ class CorrelationTable:
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         pages = getattr(book, "pages", {}) or {}
         found: list[Finding] = []
+        if book is not None:
+            from .ssa_record_return_state import accepted_ssa_component
+
+            owned = []
+            for attribute, rows_attribute in (
+                ("sequence_tables", "sequences"),
+                ("record_tables", "records"),
+                ("value_union_tables", "unions"),
+            ):
+                for name, table in (getattr(module, attribute, {}) or {}).items():
+                    function = module.functions.get(name)
+                    expected = book
+                    if function is not None and accepted_ssa_component(function):
+                        expected = function.metadata["accepted_ssa_component"]["identity_book"]
+                    if getattr(table, rows_attribute, {}):
+                        owned.append((str(name), attribute, table, expected))
+            for attribute, rows_attribute in (
+                ("struct_table", "_rows"), ("union_table", "_rows"),
+                ("call_table", None),
+            ):
+                table = getattr(module, attribute, None)
+                rows = table if rows_attribute is None else getattr(table, rows_attribute, {})
+                if rows:
+                    owned.append(("<module>", attribute, table, book))
+            for name, attribute, table, expected in owned:
+                if getattr(table, "book", None) is not expected:
+                    found.append(Finding(
+                        "concordance-table-owner-disagreement", name, None,
+                        f"{attribute} owner {getattr(table, 'owner', None)!r} "
+                        "is a view of a different identity book than its owning module/component",
+                    ))
         for descriptor_page, member_page, claims_of in (
             ("record_descriptor", "record_member", record_member_claims),
             ("sequence_descriptor", "sequence_member", sequence_member_roles),
