@@ -4722,14 +4722,10 @@ class _FunctionEmitter:
             and instr.args
         ):
             # Program: ``def f(y): return y.max(axis=0)`` with y (2, 3).
-            # Wrong reading: ``maxval(t0, dim=1)``. A rank-2 dummy is
-            # declared ``t0(2, 3)`` over row-major memory, so its logical
-            # t0(i, j) is not y[i-1][j-1] and DIM=1 reduced the wrong
-            # elements. Rule: view the memory with reversed extents
-            # (``reshape`` reads storage order), where Python axis k is
-            # DIM=rank-k and the reduced array's storage is the kept lanes
-            # row-major; max/min take numpy's rule (a NaN in the lane is
-            # its result), which MAXVAL alone skips.
+            # Rule: the DIM= form of the intrinsic over the same logical
+            # indices (t0(i, j) is y[i-1][j-1]), one result per kept lane;
+            # max/min take numpy's rule (a NaN in the lane is its result),
+            # which MAXVAL alone skips.
             shape = tuple(instr.args[0].shape or ())
             if (
                 not isinstance(axis, int) or not shape
@@ -4744,10 +4740,7 @@ class _FunctionEmitter:
             ):
                 return None
             source = self._numeric(instr, args[:1])[0]
-            dim = len(shape) - axis
-            if len(shape) > 1:
-                reversed_extents = ", ".join(str(int(size)) for size in reversed(shape))
-                source = f"reshape({source}, [{reversed_extents}])"
+            dim = axis + 1
             if op in ("max", "min"):
                 reduced = (
                     f"{'maxval' if op == 'max' else 'minval'}({source}, dim={dim})"
@@ -4764,9 +4757,6 @@ class _FunctionEmitter:
                 )
             else:
                 reduced = f"{'product' if op == 'prod' else 'sum'}({source}, dim={dim})"
-            if len(kept) > 1:
-                # Storage order out, as in: the kept lanes row-major.
-                reduced = f"reshape({reduced}, [{', '.join(str(int(size)) for size in kept)}])"
             return reduced
         if (
             op in ("max", "min")
