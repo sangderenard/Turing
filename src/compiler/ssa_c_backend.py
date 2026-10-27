@@ -885,6 +885,22 @@ def _c_numeric_literal(value: bool | int | float, c_type: str) -> str:
                else dtype_layout(c_lane_dtype_for_storage(c_type)))
     if integer.kind in {"int", "uint", "bool"}:
         numeric = int(value)
+        if integer.byte_size == 16:
+            # C has no 128-bit literal suffix. Build the exact internal
+            # value from two uint64 limbs before converting its signedness.
+            width = 8 * integer.byte_size
+            lower = 0 if integer.kind == "uint" else -(1 << (width - 1))
+            upper = (1 << width) - 1 if integer.kind == "uint" else (1 << (width - 1)) - 1
+            if not lower <= numeric <= upper:
+                raise ValueError(f"constant {numeric} is outside {integer.name}")
+            magnitude = numeric if numeric >= 0 else -numeric - 1
+            unsigned = _unsigned_c_type(integer.name)
+            limbs = (
+                f"((({unsigned}){magnitude >> 64}ULL << 64) | "
+                f"({unsigned}){magnitude & ((1 << 64) - 1)}ULL)"
+            )
+            return (f"(({c_type})({limbs}))" if numeric >= 0 else
+                    f"(-(({c_type})({limbs})) - 1)")
         if integer.kind == "uint":
             return f"{numeric}ULL"
         if numeric == -(1 << 63):
@@ -908,6 +924,14 @@ def _numpy_dtype(dtype) -> str:
     if str(dtype).casefold() in {"ptr", "ptrptr_float64"}:
         return "uintp"
     return c_lane_numpy_dtype(dtype)
+
+
+def _public_buffer_dtype(dtype: str) -> str:
+    """Internal integer registers are not a NumPy/ProgramABI buffer ABI."""
+    layout = resolve_dtype(dtype)
+    if layout is not None and layout.kind in {"int", "uint"} and layout.numpy_dtype is None:
+        raise ValueError(f"internal dtype {layout.name!r} has no public C buffer ABI")
+    return dtype
 
 
 def _dtype_for_c_storage(c_type: str) -> str:
@@ -2531,9 +2555,48 @@ def emit_ssa_module_to_c(
             and instruction.res is not None
         }
 
+        aggregate_constant_types: dict[int, str] = {}
+        constant_uses: dict[int, list[tuple]] = {}
+        for block in function.blocks.values():
+            for consumer in block.instrs:
+                for position, argument in enumerate(consumer.args):
+                    constant_uses.setdefault(int(argument.id), []).append((consumer, position))
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                result = instruction.res
+                payload = instruction.attributes.get("value")
+                if (instruction.op != "Const" or result is None
+                        or str(result.dtype) != "ssa.aggregate"
+                        or not isinstance(payload, (tuple, list))):
+                    continue
+                uses = constant_uses.get(int(result.id), ())
+                if not uses or not all(
+                    consumer.op in {"GetElementPtr", "getelementptr"} and position == 0
+                    for consumer, position in uses
+                ):
+                    continue
+                try:
+                    members = _flatten_numeric_aggregate(payload)
+                except TypeError:
+                    continue
+                kinds = {"bool" if type(item) is bool
+                         else "int64" if type(item) is int
+                         else "float64" if type(item) is float else None
+                         for item in members}
+                dtype = (next(iter(kinds)) if len(kinds) == 1 else
+                         "int64" if kinds == {"bool", "int64"} else None)
+                if dtype is not None:
+                    # A specialized iterable Const is a structural handle,
+                    # not an array of void pointers. Its exact numeric payload
+                    # owns the element type, as in the LLVM Const path. Keep
+                    # this view for both initialization and GEP stride.
+                    aggregate_constant_types[int(result.id)] = _buffer_c_type(dtype)
+
         def buffer_type(value) -> str:
             if int(value.id) in token_value_ids:
                 return "int64_t"
+            if int(value.id) in aggregate_constant_types:
+                return aggregate_constant_types[int(value.id)]
             return solved_buffer_type(fn, value)
 
         def carried_type(value) -> str:
@@ -3934,6 +3997,7 @@ def emit_ssa_module_to_c(
                             len(flattened) == 1
                             and _declared_span_rank(instruction.res) == 0
                             and not tuple(instruction.res.shape or ())
+                            and result_id not in aggregate_constant_types
                         ):
                             # Frontend index construction often preserves a
                             # one-limb tuple payload after shape specialization.
@@ -3943,6 +4007,12 @@ def emit_ssa_module_to_c(
                             held = flattened[0]
                         else:
                             element_type = buffer_type(instruction.res)
+                            if element_type.rstrip().endswith("*"):
+                                shortfalls.append(CEmissionShortfall(
+                                    op, "numeric aggregate has no exact scalar "
+                                    f"element storage contract in {fn}",
+                                ))
+                                continue
                             # ISO C has no zero-length arrays.  An empty authored
                             # aggregate has no legal element load, so one inert
                             # backing limb preserves every observable operation.
@@ -6570,7 +6640,7 @@ def emit_ssa_module_to_c(
             requirement.shape if requirement is not None else formal.shape or ()
         ))
         held = solved_buffer_type(function_name, formal)
-        buffer_dtypes.append(solved_buffer_dtype(function_name, formal, held))
+        buffer_dtypes.append(_public_buffer_dtype(solved_buffer_dtype(function_name, formal, held)))
         index = len(buffer_order) - 1
         entry_lines.append(
             f"    {held} *b{index} = "
@@ -6633,7 +6703,7 @@ def emit_ssa_module_to_c(
             if output_id in storage_requirements else output.shape or ()
         ))
         element_type = solved_buffer_type(function_name, output)
-        buffer_dtypes.append(solved_buffer_dtype(function_name, output, element_type))
+        buffer_dtypes.append(_public_buffer_dtype(solved_buffer_dtype(function_name, output, element_type)))
         index = len(buffer_order) - 1
         entry_lines.append(
             f"    {element_type} *b{index} = "

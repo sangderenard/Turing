@@ -21,6 +21,43 @@ from ..transmogrifier.ssa import Instr, SSAValue
 _NUMERIC_DTYPES = {'bool', 'int32', 'int64', 'float32', 'float64'}
 
 
+def _publish_converted_frame_binding(call_records, caller, callee, instruction,
+                                     formal, actual, converted, conversion_cell):
+    """The native frame is a converted view of the source argument edge."""
+    if not instruction.attributes.get('source_linked') or instruction.attributes.get('plan_callsite_id') is None:
+        return
+    from dataclasses import replace
+    from .identity_concordance import ConcordanceRefusal
+    book = current_identity_book()
+    if call_records is None or call_records.book is not book:
+        raise ConcordanceRefusal('source call conversion lacks its authoritative call table')
+    records = tuple(call_records.get(str(caller.name), ()))
+    matches = tuple((index, record) for index, record in enumerate(records)
+                    if record.callsite_id == instruction.attributes['plan_callsite_id']
+                    and str(record.callee_symbol) == str(callee.name)
+                    and record.resolution == 'native_call')
+    if len(matches) != 1:
+        raise ConcordanceRefusal('source call conversion lacks one exact native activation')
+    index, record = matches[0]
+    old = tuple((kind, source) for value_id, kind, source in record.frame_bindings
+                if int(value_id) == int(formal.id))
+    if (len(old) != 1 or old[0][0] not in {'caller_value', 'caller_storage', 'caller_alias'}
+            or int(old[0][1]) != int(actual.id)):
+        raise ConcordanceRefusal('source call conversion disagrees with its current physical frame')
+    bindings = tuple((value_id, 'caller_value', int(converted.id))
+                     if int(value_id) == int(formal.id) else (value_id, kind, source)
+                     for value_id, kind, source in record.frame_bindings)
+    revised = list(records)
+    revised[index] = replace(record, frame_bindings=bindings)
+    # The semantic PlanCall argument stays original. The existing Cast and
+    # conversion receipt own this exact activation's physical argument, so
+    # later frame projection cannot restore the old bool over its int64 view.
+    call_records.assign(str(caller.name), tuple(revised),
+                        sources=(record.cell, conversion_cell,
+                                 ssa_value_identity_cell(caller, converted.id)),
+                        stage=PHYSICAL_CALL_INPUT_ADAPTATION)
+
+
 def call_input_rank_updates(callee, actual, formal, *, by_value_kernel_formal=False):
     """Rank updates for one already-bound call edge; the caller posts changes."""
     # N4 advance_pieces region111 converts scalar int64 zero to double for
@@ -953,6 +990,7 @@ def _read_only_feed(
 def _adapt_physical_call_inputs_round(
     functions, *, progress=None, round_index=0,
     defer_unsettled_region_call_results=False,
+    call_records=None,
 ) -> int:
     """Perform one ordered physical-call adaptation round.
 
@@ -1360,13 +1398,19 @@ def _adapt_physical_call_inputs_round(
                             str(caller.name), int(actual.id),
                             str(callee.name), int(formal.id),
                         )
-                        current_identity_book().post(CALL_INPUT_CONVERSION, row, (
+                        conversion_fact = (
                             int(converted.id), str(source_dtype),
                             str(target_dtype), conversion['kind'],
-                        ), stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                        )
+                        if instruction.attributes.get('source_linked') and instruction.attributes.get('plan_callsite_id') is not None:
+                            conversion_fact += (int(instruction.attributes['plan_callsite_id']), str(block_name))
+                        conversion_cell = current_identity_book().post(CALL_INPUT_CONVERSION, row, conversion_fact,
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION,
                             provenance=Derived(identity_cells(caller, actual, converted,
                                 ssa_value_identity_cell(callee, formal.id))),
                             mode=Mode.REVISE)
+                        _publish_converted_frame_binding(call_records, caller, callee, instruction,
+                                                         formal, actual, converted, conversion_cell)
                         count += 1
                 publication = None
                 output_position = instruction.attributes.get('ssa_output_argument')
@@ -1494,6 +1538,7 @@ def _adaptation_state_signature(functions):
 def adapt_physical_call_inputs(
     functions, *, progress=None,
     defer_unsettled_region_call_results=False,
+    call_records=None,
 ) -> int:
     """Converge physical call-edge contracts and record every adaptation.
 
@@ -1575,6 +1620,7 @@ def adapt_physical_call_inputs(
             defer_unsettled_region_call_results=(
                 defer_unsettled_region_call_results
             ),
+            call_records=call_records,
         )
         book.post(PHYSICAL_CALL_INPUT_ADAPTATION_ROUND, (round_scope, round_index),
                   int(changed), stage=PHYSICAL_CALL_INPUT_ADAPTATION,

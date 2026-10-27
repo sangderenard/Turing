@@ -1165,6 +1165,24 @@ class ExtractionContract:
         self._source_availability: dict[
             tuple[int, str, str, str], tuple[Any, bool]
         ] = {}
+        # The project worker receives a sheet path, not the audit's in-memory
+        # with_sources object. Preserve those same exact module/path admissions
+        # when Token Orchard's authored entry crosses that fresh-process seam.
+        sources = raw.get("sources", ())
+        if not isinstance(sources, (list, tuple)):
+            raise ExtractionContractError("sources must be a list")
+        if sources:
+            resolved_sources = []
+            for entry in sources:
+                if not isinstance(entry, Mapping):
+                    raise ExtractionContractError("each declared source must be a name/path mapping")
+                path = entry.get("path")
+                if path is not None:
+                    path = Path(str(path))
+                    if not path.is_absolute():
+                        path = self.path.parent / path
+                resolved_sources.append({"name": entry.get("name"), "path": path})
+            self._declare_sources(resolved_sources)
 
     def with_program_abi(
         self, program_abi: ProgramABIContract | Mapping[str, Any],
@@ -1227,6 +1245,12 @@ class ExtractionContract:
         """
 
         derived = self._derive()
+        derived.fingerprint = self.fingerprint
+        derived._declare_sources(sources)
+        return derived
+
+    def _declare_sources(self, sources) -> None:
+        """Normalize and fingerprint the incumbent exact source admission."""
         declared = dict(self.declared_sources)
         for entry in sources:
             if isinstance(entry, Mapping):
@@ -1249,14 +1273,13 @@ class ExtractionContract:
                     f"{previous!r} and {str(name)!r}"
                 )
             declared[resolved] = str(name)
-        derived.declared_sources = declared
+        self.declared_sources = declared
         receipt = json.dumps(
-            derived.sources_receipt(), sort_keys=True, separators=(",", ":"),
+            self.sources_receipt(), sort_keys=True, separators=(",", ":"),
         )
-        derived.fingerprint = hashlib.sha256(
+        self.fingerprint = hashlib.sha256(
             f"{self.fingerprint}:sources:{receipt}".encode("utf-8")
         ).hexdigest()
-        return derived
 
     def sources_receipt(self) -> list[dict[str, str]]:
         """The foreign source files this contract admits, by name and path."""

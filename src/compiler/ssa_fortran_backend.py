@@ -846,11 +846,20 @@ def _literal(value: Any, dtype: str | None = None) -> str:
     the value.
     """
     layout = resolve_dtype_layout(dtype) if dtype else None
+    if (layout is not None and layout.kind == "int"
+            and isinstance(value, int) and not isinstance(value, bool)):
+        width = 8 * layout.byte_size
+        if not -(1 << (width - 1)) <= value < (1 << (width - 1)):
+            raise FortranEmissionError(f"constant {value} is outside {layout.name}")
+        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")").removeprefix("kind=")
+        if value == -(1 << (width - 1)):
+            return f"(-huge(0_{kind}) - 1_{kind})"
+        return f"{value}_{kind}"
     if layout is not None and layout.kind == "uint" and isinstance(value, int) and not isinstance(value, bool):
         width = 8 * layout.byte_size
         if not 0 <= value < (1 << width):
             raise FortranEmissionError(f"constant {value} is outside {layout.name}")
-        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")")
+        kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")").removeprefix("kind=")
         return f"{value}u_{kind}"
     if (
         dtype
@@ -860,17 +869,6 @@ def _literal(value: Any, dtype: str | None = None) -> str:
         and str(_DTYPE_KIND.get(str(dtype), "")).startswith("real")
     ):
         value = float(value)
-    if (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and str(dtype) in {"int64", "i64", "opaque_ref"}
-    ):
-        if value == -(2**63):
-            # A literal is a negated positive constant in Fortran, and 2**63
-            # does not fit int64 (gfortran: "Integer too big for its kind";
-            # the integer formatting helpers carry this bound, c57).
-            return "(-huge(0_c_int64_t) - 1_c_int64_t)"
-        return f"{value}_c_int64_t"
     return _literal_payload(value)
 
 
@@ -1136,6 +1134,41 @@ class _FunctionEmitter:
         self._heap_elements: dict[int, str] = {}
         self._heap_owner_ids: set[int] = set()
         heap_occurrences: dict[int, SSAValue] = {}
+        # Returned/forwarded record pools retain their complete storage
+        # descriptor even when a formal occurrence has no resident heap
+        # labels. Read that same concordance view as the allocator: the
+        # validate_atom_span child cells are pointers, not REAL(8) scalars.
+        if sequence_table is not None:
+            from .structural_concordance import storage_structure
+            for descriptor in sequence_table.sequences.values():
+                structure, _cell = storage_structure(
+                    "sequence", sequence_table.owner, descriptor.sequence_id,
+                    book=sequence_table.book,
+                )
+                native = dict(structure.children).get("native_storage")
+                if descriptor.heap_owner_value_id is not None and (
+                    native is None or native.kind == "unresolved"
+                ):
+                    raise FortranEmissionError(
+                        "owned sequence lacks a resolved concordance native-storage view"
+                    )
+                if native is None:
+                    continue
+                for _member, member in native.children:
+                    value_id = int(member.value_id)
+                    if value_id not in self._value_types:
+                        continue
+                    if member.storage == "heap_owner":
+                        if value_id in self._heap_elements:
+                            raise FortranEmissionError("heap storage identity is both owner and cell")
+                        self._heap_owner_ids.add(value_id)
+                    elif member.storage == "heap_cell":
+                        if value_id in self._heap_owner_ids:
+                            raise FortranEmissionError("heap storage identity is both owner and cell")
+                        element = dict(member.children)["element"]
+                        prior = self._heap_elements.setdefault(value_id, str(element.dtype))
+                        if prior != element.dtype:
+                            raise FortranEmissionError("heap cell has conflicting descriptor element layouts")
         for value in (
             *function.args,
             *(
@@ -1150,12 +1183,17 @@ class _FunctionEmitter:
             if str(value.dtype or "").casefold() != "ptr":
                 continue
             if accounting.get("heap_owner"):
+                if int(value.id) in self._heap_elements:
+                    raise FortranEmissionError("heap owner occurrence disagrees with storage descriptor")
                 self._heap_owner_ids.add(int(value.id))
             elif accounting.get("heap_element_dtype") is not None:
-                self._heap_elements[int(value.id)] = str(
-                    accounting["heap_element_dtype"]
-                )
-            else:
+                if int(value.id) in self._heap_owner_ids:
+                    raise FortranEmissionError("heap cell occurrence disagrees with storage descriptor")
+                element = str(accounting["heap_element_dtype"])
+                prior = self._heap_elements.setdefault(int(value.id), element)
+                if prior != element:
+                    raise FortranEmissionError("heap cell occurrence disagrees with descriptor element layout")
+            elif int(value.id) not in self._heap_elements and int(value.id) not in self._heap_owner_ids:
                 continue
             heap_occurrences.setdefault(int(value.id), value)
         for value_id, occurrence in heap_occurrences.items():
@@ -1171,6 +1209,16 @@ class _FunctionEmitter:
         self._heap_views: set[int] = set(self._heap_elements)
         self._heap_indexed: set[int] = set()
         self.release_heap_owners = bool(release_heap_owners)
+        from .compiled_program_api import is_frame_workspace
+        source_parameter_names = {
+            int(value_id): str(name)
+            for name, value_id in self.function.metadata.get("parameter_names", ())
+        }
+        self._frame_heap_owner_ids = {
+            int(value.id) for value in self.function.args
+            if int(value.id) in self._heap_owner_ids
+            and is_frame_workspace(value, source_parameter_names.get(int(value.id)))
+        }
         self.outputs = tuple(self._typed(value) for value in self.outputs)
         self.dynamic_array_extents = {
             int(instr.args[0].id): (
@@ -1252,6 +1300,50 @@ class _FunctionEmitter:
                 )
             )
         }
+        # c639: setdefault's selected child column is a GEP view of one
+        # pool row. Its descriptor already names that row's capacity (the
+        # pool stride). Publishing a new extent for the local view leaked
+        # an unbindable helper dimension to the public caller. Preserve the
+        # descriptor's exact scalar extent at this signature writer instead.
+        self._local_sequence_extent_expressions: set[str] = set()
+        if sequence_table is not None:
+            address_results = {
+                int(instruction.res.id)
+                for block in self.function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in {"GetElementPtr", "getelementptr"}
+                and instruction.res is not None
+                and instruction.attributes.get("aggregate_index") is None
+            }
+            formal_ids = {int(argument.id) for argument in self.function.args}
+            capacity_by_column: dict[int, int] = {}
+            for descriptor in sequence_table.sequences.values():
+                capacity_id = int(descriptor.capacity_value_id)
+                capacity = self._value_types.get(capacity_id)
+                if (
+                    capacity is None or tuple(capacity.shape or ())
+                    or capacity_id not in formal_ids
+                ):
+                    continue
+                for column, row_shape in zip(
+                    descriptor.column_value_ids, descriptor.column_shapes,
+                ):
+                    column_id = int(column)
+                    if (
+                        column_id not in address_results or tuple(row_shape)
+                        or self.dynamic_array_ranks.get(column_id) != 1
+                    ):
+                        continue
+                    incumbent = capacity_by_column.setdefault(column_id, capacity_id)
+                    if incumbent != capacity_id:
+                        raise ValueError(
+                            f"sequence view {column_id} has conflicting capacity identities"
+                        )
+                    extent = f"int({_name(capacity)}, c_int)"
+                    self._local_sequence_extent_expressions.add(extent)
+                    self.dynamic_array_leading_extents[column_id] = (extent,)
+                    if column_id in self.dynamic_array_extents:
+                        self.dynamic_array_extents[column_id] = extent
         self._propagate_phi_dynamic_ranks()
         self.runtime_sized_ids = {
             int(value_id) for value_id, rank in dict(
@@ -1627,6 +1719,14 @@ class _FunctionEmitter:
                     )
                     for position in positions
                 )
+                if len(positions) == 1 and (
+                    collection.accounting or {}
+                ).get("heap_owner_value_id") is not None:
+                    # An owned child row is a GEP into a flat heap pointer
+                    # array. Fortran forbids scalar-element sequence
+                    # association for a pointer array actual; the exact tail
+                    # section retains its rank and aliases the same storage.
+                    return f"{self._indexed_base(collection)}({subscripts}:)"
                 return f"{self._indexed_base(collection)}({subscripts})"
         return self._operand(value)
 
@@ -2937,9 +3037,25 @@ class _FunctionEmitter:
                 )
                 if str(target_value.dtype or self.dtype) in _INTEGER_DTYPES:
                     source_expression = f"int({source_expression}, c_int64_t)"
-            prelude.append(
-                f"    {output_argument} = {source_expression}"
+            same_caller_array = (
+                int(source_value.id) == int(target_value.id)
+                and str(source_value.dtype) == str(target_value.dtype)
+                and tuple(source_value.shape or ()) == tuple(target_value.shape or ())
+                and (
+                    bool(source_value.shape)
+                    or int(self.dynamic_array_ranks.get(int(source_value.id), 0)) > 0
+                    or int(source_value.id) in self.array_base_ids
+                )
             )
+            # Both values above are caller actuals: one Call operand and one
+            # aggregate projection in this function's SSA namespace. When a
+            # returned list already is that exact inout arena, the binding
+            # needs no seed copy. Emitting t9=t9 invented a whole assignment
+            # to an assumed-size array before the real batch call.
+            if not same_caller_array:
+                prelude.append(
+                    f"    {output_argument} = {source_expression}"
+                )
             input_arguments[input_index] = output_argument
             aliased_output_indices.add(int(output_index))
         if any(
@@ -3032,9 +3148,12 @@ class _FunctionEmitter:
                 # the caller.  Treat the exact callee output operand as that
                 # local; dynamic-rank propagation has already copied the
                 # formal's array contract onto this identity.
-                self._locals[instr.res.id] = self._typed(
-                    instr.args[position]
-                )
+                # The exact frame output operand is the physical local.
+                # Keying it by the semantic Call result registered one value
+                # under two identities (Const6 plus result7 -> operand6), so
+                # an identity-returning method declared t6 twice.
+                output_value = self._typed(instr.args[position])
+                self._locals[int(output_value.id)] = output_value
             elif not aliases_frame:
                 self._locals[instr.res.id] = self._typed(instr.res)
         elif output_count == 1 and instr.res is not None:
@@ -4653,6 +4772,23 @@ class _FunctionEmitter:
                 args = conformed
             if op not in _LOGICAL_BINARY:
                 args = self._numeric(instr, args)
+            result_layout = resolve_dtype_layout(str(instr.res.dtype or self.dtype))
+            if (op in {"Add", "Sub", "Mul"} and result_layout is not None
+                    and result_layout.kind == "int"):
+                # Signed integer SSA uses the same fixed-width arithmetic
+                # at every catalogue width, as C/LLVM do. Plain signed
+                # Fortran overflow lets GNU fold ``MAX + runtime_one == MIN``
+                # to false.
+                # Perform the operation in the catalogue's matching unsigned
+                # domain, then convert the resulting bits to the signed kind.
+                unsigned_dtype = f"uint{8 * result_layout.byte_size}"
+                unsigned_args = [
+                    _native_integer_conversion(argument, unsigned_dtype)
+                    for argument in args
+                ]
+                return _native_integer_conversion(
+                    template.format(*unsigned_args), result_layout.name,
+                )
             rule = max_step_rule(instr)
             if rule is not None and is_max(op) is not None:
                 return fortran_step(rule, bool(is_max(op)), args[0], args[1])
@@ -4855,7 +4991,7 @@ class _FunctionEmitter:
                     body.extend(
                         f"    call turing_heap_release({_name(argument)})"
                         for argument in self.function.args
-                        if int(argument.id) in self._heap_owner_ids
+                        if int(argument.id) in self._frame_heap_owner_ids
                     )
                 body.append("    return")
                 continue
@@ -5099,6 +5235,48 @@ class _FunctionEmitter:
         # growth); an allocation result is pointed where it is made.
         for argument in self.function.args:
             body[:0] = self._heap_refresh(argument)
+        if self.release_heap_owners and self.sequence_table is not None:
+            # Prepared Fortran calls reuse their workspace buffers. Releasing
+            # a private frame resets its owner but leaves old capacities and
+            # pointer cells behind; the next activation then treats freed
+            # arenas as live storage. C/LLVM entry wrappers start these same
+            # descriptor members empty on every call. Use the descriptor and
+            # ABI workspace ownership here too; public contexts survive.
+            initializations = {}
+            for descriptor in self.sequence_table.sequences.values():
+                owner = descriptor.heap_owner_value_id
+                if owner not in self._frame_heap_owner_ids:
+                    continue
+                pointer_ids = {int(owner), *map(int, descriptor.column_value_ids)}
+                scalar_ids = {int(descriptor.length_address_id), int(descriptor.capacity_value_id)}
+                if descriptor.status_address_id is not None:
+                    scalar_ids.add(int(descriptor.status_address_id))
+                pool = descriptor.child_table_pool
+                if pool is not None:
+                    pointer_ids.update(map(int, pool.column_value_ids))
+                    pointer_ids.add(int(pool.length_value_id))
+                    if pool.status_value_id is not None:
+                        pointer_ids.add(int(pool.status_value_id))
+                    scalar_ids.update((int(pool.capacity_value_id), int(pool.row_stride_value_id)))
+                for value_id in pointer_ids & self._formal_value_ids:
+                    initializations[value_id] = f"    t{value_id} = c_null_ptr"
+                for value_id in scalar_ids & self._formal_value_ids:
+                    # A private list's length/status is one scalar CELL,
+                    # also when the interoperable dummy is assumed-size.
+                    # ``values=[]; ...; selected=values[:end]`` previously
+                    # assigned zero to the entire assumed-size formal and
+                    # gfortran correctly refused its absent upper bound.
+                    # Address the existing one-element physical cell, rather
+                    # than inventing a whole-array extent for initialization.
+                    value = self._value_types[value_id]
+                    shape = tuple(value.shape or ())
+                    target = f"t{value_id}"
+                    if shape:
+                        if _element_count(shape) != 1:
+                            raise FortranEmissionError("sequence scalar cell has a nonscalar physical extent")
+                        target += "(" + ", ".join("1" for _ in shape) + ")"
+                    initializations[value_id] = f"    {target} = 0"
+            body[:0] = list(initializations.values())
         call_frame_cells = {
             int(value.id)
             for block in self.function.blocks.values()
@@ -5227,7 +5405,7 @@ class _FunctionEmitter:
             )
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(extent))
         }
-        extent_names = sorted(
+        extent_names = sorted((
             set(dim_extents.values())
             | called_extent_names
             | set(self.dynamic_array_extents.values())
@@ -5236,7 +5414,7 @@ class _FunctionEmitter:
                 for extents in self.dynamic_array_leading_extents.values()
                 for extent in extents
             }
-        )
+        ) - self._local_sequence_extent_expressions)
         self.extent_names = tuple(extent_names)
         argument_ids = {argument.id for argument in self.function.args}
         output_ids = {value.id for value in self.outputs}
@@ -6164,6 +6342,20 @@ def emit_module(
             if function.metadata.get("control_ir")
         )
     roots.update(str(root) for root in extra_roots if str(root) in functions)
+    from .ssa_storage_requirements import is_compiler_owned_storage
+    for root_name in roots:
+        public_values = (
+            *(value for value in functions[root_name].args
+              if not is_compiler_owned_storage(value)),
+            *named_outputs.get(root_name, ()),
+        )
+        for value in public_values:
+            layout = resolve_dtype_layout(value.dtype)
+            if (layout is not None and layout.kind in {"int", "uint"}
+                    and layout.numpy_dtype is None):
+                raise FortranEmissionError(
+                    f"internal dtype {layout.name!r} has no public Fortran buffer ABI"
+                )
     if roots:
         reachable = set()
         pending = list(sorted(roots))
@@ -7320,6 +7512,12 @@ def emit_module(
     entry_points = []
     subroutine_by_name = {item.name: item for item in subroutines}
     for function_name, function in functions.items():
+        if function_name not in roots:
+            # Reachable Fortran procedures use the native Fortran signature
+            # catalogue above. Only the already selected exports cross the
+            # foreign/public ABI; internal i128 operands do not acquire a
+            # ctypes/NumPy representation merely because a helper is called.
+            continue
         kind = _kind(function_name)
         note = None
         if kind == "control":

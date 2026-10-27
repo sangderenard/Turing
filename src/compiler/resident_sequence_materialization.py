@@ -1367,6 +1367,13 @@ def _source_sequence_slices(graph_obj: Any):
         return value is None or (isinstance(value, int) and not isinstance(value, bool))
 
     mutations = []
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
+    nodes_by_value: dict[int, list[int]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        nodes_by_value.setdefault(
+            int(data.get("value_id", node_id)), [],
+        ).append(int(node_id))
+
     for node_id, data in graph_obj.nodes(data=True):
         attrs = data.get("attributes") or {}
         if (attrs.get("aggregate_kind") != "list"
@@ -1376,11 +1383,32 @@ def _source_sequence_slices(graph_obj: Any):
         source, selector = roles.get("base"), roles.get("index")
         if source is None or selector is None or source not in graph_obj or selector not in graph_obj:
             continue
-        if (graph_obj.nodes[source].get("attributes") or {}).get("aggregate_kind") != "list":
+        source_value_id = value_id(source)
+        storage_value_id = source_value_id
+        seen_storage_ids = set()
+        cyclic_storage_alias = False
+        while storage_value_id in storage_aliases:
+            if storage_value_id in seen_storage_ids:
+                cyclic_storage_alias = True
+                break
+            seen_storage_ids.add(storage_value_id)
+            storage_value_id = int(storage_aliases[storage_value_id])
+        if cyclic_storage_alias:
+            continue
+        storage_nodes = nodes_by_value.get(storage_value_id, ())
+        if len(storage_nodes) != 1:
+            continue
+        storage_node = graph_obj.nodes[storage_nodes[0]]
+        if (storage_node.get("attributes") or {}).get("aggregate_kind") != "list":
             continue
         selector_data = graph_obj.nodes[selector]
         folded, selector_literal = literal_of(selector)
-        arguments, spellings = [value_id(source)], []
+        # A slice after an in-place loop update can name an IndexedStore or
+        # LoopResult as its base.  The exact graph storage-alias chain maps
+        # that version to the resident sequence descriptor; use that identity
+        # for the slice operation so its row type and storage come from the
+        # same existing sequence contract.
+        arguments, spellings = [storage_value_id], []
         if folded:
             if not (isinstance(selector_literal, slice) and selector_literal.step is None
                     and integer_or_none(selector_literal.start)
@@ -2387,10 +2415,36 @@ def _static_sequence_capacity_survey(
         for attributes in (data.get("attributes") or {},)
         if attributes.get("aggregate_kind") == "array"
         and attributes.get("producer_kind") == "sequence_materialization"
-        and tuple(role for _parent, role in data.get("parents") or ())
+        and tuple(role for _parent, role in data.get("parents") or () if role != "callee")
         == ("arg:0",)
     )
-    return bounds, unbounded | owned_empty_arrays
+    # Vocabulary.__init__ hands its empty lookup dictionaries to exact
+    # declared record slots. That handoff transfers the constructor's owned
+    # storage; treating it as an escaped borrowed argument left every later
+    # setdefault at capacity zero. Keep the allocation in its native context,
+    # as for an empty typed array, and let the established heap contract wait
+    # for its proved column layouts before binding pointer cells.
+    from .concordance_declarations import CLASS_FIELD_DECLARATION
+    from .identity_concordance import Ref
+
+    owned_record_initializers = {
+        int(parent)
+        for _node_id, target in graph_obj.nodes(data=True)
+        if str(target.get("type") or target.get("op") or "").casefold() == "setattr"
+        and isinstance((target.get("attributes") or {}).get("field_declaration_cell"), Ref)
+        and (target.get("attributes") or {})["field_declaration_cell"].page
+            == CLASS_FIELD_DECLARATION
+        for parent, role in target.get("parents") or ()
+        if str(role) == "value"
+    }
+    owned_record_dicts = frozenset(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Dict)
+        and not data["expr_obj"].keys
+        and int(node_id) in owned_record_initializers
+    )
+    return bounds, unbounded | owned_empty_arrays | owned_record_dicts
 
 
 def _linked_sequence_propagation_kind(
@@ -2528,7 +2582,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         operation = str(record["operator"])
         if operation == "sort":
             continue
-        argument_kind = "value"
+        argument_kind = str(record.get("argument_kind", "value"))
         argument_ids = tuple(map(int, record["argument_value_ids"]))
         key_column = None
         reverse = False

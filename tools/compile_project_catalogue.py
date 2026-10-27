@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import traceback
+import yaml
 from typing import Sequence
 
 from src.compiler.project_compilation_product import (
@@ -279,6 +280,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="emit each complete dependency-linked unit as a shared library",
     )
     parser.add_argument(
+        "--verification-cases", type=Path,
+        help="YAML/JSON mapping authored entry names to probes and supplied expected_probe_results; requires --emit-native",
+    )
+    parser.add_argument(
         "--plan-only", action="store_true",
         help=(
             "for exactly one entry, stop after post-reduction ProcessGraph "
@@ -351,6 +356,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args(argv)
+    if arguments.verification_cases is not None and not arguments.emit_native:
+        parser.error("--verification-cases requires --emit-native")
+    if arguments.verification_cases is not None and any(vars(arguments).get(mode) for mode in (
+        "worker", "partitioned_source", "plan_only", "planned_unit", "compile_resolved_plan", "creep_resolved_plan",
+    )):
+        parser.error("--verification-cases applies to project catalogues or --creep-project")
     if arguments.stage_units is not None and (
         not arguments.compile_resolved_plan or arguments.stage_units < 1
     ):
@@ -458,6 +469,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             bootstrap_products=selected_products,
             seed_product=arguments.seed_product,
             max_rounds=arguments.max_bootstrap_rounds,
+            verification_cases=(None if arguments.verification_cases is None else
+                                yaml.safe_load(arguments.verification_cases.read_text(encoding="utf-8"))),
             progress=lambda event: print(
                 json.dumps(event, sort_keys=True), flush=True,
             ),
@@ -855,6 +868,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         extraction_contract=arguments.extraction_contract,
         emit_native=arguments.emit_native,
+        verification_cases=(None if arguments.verification_cases is None else
+                            yaml.safe_load(arguments.verification_cases.read_text(encoding="utf-8"))),
         seed_product=arguments.seed_product,
         progress=lambda event: print(
             json.dumps(event, sort_keys=True), flush=True,
@@ -872,7 +887,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{arguments.output.resolve() / 'manifest.json'}",
         flush=True,
     )
-    return 1 if failed or partial or blocked else 0
+    # The manager's late transport exception was buried in worker telemetry;
+    # the final verification only said that no library existed. Repeat the
+    # actual recorded failure here so copying the terminal's end retains it.
+    native_failed = 0
+    for unit in manifest["units"]:
+        native_failure = unit.get("native_status") == "failed"
+        native_failed += int(native_failure)
+        if unit.get("status") != "failed" and not native_failure:
+            continue
+        detail = unit
+        failure_path = unit.get("failure")
+        if native_failure:
+            failure_path = unit.get("native_failure")
+        if failure_path and (arguments.output / failure_path).is_file():
+            detail = json.loads(
+                (arguments.output / failure_path).read_text(encoding="utf-8")
+            )
+        error = str(detail.get("error") or "")
+        print(json.dumps({
+            "stage": "failure_summary",
+            "qualified_name": unit["qualified_name"],
+            "phase": "native" if native_failure else "lowering",
+            "error_type": detail.get("error_type"),
+            "error": error[:2000],
+            "error_truncated": len(error) > 2000,
+            "failure": str(arguments.output / failure_path) if failure_path else None,
+            **({
+                "rejected_repository_ssa": str(
+                    (arguments.output / failure_path).parent / detail["rejected_repository_ssa"]
+                ),
+                "rejected_repository_ssa_sha256": detail.get("rejected_repository_ssa_sha256"),
+                "rejected_repository_ssa_linkable": False,
+            } if failure_path and detail.get("rejected_repository_ssa") else {}),
+            **({"rejected_repository_ssa_error": detail["rejected_repository_ssa_error"]}
+               if detail.get("rejected_repository_ssa_error") else {}),
+        }, sort_keys=True), flush=True)
+    for verification in manifest.get("native_case_verification", ()):
+        print(json.dumps(verification, sort_keys=True), flush=True)
+    case_failure = any(not item.get("verified") for item in manifest.get("native_case_verification", ()))
+    return 1 if failed or partial or blocked or native_failed or case_failure else 0
 
 
 if __name__ == "__main__":

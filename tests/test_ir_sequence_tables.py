@@ -1026,6 +1026,51 @@ def test_sequence_append_slice_normalizes_bounds_and_copies_between_arenas():
     assert "capacity_exhausted" in function.blocks
 
 
+def test_dynamic_sequence_append_slice_reserves_clipped_result_before_copy():
+    destination = SSASequenceDescriptor(
+        sequence_id=23,
+        column_value_ids=(230,),
+        length_address_id=231,
+        capacity_value_id=232,
+        status_address_id=233,
+        column_dtypes=("int64",),
+        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
+        heap_owner_value_id=234,
+    )
+    source = SSASequenceDescriptor(
+        sequence_id=24,
+        column_value_ids=(240,),
+        length_address_id=241,
+        capacity_value_id=242,
+        status_address_id=243,
+        column_dtypes=("int64",),
+        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
+        heap_owner_value_id=244,
+        writable=False,
+    )
+
+    lowering = lower_sequence_append_slice(
+        destination, source, function_name="dynamic_slice_copy",
+    )
+
+    assert lowering.complete, lowering.shortfalls
+    function, reserve = lowering.functions
+    assert function.metadata["ssa_sequence_operation"] == "append_slice"
+    assert reserve.metadata["ssa_sequence_operation"] == "reserve"
+    calls = [
+        instruction for block in function.blocks.values()
+        for instruction in block.instrs if instruction.op == "Call"
+    ]
+    assert [call.attributes.get("callee") for call in calls] == [reserve.name]
+    assert "append_slice_reserve" in function.blocks
+    assert "capacity_exhausted" in function.blocks
+    assert not any(
+        instruction.attributes.get("failure") == "fixed_capacity_exhausted"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+
 def test_sequence_pack_bits_is_nested_iterative_memory_ssa():
     destination = _sequence(15, 150)
     source = SSASequenceDescriptor(
@@ -1787,6 +1832,10 @@ def test_empty_dict_constructor_keeps_accepted_receiver_table_roles():
             assert sequence.key_columns == (0, 1, 2, 3)
             assert len(sequence.column_value_ids) == 5
             assert sequence.child_table_pool is not None
+            assert sequence.child_table_pool.handle_column == 4
+            assert sequence.child_table_pool.key_columns == ()
+            assert len(sequence.child_table_pool.column_value_ids) == 1
+            assert sequence.child_table_pool.live_flags_value_id is None
             assert set(field.value_ids) == {
                 *sequence.column_value_ids,
                 sequence.length_address_id,
@@ -1797,7 +1846,8 @@ def test_empty_dict_constructor_keeps_accepted_receiver_table_roles():
                 sequence.child_table_pool.capacity_value_id,
                 sequence.child_table_pool.row_stride_value_id,
                 sequence.child_table_pool.status_value_id,
-                sequence.child_table_pool.live_flags_value_id,
+                *((sequence.child_table_pool.live_flags_value_id,)
+                  if sequence.child_table_pool.live_flags_value_id is not None else ()),
             }
             receiver_views[symbol] = sequence
 
@@ -1815,7 +1865,11 @@ def test_empty_dict_constructor_keeps_accepted_receiver_table_roles():
     (value_role,) = tuple(
         set(range(len(sequence.column_value_ids))) - set(sequence.key_columns)
     )
-    assert generic.column_value_ids[1] == sequence.column_value_ids[value_role]
+    (generic_value_role,) = tuple(
+        set(range(len(generic.column_value_ids))) - set(generic.key_columns)
+    )
+    assert generic_value_role == generic.child_table_pool.handle_column
+    assert generic.column_value_ids[generic_value_role] == sequence.column_value_ids[value_role]
     assert not any(
         instruction.attributes.get("binding")
         == "scalar_record_field_assignment"

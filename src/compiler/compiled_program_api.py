@@ -36,6 +36,18 @@ SCHEMA = "turing-compiled-program-api-v1"
 _C_TYPES: dict[str, tuple[str, str]] = c_abi_type_table()
 
 
+def is_frame_workspace(value: SSAValue, source_name: str | None = None) -> bool:
+    """Whether the existing ABI assigns this storage to one entry frame."""
+    accounting = dict(value.accounting or {})
+    return (
+        source_name is None
+        and not accounting.get("program_abi_parameter")
+        and any(accounting.get(key) is not None for key in (
+            "linked_call_frame_storage", "returned_record_storage", "compiler_frame_storage",
+        ))
+    )
+
+
 @dataclass(frozen=True)
 class Parameter:
     """One dummy argument, in declaration order."""
@@ -238,15 +250,7 @@ def describe_fortran_function(
             authored_source_name = str(accounting["program_abi_parameter"])
             if accounting.get("program_abi_field"):
                 authored_source_name += "." + str(accounting["program_abi_field"])
-        workspace = (
-            authored_source_name is None
-            and not accounting.get("program_abi_parameter")
-            and (
-                accounting.get("linked_call_frame_storage") is not None
-                or accounting.get("returned_record_storage") is not None
-                or accounting.get("compiler_frame_storage") is not None
-            )
-        )
+        workspace = is_frame_workspace(value, authored_source_name)
         if str(value.dtype) == "ptr" and (
             accounting.get("heap_owner")
             or accounting.get("heap_element_dtype") is not None
