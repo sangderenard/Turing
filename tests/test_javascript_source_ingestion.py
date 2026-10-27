@@ -361,3 +361,30 @@ def test_var_that_reads_its_hoisted_undefined_stays_a_loud_refusal(body):
     assert any(
         item.code == "unsupported-binding-kind" for item in lowered.shortfalls
     ), lowered.shortfall_report()
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    "let x = n; if (p) { if (n > 1) return 1; x = 2; } return x;",
+    "let x = n; if (p) { x = 1; } else { if (n > 2) return 5; x = 2; } return x * 2;",
+    "let x = n; { if (n > 1) return 1; x = 2; } return x;",
+])
+def test_a_nested_early_return_leaves_the_other_paths_the_rest(body):
+    source = (
+        f"/** @param {{number}} n @param {{boolean}} p */ "
+        f"function root(n, p) {{ {body} }}"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(
+        source, "[[0, true], [3, true], [0, false], [3, false], [NaN, true]]",
+    ) == "PASS"
+
+
+@needs_node
+def test_a_nested_early_return_with_no_return_after_it_stays_refused():
+    source = (
+        "/** @param {number} n @param {boolean} p */ "
+        "function root(n, p) { if (p) { if (n > 1) return 1; } }"
+    )
+    assert not lower_javascript_source_to_ssa(source).complete
