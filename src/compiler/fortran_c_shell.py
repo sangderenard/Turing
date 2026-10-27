@@ -24283,8 +24283,12 @@ def _class_surface_ssa_program(
         )))
         if not identities:
             return ()
+        source_class_cell = current_source_class_cell(
+            owner, int(value_id), {}
+        )
         source_cells = tuple(dict.fromkeys((
             _identity_cell(owner, int(value_id)),
+            *((source_class_cell,) if source_class_cell is not None else ()),
             *linked_value_type_source_cells_by_graph.get(id(owner), {}).get(
                 int(value_id), (),
             ),
@@ -30203,6 +30207,24 @@ def _class_surface_ssa_program(
                         ),
                         "lowering": "writable-sequence-arena",
                     })
+
+                if (
+                    attributes.get("producer_kind")
+                    == "sequence_materialization"
+                    and attributes.get("aggregate_kind") == "array"
+                    and descriptor is not None
+                    and descriptor.writable
+                    and attributes.get("extraction_identity") is not None
+                ):
+                    extraction_materializations.append({
+                        "source_node_id": int(node_id),
+                        "source_sequence_id": sequence_id,
+                        "extraction_identity": str(
+                            attributes["extraction_identity"]
+                        ),
+                        "lowering": "writable-sequence-arena",
+                    })
+
             extraction_materializations.extend(
                 dict(record)
                 for record in root_sequence_materializations

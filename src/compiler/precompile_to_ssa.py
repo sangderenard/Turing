@@ -12063,7 +12063,6 @@ class _ControlSSABuilder(TiledObject):
             # literal's planner extent (1,) and its reserve's heap copy
             # refused the shaped "handle".
             column.dtype = "ptr"
-            column.shape = ()
             column.accounting = {
                 **dict(column.accounting or {}),
                 "heap_element_dtype": layout.name,
@@ -12074,6 +12073,12 @@ class _ControlSSABuilder(TiledObject):
                     int(descriptor.sequence_id)
                 ),
                 stage=self._stage(),
+                physical={
+                    "physical_dtype": layout.name,
+                    "storage": "span",
+                    "rank": max(1, len(tuple(column.shape or ()))),
+                    "arena": True,
+                },
             )
         # The owner is a storage member, last (``_storage_values``): every
         # helper call that passes the sequence's storage passes its owner.

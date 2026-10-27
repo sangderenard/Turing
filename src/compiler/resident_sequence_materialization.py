@@ -2446,7 +2446,17 @@ def _static_sequence_capacity_survey(
     )
     return bounds, unbounded | owned_empty_arrays | owned_record_dicts
 
+def _source_extraction_identity(
+    graph_obj: Any,
+    node_id: int,
+) -> str | None:
+    """Return the exact extraction identity retained by one source graph node."""
 
+    attributes = (
+        graph_obj.nodes.get(int(node_id), {}).get("attributes") or {}
+    )
+    identity = attributes.get("extraction_identity")
+    return None if identity is None else str(identity)
 def _linked_sequence_propagation_kind(
     mapped_arguments: Iterable[Any],
 ) -> str | None:
@@ -2594,6 +2604,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
             policy=record.get("policy"),
             argument_kind=argument_kind,
             argument_expressions=retained_argument_expressions(record),
+            extraction_identity=_source_extraction_identity(
+                graph_obj, node_id,
+            ),
             sort_key_column=key_column,
             sort_reverse=reverse,
         ))
@@ -2659,6 +2672,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
                 else "duplicates"
             ),
             argument_kind=argument_kind,
+            extraction_identity=_source_extraction_identity(
+                graph_obj, node_id,
+            ),
             sort_key_column=key_column,
             sort_reverse=reverse,
         ))
