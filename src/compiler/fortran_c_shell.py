@@ -25957,6 +25957,65 @@ def _class_surface_ssa_program(
                                 incoming_arm.metadata_state,
                                 incoming_arm.row_shape,
                             )
+                            if incumbent_physical != incoming_physical and (
+                                identity == "builtins.int"
+                                and incumbent_physical[1] == "scalar"
+                                and incoming_physical[1] == "scalar"
+                                and incumbent_physical[2] != incoming_physical[2]
+                                and {incumbent_physical[2], incoming_physical[2]}
+                                <= {"int64", "uint64", "int128"}
+                                and incumbent_physical[:2] == incoming_physical[:2]
+                                and incumbent_physical[3:] == incoming_physical[3:]
+                            ):
+                                # Program: Token Orchard's ``hi, lo =
+                                # self._fingerprint_span(...)`` (corpus c883):
+                                # one return is the constant ``0, 0`` (int64),
+                                # the other the combines proven [0, 2**64-1]
+                                # (uint64).  Both arms are the same class
+                                # ``builtins.int`` with the same storage;
+                                # only the width the actual's own interval
+                                # needs differs.  Rule: the formal's arm is
+                                # built from the interval joined over every
+                                # callsite reaching it -- the formal's own
+                                # ``source_int_range_concordance`` row -- and
+                                # takes the narrowest width holding it.  With
+                                # no such proof the arms stay a refusal.
+                                from ..common.tensors.topological_reducer import (
+                                    _int_range_cell as _arm_range_cell,
+                                )
+                                from ..transmogrifier.dtype_layout import (
+                                    python_int_range_dtype as _arm_range_dtype,
+                                )
+                                from .concordance_declarations import (
+                                    SOURCE_INT_RANGE as _ARM_INT_RANGE,
+                                )
+
+                                joined_cell = _arm_range_cell(
+                                    callee_graph, int(callee_id),
+                                )
+                                joined = (
+                                    None if joined_cell is None
+                                    else shape_identity_book.page(
+                                        _ARM_INT_RANGE
+                                    ).cell(joined_cell.row, joined_cell.column)
+                                )
+                                joined_dtype = (
+                                    None if joined is None
+                                    else _arm_range_dtype(
+                                        int(joined[0]), int(joined[1]),
+                                    )
+                                )
+                                if joined_dtype in {"int64", "uint64", "int128"}:
+                                    incoming_arm = replace(
+                                        incoming_arm, dtype=joined_dtype,
+                                        source_cells=tuple(dict.fromkeys((
+                                            *incumbent_arm.source_cells,
+                                            *incoming_arm.source_cells,
+                                            joined_cell,
+                                        ))),
+                                    )
+                                    incumbent_arms[identity] = incoming_arm
+                                    continue
                             if incumbent_physical != incoming_physical:
                                 # Two callsites binding the same class to
                                 # this formal from different declared
