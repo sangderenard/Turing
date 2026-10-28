@@ -170,6 +170,7 @@ from .resident_sequence_materialization import (
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
     _loop_carried_storage_aliases as _loop_carried_storage_aliases,
     _promote_conditional_sequence_aliases as _promote_conditional_sequence_aliases,
+    _retarget_forwarded_sequence_effects as _retarget_forwarded_sequence_effects,
     _sequence_append_call_mutations as _sequence_append_call_mutations,
     _source_mapping_mutations as _source_mapping_mutations,
     _source_glyph_sequence_materializations as _source_glyph_sequence_materializations,
@@ -27689,6 +27690,16 @@ def _class_surface_ssa_program(
                         int(entry.reference.address)
                     ] = candidates[0]
         callsite_shells = getattr(shell, "callsite_function_shells", {})
+        # The callee each call actually runs is its callsite's specialized
+        # copy; identity forwarding reads that copy, not the shared callee.
+        callsite_callee_graphs = {
+            int(callsite_id): child_graph
+            for callsite_id, child_shell in callsite_shells.items()
+            for child_graph in (getattr(
+                getattr(child_shell, "process_graph", None), "G", None,
+            ),)
+            if child_graph is not None
+        }
         transformed_call_source_ids: set[int] = set()
         transformed_parameters_by_reference: dict[int, set[int]] = {}
         for planned_call in local_plan_calls:
@@ -27830,6 +27841,7 @@ def _class_surface_ssa_program(
         returned_formal_sequence_aliases = _returned_formal_sequence_aliases(
             graph_obj, source_function_table,
             call_result_kinds=sequence_call_result_kinds,
+            callsite_graphs=callsite_callee_graphs,
         )
         (
             control,
@@ -27849,6 +27861,9 @@ def _class_surface_ssa_program(
             **returned_formal_sequence_aliases,
             **conditional_sequence_aliases,
         }
+        control = _retarget_forwarded_sequence_effects(
+            control, returned_formal_sequence_aliases,
+        )
         (
             sequence_concats,
             sequence_concat_aliases,
@@ -28840,7 +28855,7 @@ def _class_surface_ssa_program(
             graph_obj.graph.get("parameter_record_abi") or {}
         )
         descriptor_element_dtypes: dict[int, str] = {}
-        parameter_result_aliases = _identity_return_aliases(graph_obj, source_function_table)
+        parameter_result_aliases = _identity_return_aliases(graph_obj, source_function_table, callsite_callee_graphs)
         for record_parameter, record in declared_parameter_records.items():
             owner_ids = set(map(
                 int, identities.get(str(record_parameter), ())
@@ -29024,7 +29039,7 @@ def _class_surface_ssa_program(
         scalar_writes = []
         scalar_write_sources = set()
         scalar_write_effect_ids = set()
-        returned_parameter_aliases = _identity_return_aliases(graph_obj, source_function_table)
+        returned_parameter_aliases = _identity_return_aliases(graph_obj, source_function_table, callsite_callee_graphs)
         for parameter, record in declared_parameter_records.items():
             receivers = set(map(int, identities.get(str(parameter), ())))
             receivers.update(alias for alias, original in returned_parameter_aliases.items()
@@ -29546,6 +29561,7 @@ def _class_surface_ssa_program(
             (_loop_carried_storage_aliases(graph_obj), None),
             (_identity_return_aliases(
                 graph_obj, getattr(graph, "function_table", None),
+                callsite_callee_graphs,
             ), None),
             # Enum.value changes semantic class to the declaration's value
             # type while retaining the Enum receiver's fixed-width resident
