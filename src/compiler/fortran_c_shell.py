@@ -59985,6 +59985,19 @@ def _class_surface_ssa_program(
     )
     lowered_module.metadata["late_result_type_rounds"] = late_result_rounds
 
+    # The last writer of physical scalar dtypes has run: a carried Phi of a
+    # narrower class than its update is a trip-count-dependent result class.
+    from .ssa_self_check import check_loop_carried_class_widening
+
+    carried_widening = check_loop_carried_class_widening(lowered_module)
+    if carried_widening:
+        raise ValueError(
+            "; ".join(
+                f"{finding.function}: {finding.detail}"
+                for finding in carried_widening
+            )
+        )
+
     # Structural None has a semantic dtype only; post its zero-sentinel cell
     # once every pass that can create or retype a None value has run.
     from .ssa_none_sentinel import declare_none_sentinel_carriers
