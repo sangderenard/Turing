@@ -89,6 +89,7 @@ from .ast_control_normalization import (
     _normalize_loop_else as _normalize_loop_else,
     _normalize_chained_comparisons as _normalize_chained_comparisons,
     _normalize_constant_membership as _normalize_constant_membership,
+    _normalize_sequence_replication_display as _normalize_sequence_replication_display,
     _normalize_builtin_divmod as _normalize_builtin_divmod,
     _normalize_mapping_get as _normalize_mapping_get,
     _normalize_set_constructor as _normalize_set_constructor,
@@ -158,6 +159,7 @@ from .resident_sequence_materialization import (
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
+    _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
     _list_rebound_on_one_branch as _list_rebound_on_one_branch,
     _loop_carried_initial_ids as _loop_carried_initial_ids,
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
@@ -2199,9 +2201,13 @@ def _recover_late_source_pure_expressions(
                         return None
                     runtime_leaves.append((block_name, index, operand))
                     source_roots.add(initial_id)
-                    result = result_value(
-                        value_id, str(operand.dtype or "float64"),
-                    )
+                    if not operand.dtype:
+                        raise ValueError(
+                            f"scalar loop-carry cast %t{value_id}: source "
+                            f"operand %t{int(operand.id)} has no recorded "
+                            "dtype"
+                        )
+                    result = result_value(value_id, str(operand.dtype))
                     result.dtype = operand.dtype
                     result.shape = ()
                     planned.append((
@@ -4876,12 +4882,19 @@ def _lower_planned_region_record_projection_captures(
                 for block in region.blocks.values():
                     block.instrs[:] = [item for item in block.instrs if item is not instruction]
             else:
+                if not (instruction.res.dtype or capture.dtype):
+                    raise ValueError(
+                        f"record field projection %t{int(instruction.res.id)}"
+                        f" ({attribute!r} of receiver {receiver_id}): neither"
+                        " the projection nor its resident capture "
+                        f"%t{int(capture.id)} has a recorded dtype"
+                    )
                 instruction.op = "Cast"
                 instruction.args = [capture]
                 instruction.arg_roles = []
                 instruction.attributes = {
                     "target_dtype": str(
-                        instruction.res.dtype or capture.dtype or "float64"
+                        instruction.res.dtype or capture.dtype
                     ),
                     "resolved_record_field_projection": True,
                     "record_receiver_id": receiver_id,
@@ -5002,6 +5015,15 @@ def _typed_parameter_record_receipts(
             or identity is None
         ):
             continue
+        if isinstance(attributes.get("numeric_feature_descriptor"), Mapping):
+            # A numeric value type (``x: Precision[2]``) is its limbs, laid
+            # out by the precision lowering; the composite ones get their
+            # record view from the numeric descriptor itself. Joining it to
+            # the class's projected record made ``Precision`` a record whose
+            # only field is ``limbs: int64``, so ``return y`` published the
+            # limb COUNT as y and the computed limbs never reached the
+            # output (C wrote 3 into y[0]; LLVM left y zero).
+            continue
         matches = tuple(
             record
             for name, record in records.items()
@@ -5094,6 +5116,18 @@ def _exact_structural_value_origin(graph_obj: Any, value_id: int) -> int:
 
 
 from .runtime_abi import HOST_CALLBACK_SCHEMA
+
+
+def _recorded_field_dtype(field: Any, what: str) -> str:
+    """The element dtype a record field declaration recorded; refuse absence."""
+
+    dtype = field.get("dtype") if hasattr(field, "get") else None
+    if not dtype:
+        raise ValueError(
+            f"{what}: the field declaration {dict(field or {})!r} records no "
+            "dtype, so its storage type was never settled"
+        )
+    return str(dtype)
 
 _HOST_CALLBACK_DTYPES = {
     "int": "int64", "float": "float64", "bool": "bool",
@@ -6527,6 +6561,12 @@ def _canonical_program_abi_type_identity(
     # resolve through the record table.
     if canonical in _BUILTIN_PRIMITIVE_TYPE_IDENTITIES:
         return canonical
+    # ``Precision`` is a numeric value type with no ProgramABI record, so
+    # the record table cannot join its two spellings: an annotation names
+    # it ``Precision`` and a contract ``src.common.tensors.
+    # extended_precision.Precision``. Both are one type, never a union.
+    if canonical == "src.common.tensors.extended_precision.Precision":
+        return "Precision"
     return _program_abi_record_for_type_identity(
         canonical, program_abi,
     ) or canonical
@@ -13500,52 +13540,6 @@ def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[i
     return result
 
 
-def _held_table_delete_ids(graph) -> frozenset[int]:
-    """Keyed deletes an ``if`` arm holds; every other delete runs
-    unconditionally.
-
-    A delete is held when it is an arm's ``body``/``orelse`` statement, or
-    when its branch compartment is an ``if`` arm.  ``for i in range(3): if
-    i == n: del d[2]`` records only the loop's ``body`` edge to the ``if``,
-    not the ``if``'s edge to the delete, so the edge alone missed it.
-    """
-
-    from .glsl_deployment_strategy import (
-        _branch_compartments,
-        _source_control_records,
-    )
-
-    graph_obj = graph.G
-    deletes = {
-        int(node_id): int(data.get("value_id", node_id))
-        for node_id, data in graph_obj.nodes(data=True)
-        if str(data.get("type") or "") == "DelItem"
-    }
-    if not deletes:
-        return frozenset()
-    memberships = _branch_compartments(graph)
-    records = _source_control_records(graph_obj)
-    held = {
-        deletes[int(parent)]
-        for _node_id, data in graph_obj.nodes(data=True)
-        for parent, role in data.get("parents") or ()
-        if str(role) in {"body", "orelse"} and int(parent) in deletes
-    }
-    held.update(
-        value_id
-        for node_id, value_id in deletes.items()
-        if any(
-            str(arm) in {"body", "orelse"}
-            and isinstance(
-                (records.get(int(owner)) or {}).get("expression"),
-                (ast.If, ast.IfExp),
-            )
-            for owner, arm in memberships.get(int(node_id), ())
-        )
-    )
-    return frozenset(held)
-
-
 def _sequence_mutation_owner_id(mutation) -> int:
     """The graph node whose authored position places this mutation.
 
@@ -15064,144 +15058,124 @@ def _install_lexical_sequence_mutations(
                 f"guarded={guarded}",
                 file=sys.stderr,
             )
-        inserted = False
-        # Innermost authored condition has the latest source position.
-        for owner_id, arm in sorted(
-            guarded, key=lambda item: node_position(item[0]), reverse=True,
-        ):
-            root, inserted = insert_in_conditional(
-                root, owner_id, arm, mutation_block
+        # The guards, innermost first.  An arm that owns no numerical region
+        # has no surviving ConditionalBlock; its authored branch is rebuilt
+        # from the retained pre-fold control record.  Every guard between the
+        # effect and the innermost one that survives is rebuilt and nested, so
+        # the effect runs under all of its conditions.
+        def synthesize(owner_id, arm, inner):
+            record = source_control_records.get(owner_id)
+            owner_node_id = (
+                int(owner_id) if int(owner_id) in graph.G else next((
+                    int(node_id)
+                    for node_id, data in graph.G.nodes(data=True)
+                    if int(data.get("value_id", node_id)) == int(owner_id)
+                ), None)
             )
+            owner_data = (
+                {} if owner_node_id is None
+                else graph.G.nodes[int(owner_node_id)]
+            )
+            expression = (
+                record.get("expression")
+                if record is not None
+                else owner_data.get("expr_obj")
+            )
+            recorded_predicate_id = (
+                None if record is None else record.get("predicate_id")
+            )
+            if recorded_predicate_id is None:
+                recorded_predicate_id = next((
+                    int(parent)
+                    for parent, role in owner_data.get("parents", ())
+                    if str(role) == "test"
+                ), None)
+            predicate_id = (
+                None if not isinstance(expression, (ast.If, ast.IfExp))
+                else _retained_control_value_id(
+                    graph.G,
+                    recorded_predicate_id,
+                    expression.test,
+                )
+            )
+            if predicate_id is None and isinstance(
+                expression, (ast.If, ast.IfExp)
+            ):
+                direct_test = next((
+                    int(parent)
+                    for parent, role in owner_data.get("parents", ())
+                    if str(role) == "test" and int(parent) in graph.G
+                ), None)
+                if direct_test is not None:
+                    predicate_id = int(
+                        graph.G.nodes[direct_test].get(
+                            "value_id", direct_test
+                        )
+                    )
+            if (
+                predicate_id is None
+                and recorded_predicate_id is not None
+                and isinstance(expression, (ast.If, ast.IfExp))
+            ):
+                # The conditional node may have been folded out after its
+                # immutable source-control record was published.  That
+                # record already speaks in the canonical value identity
+                # consumed by region/control SSA; retain it directly.
+                predicate_id = int(recorded_predicate_id)
+            if os.environ.get("TURING_DEBUG_SEQUENCE_MUTATION"):
+                print(
+                    "DEBUGMUTATION-GUARD "
+                    f"effect={int(mutation.effect_node_id)} "
+                    f"owner={owner_id} owner_node={owner_node_id} "
+                    f"recorded_predicate={recorded_predicate_id} "
+                    f"predicate={predicate_id} "
+                    f"expression={type(expression).__name__}",
+                    file=sys.stderr,
+                )
+            if predicate_id is None:
+                return None
+            empty = SequenceBlock(())
+            return ConditionalBlock(
+                int(predicate_id),
+                inner if arm == "body" else empty,
+                inner if arm == "orelse" else None,
+                predicate_expression=_graph_control_expression(
+                    graph.G, int(predicate_id),
+                    resident=_region_resident_value_ids(dispatch_subgraphs),
+                ),
+                source_node_id=int(owner_id),
+            )
+
+        inserted = False
+        item = mutation_block
+        for owner_id, arm in sorted(
+            guarded, key=lambda entry: node_position(entry[0]), reverse=True,
+        ):
+            root, inserted = insert_in_conditional(root, owner_id, arm, item)
             if inserted:
                 break
+            item = synthesize(owner_id, arm, item)
+            if item is None:
+                break
         if not inserted:
-            # A branch containing only structural storage effects owns no
-            # numerical region, so ordinary region overlay has no marker from
-            # which to materialize its ConditionalBlock.  Reconstruct that
-            # authored branch from the retained pre-fold control record, then
-            # place the complete wrapper inside its nearest surviving outer
-            # conditional (or at the lexical root).
-            synthesized = None
-            remaining_guards = guarded
-            if guarded:
-                owner_id, arm = sorted(
-                    guarded,
-                    key=lambda item: node_position(item[0]),
-                    reverse=True,
-                )[0]
-                record = source_control_records.get(owner_id)
-                owner_node_id = (
-                    int(owner_id) if int(owner_id) in graph.G else next((
-                        int(node_id)
-                        for node_id, data in graph.G.nodes(data=True)
-                        if int(data.get("value_id", node_id)) == int(owner_id)
-                    ), None)
-                )
-                owner_data = (
-                    {} if owner_node_id is None
-                    else graph.G.nodes[int(owner_node_id)]
-                )
-                expression = (
-                    record.get("expression")
-                    if record is not None
-                    else owner_data.get("expr_obj")
-                )
-                recorded_predicate_id = (
-                    None if record is None else record.get("predicate_id")
-                )
-                if recorded_predicate_id is None:
-                    recorded_predicate_id = next((
-                        int(parent)
-                        for parent, role in owner_data.get("parents", ())
-                        if str(role) == "test"
-                    ), None)
-                predicate_id = (
-                    None if not isinstance(expression, (ast.If, ast.IfExp))
-                    else _retained_control_value_id(
-                        graph.G,
-                        recorded_predicate_id,
-                        expression.test,
-                    )
-                )
-                if predicate_id is None and isinstance(
-                    expression, (ast.If, ast.IfExp)
-                ):
-                    direct_test = next((
-                        int(parent)
-                        for parent, role in owner_data.get("parents", ())
-                        if str(role) == "test" and int(parent) in graph.G
-                    ), None)
-                    if direct_test is not None:
-                        predicate_id = int(
-                            graph.G.nodes[direct_test].get(
-                                "value_id", direct_test
-                            )
-                        )
-                if (
-                    predicate_id is None
-                    and recorded_predicate_id is not None
-                    and isinstance(expression, (ast.If, ast.IfExp))
-                ):
-                    # The conditional node may have been folded out after its
-                    # immutable source-control record was published.  That
-                    # record already speaks in the canonical value identity
-                    # consumed by region/control SSA; retain it directly.
-                    predicate_id = int(recorded_predicate_id)
-                if os.environ.get("TURING_DEBUG_SEQUENCE_MUTATION"):
-                    print(
-                        "DEBUGMUTATION-GUARD "
-                        f"effect={int(mutation.effect_node_id)} "
-                        f"owner={owner_id} owner_node={owner_node_id} "
-                        f"recorded_predicate={recorded_predicate_id} "
-                        f"predicate={predicate_id} "
-                        f"expression={type(expression).__name__}",
-                        file=sys.stderr,
-                    )
-                if predicate_id is not None:
-                    empty = SequenceBlock(())
-                    synthesized = ConditionalBlock(
-                        int(predicate_id),
-                        mutation_block if arm == "body" else empty,
-                        mutation_block if arm == "orelse" else None,
-                        predicate_expression=_graph_control_expression(
-                            graph.G, int(predicate_id),
-                            resident=_region_resident_value_ids(
-                                dispatch_subgraphs
-                            ),
-                        ),
-                        source_node_id=int(owner_id),
-                    )
-                    remaining_guards = tuple(
-                        item for item in guarded if item != (owner_id, arm)
-                    )
-            if synthesized is not None:
-                for owner_id, arm in sorted(
-                    remaining_guards,
-                    key=lambda item: node_position(item[0]),
-                    reverse=True,
-                ):
-                    root, inserted = insert_in_conditional(
-                        root, owner_id, arm, synthesized
-                    )
-                    if inserted:
-                        break
-                if not inserted:
+            if item is not None:
+                if guarded:
                     root = insert_in_enclosing_loop(
-                        root, synthesized, int(mutation.effect_node_id)
+                        root, item, int(mutation.effect_node_id)
                     )
-            elif guarded:
-                unplaced.append(int(mutation.effect_node_id))
+                else:
+                    # A display member's append is placed by its display
+                    # (``_sequence_mutation_owner_id``), in its loop too: the
+                    # member of a list merged from branches is a Phi with no
+                    # coordinate, which put the birth after the loop (c969).
+                    root = insert_in_enclosing_loop(
+                        root, item,
+                        int(mutation.effect_node_id)
+                        if isinstance(mutation, ScalarFieldWriteBlock)
+                        else _sequence_mutation_owner_id(mutation),
+                    )
             else:
-                # A display member's append is placed by its display
-                # (``_sequence_mutation_owner_id``), in its loop too: the
-                # member of a list merged from branches is a Phi with no
-                # coordinate, which put the birth after the loop (c969).
-                root = insert_in_enclosing_loop(
-                    root, mutation_block,
-                    int(mutation.effect_node_id)
-                    if isinstance(mutation, ScalarFieldWriteBlock)
-                    else _sequence_mutation_owner_id(mutation),
-                )
+                unplaced.append(int(mutation.effect_node_id))
     # A source effect now owned by lexical control must not also leave a
     # numerical-region marker. Copier stores40/85/92 were removed from their
     # numerical bodies, but their markers emitted undefined numerical_region
@@ -21868,7 +21842,25 @@ def _settle_linked_dynamic_sequences(
         graph_obj.graph["linked_bounded_sequence_ids"] = tuple(sorted(
             value_id
             for node_id, data in graph_obj.nodes(data=True)
+            # Program: ``t = [n, 1] if n > 2 else [7, n]`` passed to a
+            # callee that only reads it (c651).  Wrong record: only list
+            # displays were candidates, so the merge (an ``aggregate_phi``,
+            # which the survey counts as a local list of its leaf rows)
+            # stayed escaped-unbounded and its FIXED fill ran out of
+            # capacity (code 75).  Rule: a merged list is a local list
+            # like a display; its leaf rows bound it when nothing grows it.
             if isinstance(data.get("expr_obj"), ast.List)
+            or (
+                (data.get("attributes") or {}).get("producer_kind")
+                == "aggregate_phi"
+                and (data.get("attributes") or {}).get("aggregate_kind")
+                == "list"
+                and (data.get("attributes") or {}).get("aggregate_leaf_value_ids")
+            )
+            # Program: the same merge from displays of different lengths
+            # (c654).  Born by the arms' copies, it is bounded by the
+            # longest arm (the survey's copy bound) when nothing grows it.
+            or _list_merged_from_unequal_displays(graph_obj, int(node_id))
             for value_id in (int(node_id),)
             if value_id in escapes
             and (
@@ -24283,8 +24275,12 @@ def _class_surface_ssa_program(
         )))
         if not identities:
             return ()
+        source_class_cell = current_source_class_cell(
+            owner, int(value_id), {}
+        )
         source_cells = tuple(dict.fromkeys((
             _identity_cell(owner, int(value_id)),
+            *((source_class_cell,) if source_class_cell is not None else ()),
             *linked_value_type_source_cells_by_graph.get(id(owner), {}).get(
                 int(value_id), (),
             ),
@@ -24417,12 +24413,12 @@ def _class_surface_ssa_program(
                     primitive_receipt = receipt
                 if not storage and primitive_receipt is not None:
                     storage = str(primitive_receipt["storage"])
-            if storage in {"keyed", "table"}:
-                # Keyed/table are ProgramABI access policies over the existing
-                # descriptor-backed resident sequence storage.  A semantic
-                # union arm records the physical kind, while storage_identity
-                # below retains the exact authored table/key declaration.
-                storage = "sequence"
+            # Keyed/table are ProgramABI access policies over the existing
+            # descriptor-backed resident sequence storage.  A semantic
+            # union arm records the physical kind, while storage_identity
+            # below retains the exact authored table/key declaration.
+            from .concordance_declarations import POLICY_PHYSICAL_KIND
+            storage = POLICY_PHYSICAL_KIND.get(storage, storage)
             dtype = str(
                 contract.get("dtype") or node_abi.get("program_abi_dtype")
                 or (primitive_receipt or {}).get("dtype")
@@ -28511,12 +28507,11 @@ def _class_surface_ssa_program(
         # delete an ``if`` holds owns no numerical region, so its arm was
         # projected away and the delete rode the nearest region in value
         # order -- after the loop, unconditionally -- and ``len(d)`` was 1
-        # for 2 (clean audit).  Rule: a held keyed delete is an authored
-        # control effect like a held append: a table-delete mutation placed
+        # for 2 (clean audit).  Rule: a keyed delete is an authored
+        # control effect like an append: a table-delete mutation placed
         # in its arm (synthesized from the retained conditional when the arm
         # has no region), so it runs exactly when and where its ``if`` does.
         from .control_source import ControlSequenceMutation
-        held_table_delete_ids = _held_table_delete_ids(graph)
         held_table_deletes = tuple(
             ControlSequenceMutation(
                 sequence_value_id=int(sequence_id),
@@ -28532,8 +28527,7 @@ def _class_surface_ssa_program(
                 ),
             )
             for effect_id, key, sequence_id, _storage in table_deletions
-            if int(effect_id) in held_table_delete_ids
-            and int(effect_id) in graph_obj
+            if int(effect_id) in graph_obj
             and sequence_id is not None
             and key != ()
         )
@@ -28543,54 +28537,54 @@ def _class_surface_ssa_program(
                 extra_mutations=held_table_deletes,
             )
             lexical_sequence_shortfalls = (*lexical_sequence_shortfalls, *held_delete_shortfalls)
-            # Numerical region order alone does not represent reads of mutable
-            # fields. Restore authored sibling order before the dependency
-            # scheduler: an early bool(field) must precede the conditional
-            # that updates the field and publishes its continuation version.
-            from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock
-            # A dispatch region is atomic and may contain early input casts
-            # together with a later authored update.  Place it where the
-            # whole region becomes complete.  Using the earliest member here
-            # undid the dependency-safe atomic region order: pi_update's
-            # final self.acc region also contains line-5 casts, so it
-            # overtook the line-7 normalization and read stale resident state.
-            region_positions = _dispatch_region_completion_positions(
-                graph_obj, getattr(shell, "dispatch_subgraphs", ()),
-            )
-            def source_position(block):
-                if isinstance(block, StatementBlock) and len(block.lines) == 1:
-                    line = block.lines[0]
-                    if line.startswith("__scheduled_region_") and line.endswith("__"):
-                        return region_positions.get(int(line[len("__scheduled_region_"):-2]), (1 << 30, 0, 0))
-                node_id = (block.effect_node_id if isinstance(block, ScalarFieldWriteBlock)
-                           else getattr(block, "source_node_id", None))
-                if node_id is None:
-                    node_id = getattr(block, "source_loop_node_id", None)
-                if node_id is not None:
-                    return _authored_node_position(graph_obj, int(node_id))
-                return (1 << 30, 0, 0)
-            def order_field_effects(block):
-                if isinstance(block, SequenceBlock):
-                    children = [order_field_effects(child) for child in block.blocks]
-                    # Unknown statements remain barriers; do not move calls
-                    # whose source ownership is supplied by the linker.
-                    result, run = [], []
-                    for child in children:
-                        if source_position(child)[0] >= (1 << 30):
-                            result.extend(sorted(run, key=source_position)); run = []
-                            result.append(child)
-                        else:
-                            run.append(child)
-                    result.extend(sorted(run, key=source_position))
-                    return replace(block, blocks=tuple(result))
-                if isinstance(block, ConditionalBlock):
-                    return replace(block, body=order_field_effects(block.body),
-                                   orelse=None if block.orelse is None else order_field_effects(block.orelse))
-                if isinstance(block, (LoopBlock, WhileBlock)):
-                    return replace(block, body=order_field_effects(block.body))
-                return block
-            control = replace(control, root=order_field_effects(control.root))
-            from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
+        # Numerical region order alone does not represent reads of mutable
+        # fields. Restore authored sibling order before the dependency
+        # scheduler: an early bool(field) must precede the conditional
+        # that updates the field and publishes its continuation version.
+        from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock
+        # A dispatch region is atomic and may contain early input casts
+        # together with a later authored update.  Place it where the
+        # whole region becomes complete.  Using the earliest member here
+        # undid the dependency-safe atomic region order: pi_update's
+        # final self.acc region also contains line-5 casts, so it
+        # overtook the line-7 normalization and read stale resident state.
+        region_positions = _dispatch_region_completion_positions(
+            graph_obj, getattr(shell, "dispatch_subgraphs", ()),
+        )
+        def source_position(block):
+            if isinstance(block, StatementBlock) and len(block.lines) == 1:
+                line = block.lines[0]
+                if line.startswith("__scheduled_region_") and line.endswith("__"):
+                    return region_positions.get(int(line[len("__scheduled_region_"):-2]), (1 << 30, 0, 0))
+            node_id = (block.effect_node_id if isinstance(block, ScalarFieldWriteBlock)
+                       else getattr(block, "source_node_id", None))
+            if node_id is None:
+                node_id = getattr(block, "source_loop_node_id", None)
+            if node_id is not None:
+                return _authored_node_position(graph_obj, int(node_id))
+            return (1 << 30, 0, 0)
+        def order_field_effects(block):
+            if isinstance(block, SequenceBlock):
+                children = [order_field_effects(child) for child in block.blocks]
+                # Unknown statements remain barriers; do not move calls
+                # whose source ownership is supplied by the linker.
+                result, run = [], []
+                for child in children:
+                    if source_position(child)[0] >= (1 << 30):
+                        result.extend(sorted(run, key=source_position)); run = []
+                        result.append(child)
+                    else:
+                        run.append(child)
+                result.extend(sorted(run, key=source_position))
+                return replace(block, blocks=tuple(result))
+            if isinstance(block, ConditionalBlock):
+                return replace(block, body=order_field_effects(block.body),
+                               orelse=None if block.orelse is None else order_field_effects(block.orelse))
+            if isinstance(block, (LoopBlock, WhileBlock)):
+                return replace(block, body=order_field_effects(block.body))
+            return block
+        control = replace(control, root=order_field_effects(control.root))
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         # Keyed values consumed directly by control have no numerical region
         # to schedule their reads.  This includes direct return operands, but
         # also branch predicates and resident sequence mutations (notably the
@@ -28974,7 +28968,76 @@ def _class_surface_ssa_program(
                 sequence_declarations
             ):
                 sequence_id = int(sequence_id)
-                if sequence_id in native_value_type_abi:
+                settled_abi = native_value_type_abi.get(sequence_id)
+                # Program: ``excluded: frozenset[Any]`` read by ``in`` on a
+                # record (test_sequence_contract_concordance).  Wrong record:
+                # the linked snapshot arm stated the ProgramABI field's
+                # declared ``span`` while SEQUENCE_CONTRACT made the value a
+                # descriptor-backed resident, and the SSA row says
+                # ``sequence``.  Rule: SEQUENCE_CONTRACT owns a resident
+                # collection's physical kind; the settled arm keeps its
+                # dtype/shape and takes its storage from that contract.
+                if settled_abi is not None:
+                    settled_arms = tuple(settled_abi.physical_alternatives)
+                    if len(settled_arms) != 1 or settled_arms[0].storage != "span":
+                        continue
+                    from .identity_concordance import (
+                        committed_sequence_contract as _late_committed,
+                    )
+                    if _late_committed(str(symbol), sequence_id) is None:
+                        continue
+                    # The arm and the SSA row describe one resident.  An arm
+                    # sourced from a ``parameter_annotation`` cell is a
+                    # declared parameter's own value: its physical kind is
+                    # the parameter's ProgramABI declaration
+                    # (``parameter_abi_kind``, where the SSA row posts
+                    # ``span``), so SEQUENCE_CONTRACT does not restate it.
+                    if any(
+                        getattr(cell.page, "name", cell.page) == "parameter_annotation"
+                        for cell in settled_arms[0].source_cells
+                    ) or any(
+                        # A value with no producing edge (an input, or the
+                        # literal a callsite specialization bound to the
+                        # formal: in the specialized copy a ``const`` with
+                        # in_degree 0 and no binding_kind) is the
+                        # parameter's own value, whose kind belongs to
+                        # parameter_abi_kind; a resident derived inside the
+                        # function is the one SEQUENCE_CONTRACT restates.
+                        int(data.get("value_id", node_id)) == sequence_id
+                        and graph_obj.in_degree(node_id) == 0
+                        for node_id, data in graph_obj.nodes(data=True)
+                    ):
+                        continue
+                    from dataclasses import replace as _replace
+                    contract_cell = late_book.latest_ref(
+                        _LATE_SEQUENCE_CONTRACT, (str(symbol), sequence_id),
+                    )
+                    arm = _replace(
+                        settled_arms[0], storage="sequence",
+                        source_cells=tuple(dict.fromkeys((
+                            *settled_arms[0].source_cells, *((contract_cell,) if contract_cell is not None else ()),
+                        ))),
+                    )
+                    fact = _LateValueTypeABIFact(
+                        settled_abi.alternatives, settled_abi.tags, (arm,),
+                    )
+                    row = (tuple(late_type_scope), sequence_id)
+                    incumbent = late_book.latest_ref(_LATE_VALUE_TYPE_ABI, row)
+                    late_book.post(
+                        _LATE_VALUE_TYPE_ABI, row, fact,
+                        stage=SHELL_HANDOFF,
+                        provenance=_LateDerived(tuple(dict.fromkeys(cell for cell in (
+                            incumbent,
+                            _identity_cell(graph_obj, sequence_id),
+                            late_book.latest_ref(
+                                _LATE_SOURCE_VALUE_CLASS,
+                                (late_numeric_scope, sequence_id),
+                            ),
+                            *arm.source_cells,
+                        ) if cell is not None))),
+                        mode=Mode.REVISE,
+                    )
+                    native_value_type_abi[sequence_id] = fact
                     continue
                 class_row = (late_numeric_scope, sequence_id)
                 class_cell = late_book.latest_ref(
@@ -29550,21 +29613,6 @@ def _class_surface_ssa_program(
                 ),
                 table_stores=table_stores,
                 table_deletions=table_deletions,
-                # The table version each keyed delete reads (its ``base``).
-                table_deletion_bases={
-                    int(data.get("value_id", node_id)): int(
-                        graph_obj.nodes[base].get("value_id", base)
-                    )
-                    for node_id, data in graph_obj.nodes(data=True)
-                    if str(data.get("type") or "") == "DelItem"
-                    for base in (next((
-                        int(parent)
-                        for parent, role in data.get("parents") or ()
-                        if str(role) == "base" and int(parent) in graph_obj
-                    ), None),)
-                    if base is not None
-                },
-                table_deletion_held_ids=_held_table_delete_ids(graph),
                 retained_sequence_ids=retained_sequence_ids,
                 nested_sequence_ids=nested_sequence_ids,
                 nested_tensor_sequence_ids=nested_tensor_sequence_ids,
@@ -30203,6 +30251,24 @@ def _class_surface_ssa_program(
                         ),
                         "lowering": "writable-sequence-arena",
                     })
+
+                if (
+                    attributes.get("producer_kind")
+                    == "sequence_materialization"
+                    and attributes.get("aggregate_kind") == "array"
+                    and descriptor is not None
+                    and descriptor.writable
+                    and attributes.get("extraction_identity") is not None
+                ):
+                    extraction_materializations.append({
+                        "source_node_id": int(node_id),
+                        "source_sequence_id": sequence_id,
+                        "extraction_identity": str(
+                            attributes["extraction_identity"]
+                        ),
+                        "lowering": "writable-sequence-arena",
+                    })
+
             extraction_materializations.extend(
                 dict(record)
                 for record in root_sequence_materializations
@@ -32854,8 +32920,13 @@ def _class_surface_ssa_program(
                         f"operand:{reduction_operands[0]}",
                     ))
                     return None
+                if not operand.dtype:
+                    raise ValueError(
+                        f"structural {operation} %t{value_id}: operand "
+                        f"%t{int(operand.id)} has no recorded dtype"
+                    )
                 result = SSAValue(
-                    value_id, dtype=operand.dtype or "float64", shape=(),
+                    value_id, dtype=operand.dtype, shape=(),
                 )
                 insertions.append(Instr(
                     operation, [operand], result,
@@ -36587,8 +36658,9 @@ def _class_surface_ssa_program(
                                 (
                                     "int64"
                                     if nested_field.get("value_tensor")
-                                    else str(
-                                        nested_field.get("dtype") or "float64"
+                                    else _recorded_field_dtype(
+                                        nested_field,
+                                        "nested mapping field values column",
                                     )
                                 ),
                                 1,
@@ -37665,7 +37737,9 @@ def _class_surface_ssa_program(
                         leaf_path, leaf_storage, leaf_declaration_cell,
                     ))
                     continue
-                leaf_dtype = str(leaf_field.get("dtype") or "float64")
+                leaf_dtype = _recorded_field_dtype(
+                    leaf_field, f"record leaf {leaf_name!r}",
+                )
                 leaf_mutable = bool(leaf_field.get("mutable", False))
                 column_shape = (
                     () if row_count is None
@@ -38706,7 +38780,9 @@ def _class_surface_ssa_program(
                                 (
                                     "int64"
                                     if field.get("value_tensor")
-                                    else str(field.get("dtype") or "float64")
+                                    else _recorded_field_dtype(
+                                        field, "mapping field values column",
+                                    )
                                 ),
                                 1,
                             ),
@@ -40531,7 +40607,9 @@ def _class_surface_ssa_program(
                         (
                             "values", SSARecordFieldStorage.SPAN,
                             int(sequence.column_value_ids[value_columns[0]]),
-                            str(field.get("dtype") or "float64"), 1,
+                            _recorded_field_dtype(
+                                field, "mapping field values column",
+                            ), 1,
                         ),
                     )
                     for part_name, part_storage, part_id, part_dtype, rank in (
@@ -42551,7 +42629,7 @@ def _class_surface_ssa_program(
                     value_dtype = str(parts["values"].dtype or "unknown")
                     keyed_helper_dtypes = (
                         ("int64", None), (value_dtype, None),
-                        ("int64", (1,)), ("int64", None),
+                        ("int64", None), ("int64", None),
                         ("int", (1,)), ("int64", None),
                     )
                     if sequence_operation == "contains":
@@ -45932,6 +46010,9 @@ def _class_surface_ssa_program(
                     {} if caller_node is None
                     else caller_node.get("attributes") or {}
                 )
+                from .glsl_deployment_strategy import (
+                    loop_carried_initial_at_call as _loop_initial_at_call,
+                )
                 if (
                     caller_node is not None
                     and str(caller_node.get("type")) in {
@@ -45940,6 +46021,10 @@ def _class_surface_ssa_program(
                     and (
                         "value" in caller_attributes
                         or "constant" in caller_node
+                    )
+                    and not _loop_initial_at_call(
+                        caller_graph, planned_call.callsite_id,
+                        caller_value_id,
                     )
                 ):
                     frame_bindings.append((
@@ -46775,16 +46860,29 @@ def _class_surface_ssa_program(
     def frame_fixed_point_digest() -> str:
         """Fingerprint every mutable ledger governed by the frame pass."""
 
+        import io
         import pickle
+        import types
         payload = (
             all_functions,
             all_record_tables,
             all_sequence_tables,
             call_records,
         )
-        return hashlib.sha256(
-            pickle.dumps(payload, protocol=5)
-        ).hexdigest()
+
+        class _LedgerPickler(pickle.Pickler):
+            # A retained source class keeps its defining module's lexical
+            # bindings (``math`` for ``Precision``) on the ClassDef the
+            # record-class page holds. A module is immutable here and is
+            # named by its import path, so the digest records the name.
+            def persistent_id(self, value):
+                if isinstance(value, types.ModuleType):
+                    return ("module", value.__name__)
+                return None
+
+        buffer = io.BytesIO()
+        _LedgerPickler(buffer, protocol=5).dump(payload)
+        return hashlib.sha256(buffer.getvalue()).hexdigest()
 
     frame_states = {frame_fixed_point_digest(): 0}
     frame_guard = BoundedFixedPoint(
@@ -47954,7 +48052,29 @@ def _class_surface_ssa_program(
                                 # A scalar native call publishes through its
                                 # own result value; rebind the call itself.
                                 for spliced in reversed(sequence):
-                                    if spliced.op == "Call" and spliced.res is not None:
+                                    # A frame-aliased call's result IS its
+                                    # caller operand (the returned formal's
+                                    # storage).  A marker naming a DIFFERENT
+                                    # id (the record handle) is not a second
+                                    # definition of it; a marker naming the
+                                    # call's own semantic result is its
+                                    # identity and is retained.
+                                    aliased_elsewhere = (
+                                        spliced.attributes.get(
+                                            "result_aliases_frame"
+                                        )
+                                        and spliced.attributes.get(
+                                            "semantic_result_id"
+                                        ) is not None
+                                        and int(spliced.attributes[
+                                            "semantic_result_id"
+                                        ]) != int(marker_result.id)
+                                    )
+                                    if (
+                                        spliced.op == "Call"
+                                        and spliced.res is not None
+                                        and not aliased_elsewhere
+                                    ):
                                         spliced.res = retain_result(marker_result, spliced.res)
                                         values[int(marker_result.id)] = (
                                             marker_result
@@ -50932,6 +51052,18 @@ def _class_surface_ssa_program(
                                         ),
                                     },
                                 )
+                                # Program: ``t = [n, 1] if n > 2 else [5, 6]``
+                                # passed to a callee.  Wrong record: this
+                                # restored occurrence took the callee formal's
+                                # provisional shape () while the lease's
+                                # ``ssa_value`` row already published (2,).
+                                # Rule: an occurrence is a view of its row.
+                                _posted = _posted_ssa_value_fact(
+                                    caller, int(source),
+                                )
+                                if _posted is not None:
+                                    value.dtype = _posted.dtype
+                                    value.shape = tuple(_posted.shape or ())
                                 caller.args.append(value)
                                 values[int(source)] = value
                             if value is None:
@@ -51063,6 +51195,33 @@ def _class_surface_ssa_program(
                             result = call_arguments[
                                 int(aliased_return_argument_index)
                             ]
+                            # Program: ``def keep(m): m.v = 0.5; return m``
+                            # called as ``keep(metrics)``.  Wrong record: the
+                            # call record's result binding named the semantic
+                            # record handle (callee 0 -> caller 1) while the
+                            # call's result is the returned formal's caller
+                            # storage (formal 1 -> caller 3), a pair no record
+                            # held, so the frame-aliased projection refused.
+                            # Rule: when the live Ret value is a formal, the
+                            # record carries that exact pair beside the
+                            # handle pair.
+                            aliased_result_pair = (
+                                int(callee.args[
+                                    int(aliased_return_argument_index)
+                                ].id),
+                                int(caller_result_id),
+                            )
+                            if aliased_result_pair not in tuple(
+                                (int(a), int(b))
+                                for a, b in record.result_bindings
+                            ):
+                                record = replace(
+                                    record,
+                                    result_bindings=(
+                                        *record.result_bindings,
+                                        aliased_result_pair,
+                                    ),
+                                )
                             callee_sequence_table = all_sequence_tables.get(
                                 str(record.callee_symbol)
                             )
@@ -51459,6 +51618,24 @@ def _class_surface_ssa_program(
                         },
                     )
                     forwarded_frame_result = _retain_forwarded_aggregate_storage(native_call, callee)
+                    # The linker has revised this call's record in flight
+                    # (result bindings re-keyed to the callee's semantic
+                    # outputs, the returned formal's pair added).  The
+                    # frame-aliased projection reads the book, so publish the
+                    # revision first; its reference then proves the binding.
+                    published_row = call_records[caller_symbol]
+                    published_at = [
+                        index for index, item in enumerate(published_row)
+                        if int(item.callsite_id) == int(record.callsite_id)
+                        and str(item.callee_symbol) == str(record.callee_symbol)
+                    ]
+                    if len(published_at) == 1 and published_row[published_at[0]] != record:
+                        published_row.replace(
+                            published_at[0], record,
+                            sources=_frame_cells(published_row[published_at[0]].cell),
+                            stage=FRAME_BINDING,
+                        )
+                        record = call_records[caller_symbol][published_at[0]]
                     _refresh_frame_aliased_result(native_call, callee, record=record)
                     aggregate_unpack = []
                     if returns_aggregate and result is not None and not forwarded_frame_result:
@@ -54521,13 +54698,23 @@ def _class_surface_ssa_program(
                     if formal.dtype in {None, "unknown"} and fed.dtype:
                         formal.dtype = fed.dtype
                     if isinstance(formal_physical, dict):
+                        # Rule: a formal whose posted physical view is the
+                        # caller actual's scalar slot has that actual's
+                        # shape; the planner's graph extent (1,) would
+                        # contradict the storage this row now posts.
+                        formal_shape = tuple(formal.shape or ())
+                        if (formal_physical.get("storage") == "scalar"
+                                and formal_physical.get("rank") == 0
+                                and not tuple(fed.shape or ())):
+                            formal_shape = ()
                         _revise_ssa_value(
                             callee, formal.id, dtype=formal.dtype,
-                            shape=tuple(formal.shape or ()),
+                            shape=formal_shape,
                             stage=FRAME_BINDING,
                             sources=(_frame_value_cell(caller, fed.id),),
                             physical=formal_physical,
                         )
+                        formal.shape = formal_shape
 
     # Exact writable ProgramABI outputs use an in/out calling convention: the
     # caller-owned formal is also the storage defined by the region's producer.
@@ -58168,9 +58355,14 @@ def _class_surface_ssa_program(
                 int(extent) for extent in (argument.shape or ())
                 if isinstance(extent, int) or str(extent).isdigit()
             )
+            if not argument.dtype:
+                raise ValueError(
+                    f"declared call storage for %t{int(argument.id)} "
+                    f"(callee {owner!r}) has no recorded dtype"
+                )
             declared_storage.append({
                 "value_id": int(argument.id),
-                "dtype": str(argument.dtype or "float64"),
+                "dtype": str(argument.dtype),
                 "shape": shape,
                 "callee": str(owner),
                 "callsite_id": accounting.get("callsite_id"),
@@ -59336,6 +59528,14 @@ def _class_surface_ssa_program(
         late_type_conflicts
     )
     lowered_module.metadata["late_result_type_rounds"] = late_result_rounds
+
+    # Structural None has a semantic dtype only; post its zero-sentinel cell
+    # once every pass that can create or retype a None value has run.
+    from .ssa_none_sentinel import declare_none_sentinel_carriers
+
+    lowered_module.metadata["none_sentinel_carriers"] = (
+        declare_none_sentinel_carriers(lowered_module.functions)
+    )
 
     # Call-result settlement is the last writer of physical scalar dtypes.
     # A nested child-table element can therefore become concrete only here,
@@ -61203,6 +61403,9 @@ def _lower_ast_source_to_ssa_impl(
     # Membership in an inline numeric literal becomes a disjunction before
     # the short-circuit normalization nests it.
     chained_comparison_receipts.extend(_normalize_constant_membership(tree))
+    chained_comparison_receipts.extend(
+        _normalize_sequence_replication_display(tree)
+    )
     chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
     chained_comparison_receipts.extend(_normalize_mapping_get(tree))
     chained_comparison_receipts.extend(_normalize_set_constructor(tree))
@@ -61276,6 +61479,21 @@ def _lower_ast_source_to_ssa_impl(
         features = frozenset(map(str, descriptor.features))
         if features == frozenset({"precision"}):
             return None
+
+        def _numeric_descriptor_element(descriptor: Any) -> str:
+            # A precision numeral's coefficients are limbs, and the limb
+            # element is stated by the precision library itself.
+            if "precision" in set(map(str, descriptor.features)):
+                from ..common.tensors.extended_precision import (
+                    limb_element_name,
+                )
+                return limb_element_name(descriptor.element_type)
+            if not descriptor.element_type:
+                raise ValueError(
+                    f"numeric descriptor {descriptor.type_name!r} records no "
+                    "element_type for its coefficient fields"
+                )
+            return str(descriptor.element_type)
         # A precision numeral's coefficient leaves are Precision values of
         # the numeral's width: each leaf carries that many limbs.
         leaf_width = (
@@ -61306,7 +61524,7 @@ def _lower_ast_source_to_ssa_impl(
                 fields = {
                     name: {
                         "storage": "scalar",
-                        "dtype": str(descriptor.element_type or "float64"),
+                        "dtype": _numeric_descriptor_element(descriptor),
                         "rank": 0,
                         "mutable": False,
                         **leaf_width,
@@ -61328,7 +61546,7 @@ def _lower_ast_source_to_ssa_impl(
             fields = {
                 name: {
                     "storage": "scalar",
-                    "dtype": str(descriptor.element_type or "float64"),
+                    "dtype": _numeric_descriptor_element(descriptor),
                     "rank": 0,
                     "mutable": False,
                     **leaf_width,
@@ -61616,6 +61834,9 @@ def _lower_ast_source_to_ssa_impl(
         )
         chained_comparison_receipts.extend(
             _normalize_constant_membership(discovered_tree)
+        )
+        chained_comparison_receipts.extend(
+            _normalize_sequence_replication_display(discovered_tree)
         )
         chained_comparison_receipts.extend(
             _normalize_builtin_divmod(discovered_tree)

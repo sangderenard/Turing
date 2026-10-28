@@ -87,6 +87,10 @@ def _publish_type(function, value, winner, decision, carried=None):
     )
     return changed
 
+def _recorded_storage_type(function, value):
+    recorded = _recorded_type(function, value)
+    dtype = recorded[3] or recorded[0]
+    return (dtype, recorded[1], recorded[2])
 
 def _storage_type(value):
     # Logical Boolean/integer tensors can deliberately use double-valued
@@ -121,6 +125,52 @@ def _value_cells(*pairs):
         if cell not in cells:
             cells.append(cell)
     return tuple(cells)
+
+
+def _refresh_scope_occurrences(functions):
+    """Make every occurrence of a settled identity a view of its row.
+
+    Program: ``any([x > n for x in xs])`` beside a mutating call
+    (c244/c269/c283).  Wrong record: a planned region and its control
+    function share one ``ssa_value`` scope, so the region's publication of
+    the list's settled ``(3,)`` revised the row both functions read, while
+    ``publish_ssa_value_type`` refreshed only the publishing function's own
+    occurrences; the control function kept the provisional ``()`` and the
+    final concordance refused the disagreement.  Rule: a published type is
+    the identity's, so each same-scope function's occurrences take the row's
+    dtype and shape (the rule ``publish_ssa_value_type`` states)."""
+    from .concordance_declarations import SSA_VALUE, SSAValueFact
+    from .identity_concordance import current_identity_book
+    from .ssa_record_return_state import accepted_ssa_component, function_scope_of
+
+    book = current_identity_book()
+    for function in functions.values():
+        if accepted_ssa_component(function):
+            continue
+        scope = function_scope_of(function)
+        occurrences = [
+            *function.args,
+            *(
+                value
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for value in (*instruction.args, instruction.res)
+                if value is not None
+            ),
+        ]
+        for value in occurrences:
+            cell = book.latest_ref(SSA_VALUE, (scope, int(value.id)))
+            if cell is None:
+                continue
+            fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
+            if (
+                isinstance(fact, SSAValueFact)
+                and fact.dtype not in (None, "", "unknown")
+                and (value.dtype, tuple(value.shape or ()))
+                != (fact.dtype, tuple(fact.shape or ()))
+                and value.dtype == fact.dtype
+            ):
+                value.shape = tuple(fact.shape or ())
 
 
 def settle_call_result_types(functions, emit_outputs, function_values):
@@ -164,12 +214,19 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 and recorded[0] not in {None, '', 'unknown'}
                 and complete_shape
             )
-            ledger.propose((function.name, int(value.id)),
-                'physical_storage' if physical else 'provisional',
-                ('initial', recorded), after=recorded,
-                sources=_value_cells((function, value)))
-            _publish_type(function, value, recorded,
-                          ledger.decision_cell((function.name, int(value.id))))
+            identity = (function.name, int(value.id))
+            sources = _value_cells((function, value))
+
+            ledger.propose(
+                identity,
+                'provisional',
+                ('existing_concordance_state', recorded),
+                after=recorded,
+                sources=sources,
+            )
+
+            # Do not republish the resident state here.
+            # It is already the concordance-backed state of this value.
 
     capture_planning_cells = {}
     # The posted storage/rank/arena of each identity's accepted callee-output
@@ -385,60 +442,41 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             source_type = _recorded_type(callee, source)
             if source_type[0] in {None, '', 'unknown'} and not source_type[1] and source_type[2] is None:
                 continue
-            identity = (caller.name, int(target.id))
-            source_priority = ledger.incumbent_priority((callee.name, int(source.id))) or 1
-            rule = 'physical_storage' if source_priority == 3 else 'callee_output'
-            previous_priority = ledger.incumbent_priority(identity)
             source_cells = _value_cells((callee, source), (caller, target))
-            accepted = ledger.propose(identity, rule,
-                (callee.name, int(source.id), source_type), before=_recorded_type(caller, target), after=source_type,
-                sources=source_cells + capture_planning_cells.get(id(target), ()) + tuple(
-                    cell for cell in (
-                        ledger.decision_cell((callee.name, int(source.id))),
-                    ) if cell is not None
-                ), revision_source=source_cells[0])
-            winner = ledger.incumbent_target(identity)
-            if accepted:
-                carried_physical[identity] = _posted_physical(callee, source)
-            if _publish_type(caller, target, winner, ledger.decision_cell(identity),
-                             carried_physical.get(identity)):
+            source_physical = _posted_physical(callee, source)
+            if _publish_type(caller, target, source_type, source_cells[0],
+                             source_physical):
                 changed = True
-            if ledger.incumbent_priority(identity) != previous_priority:
-                changed = True
-            if accepted:
-                target.accounting = {**dict(target.accounting or {}),
-                    'ssa_call_result_from': (callee.name, int(source.id))}
-                # Rule: accounting is a view of the target's posted row; a
-                # source's accounting dtype with no row behind it is not
-                # copied onto the target.
-                physical_dtype = _row_physical(caller, target).get('physical_dtype')
-                if physical_dtype and previous_priority != 3:
-                    target.accounting['physical_dtype'] = physical_dtype
-                    target.accounting['physical_dtype_provenance'] = (
-                        'callee_output', callee.name, int(source.id))
-            elif winner == source_type:
-                target.accounting = dict(target.accounting or {})
-                target.accounting.setdefault('ssa_call_result_from', (callee.name, int(source.id)))
-            # A rejected physical incumbent need not have a callee origin.
-            # Only accepted/equivalent result bindings authorize downstream
-            # consumers to propagate that origin.
-            if (accepted or winner == source_type) and (target.accounting or {}).get('ssa_call_result_from'):
-                exact_values.add(id(target))
+            target.accounting = {**dict(target.accounting or {}),
+                'ssa_call_result_from': (callee.name, int(source.id))}
+            # Rule: accounting is a view of the target's posted row; a
+            # source's accounting dtype with no row behind it is not
+            # copied onto the target.
+            physical_dtype = _row_physical(caller, target).get('physical_dtype')
+            if physical_dtype is not None:
+                target.accounting['physical_dtype'] = physical_dtype
+                target.accounting['physical_dtype_provenance'] = (
+                    'callee_output', callee.name, int(source.id))
+            exact_values.add(id(target))
 
+    _refresh_scope_occurrences(functions)
     conflicts = tuple(dict(caller=caller.name, value_id=int(target.id),
         retained=_type(target)[:3], retained_storage=_storage_type(target),
+        retained_recorded=_recorded_type(caller, target),
+        retained_physical=_row_physical(caller, target),
         callee=callee.name, callee_value_id=int(source.id),
-        proposed=_type(source)[:3], proposed_storage=_storage_type(source))
+        proposed=_type(source)[:3], proposed_storage=_storage_type(source),
+        proposed_recorded=_recorded_type(callee, source),
+        proposed_physical=_row_physical(callee, source))
         for caller, target, callee, source in bindings()
-        if source.dtype not in {None, '', 'unknown'}
-        and not equivalent_physical_layout(_storage_type(source), _storage_type(target))
-        # The ledger's absence-of-claim rule, for storage: a pointer whose
-        # row posts no element type (the callee's list handle in A6 probe
-        # c985) does not contradict the same pointer whose typed loads
-        # posted int64 (the caller's arena).  Only two recorded element
-        # types can disagree.
+        if _recorded_type(callee, source)[0] not in {None, '', 'unknown'}
+        and not equivalent_physical_layout(
+            _recorded_storage_type(callee, source),
+            _recorded_storage_type(caller, target),
+        )
         and not (
-            _type(source)[:3] == _type(target)[:3]
+            _recorded_type(callee, source)[:3]
+            == _recorded_type(caller, target)[:3]
             and _recorded_type(callee, source)[3] is None
         ))
     return exact_values, ledger.events, conflicts, rounds

@@ -920,37 +920,65 @@ def test_loop_carried_initializer_is_region_capture_not_body_constant():
     assert planned_region.captures == (1,)
     assert [line.outputs for line in planned_region.items] == [(2,)]
 
-def test_region_pursues_structural_constant_expression_captures_into_source():
-    process = nx.DiGraph()
-    process.add_node(0, type="Constant", op="const", attributes={"value": 2})
-    process.add_node(
-        1, type="neg", op="neg", parents=((0, "operand"),), attributes={}
+_INTEGER_ABI_CONTRACT = "extraction_contracts/program_extraction.yaml"
+
+
+def _native_integer_call(tmp_path, source, arguments):
+    """Compile ``source`` (function ``f`` of int64 scalars) to C and run it."""
+    import numpy as np
+
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    policy = ExtractionContract(_INTEGER_ABI_CONTRACT).with_program_abi({
+        "records": {},
+        "bindings": [],
+        "values": [
+            {
+                "function": "f", "parameter": name, "storage": "scalar",
+                "dtype": "int64", "rank": 0, "python_type": "builtins.int",
+            }
+            for name in arguments
+        ],
+    })
+    module, outputs, exports = lower_ast_source_to_ssa(
+        source, "f", name="x", extraction_contract=policy,
+        progress=lambda _message: None,
     )
-    process.add_node(2, type="Input", op="input", attributes={"binding_name": "x"})
-    process.add_node(
-        3,
-        type="transpose",
-        op="transpose",
-        parents=((2, "operand"), (1, "arg0")),
-        attributes={"tensor": "transpose"},
-    )
-    process.add_edges_from(((0, 1), (1, 3), (2, 3)))
-    region = nx.DiGraph()
-    region.graph.update({"deployment_nodes": (3,), "deployment_inputs": (2, 1)})
-    shell = SimpleNamespace(
-        process_graph=SimpleNamespace(G=process),
-        dispatch_subgraphs=(SimpleNamespace(G=region),),
-        callsite_function_shells={},
-        loop_plans=(),
-        shell_control_program=None,
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path)
+    names = dict(module.functions[exports[0]].metadata["parameter_names"])
+    execution = artifact.prepare_execution({
+        names[name]: np.array([value], dtype=np.int64)
+        for name, value in arguments.items()
+    }).run()
+    result = outputs[exports[0]][0]
+    return execution.buffers[result.id].item(), result.dtype
+
+
+def _assert_native_matches_python_int(tmp_path, source, arguments):
+    namespace = {}
+    exec(source, namespace)
+    expected = namespace["f"](**arguments)
+    native, dtype = _native_integer_call(tmp_path, source, arguments)
+    assert type(expected) is int
+    assert dtype == "int64"
+    assert native == expected
+    assert type(native) is int
+
+
+def test_region_pursues_structural_constant_expression_captures_into_source(
+    tmp_path,
+):
+    source = (
+        "def f(x, y):\n"
+        "    k = 2\n"
+        "    return x * (-k) + y\n"
     )
 
-    planned_region = _build_shell_hierarchy_plan(shell).items[0]
-
-    assert planned_region.captures == (2,)
-    assert planned_region.items[0].opcode == "Const"
-    assert planned_region.items[0].outputs == (1,)
-    assert dict(planned_region.items[0].attributes)["value"] == -2
+    _assert_native_matches_python_int(tmp_path, source, {"x": 5, "y": 3})
 
 
 def test_structural_constant_state_does_not_use_python_object_sentinel():
@@ -1001,51 +1029,18 @@ def test_structural_none_constant_is_distinct_from_unavailable_state():
     assert dict(planned_region.items[0].attributes)["value"] == (None, 2)
 
 
-def test_structural_constant_capture_walk_is_iterative_for_deep_source():
-    process = nx.DiGraph()
-    process.add_node(0, type="Constant", op="const", attributes={"value": 7})
-    # Above CPython's default recursion limit: the former recursive evaluator
-    # fails here, while the explicit work stack remains bounded by heap memory.
+def test_structural_constant_capture_walk_is_iterative_for_deep_source(
+    tmp_path,
+):
+    # Above CPython's default recursion limit: a recursive evaluator of the
+    # nested constant expression fails here.
     depth = 1050
-    for node_id in range(1, depth + 1):
-        process.add_node(
-            node_id,
-            type="pos",
-            op="pos",
-            parents=((node_id - 1, "operand"),),
-            attributes={},
-        )
-        process.add_edge(node_id - 1, node_id)
-    data_id = depth + 1
-    result_id = depth + 2
-    process.add_node(
-        data_id, type="Input", op="input", attributes={"binding_name": "x"}
-    )
-    process.add_node(
-        result_id,
-        type="reshape",
-        op="reshape",
-        parents=((data_id, "operand"), (depth, "arg0")),
-        attributes={"tensor": "reshape"},
-    )
-    process.add_edges_from(((data_id, result_id), (depth, result_id)))
-    region = nx.DiGraph()
-    region.graph.update({
-        "deployment_nodes": (result_id,),
-        "deployment_inputs": (data_id, depth),
-    })
-    shell = SimpleNamespace(
-        process_graph=SimpleNamespace(G=process),
-        dispatch_subgraphs=(SimpleNamespace(G=region),),
-        callsite_function_shells={},
-        loop_plans=(),
-        shell_control_program=None,
+    source = (
+        "def f(x):\n"
+        f"    return x + {'+' * depth}7\n"
     )
 
-    planned_region = _build_shell_hierarchy_plan(shell).items[0]
-
-    assert planned_region.captures == (data_id,)
-    assert dict(planned_region.items[0].attributes)["value"] == 7
+    _assert_native_matches_python_int(tmp_path, source, {"x": 5})
 
 
 def test_feedback_capture_is_not_misclassified_as_constant_source():
@@ -1831,39 +1826,15 @@ def test_hierarchical_control_survives_value_alias_missing_from_table():
     assert updated != initial
 
 
-def test_python_integer_chain_is_int64_before_backend_lowering():
-    region = PlanClosure(
-        "region_0",
-        captures=(1, 2),
-        items=(
-            PlanLine.create(
-                "int", inputs=(1,), outputs=(3,), input_roles=("arg:0",),
-            ),
-            PlanLine.create("Const", outputs=(4,), attributes={"value": 1}),
-            PlanLine.create("Sub", inputs=(3, 4), outputs=(5,)),
-            PlanLine.create("BitLength", inputs=(5,), outputs=(6,)),
-            PlanLine.create("Shl", inputs=(4, 6), outputs=(7,)),
-            PlanLine.create("min", inputs=(2, 7), outputs=(8,)),
-        ),
-        value_shapes=tuple(
-            (
-                value_id, (),
-                "int64" if value_id in {1, 2} else "float64",
-            )
-            for value_id in range(1, 9)
-        ),
+def test_python_integer_chain_is_int64_before_backend_lowering(tmp_path):
+    source = (
+        "def f(n, cap):\n"
+        "    m = int(n) - 1\n"
+        "    return min(cap, 1 << m.bit_length())\n"
     )
 
-    instructions = plan_region_to_ssa_instrs(region)
-    dtypes = {
-        int(instruction.res.id): instruction.res.dtype
-        for instruction in instructions if instruction.res is not None
-    }
-
-    assert dtypes == {
-        3: "int64", 4: "int64", 5: "int64", 6: "int64",
-        7: "int64", 8: "int64",
-    }
+    for arguments in ({"n": 10, "cap": 100}, {"n": 10, "cap": 8}):
+        _assert_native_matches_python_int(tmp_path, source, arguments)
 
 
 def test_lowercase_finiteness_predicate_is_boolean_before_backend_lowering():

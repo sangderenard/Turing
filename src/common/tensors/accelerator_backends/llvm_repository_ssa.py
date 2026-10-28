@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import re
 from typing import Any
 
+from ....transmogrifier.dtype_layout import by_llvm_type
 from ....transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -98,6 +99,22 @@ _FLOAT_PREDICATES = {
 }
 
 
+def _layout_dtype(llvm_type: Any) -> str:
+    """The layout name of an LLVM scalar spelling.
+
+    Program: any imported repository kernel (``binary_double``).  Wrong
+    record: its values carried LLVM's own spelling (``double``, ``i64``) as
+    ``SSAValue.dtype`` while every lowered value of the same width carries
+    the layout name (``float64``, ``int64``), so the concordance saw one
+    value under two dtype spellings.  Rule: the importer states the
+    declared layout name; a type with no scalar layout (vector, struct,
+    ``void``) keeps its LLVM spelling.
+    """
+
+    layout = by_llvm_type(llvm_type)
+    return str(llvm_type) if layout is None else layout.name
+
+
 @dataclass(frozen=True, order=True)
 class LLVMRepositorySSAShortfall:
     function: str
@@ -167,7 +184,7 @@ class _FunctionImporter:
         arguments = []
         for argument in self.llvm_function.arguments:
             value = self.fresh(
-                str(argument.type), "argument", str(argument.name),
+                _layout_dtype(argument.type), "argument", str(argument.name),
             )
             self.values[self._value_key(argument)] = value
             arguments.append(value)
@@ -192,7 +209,8 @@ class _FunctionImporter:
                 if str(instruction.type) == "void":
                     continue
                 self.values[self._value_key(instruction)] = self.fresh(
-                    str(instruction.type), "instruction", str(instruction.name),
+                    _layout_dtype(instruction.type), "instruction",
+                    str(instruction.name),
                 )
         return arguments
 
@@ -203,7 +221,7 @@ class _FunctionImporter:
         if key in self.constants:
             return
         value = self.fresh(
-            str(operand.type), "constant", str(operand).strip(),
+            _layout_dtype(operand.type), "constant", str(operand).strip(),
         )
         self.constants[key] = value
         self.constant_attributes[value.id] = {
@@ -221,7 +239,7 @@ class _FunctionImporter:
         key = ("constant_int", spelled)
         if key in self.constants:
             return
-        value = self.fresh(str(llvm_type), "constant", spelled)
+        value = self.fresh(_layout_dtype(llvm_type), "constant", spelled)
         self.constants[key] = value
         self.constant_attributes[value.id] = {"llvm_literal": spelled}
 
@@ -272,7 +290,7 @@ class _FunctionImporter:
             return self.constants[key]
         # Global storage and declarations are ABI roots, not instructions in
         # the current function.  Preserve them as explicit Load arguments.
-        value = self.fresh(str(operand.type), "global", str(operand.name))
+        value = self.fresh(_layout_dtype(operand.type), "global", str(operand.name))
         self.values[key] = value
         return value
 
@@ -412,7 +430,7 @@ class _FunctionImporter:
             )
             if not is_last:
                 self.blocks[next_name] = BasicBlock(next_name)
-            condition = self.fresh("i1", "switch_condition", next_name)
+            condition = self.fresh("bool", "switch_condition", next_name)
             current.instrs.extend((
                 Instr(
                     Handler.Eq.value,
@@ -470,10 +488,11 @@ class _FunctionImporter:
             "llvm_argument_names": tuple(
                 str(argument.name) for argument in self.llvm_function.arguments
             ),
-            "llvm_return_dtype": return_type,
+            "llvm_return_dtype": _layout_dtype(return_type),
         }
         if return_type != "void":
-            metadata["return_value"] = self.fresh(return_type, "return", "")
+            metadata["return_value"] = self.fresh(
+                _layout_dtype(return_type), "return", "")
         # The kernel's source record, read by ``post_repository_kernel_identity``
         # in each compile book: the digest of its LLVM text and where every
         # value it numbered sits in it.  Provenance only; no decision reads it.
@@ -529,7 +548,7 @@ def import_llvm_to_repository_ssa(
                         len(origins), "argument", str(argument.name),
                     )
                     arguments.append(
-                        SSAValue(next_value_id, dtype=str(argument.type))
+                        SSAValue(next_value_id, dtype=_layout_dtype(argument.type))
                     )
                     next_value_id += 1
                 functions[name] = Function(

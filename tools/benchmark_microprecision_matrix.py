@@ -488,13 +488,31 @@ def _run_for_accuracy(
     count = len(points)
     x = np.zeros(count * width, dtype=np.float64)
     x[::width] = points
-    y = np.zeros(count * width, dtype=np.float64)
+    # Every limb of y starts as a NaN payload no arithmetic produces, so an
+    # output the kernel never wrote cannot pass for a result. A zero-filled
+    # y once let a core that published the limb COUNT instead of its limbs
+    # score as "passed" (a true p99 of 9e15 ulp, nothing flagged).
+    y = np.full(count * width, _UNWRITTEN, dtype=np.float64)
     output_id = int(core.roles["output"].id)
     execution = _prepare_native_execution(
         core.native, _feeds(core, width, x, y, count)
     )
     execution.run()
-    return np.asarray(execution.buffers[output_id]).ravel().copy()
+    produced = np.asarray(execution.buffers[output_id]).ravel().copy()
+    unwritten = int(np.count_nonzero(
+        produced.view(np.uint64) == np.float64(_UNWRITTEN).view(np.uint64)
+    ))
+    if unwritten:
+        raise RuntimeError(
+            f"the kernel never wrote {unwritten} of {produced.size} output "
+            f"limbs (width {width}, {count} elements)"
+        )
+    return produced
+
+
+#: A quiet NaN with a payload (0x7ff8_dead_beef_0001) that IEEE arithmetic
+#: never yields: operations on NaN keep a payload but do not invent one.
+_UNWRITTEN = np.uint64(0x7FF8DEADBEEF0001).view(np.float64)
 
 
 def _mp_function(name: str, mpmath):

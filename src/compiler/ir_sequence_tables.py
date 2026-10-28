@@ -4055,6 +4055,13 @@ def lower_table_store(
     capacity_check = builder.block("capacity_check")
     insert = builder.block("insert")
     full = builder.block("capacity_exhausted")
+    compact_header = builder.block("compact_header")
+    compact_body = builder.block("compact_body")
+    compact_copy = builder.block("compact_copy")
+    compact_latch = builder.block("compact_latch")
+    compact_done = builder.block("compact_done")
+    insert_compacted = builder.block("insert_compacted")
+    full_status = builder.block("capacity_exhausted_status")
     complete = builder.block("complete")
     # All sequence extent cells are declared int64. Keep their scan and
     # increment values int64 too; source call-type settlement otherwise
@@ -4142,25 +4149,93 @@ def lower_table_store(
             value_columns, value_dtypes, new_values, strict=True,
         )
     )
-    for column_id, dtype, value in inserted_columns:
-        address = builder.fresh("ptr")
-        builder.emit(insert, "GetElementPtr", [
-            SSAValue(column_id, dtype=dtype), length
-        ], address)
-        builder.emit(insert, "Store", [value, address])
-    if descriptor.live_flags_value_id is not None:
-        live_address = builder.fresh("ptr")
-        builder.emit(insert, "GetElementPtr", [
-            SSAValue(descriptor.live_flags_value_id, dtype="bool"), length
-        ], live_address)
-        builder.emit(insert, "Store", [one, live_address])
-    next_length = builder.fresh("int64")
-    builder.emit(insert, "Add", [length, one], next_length)
-    builder.emit(insert, "Store", [next_length, length_slot])
-    builder.emit(insert, "Store", [one, status_slot])
-    builder.branch(insert, complete)
-    builder.emit(full, "Store", [two, status_slot])
-    builder.branch(full, complete)
+
+    def emit_insert(block, slot):
+        for column_id, dtype, value in inserted_columns:
+            address = builder.fresh("ptr")
+            builder.emit(block, "GetElementPtr", [
+                SSAValue(column_id, dtype=dtype), slot
+            ], address)
+            builder.emit(block, "Store", [value, address])
+        if descriptor.live_flags_value_id is not None:
+            live_address = builder.fresh("ptr")
+            builder.emit(block, "GetElementPtr", [
+                SSAValue(descriptor.live_flags_value_id, dtype="bool"), slot
+            ], live_address)
+            builder.emit(block, "Store", [one, live_address])
+        next_length = builder.fresh("int64")
+        builder.emit(block, "Add", [slot, one], next_length)
+        builder.emit(block, "Store", [next_length, length_slot])
+        builder.emit(block, "Store", [one, status_slot])
+        builder.branch(block, complete)
+
+    emit_insert(insert, length)
+    # Program: ``d = {2: 5}; for i in range(n): d[1] = i; del d[1]`` (corpus
+    # c713).  Wrong record: a delete clears a live flag and keeps the row,
+    # and a store only appends, so every pass spent a fresh row against a
+    # bound that counts keys; the table reported "full" (code 75) with one
+    # live key.  Rule: a full table whose rows include dead ones closes up
+    # its live rows in order (row order is insertion order, so a re-stored
+    # key still lands last) and stores into the room that frees; with no
+    # dead row it is full.
+    if descriptor.live_flags_value_id is None:
+        builder.branch(full, full_status)
+    else:
+        builder.branch(full, compact_header)
+        row_index = builder.fresh("int64")
+        next_row = builder.fresh("int64")
+        write_index = builder.fresh("int64")
+        next_write = builder.fresh("int64")
+        builder.emit(compact_header, "Phi", [zero, next_row], row_index, attributes={
+            "incoming_blocks": (full.name, compact_latch.name)
+        })
+        builder.emit(compact_header, "Phi", [zero, next_write], write_index, attributes={
+            "incoming_blocks": (full.name, compact_latch.name)
+        })
+        scanning = builder.fresh("bool")
+        builder.emit(compact_header, "Lt", [row_index, length], scanning)
+        builder.cond(compact_header, scanning, compact_body, compact_done)
+        row_live_address = builder.fresh("ptr")
+        row_live = builder.fresh("bool")
+        builder.emit(compact_body, "GetElementPtr", [
+            SSAValue(descriptor.live_flags_value_id, dtype="bool"), row_index
+        ], row_live_address)
+        builder.emit(compact_body, "Load", [row_live_address], row_live)
+        builder.cond(compact_body, row_live, compact_copy, compact_latch)
+        for column in range(len(descriptor.column_value_ids)):
+            column_dtype = descriptor.column_dtypes[column]
+            source_address = builder.fresh("ptr")
+            target_address = builder.fresh("ptr")
+            moved = builder.fresh(column_dtype)
+            column_value = SSAValue(
+                descriptor.column_value_ids[column], dtype=column_dtype,
+            )
+            builder.emit(compact_copy, "GetElementPtr", [column_value, row_index], source_address)
+            builder.emit(compact_copy, "Load", [source_address], moved)
+            builder.emit(compact_copy, "GetElementPtr", [column_value, write_index], target_address)
+            builder.emit(compact_copy, "Store", [moved, target_address])
+        moved_live_address = builder.fresh("ptr")
+        builder.emit(compact_copy, "GetElementPtr", [
+            SSAValue(descriptor.live_flags_value_id, dtype="bool"), write_index
+        ], moved_live_address)
+        builder.emit(compact_copy, "Store", [one, moved_live_address])
+        copied_write = builder.fresh("int64")
+        builder.emit(compact_copy, "Add", [write_index, one], copied_write)
+        builder.branch(compact_copy, compact_latch)
+        builder.emit(compact_latch, "Phi", [write_index, copied_write], next_write, attributes={
+            "incoming_blocks": (compact_body.name, compact_copy.name)
+        })
+        builder.emit(compact_latch, "Add", [row_index, one], next_row)
+        builder.branch(compact_latch, compact_header)
+        builder.emit(compact_done, "Store", [write_index, length_slot])
+        compacted_room = builder.fresh("bool")
+        builder.emit(compact_done, "Lt", [
+            write_index, SSAValue(descriptor.capacity_value_id, dtype="int64")
+        ], compacted_room)
+        builder.cond(compact_done, compacted_room, insert_compacted, full_status)
+        emit_insert(insert_compacted, write_index)
+    builder.emit(full_status, "Store", [two, status_slot])
+    builder.branch(full_status, complete)
     builder.emit(complete, "Ret", [])
     name = function_name or f"ssa_sequence_{descriptor.sequence_id}_store"
     function = Function(
@@ -4954,15 +5029,54 @@ def lower_sequence_aggregate_constants(
     frame; the retained stores populate it on every invocation.
     """
 
-    arena_ids = {
-        int(descriptor.column_value_ids[0])
-        for table in sequence_tables.values()
-        for descriptor in table.sequences.values()
-        if descriptor.column_value_ids
-    }
-    if not arena_ids:
+    # Value ids are numbered per function, so an arena's declared dtype is
+    # keyed by (function, id); two descriptors of one function that declare
+    # different dtypes for one arena are a disagreement, never first-wins.
+    arena_dtypes: dict[tuple[str, int], str | None] = {}
+    for table_name, table in sequence_tables.items():
+        for descriptor in table.sequences.values():
+            if not descriptor.column_value_ids:
+                continue
+            declared = (
+                str(descriptor.column_dtypes[0])
+                if descriptor.column_dtypes
+                and str(descriptor.column_dtypes[0]) not in {"", "unknown"}
+                else None
+            )
+            key = (str(table_name), int(descriptor.column_value_ids[0]))
+            earlier = arena_dtypes.get(key)
+            if key in arena_dtypes and None not in (earlier, declared) and earlier != declared:
+                raise ValueError(
+                    f"lower_sequence_aggregate_constants: sequence arena "
+                    f"%t{key[1]} of {key[0]} is declared {earlier!r} and "
+                    f"{declared!r} by two sequence descriptors"
+                )
+            arena_dtypes[key] = declared if declared is not None else earlier
+    if not arena_dtypes:
         return
+
+    def arena_dtype(function_name: str, value: SSAValue) -> str:
+        # The arena's element type is proven by the Const's own annotation or
+        # by the sequence descriptor's declared first column; nothing else.
+        # 'unknown' is the absence of a dtype, not a dtype.
+        own = str(value.dtype or "")
+        proven = (
+            own if own not in {"", "unknown"}
+            else arena_dtypes.get((function_name, int(value.id)))
+        )
+        if not proven:
+            raise ValueError(
+                f"lower_sequence_aggregate_constants: sequence arena value "
+                f"%t{int(value.id)} has no proven element dtype (neither the "
+                f"aggregate Const nor its sequence descriptor declares one)"
+            )
+        return str(proven)
+
     for function in functions.values():
+        arena_ids = {
+            value_id for name, value_id in arena_dtypes
+            if name == function.name
+        }
         locally_initialized_arena_ids = {
             int(instruction.args[0].id)
             for block in function.blocks.values()
@@ -4993,7 +5107,7 @@ def lower_sequence_aggregate_constants(
                         # backend to print a Python container as one literal.
                         promoted[value_id] = SSAValue(
                             value_id,
-                            dtype=instruction.res.dtype or "unknown",
+                            dtype=arena_dtype(function.name, instruction.res),
                             accounting={
                                 "sequence_arena": True,
                                 "compile_time_initialized": True,
@@ -5005,7 +5119,7 @@ def lower_sequence_aggregate_constants(
                         continue
                     promoted[int(instruction.res.id)] = SSAValue(
                         int(instruction.res.id),
-                        dtype=instruction.res.dtype or "unknown",
+                        dtype=arena_dtype(function.name, instruction.res),
                         accounting={"sequence_arena": True},
                     )
                     continue

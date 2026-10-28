@@ -188,6 +188,17 @@ _FUSED_UNARY: dict[str, str] = {
 }
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 def _fused_opcode_name(opcode: int) -> str | None:
     from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         C_TENSOR_OPCODE_ORDER,
@@ -1162,6 +1173,14 @@ def _value_llvm_type(value: _Any) -> str:
     # names. Resolve them before consulting the scalar layout catalogue.
     if str(getattr(value, "dtype", "")) in {"ssa.aggregate", "ptrptr_float64"}:
         return "ptr"
+    if (
+        str(getattr(value, "dtype", "")).casefold() == "none"
+        and not accounting.get("physical_dtype")
+    ):
+        # Structural absence is not a numeric dtype: it is the inert scalar
+        # carrier cell the C emitter spells ``double`` for ``none`` (see
+        # ``_scalar_c_type``), holding the zero sentinel.
+        return "double"
     if accounting.get("heap_owner") or accounting.get("heap_element_dtype") is not None:
         # These are declared native pointer CELLS, not a typed address whose
         # dtype names the pointee. Raw ptr spelling alone historically means
@@ -1929,7 +1948,9 @@ def _emit_repository_call_module(
             ring_id, count_id = history_ids(raw_id)
             appended_history.append(_SSAValue(
                 ring_id,
-                dtype=getattr(value, "dtype", None) or "float64",
+                dtype=_settled_dtype(
+                    getattr(value, "dtype", None), raw_id,
+                    "watched history value dtype"),
                 shape=(depth,),
             ))
             appended_history.append(_SSAValue(count_id, dtype="int64"))

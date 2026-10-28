@@ -4,7 +4,8 @@ The JavaScript counterpart of ``differential_fuzz.py``.  Each program is a
 random function over two Number parameters (``a``, ``b``) and two Boolean
 parameters (``p``, ``q``) built from ``const``/``let`` bindings,
 reassignments (``=``, ``op=``, ``++``/``--``) under nested ``if``/``else``
-and bounded ``for``/``while`` loops,
+and bounded ``for``/``while`` loops (with guarded ``break``/``continue``,
+labeled ones to enclosing loops, and early ``return``),
 an optional early-return ``if`` and typed expression snippets.  It is lowered with
 ``lower_javascript_source_to_ssa``, compiled through the C backend and run on
 rows of ordinary and special values (``NaN``, ``-0``, ``Infinity``), and
@@ -14,8 +15,10 @@ Statuses: PASS, WRONG, TYPE, LOUD (a named refusal or emission shortfall),
 FINDING (anything else: lowering/emission crash, run failure, SEGV).
 WRONG and TYPE are emergencies: stop and minimize.
 
-Programs using an implementation-approximated operation (``Math.sin``,
-``**``, ...) are judged within the oracle's ulp tier.  ``%``,
+Programs using an implementation-approximated operation are judged bit for
+bit against node replaying with those calls answered by the C library
+(``Math.sin``, ``Math.log``, ...), or within the oracle's ulp tier when one
+is ``**``.  ``%``,
 ``Math.sign``, ``Math.max``/``Math.min`` and ``&&``/``||`` on Numbers
 are exact programs, judged bit for bit.  The grammar also includes a
 spelling the frontend refuses today (``&&`` on a Number and a Boolean,
@@ -118,6 +121,11 @@ class Generator:
             f"{self.boolean(depth - 1)})"
         )
 
+    def result(self, depth: int) -> str:
+        """A returned value of the function's one result kind."""
+
+        return self.number(depth) if self.returns_number else self.boolean(depth)
+
     def condition(self, depth: int) -> str:
         # Conditions may be Numbers (JavaScript truthiness) or Booleans.
         if self.rng.random() < 0.35:
@@ -149,9 +157,35 @@ class Generator:
         visible = list(self.numbers)
         for _ in range(rng.randint(1, 2)):
             choice = rng.random()
-            if depth > 0 and choice < 0.15:
+            if self.loops and choice < 0.12:
+                # ``continue`` would skip a while loop's trailing counter
+                # increment, so only a ``for`` loop gets one.
+                # The innermost loop, or (named) an enclosing labeled one.
+                targets = [self.loops[-1]] + [
+                    loop for loop in self.loops if loop[1] is not None
+                ]
+                kind, label = rng.choice(targets)
+                if (kind, label) == self.loops[-1] and rng.random() < 0.6:
+                    label = None
+                exit_ = "break" if kind == "while" or (
+                    rng.random() < 0.5
+                ) else "continue"
+                if label is not None:
+                    exit_ += f" {label}"
+                if rng.random() < 0.3:
+                    exit_ = f"return {self.result(1)}"
+                lines.append(f"{indent}if ({self.condition(1)}) {{ {exit_}; }}")
+            elif not self.loops and choice < 0.1:
+                # An early return in an arm; the other paths fall through
+                # into the rest of the function.
+                lines.append(
+                    f"{indent}if ({self.condition(1)}) {{ return {self.result(1)}; }}"
+                )
+            elif depth > 0 and choice < 0.18:
+                lines.extend(self.switch_statement(depth - 1, indent))
+            elif depth > 0 and choice < 0.25:
                 lines.extend(self.loop_statement(depth - 1, indent))
-            elif depth > 0 and choice < 0.4:
+            elif depth > 0 and choice < 0.5:
                 lines.extend(self.if_statement(depth - 1, indent))
             else:
                 lines.append(f"{indent}{self.assignment(2)}")
@@ -173,17 +207,54 @@ class Generator:
         if rng.random() < 0.4:
             guard += f" && {counter} < {rng.choice(('a', 'b'))}"
         self.numbers.append(counter)
-        if rng.random() < 0.7:
-            lines = [f"{indent}for (let {counter} = 0; {guard}; {counter}++) {{"]
-            lines.extend(self.block(depth, indent + "  "))
-        else:
-            lines = [f"{indent}let {counter} = 0;", f"{indent}while ({guard}) {{"]
+        label = f"L{self.loop_index}" if rng.random() < 0.35 else None
+        prefix = f"{label}: " if label else ""
+        form = rng.random()
+        if form < 0.15:
+            # A do loop tests after its body; it gets no continue, which
+            # would skip the trailing counter increment.
+            lines = [f"{indent}let {counter} = 0;", f"{indent}{prefix}do {{"]
+            self.loops.append(("while", label))
             lines.extend(self.block(depth, indent + "  "))
             lines.append(f"{indent}  {counter}++;")
+            self.loops.pop()
+            lines.append(f"{indent}}} while ({guard});")
+            return lines
+        if form < 0.7:
+            lines = [
+                f"{indent}{prefix}for ({rng.choice(('let', 'let', 'var'))} "
+                f"{counter} = 0; {guard}; {counter}++) {{"
+            ]
+            self.loops.append(("for", label))
+            lines.extend(self.block(depth, indent + "  "))
+        else:
+            lines = [
+                f"{indent}let {counter} = 0;", f"{indent}{prefix}while ({guard}) {{",
+            ]
+            self.loops.append(("while", label))
+            lines.extend(self.block(depth, indent + "  "))
+            lines.append(f"{indent}  {counter}++;")
+        self.loops.pop()
         lines.append(f"{indent}}}")
-        if lines[0].lstrip().startswith("for"):
-            # A for-head let is scoped to the loop.
+        if "for (" in lines[0]:
+            # A for-head let is scoped to the loop (a var is not read after).
             self.numbers.remove(counter)
+        return lines
+
+    def switch_statement(self, depth: int, indent: str) -> list[str]:
+        """A switch over a small number, with fallthrough and a default."""
+
+        rng = self.rng
+        lines = [f"{indent}switch ({self.number(1)}) {{"]
+        labels = rng.sample(("0", "1", "2", "-0", "0.5"), rng.randint(1, 3))
+        if rng.random() < 0.6:
+            labels.insert(rng.randint(0, len(labels)), None)
+        for value in labels:
+            lines.append(f"{indent}  {'default' if value is None else 'case ' + value}:")
+            lines.append(f"{indent}    {self.assignment(2)}")
+            if rng.random() < 0.6:
+                lines.append(f"{indent}    break;")
+        lines.append(f"{indent}}}")
         return lines
 
     def if_statement(self, depth: int, indent: str) -> list[str]:
@@ -202,19 +273,22 @@ class Generator:
         self.mutable_numbers = ["a", "b"] if rng.random() < 0.3 else []
         self.mutable_booleans = []
         self.loop_index = 0
+        self.loops: list[tuple[str, str | None]] = []
+        self.returns_number = rng.random() < 0.7
         for index in range(rng.randint(0, 4)):
-            binding = "let" if rng.random() < 0.5 else "const"
+            # A var declared up front with an initializer reads like a let.
+            binding = rng.choice(("let", "let", "const", "const", "var"))
             if rng.random() < 0.7:
                 name = f"n{index}"
                 lines.append(f"  {binding} {name} = {self.number(3)};")
                 self.numbers.append(name)
-                if binding == "let":
+                if binding != "const":
                     self.mutable_numbers.append(name)
             else:
                 name = f"t{index}"
                 lines.append(f"  {binding} {name} = {self.boolean(3)};")
                 self.booleans.append(name)
-                if binding == "let":
+                if binding != "const":
                     self.mutable_booleans.append(name)
             if (self.mutable_numbers or self.mutable_booleans) and rng.random() < 0.5:
                 form = rng.random()
@@ -224,10 +298,7 @@ class Generator:
                     lines.extend(self.if_statement(1, "  "))
                 else:
                     lines.append(f"  {self.assignment(3)}")
-        returns_number = rng.random() < 0.7
-        value = (lambda: self.number(3)) if returns_number else (
-            lambda: self.boolean(3)
-        )
+        value = lambda: self.result(3)  # noqa: E731
         if rng.random() < 0.4:
             lines.append(f"  if ({self.condition(2)}) {{ return {value()}; }}")
         lines.append(f"  return {value()};")

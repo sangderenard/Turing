@@ -119,7 +119,22 @@ def test_transcendentals_compile_to_repository_operations_within_the_ulp_tier():
     assert {"sin", "exp", "log", "atan"} <= operations
     assert "Call" not in operations
     status = check_program(source, "[[0.5], [1], [2.5], [-1.5], [10], [-0], [NaN], [Infinity]]")
-    assert status.startswith("PASS (approximated"), status
+    # Bit for bit against node replaying with the C library's answers.
+    assert status == "PASS (libm-pinned: atan, exp, log, sin)", status
+
+
+@needs_node
+def test_pinned_oracle_judges_amplified_approximations_exactly():
+    # V8's Math.log(3) is one ulp from glibc's; the remainder amplifies it
+    # ~7e4 ulp, which a ulp tier on the result called WRONG.  Replaying
+    # node with libm's answers leaves only JavaScript semantics to judge.
+    source = (
+        "/** @param {number} b */ function root(b) "
+        "{ return Math.exp(10) % Math.log(b); }"
+    )
+    assert check_program(source, "[[3], [2], [0.5], [-1], [NaN]]") == (
+        "PASS (libm-pinned: exp, log)"
+    )
 
 
 @needs_node
@@ -127,11 +142,13 @@ def test_transcendentals_compile_to_repository_operations_within_the_ulp_tier():
     "path", sorted(CORPUS.glob("c*.js")), ids=lambda path: path.stem,
 )
 def test_javascript_corpus_matches_node(path):
-    # Bit for bit, or within the ulp tier when the program uses an
-    # implementation-approximated operation (the status then says so).
+    # Bit for bit (approximated calls pinned to libm), or within the ulp
+    # tier when the program uses ``**`` / Math.pow (the status says which).
     source, inputs = split_program(path.read_text(encoding="utf-8"))
     status = check_program(source, inputs)
-    assert status == "PASS" or status.startswith("PASS (approximated"), status
+    assert status == "PASS" or status.startswith((
+        "PASS (approximated", "PASS (libm-pinned",
+    )), status
 
 
 @needs_node
@@ -164,11 +181,15 @@ def test_loop_lowers_to_header_body_exit_blocks_with_phis():
 
 @needs_node
 @pytest.mark.parametrize("source", [
-    # break/continue/return leave a loop other than through its condition.
+    # A label on a block is not a loop's: its exit has no flag.
     "/** @param {number} n */ function root(n) { let s = 0; "
-    "for (let i = 0; i < n; i++) { if (i > 2) { break; } s += i; } return s; }",
+    "blk: { if (n > 1) { break blk; } s = 1; } return s; }",
+    # A returned value whose kind is not known before the loop.
+    "/** @param {number} n */ function root(n) { "
+    "for (let i = 0; i < n; i++) { if (i > 2) return f(i); } return 1; }",
+    # A loop with neither a condition nor a break never leaves.
     "/** @param {number} n */ function root(n) { let s = 0; "
-    "while (s < n) { return s; } return 1; }",
+    "for (;;) { s += n; } return s; }",
     # A carried value that changes kind has no single dtype.
     "/** @param {number} n */ function root(n) { let x = 0; "
     "for (let i = 0; i < n; i++) { x = x > 0; } return x; }",
@@ -269,3 +290,140 @@ def test_lowering_inside_an_open_compile_posts_to_that_book():
     finally:
         end_identity_book(token)
     assert lowered.module.metadata["identity_book"] is book
+
+
+@needs_node
+def test_break_and_continue_are_flags_on_the_loop():
+    source = (
+        "/** @param {number} n */ function root(n) { let s = 0; "
+        "for (let i = 0; i < n && i < 40; i++) "
+        "{ if (i % 2 === 0) continue; if (s > 20) break; s += i; } return s; }"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    phis = [
+        instruction.attributes["binding_name"]
+        for instruction in lowered.module.functions["root"].blocks["loop0_header"].instrs
+        if instruction.op == "Phi"
+    ]
+    # The break flag is carried; the continue flag is per iteration.
+    assert sorted(name.split("@")[0] for name in phis) == ["%break", "i", "s"]
+    assert check_program(source, "[[0], [3], [9], [100], [NaN], [Infinity]]") == "PASS"
+
+
+@needs_node
+def test_return_inside_a_loop_is_a_carried_flag_and_result():
+    source = (
+        "/** @param {number} n */ function root(n) { let s = 0; "
+        "for (let i = 0; i < n && i < 40; i++) { s += i; if (s > 10) return i; } "
+        "return -s; }"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    phis = sorted(
+        instruction.attributes["binding_name"]
+        for instruction in lowered.module.functions["root"].blocks["loop0_header"].instrs
+        if instruction.op == "Phi"
+    )
+    assert [name.split("@")[0] for name in phis] == ["%result", "%return", "i", "s"]
+    assert check_program(source, "[[0], [3], [9], [100], [NaN], [Infinity]]") == "PASS"
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    # break/continue to an enclosing loop from a nested one.
+    "let s = 0; outer: for (let i = 0; i < 5; i++) { for (let j = 0; j < 5; j++) "
+    "{ if (i * j > n) break outer; if (j > i) continue outer; s += j; } s += 100; } return s;",
+    # Three levels, each exit to a different loop, beside a return.
+    "let s = 0; a: for (let i = 0; i < 4; i++) { b: for (let j = 0; j < 4; j++) "
+    "{ for (let k = 0; k < 4; k++) { if (k > j) continue b; if (i + j + k > n) break a; "
+    "if (s > 40) return -s; s += 1; } s += 10; } s += 100; } return s;",
+])
+def test_labeled_exits_set_the_target_loops_flags(body):
+    source = f"/** @param {{number}} n */ function root(n) {{ {body} }}"
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(source, "[[0], [2], [5], [9], [NaN], [Infinity]]") == "PASS"
+
+
+@needs_node
+def test_var_that_reads_like_let_is_rewritten_into_one():
+    source = (
+        "/** @param {number} n */ function root(n) { var s = 0; "
+        "for (var i = 0; i < n && i < 40; i++) { var t = i * 2; s += t; } "
+        "var n = n + i; return s + n; }"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(source, "[[0], [3], [9], [100], [NaN], [Infinity]]") == "PASS"
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    # Read before the declaration runs: the hoisted value is undefined.
+    "let s = x; var x = n; return s;",
+    # Read in its own initializer.
+    "var x = x + n; return x;",
+    # Read outside the block that declares it.
+    "if (n > 0) { var x = n; } return x;",
+    # Declared only in a loop body, read after the loop.
+    "for (let i = 0; i < 3; i++) { var x = i; } return x;",
+    # No initializer: undefined until assigned.
+    "var x; x = n; return x;",
+])
+def test_var_that_reads_its_hoisted_undefined_stays_a_loud_refusal(body):
+    source = f"/** @param {{number}} n */ function root(n) {{ {body} }}"
+    lowered = lower_javascript_source_to_ssa(source)
+    assert not lowered.complete
+    assert any(
+        item.code == "unsupported-binding-kind" for item in lowered.shortfalls
+    ), lowered.shortfall_report()
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    "let x = n; if (p) { if (n > 1) return 1; x = 2; } return x;",
+    "let x = n; if (p) { x = 1; } else { if (n > 2) return 5; x = 2; } return x * 2;",
+    "let x = n; { if (n > 1) return 1; x = 2; } return x;",
+])
+def test_a_nested_early_return_leaves_the_other_paths_the_rest(body):
+    source = (
+        f"/** @param {{number}} n @param {{boolean}} p */ "
+        f"function root(n, p) {{ {body} }}"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(
+        source, "[[0, true], [3, true], [0, false], [3, false], [NaN, true]]",
+    ) == "PASS"
+
+
+@needs_node
+def test_a_nested_early_return_with_no_return_after_it_stays_refused():
+    source = (
+        "/** @param {number} n @param {boolean} p */ "
+        "function root(n, p) { if (p) { if (n > 1) return 1; } }"
+    )
+    assert not lower_javascript_source_to_ssa(source).complete
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    "let s = 0; let i = 0; do { s += n; i++; if (s > 9) break; } while (i < 3); return s;",
+    "let s = 0; switch (n) { case 1: s = 1; case 2: s += 2; break; default: s = 7; case 3: s += 3; } return s;",
+])
+def test_do_and_switch_become_the_loops_and_ifs_they_mean(body):
+    source = f"/** @param {{number}} n */ function root(n) {{ {body} }}"
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(source, "[[0], [1], [2], [3], [5], [NaN], [-0]]") == "PASS"
+
+
+@needs_node
+def test_a_switch_whose_cases_declare_a_let_stays_refused():
+    # Every case shares one scope; per-case blocks would split it.
+    source = (
+        "/** @param {number} n */ function root(n) { switch (n) "
+        "{ case 1: let t = 2; return t; default: return 0; } }"
+    )
+    assert not lower_javascript_source_to_ssa(source).complete

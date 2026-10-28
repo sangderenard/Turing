@@ -826,6 +826,29 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
     while changed:
         changed = False
         for node_id, data in graph_obj.nodes(data=True):
+            # Program: ``d = {1: n, 2: 5}; for i in range(3): if i == n:
+            # d[2] = i`` then ``d[2]`` (corpus c670).  Wrong record: the
+            # loop's result names the body's ``if`` merge, which is no
+            # store version, so the post-loop read of ``d`` was claimed by
+            # no table and lowered as a positional row read (0 for 5).
+            # Rule: a loop result whose carried value is a merge already
+            # proven to be one dict's storage is that dict's storage.
+            if node_kind(node_id) in {"loopresult", "loopexit"}:
+                carried = next((
+                    parent for preferred_role in ("updated", "value")
+                    for parent, role in data.get("parents") or ()
+                    if str(role) == preferred_role and parent in graph_obj
+                ), None)
+                if carried is None or node_kind(carried) != "phi":
+                    continue
+                resident = root(value_id_of(carried))
+                if (graph_obj.nodes.get(resident, {}).get("attributes") or {}).get("aggregate_kind") != "dict":
+                    continue
+                value = value_id_of(node_id)
+                if value != resident and aliases.get(value) != resident:
+                    aliases[value] = resident
+                    changed = True
+                continue
             if node_kind(node_id) != "phi":
                 continue
             parents = [root(value_id_of(parent)) for parent, role in data.get("parents") or ()
@@ -1064,12 +1087,42 @@ def _promote_conditional_sequence_aliases(
                 resident_by_value[merged_id] = destination
                 kind_by_value[merged_id] = initial_kind
                 promoted_aliases[merged_id] = (destination, initial_kind)
+            # Program: ``if n > 2: t = [n, 1, 2] else: t = [7, n]`` then
+            # ``len(t)``, ``total(t)`` (corpus c654).  Wrong record: a list
+            # first bound in both arms, to displays of different lengths,
+            # published a scalar result merge of two handles and no member
+            # layout, so the merge had no birth (it was refused by name as
+            # "different shapes").  Python's list length is dynamic; that is
+            # no reason to refuse.  Rule: the merge is its own storage and
+            # each arm copies its display into it (the ``replace`` a
+            # carried sequence alias lowers), so its length is the taken
+            # arm's and its capacity the longest arm's (the arms' own
+            # bounds, surveyed as a copy source).
+            results = []
+            for result in block.result_aliases:
+                true_id, false_id, merged_id = map(int, result)
+                if not _list_merged_from_unequal_displays(
+                    graph_obj, node_by_value.get(merged_id, -1),
+                ):
+                    results.append(result)
+                    continue
+                true_resident = resident_by_value.get(true_id)
+                false_resident = resident_by_value.get(false_id)
+                if true_resident is None or false_resident is None:
+                    results.append(result)
+                    continue
+                sequences.append((
+                    int(true_resident), int(false_resident),
+                    merged_id, merged_id,
+                ))
+                destination_ids.add(merged_id)
             return replace(
                 block,
                 body=promote(block.body),
                 orelse=(
                     None if block.orelse is None else promote(block.orelse)
                 ),
+                result_aliases=tuple(results),
                 carried_aliases=tuple(scalar),
                 carried_field_cells=tuple(scalar_field_cells),
                 carried_sequence_aliases=tuple(sequences),
@@ -1522,8 +1575,25 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
             continue
         parameters = tuple(child.graph.get("function_parameters") or ())
         actuals = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        # Program: ``def f(v): r = 0; while v < 100: (if v > 3: r = v; break);
+        # v = v + 1; return r`` (and a direct tail call, which normalizes to
+        # that loop).  Wrong record: the return slot names the parameter's
+        # graph node, because ``r = v`` and the name ``v`` after a loop both
+        # resolve to the pre-loop node; the call was folded into its actual
+        # and the caller read the seed.  Rule: a parameter a loop carries or
+        # a break binds is not the returned identity -- its node names only
+        # the seed, so it is never a proved identity return.
+        loop_rebound = set()
+        for _loop_id, loop_data in child.nodes(data=True):
+            loop_attrs = loop_data.get("attributes") or {}
+            for pair in (loop_attrs.get("loop_carried_bindings") or {}).values():
+                loop_rebound.add(int(pair[0]))
+            for pair in (loop_attrs.get("loop_break_bindings") or {}).values():
+                loop_rebound.update(int(item) for item in pair)
         for index, slots in enumerate(zip(*sites)):
             if len(set(slots)) != 1 or slots[0] is None:
+                continue
+            if int(slots[0]) in loop_rebound:
                 continue
             formal = child.nodes.get(int(slots[0]), {})
             attrs = formal.get("attributes") or {}
@@ -2195,6 +2265,29 @@ def _static_sequence_capacity_survey(
                 and not any(isinstance(element, ast.Starred)
                             for element in expression.elts)):
             bounds.setdefault(int(node_id), len(expression.elts))
+    # Program: ``a = [1, 2]; t = a if n > 2 else [3, 4]`` then ``len(a)``
+    # (corpus c271).  Wrong record: the merge (an ``aggregate_phi``) was
+    # bounded, but each folded literal arm is a resident arena of its own
+    # (it is the phi's member), and no arm had a bound, so C refused it as
+    # a private sequence with no capacity.  Rule: an arm of a list merge
+    # that is a folded literal and that nothing grows is bounded by its
+    # literal length.
+    grown_arms = {
+        int(mutation.sequence_value_id)
+        for mutation in _sequence_append_call_mutations(graph_obj)
+    }
+    for _node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if (attributes.get("producer_kind") != "aggregate_phi"
+                or attributes.get("aggregate_kind") != "list"):
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) not in {"body", "orelse"} or int(parent) in grown_arms:
+                continue
+            arm = graph_obj.nodes.get(int(parent), {}).get("attributes") or {}
+            if (arm.get("aggregate_kind") == "list"
+                    and isinstance(arm.get("value"), (list, tuple))):
+                bounds.setdefault(int(parent), len(arm["value"]))
     if control is not None:
         bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
             control, local_lists,
@@ -2381,6 +2474,12 @@ def _static_sequence_capacity_survey(
         settled = True
         for destination, sources in copies.items():
             own = sequence_bound(destination)
+            # A list merged from displays of different lengths owns no rows
+            # of its own: its arms' copies are all it holds (c654).
+            if own is None and _list_merged_from_unequal_displays(
+                graph_obj, destination,
+            ):
+                own = 0
             if own is None:
                 continue
             source_bounds = [sequence_bound(source) for source in sources]
@@ -2446,7 +2545,17 @@ def _static_sequence_capacity_survey(
     )
     return bounds, unbounded | owned_empty_arrays | owned_record_dicts
 
+def _source_extraction_identity(
+    graph_obj: Any,
+    node_id: int,
+) -> str | None:
+    """Return the exact extraction identity retained by one source graph node."""
 
+    attributes = (
+        graph_obj.nodes.get(int(node_id), {}).get("attributes") or {}
+    )
+    identity = attributes.get("extraction_identity")
+    return None if identity is None else str(identity)
 def _linked_sequence_propagation_kind(
     mapped_arguments: Iterable[Any],
 ) -> str | None:
@@ -2506,6 +2615,63 @@ def source_sort_contract(graph_obj: Any, call_node_id: int):
             f"sort graph view has no exact source contract: {row!r}"
         )
     return fact, cell
+
+
+def _discarded_dict_pop(graph_obj: Any, node_id: int, storage_aliases: Mapping[int, int]):
+    """``(dict node, argument nodes, argument kind)`` for a dict ``pop``
+    statement whose result nothing reads, else None.
+
+    Program: ``d = {1: 10, 2: 20}; d.pop(1, None); d[3] = n`` then
+    ``len(d)`` (corpus c708).  Wrong record: a dict ``pop`` statement had no
+    mutation record outside a retained loop's state effects, so it lowered
+    to an empty region and the key stayed (3 for 2; clean audit).  Rule: a
+    dict ``pop`` whose result nothing reads is a keyed delete of its key, as
+    the loop lowering already states it: lookup-and-delete, an absent key
+    tolerated only when a default is given.  A statement after a store in
+    the same body names the store's version of the dict: the same storage,
+    by the storage aliases.
+    """
+
+    data = graph_obj.nodes[node_id]
+    expression = data.get("expr_obj")
+    if not (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr == "pop"
+    ):
+        return None
+    parents = tuple(data.get("parents") or ())
+    receiver = next((
+        int(parent) for parent, role in parents
+        if str(role) == "operand" and int(parent) in graph_obj
+    ), None)
+    arguments = tuple(
+        int(parent) for parent, role in parents
+        if str(role).startswith("arg:") and int(parent) in graph_obj
+    )
+    if receiver is None or len(arguments) not in {1, 2}:
+        return None
+    receiver = int(storage_aliases.get(receiver, receiver))
+    if (graph_obj.nodes[receiver].get("attributes") or {}).get(
+        "aggregate_kind"
+    ) != "dict":
+        return None
+    for successor in graph_obj.successors(node_id):
+        # A statement's only consumer is the control construct that holds it
+        # as a ``body``/``orelse`` member.
+        if str(graph_obj.nodes[successor].get("type") or "") not in {
+            "For", "While", "If"
+        } or any(
+            str(role) not in {"body", "orelse"}
+            for parent, role in (
+                graph_obj.nodes[successor].get("parents") or ()
+            )
+            if int(parent) == int(node_id)
+        ):
+            return None
+    return receiver, arguments, (
+        "mapping_pop_default_none" if len(arguments) == 2 else "mapping_pop"
+    )
 
 
 def _sequence_append_call_mutations(graph_obj: Any):
@@ -2594,6 +2760,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
             policy=record.get("policy"),
             argument_kind=argument_kind,
             argument_expressions=retained_argument_expressions(record),
+            extraction_identity=_source_extraction_identity(
+                graph_obj, node_id,
+            ),
             sort_key_column=key_column,
             sort_reverse=reverse,
         ))
@@ -2603,13 +2772,14 @@ def _sequence_append_call_mutations(graph_obj: Any):
     recorded_effect_ids = {
         int(mutation.effect_node_id) for mutation in mutations
     }
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         expression = data.get("expr_obj")
         if not (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Attribute)
-            and expression.func.attr in {"append", "add", "clear"}
+            and expression.func.attr in {"append", "add", "clear", "pop"}
         ):
             continue
         if int(node_id) in recorded_effect_ids:
@@ -2625,10 +2795,23 @@ def _sequence_append_call_mutations(graph_obj: Any):
         )
         operation = str(expression.func.attr)
         arity = 0 if operation == "clear" else 1
+        discarded_pop = (
+            _discarded_dict_pop(graph_obj, int(node_id), storage_aliases)
+            if operation == "pop" else None
+        )
+        if operation == "pop":
+            if discarded_pop is None:
+                continue
+            destination_node, arguments, pop_argument_kind = discarded_pop
+            arity = len(arguments)
+        destination = (
+            graph_obj.nodes[destination_node]
+            if destination_node is not None else {}
+        )
+        attributes = destination.get("attributes") or {}
+        pops_dict = discarded_pop is not None
         if destination_node is None or len(arguments) != arity:
             continue
-        destination = graph_obj.nodes[destination_node]
-        attributes = destination.get("attributes") or {}
         # Program: ``cells = {1: 10, 2: 20}; if n: cells.clear();
         # return len(cells)``.  Wrong record: a dict's clear was not a
         # mutation at all (dicts were outside ``sequence_kinds``), so the
@@ -2637,9 +2820,14 @@ def _sequence_append_call_mutations(graph_obj: Any):
         clears_dict = (
             operation == "clear" and attributes.get("aggregate_kind") == "dict"
         )
-        if attributes.get("aggregate_kind") not in sequence_kinds and not clears_dict:
+        if (
+            attributes.get("aggregate_kind") not in sequence_kinds
+            and not clears_dict and not pops_dict
+        ):
             continue
         argument_kind = "value"
+        if pops_dict:
+            argument_kind = pop_argument_kind
         argument_ids = tuple(
             int(graph_obj.nodes[argument].get("value_id", argument))
             for argument in arguments
@@ -2659,6 +2847,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
                 else "duplicates"
             ),
             argument_kind=argument_kind,
+            extraction_identity=_source_extraction_identity(
+                graph_obj, node_id,
+            ),
             sort_key_column=key_column,
             sort_reverse=reverse,
         ))
@@ -2854,6 +3045,45 @@ def _scalar_constant_member(row: Mapping[str, Any]) -> Any:
         return expression.value
     literal = attributes.get("value", row.get("constant"))
     return literal if isinstance(literal, (bool, int, float, str)) else None
+
+
+def _list_merged_from_unequal_displays(graph_obj: Any, node_id: int) -> bool:
+    """Whether a list merge joins two list displays of different lengths.
+
+    Both arms are list displays (``aggregate_leaf_value_ids`` published) and
+    the merge is first bound there (no initial list).  Equal-length arms
+    publish member Phis and are born from them; an arm that is no display is
+    not this shape.
+    """
+
+    data = graph_obj.nodes.get(int(node_id)) or {}
+    attributes = data.get("attributes") or {}
+    if (
+        attributes.get("producer_kind") != "aggregate_phi"
+        or attributes.get("aggregate_kind") != "list"
+        or attributes.get("initial_value_id") is not None
+        or attributes.get("aggregate_leaf_value_ids") is not None
+    ):
+        return False
+    arms = tuple(
+        graph_obj.nodes[parent]
+        for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and parent in graph_obj
+    )
+    if len(arms) != 2:
+        return False
+    lengths = []
+    for arm in arms:
+        arm_attributes = arm.get("attributes") or {}
+        leaves = arm_attributes.get("aggregate_leaf_value_ids")
+        if (
+            arm_attributes.get("producer_kind") != "aggregate"
+            or arm_attributes.get("aggregate_kind") != "list"
+            or leaves is None
+        ):
+            return False
+        lengths.append(len(leaves))
+    return lengths[0] != lengths[1]
 
 
 def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
@@ -3090,6 +3320,10 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 rebound_on_one_branch = _list_rebound_on_one_branch(
                     graph_obj, int(node_id),
                 )
+                if _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+                    # Born by the arms' copies into this storage
+                    # (``_promote_conditional_sequence_aliases``).
+                    continue
                 if attributes.get("aggregate_kind") == "list" and not (
                     rebound_on_one_branch
                 ):
@@ -3166,6 +3400,24 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                         else row.get("expr_obj") is element
                     )
                 )
+            # Program: ``a = [n, 7, n, 7]; a[1] = n + 1`` (corpus c725).
+            # Wrong record: one value used for two members has one producer
+            # node and two ``elts`` edges, so both edges matched the second
+            # occurrence's ordinal and the list was refused as lacking one
+            # exact producer.  Rule: the k-th member that names a value is
+            # that value's k-th edge, in source order; a value with fewer
+            # edges than members is still refused.
+            if (
+                member_id is not None and element is not None
+                and len(exact) > 1
+                and not isinstance(element, ast.Starred)
+            ):
+                earlier = sum(
+                    1 for position in range(ordinal)
+                    if int(layout_members[position]) == int(member_id)
+                )
+                if earlier < len(exact):
+                    exact = (exact[earlier],)
             if len(exact) != 1 or isinstance(element, ast.Starred):
                 raise ValueError(
                     f"{'Set' if is_set else 'List'} {sequence_id} lacks one "
