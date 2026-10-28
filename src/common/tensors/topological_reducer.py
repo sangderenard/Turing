@@ -6455,6 +6455,33 @@ def _normalize_lexical_values(
     }
     parameter_store_cache: dict[tuple[int, str], bool] = {}
 
+    def record_class_is_frozen(class_identity: str) -> bool:
+        """Whether the record class declares frozen fields.
+
+        Program: ``context = SSAObjectContext(...); context_values(context);
+        context.storage_identity`` (bootstrap ``validate_context_function``,
+        c936).  Wrong record: a call that may store into the record was
+        taken to rebind its fields, so the field read after it refused.
+        Rule: a frozen dataclass's field bindings never change after
+        construction, so no call can store into them.  An authored class
+        answers from its ClassDef; an imported one from its declared
+        dataclass parameters (metadata only, never an instance)."""
+
+        class_table = dict(graph.G.graph.get("class_table") or {})
+        for spelling in (class_identity, class_identity.rsplit(".", 1)[-1]):
+            descriptor = class_table.get(spelling)
+            if descriptor is not None and "frozen_record" in descriptor:
+                return bool(descriptor["frozen_record"])
+        for name, value in dict(static_bindings or {}).items():
+            if not isinstance(value, type) or class_identity not in {
+                str(name), f"{value.__module__}.{value.__qualname__}",
+            }:
+                continue
+            return bool(
+                is_dataclass(value) and value.__dataclass_params__.frozen
+            )
+        return False
+
     def parameter_may_store(definition: Any, name: str) -> bool:
         """Whether ``definition`` may store into its parameter ``name``.
 
@@ -10213,6 +10240,7 @@ def _normalize_lexical_values(
                     and receiver_class is not None
                     and isinstance(expression.value, ast.Name)
                     and id(expression) not in method_lookup_ids
+                    and not record_class_is_frozen(str(receiver_class))
                     and (
                         int(receiver) in storing_call_values
                         or any(
@@ -21580,6 +21608,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 if owner == class_name
             },
             "field_callables": class_field_callables(definition),
+            # ``@dataclass(frozen=True)``: no assignment rebinds a field
+            # after construction (the declaration, not a host instance).
+            "frozen_record": any(
+                isinstance(decorator, ast.Call)
+                and (
+                    decorator.func.id if isinstance(decorator.func, ast.Name)
+                    else decorator.func.attr
+                    if isinstance(decorator.func, ast.Attribute) else ""
+                ) == "dataclass"
+                and any(
+                    keyword.arg == "frozen"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                    for keyword in decorator.keywords
+                )
+                for decorator in definition.decorator_list
+            ),
         }
         for class_name, definition in class_definitions.items()
     }
