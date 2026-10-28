@@ -101,6 +101,11 @@ _UNARY: dict[str, str] = {
     "Not": "{out} = xor i1 {0}, true",
     "LNot": "{out} = xor i1 {0}, true",
     "Invert": "{out} = xor i64 {0}, -1",
+    # Python's ``int.bit_length``: an integer opcode like ``Invert``, spelled
+    # through ``turing_bit_length`` -- the LLVM text of the C backend's own
+    # helper (c695, c696; lane G).  Its integer domain is spelled by
+    # ``integer_scalar_lines``.
+    "BitLength": "{out} = call i64 @turing_bit_length(i64 {0})",
     "SIToFP": "{out} = sitofp i32 {0} to double",
     "FPToSI": "{out} = fptosi double {0} to i32",
     "SiToFp": "{out} = sitofp i32 {0} to double",
@@ -1391,6 +1396,28 @@ def integer_scalar_lines(
             f"{register} = select i1 {register}.below, "
             f"{operand_type} {register}.neg, {operand_type} {operands[0]}",
         ], operand_type)
+    if operation == "BitLength" and len(operands) == 1:
+        # Program: ``a.bit_length() * 100 + b.bit_length()`` (c695) and a
+        # loop-carried ``v.bit_length()`` (c696).  Wrong record: LLVM had no
+        # spelling and refused what C runs through ``turing_bit_length``.
+        # Rule: the same helper, called the way C calls it -- the operand
+        # converted to ``long long`` (sign- or zero-extended from a narrower
+        # integer), an i64 bit count back.  No wider operand has a C form.
+        width = int(operand_type[1:])
+        if width > 64:
+            return None
+        if width == 64:
+            argument, lines = operands[0], []
+        else:
+            argument = f"{register}.wide"
+            lines = [
+                f"{argument} = {'zext' if unsigned else 'sext'} "
+                f"{operand_type} {operands[0]} to i64"
+            ]
+        return ([
+            *lines,
+            f"{register} = call i64 @turing_bit_length(i64 {argument})",
+        ], "i64")
     if operation == "Invert" and len(operands) == 1:
         # The canonical authored ``~mask`` opcode preserves its integer
         # domain. The old double fallback rejected it, despite an i64
@@ -1513,6 +1540,28 @@ exit:
     ),
     # A range loop's induction step saturates (``loop_induction_step``).
     "llvm.sadd.sat.i64": "declare i64 @llvm.sadd.sat.i64(i64, i64)",
+    # Python's ``int.bit_length``, the C backend's ``turing_bit_length``
+    # statement for statement: the unsigned magnitude (``0 - v`` for a
+    # negative v, so INT64_MIN answers 64), then count shifts to zero.
+    # (c695, c696; lane G)
+    "turing_bit_length": """define internal i64 @turing_bit_length(i64 %v) {
+entry:
+  %negative = icmp slt i64 %v, 0
+  %negated = sub i64 0, %v
+  %magnitude = select i1 %negative, i64 %negated, i64 %v
+  br label %scan
+scan:
+  %m = phi i64 [ %magnitude, %entry ], [ %shifted, %count ]
+  %n = phi i64 [ 0, %entry ], [ %counted, %count ]
+  %done = icmp eq i64 %m, 0
+  br i1 %done, label %exit, label %count
+count:
+  %counted = add i64 %n, 1
+  %shifted = lshr i64 %m, 1
+  br label %scan
+exit:
+  ret i64 %n
+}""",
     **{
         f"llvm.{name}.with.overflow.i64": (
             f"declare {{i64, i1}} @llvm.{name}.with.overflow.i64(i64, i64)"
