@@ -23742,6 +23742,47 @@ def _class_surface_ssa_program(
             physical = _authored_annotation_field_receipt(annotation)
             if not declared_types and physical is None:
                 continue
+            # Program: ``def probe(self, row) -> int: return self.count[row]``
+            # over ``array("I")``, then ``1 + s.probe(0)`` (string core
+            # ``token_domain``).  Wrong record: the ``int`` receipt's int64
+            # was posted as the call result's physical dtype before the
+            # callee settled its return, while the callee returns uint32,
+            # so the caller's region and the callee's return disagreed
+            # (``uint32`` versus ``int64``).  Rule: ``-> int`` is a class,
+            # not a width.  A primitive scalar call result carries the
+            # width the callee's own return record settles
+            # (``_callee_return_scalar_dtype``: its return sites typed by
+            # its planned dtypes) when that is a layout of the declared
+            # class; the receipt's default width is only the fallback.
+            if (
+                physical is not None
+                and call_reference is not None
+                and str(physical.get("storage") or "") == "scalar"
+                and source_process_graph is not None
+            ):
+                from .glsl_deployment_strategy import (
+                    _callee_return_scalar_dtype,
+                )
+                from ..transmogrifier.dtype_layout import (
+                    resolve as _return_layout,
+                )
+
+                settled_return = _callee_return_scalar_dtype(
+                    source_process_graph, int(call_reference),
+                )
+                settled_layout = (
+                    None if settled_return is None
+                    or settled_return[0] != "scalar"
+                    else _return_layout(settled_return[1])
+                )
+                declared_layout = _return_layout(physical.get("dtype"))
+                if (
+                    settled_layout is not None
+                    and declared_layout is not None
+                    and {settled_layout.kind, declared_layout.kind}
+                    <= {"int", "uint"}
+                ):
+                    physical = {**physical, "dtype": str(settled_return[1])}
             contract = value_contracts.setdefault(value_id, {})
             _admit_contract_types(contract, declared_types)
             if physical is not None:
