@@ -16179,10 +16179,22 @@ def _install_lexical_sequence_queries(
             and (data.get("attributes") or {}).get("extraction_identity")
                 == f"builtins.{expression.func.id}"
         )
+        # Program: ``g = [[1, 2], [3]]; len(g[i])`` (corpus c800).  A row of a
+        # born list of lists is a resident row sequence of its own, so its
+        # length is the resident length query, as ``len(xs)`` is.
+        list_row_query = (
+            expression.func.id in {"bool", "len"}
+            and len(arguments) == 1
+            and int(sequence_data.get("value_id", sequence_id))
+                in set(map(int, list_row_reads(graph_obj)))
+            and (data.get("attributes") or {}).get("extraction_identity")
+                == f"builtins.{expression.func.id}"
+        )
         if (
             producer_loop_node_id is None
             and not local_list_truth
             and not loop_row_query
+            and not list_row_query
         ):
             continue
         if os.environ.get("TURING_DEBUG_BUILTIN_SELECTION"):
