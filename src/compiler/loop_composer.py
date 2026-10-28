@@ -2155,18 +2155,44 @@ def materialize_retained_loop_ports(
                 return book.latest_ref(LOOP_CARRIED_BINDING, row)
         return None
 
-    def post_port_version(name: str, port_id: int) -> None:
+    def insert_port_version(name: str, continued: int, port_id: int) -> None:
+        """Place a loop's result port in ``name``'s version history.
+
+        Program: ``while index < rounds: checksum += index`` then
+        ``checksum += 100; return checksum``.  Wrong record: the port was
+        appended after the post-loop ``checksum += 100`` version, so the
+        history read ``(..., 4, 9, port)`` and the returned name resolved
+        to the loop's exit value, dropping the add.  Rule: the port is the
+        version right after the loop's last version of the name; a version
+        bound after the loop stays newer than it.  The port's
+        ``name_binding`` row keeps the next free version row, so an authored
+        version's row is never revised to the port.
+        """
+
+        versions = identities.setdefault(str(name), [])
+        position = next((
+            index + 1
+            for index in reversed(range(len(versions)))
+            if int(versions[index]) == int(continued)
+        ), len(versions))
+        versions.insert(position, int(port_id))
+        post_port_version(str(name), int(port_id), len(versions) - 1)
+
+    def post_port_version(
+        name: str, port_id: int, version: int | None = None,
+    ) -> None:
         """The port's version of ``name`` on ``name_binding``: row (scope,
-        name, its position in the identity table), DERIVED from the port's
-        ``canonical_value`` row (plan 80, A2.7)."""
+        name, its position in the identity table, or the given ``version``),
+        DERIVED from the port's ``canonical_value`` row (plan 80, A2.7)."""
 
         port_row = port_rows.get(int(port_id))
         if port_row is None or read_scope is None:
             return
         versions = identities.get(str(name), [])
-        version = len(versions) - 1
-        while version >= 0 and int(versions[version]) != int(port_id):
-            version -= 1
+        if version is None:
+            version = len(versions) - 1
+            while version >= 0 and int(versions[version]) != int(port_id):
+                version -= 1
         if version < 0:
             return
         row = (read_scope, str(name), int(version))
@@ -2564,8 +2590,7 @@ def materialize_retained_loop_ports(
             rewire_continuation(
                 int(updated), result_id, owned_nodes, str(name),
             )
-            identities.setdefault(str(name), []).append(result_id)
-            post_port_version(str(name), result_id)
+            insert_port_version(str(name), int(updated), result_id)
             carried_results[str(name)] = result_id
         for name, initial, continuation in loop.break_bindings:
             if str(name) in carried_results:
@@ -2587,8 +2612,7 @@ def materialize_retained_loop_ports(
             rewire_continuation(
                 int(continuation), result_id, owned_nodes, str(name),
             )
-            identities.setdefault(str(name), []).append(result_id)
-            post_port_version(str(name), result_id)
+            insert_port_version(str(name), int(continuation), result_id)
             carried_results[str(name)] = result_id
 
         planned_iteration_outputs = []

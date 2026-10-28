@@ -29,3 +29,53 @@
   8. When every callsite binds a formal to `None` (or omits it with a `None` default), its unpacked members never hold a value and join as nothing.
   9. A specialized copy's interval is met with its authored function's interval, because the copy runs a subset of the authored executions. A copy cannot see the callsites, but the authored proof can.
 - Measured: c796 gives the audit's exact error on main and passes here. The whole-core audit gets past value 78 and stops at the next one: "declared call storage for %t... (callee intern_batch) has no recorded dtype".
+
+## A loop return the late fold disproves (corpus c797)
+
+`validate_batch_envelope`'s `if not isinstance(offset, int) or
+isinstance(offset, bool): return 1, 0` sits in its offsets loop.  The loop
+is composed during deployment selection; only the hierarchy plan's later
+structural fold proves the branch false, removes the `1, 0` literals and
+revises the return site to `RETURN_SITE_UNREACHABLE`.  The loop's return
+block still named the removed literals, and control lowering minted them as
+untyped caller storage ("declared call storage ... has no recorded dtype").
+The SSA builder now reads the site's slot rows and emits no edge for a site
+the record calls unreachable.
+
+## A name rebound after a carried `while` (corpus c798)
+
+`while ...: checksum += x` then `checksum += 100; return checksum`.  The
+loop composer appended the loop's result port to `checksum`'s version
+history after the post-loop version, so the returned name resolved to the
+loop's exit value and the add was dropped with no error.  The port is now
+inserted right after the loop's last version of the name; its
+`name_binding` row still takes the next free row.
+
+## A list formal with an all-literal caller (corpus c799)
+
+`width(values: list[int])` called with `[65 + r, 66]` and with
+`[65, 67, 68]`.  The literal call's specialization declared the formal in
+`_field_slot_ops` as a retained arena (live flags).  The schema survey joins
+every variant of `width`, so the generic variant counted live flags that its
+runtime caller never wrote, and `len(values)` read 0 with no error.  An
+authored list formal is the caller's storage viewed as a list: it keeps
+deleted rows only when its function deletes from it.
+
+## A literal argument the callee mutates (corpus c900, c901)
+
+`trim(values: list[int]): values.pop(); for v in values: ...` called with
+`[1, 2, 3, 4]`.  The literal specialized the callee (a callsite copy with
+two callers, the catalogue fold with one), the loop unrolled over the
+authored four elements, and the pop was ignored.  A literal is now a value
+of the callee only while the callee never mutates that formal
+(`_formal_is_mutated_in_place`).
+
+## Unproven int64 arithmetic wrapped silently (Precision adaptor stage 1)
+
+Python `int` `+ - *` (and unary `-`) on scalars no interval bounds lowered to
+plain int64 arithmetic, so `mul(n, n)` past 2**63 returned a wrapped value
+Python never computes. Both native lanes now check these ops
+(`llvm.s*.with.overflow.i64`, `__builtin_*_overflow`) and report
+`native_faults.INT_OVERFLOW` (NativeIntOverflow) instead. Stage 2 replaces the
+report with continuation as Precision limbs. Test:
+tests/test_native_int_overflow_checked.py.

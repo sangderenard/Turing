@@ -10923,7 +10923,6 @@ def _field_slot_ops(
         for sequence_id, _policy, _columns, _writable
         in sequence_declarations
     }
-    linked_list_parameters = _linked_list_parameter_contracts(graph_obj)
     for parameter_name, contract in _authored_parameter_sequence_contracts(graph_obj).items():
         history = tuple(map(int, identity.get(str(parameter_name), ())))
         if not history:
@@ -10939,8 +10938,15 @@ def _field_slot_ops(
             sequence_id, policy, int(column_count), bool(writable),
         ))
         declared_sequence_ids.add(sequence_id)
-        if str(parameter_name) not in linked_list_parameters:
-            retained_sequence_ids.add(sequence_id)
+        # Program: ``def width(values: list[int]): return len(values)``
+        # called with ``[65 + r, 66]`` and with the all-literal ``[65, 67,
+        # 68]``.  Wrong record: the literal call's specialization declared
+        # the formal here as a retained arena (live flags), the schema
+        # survey joins every variant of ``width``, and the generic variant
+        # then counted live flags its runtime caller never wrote: ``len``
+        # read 0.  Rule: an authored list formal is the caller's storage
+        # viewed as a list; it keeps deleted rows only when this function
+        # deletes from it (``table_deletions``), never by being a formal.
 
     # Source-derived ``Sequence[Record]`` metadata survives graph extraction
     # independently of any one Input wrapper. Declare its caller-owned

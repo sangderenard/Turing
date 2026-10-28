@@ -26,6 +26,7 @@ from ..transmogrifier.dtype_layout import (
 )
 from ..transmogrifier.ssa import Function, IRModule
 from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+from .native_faults import INT_OVERFLOW as _INT_OVERFLOW_CODE
 from .max_semantics import NUMPY, c_step, max_step_rule
 from .output_publication import (
     function_output_publications,
@@ -6377,6 +6378,32 @@ def emit_ssa_module_to_c(
                         f"const {kind} t{result_id} = "
                         f"{expression};"
                     )
+                    from .ssa_llvm_backend import python_int_overflow_checked
+
+                    if (
+                        integral and op in {"Add", "Sub", "Mul"}
+                        and kind == "int64_t"
+                        and python_int_overflow_checked(instruction)
+                    ):
+                        # The LLVM lane's rule (python_int_overflow_checked):
+                        # Python ``int`` arithmetic never wraps.
+                        prototype = (
+                            "void turing_validation_error(uint32_t error_code);"
+                        )
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        builtin = {
+                            "Add": "__builtin_add_overflow",
+                            "Sub": "__builtin_sub_overflow",
+                            "Mul": "__builtin_mul_overflow",
+                        }[op]
+                        declared = (
+                            f"int64_t t{result_id}; if ({builtin}("
+                            f"(int64_t)({args[0]}), (int64_t)({args[1]}), "
+                            f"&t{result_id})) "
+                            f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                        )
                 elif op in _INTEGER_BINARY and len(args) == 2:
                     integer_ids.add(result_id)
                     kind = _scalar_c_type(instruction.res.dtype)
