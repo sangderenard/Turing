@@ -6426,15 +6426,27 @@ def _normalize_lexical_values(
     #: at a loop, so the first pass over a body sees no cursor for a field
     #: the body itself rewrites later; that read is not the construction's.
     loop_body_field_writes: list[frozenset[tuple[str, str]]] = []
-    #: Local names passed (as an argument or a method receiver) to a call
-    #: that may store into them.  A record this function constructs has no
-    #: field storage the reducer reloads after such a call, so a later read
-    #: of its field is refused rather than answered from the cursor.
-    storing_call_receivers: set[str] = set()
+    #: Values passed (as an argument or a method receiver) to a call that
+    #: may store into them.  A record this function constructs has no field
+    #: storage the reducer reloads after such a call, so a later read of its
+    #: field is refused rather than answered from the cursor.
+    #:
+    #: Program: ``old = acc; add(acc, b); return old.total`` (c933), and
+    #: ``level = IdentityLogLevel(level); level.name`` (bootstrap
+    #: ``iter_identity_book_lines``, c932).  Wrong record: the mark named the
+    #: binding, not the value.  An alias read the construction's stale
+    #: argument (silent), and a fresh record rebound to the passed name was
+    #: refused.  Rule: a call stores into the value its argument names when
+    #: the call runs; every name bound to that value sees the store, and a
+    #: later binding of the name to another value does not.
+    storing_call_values: set[int] = set()
     storing_call_effects: dict[int, list[int]] = {}
-    #: The same names for each loop being reduced, innermost last: a call
+    #: For each loop being reduced, innermost last: the names a call in the
+    #: body may store into, and the values they hold at loop entry.  A call
     #: later in the body stores before the next iteration's read.
-    loop_body_storing_receivers: list[frozenset[str]] = []
+    loop_body_storing_receivers: list[
+        tuple[frozenset[str], frozenset[int]]
+    ] = []
     storing_definitions = dict(authored_definitions_by_name or {})
     #: ``acc.add`` in ``acc.add(b)`` is a method lookup, not a field read.
     method_lookup_ids = {
@@ -6442,6 +6454,33 @@ def _normalize_lexical_values(
         if isinstance(node, ast.Call)
     }
     parameter_store_cache: dict[tuple[int, str], bool] = {}
+
+    def record_class_is_frozen(class_identity: str) -> bool:
+        """Whether the record class declares frozen fields.
+
+        Program: ``context = SSAObjectContext(...); context_values(context);
+        context.storage_identity`` (bootstrap ``validate_context_function``,
+        c936).  Wrong record: a call that may store into the record was
+        taken to rebind its fields, so the field read after it refused.
+        Rule: a frozen dataclass's field bindings never change after
+        construction, so no call can store into them.  An authored class
+        answers from its ClassDef; an imported one from its declared
+        dataclass parameters (metadata only, never an instance)."""
+
+        class_table = dict(graph.G.graph.get("class_table") or {})
+        for spelling in (class_identity, class_identity.rsplit(".", 1)[-1]):
+            descriptor = class_table.get(spelling)
+            if descriptor is not None and "frozen_record" in descriptor:
+                return bool(descriptor["frozen_record"])
+        for name, value in dict(static_bindings or {}).items():
+            if not isinstance(value, type) or class_identity not in {
+                str(name), f"{value.__module__}.{value.__qualname__}",
+            }:
+                continue
+            return bool(
+                is_dataclass(value) and value.__dataclass_params__.frozen
+            )
+        return False
 
     def parameter_may_store(definition: Any, name: str) -> bool:
         """Whether ``definition`` may store into its parameter ``name``.
@@ -7131,6 +7170,10 @@ def _normalize_lexical_values(
     }
 
     local_class_declarations: dict[str, tuple[str, Any]] = {}
+    # Locals whose declaration is ``C | None``: ``local_class_declarations``
+    # holds the present arm ``C`` (what a presence refinement proves), never
+    # the class of every value the local binds.
+    local_optional_class_declarations: set[str] = set()
     local_sequence_element_declarations: dict[str, tuple[str, Any]] = {}
     source_identity = getattr(statement, "_python_source_identity", None)
     function_identity = (
@@ -7204,6 +7247,7 @@ def _normalize_lexical_values(
             annotation_members = [annotation_expression]
             class_identities = []
             valid_class_annotation = True
+            admits_none = False
             while annotation_members:
                 member = annotation_members.pop()
                 if isinstance(member, ast.BinOp) and isinstance(
@@ -7215,6 +7259,7 @@ def _normalize_lexical_values(
                 ) or (
                     isinstance(member, ast.Name) and member.id == "None"
                 ):
+                    admits_none = True
                     continue
                 elif (
                     isinstance(member, ast.Name)
@@ -7249,6 +7294,43 @@ def _normalize_lexical_values(
                 annotation,
                 annotation_cell,
             )
+            if admits_none:
+                local_optional_class_declarations.add(name)
+
+    def concord_local_class_declaration(name: str, value_id: int) -> None:
+        class_identity, annotation_cell = local_class_declarations[name]
+        class_sources = tuple(filter(None, (
+            node_identity_cell(graph, int(value_id)),
+            annotation_cell,
+        )))
+        if name in local_optional_class_declarations:
+            # Program: ``minted: int | None = None`` (c930, and
+            # ``IdentityBook._post`` in the bootstrap).  Wrong record: the
+            # declaration posted the present arm ``int`` as the class of
+            # the bound ``None`` literal.  Rule: a ``C | None`` declaration
+            # names two classes; it concords with the class the value's own
+            # producer posted when that is one of them, and claims nothing
+            # for a value whose class is not yet recorded.
+            from ...compiler.concordance_declarations import (
+                SOURCE_VALUE_CLASS,
+            )
+
+            incumbent = current_identity_book().page(
+                SOURCE_VALUE_CLASS
+            ).latest((value_class_scope, int(value_id)))
+            if incumbent is None:
+                return
+            if _canonical_source_class_identity(
+                incumbent[0]
+            ) == "builtins.NoneType":
+                class_identity = "builtins.NoneType"
+        _concord_source_value_class(
+            value_class_scope,
+            int(value_id),
+            class_identity,
+            source=f"authored local annotation {name}",
+            provenance=_Derived(class_sources) if class_sources else None,
+        )
 
     def annotation_aggregate_kind(annotation: ast.AST | None) -> str | None:
         if isinstance(annotation, ast.Name) and annotation.id in {
@@ -8691,7 +8773,9 @@ def _normalize_lexical_values(
                             {"result_class_ref": local_class_declarations[
                                 target.id
                             ][0]}
-                            if target.id in local_class_declarations else {}
+                            if target.id in local_class_declarations
+                            and target.id
+                            not in local_optional_class_declarations else {}
                         ),
                         **(
                             {
@@ -8719,20 +8803,7 @@ def _normalize_lexical_values(
                     target.id
                 )
                 if local_class_declaration is not None:
-                    class_identity, annotation_cell = local_class_declaration
-                    class_sources = tuple(filter(None, (
-                        node_identity_cell(graph, int(value)),
-                        annotation_cell,
-                    )))
-                    _concord_source_value_class(
-                        value_class_scope,
-                        int(value),
-                        class_identity,
-                        source=f"authored local annotation {target.id}",
-                        provenance=(
-                            _Derived(class_sources) if class_sources else None
-                        ),
-                    )
+                    concord_local_class_declaration(target.id, int(value))
                 loop_target_bindings_by_ast[target_identity] = value
                 identity_bindings.setdefault(target.id, []).append(value)
                 # The loop target's ``name_binding`` row: DERIVED from the
@@ -9425,7 +9496,10 @@ def _normalize_lexical_values(
             # operands. Recursive expression resolution preserves left/right
             # order, so acc.add(b) + acc.total still refuses its stale read.
             names = storing_call_names(expression)
-            storing_call_receivers.update(names)
+            storing_call_values.update(
+                int(environment[name]) for name in names
+                if isinstance(environment.get(name), int)
+            )
             if isinstance(result, int) and result in graph.G and isinstance(
                 graph.G.nodes[result].get("expr_obj"), ast.Call,
             ):
@@ -10166,11 +10240,13 @@ def _normalize_lexical_values(
                     and receiver_class is not None
                     and isinstance(expression.value, ast.Name)
                     and id(expression) not in method_lookup_ids
+                    and not record_class_is_frozen(str(receiver_class))
                     and (
-                        str(expression.value.id) in storing_call_receivers
+                        int(receiver) in storing_call_values
                         or any(
                             str(expression.value.id) in names
-                            for names in loop_body_storing_receivers
+                            or int(receiver) in values
+                            for names, values in loop_body_storing_receivers
                         )
                     )
                 )
@@ -14793,23 +14869,11 @@ def _normalize_lexical_values(
                     })
             local_class_declaration = local_class_declarations.get(target.id)
             if local_class_declaration is not None and int(value) in graph.G:
-                class_identity, annotation_cell = local_class_declaration
-                graph.G.nodes[int(value)].setdefault(
-                    "attributes", {}
-                )["result_class_ref"] = class_identity
-                class_sources = tuple(filter(None, (
-                    node_identity_cell(graph, int(value)),
-                    annotation_cell,
-                )))
-                _concord_source_value_class(
-                    value_class_scope,
-                    int(value),
-                    class_identity,
-                    source=f"authored local annotation {target.id}",
-                    provenance=(
-                        _Derived(class_sources) if class_sources else None
-                    ),
-                )
+                if target.id not in local_optional_class_declarations:
+                    graph.G.nodes[int(value)].setdefault(
+                        "attributes", {}
+                    )["result_class_ref"] = local_class_declaration[0]
+                concord_local_class_declaration(target.id, int(value))
             source_binding = None
             source_version = None
             if isinstance(value_occurrence, ast.Name):
@@ -15542,11 +15606,20 @@ def _normalize_lexical_values(
     def reduce_statement(body_statement: ast.stmt) -> int | None:
         # Individual Call resolution publishes stores after its operands;
         # premarking a whole statement invalidates reads before the call.
-        result = reduce_statement_body(body_statement)
-        if not isinstance(body_statement, (
+        if isinstance(body_statement, (
             ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
         )):
-            storing_call_receivers.update(storing_call_names(body_statement))
+            return reduce_statement_body(body_statement)
+        names = storing_call_names(body_statement)
+        entry_values = {name: environment.get(name) for name in names}
+        result = reduce_statement_body(body_statement)
+        # The statement's calls ran on the values bound when it began.  A
+        # name it binds first was marked by its call's own resolution, at
+        # the value the call received; its value now may be a new binding.
+        storing_call_values.update(
+            int(stored) for stored in entry_values.values()
+            if isinstance(stored, int)
+        )
         return result
 
     def reduce_statement_body(body_statement: ast.stmt) -> int | None:
@@ -17005,10 +17078,17 @@ def _normalize_lexical_values(
                 if isinstance(target, ast.Attribute)
                 and isinstance(target.value, ast.Name)
             ))
-            loop_body_storing_receivers.append(frozenset(
+            loop_storing_names = frozenset(
                 name
                 for nested in body_statement.body
                 for name in storing_call_names(nested)
+            )
+            loop_body_storing_receivers.append((
+                loop_storing_names,
+                frozenset(
+                    int(environment[name]) for name in loop_storing_names
+                    if isinstance(environment.get(name), int)
+                ),
             ))
             try:
                 for nested in body_statement.body:
@@ -21528,6 +21608,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 if owner == class_name
             },
             "field_callables": class_field_callables(definition),
+            # ``@dataclass(frozen=True)``: no assignment rebinds a field
+            # after construction (the declaration, not a host instance).
+            "frozen_record": any(
+                isinstance(decorator, ast.Call)
+                and (
+                    decorator.func.id if isinstance(decorator.func, ast.Name)
+                    else decorator.func.attr
+                    if isinstance(decorator.func, ast.Attribute) else ""
+                ) == "dataclass"
+                and any(
+                    keyword.arg == "frozen"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                    for keyword in decorator.keywords
+                )
+                for decorator in definition.decorator_list
+            ),
         }
         for class_name, definition in class_definitions.items()
     }

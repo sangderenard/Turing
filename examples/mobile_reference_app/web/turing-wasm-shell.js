@@ -25,11 +25,15 @@ export class TuringWasmProgram {
         return parameter.offset;
       }
       if (!(parameter.name in feeds)) throw new Error(`missing Turing feed: ${parameter.name}`);
+      // A Python int is an i64 formal, which takes a BigInt; never truncate it.
+      if (parameter.kind === 'i64') return BigInt(feeds[parameter.name]);
       return parameter.kind === 'i32' ? Number(feeds[parameter.name]) | 0 : Number(feeds[parameter.name]);
     });
     this.instance.exports[this.contract.entrypoint](...args);
     return Object.fromEntries(this.contract.parameters
       .filter(parameter => parameter.kind === 'buffer' && parameter.role === 'output')
-      .map(parameter => [parameter.name, this.memory.getFloat64(parameter.offset, true)]));
+      .map(parameter => [parameter.name, parameter.dtype === 'int64'
+        ? this.memory.getBigInt64(parameter.offset, true)
+        : this.memory.getFloat64(parameter.offset, true)]));
   }
 }

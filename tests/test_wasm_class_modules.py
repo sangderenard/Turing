@@ -14,6 +14,7 @@ from src.compiler.wasm_class_modules import (
     describe_process_graph_api, emit_class_modules,
     fused_program_extent_effect, partition_reduced_program,
     partition_threaded_wasm_program,
+    module_node_names,
     schedule_module_levels,
 )
 
@@ -354,14 +355,18 @@ def test_build_module_process_graph_is_the_real_process_graph_class():
     assert isinstance(graph, ProcessGraph)
     assert isinstance(graph.scheduler, ILPScheduler)
     chunk0, chunk1 = specs
-    assert (chunk0.module_name, chunk1.module_name) in graph.G.edges
+    # Node ids are the memory graph's integers; each carries its module name.
+    names = module_node_names(graph)
+    assert [(names[a], names[b]) for a, b in graph.G.edges] == [
+        (chunk0.module_name, chunk1.module_name)
+    ]
 
 
 def test_a_single_module_gets_a_process_graph_of_one_node():
     program = _linear_program(3)
     specs = partition_reduced_program(program, chunk_size=10, owner_name="kernel")
     graph = build_module_process_graph(specs)
-    assert list(graph.G.nodes) == ["kernel__0"]
+    assert list(module_node_names(graph).values()) == ["kernel__0"]
     assert list(graph.G.edges) == []
     assert schedule_module_levels(specs) == {"kernel__0": 0}
 

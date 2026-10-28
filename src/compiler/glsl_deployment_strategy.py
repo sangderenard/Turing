@@ -5575,8 +5575,15 @@ def _build_shell_hierarchy_plan(
                         .get("numeric_feature_descriptor")
                         if base is not None else None
                     )
+                # A ``Precision[k]`` with no element names the Precision
+                # type's own limb element (``limb_element_name``), which
+                # refuses an element it has no limb facts for.
+                from ..common.tensors.extended_precision import (
+                    limb_element_name,
+                )
+
                 precision_dtype = (
-                    str(numeric.get("element_type") or "float64")
+                    limb_element_name(numeric.get("element_type"))
                     if isinstance(numeric, Mapping)
                     and set(map(str, numeric.get("features") or ()))
                     == {"precision"}
@@ -5588,8 +5595,8 @@ def _build_shell_hierarchy_plan(
                 ):
                     # A precision operation's result: limbs of the element
                     # the reducer recorded for it.
-                    precision_dtype = str(
-                        attributes.get("precision_element") or "float64"
+                    precision_dtype = limb_element_name(
+                        attributes.get("precision_element")
                     )
                 dtype = (
                     tensor.get("dtype")
@@ -21273,6 +21280,15 @@ def _publish_conditional_call_aggregate_merges(
             and len(body.members) == len(orelse.members)
         ):
             return None
+        # Program: ``d = {1: n}; for i in range(4): if i == n: d[i + 5] =
+        # i`` (corpus c671).  Wrong record: the dict's ``if`` merge became
+        # an ``aggregate_phi`` of per-row member Phis on the source graph,
+        # so the table the loop carries was split into rows whose handle
+        # and column roles disagreed at the final concordance.  Rule: a
+        # dict's arms are versions of one table; its merge stays that
+        # table (``_loop_carried_storage_aliases``), never member Phis.
+        if body.aggregate_kind == "dict":
+            return None
         # The same merge may already be on the book, posted from the work
         # copy of this graph; this graph still needs its member Phis.
         incumbent, incumbent_cell = layout_of(merged_id)
@@ -29044,15 +29060,21 @@ def _fold_callsite_structural_values(
                                 or operation in {"div", "truediv"}
                             )
                         ):
-                            from ..common.tensors.topological_reducer import (
-                                _widest_element,
+                            from ..transmogrifier.dtype_layout import (
+                                python_float_result_dtype,
                             )
 
-                            result_dtype = _widest_element(*(
-                                {"float": "float64", "double": "float64"}
-                                .get(dtype, dtype)
-                                for dtype in scalar_float_operands
-                            )) or "float64"
+                            result_dtype = python_float_result_dtype(
+                                descriptor.get("dtype")
+                                for descriptor in parent_descriptors
+                            )
+                            if result_dtype is None:
+                                raise ValueError(
+                                    f"scalar {operation} of operands "
+                                    f"{[d.get('dtype') for d in parent_descriptors]} "
+                                    "has no float result record: an operand's "
+                                    "dtype is neither float nor integral"
+                                )
                         data["tensor"] = {
                             "shape": shape,
                             "dtype": result_dtype,
@@ -30845,7 +30867,14 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
     the control planner to carry a tensor through a Python ``for`` loop.
     """
 
-    if str(graph.G.graph.get("function_name") or "") != "unbroadcast":
+    # The identity is the authored definition, not its spelling: a program's
+    # own ``def unbroadcast(G, target_shape)`` was rewritten to sum/reshape.
+    from ..common.tensors import backward_registry
+
+    identity = graph.G.graph.get("authored_function_identity")
+    if not identity or tuple(identity)[1:2] != ("unbroadcast",):
+        return False
+    if str(tuple(identity)[0]) != backward_registry.__name__:
         return False
     descriptors = graph.G.graph.get("planner_tensor_descriptors") or {}
     specializations = graph.G.graph.get("planner_specializations") or {}

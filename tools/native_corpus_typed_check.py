@@ -14,7 +14,7 @@ BACKENDS = tuple(
     name.strip() for name in os.environ.get("TYPED_CHECK_BACKENDS", "c").split(",")
     if name.strip()
 )
-unknown_backends = set(BACKENDS) - {"c", "llvm", "fortran"}
+unknown_backends = set(BACKENDS) - {"c", "llvm", "fortran", "wasm"}
 if unknown_backends:
     raise SystemExit(f"unknown TYPED_CHECK_BACKENDS entries: {sorted(unknown_backends)}")
 # The Fortran artifact carries its runtime by default: linked in on Windows,
@@ -177,7 +177,14 @@ def run_fortran(module, export, params, outs, inputs, expects):
         FortranCoreNative, emit_module, fortran_compiler,
     )
     try:
-        fortran_module = emit_module(module, progress=lambda _: None)
+        # The export is the root, as in the C/LLVM lanes (which emit only
+        # ``export``) and the compilation product (``extra_roots=
+        # export_names``).  Without it every control function became an
+        # entry: c829/c855/c856's inlined ``same(a)`` helper was exported
+        # on its own and refused for returning its heap list.
+        fortran_module = emit_module(
+            module, extra_roots=(export,), progress=lambda _: None,
+        )
     except Exception as e:
         return f"EMIT-FAIL {type(e).__name__}: {str(e)[:300]}", None
     if not getattr(fortran_module, "complete", True):
@@ -204,6 +211,43 @@ def run_fortran(module, export, params, outs, inputs, expects):
         except Exception as e:
             values.append(None)
             results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
+    bad = [r for r in results if r != "ok"]
+    return f"{'PASS' if not bad else 'FAIL'} {bad[:3]}", values
+
+
+def run_wasm(module, export, params, outs, inputs, expects):
+    # The independent repository-SSA WebAssembly core (the mobile PWA's
+    # execution product), run in node.  Same verdicts as the other lanes.
+    from src.compiler.ssa_wasm_backend import (
+        emit_ssa_module_to_wasm_core, prepare_wasm_core_execution,
+    )
+    try:
+        art = emit_ssa_module_to_wasm_core(module, export, entry_name=export)
+    except Exception as e:
+        return f"EMIT-FAIL {type(e).__name__}: {str(e)[:300]}", None
+    if not art.complete:
+        return f"EMIT-INCOMPLETE {[str(s.reason)[:150] for s in art.shortfalls[:2]]}", None
+    # Scalar formals are wasm parameters passed by value; buffers are fed
+    # one-element arrays, as in the other lanes.
+    by_value = {value_id for kind, value_id in art.parameters if kind != "buffer"}
+    results, values = [], []
+    for feeds, expect in zip(inputs, expects):
+        ex = None
+        try:
+            fed = _feeds(module, export, params, feeds)
+            ex = prepare_wasm_core_execution(art, {
+                value_id: (cell[0].item() if value_id in by_value else cell)
+                for value_id, cell in fed.items()
+            }).run()
+            flat, kinds = output_values(module, export, outs, lambda i: ex.buffers[i])
+            values.append(flat)
+            results.append(judge(feeds, expect, flat, kinds))
+        except Exception as e:
+            values.append(None)
+            results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
+        finally:
+            if ex is not None:
+                ex.close()
     bad = [r for r in results if r != "ok"]
     return f"{'PASS' if not bad else 'FAIL'} {bad[:3]}", values
 
@@ -318,6 +362,12 @@ def check_group(path, src, inputs, expects, inventory, label=None):
             found = disagreements(inputs, c_values, fortran_values or ())
             if found:
                 print(f"{label}: DISAGREE c/fortran {found[:2]}")
+        if "wasm" in BACKENDS:
+            verdict, wasm_values = run_isolated(run_wasm, module, exports[0], params, outs, inputs, expects)
+            print(f"{label}: WASM {verdict}")
+            found = disagreements(inputs, c_values, wasm_values or ())
+            if found:
+                print(f"{label}: DISAGREE c/wasm {found[:2]}")
 
 
 if __name__ == "__main__":
