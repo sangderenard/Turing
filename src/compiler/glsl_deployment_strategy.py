@@ -2312,6 +2312,18 @@ def _planned_scalar_dtypes_from(
                 is not None
             ):
                 settle(scalar, node_id, classes[next(iter(declared_returns))])
+            # Program: ``head(xs) * 10`` with ``def head(xs: list[int]) ->
+            # int`` (corpus c385).  The same record on a plain function call:
+            # its result is stamped with the callee's declared class.
+            elif (
+                attributes.get("source_type") == "Call"
+                and not attributes.get("aggregate_kind")
+                and str(attributes.get("result_class_ref") or "")
+                .removeprefix("builtins.") in classes
+            ):
+                settle(scalar, node_id, classes[
+                    str(attributes["result_class_ref"]).removeprefix("builtins.")
+                ])
             if op in {"const", "constant"}:
                 literal = attributes.get(
                     "value",
@@ -4331,9 +4343,6 @@ def _build_shell_hierarchy_plan(
                 # receiver) needs none; one that is refuses by name where it
                 # is consumed (``_value_shape_dtype`` below).
                 dtype = str(dtype) if dtype else None
-                import os
-                if os.environ.get("DBGA") and not (tensor.get("dtype") or getattr(specialization,"dtype",None) or node.get("dtype") or described_dtype or planned_scalar_dtypes().get(int(current))):
-                    print("DOMDEF", int(current), node.get("op"), dtype, (node.get("attributes") or {}).get("binding_name"), node.get("parents"))
                 field_name = attributes.get("attribute")
                 if (
                     not logical
@@ -4500,7 +4509,17 @@ def _build_shell_hierarchy_plan(
                     # disagreed with the loop Phi's physical storage. Ports
                     # continue values; consult the existing proven descriptor.
                     posted = planned_descriptor(int(current))
-                    if posted is not None and posted.get("dtype"):
+                    # Program: ``for y in [x * n for x in xs]: t += y``
+                    # (corpus c265).  Wrong record: the loop's result port
+                    # took its descriptor's float64 domain default over the
+                    # int64 the source proves (``_planned_scalar_dtypes``),
+                    # and every value computed from it followed.  Rule: a
+                    # class the source proves stands; the descriptor speaks
+                    # only where the source proves none.
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven is not None:
+                        dtype = str(proven)
+                    elif posted is not None and posted.get("dtype"):
                         dtype = str(posted["dtype"])
                     elif len(parent_dtypes) == 1:
                         dtype = parent_dtypes[0]
@@ -4729,20 +4748,12 @@ def _build_shell_hierarchy_plan(
                 == "staticreference"
             ):
                 return None
-            import os
-            if os.environ.get("DBGA"):
-                print("RV", int(value_id)); [print("  ANC", n, graph.G.nodes[n].get("op"), {k:v for k,v in (graph.G.nodes[n].get("attributes") or {}).items() if k in ("aggregate_kind","producer_kind","binding_kind","static_python_reference","value")}, _shape_dtype_cache.get(n), planned_scalar_dtypes().get(n), graph.G.nodes[n].get("parents")) for n in sorted(__import__("networkx").ancestors(graph.G,int(value_id)))]
             raise ValueError(
                 f"region value {int(value_id)} has no settled dtype in the "
                 "tensor, specialization, node, descriptor, planned scalar "
                 "types, its operands or domain"
             )
 
-        import os
-        if os.environ.get("DBGA"):
-            print("PLANNED", planned_scalar_dtypes())
-            print("NODES", {n:(d.get("op"), d.get("parents")) for n,d in graph.G.nodes(data=True)})
-            print("VS", [ _typed_value_shape(v) for v in (*region_nodes, *region_captures)])
         value_shapes = tuple(
             record
             for record in (
