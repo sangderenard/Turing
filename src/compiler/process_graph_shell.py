@@ -175,17 +175,18 @@ def schedule_table(
     import networkx as nx
 
     from .wasm_class_modules import (
-        build_module_process_graph, schedule_module_levels,
+        build_module_process_graph, module_node_names, schedule_module_levels,
     )
 
     graph = build_module_process_graph(specs)
+    names = module_node_names(graph)
     levels = schedule_module_levels(specs, method=method)
 
     components = list(nx.weakly_connected_components(graph.G))
     group_of: dict[str, int] = {}
     for group_index, component in enumerate(components):
         for node_id in component:
-            group_of[node_id] = group_index
+            group_of[names[node_id]] = group_index
 
     nodes = [
         {
@@ -196,7 +197,9 @@ def schedule_table(
         }
         for spec in specs
     ]
-    edges = [{"from": src, "to": dst} for src, dst in graph.G.edges]
+    edges = [
+        {"from": names[src], "to": names[dst]} for src, dst in graph.G.edges
+    ]
 
     return {
         "nodes": nodes,
