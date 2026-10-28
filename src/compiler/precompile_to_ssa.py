@@ -2263,6 +2263,7 @@ class _ControlSSABuilder(TiledObject):
         retained_sequence_ids: tuple[int, ...] = (),
         nested_sequence_ids: tuple[int, ...] = (),
         nested_tensor_sequence_ids: tuple[int, ...] = (),
+        nested_tensor_value_dtypes: Mapping[int, str] | None = None,
         joined_sequence_ids: tuple[int, ...] = (),
         joined_singleton_values: Mapping[int, int] | None = None,
         nested_row_target_ids: tuple[int, ...] = (),
@@ -3191,7 +3192,10 @@ class _ControlSSABuilder(TiledObject):
         nested_tensor_sequence_ids = set(map(
             int, nested_tensor_sequence_ids
         ))
-        nested_value_dtypes: dict[int, str] = {}
+        nested_value_dtypes: dict[int, str] = {
+            int(sid): str(dtype)
+            for sid, dtype in (nested_tensor_value_dtypes or {}).items()
+        }
         lookup_sequence_by_result = {
             int(result_id): int(sequence_id)
             for result_id, _query_id, sequence_id in table_lookups
@@ -24531,6 +24535,7 @@ def lower_control_program_to_ssa(
     retained_sequence_ids: tuple[int, ...] = (),
     nested_sequence_ids: tuple[int, ...] = (),
     nested_tensor_sequence_ids: tuple[int, ...] = (),
+    nested_tensor_value_dtypes: Mapping[int, str] | None = None,
     joined_sequence_ids: tuple[int, ...] = (),
     joined_singleton_values: Mapping[int, int] | None = None,
     nested_row_target_ids: tuple[int, ...] = (),
@@ -24597,6 +24602,7 @@ def lower_control_program_to_ssa(
         retained_sequence_ids=retained_sequence_ids,
         nested_sequence_ids=nested_sequence_ids,
         nested_tensor_sequence_ids=nested_tensor_sequence_ids,
+        nested_tensor_value_dtypes=nested_tensor_value_dtypes,
         joined_sequence_ids=joined_sequence_ids,
         joined_singleton_values=joined_singleton_values,
         nested_row_target_ids=nested_row_target_ids,
@@ -28262,6 +28268,7 @@ def lower_control_sections_to_ssa(
     retained_sequence_ids: tuple[int, ...] = (),
     nested_sequence_ids: tuple[int, ...] = (),
     nested_tensor_sequence_ids: tuple[int, ...] = (),
+    nested_tensor_value_dtypes: Mapping[int, str] | None = None,
     joined_sequence_ids: tuple[int, ...] = (),
     joined_singleton_values: Mapping[int, int] | None = None,
     nested_record_fields: tuple[tuple[int, str, int], ...] = (),
@@ -31298,6 +31305,7 @@ def lower_control_sections_to_ssa(
         retained_sequence_ids=retained_sequence_ids,
         nested_sequence_ids=nested_sequence_ids,
         nested_tensor_sequence_ids=nested_tensor_sequence_ids,
+        nested_tensor_value_dtypes=nested_tensor_value_dtypes,
         joined_sequence_ids=joined_sequence_ids,
         joined_singleton_values=joined_singleton_values,
         nested_row_target_ids=tuple(sorted(

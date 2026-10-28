@@ -1340,6 +1340,9 @@ def sample(reading: Reading, key: str):
 
 
 def test_keyed_tensor_lookup_feeds_tensor_property_region_as_span():
+    from src.compiler.called_inventory import (
+            MappingClass, RecordClass, TensorClass,
+        )
     module, _outputs, _exports = lower_ast_source_to_ssa(
         """
 from dataclasses import dataclass
@@ -1356,6 +1359,12 @@ def sample(reading: Reading, key: str):
 """,
         "sample",
         name="keyed_tensor_region",
+        root_calls=[{
+            "reading": RecordClass(
+                "Reading", voltage_v=MappingClass(str, TensorClass("float64")),
+            ),
+            "key": str,
+        }],
         extraction_contract=(
             Path(__file__).resolve().parents[1]
             / "extraction_contracts"
