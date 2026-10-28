@@ -127,6 +127,52 @@ def _value_cells(*pairs):
     return tuple(cells)
 
 
+def _refresh_scope_occurrences(functions):
+    """Make every occurrence of a settled identity a view of its row.
+
+    Program: ``any([x > n for x in xs])`` beside a mutating call
+    (c244/c269/c283).  Wrong record: a planned region and its control
+    function share one ``ssa_value`` scope, so the region's publication of
+    the list's settled ``(3,)`` revised the row both functions read, while
+    ``publish_ssa_value_type`` refreshed only the publishing function's own
+    occurrences; the control function kept the provisional ``()`` and the
+    final concordance refused the disagreement.  Rule: a published type is
+    the identity's, so each same-scope function's occurrences take the row's
+    dtype and shape (the rule ``publish_ssa_value_type`` states)."""
+    from .concordance_declarations import SSA_VALUE, SSAValueFact
+    from .identity_concordance import current_identity_book
+    from .ssa_record_return_state import accepted_ssa_component, function_scope_of
+
+    book = current_identity_book()
+    for function in functions.values():
+        if accepted_ssa_component(function):
+            continue
+        scope = function_scope_of(function)
+        occurrences = [
+            *function.args,
+            *(
+                value
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                for value in (*instruction.args, instruction.res)
+                if value is not None
+            ),
+        ]
+        for value in occurrences:
+            cell = book.latest_ref(SSA_VALUE, (scope, int(value.id)))
+            if cell is None:
+                continue
+            fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
+            if (
+                isinstance(fact, SSAValueFact)
+                and fact.dtype not in (None, "", "unknown")
+                and (value.dtype, tuple(value.shape or ()))
+                != (fact.dtype, tuple(fact.shape or ()))
+                and value.dtype == fact.dtype
+            ):
+                value.shape = tuple(fact.shape or ())
+
+
 def settle_call_result_types(functions, emit_outputs, function_values):
     from .concordance_declarations import PLANNING_VALUE
     from .identity_concordance import current_identity_book
@@ -413,6 +459,7 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                     'callee_output', callee.name, int(source.id))
             exact_values.add(id(target))
 
+    _refresh_scope_occurrences(functions)
     conflicts = tuple(dict(caller=caller.name, value_id=int(target.id),
         retained=_type(target)[:3], retained_storage=_storage_type(target),
         retained_recorded=_recorded_type(caller, target),

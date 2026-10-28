@@ -89,6 +89,7 @@ from .ast_control_normalization import (
     _normalize_loop_else as _normalize_loop_else,
     _normalize_chained_comparisons as _normalize_chained_comparisons,
     _normalize_constant_membership as _normalize_constant_membership,
+    _normalize_sequence_replication_display as _normalize_sequence_replication_display,
     _normalize_builtin_divmod as _normalize_builtin_divmod,
     _normalize_mapping_get as _normalize_mapping_get,
     _normalize_set_constructor as _normalize_set_constructor,
@@ -158,6 +159,7 @@ from .resident_sequence_materialization import (
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
+    _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
     _list_rebound_on_one_branch as _list_rebound_on_one_branch,
     _loop_carried_initial_ids as _loop_carried_initial_ids,
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
@@ -21840,7 +21842,25 @@ def _settle_linked_dynamic_sequences(
         graph_obj.graph["linked_bounded_sequence_ids"] = tuple(sorted(
             value_id
             for node_id, data in graph_obj.nodes(data=True)
+            # Program: ``t = [n, 1] if n > 2 else [7, n]`` passed to a
+            # callee that only reads it (c651).  Wrong record: only list
+            # displays were candidates, so the merge (an ``aggregate_phi``,
+            # which the survey counts as a local list of its leaf rows)
+            # stayed escaped-unbounded and its FIXED fill ran out of
+            # capacity (code 75).  Rule: a merged list is a local list
+            # like a display; its leaf rows bound it when nothing grows it.
             if isinstance(data.get("expr_obj"), ast.List)
+            or (
+                (data.get("attributes") or {}).get("producer_kind")
+                == "aggregate_phi"
+                and (data.get("attributes") or {}).get("aggregate_kind")
+                == "list"
+                and (data.get("attributes") or {}).get("aggregate_leaf_value_ids")
+            )
+            # Program: the same merge from displays of different lengths
+            # (c654).  Born by the arms' copies, it is bounded by the
+            # longest arm (the survey's copy bound) when nothing grows it.
+            or _list_merged_from_unequal_displays(graph_obj, int(node_id))
             for value_id in (int(node_id),)
             if value_id in escapes
             and (
@@ -45990,6 +46010,9 @@ def _class_surface_ssa_program(
                     {} if caller_node is None
                     else caller_node.get("attributes") or {}
                 )
+                from .glsl_deployment_strategy import (
+                    loop_carried_initial_at_call as _loop_initial_at_call,
+                )
                 if (
                     caller_node is not None
                     and str(caller_node.get("type")) in {
@@ -45998,6 +46021,10 @@ def _class_surface_ssa_program(
                     and (
                         "value" in caller_attributes
                         or "constant" in caller_node
+                    )
+                    and not _loop_initial_at_call(
+                        caller_graph, planned_call.callsite_id,
+                        caller_value_id,
                     )
                 ):
                     frame_bindings.append((
@@ -61376,6 +61403,9 @@ def _lower_ast_source_to_ssa_impl(
     # Membership in an inline numeric literal becomes a disjunction before
     # the short-circuit normalization nests it.
     chained_comparison_receipts.extend(_normalize_constant_membership(tree))
+    chained_comparison_receipts.extend(
+        _normalize_sequence_replication_display(tree)
+    )
     chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
     chained_comparison_receipts.extend(_normalize_mapping_get(tree))
     chained_comparison_receipts.extend(_normalize_set_constructor(tree))
@@ -61804,6 +61834,9 @@ def _lower_ast_source_to_ssa_impl(
         )
         chained_comparison_receipts.extend(
             _normalize_constant_membership(discovered_tree)
+        )
+        chained_comparison_receipts.extend(
+            _normalize_sequence_replication_display(discovered_tree)
         )
         chained_comparison_receipts.extend(
             _normalize_builtin_divmod(discovered_tree)
