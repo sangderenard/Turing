@@ -29467,7 +29467,11 @@ def lower_control_sections_to_ssa(
             # generic guess is an integer, decided here, once, before the
             # control caller and later regions read it (``n + k`` indexing
             # an array; its caller once loaded the int result as a double).
-            integer_dtypes = {"int", "int64", "int32", "int16", "int8"}
+            # uint64/int128 are settled integers too: the width of a proven
+            # interval (``source_int_range_concordance``), never a guess.
+            integer_dtypes = {
+                "int", "int64", "int32", "int16", "int8", "uint64", "int128",
+            }
             integer_ops = {
                 "add", "sub", "mul", "floordiv", "mod", "neg",
                 "min", "max", "abs",
