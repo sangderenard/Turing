@@ -13815,6 +13815,32 @@ def _normalize_lexical_values(
                 )
             if isinstance(target.value, ast.Name):
                 bind_target(target.value, node_id)
+            elif (
+                isinstance(target.value, ast.Subscript)
+                and isinstance(target.value.value, ast.Name)
+                and graph.G.nodes[int(base)].get("type") == "Indexed"
+                and any(
+                    role == "base"
+                    and (
+                        (graph.G.nodes[parent].get("attributes") or {}).get(
+                            "aggregate_kind"
+                        ) == "list"
+                        or (graph.G.nodes[parent].get("attributes") or {}).get(
+                            "row_store_of_list"
+                        )
+                    )
+                    for parent, role in graph.G.nodes[int(base)].get("parents") or ()
+                )
+            ):
+                node_data["attributes"]["row_store_of_list"] = True
+                # Program: ``g = [[1, 2], [3, 4]]; g[i][1] = v; ... g[k]``
+                # (corpus c740).  Wrong record: a store into a row of a list
+                # of lists versioned nothing the outer list's name reads, so
+                # a later read of ``g`` had no edge from the store and
+                # region formation fused it with work before the store.
+                # Rule: the row write is a new version of the list that owns
+                # the row, as ``xs[i] = v`` is of ``xs``.
+                bind_target(target.value.value, node_id)
             elif isinstance(target.value, ast.Attribute) and isinstance(
                 target.value.value, ast.Name
             ):
