@@ -301,6 +301,9 @@ def _table_operation_sequence_accesses(
         reads.add(int(arguments[2]))
     elif kind in ("row_load", "row_load_capture"):
         reads.add(int(arguments[1]))
+        # The loaded row of a list of lists is a sequence: ``len(g[i])``
+        # reads it, so it follows the load that selects it.
+        writes.add(int(arguments[0]))
     elif kind == "row_store":
         writes.add(int(arguments[1]))
     elif kind == "store":
@@ -337,6 +340,12 @@ def _table_operation_value_reads(
         return {int(value) for value in arguments[2:4] if value is not None}
     if kind == "append_scalar":
         return {int(arguments[1])}
+    # Program: ``len(g[i])`` over a list of lists (corpus c800).  Wrong
+    # record: a row load whose region held nothing else read no value, so it
+    # was scheduled before the region that computes ``i``.  Rule: a row load
+    # reads its runtime index.
+    if kind in ("row_load", "row_load_capture"):
+        return {int(arguments[2])} if arguments[3] is None else set()
     return set()
 
 
@@ -3307,6 +3316,11 @@ class _ControlSSABuilder(TiledObject):
         collect_handle_merges(program.root)
 
         for sequence_id, policy, column_count, writable in sequence_declarations:
+            # A row of a list of lists is selected by its row load, which
+            # builds its descriptor where it runs (``len(g[i])``, corpus
+            # c800); declared here it would load before its index exists.
+            if int(sequence_id) in (consumer_row_loads or {}):
+                continue
             committed = commit_sequence_contract(
                 function_name,
                 int(sequence_id),
@@ -3542,6 +3556,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={"binding": "ssa_joined_sequence_initialize"},
             )
         for sequence_id, policy, column_count in sequence_initializations:
+            if int(sequence_id) in (consumer_row_loads or {}):
+                continue
             literal_table_rows = None
             descriptor_policy = (
                 "duplicates"
@@ -11592,6 +11608,18 @@ class _ControlSSABuilder(TiledObject):
                     "a selected row view from another conditional needs an explicit merged physical view",
                 ))
                 return None
+        if (
+            selected is not None
+            and selected[0].shape_value_id is None
+            and value_id in self.sequence_descriptors
+            and value_id in self.sequence_storage_values
+        ):
+            # Program: ``g = [[1, 2], [3]]; len(g[i])`` (corpus c800).  Wrong
+            # record: a query asked again for a row view the row load had
+            # built, and the general path below minted its length and
+            # capacity cells a second time, never emitted (length 0).  Rule:
+            # a selected row has one view; later requests read it.
+            return self.sequence_descriptors[value_id]
         if selected is not None and selected[0].shape_value_id is None and value_id not in self.sequence_descriptors:
             # ``d.setdefault(k, []).append(v)``: the returned collection is
             # exactly the selected pool row. Allocating an arena for this
@@ -12758,6 +12786,11 @@ class _ControlSSABuilder(TiledObject):
             self._emit_sequence_membership(*arguments)
             return
         sequence_id = int(query.sequence_value_id)
+        # A queried row of a list of lists is selected by its row load, which
+        # runs where the row is first asked for: here (corpus c800).
+        row_load = self.consumer_row_loads.pop(sequence_id, None)
+        if row_load is not None and sequence_id not in self.external_values:
+            self._emit_sequence_row_load(*row_load)
         selected_extent = self.selected_child_extent_values.get(sequence_id)
         if selected_extent is not None and query.operation in {"length", "truth"}:
             result = self.produced_value(int(query.result_value_id),
@@ -18476,10 +18509,14 @@ class _ControlSSABuilder(TiledObject):
                 merged.dtype = self._numeric_join(
                     (true_value, false_value),
                 ) or true_value.dtype or false_value.dtype
+            join_arms = (true_value, false_value)
             true_value, false_value = self._numeric_join_arms(
                 merged.dtype if not tuple(merged.shape or ()) else None,
                 ((true_exit, true_value), (false_exit, false_value)),
             )
+            # An arm converted to the join's class: where Python could tell
+            # the classes apart, ``ssa_numeric_joins`` refuses the join.
+            numeric_join_promoted = (true_value, false_value) != join_arms
             if (
                 int(result_id) not in self.region_value_meta
                 and tuple(true_value.shape) == tuple(false_value.shape)
@@ -18493,6 +18530,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_result",
+                    **({"numeric_join_promoted": True}
+                       if numeric_join_promoted else {}),
                     # The merge of a short-circuit operator IS the operator.
                     **({
                         "structural_operation": "boolop",
@@ -22628,10 +22667,12 @@ class _ControlSSABuilder(TiledObject):
                     str(value.dtype) for value in incoming_values
                     if value.dtype not in {None, "unknown", "none", "None"}
                 }
+                numeric_join_promoted = False
                 if len(merge_dtypes) > 1:
                     promoted = self._numeric_join(incoming_values)
                     if promoted is not None:
                         dtype = promoted
+                        numeric_join_promoted = True
                         incoming_values = list(self._numeric_join_arms(
                             dtype, tuple(
                                 (block, value)
@@ -22693,6 +22734,8 @@ class _ControlSSABuilder(TiledObject):
                             "incoming_blocks": tuple(incoming_blocks),
                             "binding": "return_merge",
                             "return_slot_index": slot,
+                            **({"numeric_join_promoted": True}
+                               if numeric_join_promoted else {}),
                             **(
                                 {"return_arm_absent": tuple(incoming_absent)}
                                 if member_phi else {}
@@ -25134,6 +25177,7 @@ def _schedule_loop_callsites(
     pure_region_indices: frozenset[int] = frozenset(),
     table_region_operations: Mapping[int, Any] | None = None,
     table_region_post_operations: Mapping[int, Any] | None = None,
+    row_load_reads: Mapping[int, tuple[int, ...]] | None = None,
 ) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
     """Install this closure's PlanCalls as ordinary scheduled statements.
 
@@ -25618,6 +25662,13 @@ def _schedule_loop_callsites(
                     # generator query has a separate, explicit producer.
                     *((int(block.sequence_value_id),)
                       if block.producer_loop_node_id is not None else ()),
+                    # Program: ``len(g[i])`` over a list of lists (corpus
+                    # c800).  The queried row is selected by a row load that
+                    # no region owns, so the query is the load's consumer:
+                    # it reads the load's sequence and index.
+                    *map(int, (row_load_reads or {}).get(
+                        int(block.sequence_value_id), ()
+                    )),
                     *(
                         () if block.default_value_id is None
                         else (int(block.default_value_id),)
@@ -29706,6 +29757,39 @@ def lower_control_sections_to_ssa(
         from .identity_concordance import current_identity_book
 
         item_operand_page = current_identity_book().page("item_operand")
+    def retained_lookup_ids(block):
+        if isinstance(block, SequenceQueryBlock) and block.operation == "lookup":
+            yield int(block.result_value_id)
+        for child in getattr(block, "blocks", ()):
+            yield from retained_lookup_ids(child)
+        for name in ("condition", "body", "orelse", "callee"):
+            child = getattr(block, name, None)
+            if child is not None:
+                yield from retained_lookup_ids(child)
+
+    retained_table_lookup_ids = set(retained_lookup_ids(control.root))
+    scheduled_lookup_ids = {
+        int(operation[0])
+        for operations in (
+            *table_region_operations.values(),
+            *table_region_post_operations.values(),
+        )
+        for kind, operation in operations
+        if str(kind) in {"lookup", "lookup_capture"}
+    }
+    # Lookups the control tree retains or a loop owns are placed there.
+    unplaced_lookup_ids = {
+        int(result_id)
+        for result_id, query_ids, _sequence_id in table_lookups
+        if int(result_id) not in scheduled_lookup_ids
+        and int(result_id) not in retained_table_lookup_ids
+        and not any(
+            int(key) in (table_lookup_loop_owners or {})
+            for key in (
+                query_ids if isinstance(query_ids, tuple) else (query_ids,)
+            )
+        )
+    }
     for region_index, instructions in planned_region_instructions.items():
         # Program: ``xs1 = [4, n]; xs1[0] += n; return xs1[0]`` (fuzzer
         # p25_25; corpus c273).  Wrong record: the store's region spelled
@@ -29764,19 +29848,46 @@ def lower_control_sections_to_ssa(
                 if read_id is not None
             ),
         )))
+        # An unscheduled captured lookup likewise reads its key: ``self._d.get(k +
+        # 7, -1)`` needs the region producing ``k + 7`` first.
+        consumed = tuple(dict.fromkeys((
+            *consumed,
+            *(
+                int(query)
+                for value_id in consumed
+                if int(value_id) in unplaced_lookup_ids
+                for lookup in (lookup_by_result.get(int(value_id)),)
+                if lookup is not None
+                for query in (
+                    lookup[1] if isinstance(lookup[1], (tuple, list))
+                    else (lookup[1],)
+                )
+                if isinstance(query, int)
+            ),
+        )))
         region_dependency_signatures[int(region_index)] = (consumed, produced)
 
-    def retained_lookup_ids(block):
-        if isinstance(block, SequenceQueryBlock) and block.operation == "lookup":
-            yield int(block.result_value_id)
-        for child in getattr(block, "blocks", ()):
-            yield from retained_lookup_ids(child)
-        for name in ("condition", "body", "orelse", "callee"):
-            child = getattr(block, name, None)
-            if child is not None:
-                yield from retained_lookup_ids(child)
+    # Program: ``self._d[k] = v`` then ``return self._d.get(k + 7, -1) +
+    # len(self._d)`` in a method.  Wrong record: no region scheduled the
+    # lookup (its receiver is a record field, not a region value), so the
+    # prologue emitted it at entry, before its key's region and before the
+    # store it must observe; the final audit refused the read before the
+    # definition.  Rule: an unscheduled lookup a region captures is emitted
+    # with the first such region, as that region's captured lookup.
+    for result_id, lookup in sorted(lookup_by_result.items()):
+        if result_id not in unplaced_lookup_ids:
+            continue
+        consumers = sorted(
+            int(region_index)
+            for region_index, (consumed, _produced)
+            in region_dependency_signatures.items()
+            if int(result_id) in consumed
+        )
+        if consumers:
+            table_region_operations.setdefault(consumers[0], []).append((
+                "lookup_capture", lookup,
+            ))
 
-    retained_table_lookup_ids = set(retained_lookup_ids(control.root))
     region_scheduled_lookup_ids = {
         int(operation[0])
         for operations in (
@@ -29818,6 +29929,13 @@ def lower_control_sections_to_ssa(
         callsite_projection_ids=callsite_projection_ids,
         callsite_stored_argument_ids=callsite_stored_argument_ids,
         sequence_length_values=sequence_length_values,
+        row_load_reads={
+            int(result): tuple(
+                int(read) for read in (operation[0], operation[1])
+                if read is not None
+            )
+            for result, operation in row_load_by_result.items()
+        },
         pure_region_indices=frozenset(
             index for index, instructions in planned_region_instructions.items()
             if all(instruction.op in _PURE_REGION_OPS for instruction in instructions)

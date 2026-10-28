@@ -244,6 +244,8 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "output_identity_concordance": PageLifecycle(LOWERING, REPAIRS, REPAIRS),
     "page_spill_receipt": PageLifecycle(None, None, None),
     "parameter_abi_kind": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
+    "root_call_record": PageLifecycle(CLOSURE, CLOSURE, LOWERING),
+    "called_inventory": PageLifecycle(CLOSURE, CLOSURE, LOWERING),
     "parameter_annotation": PageLifecycle(CLOSURE, LOWERING, LOWERING),
     "parameter_record_class": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "phi_edge_projection_placement_concordance": PageLifecycle(None, LOWERING, LOWERING),

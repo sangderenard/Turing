@@ -6603,15 +6603,46 @@ class ProcessGraph(TiledObject):
                             mode=Mode.CONCORD,
                         )
                 for parameter in parameters:
+                    # The called inventory (compiler/called_inventory.py): the
+                    # class the callers pass for this formal is the formal's
+                    # evidence where no annotation states one.  An annotation
+                    # that does not admit the inventory's class is a named
+                    # refusal, never a silent preference.
+                    from ...compiler.called_inventory import called_class
+                    inventory = called_class(
+                        book, str(identity), str(parameter.arg),
+                    )
+                    inventory_cell = None
+                    annotation_node = parameter.annotation
                     if parameter.annotation is None:
-                        continue
+                        if inventory is None:
+                            continue
+                    else:
+                        if inventory is not None:
+                            inventory_cell = inventory[1]
+                            admitted = {
+                                node.id for node in ast.walk(parameter.annotation)
+                                if isinstance(node, ast.Name)
+                            }
+                            if inventory[0] not in admitted and not (
+                                (inventory[0] == "bool" and "int" in admitted)
+                                or (inventory[0] in ("bool", "int")
+                                    and "float" in admitted)
+                            ):
+                                raise ValueError(
+                                    f"formal {parameter.arg} of {identity} is "
+                                    f"annotated {ast.unparse(parameter.annotation)} "
+                                    f"but its call records pass {inventory[0]}"
+                                )
                     row = (module_name, str(identity), str(parameter.arg))
                     parameter_span = post_source_span(function, parameter)
                     if parameter_span is None:
                         continue
                     parameter_sources = [parameter_span]
+                    if inventory_cell is not None:
+                        parameter_sources.append(inventory_cell)
                     for name in dict.fromkeys(
-                        node.id for node in ast.walk(parameter.annotation)
+                        node.id for node in ast.walk(annotation_node)
                         if isinstance(node, ast.Name)
                     ):
                         declared_class = book.latest_ref(
@@ -6622,7 +6653,7 @@ class ProcessGraph(TiledObject):
                             parameter_sources.append(declared_class)
                     book.post(
                         PARAMETER_ANNOTATION, row,
-                        ast.unparse(parameter.annotation),
+                        ast.unparse(annotation_node),
                         stage=INGESTION,
                         provenance=Derived(tuple(dict.fromkeys(
                             parameter_sources
