@@ -1545,8 +1545,25 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
             continue
         parameters = tuple(child.graph.get("function_parameters") or ())
         actuals = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        # Program: ``def f(v): r = 0; while v < 100: (if v > 3: r = v; break);
+        # v = v + 1; return r`` (and a direct tail call, which normalizes to
+        # that loop).  Wrong record: the return slot names the parameter's
+        # graph node, because ``r = v`` and the name ``v`` after a loop both
+        # resolve to the pre-loop node; the call was folded into its actual
+        # and the caller read the seed.  Rule: a parameter a loop carries or
+        # a break binds is not the returned identity -- its node names only
+        # the seed, so it is never a proved identity return.
+        loop_rebound = set()
+        for _loop_id, loop_data in child.nodes(data=True):
+            loop_attrs = loop_data.get("attributes") or {}
+            for pair in (loop_attrs.get("loop_carried_bindings") or {}).values():
+                loop_rebound.add(int(pair[0]))
+            for pair in (loop_attrs.get("loop_break_bindings") or {}).values():
+                loop_rebound.update(int(item) for item in pair)
         for index, slots in enumerate(zip(*sites)):
             if len(set(slots)) != 1 or slots[0] is None:
+                continue
+            if int(slots[0]) in loop_rebound:
                 continue
             formal = child.nodes.get(int(slots[0]), {})
             attrs = formal.get("attributes") or {}
