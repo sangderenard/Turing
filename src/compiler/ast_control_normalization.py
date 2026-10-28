@@ -747,6 +747,70 @@ def _normalize_constant_membership(
     return tuple(receipts)
 
 
+def _normalize_sequence_replication_display(
+    tree: ast.Module,
+) -> tuple[dict[str, Any], ...]:
+    """Spell ``[a, b] * 3`` as ``[a, b, a, b, a, b]``.
+
+    Program: ``xs = [n, 7] * 3`` then ``len(xs) * 100 + xs[4]`` (corpus
+    c722).  Wrong record: only a replication of one member has a birth (the
+    fill of one value), so a wider row was refused by name.  A display of
+    the same members is born, and a repeated pure member is an ordinary
+    display (``[n, 7, n, 7]``).  Rule: a list row of two or more pure
+    members times a literal count of at most 64 rows is the display of the
+    repeated members, in order.  A row that is not pure would evaluate its
+    members once in Python and more than once here, and a runtime count has
+    no display; both keep the existing lowering.
+    """
+
+    receipts: list[dict[str, Any]] = []
+
+    def literal_count(node: ast.AST) -> int | None:
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, int)
+            and not isinstance(node.value, bool)
+            and node.value >= 1
+        ):
+            return int(node.value)
+        return None
+
+    class Rewriter(ast.NodeTransformer):
+        def visit_BinOp(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            if not isinstance(node.op, ast.Mult):
+                return node
+            for row, count_node in ((node.left, node.right), (node.right, node.left)):
+                count = literal_count(count_node)
+                if (
+                    isinstance(row, ast.List)
+                    and count is not None
+                    and len(row.elts) >= 2
+                    and len(row.elts) * count <= 64
+                    and not any(isinstance(e, ast.Starred) for e in row.elts)
+                    and all(_pure_operand(e) for e in row.elts)
+                ):
+                    members = [
+                        element if repeat == 0 else copy.deepcopy(element)
+                        for repeat in range(count)
+                        for element in row.elts
+                    ]
+                    receipts.append({
+                        "line": int(getattr(node, "lineno", -1)),
+                        "column": int(getattr(node, "col_offset", -1)),
+                        "members": len(members),
+                    })
+                    return ast.copy_location(
+                        ast.List(elts=members, ctx=ast.Load()), node,
+                    )
+            return node
+
+    Rewriter().visit(tree)
+    if receipts:
+        ast.fix_missing_locations(tree)
+    return tuple(receipts)
+
+
 def _normalize_builtin_divmod(
     tree: ast.Module,
 ) -> tuple[dict[str, Any], ...]:
