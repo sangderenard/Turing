@@ -195,6 +195,31 @@ def module_storage_requirements(
                 shapes[function_name].setdefault(
                     int(descriptor.live_flags_value_id), set()
                 ).add((max(1, int(count)),))
+        # Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  A list
+        # of lists keeps one fixed-stride slice per row in its child-table
+        # pool: ``rows`` slices of ``stride`` elements.  The pool's columns
+        # and live flags hold ``rows * stride`` elements; its length and
+        # status arenas one cell per row.
+        for outer_id, rows, stride in tuple(
+            function.metadata.get("child_pool_static_extents", ())
+        ):
+            descriptor = table.sequences.get(int(outer_id))
+            pool = None if descriptor is None else descriptor.child_table_pool
+            if pool is None:
+                continue
+            for column_id in pool.column_value_ids:
+                shapes[function_name].setdefault(int(column_id), set()).add(
+                    (int(rows) * int(stride),)
+                )
+            if pool.live_flags_value_id is not None:
+                shapes[function_name].setdefault(
+                    int(pool.live_flags_value_id), set()
+                ).add((int(rows) * int(stride),))
+            for member_id in (pool.length_value_id, pool.status_value_id):
+                if member_id is not None:
+                    shapes[function_name].setdefault(
+                        int(member_id), set()
+                    ).add((int(rows),))
     for function_name, table in tensor_tables.items():
         function_name = str(function_name)
         if function_name not in functions:

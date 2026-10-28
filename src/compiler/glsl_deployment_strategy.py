@@ -2284,6 +2284,9 @@ def _planned_scalar_dtypes_from(
 
     scalar: dict[int, str] = {}
     element: dict[int, str] = dict(assumed_elements or {})
+    # A list of lists holds one element class per row: ``row_element`` is
+    # the class every row of a collection-of-collections shares.
+    row_element: dict[int, str] = {}
 
     def join(dtypes):
         known = {dtype for dtype in dtypes if dtype is not None}
@@ -2431,6 +2434,18 @@ def _planned_scalar_dtypes_from(
                     settle(element, node_id, join([
                         literal_dtype(member) for member in literal
                     ]))
+                    # A folded list of lists (corpus c733) holds the one
+                    # class its member rows share.
+                    if all(
+                        isinstance(member, (list, tuple)) and member
+                        for member in literal
+                    ):
+                        settle(row_element, node_id, join([
+                            join([literal_dtype(item) for item in member])
+                            for member in literal
+                        ]))
+                        # Its own column holds the rows' handles.
+                        settle(element, node_id, "int64")
                 # Program: ``sum(i * k for i in range(6))`` (corpus c27).
                 # Lane D, D2.  A folded ``range`` is a constant whose rows
                 # are Python ints by construction; nobody read that, so the
@@ -2909,6 +2924,26 @@ def _planned_scalar_dtypes_from(
                     if attributes.get("producer_kind") == "sequence_materialization"
                     else parents(data, "elts")
                 )
+                # Program: ``g = [[1, 2], [3, n]]; g[i][1] * 10`` (corpus
+                # c732).  Wrong record: a member that is itself a list has no
+                # scalar class, so the outer list joined nothing, the row
+                # ``g[i]`` had no element class, and the planner stopped at
+                # "has no settled dtype".  Rule: when every member is a
+                # collection the outer list's rows are lists, and it holds
+                # the one element class its member rows share.
+                row_members = members or [
+                    int(leaf) for leaf in
+                    attributes.get("aggregate_leaf_value_ids") or ()
+                    if int(leaf) in G
+                ]
+                if row_members and all(
+                    is_collection(member) for member in row_members
+                ):
+                    settle(row_element, node_id, join(
+                        [element.get(member) for member in row_members]
+                    ))
+                    # Its own column holds the rows' handles.
+                    settle(element, node_id, "int64")
                 writers = [scalar.get(member) for member in members]
                 # Lane D, D2 step 4.  Program: ``ys = sorted(xs); ys[0]``
                 # (corpus c127, c129).  ``sorted`` returns a new list of its
@@ -3061,7 +3096,10 @@ def _planned_scalar_dtypes_from(
                 continue
             if op in {"indexed", "getitem", "subscript"}:
                 base = parents(data, "base", "value", "object")
-                if base:
+                if base and base[0] in row_element:
+                    # A row of a list of lists is a list of the shared class.
+                    settle(element, node_id, row_element[base[0]])
+                elif base:
                     settle(scalar, node_id, element.get(base[0]))
                 continue
             # Program: ``d = {}; for i in range(n): d[i % 2] = d.get(i % 2,
@@ -5420,6 +5458,25 @@ def _build_shell_hierarchy_plan(
                 and int(descriptor.get("rank", -1)) == 0
                 and descriptor.get("metadata_state", "static") == "static"
             ))
+        )
+        # Program: ``g = [[1, 2], [3, 4]]; g[i][j]`` (corpus c733).  Wrong
+        # record: a folded list of lists has no tensor extent (its rows are
+        # lists), so its ``Const`` line got no value record and the region
+        # refused it.  Rule: such a constant is a list of row handles: one
+        # int64 per row.
+        value_shapes += tuple(
+            (int(value_id), (len(literal),), "int64")
+            for value_id in sorted(materialised)
+            if int(value_id) not in produced
+            and int(value_id) not in captured
+            and int(value_id) not in {record[0] for record in value_shapes}
+            for literal in ((
+                (graph.G.nodes.get(int(value_id)) or {}).get("attributes")
+                or {}
+            ).get("value"),)
+            if isinstance(literal, list) and literal and all(
+                isinstance(member, (list, tuple)) for member in literal
+            )
         )
         value_ranks = tuple(
             (
@@ -12493,8 +12550,14 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                 int(graph.G.nodes[receivers[0]].get("value_id", receivers[0])), declaration,
             )
 
+    from .resident_sequence_materialization import _handle_merge_storage_roots
+
+    handle_roots = _handle_merge_storage_roots(graph.G)
+
     def storage_key(value_id):
-        return field_storage_keys.get(int(value_id), int(value_id))
+        return field_storage_keys.get(
+            int(value_id), handle_roots.get(int(value_id), int(value_id)),
+        )
 
     readers_by_sequence: dict[Any, list[tuple[tuple[int, int], int]]] = {}
     reader_ends: dict[int, tuple[int, int]] = {}
@@ -20255,7 +20318,9 @@ def _publish_conditional_call_aggregate_merges(
     def arm_layout(value_id: int):
         """The arm's layout row; a call arm's is posted from its ledger."""
         layout, cell = layout_of(value_id)
-        if layout is not None:
+        if layout is not None and all(
+            int(member.value_id) in graph.G for member in layout.members
+        ):
             return layout, cell
         data = graph.G.nodes[int(value_id)]
         attributes = data.get("attributes") or {}
@@ -20307,9 +20372,9 @@ def _publish_conditional_call_aggregate_merges(
             and len(body.members) == len(orelse.members)
         ):
             return None
+        # The same merge may already be on the book, posted from the work
+        # copy of this graph; this graph still needs its member Phis.
         incumbent, incumbent_cell = layout_of(merged_id)
-        if incumbent is not None:
-            return incumbent_cell
         members = []
         for index, (left, right) in enumerate(zip(body.members, orelse.members)):
             member_sources = tuple(dict.fromkeys(filter(None, (
@@ -20360,6 +20425,11 @@ def _publish_conditional_call_aggregate_merges(
             ),
         })
         graph.G.nodes[int(merged_id)].pop("tensor", None)
+        if incumbent is not None:
+            graph.G.nodes[int(merged_id)].setdefault("attributes", {})[
+                "source_aggregate_layout_row"
+            ] = (scope, int(merged_id))
+            return incumbent_cell
         return post_layout(
             int(merged_id), body.aggregate_kind, members,
             conditional_cell, (body_cell, else_cell),
@@ -20900,6 +20970,12 @@ def _propagate_callsite_tensor_specializations(
             isolated_callers.get(id(caller.G), caller)
             for caller in graphs
         ]
+    #: (source graph, call node) -> the return members published on the
+    #: isolated copy, replayed on the source graph once the rounds settle.
+    isolated_return_members: dict[tuple[int, int], tuple] = {}
+    isolated_origin = {
+        id(clean.G): key for key, clean in isolated_callers.items()
+    }
     #: (caller graph, call node) -> per-slot callee return value cells of
     #: the latest ``call_result_descriptor`` answer for that call.
     return_cells_by_call: dict[tuple[int, int], tuple] = {}
@@ -21496,6 +21572,10 @@ def _propagate_callsite_tensor_specializations(
             conditional_changed |= _publish_conditional_call_aggregate_merges(
                 caller, function_table,
             )
+            if conditional_changed:
+                # A merge published just now gives its unpack projections a
+                # member ledger the earlier fold could not read.
+                _fold_callsite_structural_values(caller)
             changed |= conditional_changed
             mutation_counts["conditional_members"] += int(conditional_changed)
             for _node_id, data in tuple(caller.G.nodes(data=True)):
@@ -21708,6 +21788,15 @@ def _propagate_callsite_tensor_specializations(
                                 (id(caller.G), int(_node_id)), (),
                             ),
                         )
+                        if id(caller.G) in isolated_origin:
+                            isolated_return_members[(
+                                isolated_origin[id(caller.G)], int(_node_id),
+                            )] = (
+                                result_descriptors, next(iter(return_kinds)),
+                                return_cells_by_call.get(
+                                    (id(caller.G), int(_node_id)), (),
+                                ),
+                            )
                         changed |= return_members_changed
                         mutation_counts["return_members"] += int(
                             return_members_changed
@@ -22158,6 +22247,16 @@ def _propagate_callsite_tensor_specializations(
                 else _callee_optional_aggregate_members(callee)
             )
             if arms_members is None:
+                replay = isolated_return_members.get(
+                    (id(source.G), int(_node_id))
+                )
+                if replay is not None and not attributes.get(
+                    "aggregate_leaf_value_ids"
+                ):
+                    _publish_callsite_return_members(
+                        source, int(_node_id), *replay[:2],
+                        return_cells=replay[2],
+                    )
                 continue
             _publish_callsite_return_members(
                 source, int(_node_id),
@@ -22172,7 +22271,8 @@ def _propagate_callsite_tensor_specializations(
                 ),
             )
         _publish_conditional_tuple_members(source, function_table)
-        _publish_conditional_call_aggregate_merges(source, function_table)
+        if _publish_conditional_call_aggregate_merges(source, function_table):
+            _fold_callsite_structural_values(source)
 
 
 def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
@@ -25578,6 +25678,14 @@ def _mutated_sequence_node_ids(
         literal = (data.get("attributes") or {}).get("value")
         if isinstance(literal, (list, set, dict, bytearray)):
             return True
+        # A list merged from branches is the taken arm's own mutable list
+        # (``grow(t, k)`` then ``len(a)``, c739), not an immutable value.
+        if (
+            (data.get("attributes") or {}).get("producer_kind")
+            in {"aggregate_phi", "aggregate_merge"}
+            and (data.get("attributes") or {}).get("aggregate_kind") == "list"
+        ):
+            return True
         return str((data.get("attributes") or {}).get(
             "extraction_identity"
         ) or "") in {
@@ -25657,7 +25765,9 @@ def _mutated_sequence_node_ids(
         ]
         while pending:
             merged = graph_obj.nodes[pending.pop()]
-            if (merged.get("attributes") or {}).get("producer_kind") != "aggregate_phi":
+            if (merged.get("attributes") or {}).get("producer_kind") not in {
+                "aggregate_phi", "aggregate_merge",
+            }:
                 continue
             for parent, role in merged.get("parents") or ():
                 if (

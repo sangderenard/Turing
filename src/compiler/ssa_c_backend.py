@@ -6853,6 +6853,28 @@ def emit_ssa_module_to_c(
                     UnitKind.STATEMENT,
                     args=(int(sequence.capacity_value_id),), spelling=capacity,
                 )
+    # A root-owned list of lists keeps its row slices in a child-table pool:
+    # publish the pool's proven capacity and stride, as the outer capacity
+    # cell above is, before any row is allocated.
+    if root_sequences is not None:
+        for outer_id, rows, stride in tuple(
+            root.metadata.get("child_pool_static_extents", ())
+        ):
+            outer = root_sequences.sequences.get(int(outer_id))
+            pool = None if outer is None else outer.child_table_pool
+            if pool is None:
+                continue
+            for member_id, value in (
+                (pool.capacity_value_id, int(rows) * int(stride)),
+                (pool.row_stride_value_id, int(stride)),
+            ):
+                cell = owned_storage_names.get(int(member_id))
+                if cell is None:
+                    continue
+                entry_lines.append(f"    ((int64_t *){cell})[0] = {value};")
+                entry_span.take(
+                    UnitKind.STATEMENT, args=(int(member_id),), spelling=cell,
+                )
     # -- record-parameter relocation prologue -------------------------------
     # Record parameters are runtime cell arenas (the program mutates scalar
     # cells in place), but their private storage starts calloc-zeroed, so
