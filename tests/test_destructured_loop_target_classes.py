@@ -46,3 +46,69 @@ def walk(ps: {annotation}) -> int:
         progress=lambda _: None, progress_bars=False,
     )
     assert seen == {name: (cls, cls) for name, cls in expected.items()}
+
+
+@pytest.mark.parametrize('annotation,loop,expected', [
+    ('dict[int, float]', 'a in ps', {'a': 'builtins.int'}),
+    ('dict[float, int]', 'a in ps', {'a': 'builtins.float'}),
+    ('dict[int, float]', 'a in ps.values()', {'a': 'builtins.float'}),
+    ('Mapping[int, int]', 'a in ps.values()', {'a': 'builtins.int'}),
+])
+def test_name_targets_over_mapping_take_key_or_value_class(annotation, loop, expected):
+    source = f'''from typing import Mapping
+
+
+def walk(ps: {annotation}) -> int:
+    t = 0
+    for {loop}:
+        t += 1
+    return t
+'''
+    seen = {}
+
+    def inspect(graph):
+        entry = next(item for item in graph.function_table if item.name == 'walk')
+        for node, data in entry.graph.G.nodes(data=True):
+            attrs = data.get('attributes') or {}
+            if attrs.get('binding_kind') == 'loop':
+                seen[attrs['binding_name']] = attrs.get('result_class_ref')
+
+    lower_ast_source_to_ssa(
+        source, 'walk', name='mapping_name_target_class',
+        extraction_contract=ROOT / 'extraction_contracts/program_extraction.yaml',
+        resolved_process_graph_sink=inspect, stop_after_compilation_unit_plan=True,
+        progress=lambda _: None, progress_bars=False,
+    )
+    assert seen == expected
+
+
+@pytest.mark.parametrize('display,expected', [
+    ('[(n, 2), (3, 4)]', {'a': 'int64', 'b': 'int64'}),
+    ('((n, 2.5), (3, 4.5))', {'a': 'int64', 'b': 'float64'}),
+    ('[(n, 2), (3.5, 4)]', {'a': None, 'b': 'int64'}),
+])
+def test_literal_rows_give_each_name_its_position_dtype(display, expected):
+    from src.compiler.glsl_deployment_strategy import _planned_scalar_dtypes_from
+    source = f'''def walk(n: int) -> int:
+    t = 0
+    for a, b in {display}:
+        t += 1
+    return t
+'''
+    seen = {}
+
+    def inspect(graph):
+        entry = next(item for item in graph.function_table if item.name == 'walk')
+        planned = _planned_scalar_dtypes_from(entry.graph)
+        for node, data in entry.graph.G.nodes(data=True):
+            attrs = data.get('attributes') or {}
+            if attrs.get('binding_kind') == 'loop':
+                seen[attrs['binding_name']] = planned.get(int(node))
+
+    lower_ast_source_to_ssa(
+        source, 'walk', name='literal_rows_position_dtype',
+        extraction_contract=ROOT / 'extraction_contracts/program_extraction.yaml',
+        resolved_process_graph_sink=inspect, stop_after_compilation_unit_plan=True,
+        progress=lambda _: None, progress_bars=False,
+    )
+    assert seen == expected
