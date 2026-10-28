@@ -1142,6 +1142,29 @@ def integer_arithmetic_policy(mode=None):
     return policy
 
 
+#: ``integer_narrowing``: what an int stored into, or converted to, an
+#: integer layout that cannot hold it means.  ``trap`` -- the native module
+#: reports ``native_faults.INT_OVERFLOW`` (Python's int never changes value
+#: on the way into a slot).  ``wrap`` -- the slot keeps the low bits.
+_INTEGER_NARROWING_POLICIES = ("trap", "wrap")
+
+
+def integer_narrowing_policy(mode=None):
+    """The numeric contract's ``integer_narrowing`` for ``mode``."""
+
+    try:
+        contract = _NUMERIC_CONVERSION_MODES[mode or _DEFAULT_NUMERIC_MODE]
+    except KeyError:
+        raise ValueError(f"unknown numeric conversion mode {mode!r}")
+    policy = contract["integer_narrowing"]
+    if policy not in _INTEGER_NARROWING_POLICIES:
+        raise ValueError(
+            f"integer_narrowing must be one of {_INTEGER_NARROWING_POLICIES}, "
+            f"got {policy!r}"
+        )
+    return policy
+
+
 def _numeric_conversion_attributes(
     source_dtype,
     target_dtype,
