@@ -59656,13 +59656,6 @@ def _class_surface_ssa_program(
                 continue
             value.dtype = dtype
 
-    # Native heap cell/owner contracts cross the SAME exact linked call edge
-    # as its values. Raw ptr alone cannot state pointer-cell storage at the
-    # public buffer ABI; the imported formal is that declaration's authority.
-    from .ssa_heap_allocation import project_native_heap_call_contexts
-    compile_substage("project native heap call contexts")
-    project_native_heap_call_contexts(all_functions)
-
     # Sequence helper calls are physical ABI operations.  Their row argument
     # often inlines the producer expression, so updating only the Call's
     # SSAValue occurrence leaves the producer spelling at its provisional
@@ -60024,6 +60017,19 @@ def _class_surface_ssa_program(
         lowered_module.metadata[
             "post_aggregate_frame_reconciliations"
         ] = tuple(post_aggregate_frame_reconciliations)
+
+    # Native heap cell/owner contracts cross the SAME exact linked call edge
+    # as its values. Raw ptr alone cannot state pointer-cell storage at the
+    # public buffer ABI; the imported formal is that declaration's authority.
+    # Program: a copy-merge callee plus a local-merge-append callee in one root
+    # (c879).  Wrong record: this projection ran BEFORE the post-aggregate
+    # exact frame reconciliation above, which then rebinds call actuals to the
+    # frame's caller value, so the receipt (keyed by the whole edge) named
+    # actuals the live edge no longer held.  Rule: the edge actuals are settled
+    # first; the owner decision is made once, on the settled edge.
+    from .ssa_heap_allocation import project_native_heap_call_contexts
+    compile_substage("project native heap call contexts")
+    project_native_heap_call_contexts(all_functions)
 
     # Physical record/call legalization can materialize a pure field
     # projection after control lowering has already built the Phi that reads
