@@ -4881,6 +4881,62 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             str(data.get("type") or data.get("op") or "").casefold() == "phi"
             and (data.get("attributes") or {}).get("source_conditional_id") is not None
         )
+        field_state = (data.get("attributes") or {}).get("record_field_state")
+        initial_id = (data.get("attributes") or {}).get("initial_value_id")
+        if (
+            conditional_phi
+            and isinstance(field_state, tuple) and len(field_state) == 2
+            and initial_id in target
+        ):
+            # Program: ``r.x * 10`` after ``if c: r.x = n + 100`` with
+            # ``x: int`` on the record (corpus c426, c553).  Wrong record:
+            # the merge's initial-state arm (a GetAttr of the field before
+            # the write) had no class row, so the merge's class was undecided
+            # and its consumers described it as the float64 host-scalar
+            # default.  Rule: the initial field-state read has the builtin
+            # scalar class the record's CLASS_FIELD_DECLARATION annotates for
+            # the merge's ``record_field_state`` (record node, field),
+            # DERIVED from that declaration cell and the read's own cell.
+            record_data = target.nodes.get(int(field_state[0])) or {}
+            record_attributes = record_data.get("attributes") or {}
+            owner = record_attributes.get(
+                "class_ref", record_attributes.get("program_abi_record_identity"),
+            )
+            initial_value = int(
+                target.nodes[initial_id].get("value_id", initial_id)
+            )
+            if owner and page.latest((scope, initial_value)) is None:
+                module_identity = (
+                    scope[0] if isinstance(scope, tuple) and scope else scope
+                )
+                owner_name = owner[-1] if isinstance(owner, tuple) else owner
+                field_cell = book.latest_ref(
+                    _CLASS_FIELD_DECLARATION,
+                    (module_identity, str(owner_name), str(field_state[1])),
+                )
+                annotation = "" if field_cell is None else str(getattr(
+                    book.page(_CLASS_FIELD_DECLARATION).cell(
+                        field_cell.row, field_cell.column,
+                    ), "annotation", "",
+                ))
+                field_class = {
+                    "int": "builtins.int", "builtins.int": "builtins.int",
+                    "float": "builtins.float",
+                    "builtins.float": "builtins.float",
+                    "bool": "builtins.bool", "builtins.bool": "builtins.bool",
+                }.get(annotation.replace("<class '", "").replace("'>", ""))
+                if field_class is not None:
+                    _concord_source_value_class(
+                        scope, initial_value, field_class,
+                        source="record field declaration",
+                        provenance=_Derived(tuple(dict.fromkeys(
+                            cell for cell in (
+                                node_identity_cell(graph, int(initial_id)),
+                                field_cell,
+                            ) if cell is not None
+                        ))),
+                    )
+                    changed = True
         if conditional_phi:
             roles = ("body", "orelse")
         elif isinstance(expression, ast.BinOp):
@@ -11977,6 +12033,48 @@ def _normalize_lexical_values(
                 parent for _role, _ordinal, parent
                 in aggregate_member_positions
             )
+            if aggregate_kind == "dict":
+                # A display whose every value is a list is a mapping of child
+                # lists: the value column holds child-pool row handles, as a
+                # ``setdefault(key, [])`` receiver's does.
+                member_attributes = tuple(
+                    (graph.G.nodes[parent].get("attributes") or {})
+                    for role, _ordinal, parent in aggregate_member_positions
+                    if role in {"values", "value", "keys", "key"}
+                    and parent in graph.G
+                )
+                value_attributes = tuple(
+                    (graph.G.nodes[parent].get("attributes") or {})
+                    for role, _ordinal, parent in aggregate_member_positions
+                    if role in {"values", "value"} and parent in graph.G
+                )
+                key_attributes = tuple(
+                    (graph.G.nodes[parent].get("attributes") or {})
+                    for role, _ordinal, parent in aggregate_member_positions
+                    if role in {"keys", "key"} and parent in graph.G
+                )
+                if (
+                    value_attributes
+                    and all(
+                        item.get("aggregate_kind") == "list"
+                        for item in value_attributes
+                    )
+                    and all(
+                        item.get("aggregate_kind") is None
+                        for item in key_attributes
+                    )
+                ):
+                    aggregate_attributes.update({
+                        "mapping_value_aggregate_kind": "list",
+                        "mapping_key_column_count": 1,
+                    })
+                    for _role, _ordinal, parent in aggregate_member_positions:
+                        if _role in {"values", "value"} and parent in graph.G:
+                            # The row is born by the mapping's display, in
+                            # the child pool: it owns no arena of its own.
+                            graph.G.nodes[parent].setdefault(
+                                "attributes", {}
+                            )["mapping_display_child"] = True
             source_members = []
             for role, ordinal, member_id in aggregate_member_positions:
                 member_cell = node_identity_cell(graph, int(member_id))

@@ -5010,7 +5010,7 @@ class _ControlSSABuilder(TiledObject):
             self.emit(Handler.Ret, [
                 self.constant_value(0, dtype=str(value.dtype))
                 for value in values
-            ])
+            ], attributes={"fault_exit": True})
             return
         # Outputs that cannot be zeroed: continue as ``pop`` does.
         self.current = fault_exit
@@ -5026,6 +5026,17 @@ class _ControlSSABuilder(TiledObject):
         self, result_id: int, sequence_id: int, index_id: int,
         index_literal: int | None, column: int, _row_value_id: int,
     ) -> None:
+        if (
+            int(sequence_id) not in self.sequence_descriptors
+            and int(sequence_id) in self.child_table_selections
+            and int(sequence_id) not in self.empty_default_child_ids
+        ):
+            # ``d[k][j]``: the keyed lookup selected a pool slice; its view
+            # is built where the first positional access asks for it.
+            self._sequence_descriptor(
+                int(sequence_id), policy="duplicates", writable=True,
+                location=f"{self.function_name}.mapping_row_view",
+            )
         descriptor = self.sequence_descriptors.get(int(sequence_id))
         if descriptor is None or not 0 <= int(column) < len(
             descriptor.column_value_ids
@@ -12517,13 +12528,41 @@ class _ControlSSABuilder(TiledObject):
             )
             for member in members:
                 span = int(member.id) in arena_ids or bool(member.shape)
+                _storage = "span" if span else "scalar"
+                # Program: ``for k in d`` over ``d: dict[int, int]`` and
+                # ``for a, b in ps`` over ``ps: list[tuple[int, int]]``.
+                # Wrong record: a member the ProgramABI binding already
+                # posted ``sequence`` (the sequence's own value) or
+                # ``reference`` (a tuple element's cell) was restated
+                # ``span``, and the physical view refused the two.  Rule: a
+                # member whose row already carries one of those kinds keeps
+                # it, with its rank.
+                _rank = 1 if span else 0
+                _prior_cell = self._book().latest_ref(
+                    SSA_VALUE, (self._scope(), int(member.id)),
+                )
+                _prior = (
+                    None if _prior_cell is None else
+                    self._book().page(SSA_VALUE).cell(
+                        _prior_cell.row, _prior_cell.column,
+                    )
+                )
+                _prior_storage = getattr(_prior, "storage", None)
+                if (
+                    _prior_storage == "reference"
+                    or (_prior_storage == "sequence"
+                        and int(member.id) == int(value_id))
+                ):
+                    _storage = _prior_storage
+                    if getattr(_prior, "rank", None) is not None:
+                        _rank = int(_prior.rank)
                 _member_cell = self._revise_value(
                     member,
                     self._sequence_contract_cell(value_id), _owner_kind,
                     stage=self._stage(),
                     physical={
-                        "storage": "span" if span else "scalar",
-                        "rank": 1 if span else 0,
+                        "storage": _storage,
+                        "rank": _rank,
                     },
                 )
                 _member_fact = self._book().page(SSA_VALUE).cell(
@@ -16627,6 +16666,13 @@ class _ControlSSABuilder(TiledObject):
                     required=not optional_none,
                 )
                 return
+            if operation == "setdefault" and (
+                mutation.argument_kind == "mapping_child_row"
+            ):
+                self._emit_mapping_child_row_birth(
+                    mutation, destination, location=location,
+                )
+                return
             if operation == "setdefault":
                 pool = destination.child_table_pool
                 key_count = len(destination.key_columns)
@@ -18015,6 +18061,106 @@ class _ControlSSABuilder(TiledObject):
                 ),
             ],
             attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def _emit_mapping_child_row_birth(
+        self, mutation: ControlSequenceMutation,
+        destination: SSASequenceDescriptor, *, location: str,
+    ) -> None:
+        """One list value of a dict display: a new row in the child pool.
+
+        The display cleared the mapping, so its keys are new: the row's
+        handle is the table's length (as ``setdefault`` allocates), its
+        length starts at zero, and the key's row stores the handle.  The row
+        then takes its member appends like any selected child (no found
+        branch, so the selection needs no validity guard).
+        """
+
+        pool = destination.child_table_pool
+        key_count = len(destination.key_columns)
+        if pool is None or len(mutation.argument_value_ids) != key_count + 1:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "mapping-child-row", location,
+                "a dict display of lists requires a resolved child-table "
+                "pool and exact key columns; "
+                f"child_pool={pool is not None}, "
+                f"key_columns={destination.key_columns}",
+            ))
+            return
+        handle_dtype = destination.column_dtypes[pool.handle_column]
+        key_ids = tuple(map(int, mutation.argument_value_ids[:key_count]))
+        outer_length_cell = self.sequence_storage_values[
+            int(destination.sequence_id)
+        ][len(destination.column_value_ids)]
+        outer_length_address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(outer_length_cell,),
+        )
+        self.emit(
+            Handler.GetElementPtr,
+            [outer_length_cell, self.constant_value(0, outer_length_cell)],
+            outer_length_address,
+            attributes={"binding": "ssa_mapping_setdefault_length_address"},
+        )
+        outer_length = self.fresh_value(
+            dtype="int64", transform=LOAD, operands=(outer_length_address,),
+        )
+        self.emit(
+            Handler.Load, [outer_length_address], outer_length,
+            attributes={"binding": "ssa_mapping_setdefault_handle"},
+        )
+        new_handle = self.fresh_value(
+            dtype=handle_dtype, transform=CONTROL_CAST,
+            operands=(outer_length,),
+        )
+        self.emit(
+            Handler.Cast, [outer_length], new_handle,
+            attributes={"target_dtype": handle_dtype},
+        )
+        self._bind(
+            int(new_handle.id), new_handle, BindingKind.SEQUENCE_RESULT,
+            outer_length,
+        )
+        pool_length = self.external_value(int(pool.length_value_id))
+        child_length_address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(pool_length, new_handle),
+        )
+        self.emit(
+            Handler.GetElementPtr, [pool_length, new_handle],
+            child_length_address,
+            attributes={"binding": "ssa_child_table_length"},
+        )
+        self.emit(
+            Handler.Store,
+            [self.constant_value(0, child_length_address), child_length_address],
+            attributes={"binding": "ssa_child_table_initialize"},
+        )
+        if pool.status_value_id is not None:
+            pool_status = self.external_value(int(pool.status_value_id))
+            child_status_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS,
+                operands=(pool_status, new_handle),
+            )
+            self.emit(
+                Handler.GetElementPtr, [pool_status, new_handle],
+                child_status_address,
+                attributes={"binding": "ssa_child_table_status"},
+            )
+            self.emit(
+                Handler.Store,
+                [self.constant_value(0, child_status_address),
+                 child_status_address],
+                attributes={"binding": "ssa_child_table_initialize"},
+            )
+        self._emit_table_store(
+            int(mutation.effect_node_id), key_ids, int(new_handle.id),
+            int(destination.sequence_id),
+        )
+        self.child_table_selections[int(mutation.effect_node_id)] = (
+            pool, new_handle,
+        )
+        self._bind(
+            int(mutation.effect_node_id), new_handle,
+            BindingKind.SEQUENCE_RESULT, outer_length,
         )
 
     def _emit_child_row_birth(
@@ -19718,6 +19864,9 @@ class _ControlSSABuilder(TiledObject):
             loop.step,
             location=f"{path}.step",
         )
+        # An extent that loads a row of a list of lists checks its index,
+        # which leaves the preheader in a later block (corpus c777).
+        preheader = self.current
         # A resident sequence extent is int64. The old header hard-coded
         # int (i32), while its latch's indexed use settled to i64, producing
         # an invalid Phi even for a two-member native table iteration.
@@ -20303,9 +20452,30 @@ class _ControlSSABuilder(TiledObject):
                             descriptor.column_value_ids
                         )
                     ):
-                        source = self.external_value(
-                            int(descriptor.column_value_ids[int(column_projection)]),
-                            dtype=str(descriptor.column_dtypes[int(column_projection)]),
+                        # Program: ``for k, v in d.items()`` over a dict
+                        # parameter.  Wrong record: the column was asked of
+                        # ``external_value`` by id, which did not find the
+                        # descriptor's own column cell (it is an argument, not
+                        # a bound value) and appended a second formal with
+                        # the same id, so the callee's signature carried it
+                        # twice and its callers' receipt was refused.  Rule:
+                        # the column is the descriptor's own storage value.
+                        _column_id = int(
+                            descriptor.column_value_ids[int(column_projection)]
+                        )
+                        _column_cell = next((
+                            value for value in self.sequence_storage_values.get(
+                                resident_sequence_id, ()
+                            ) if int(value.id) == _column_id
+                        ), None)
+                        source = (
+                            _column_cell if _column_cell is not None else
+                            self.external_value(
+                                _column_id,
+                                dtype=str(descriptor.column_dtypes[
+                                    int(column_projection)
+                                ]),
+                            )
                         )
                     elif int(column_projection) == 0:
                         source = self.external_value(
@@ -29944,6 +30114,29 @@ def lower_control_sections_to_ssa(
                         else argument
                         for argument in instruction.args
                     ]
+                # The typed views above were keyed by the alias spelling.  The
+                # region now names the resident root, which is the SAME
+                # storage (rule 8): the root takes the alias's typed view
+                # unless it already has its own, so the formal is typed once.
+                for alias_id, root_id in capture_rebindings.items():
+                    if alias_id in region_value_meta:
+                        region_value_meta.setdefault(
+                            root_id, region_value_meta[alias_id],
+                        )
+                    if alias_id in region_values:
+                        view = region_values[alias_id]
+                        region_values.setdefault(root_id, SSAValue(
+                            root_id, dtype=view.dtype,
+                            shape=tuple(view.shape or ()),
+                        ))
+                    if alias_id in instruction_values:
+                        view = instruction_values[alias_id]
+                        instruction_values.setdefault(root_id, SSAValue(
+                            root_id, dtype=view.dtype,
+                            shape=tuple(view.shape or ()),
+                            device=view.device,
+                            accounting=dict(view.accounting or {}),
+                        ))
                 effective_captures = tuple(dict.fromkeys(
                     resident_root(int(value_id))
                     for value_id in effective_captures

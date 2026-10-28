@@ -3409,6 +3409,27 @@ class CorrelationTable:
                                 for resident in resident_objects.get(inner, ())
                             ):
                                 continue
+                            # Program: ``h, l = step(h, l, i)`` with
+                            # ``step`` returning ``low ^ byte, high``.  The
+                            # updated ``l`` is the callee's bare formal, so
+                            # the passthrough fold rebinds the call output
+                            # to the actual -- the carried Phi of ``h`` --
+                            # as a projection occurrence of that same id.
+                            # Wrong record: that occurrence is a distinct
+                            # object, so it read as a private resident.
+                            # Rule: an occurrence the aggregate passthrough
+                            # rebinding minted for a resident the function
+                            # defines is that resident, not a private one.
+                            if (
+                                resident_objects.get(inner)
+                                and (argument.accounting or {}).get(
+                                    "ssa_aggregate_passthrough"
+                                ) is not None
+                                and (argument.accounting or {}).get(
+                                    "ssa_storage_alias"
+                                ) == inner
+                            ):
+                                continue
                             found.append(Finding(
                                 "loop-scope-inner-private-resident",
                                 name, inner,
