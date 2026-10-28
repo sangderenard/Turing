@@ -59828,6 +59828,65 @@ def _class_surface_ssa_program(
                             "compiler_frame_sequence_id": int(sequence_id),
                             "compiler_frame_member": int(member_index),
                         }
+            # Program: ``def mid(): cover = make(); ...`` with ``make``
+            # returning ``out[:k]``, ``mid`` called in a loop (string core
+            # ``_intern_validated_span`` -> ``_cover_span``).  Wrong record:
+            # the returned list's heap column is the Call result, a frame
+            # local that starts null on every invocation, while its capacity
+            # cell is caller workspace that keeps the previous invocation's
+            # capacity.  The second call's reserve saw "fits", skipped the
+            # allocation and stored through the null column (SIGSEGV on C
+            # and LLVM).  Rule: a dynamic sequence whose heap column is a
+            # call result of this frame owns no buffer at entry, so its
+            # workspace capacity starts at zero on every invocation.
+            from ..transmogrifier.ssa import SSASequenceCapacityPolicy
+
+            call_result_ids = {
+                int(instruction.res.id)
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+                and str(instruction.op).casefold() == "call"
+            }
+            entry_resets = []
+            for sequence_id, descriptor in sorted(
+                sequence_table.sequences.items()
+            ):
+                capacity = arguments_by_id.get(int(descriptor.capacity_value_id))
+                if (
+                    capacity is None
+                    or descriptor.capacity_policy
+                    is not SSASequenceCapacityPolicy.DYNAMIC
+                    or not any(
+                        int(column) in call_result_ids
+                        and int(column) not in arguments_by_id
+                        for column in descriptor.column_value_ids
+                    )
+                ):
+                    continue
+                zero = SSAValue(
+                    mint_compiler_value_id(
+                        function, FRAME_SCAFFOLD,
+                        _frame_cells(_frame_value_cell(
+                            function, int(capacity.id),
+                        )),
+                        dtype="int64",
+                    ),
+                    dtype="int64",
+                )
+                entry_resets.extend((
+                    Instr("Const", [], zero, attributes={"value": 0}),
+                    Instr(
+                        "Store", [zero, capacity], None,
+                        attributes={
+                            "binding": "ssa_call_result_sequence_capacity",
+                            "sequence_id": int(sequence_id),
+                        },
+                    ),
+                ))
+            if entry_resets:
+                entry_block = next(iter(function.blocks.values()))
+                entry_block.instrs[0:0] = entry_resets
         declared_storage = []
         for argument in function.args:
             accounting = dict(argument.accounting or {})
