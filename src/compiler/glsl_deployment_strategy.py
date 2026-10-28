@@ -2152,6 +2152,64 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
     return assumed
 
 
+_CALLEE_RETURN_ACTIVE: set[int] = set()
+
+
+def _callee_return_scalar_dtype(
+    graph: Any, reference: int,
+) -> tuple[str, str] | None:
+    """The one class a callee's return sites state, or ``None``.
+
+    ``("scalar", dtype)`` when every site returns one scalar of one class;
+    ``("element", dtype)`` when every site returns a tuple display whose
+    members join to one element class.
+
+    Read from the callee's own graph record (``return_slot_values`` through
+    its ``function_table`` entry), typed by its planned scalar dtypes.  A
+    site returning a ``None`` literal is the optional's absent arm.  Any
+    site that is not a single typed scalar, or sites that disagree, prove
+    nothing (no default is supplied).
+    """
+
+    try:
+        callee = graph.function_table.entry(int(reference)).graph
+        callee_graph = callee.G
+        sites = callee_graph.graph.get("return_slot_values")
+        site_values = list(sites.values()) if sites is not None else []
+    except (AttributeError, KeyError, ValueError, TypeError):
+        return None
+    if not site_values or id(callee) in _CALLEE_RETURN_ACTIVE:
+        return None
+    _CALLEE_RETURN_ACTIVE.add(id(callee))
+    try:
+        dtypes = _planned_scalar_dtypes_from(callee)
+    finally:
+        _CALLEE_RETURN_ACTIVE.discard(id(callee))
+    found: list[str | None] = []
+    kinds: set[str] = set()
+    for values in site_values:
+        values = tuple(values)
+        if len(values) != 1 or int(values[0]) not in callee_graph:
+            return None
+        node = callee_graph.nodes[int(values[0])]
+        returned = node.get("expr_obj")
+        if isinstance(returned, ast.Constant) and returned.value is None:
+            continue
+        aggregate = isinstance(returned, ast.Tuple) or (
+            (node.get("attributes") or {}).get("aggregate_kind") is not None
+        )
+        if aggregate and not isinstance(returned, ast.Tuple):
+            return None
+        kinds.add("element" if aggregate else "scalar")
+        found.append(dtypes.get(int(values[0])))
+    if (
+        not found or None in found or len(set(found)) != 1
+        or len(kinds) != 1
+    ):
+        return None
+    return next(iter(kinds)), found[0]
+
+
 def _planned_scalar_dtypes_from(
     graph: Any,
     *,
@@ -2350,6 +2408,67 @@ def _planned_scalar_dtypes_from(
                 if isinstance(literal, range):
                     settle(element, node_id, "int64")
                 continue
+            # Program: ``[i * i for i in range(n) if i % 2 == 1]`` and
+            # ``any(i > 3 for i in range(n))`` (corpus c159, c165).  Wrong
+            # record: a non-constant ``range(n)`` call is a sequence whose
+            # element type nobody read, so its region value had no row and
+            # lowering refused ("region value N has no settled dtype").
+            # Rule: Python's ``range`` yields ints; the call's identity is
+            # ``builtins.range`` (the extraction contract), so its element
+            # type is int64, as for a folded range constant above.
+            if (
+                op == "call"
+                and attributes.get("extraction_identity") == "builtins.range"
+            ):
+                settle(element, node_id, "int64")
+                continue
+            # Program: ``while (lim - total).item() > 0.5: ...`` over
+            # ``AbstractTensor.tensor`` values (corpus c369).  Wrong record:
+            # ``.item()`` reads one element of its receiver tensor, but its
+            # own node carried no row, so the latch test's region refused
+            # ("region value N has no settled dtype").  Rule: the element a
+            # rank-0 receiver tensor yields has the dtype of that tensor's
+            # record (``tensor.dtype``, stamped by the reducer from the
+            # tensor's constructor argument); a receiver with no such record
+            # proves nothing.
+            if op == "item" and attributes.get("tensor_candidate") == "item":
+                receivers = parents(data, "operand")
+                receiver_tensor = (
+                    G.nodes[receivers[0]].get("tensor") or {}
+                ) if len(receivers) == 1 else {}
+                receiver_dtype = receiver_tensor.get("dtype")
+                if (
+                    receiver_dtype in {"int64", "float64", "bool"}
+                    and not tuple(receiver_tensor.get("shape") or ())
+                ):
+                    settle(scalar, node_id, receiver_dtype)
+                continue
+            # Program: ``v = maybe(row, flag); if v is not None: total +=
+            # v`` with ``maybe`` returning ``row + 1`` or ``None`` (corpus
+            # c231).  Wrong record: the callee's body is attached to the
+            # caller's plan only at a later freeze, so at plan time the call
+            # result had no row and the region reading it refused.  Rule: the
+            # callee's return class is already recorded on the callee's own
+            # graph (``function_table`` entry: ``return_slot_values`` names
+            # each return site's value, and the callee's planned scalar
+            # dtypes type it).  A call whose every return site yields one
+            # scalar of one class (a ``None`` site is the absent arm; the
+            # payload is the only value a region reads) has that class.
+            callee_reference = attributes.get("callee_ref")
+            if (
+                op == "call"
+                and callee_reference is not None
+                and not attributes.get("aggregate_kind")
+                and node_id not in scalar and node_id not in element
+            ):
+                callee_dtype = _callee_return_scalar_dtype(
+                    graph, int(callee_reference),
+                )
+                if callee_dtype is not None:
+                    settle(
+                        scalar if callee_dtype[0] == "scalar" else element,
+                        node_id, callee_dtype[1],
+                    )
             # A generator expression is a read-only sequence of its ``elt``:
             # nothing can append to it, so its element type is the ``elt``'s
             # class (corpus c27).  List and set comprehensions are not typed
@@ -3046,14 +3165,44 @@ def _planned_scalar_dtypes_from(
                 # joined table, and every store fed by one, took the
                 # float64 domain default.  An arm still unproven leaves the
                 # join unproven.
-                if arms and all(
-                    is_collection(o) or o in element for o in arms
-                ) and not any(o in scalar for o in arms):
+                # A ``None`` arm is the optional's absent arm (corpus c31,
+                # ``fork_of(row) if flag > 0 else None``): the join is over
+                # the present arms.
+                present_arms = [
+                    o for o in arms
+                    if not (
+                        isinstance(G.nodes[o].get("expr_obj"), ast.Constant)
+                        and G.nodes[o]["expr_obj"].value is None
+                    )
+                ]
+                if present_arms and all(
+                    is_collection(o) or o in element for o in present_arms
+                ) and not any(o in scalar for o in present_arms):
                     settle(element, node_id, join(
-                        [element.get(o) for o in arms]
+                        [element.get(o) for o in present_arms]
                     ))
                     continue
-                settle(scalar, node_id, join([scalar.get(o) for o in arms]))
+                # Program: ``v = d.get(n); a = -1 if v is None else v``
+                # (corpus c434).  Wrong record: ``d.get(n)`` is the IfExp
+                # ``d[n] if n in d else None``; its ``None`` arm is a
+                # constant with no scalar class, so the join never closed
+                # and the consumer's region had no row.  Rule: an optional
+                # join's payload (the only value a region reads, its
+                # presence being a separate value) has the class of its
+                # non-None arms, as for a linked optional result above; a
+                # join whose arms are all ``None`` proves nothing.
+                def none_literal(arm):
+                    arm_expression = G.nodes[arm].get("expr_obj")
+                    return (
+                        isinstance(arm_expression, ast.Constant)
+                        and arm_expression.value is None
+                    )
+
+                payload_arms = [o for o in arms if not none_literal(o)]
+                if payload_arms:
+                    settle(scalar, node_id, join(
+                        [scalar.get(o) for o in payload_arms]
+                    ))
                 continue
             # Lane D, D2.  Program: ``if a > 0 and b < n: ...``, ``x = p or
             # q`` (corpus c07, c155).  Python's ``and``/``or`` returns one of
