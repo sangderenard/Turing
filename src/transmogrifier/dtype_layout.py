@@ -20,6 +20,43 @@ from typing import Mapping
 #: The dtype every lane assumes when a value declares none.
 DEFAULT_DTYPE = "float64"
 
+#: Python's ``float`` class is IEEE binary64.  This is the language's record
+#: for a value whose class is ``float`` and that declares no other width: a
+#: float literal, and the result of true division (or ``math.sqrt``/``exp``/
+#: ``log``) whose operands are all ``int``/``bool``.
+PYTHON_FLOAT_DTYPE = "float64"
+
+#: Integer and boolean spellings whose true quotient is a Python ``float``.
+PYTHON_INTEGRAL_DTYPES = frozenset({
+    "bool", "i1", "int", "int8", "int16", "int32", "int64", "int128",
+    "uint8", "uint16", "uint32", "uint64", "i32", "i64", "long",
+})
+
+
+def python_float_result_dtype(operand_dtypes) -> str | None:
+    """The record for a float-valued result over ``operand_dtypes``.
+
+    The widest float the operands carry wins (``float`` spells binary64).
+    With no float operand the result is a Python ``float`` only when every
+    operand is integral; an operand with no settled dtype leaves the result
+    unsettled (``None``), never assumed.
+    """
+
+    from ..common.tensors.topological_reducer import _widest_element
+
+    dtypes = tuple(operand_dtypes)
+    widest = _widest_element(*(
+        {"float": PYTHON_FLOAT_DTYPE}.get(str(d), str(d))
+        for d in dtypes if d
+    ))
+    if widest is not None:
+        return widest
+    if dtypes and all(
+        d and str(d).casefold() in PYTHON_INTEGRAL_DTYPES for d in dtypes
+    ):
+        return PYTHON_FLOAT_DTYPE
+    return None
+
 
 @dataclass(frozen=True)
 class DTypeLayout:
@@ -276,6 +313,44 @@ def python_int_literal_dtype(value: object) -> str:
     )
 
 
+def python_int_range_dtype(low: int, high: int) -> str | None:
+    """The narrowest declared layout holding every int in ``[low, high]``.
+
+    The same law as ``python_int_literal_dtype``, applied to a proven
+    interval: int64 while both ends fit it, uint64 for a non-negative
+    interval above INT64_MAX, then int128.  ``None`` when no declared layout
+    holds the interval.
+    """
+
+    if type(low) is not int or type(high) is not int or low > high:
+        raise TypeError("integer range layout requires an ordered int interval")
+    if -(1 << 63) <= low and high <= (1 << 63) - 1:
+        return "int64"
+    if 0 <= low and high <= (1 << 64) - 1:
+        return "uint64"
+    if -(1 << 127) <= low and high <= (1 << 127) - 1:
+        return "int128"
+    return None
+
+
+# ``array.array(typecode)``: the typecode is the authored element layout of
+# the array's one column.  ``l``/``L`` are platform-sized in CPython and are
+# deliberately absent: no declared width is stated for them.
+ARRAY_TYPECODE_DTYPES = {
+    "b": "int8", "B": "uint8",
+    "h": "int16", "H": "uint16",
+    "i": "int32", "I": "uint32",
+    "q": "int64", "Q": "uint64",
+    "f": "float32", "d": "float64",
+}
+
+
+def array_typecode_dtype(typecode: object) -> str | None:
+    """The element dtype ``array(typecode)`` declares, or ``None``."""
+
+    return ARRAY_TYPECODE_DTYPES.get(typecode) if isinstance(typecode, str) else None
+
+
 # --------------------------------------------------------------------------
 # Layout views. Native backend support is a property of the same record.
 # --------------------------------------------------------------------------
@@ -517,6 +592,8 @@ def shell_numpy_dtype(dtype: object) -> str | None:
 
 __all__ = [
     "DEFAULT_DTYPE",
+    "PYTHON_FLOAT_DTYPE",
+    "python_float_result_dtype",
     "DTypeLayout",
     "DTYPES",
     "ALIASES",
@@ -524,6 +601,7 @@ __all__ = [
     "layout_for",
     "common_integer_dtype",
     "python_int_literal_dtype",
+    "python_int_range_dtype",
     "by_llvm_type",
     "llvm_abi_numpy_table",
     "C_ABI_NAMES",

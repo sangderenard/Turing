@@ -26,6 +26,7 @@ from ..transmogrifier.dtype_layout import (
 )
 from ..transmogrifier.ssa import Function, IRModule
 from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+from .native_faults import INT_OVERFLOW as _INT_OVERFLOW_CODE
 from .max_semantics import NUMPY, c_step, max_step_rule
 from .output_publication import (
     function_output_publications,
@@ -246,12 +247,31 @@ _FLOORED_HELPERS = (
     "    long long q = a / b, r = a % b;",
     "    return (r != 0 && ((r ^ b) < 0)) ? q - 1 : q;",
     "}",
+    # The same floored law in the internal int128 domain (the exact join of
+    # int64 and uint64): narrowing it through long long kept the low bits.
+    "static __int128 turing_imod128(__int128 a, __int128 b) {",
+    "    __int128 r = a % b;",
+    "    return (r != 0 && ((r ^ b) < 0)) ? r + b : r;",
+    "}",
+    "static __int128 turing_ifloordiv128(__int128 a, __int128 b) {",
+    "    __int128 q = a / b, r = a % b;",
+    "    return (r != 0 && ((r ^ b) < 0)) ? q - 1 : q;",
+    "}",
     "static double turing_fmod(double a, double b) {",
     "    double r = fmod(a, b);",
     "    return (r != 0.0 && ((r < 0.0) != (b < 0.0))) ? r + b : r;",
     "}",
     "static double turing_ffloordiv(double a, double b) {",
     "    return floor(a / b);",
+    "}",
+    # Python's int.bit_length: the bits of |v| (0 for 0, 64 for INT64_MIN),
+    # the C spelling of the Fortran lane's turing_python_bit_length.
+    "static long long turing_bit_length(long long v) {",
+    "    unsigned long long m = v < 0 ? 0ULL - (unsigned long long)v",
+    "                                 : (unsigned long long)v;",
+    "    long long n = 0;",
+    "    while (m != 0) { n += 1; m >>= 1; }",
+    "    return n;",
     "}",
 )
 #: Owned heap arenas (``ssa_heap_allocation``): every block is
@@ -274,6 +294,135 @@ _FLOORED = {
     "Mod": ("turing_imod", "turing_fmod"),
     "FloorDiv": ("turing_ifloordiv", "turing_ffloordiv"),
 }
+#: The int128 integer helper per opcode.
+_FLOORED_INT128 = {
+    "Mod": "turing_imod128",
+    "FloorDiv": "turing_ifloordiv128",
+}
+
+
+#: Python ``int`` operations spelled by ``_python_int_statement`` when
+#: ``python_int_overflow_checked`` holds, with their operand counts.
+_PYTHON_INT_OPERATIONS = {
+    "Shl": 2, "Shr": 2, "FloorDiv": 2, "Mod": 2, "Abs": 1, "abs": 1, "Neg": 1,
+}
+_C_INT64_MIN = "(-9223372036854775807LL - 1)"
+
+
+def _python_int_overflow_checked(instruction) -> bool:
+    from .ssa_llvm_backend import python_int_overflow_checked
+
+    return python_int_overflow_checked(instruction)
+
+
+def _python_int_spelled(op: str, instruction) -> bool:
+    """Whether ``_python_int_statement`` spells this op (its LLVM rule).
+
+    ``<< >> // %`` keep Python's semantics proven or not; ``abs`` and unary
+    ``-`` only need it while no interval proves the result inside int64.
+    """
+
+    from .ssa_llvm_backend import python_int_operation
+
+    if op in {"Abs", "abs", "Neg"}:
+        return _python_int_overflow_checked(instruction)
+    return python_int_operation(instruction)
+
+
+def _python_int_true_division(instruction) -> bool:
+    from .ssa_llvm_backend import python_int_true_division
+
+    return python_int_true_division(instruction)
+
+
+def _python_int_true_division_statement(args, target: str) -> str:
+    """C for Python's ``int / int`` (the LLVM lane's
+    ``python_int_true_division_lines``): one IEEE division of operands that
+    are exactly float64, else ``INT_ZERO_DIVISION`` or
+    ``INT_TRUE_DIVISION_INEXACT``."""
+
+    from .native_faults import INT_TRUE_DIVISION_INEXACT, INT_ZERO_DIVISION
+
+    left, right = (f"((int64_t)({argument}))" for argument in args)
+
+    def exact(value: str) -> str:
+        return (
+            f"((double){value} < 9223372036854775808.0 "
+            f"&& (int64_t)(double){value} == {value})"
+        )
+
+    return (
+        f"double {target} = ((double){left} / (double){right}); "
+        f"if ({right} == 0) turing_validation_error({INT_ZERO_DIVISION}u); "
+        f"else if (!({exact(left)} && {exact(right)})) "
+        f"turing_validation_error({INT_TRUE_DIVISION_INEXACT}u);"
+    )
+
+
+def _python_int_statement(op: str, args, target: str) -> str:
+    """C for Python's ``<< >> // %``, ``abs`` and unary ``-`` on an int64.
+
+    The LLVM lane's ``_python_int_lines``: Python's value or a named fault
+    (``NEGATIVE_SHIFT_COUNT``, ``INT_ZERO_DIVISION``, ``INT_OVERFLOW``),
+    computed on a safe operand so no C operation is undefined.  The
+    statement opens ``int64_t <target> = <value>;`` so a loop's later
+    definition can assign the incumbent local instead.
+    """
+
+    from .native_faults import INT_ZERO_DIVISION, NEGATIVE_SHIFT_COUNT
+
+    def fault(code: int) -> str:
+        return f"turing_validation_error({int(code)}u);"
+
+    overflow = fault(_INT_OVERFLOW_CODE)
+    if op == "Neg":
+        (value,) = args
+        return (
+            f"int64_t {target} = 0; if (__builtin_sub_overflow("
+            f"(int64_t)0, (int64_t)({value}), &{target})) {overflow}"
+        )
+    if op in {"Abs", "abs"}:
+        (value,) = args
+        return (
+            f"int64_t {target} = (({value}) < 0 ? (int64_t)(0 - "
+            f"(uint64_t)({value})) : ({value})); "
+            f"if (({value}) == {_C_INT64_MIN}) {overflow}"
+        )
+    left, right = (f"((int64_t)({argument}))" for argument in args)
+    if op in {"Shl", "Shr"}:
+        inrange = f"({right} >= 0 && {right} < 64)"
+        negative = f"if ({right} < 0) {fault(NEGATIVE_SHIFT_COUNT)}"
+        if op == "Shr":
+            # Python ``>>`` floors: arithmetic, and 0 / -1 past 63 bits.
+            return (
+                f"int64_t {target} = ({left} >> ({inrange} ? {right} : 63)); "
+                f"{negative}"
+            )
+        return (
+            f"int64_t {target} = (int64_t)((uint64_t){left} << "
+            f"({inrange} ? {right} : 0)); {negative} "
+            f"else if ({right} < 64 ? (({target} >> {right}) != {left}) "
+            f": ({left} != 0)) {overflow}"
+        )
+    wide = f"({left} == {_C_INT64_MIN} && {right} == -1)"
+    helper = "turing_ifloordiv" if op == "FloorDiv" else "turing_imod"
+    statement = (
+        f"int64_t {target} = {helper}({left}, "
+        f"({right} == 0 || {wide}) ? 1 : {right}); "
+        f"if ({right} == 0) {fault(INT_ZERO_DIVISION)}"
+    )
+    if op == "FloorDiv":
+        # -2**63 // -1 == 2**63; -2**63 % -1 == 0 is the safe divisor's.
+        statement += f" else if {wide} {overflow}"
+    return statement
+
+
+def _floored_integer_helper(op: str, operands) -> str:
+    """The floored integer helper whose domain holds every operand."""
+
+    if any(str(value.dtype or "").casefold() == "int128" for value in operands):
+        return _FLOORED_INT128[op]
+    return _FLOORED[op][0]
 
 #: C is the one destination where both halves of the precision-section API
 #: have a STANDARD answer rather than a compiler-specific one.
@@ -496,8 +645,9 @@ def emit_ssa_function_to_c(
         if op in {"Cast", "CastLike", "cast_like"} and len(args) >= 1:
             target = str(
                 instruction.attributes.get("target_dtype")
-                or instruction.res.dtype
-                or "float64"
+                or _settled_dtype(
+                    instruction.res.dtype, instruction.res.id,
+                    "Cast target_dtype attribute or result dtype")
             ).casefold()
             if target in {"bool", "i1"}:
                 rendered = f"(({args[0]}) != 0.0)"
@@ -694,8 +844,67 @@ _PRECISION_HOSTILE_FLAGS = (
 )
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
+def _blocks_in_definition_order(function) -> list[str]:
+    """Block names in reverse post-order from the entry block.
+
+    C binds an SSA result to its local when the defining statement is
+    emitted, so a block must be emitted after every block that dominates it.
+    The block dict is insertion ordered, and a lowering may append a block
+    (for example a sequence-index in-range arm) after the loop latch it
+    branches to; emitting in dict order then reaches the latch before the
+    definition it consumes.  Labels and ``goto`` make the textual order free,
+    so emit in reverse post-order (every dominator precedes the blocks it
+    dominates), the order the SSA's dominance already guarantees.  Blocks
+    unreachable from the entry keep their dict order at the end.
+    """
+
+    names = list(function.blocks)
+    if not names:
+        return names
+    start = "entry" if "entry" in function.blocks else names[0]
+
+    def successors(name: str) -> list[str]:
+        block = function.blocks[name]
+        targets: list[str] = []
+        for instruction in block.instrs:
+            attributes = instruction.attributes or {}
+            for key in ("target", "true_target", "false_target"):
+                target = attributes.get(key)
+                if target is not None and str(target) in function.blocks:
+                    targets.append(str(target))
+        return targets
+
+    visited: set[str] = {start}
+    post: list[str] = []
+    stack: list[tuple[str, iter]] = [(start, iter(successors(start)))]
+    while stack:
+        name, pending = stack[-1]
+        for successor in pending:
+            if successor not in visited:
+                visited.add(successor)
+                stack.append((successor, iter(successors(successor))))
+                break
+        else:
+            stack.pop()
+            post.append(name)
+    ordered = post[::-1]
+    ordered.extend(name for name in names if name not in visited)
+    return ordered
+
+
 def _scalar_c_type(dtype) -> str:
-    name = str(dtype or "float64").casefold()
+    name = str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold()
     if name == "ptr":
         return "double *"
     if name == "none":
@@ -715,12 +924,12 @@ def _unsigned_c_type(dtype) -> str:
 
 
 def _is_integer_dtype(dtype) -> bool:
-    layout = resolve_dtype(str(dtype or "float64").casefold())
+    layout = resolve_dtype(str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold())
     return layout is not None and layout.kind in {"int", "uint", "bool"}
 
 
 def _is_unsigned_dtype(dtype) -> bool:
-    layout = resolve_dtype(str(dtype or "float64").casefold())
+    layout = resolve_dtype(str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold())
     return layout is not None and layout.kind == "uint"
 
 
@@ -755,6 +964,29 @@ def supported_tensor_operations() -> frozenset[str]:
     return llvm_tensor_ops()
 
 
+def integer_narrowing_c_check(*arguments):
+    from .ssa_llvm_backend import integer_narrowing_c_check as check
+
+    return check(*arguments)
+
+
+def _contract_integer_narrowing(instruction) -> bool:
+    from .ssa_llvm_backend import contract_integer_narrowing
+
+    return contract_integer_narrowing(instruction)
+
+
+def _c_storage_dtype(c_type: str) -> str | None:
+    """The integer dtype a C storage type spells (``uint8_t`` is uint8)."""
+
+    from ..transmogrifier.dtype_layout import DTYPES
+
+    for layout in DTYPES.values():
+        if layout.kind in {"int", "uint"} and layout.c_storage_type == c_type:
+            return layout.name
+    return None
+
+
 def _buffer_c_type(dtype) -> str:
     """The type a buffer SLOT holds, as opposed to arithmetic width.
 
@@ -762,7 +994,7 @@ def _buffer_c_type(dtype) -> str:
     memory, and the value widens on load rather than on the way in.
     """
 
-    name = str(dtype or "float64").casefold()
+    name = str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold()
     if name == "ptrptr_float64":
         return "double *"
     if name == "none":
@@ -954,7 +1186,12 @@ class CModuleExecution:
         self.artifact.entry()(self._pointers, self._extents)
         validation_error = self.artifact.take_validation_error()
         if validation_error:
-            raise RuntimeError(f"native tile runtime validation failed with code {validation_error}")
+            from .native_faults import validation_fault
+
+            raise validation_fault(
+                validation_error,
+                f"native tile runtime validation failed with code {validation_error}",
+            )
         if self.artifact.external_slots:
             from .external_functions import check_external_faults
 
@@ -2364,6 +2601,21 @@ def emit_ssa_module_to_c(
         )) is not None
     )
 
+    # Program: ``def f(x, y): return (x * y).sum()`` over runtime-sized
+    # spans.  The product crosses a region boundary as a runtime-sized span:
+    # its producer's caller sizes it, and its reducer counts it, from the
+    # extents array, so both carry it.
+    extent_users.update(
+        owner for owner in reachable
+        for block in module.functions[owner].blocks.values()
+        for instruction in block.instrs
+        if any(
+            _runtime_sized_span(value)
+            for value in (*instruction.args, instruction.res)
+            if value is not None
+        )
+    )
+
     def _extent_needs_runtime(owner: str, instruction) -> bool:
         """Whether an ``extent`` op will read the runtime extents array.
 
@@ -2453,7 +2705,8 @@ def emit_ssa_module_to_c(
         # The native uint64 Add(2**53+1, 0) audit must retain its declaring
         # dtype after width settlement; reversing i64 alone loses signedness.
         declared = resolve_dtype(str((value.accounting or {}).get(
-            "physical_dtype") or value.dtype or "float64").casefold())
+            "physical_dtype") or _settled_dtype(
+                value.dtype, value.id, "SSAValue.dtype")).casefold())
         if declared is not None and declared.llvm_type == llvm_type:
             return declared.c_storage_type
         return c_lane_storage_for_llvm_type(llvm_type)
@@ -2465,7 +2718,8 @@ def emit_ssa_module_to_c(
         # bool and uint8 share uint8_t memory but different public value
         # classes. Preserve the declaring record, not a reverse C lookup.
         layout = resolve_dtype(str((value.accounting or {}).get(
-            "physical_dtype") or value.dtype or "float64").casefold())
+            "physical_dtype") or _settled_dtype(
+                value.dtype, value.id, "SSAValue.dtype")).casefold())
         if layout is not None and layout.c_storage_type == held:
             return layout.name
         return _dtype_for_c_storage(held)
@@ -3010,7 +3264,21 @@ def emit_ssa_module_to_c(
                     # typed a double callee result as one byte).
                     element_type = solved_buffer_type(record.callee, output)
                     shape = tuple(output.shape or ())
-                    if shape:
+                    runtime_slot = (
+                        extent_slot(
+                            record.callee, int(output.id), "element_count", None,
+                        )
+                        if not shape and _runtime_sized_span(output) else None
+                    )
+                    if runtime_slot is not None:
+                        # A runtime-sized span result is owned storage of
+                        # its element count, never one scalar slot.
+                        storage = runtime_activation_array(
+                            element_type, f"extents[{runtime_slot}]",
+                        )
+                        projected_expression = storage
+                        projected_address = storage
+                    elif shape:
                         count = math.prod(shape)
                         requirement = storage_requirements_by_function.get(
                             record.callee, {}
@@ -3286,7 +3554,48 @@ def emit_ssa_module_to_c(
                 )
                 for key in table if key.casefold() == op.casefold()
             ), op)
-            if op in _BINARY and len(elements) == 2:
+            from .ssa_llvm_backend import python_int_lane_overflow_checked
+
+            lane_checked = (
+                integral and result_type == "int64_t"
+                and python_int_lane_overflow_checked(instruction)
+            )
+            # A checked lane is a statement: the overflow builtin reports
+            # code 86 (NativeIntOverflow) for the lane Python's ``int``
+            # would carry past int64.
+            lane_statement = None
+            if lane_checked and op in {"Add", "Sub", "Mul", "Neg", "Abs"}:
+                prototype = "void turing_validation_error(uint32_t error_code);"
+                if prototype not in prototypes:
+                    prototypes.append(prototype)
+                needs_validation_runtime = True
+                lane = f"ew_v_{result_id}"
+                report = f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                if op in {"Add", "Sub", "Mul"} and len(elements) == 2:
+                    builtin = {
+                        "Add": "__builtin_add_overflow",
+                        "Sub": "__builtin_sub_overflow",
+                        "Mul": "__builtin_mul_overflow",
+                    }[op]
+                    lane_statement = (
+                        f"int64_t {lane}; if ({builtin}((int64_t)({elements[0]}), "
+                        f"(int64_t)({elements[1]}), &{lane})) {report}"
+                    )
+                elif op in {"Neg", "Abs"} and len(elements) == 1:
+                    lane_statement = (
+                        f"int64_t {lane}; if (__builtin_sub_overflow((int64_t)0, "
+                        f"(int64_t)({elements[0]}), &{lane})) {report}"
+                    )
+                    if op == "Abs":
+                        # |x| leaves int64 only at INT64_MIN, the one lane
+                        # whose checked negation reports.
+                        lane_statement += (
+                            f" if (({elements[0]}) >= 0) {lane} = "
+                            f"(int64_t)({elements[0]});"
+                        )
+            if lane_statement is not None:
+                expression = f"ew_v_{result_id}"
+            elif op in _BINARY and len(elements) == 2:
                 if op == "Div" and not _is_integer_dtype(result.dtype):
                     expression = (
                         f"((double){elements[0]} / (double){elements[1]})"
@@ -3318,7 +3627,10 @@ def emit_ssa_module_to_c(
                     ))
                     return
                 else:
-                    helper = _FLOORED[op][0 if integral else 1]
+                    helper = (
+                        _floored_integer_helper(op, instruction.args)
+                        if integral else _FLOORED[op][1]
+                    )
                     expression = f"{helper}({elements[0]}, {elements[1]})"
             elif op in {"Max", "Min"} and len(elements) == 2:
                 comparison = ">" if op == "Max" else "<"
@@ -3330,8 +3642,28 @@ def emit_ssa_module_to_c(
                 )
             elif op == "Pow" and len(elements) == 2 and not integral:
                 expression = f"pow({elements[0]}, {elements[1]})"
+            elif op == "Neg" and len(elements) == 1 and integral:
+                # Negation through the unsigned type, as Add/Sub/Mul above:
+                # INT64_MIN wraps to itself instead of being undefined.
+                layout = dtype_layout(result.dtype)
+                unsigned = dtype_layout(
+                    f"uint{max(32, 8 * layout.byte_size)}"
+                ).c_storage_type
+                expression = f"({result_type})(0 - ({unsigned}){elements[0]})"
             elif op == "Neg" and len(elements) == 1:
                 expression = f"(-{elements[0]})"
+            elif (
+                op == "Abs" and len(elements) == 1 and integral
+                and _is_integer_dtype(result.dtype)
+            ):
+                layout = dtype_layout(result.dtype)
+                unsigned = dtype_layout(
+                    f"uint{max(32, 8 * layout.byte_size)}"
+                ).c_storage_type
+                expression = (
+                    f"(({elements[0]}) < 0 ? ({result_type})(0 - "
+                    f"({unsigned})({elements[0]})) : ({elements[0]}))"
+                )
             elif (
                 op in _UNARY and _UNARY[op] is not None
                 and len(elements) == 1 and not integral
@@ -3349,10 +3681,15 @@ def emit_ssa_module_to_c(
                     activation_array(result_type, int(count)) if static
                     else runtime_activation_array(result_type, count)
                 )
+            store = (
+                f"(({result_type} *)({destination}))[{index}] = "
+                f"({result_type})({expression});"
+            )
+            if lane_statement is not None:
+                store = f"{{ {lane_statement} {store} }}"
             loop = (
                 f"for (ptrdiff_t {index} = 0; {index} < (ptrdiff_t)({count}); "
-                f"++{index}) (({result_type} *)({destination}))[{index}] = "
-                f"({result_type})({expression});"
+                f"++{index}) {store}"
             )
             if checks:
                 prototype = "void turing_validation_error(uint32_t error_code);"
@@ -3372,6 +3709,120 @@ def emit_ssa_module_to_c(
             object_expressions[id(result)] = destination
             object_addresses[id(result)] = destination
             address_buffer_types[result_id] = result_type
+
+        def emit_axis_reduction(instruction, op: str) -> bool:
+            """``x.sum(axis=k)`` (and prod/mean/max/min) over a static shape.
+
+            Program: ``def f(y): return y.max(axis=0)`` with y (2, 3).
+            Rule: one result per lane of the kept axes, row-major, folded
+            along axis k in index order; max/min take numpy's rule (a NaN
+            in the lane is the lane's result). Returns False when this is
+            not an axis reduction, True once spelled or refused by name.
+            """
+
+            axis = instruction.attributes.get("axis")
+            if axis is None:
+                axis = instruction.attributes.get("dim")
+            if axis is None or not instruction.args:
+                return False
+            source_value = instruction.args[0]
+            shape = tuple(source_value.shape or ())
+            if not shape and not int(
+                (source_value.accounting or {}).get("program_abi_rank") or 0
+            ):
+                # builtin ``min(n, 3)`` carries its second operand as
+                # ``dim``; a scalar has no axis to reduce.
+                return False
+            result = instruction.res
+            if isinstance(axis, (list, tuple)) or not shape or not all(
+                isinstance(item, int) for item in shape
+            ) or not isinstance(axis, int):
+                shortfalls.append(CEmissionShortfall(
+                    op, f"{op} over axis {axis!r} of %t{source_value.id} "
+                    f"(shape {shape!r}) needs one integer axis of a static "
+                    f"shape in {fn}",
+                ))
+                return True
+            rank = len(shape)
+            if not -rank <= axis < rank:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"axis {axis} is out of range for shape {shape!r} in {fn}",
+                ))
+                return True
+            axis %= rank
+            length = shape[axis]
+            outer = math.prod(shape[:axis])
+            inner = math.prod(shape[axis + 1:])
+            if math.prod(tuple(result.shape or ())) != outer * inner:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"{op} over axis {axis} of {shape!r} gives "
+                    f"{outer * inner} values but %t{result.id} holds "
+                    f"{tuple(result.shape or ())!r} in {fn}",
+                ))
+                return True
+            if length == 0 and op in {"max", "min"}:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"{op} over an empty axis raises (numpy: zero-size "
+                    f"array) in {fn}",
+                ))
+                return True
+            source = address_operand(source_value)
+            if source is None:
+                return True
+            result_id = int(result.id)
+            result_type = buffer_type(result)
+            floating = not _is_integer_dtype(result.dtype)
+            accumulator_type = "double" if floating else result_type
+            rows = f"((const {buffer_type(source_value)} *)({source}))"
+            lane = f"ax_l_{result_id}"
+            step = f"ax_k_{result_id}"
+            at = (
+                f"({lane} / {inner}) * {length * inner} + ({lane} % {inner})"
+                f" + {step} * {inner}"
+            )
+            element = f"({accumulator_type}){rows}[{at}]"
+            if op in {"max", "min"}:
+                rule = max_step_rule(instruction) or NUMPY
+                first = (
+                    f"({accumulator_type}){rows}[({lane} / {inner}) * "
+                    f"{length * inner} + ({lane} % {inner})]"
+                )
+                fold = (
+                    f"{accumulator_type} acc = {first}; "
+                    f"for (ptrdiff_t {step} = 1; {step} < {length}; ++{step}) "
+                    f"acc = " + c_step(rule, op == "max", "acc", element) + ";"
+                )
+                value = "acc"
+            elif op in {"sum", "mean", "prod"}:
+                start = "1" if op == "prod" else "0"
+                combine = "*" if op == "prod" else "+"
+                fold = (
+                    f"{accumulator_type} acc = {start}; "
+                    f"for (ptrdiff_t {step} = 0; {step} < {length}; ++{step}) "
+                    f"acc = acc {combine} {element};"
+                )
+                value = (
+                    f"(acc / (double){length})" if op == "mean" else "acc"
+                )
+            else:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"{op} over an axis has no C spelling in {fn}",
+                ))
+                return True
+            destination = output_destinations.get(result_id)
+            if destination is None or result_id in formals_by_id:
+                destination = activation_array(result_type, int(outer * inner))
+            body.append(
+                f"        for (ptrdiff_t {lane} = 0; {lane} < {outer * inner}; "
+                f"++{lane}) {{ {fold} (({result_type} *)({destination}))"
+                f"[{lane}] = ({result_type})({value}); }}"
+            )
+            expressions[result_id] = destination
+            addresses[result_id] = destination
+            object_expressions[id(result)] = destination
+            object_addresses[id(result)] = destination
+            address_buffer_types[result_id] = result_type
+            return True
 
         def heap_element(value) -> str | None:
             """Element layout of a heap arena pointer CELL, else None.
@@ -3740,7 +4191,7 @@ def emit_ssa_module_to_c(
             )
         }
 
-        block_names = list(function.blocks)
+        block_names = _blocks_in_definition_order(function)
         emitted_scalar_locals: set[int] = set()
         effect_guarded_blocks = set(
             function.metadata.get("pool_effect_guarded_blocks") or ()
@@ -4168,6 +4619,13 @@ def emit_ssa_module_to_c(
                     body.append(f"            goto {_c_label(on_false)};")
                     body.append("        }")
                     continue
+                if op == "Trap" and instruction.attributes.get("fault_exit"):
+                    # A checked fault already recorded its validation code;
+                    # the exit publishes no outputs and leaves through the
+                    # activation-storage cleanup.
+                    span.take_pending()
+                    body.append(f"        goto cleanup_{_c_symbol(fn)};")
+                    continue
                 if op in {"Ret", "ret", "Return", "return"}:
                     if trace_this_function:
                         pending_trace.clear()
@@ -4273,6 +4731,18 @@ def emit_ssa_module_to_c(
                             count = f"(ptrdiff_t)({parts[0]})"
                             if op in {"max", "min"}:
                                 empty_guard = count
+                    if count is None and _runtime_sized_span(source):
+                        # Program: ``def f(x, y): return (x * y).sum()``
+                        # over rank-1 spans of runtime length.  Rule: a
+                        # runtime-sized span reduces over its element count,
+                        # the extent slot its elementwise producer is sized by.
+                        slot = extent_slot(
+                            fn, int(source.id), "element_count", None,
+                        )
+                        if slot is not None:
+                            count = f"(ptrdiff_t)(extents[{slot}])"
+                            if op in {"max", "min"}:
+                                empty_guard = count
                     if count is None:
                         shortfalls.append(CEmissionShortfall(
                             op,
@@ -4296,7 +4766,29 @@ def emit_ssa_module_to_c(
                         sum_start = scalar_operand(instruction.args[1])
                         if sum_start is None:
                             continue
-                    if count == 1:
+                    # ``sum(xs)`` of Python ints: each step is int ``+``.
+                    checked_sum = (
+                        op == "sum" and result_type == "int64_t"
+                        and _python_int_overflow_checked(instruction)
+                    )
+                    if checked_sum:
+                        prototype = (
+                            "void turing_validation_error(uint32_t error_code);"
+                        )
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                    if count == 1 and checked_sum:
+                        scalar = scalar_operand(source)
+                        if scalar is None:
+                            continue
+                        body.append(
+                            f"        int64_t t{result_id} = 0; "
+                            f"if (__builtin_add_overflow((int64_t)({sum_start}), "
+                            f"(int64_t)({scalar}), &t{result_id})) "
+                            f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                        )
+                    elif count == 1:
                         scalar = scalar_operand(source)
                         if scalar is None:
                             continue
@@ -4345,6 +4837,12 @@ def emit_ssa_module_to_c(
                         elif op == "sum":
                             # Left to right from ``start``, as Python adds.
                             step = (
+                                f"if (__builtin_add_overflow("
+                                f"turing_red_{result_id}, "
+                                f"(int64_t)turing_red_{result_id}_v, "
+                                f"&turing_red_{result_id})) "
+                                f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                                if checked_sum else
                                 f"turing_red_{result_id} += "
                                 f"({result_type})turing_red_{result_id}_v;"
                             )
@@ -5614,6 +6112,18 @@ def emit_ssa_module_to_c(
                                 int(addressed_value.id),
                                 carried_type(stored_value),
                             )
+                            source_type = carried_type(stored_value)
+                            narrowing = integer_narrowing_c_check(
+                                _c_storage_dtype(source_type),
+                                _c_storage_dtype(stored_type),
+                                source_type, value,
+                            )
+                            if narrowing is not None:
+                                prototype = "void turing_validation_error(uint32_t error_code);"
+                                if prototype not in prototypes:
+                                    prototypes.append(prototype)
+                                needs_validation_runtime = True
+                                body.append(f"        {narrowing}")
                             body.append(
                                 f"        *(({stored_type} *)({where})) = {value};"
                             )
@@ -5672,6 +6182,15 @@ def emit_ssa_module_to_c(
                     object_addresses[id(instruction.res)] = f"t{result_id}"
                     heap_allocation_ids.add(result_id)
                     continue
+                if (
+                    op.casefold() in {"sum", "prod", "mean", "max", "min"}
+                    and (
+                        instruction.attributes.get("axis") is not None
+                        or instruction.attributes.get("dim") is not None
+                    )
+                    and emit_axis_reduction(instruction, op.casefold())
+                ):
+                    continue
                 span_op = TENSOR_OPERATION_SCALAR_SPELLING.get(
                     op.casefold(), op,
                 )
@@ -5715,7 +6234,14 @@ def emit_ssa_module_to_c(
                         op, f"mixed signed/unsigned operands require an explicit conversion in {fn}",
                     ))
                     continue
-                declared_storage_type = _scalar_c_type(instruction.res.dtype)
+                # An address view carries no scalar dtype of its own; every
+                # other result must have its dtype settled by now.
+                declared_storage_type = (
+                    None if op in {"GetElementPtr", "getelementptr"}
+                    else _scalar_c_type(_settled_dtype(
+                        instruction.res.dtype, instruction.res.id,
+                        f"result dtype of {op}"))
+                )
                 if op in {"GetElementPtr", "getelementptr"} and len(args) >= 2:
                     # Checked sequence extend passes source length formal 11
                     # (int64[1]) as a ptr-typed address occurrence. The formal
@@ -5909,6 +6435,19 @@ def emit_ssa_module_to_c(
                         f"const {result_type} t{result_id} = "
                         f"({result_type})({cast_source});"
                     )
+                    narrowing = (
+                        integer_narrowing_c_check(
+                            instruction.args[0].dtype, instruction.res.dtype,
+                            _scalar_c_type(instruction.args[0].dtype), args[0],
+                        )
+                        if _contract_integer_narrowing(instruction) else None
+                    )
+                    if narrowing is not None:
+                        prototype = "void turing_validation_error(uint32_t error_code);"
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        declared = f"{narrowing} {declared}"
                 elif (
                     op.casefold() == "item"
                     and len(args) == 1
@@ -6093,6 +6632,35 @@ def emit_ssa_module_to_c(
                         )
                         + ";"
                     )
+                elif _python_int_true_division(instruction):
+                    prototype = "void turing_validation_error(uint32_t error_code);"
+                    if prototype not in prototypes:
+                        prototypes.append(prototype)
+                    needs_validation_runtime = True
+                    declared_storage_type = "double"
+                    declared = _python_int_true_division_statement(
+                        args, f"t{result_id}",
+                    )
+                elif (
+                    op in _PYTHON_INT_OPERATIONS
+                    and len(args) == _PYTHON_INT_OPERATIONS[op]
+                    and _scalar_c_type(instruction.res.dtype) == "int64_t"
+                    and all(
+                        # The spelling computes on int64 operands; an int128
+                        # operand (a uint64 widened for ``%``) is not narrowed
+                        # through it but takes the int128 floored helper.
+                        is_integer(value) and str(value.dtype) == "int64"
+                        for value in instruction.args
+                    )
+                    and _python_int_spelled(op, instruction)
+                ):
+                    prototype = "void turing_validation_error(uint32_t error_code);"
+                    if prototype not in prototypes:
+                        prototypes.append(prototype)
+                    needs_validation_runtime = True
+                    integer_ids.add(result_id)
+                    declared_storage_type = "int64_t"
+                    declared = _python_int_statement(op, args, f"t{result_id}")
                 elif op == "Pow" and len(args) == 2:
                     if _is_integer_dtype(instruction.res.dtype):
                         shortfalls.append(CEmissionShortfall(
@@ -6152,6 +6720,45 @@ def emit_ssa_module_to_c(
                         f"const {kind} t{result_id} = "
                         f"{expression};"
                     )
+                    from .ssa_llvm_backend import python_int_overflow_checked
+
+                    if (
+                        integral and op == "Add" and kind == "int64_t"
+                        and (instruction.attributes or {}).get("binding")
+                        == "loop_induction_step"
+                    ):
+                        # A range loop's induction step saturates, as the
+                        # LLVM lane's ``llvm.sadd.sat`` (precompile_to_ssa).
+                        declared = (
+                            f"int64_t t{result_id} = 0; if (__builtin_add_overflow("
+                            f"(int64_t)({args[0]}), (int64_t)({args[1]}), "
+                            f"&t{result_id})) t{result_id} = "
+                            f"((int64_t)({args[1]}) > 0) ? INT64_MAX : INT64_MIN;"
+                        )
+                    elif (
+                        integral and op in {"Add", "Sub", "Mul"}
+                        and kind == "int64_t"
+                        and python_int_overflow_checked(instruction)
+                    ):
+                        # The LLVM lane's rule (python_int_overflow_checked):
+                        # Python ``int`` arithmetic never wraps.
+                        prototype = (
+                            "void turing_validation_error(uint32_t error_code);"
+                        )
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        builtin = {
+                            "Add": "__builtin_add_overflow",
+                            "Sub": "__builtin_sub_overflow",
+                            "Mul": "__builtin_mul_overflow",
+                        }[op]
+                        declared = (
+                            f"int64_t t{result_id}; if ({builtin}("
+                            f"(int64_t)({args[0]}), (int64_t)({args[1]}), "
+                            f"&t{result_id})) "
+                            f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                        )
                 elif op in _INTEGER_BINARY and len(args) == 2:
                     integer_ids.add(result_id)
                     kind = _scalar_c_type(instruction.res.dtype)
@@ -6210,7 +6817,10 @@ def emit_ssa_module_to_c(
                     )
                 elif op in _FLOORED and len(args) == 2:
                     integral = all(map(is_integer, instruction.args))
-                    helper = _FLOORED[op][0 if integral else 1]
+                    helper = (
+                        _floored_integer_helper(op, instruction.args)
+                        if integral else _FLOORED[op][1]
+                    )
                     kind = _scalar_c_type(instruction.res.dtype)
                     if integral:
                         integer_ids.add(result_id)
@@ -6272,7 +6882,14 @@ def emit_ssa_module_to_c(
                     kind = (
                         _scalar_c_type(instruction.res.dtype)
                     )
-                    declared = f"const {kind} t{result_id} = (-{args[0]});"
+                    # Program: ``return -n`` declared int128 (the int
+                    # overflow union's exact arm).  Wrong record: ``-n`` ran
+                    # in n's int64 and -(-2**63) wrapped before widening.
+                    # Rule: negate in the declared domain (an exact widening
+                    # of the operand), as the binary ops do.
+                    declared = (
+                        f"const {kind} t{result_id} = (-({kind})({args[0]}));"
+                    )
                 elif (
                     op.casefold() in _UNARY_PREDICATES
                     and len(args) == 1
@@ -6304,6 +6921,18 @@ def emit_ssa_module_to_c(
                         f"(({args[0]}) < 0 ? ({kind})(0 - "
                         f"({_unsigned_c_type(instruction.res.dtype)})"
                         f"({args[0]})) : ({args[0]}));"
+                    )
+                elif (
+                    op == "BitLength" and len(args) == 1
+                    and is_integer(instruction.args[0])
+                    and _is_integer_dtype(instruction.res.dtype)
+                ):
+                    kind = _scalar_c_type(instruction.res.dtype)
+                    declared_storage_type = kind
+                    integer_ids.add(result_id)
+                    declared = (
+                        f"const {kind} t{result_id} = "
+                        f"({kind})turing_bit_length((long long)({args[0]}));"
                     )
                 elif (
                     op.casefold() in _INTEGER_VALUED_UNARY and len(args) == 1
@@ -6810,6 +7439,28 @@ def emit_ssa_module_to_c(
                 entry_span.take(
                     UnitKind.STATEMENT,
                     args=(int(sequence.capacity_value_id),), spelling=capacity,
+                )
+    # A root-owned list of lists keeps its row slices in a child-table pool:
+    # publish the pool's proven capacity and stride, as the outer capacity
+    # cell above is, before any row is allocated.
+    if root_sequences is not None:
+        for outer_id, rows, stride in tuple(
+            root.metadata.get("child_pool_static_extents", ())
+        ):
+            outer = root_sequences.sequences.get(int(outer_id))
+            pool = None if outer is None else outer.child_table_pool
+            if pool is None:
+                continue
+            for member_id, value in (
+                (pool.capacity_value_id, int(rows) * int(stride)),
+                (pool.row_stride_value_id, int(stride)),
+            ):
+                cell = owned_storage_names.get(int(member_id))
+                if cell is None:
+                    continue
+                entry_lines.append(f"    ((int64_t *){cell})[0] = {value};")
+                entry_span.take(
+                    UnitKind.STATEMENT, args=(int(member_id),), spelling=cell,
                 )
     # -- record-parameter relocation prologue -------------------------------
     # Record parameters are runtime cell arenas (the program mutates scalar

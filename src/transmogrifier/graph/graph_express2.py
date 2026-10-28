@@ -3494,6 +3494,17 @@ def _expand_unresolved_ast_parents(
     # stamped as they are appended.
     _annotate_visual_source_owners(module)
     root_bindings = _import_ast_bindings(module, bindings, package=package)
+    # A module-level ``def max``/``class sum`` shadows the builtin of that
+    # name, as in Python.  Without its definition here the builtin fallback
+    # below bound the name, and the call was classified ``builtins.max``
+    # while reduction resolved it to the program's own function.
+    for statement in module.body:
+        if (
+            isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef))
+            and hasattr(builtins, statement.name)
+        ):
+            root_bindings.setdefault(statement.name, statement)
     # Built-ins are ordinary lexical fallback bindings in Python.  Put them
     # through the same source/host-code implementation resolver as imports and
     # globals so a source-less builtin can be decompiled rather than becoming
@@ -6603,15 +6614,59 @@ class ProcessGraph(TiledObject):
                             mode=Mode.CONCORD,
                         )
                 for parameter in parameters:
+                    # The called inventory (compiler/called_inventory.py): the
+                    # class the callers pass for this formal is the formal's
+                    # evidence where no annotation states one.  An annotation
+                    # that does not admit the inventory's class is a named
+                    # refusal, never a silent preference.
+                    from ...compiler.called_inventory import called_class
+                    inventory = called_class(
+                        book, str(identity), str(parameter.arg),
+                    )
+                    inventory_cell = None
+                    annotation_node = parameter.annotation
                     if parameter.annotation is None:
-                        continue
+                        if inventory is None:
+                            continue
+                    else:
+                        if inventory is not None:
+                            inventory_cell = inventory[1]
+                            admitted = {
+                                node.id for node in ast.walk(parameter.annotation)
+                                if isinstance(node, ast.Name)
+                            }
+                            # ``list[int]`` is admitted by an annotation that
+                            # names the container and admits the element class.
+                            head, _, element = inventory[0].partition("[")
+                            element = element.rstrip("]")
+                            if element:
+                                spelled_ok = head in admitted and (
+                                    element in admitted
+                                    or (element == "bool" and "int" in admitted)
+                                    or (element in ("bool", "int")
+                                        and "float" in admitted)
+                                )
+                            else:
+                                spelled_ok = inventory[0] in admitted or (
+                                    (inventory[0] == "bool" and "int" in admitted)
+                                    or (inventory[0] in ("bool", "int")
+                                        and "float" in admitted)
+                                )
+                            if not spelled_ok:
+                                raise ValueError(
+                                    f"formal {parameter.arg} of {identity} is "
+                                    f"annotated {ast.unparse(parameter.annotation)} "
+                                    f"but its call records pass {inventory[0]}"
+                                )
                     row = (module_name, str(identity), str(parameter.arg))
                     parameter_span = post_source_span(function, parameter)
                     if parameter_span is None:
                         continue
                     parameter_sources = [parameter_span]
+                    if inventory_cell is not None:
+                        parameter_sources.append(inventory_cell)
                     for name in dict.fromkeys(
-                        node.id for node in ast.walk(parameter.annotation)
+                        node.id for node in ast.walk(annotation_node)
                         if isinstance(node, ast.Name)
                     ):
                         declared_class = book.latest_ref(
@@ -6622,7 +6677,7 @@ class ProcessGraph(TiledObject):
                             parameter_sources.append(declared_class)
                     book.post(
                         PARAMETER_ANNOTATION, row,
-                        ast.unparse(parameter.annotation),
+                        ast.unparse(annotation_node),
                         stage=INGESTION,
                         provenance=Derived(tuple(dict.fromkeys(
                             parameter_sources

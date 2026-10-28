@@ -831,8 +831,16 @@ def tensor_operation_name(node: Any) -> Optional[str]:
                     if hasattr(func, stamp):
                         setattr(replacement, stamp, getattr(func, stamp))
                 node.func = replacement
-        elif isinstance(func, ast.Name) and func.id != canonical:
+        elif (
+            isinstance(func, ast.Name)
+            and func.id != canonical
+            and canonical == "tensor"
+        ):
             func.id = canonical
+        # Any other bare name keeps its spelling: ``sum_``/``T``/``randint``
+        # name whatever the program bound to them, and lexical resolution
+        # reads ``func.id``.  Renaming them to the canonical op made a user
+        # ``def sum_(a, b)`` call resolve to builtins ``sum``.
         return canonical
     return None
 

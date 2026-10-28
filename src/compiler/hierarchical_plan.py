@@ -13,6 +13,7 @@ from functools import cached_property
 from typing import Any, Mapping
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+from ..transmogrifier.dtype_layout import python_float_result_dtype
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -491,7 +492,11 @@ def plan_region_to_ssa_instrs(
         if (
             shape_of.get(int(value_id), ()) == ()
             and rank_of.get(int(value_id), 0) == 0
-            and dtype in {"int", "int32", "int64", "i32", "i64"}
+            # uint64/int128: the width of a proven interval
+            # (``source_int_range_concordance``) beyond int64.
+            and dtype in {
+                "int", "int32", "int64", "i32", "i64", "uint64", "int128",
+            }
             and source_result_class(int(value_id)) == "builtins.int"
         ):
             return str(dtype)
@@ -536,7 +541,9 @@ def plan_region_to_ssa_instrs(
             "float", "float16", "float32", "float64", "double",
             "f16", "f32", "f64",
         }):
-            return promoted_float_dtype(value_ids) or "float64"
+            return promoted_float_dtype(value_ids) or python_float_result_dtype(
+                dtype_of.get(int(value_id)) for value_id in value_ids
+            )
         from ..transmogrifier.dtype_layout import (
             common_integer_dtype, resolve as resolve_dtype,
         )
@@ -617,10 +624,13 @@ def plan_region_to_ssa_instrs(
                 inferred = scalar_cast_dtypes[opcode]
             elif opcode in {"truediv", "div"}:
                 # True division is floating: the operands' widest declared
-                # float width, float64 when none is declared.
+                # float width; over integral operands, Python's float.
                 inferred = (
                     promoted_float_dtype(semantic_input_ids(item))
-                    or "float64"
+                    or python_float_result_dtype(
+                        dtype_of.get(int(value_id))
+                        for value_id in semantic_input_ids(item)
+                    )
                 )
             elif opcode in dtype_preserving_ops:
                 inferred = (
@@ -675,9 +685,14 @@ def plan_region_to_ssa_instrs(
         existing = values.get(value_id)
         if existing is not None:
             return existing
+        if value_id not in dtype_of:
+            raise ValueError(
+                f"region value {value_id} has no settled dtype in the "
+                "region's value records"
+            )
         made = SSAValue(
             value_id,
-            dtype=dtype_of.get(value_id, "float64"),
+            dtype=dtype_of[value_id],
             shape=shape_of.get(value_id, ()),
             accounting={
                 "program_abi_rank": rank_of[value_id],
@@ -896,9 +911,13 @@ def plan_region_to_ssa_instrs(
             # a same-value cast carrying the schema promise; target code does
             # not reconstruct or invoke a Python object.
             attributes.setdefault("source_operator", opcode)
-            attributes.setdefault("target_dtype", dtype_of.get(
-                int(item.outputs[0]) if item.outputs else -1, "float64"
-            ))
+            tensor_output = int(item.outputs[0]) if item.outputs else -1
+            if tensor_output not in dtype_of:
+                raise ValueError(
+                    f"tensor() output value {tensor_output} has no settled "
+                    "dtype in the region's value records"
+                )
+            attributes.setdefault("target_dtype", dtype_of[tensor_output])
             opcode = "Cast"
         elif opcode == "const":
             # A plan line the planner folded to a literal (``0.5 * step`` of
@@ -917,10 +936,8 @@ def plan_region_to_ssa_instrs(
             ) == 0
             and all(
                 max(
-                    len(tuple(value(value_id).shape)),
-                    int((value(value_id).accounting or {}).get(
-                        "program_abi_rank", 0
-                    )),
+                    len(tuple(shape_of.get(int(value_id), ()))),
+                    int(rank_of.get(int(value_id), 0)),
                 ) == 0
                 for value_id in semantic_inputs
             )

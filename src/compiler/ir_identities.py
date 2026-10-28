@@ -209,6 +209,291 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
     return counts
 
 
+def _python_int_dtype(dtype) -> bool:
+    return str(dtype) == "int64"
+
+
+def _integer_constant(instruction) -> int | None:
+    """The exact int payload of an integer ``Const``, else ``None``."""
+
+    for key in ("constant", "values", "value"):
+        payload = instruction.attributes.get(key)
+        if payload is not None:
+            break
+    if isinstance(payload, bool) or not isinstance(payload, int):
+        return None
+    return int(payload)
+
+
+def _integer_pow_site(instruction) -> str | None:
+    """Which exact power reduction an instruction takes, else ``None``.
+
+    ``"int"``: ``a ** b`` / ``pow(a, b)`` on int64 with an int64 result.
+    ``"modular"``: ``pow(a, b, m)`` on int64.
+    """
+
+    canonical = str(
+        instruction.attributes.get("tensor_operation")
+        or instruction.attributes.get("tensor")
+        or instruction.op
+    )
+    result = instruction.res
+    if (
+        canonical not in _POW or result is None
+        or tuple(getattr(result, "shape", None) or ())
+        or len(instruction.args) not in (2, 3)
+        or not all(_python_int_dtype(value.dtype) for value in instruction.args)
+        or any(tuple(value.shape or ()) for value in instruction.args)
+        or not _python_int_dtype(result.dtype)
+    ):
+        return None
+    return "int" if len(instruction.args) == 2 else "modular"
+
+
+def reduce_integer_pow(functions) -> dict:
+    """The shared exact power reduction: Python ``int`` powers, in place.
+
+    Program: ``a ** b``, ``pow(a, b)``, ``pow(a, b, m)`` on ints.  Wrong
+    record: C and LLVM refused every int power but ``x ** 2``, and a float
+    ``pow`` of an int is not Python's exact int.  Rule: square-and-multiply
+    in ordinary repository SSA, so every backend inherits it -- each
+    multiply is Python ``int`` arithmetic (``source_type`` ``BinOp``),
+    which C and LLVM overflow-check (``native_faults.INT_OVERFLOW``).
+    A constant exponent unrolls straight-line; a variable one becomes a
+    loop over its bits (at most 63 trips).  ``pow(a, b, m)`` reduces each
+    product by Python's floored ``%``, so intermediates stay below ``m**2``.
+
+    Python's other outcomes are named faults: ``0 ** -n`` raises
+    ``ZeroDivisionError`` (``INT_ZERO_DIVISION``), ``pow(a, b, 0)``
+    ``ValueError`` (``POW_MODULUS_ZERO``).  ``a ** -n`` is a float in
+    Python and ``pow(a, -n, m)`` a modular inverse; an int-typed power
+    reaching a negative exponent reports ``INT_POWER_NEGATIVE_EXPONENT``
+    rather than return an int Python never computes: the frontend types
+    every int ** int as int (``a ** -2`` too), and a float arm would need
+    an int | float result.
+    """
+
+    from .concordance_declarations import (
+        PRECISION_IDENTITIES, PRECISION_IDENTITY_VALUE, SSA_BLOCK,
+        SSABlockKind,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import function_scope_of, identity_cells
+    from .native_faults import (
+        INT_POWER_NEGATIVE_EXPONENT, INT_ZERO_DIVISION, POW_MODULUS_ZERO,
+    )
+    from .ssa_record_return_state import mint_ssa_value
+    from ..transmogrifier.ssa import BasicBlock
+
+    counts = {"int_pow_unrolled": 0, "int_pow_loop": 0, "int_pow_modular": 0}
+
+    def rewrite(function, block_name: str, index: int) -> None:
+        block = function.blocks[block_name]
+        power = block.instrs[index]
+        site = _integer_pow_site(power)
+        post = block.instrs[index + 1:]
+        old_successors = list(block.successors)
+        block.instrs = block.instrs[:index]
+        anchor = power.args[0]
+        constants = {
+            int(instruction.res.id): _integer_constant(instruction)
+            for candidate in function.blocks.values()
+            for instruction in candidate.instrs
+            if instruction.op == "Const" and instruction.res is not None
+        }
+        added: list[BasicBlock] = []
+        taken = set(function.blocks)
+        state = {"current": block}
+
+        def new_block(stem: str, kind) -> BasicBlock:
+            serial = 0
+            name = f"{block_name}.{stem}"
+            while name in taken:
+                serial += 1
+                name = f"{block_name}.{stem}.{serial}"
+            taken.add(name)
+            created = BasicBlock(name)
+            added.append(created)
+            # The block's ``ssa_block`` row, from the power it spells.
+            owners = identity_cells(function, power.res, *power.args)
+            book = current_identity_book()
+            row = (function_scope_of(function), str(function.name), name)
+            if owners and book.latest_ref(SSA_BLOCK, row) is None:
+                book.post(
+                    SSA_BLOCK, row, kind, stage=PRECISION_IDENTITIES,
+                    provenance=Derived(owners), mode=Mode.CONCORD,
+                )
+            return created
+
+        def mint(dtype: str) -> SSAValue:
+            return SSAValue(mint_ssa_value(
+                function, PRECISION_IDENTITY_VALUE, (anchor,),
+                dtype=dtype, shape=(), stage=PRECISION_IDENTITIES,
+            ), dtype=dtype)
+
+        def put(op, args, dtype="int64", attributes=None, res=None) -> SSAValue:
+            res = mint(dtype) if res is None else res
+            state["current"].instrs.append(
+                Instr(op, list(args), res, attributes=dict(attributes or {}))
+            )
+            return res
+
+        def arithmetic(op, args, res=None) -> SSAValue:
+            # Python ``int`` arithmetic: the backends' checked spelling.
+            return put(op, args, attributes={
+                "source_type": "BinOp", "integer_power": True,
+            }, res=res)
+
+        def const(value: int) -> SSAValue:
+            return put("Const", [], attributes={"value": int(value)})
+
+        def jump(target: BasicBlock) -> None:
+            current = state["current"]
+            current.instrs.append(
+                Instr("Br", [], None, attributes={"target": target.name})
+            )
+            current.successors = [target.name]
+
+        def guard(condition: SSAValue, code: int, failure: str) -> None:
+            fault = new_block("pow_fault", SSABlockKind.VALIDATION_FAIL)
+            passing = new_block("pow_checked", SSABlockKind.VALIDATION_PASS)
+            current = state["current"]
+            current.instrs.append(Instr("CondBr", [condition], None, attributes={
+                "true_target": fault.name, "false_target": passing.name,
+            }))
+            current.successors = [fault.name, passing.name]
+            fault.instrs.append(Instr("Call", [], None, attributes={
+                "callee": "turing_validation_error", "error_code": int(code),
+                "failure": failure,
+            }))
+            state["current"] = fault
+            jump(passing)
+            state["current"] = passing
+
+        base, exponent = power.args[0], power.args[1]
+        literal = constants.get(int(exponent.id))
+        zero, one = const(0), const(1)
+        unrolled = site == "int" and literal is not None and literal >= 0
+        negative = None if unrolled else put("Lt", [exponent, zero], "bool")
+        modulus = None
+        if site == "modular":
+            modulus = power.args[2]
+            modulus_zero = put("Eq", [modulus, zero], "bool")
+            guard(modulus_zero, POW_MODULUS_ZERO, "pow_modulus_zero")
+            guard(negative, INT_POWER_NEGATIVE_EXPONENT,
+                  "pow_negative_exponent")
+            modulus = put("Select", [modulus_zero, one, modulus])
+        elif not unrolled:
+            zero_base = put("Eq", [base, zero], "bool")
+            guard(put("And", [negative, zero_base], "bool"),
+                  INT_ZERO_DIVISION, "zero_to_negative_power")
+            guard(negative, INT_POWER_NEGATIVE_EXPONENT,
+                  "pow_negative_exponent")
+        if unrolled:
+            # Straight-line square-and-multiply over the literal's bits.
+            square, result, bits = base, None, int(literal)
+            if bits == 0:
+                put("Const", [], attributes={"value": 1}, res=power.res)
+            while bits:
+                last_bit = bits == 1
+                if bits & 1:
+                    result = square if result is None else arithmetic(
+                        "Mul", [result, square],
+                        res=power.res if last_bit else None,
+                    )
+                    if result is square and last_bit:
+                        arithmetic("Mul", [square, one], res=power.res)
+                bits >>= 1
+                if bits:
+                    square = arithmetic("Mul", [square, square])
+            counts["int_pow_unrolled"] += 1
+        else:
+            count = put("Select", [negative, zero, exponent])
+            if modulus is not None:
+                start = arithmetic("Mod", [base, modulus])
+                first = arithmetic("Mod", [one, modulus])
+            else:
+                start, first = base, one
+            entry = state["current"]
+            header = new_block("pow_loop", SSABlockKind.LOOP_HEADER)
+            step = new_block("pow_step", SSABlockKind.LOOP_BODY)
+            done = new_block("pow_done", SSABlockKind.LOOP_EXIT)
+            jump(header)
+            result, square, remaining = power.res, mint("int64"), mint("int64")
+            next_result, next_square, next_remaining = (
+                mint("int64"), mint("int64"), mint("int64"),
+            )
+            incoming = {"incoming_blocks": (entry.name, step.name)}
+            state["current"] = header
+            put("Phi", [first, next_result], attributes=incoming, res=result)
+            put("Phi", [start, next_square], attributes=incoming, res=square)
+            put("Phi", [count, next_remaining], attributes=incoming,
+                res=remaining)
+            going = put("Gt", [remaining, zero], "bool")
+            header.instrs.append(Instr("CondBr", [going], None, attributes={
+                "true_target": step.name, "false_target": done.name,
+            }))
+            header.successors = [step.name, done.name]
+            state["current"] = step
+            odd = put("Ne", [put("BitAnd", [remaining, one]), zero], "bool")
+            factor = put("Select", [odd, square, one])
+            put("Shr", [remaining, one], res=next_remaining)
+            more = put("Gt", [next_remaining, zero], "bool")
+            # The square is taken only while bits remain, so it
+            # overflows only where the power itself does.
+            kept = put("Select", [more, square, one])
+            if modulus is None:
+                arithmetic("Mul", [result, factor], res=next_result)
+                arithmetic("Mul", [kept, kept], res=next_square)
+            else:
+                arithmetic("Mod", [arithmetic("Mul", [result, factor]),
+                                   modulus], res=next_result)
+                arithmetic("Mod", [arithmetic("Mul", [kept, kept]),
+                                   modulus], res=next_square)
+            jump(header)
+            state["current"] = done
+            counts["int_pow_modular" if modulus is not None
+                   else "int_pow_loop"] += 1
+
+        tail = state["current"]
+        tail.instrs.extend(post)
+        tail.successors = old_successors
+        if tail is not block:
+            # Successor Phis now enter from the block holding the tail.
+            for successor in old_successors:
+                target = function.blocks.get(successor)
+                for instruction in (target.instrs if target else ()):
+                    blocks = instruction.attributes.get("incoming_blocks")
+                    if str(instruction.op) == "Phi" and blocks:
+                        instruction.attributes["incoming_blocks"] = tuple(
+                            tail.name if str(origin) == block_name else origin
+                            for origin in blocks
+                        )
+        ordered = []
+        for name, existing in function.blocks.items():
+            ordered.append((name, existing))
+            if name == block_name:
+                ordered.extend((created.name, created) for created in added)
+        function.blocks.clear()
+        function.blocks.update(ordered)
+
+    for function in functions.values():
+        while True:
+            site = next(
+                (
+                    (name, position)
+                    for name, candidate in function.blocks.items()
+                    for position, instruction in enumerate(candidate.instrs)
+                    if _integer_pow_site(instruction) is not None
+                ),
+                None,
+            )
+            if site is None:
+                break
+            rewrite(function, *site)
+    return counts
+
+
 # Operations a region may contain and still be removable when nothing reads
 # its results: value construction and arithmetic only -- no stores, no
 # calls, no table traffic.  ``LNot``, ``Select`` and ``isfinite`` are the
@@ -572,8 +857,8 @@ def drop_dead_pure_region_calls(functions) -> int:
 #: cannot be allowed to disagree.
 _NARROW_LIMB_ELEMENTS = frozenset({"float32", "f32", "single"})
 
-_FLOAT64_SPELLINGS = frozenset({"float64", "double", "f64"})
-_INT64_SPELLINGS = frozenset({"int64", "i64", "long"})
+_FLOAT64_SPELLINGS = frozenset({"float64"})
+_INT64_SPELLINGS = frozenset({"int64"})
 
 
 def narrow_float64_to_float32(module) -> int:
@@ -612,9 +897,13 @@ def narrow_float64_to_float32(module) -> int:
             "sections: there are no limbs carrying the precision that "
             "narrowing would rely on, so this would only lose digits"
         )
-    declared = {
-        str(contract.get("element") or "float64") for contract in contracts
-    }
+    for contract in contracts:
+        if not contract.get("element"):
+            raise ValueError(
+                "narrow_float64_to_float32 refuses a precision section "
+                f"contract with no recorded limb element: {contract!r}"
+            )
+    declared = {str(contract["element"]) for contract in contracts}
     unsupported = {
         element for element in declared
         if element not in _NARROW_LIMB_ELEMENTS
@@ -2219,6 +2508,71 @@ def lower_precision_operations(
         if bases:
             precision_arrays[str(name)] = bases
 
+    # -- declared precision arrays, across the planned-region seam ---------
+    #
+    # Recognition by use stops at a call. The planner puts a pack loop's
+    # ``z = x[i]`` and ``y[i] = ...`` in regions of their own, so the load
+    # of x feeds only a Ret and the store into y stores a formal: neither
+    # region holds a precision operation, and both indexed element i as one
+    # double -- x[i] read element i/2's limbs as two elements, and y[i]
+    # kept only the leading limb. The parameter's declaration says what
+    # the array IS: a ``Precision[k]`` array parameter of the authored
+    # function is limb-strided at width k wherever it is addressed, and a
+    # region formal bound to it by position is the same array.
+    declared_arrays: dict[str, dict[int, int]] = {}
+    for name, function in functions.items():
+        for row in (
+            function.metadata.get("numeric_parameter_descriptors", ()) or ()
+        ):
+            if not isinstance(row, Mapping):
+                continue
+            descriptor = dict(row.get("descriptor") or {})
+            limbs_declared = int(descriptor.get("limbs") or 1)
+            if (
+                limbs_declared > 1
+                and "precision" in tuple(descriptor.get("features") or ())
+                and row.get("value_id") is not None
+            ):
+                declared_arrays.setdefault(str(name), {})[
+                    int(row["value_id"])
+                ] = limbs_declared
+    changed = True
+    while changed:
+        changed = False
+        for name, function in functions.items():
+            known = declared_arrays.get(str(name)) or {}
+            if not known:
+                continue
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in ("Call", "call"):
+                        continue
+                    callee = str(instruction.attributes.get("callee") or "")
+                    formals = original_formals.get(callee)
+                    if not formals:
+                        continue
+                    there = declared_arrays.setdefault(callee, {})
+                    for formal, actual in zip(formals, instruction.args):
+                        width = known.get(int(actual.id), 1)
+                        if width > there.get(int(formal.id), 1):
+                            there[int(formal.id)] = width
+                            changed = True
+    for name, function in functions.items():
+        known = declared_arrays.get(str(name)) or {}
+        if not known:
+            continue
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op) == "GetElementPtr" and instruction.args
+                    and int(instruction.args[0].id) in known
+                    and int(instruction.args[0].id)
+                    not in promoted_scalar_formals[str(name)]
+                ):
+                    base = int(instruction.args[0].id)
+                    bases = precision_arrays.setdefault(str(name), {})
+                    bases[base] = max(bases.get(base, 1), known[base])
+
     parameter_widths: dict[str, dict[int, int]] = {}
     for name, function in functions.items():
         formal_ids = {int(value.id) for value in function.args}
@@ -2273,6 +2627,29 @@ def lower_precision_operations(
                         widths[int(argument.id)] = max(
                             widths.get(int(argument.id), 1), width
                         )
+        # A formal stored into a precision array is an element of it: the
+        # store region of a pack loop receives the value to write as a
+        # formal, and keeping it one scalar wrote only the leading limb.
+        arrays_here = precision_arrays.get(str(name)) or {}
+        for block in function.blocks.values():
+            pointers = {
+                int(instruction.res.id): int(instruction.args[0].id)
+                for instruction in block.instrs
+                if str(instruction.op) == "GetElementPtr"
+                and instruction.args and instruction.res is not None
+            }
+            for instruction in block.instrs:
+                if str(instruction.op) != "Store" or len(instruction.args) < 2:
+                    continue
+                stored = int(instruction.args[0].id)
+                width = arrays_here.get(
+                    pointers.get(int(instruction.args[1].id), -1), 1
+                )
+                if (
+                    width > 1 and stored in formal_ids
+                    and stored not in promoted_scalar_formals[str(name)]
+                ):
+                    widths[stored] = max(widths.get(stored, 1), width)
         if widths:
             parameter_widths[str(name)] = widths
 
@@ -2366,7 +2743,37 @@ def lower_precision_operations(
             )
         seeded[str(name)] = rows
 
-    for function_name, function in functions.items():
+    # Callees first: a caller reading a region's result needs to know which
+    # aggregate fields the region appended for that result's limbs.
+    callee_first: list[str] = []
+
+    def visit(name: str, seen: set[str]) -> None:
+        if name in seen or name not in functions:
+            return
+        seen.add(name)
+        for block in functions[name].blocks.values():
+            for instruction in block.instrs:
+                if instruction.op in ("Call", "call"):
+                    visit(str(instruction.attributes.get("callee") or ""), seen)
+        callee_first.append(name)
+
+    aggregate_callees = {
+        str(instruction.attributes.get("callee") or "")
+        for function in functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in ("Call", "call")
+        and instruction.res is not None
+        and instruction.attributes.get("result_convention") == "ssa.aggregate"
+    }
+    visited: set[str] = set()
+    for name in functions:
+        visit(str(name), visited)
+    # result field -> the fields appended for its limbs, per region
+    returned_limb_fields: dict[str, dict[int, tuple[tuple[int, object], ...]]] = {}
+
+    for function_name in callee_first:
+        function = functions[function_name]
         # value id -> its limbs, high first. Absent means an ordinary value,
         # which is simply a one-limb expansion whose low limb is zero.
         limbs: dict[int, list] = {}
@@ -2906,6 +3313,10 @@ def lower_precision_operations(
             arrays = precision_arrays.get(str(function_name)) or {}
             # pointer value id -> (base array id, index value)
             addressed: dict[int, tuple] = {}
+            # aggregate value id -> the region that returned it, and a field
+            # pointer's id -> (its GetElementPtr, the field it addresses)
+            aggregates: dict[int, str] = {}
+            fields_of: dict[int, tuple] = {}
 
             def constant(number: int, like):
                 # Minted through the book from the index it strides.
@@ -2992,6 +3403,28 @@ def lower_precision_operations(
                         instruction.attributes[
                             "precision_actual_formal_ids"
                         ] = tuple(added_formal_ids)
+                    appended = returned_limb_fields.get(callee)
+                    if appended and instruction.res is not None:
+                        aggregates[int(instruction.res.id)] = callee
+                        if (
+                            "output_ids" in instruction.attributes
+                            and not instruction.attributes.get(
+                                "precision_result_limbs_bound"
+                            )
+                        ):
+                            instruction.attributes["output_ids"] = (
+                                *tuple(instruction.attributes["output_ids"]),
+                                *(
+                                    int(limb.id)
+                                    for _field, fields in sorted(
+                                        appended.items()
+                                    )
+                                    for _index, limb in fields
+                                ),
+                            )
+                            instruction.attributes[
+                                "precision_result_limbs_bound"
+                            ] = True
                     emitted.append(instruction)
                     continue
 
@@ -3002,6 +3435,11 @@ def lower_precision_operations(
                     addressed[int(instruction.res.id)] = (
                         instruction.args[0], instruction.args[1],
                     )
+                    if instruction.attributes.get("aggregate_index") is not None:
+                        fields_of[int(instruction.res.id)] = (
+                            instruction,
+                            int(instruction.attributes["aggregate_index"]),
+                        )
                     emitted.append(instruction)
                     continue
 
@@ -3032,6 +3470,61 @@ def lower_precision_operations(
                         # instruction read whatever the slot happened to hold.
                         collapse(loaded_limbs, instruction.res)
                         continue
+                    field = fields_of.get(int(instruction.args[0].id))
+                    callee = aggregates.get(int(where[0].id)) if where else None
+                    appended = (
+                        returned_limb_fields.get(callee, {}).get(field[1])
+                        if callee and field else None
+                    )
+                    if appended:
+                        # The region returned this result's limbs in fields
+                        # of their own; read each one back under the id the
+                        # region gave it, as the head field already is.
+                        emitted.append(instruction)
+                        pointer_instruction = field[0]
+                        received = []
+                        for index, limb in appended:
+                            pointer = fresh(pointer_instruction.res)
+                            pointer.dtype = pointer_instruction.res.dtype
+                            pointer.shape = tuple(
+                                pointer_instruction.res.shape or ()
+                            )
+                            emitted.append(Instr(
+                                "GetElementPtr",
+                                [where[0], constant(index, where[1])],
+                                pointer,
+                                attributes={
+                                    **dict(pointer_instruction.attributes),
+                                    "aggregate_index": int(index),
+                                    "source_output_id": int(limb.id),
+                                    PRECISION_SECTION_ATTRIBUTE: True,
+                                },
+                            ))
+                            value = SSAValue(
+                                int(limb.id), dtype=limb.dtype,
+                                shape=tuple(limb.shape or ()),
+                                device=limb.device,
+                                accounting={
+                                    "ssa_call_result_from": (
+                                        callee, int(limb.id),
+                                    ),
+                                },
+                            )
+                            emitted.append(Instr(
+                                "Load", [pointer], value,
+                                attributes={
+                                    **dict(instruction.attributes),
+                                    "aggregate_index": int(index),
+                                    "source_output_id": int(limb.id),
+                                    PRECISION_SECTION_ATTRIBUTE: True,
+                                },
+                            ))
+                            received.append(value)
+                        limbs[int(instruction.res.id)] = received
+                        lowered_limb_records[int(instruction.res.id)] = tuple(
+                            int(value.id) for value in received
+                        )
+                        continue
                     emitted.append(instruction)
                     continue
 
@@ -3056,6 +3549,48 @@ def lower_precision_operations(
                                 },
                             ))
                         continue
+                    emitted.append(instruction)
+                    continue
+
+                if (
+                    operation in ("Ret", "ret")
+                    and str(function_name) in aggregate_callees
+                    and not instruction.attributes.get(
+                        "precision_result_limbs_bound"
+                    )
+                    and any(
+                        len(limbs.get(int(value.id), ())) > 1
+                        for value in instruction.args
+                    )
+                ):
+                    # A region hands its results back as an aggregate the
+                    # caller takes apart field by field. A limbed result
+                    # keeps its collapsed head in its own field, for any
+                    # reader that wants one number, and its limbs follow in
+                    # fields appended after every existing one -- so no
+                    # existing field moves.
+                    appended: dict[int, tuple] = {}
+                    extra = []
+                    for position, value in enumerate(list(instruction.args)):
+                        held = limbs.get(int(value.id), ())
+                        if len(held) <= 1:
+                            continue
+                        rows = []
+                        for limb in held:
+                            rows.append((
+                                len(instruction.args) + len(extra), limb,
+                            ))
+                            extra.append(limb)
+                        appended[position] = tuple(rows)
+                    instruction.args.extend(extra)
+                    instruction.attributes["precision_result_limbs_bound"] = True
+                    returned_limb_fields[str(function_name)] = appended
+                    function.metadata["precision_returned_limb_fields"] = tuple(
+                        (position, tuple(
+                            (index, int(limb.id)) for index, limb in rows
+                        ))
+                        for position, rows in sorted(appended.items())
+                    )
                     emitted.append(instruction)
                     continue
 

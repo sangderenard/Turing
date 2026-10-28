@@ -12,7 +12,7 @@ from .concordance_declarations import (
     STRUCTURAL_CONCORDANCE, STRUCTURAL_VALUE, OPTIONAL_VALUE_STRUCTURE, BoundaryTransport,
     SourceAggregateLayout, StructuralValue, RETURN_SITE_SLOT, RETURN_OUTPUT_ARMS, CALL_EDGE,
     AGGREGATE_RETURN_LAYOUT, RECORD_SCALAR_SHAPE, SSAValueFact,
-    VALUE_TYPE_ABI, CELL_SET, SSA_VALUE_PHYSICAL_FIELDS, INGESTION_VALUE,
+    VALUE_TYPE_ABI, CELL_SET, SSA_VALUE_PHYSICAL_FIELDS, POLICY_PHYSICAL_KIND, INGESTION_VALUE,
 )
 from .identity_concordance import ConcordanceRefusal, Ref, current_identity_book
 
@@ -79,7 +79,8 @@ def return_slot_structure(scope, site, slot, *, book=None):
     return book.page(STRUCTURAL_VALUE).cell(cell.row, cell.column), cell
 
 
-def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=()):
+def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=(),
+                       storage_scope=None):
     """The current physical view of existing concordance authorities.
 
     A source annotation, a shape state and a semantic mint are views of one
@@ -124,6 +125,12 @@ def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=())
                     storage, dtype, shape, rank = next(iter(views))
                     if (storage != "none" and str(dtype) == str(fact.dtype)
                             and tuple(shape) == tuple(fact.shape or ())):
+                        # The row's declared keyed/table policy IS this physical
+                        # kind (POLICY_PHYSICAL_KIND); the arm adds no second
+                        # storage claim to it.
+                        row_storage = fields.get("storage")
+                        if POLICY_PHYSICAL_KIND.get(row_storage) == storage:
+                            storage = row_storage
                         merge({"physical_dtype": str(dtype), "storage": storage, "rank": rank})
             continue
         # Revisions retain historical origin edges. Follow those exact refs,
@@ -134,24 +141,6 @@ def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=())
         elif source.page == CELL_SET:
             read(CELL_SET, source.row)
             pending.extend(read.sources(source))
-    if shape_scope is not None:
-        state = read(SHAPE_STATE_PAGE, (tuple(shape_scope), int(value_id)))
-        state = (shape_transformation_state(state[1]) if isinstance(state, tuple)
-                 and state and state[0] == "resolved" else None)
-        if state is not None:
-            shape, dtype, rank, metadata, _row_shape = state
-            layout = resolve(dtype)
-            if (str(dtype) == str(fact.dtype) and layout is not None
-                    and layout.kind in {"bool", "int", "uint", "float"}
-                    and str(dtype) != "opaque_ref"
-                    and fields.get("storage") in (None, "scalar", "span")):
-                if (metadata == "static" and rank == len(shape)
-                        and (tuple(shape) == tuple(fact.shape or ()) or not fact.shape)
-                        and not (rank == 0 and fields.get("arena"))):
-                    merge({"physical_dtype": str(dtype), "storage": "span" if rank else "scalar",
-                           "rank": rank})
-                elif metadata == "dynamic" and not shape and rank > 0 and not fact.shape:
-                    merge({"physical_dtype": str(dtype), "storage": "span", "rank": rank})
     for origin in origins:
         mint = read(MINT_PAGE, (origin.key, int(value_id)))
         if not (isinstance(mint, tuple) and len(mint) == 2):
@@ -182,6 +171,7 @@ def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=())
                     if isinstance(value, SSAValueFact):
                         physical = _ssa_physical_view(
                             read, *operand.row, value, shape_scope=shape_scope, active=active,
+                            storage_scope=storage_scope,
                         )
                         incoming.append((value, physical))
                         # The existing Phi law inherits storage/rank, not a
@@ -215,7 +205,8 @@ def _ssa_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
     cell = read.ref(SSA_VALUE, row)
     if cell is None or not isinstance(fact, SSAValueFact):
         raise ConcordanceRefusal(f"physical structure lacks SSA identity: {row!r}")
-    physical = _ssa_physical_view(read, scope, value_id, fact, shape_scope)
+    physical = _ssa_physical_view(read, scope, value_id, fact, shape_scope,
+                                  storage_scope=storage_scope)
     dtype = None if fact.dtype in (None, "", "unknown") else str(fact.dtype)
     shape = tuple(fact.shape or ())
     if shape_scope is not None:
@@ -528,7 +519,22 @@ def _storage_structure(read, authority, owner, value_id, sequence_owner, active=
     descriptor = read(page, row)
     cell = read.ref(page, row)
     if descriptor is None:
-        raise ConcordanceRefusal(f"withdrawn {authority} descriptor: {row!r}")
+        # A concordant duplicate sequence is withdrawn with the resident
+        # descriptor that superseded it as its source.  A live projection
+        # registered on the duplicate (an element Load of a re-read field)
+        # reads that resident; any other withdrawal still refuses.
+        successors = () if authority != "sequence" or cell is None else tuple(
+            parent for parent in read.sources(cell)
+            if parent.page == SEQUENCE_DESCRIPTOR and parent.row != row
+            and parent.row[0] == owner
+            and read(SEQUENCE_DESCRIPTOR, parent.row) is not None
+        )
+        if len(successors) != 1:
+            raise ConcordanceRefusal(f"withdrawn {authority} descriptor: {row!r}")
+        return _storage_structure(
+            read, authority, owner, int(successors[0].row[1]), sequence_owner,
+            active, column_scope=column_scope,
+        )
     if authority == "record":
         fields = []
         for field in descriptor.fields:

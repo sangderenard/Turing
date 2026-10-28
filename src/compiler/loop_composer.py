@@ -1131,6 +1131,31 @@ def evaporate_unrolled_loops(
         loop_id = int(plan.loop.node_id)
         if loop_id in handled_loop_ids:
             continue
+        # Program: ``d = {1: 5, 2: 6}; for i in range(1): d[3] = n + i;
+        # del d[2]`` then ``len(d)`` (corpus c711).  Wrong record: unrolling
+        # copies the body's values and collection effects, and a keyed
+        # ``del`` is neither (it produces no value and is no state effect),
+        # so the pruning below deleted it and the key stayed (3 for 2).
+        # Rule: a loop whose body holds a keyed delete is not unrolled; the
+        # retained loop runs the delete where the body states it.
+        # The same holds for a dict ``pop`` statement, a keyed delete.
+        from .resident_sequence_materialization import (
+            _discarded_dict_pop,
+            _loop_carried_storage_aliases,
+        )
+
+        storage_aliases = _loop_carried_storage_aliases(graph.G)
+        if any(
+            int(node_id) in graph.G
+            and (
+                graph.G.nodes[int(node_id)].get("type") == "DelItem"
+                or _discarded_dict_pop(
+                    graph.G, int(node_id), storage_aliases,
+                ) is not None
+            )
+            for node_id in plan.loop.body_nodes
+        ):
+            continue
         group = nested_groups.get(loop_id)
         if group is not None and plan is not group[0]:
             continue
@@ -1807,7 +1832,7 @@ def evaporate_unrolled_loops(
             _retain_source_sequence_mutation_records,
         )
 
-        _retain_source_sequence_mutation_records(graph.G)
+        _retain_source_sequence_mutation_records(graph.G, getattr(graph, "function_table", None))
         live.update(
             int(effect_id)
             for effect_id in (
@@ -2130,18 +2155,44 @@ def materialize_retained_loop_ports(
                 return book.latest_ref(LOOP_CARRIED_BINDING, row)
         return None
 
-    def post_port_version(name: str, port_id: int) -> None:
+    def insert_port_version(name: str, continued: int, port_id: int) -> None:
+        """Place a loop's result port in ``name``'s version history.
+
+        Program: ``while index < rounds: checksum += index`` then
+        ``checksum += 100; return checksum``.  Wrong record: the port was
+        appended after the post-loop ``checksum += 100`` version, so the
+        history read ``(..., 4, 9, port)`` and the returned name resolved
+        to the loop's exit value, dropping the add.  Rule: the port is the
+        version right after the loop's last version of the name; a version
+        bound after the loop stays newer than it.  The port's
+        ``name_binding`` row keeps the next free version row, so an authored
+        version's row is never revised to the port.
+        """
+
+        versions = identities.setdefault(str(name), [])
+        position = next((
+            index + 1
+            for index in reversed(range(len(versions)))
+            if int(versions[index]) == int(continued)
+        ), len(versions))
+        versions.insert(position, int(port_id))
+        post_port_version(str(name), int(port_id), len(versions) - 1)
+
+    def post_port_version(
+        name: str, port_id: int, version: int | None = None,
+    ) -> None:
         """The port's version of ``name`` on ``name_binding``: row (scope,
-        name, its position in the identity table), DERIVED from the port's
-        ``canonical_value`` row (plan 80, A2.7)."""
+        name, its position in the identity table, or the given ``version``),
+        DERIVED from the port's ``canonical_value`` row (plan 80, A2.7)."""
 
         port_row = port_rows.get(int(port_id))
         if port_row is None or read_scope is None:
             return
         versions = identities.get(str(name), [])
-        version = len(versions) - 1
-        while version >= 0 and int(versions[version]) != int(port_id):
-            version -= 1
+        if version is None:
+            version = len(versions) - 1
+            while version >= 0 and int(versions[version]) != int(port_id):
+                version -= 1
         if version < 0:
             return
         row = (read_scope, str(name), int(version))
@@ -2539,8 +2590,7 @@ def materialize_retained_loop_ports(
             rewire_continuation(
                 int(updated), result_id, owned_nodes, str(name),
             )
-            identities.setdefault(str(name), []).append(result_id)
-            post_port_version(str(name), result_id)
+            insert_port_version(str(name), int(updated), result_id)
             carried_results[str(name)] = result_id
         for name, initial, continuation in loop.break_bindings:
             if str(name) in carried_results:
@@ -2562,8 +2612,7 @@ def materialize_retained_loop_ports(
             rewire_continuation(
                 int(continuation), result_id, owned_nodes, str(name),
             )
-            identities.setdefault(str(name), []).append(result_id)
-            post_port_version(str(name), result_id)
+            insert_port_version(str(name), int(continuation), result_id)
             carried_results[str(name)] = result_id
 
         planned_iteration_outputs = []
@@ -6358,7 +6407,12 @@ def analyze_shader_loop_reductions(
         # ``previous = value`` is a control-owned iterable load and carried
         # Phi, even when every numerical predicate region folded away. Its
         # exact carried binding is work; no shader closure is required.
-        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings:
+        # Program: ``for t in xs: return t`` then ``return 0``.  Wrong
+        # record: the body has no numerical region, so the loop was blocked
+        # as region-less and dropped with its authored return; the function
+        # always fell through (silent 0 for 70 in a dict-of-lists ``.get``
+        # read).  Rule: a source ``return`` edge is loop work too.
+        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings and not loop.return_controls:
             blockers.append("no-shader-region")
         if (
             loop.source_type == "While"

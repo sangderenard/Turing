@@ -437,9 +437,15 @@ def publish_program_abi_graph_identities(
                         declared_shape = (int(field["fixed_length"]),)
                     if storage == "span" and declared_shape is not None:
                         declared_shape = tuple(map(int, declared_shape))
+                        if not field.get("dtype"):
+                            raise ValueError(
+                                f"class field {field_name!r} declares a span "
+                                f"of shape {declared_shape} but records no "
+                                "element dtype"
+                            )
                         declared_state = {
                             "shape": declared_shape,
-                            "dtype": str(field.get("dtype") or "float64"),
+                            "dtype": str(field["dtype"]),
                             "rank": int(field.get(
                                 "rank", len(declared_shape),
                             )),
@@ -3403,6 +3409,27 @@ class CorrelationTable:
                                 for resident in resident_objects.get(inner, ())
                             ):
                                 continue
+                            # Program: ``h, l = step(h, l, i)`` with
+                            # ``step`` returning ``low ^ byte, high``.  The
+                            # updated ``l`` is the callee's bare formal, so
+                            # the passthrough fold rebinds the call output
+                            # to the actual -- the carried Phi of ``h`` --
+                            # as a projection occurrence of that same id.
+                            # Wrong record: that occurrence is a distinct
+                            # object, so it read as a private resident.
+                            # Rule: an occurrence the aggregate passthrough
+                            # rebinding minted for a resident the function
+                            # defines is that resident, not a private one.
+                            if (
+                                resident_objects.get(inner)
+                                and (argument.accounting or {}).get(
+                                    "ssa_aggregate_passthrough"
+                                ) is not None
+                                and (argument.accounting or {}).get(
+                                    "ssa_storage_alias"
+                                ) == inner
+                            ):
+                                continue
                             found.append(Finding(
                                 "loop-scope-inner-private-resident",
                                 name, inner,
@@ -4155,18 +4182,78 @@ class CorrelationTable:
         metadata = dict(getattr(module, "metadata", {}) or {})
         book = metadata.get("identity_book")
         found = []
+        # An ``int`` key column is the narrowest width holding the join of
+        # every writer's member interval: each view cites the
+        # ``source_int_range_concordance`` cells it read (none: the int64
+        # range).  Re-derive that join from the cited cells.
+        from .concordance_declarations import SOURCE_INT_RANGE
+        from ..transmogrifier.dtype_layout import python_int_range_dtype
+
+        int64_bounds = (-(1 << 63), (1 << 63) - 1)
+        joined_key_widths: dict = {}
+        if book is not None:
+            joins: dict = {}
+            for view in metadata.get("mapping_child_contract_evidence") or ():
+                for index, cell in enumerate(view.get("key_range_cells") or ()):
+                    interval = int64_bounds
+                    if isinstance(cell, Ref) and cell.page == SOURCE_INT_RANGE:
+                        fact = book.page(SOURCE_INT_RANGE).cell(cell.row, cell.column)
+                        interval = (int(fact[0]), int(fact[1]))
+                    key = (view.get("field_cell"), index)
+                    low, high = joins.get(key, interval)
+                    joins[key] = (min(low, interval[0]), max(high, interval[1]))
+            joined_key_widths = {
+                key: python_int_range_dtype(*interval)
+                for key, interval in joins.items()
+            }
+
+        def int_key_dtype(view, index, cell, expected):
+            if expected != "int64":
+                return expected
+            range_cells = tuple(view.get("key_range_cells") or ())
+            if index < len(range_cells):
+                range_cell = range_cells[index]
+                if range_cell is not None and (
+                    not isinstance(range_cell, Ref)
+                    or range_cell.page != SOURCE_INT_RANGE
+                    or int(range_cell.row[1]) != int(cell.row[1])
+                ):
+                    return None
+                return joined_key_widths.get(
+                    (view.get("field_cell"), index), expected,
+                )
+            return expected
+
         for view in metadata.get("mapping_child_contract_evidence") or ():
             field, scalar, key = (view.get(name) for name in (
                 "field_cell", "class_cell", "key_layout_cell",
             ))
             problem = None
+            # A scalar key has no aggregate layout: its one key column is
+            # its own exact source class.
+            scalar_key = key is None and view.get("key_width") == 1
             if book is None or any(
                 not isinstance(cell, Ref) or cell.page != page
                 for cell, page in ((field, CLASS_FIELD_DECLARATION),
                                    (scalar, SOURCE_VALUE_CLASS),
-                                   (key, SOURCE_AGGREGATE_LAYOUT))
+                                   *(() if scalar_key else ((key, SOURCE_AGGREGATE_LAYOUT),)))
             ):
                 problem = "child view lacks its field/class/key-layout authority"
+            elif scalar_key:
+                class_fact = book.page(SOURCE_VALUE_CLASS).cell(scalar.row, scalar.column)
+                expected = {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(class_fact[0]))
+                key_cells = tuple(view.get("key_class_cells", ()))
+                key_cell = key_cells[0] if len(key_cells) == 1 else None
+                key_fact = (None if not isinstance(key_cell, Ref)
+                            or key_cell.page != SOURCE_VALUE_CLASS
+                            or key_cell.row[0] != scalar.row[0]
+                            else book.page(SOURCE_VALUE_CLASS).cell(key_cell.row, key_cell.column))
+                if expected != view.get("dtype") or int(class_fact[1]) != 1:
+                    problem = f"child dtype {view.get('dtype')!r} disagrees with operand class {class_fact!r}"
+                elif key_fact is None or int(key_fact[1]) != 1 or tuple(view.get("key_dtypes", ())) != (
+                    int_key_dtype(view, 0, key_cell, {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]))),
+                ):
+                    problem = "scalar key dtype disagrees with its exact key class"
             else:
                 try:
                     class_fact = book.page(SOURCE_VALUE_CLASS).cell(scalar.row, scalar.column)
@@ -4179,7 +4266,7 @@ class CorrelationTable:
                     elif len(view.get("key_class_cells", ())) != len(layout.members) or len(view.get("key_dtypes", ())) != len(layout.members):
                         problem = "child key column type view has the wrong member count"
                     else:
-                        for member, cell, dtype in zip(layout.members, view["key_class_cells"], view["key_dtypes"], strict=True):
+                        for index, (member, cell, dtype) in enumerate(zip(layout.members, view["key_class_cells"], view["key_dtypes"], strict=True)):
                             if cell is None:
                                 if dtype != "unknown":
                                     problem = "unproved key member was assigned a physical dtype"
@@ -4188,7 +4275,7 @@ class CorrelationTable:
                                 problem = "key class does not name its exact ordered member"
                                 break
                             key_fact = book.page(SOURCE_VALUE_CLASS).cell(cell.row, cell.column)
-                            expected_key = {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]), "unknown")
+                            expected_key = int_key_dtype(view, index, cell, {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]), "unknown"))
                             if dtype != expected_key:
                                 problem = "key dtype disagrees with its exact member class"
                                 break
@@ -10410,6 +10497,13 @@ def record_proven_shape(
     extents = tuple(int(extent) for extent in (extents or ()))
     if not extents:
         return
+    if not dtype:
+        raise ValueError(
+            f"proven shape for value {int(value_id)} of "
+            f"{_shape_key(function)!r} (extents {extents}) was posted with "
+            "no dtype; the caller never recorded the element type, so the "
+            "proof refuses to invent one"
+        )
     book = current_identity_book()
     page = book.page(PROVEN_SHAPE_PAGE)
     row = (_shape_key(function), int(value_id))
@@ -10430,7 +10524,7 @@ def record_proven_shape(
         max(recorded_levels, default=0)
         if level is None else int(level)
     )
-    fact = ("proven", extents, str(dtype or "float64"), target_level)
+    fact = ("proven", extents, str(dtype), target_level)
     if not recorded:
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
@@ -10455,7 +10549,7 @@ def record_proven_shape(
         target_level = max(recorded_levels, default=-1) + 1
         if level is not None:
             target_level = max(target_level, int(level))
-        fact = ("proven", extents, str(dtype or "float64"), target_level)
+        fact = ("proven", extents, str(dtype), target_level)
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
             book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
@@ -10477,7 +10571,7 @@ def record_proven_shape(
         # confirmed more deeply; retain that depth and let the duplicate
         # source check below decide whether any new evidence was added.
         target_level = deepest_level
-        fact = ("proven", extents, str(dtype or "float64"), target_level)
+        fact = ("proven", extents, str(dtype), target_level)
     if (
         tuple(deepest[1][1]) == extents
         or target_level > deepest_level

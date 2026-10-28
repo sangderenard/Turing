@@ -101,6 +101,11 @@ _UNARY: dict[str, str] = {
     "Not": "{out} = xor i1 {0}, true",
     "LNot": "{out} = xor i1 {0}, true",
     "Invert": "{out} = xor i64 {0}, -1",
+    # Python's ``int.bit_length``: an integer opcode like ``Invert``, spelled
+    # through ``turing_bit_length`` -- the LLVM text of the C backend's own
+    # helper (c695, c696; lane G).  Its integer domain is spelled by
+    # ``integer_scalar_lines``.
+    "BitLength": "{out} = call i64 @turing_bit_length(i64 {0})",
     "SIToFP": "{out} = sitofp i32 {0} to double",
     "FPToSI": "{out} = fptosi double {0} to i32",
     "SiToFp": "{out} = sitofp i32 {0} to double",
@@ -186,6 +191,17 @@ _FUSED_UNARY: dict[str, str] = {
         "{out} = uitofp i1 {out}.c to double"
     ),
 }
+
+
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
 
 
 def _fused_opcode_name(opcode: int) -> str | None:
@@ -757,6 +773,11 @@ _INTEGER_BINARY: dict[str, str] = {
     "BitAnd": "and", "BitOr": "or", "BitXor": "xor",
     "Shl": "shl", "Shr": "lshr",
 }
+# Python ``int`` arithmetic no interval proves inside int64
+# (``python_int_overflow_checked``): the signed overflow intrinsics.
+_CHECKED_INTEGER_INTRINSICS: dict[str, str] = {
+    "Add": "sadd", "Sub": "ssub", "Mul": "smul",
+}
 _INTEGER_COMPARISON: dict[str, str] = {
     "Eq": "eq", "Ne": "ne", "Lt": "slt",
     "Le": "sle", "Gt": "sgt", "Ge": "sge",
@@ -783,19 +804,500 @@ def _unsigned_value(value: _Any) -> bool:
     return layout is not None and layout.kind in {"uint", "bool"}
 
 
+_PYTHON_INT_BUILTINS = frozenset({"builtins.abs", "builtins.sum", "builtins.pow"})
+
+
+_INT64_BOUNDS = (-(1 << 63), (1 << 63) - 1)
+
+
+def python_int_proven_range(instruction: _Any) -> tuple[int, int] | None:
+    """The interval the solver proved for this op's result, else ``None``.
+
+    ``_solve_int_ranges`` stamps it on the source node
+    (``python_int_range``), which the lowered instruction carries.
+    """
+
+    attributes = getattr(instruction, "attributes", None) or {}
+    interval = attributes.get("python_int_range")
+    if interval is None or len(tuple(interval)) != 2:
+        return None
+    low, high = (int(bound) for bound in interval)
+    return (low, high) if low <= high else None
+
+
+def python_int_proven_within(instruction: _Any, bounds: tuple[int, int]) -> bool:
+    """Whether the proven result interval lies inside ``bounds``."""
+
+    interval = python_int_proven_range(instruction)
+    return (
+        interval is not None
+        and bounds[0] <= interval[0] and interval[1] <= bounds[1]
+    )
+
+
+def python_int_overflow_checked(instruction: _Any) -> bool:
+    """Whether a scalar op is Python ``int`` arithmetic that must not wrap.
+
+    Program: ``a * b`` on ints the interval solver does not bound.  Wrong
+    record: the native op wrapped at int64 and returned a value Python never
+    computes.  Rule: authored scalar int64 arithmetic with no proven int64
+    interval (``python_int_proven_range``) is overflow-checked; a proven
+    interval inside int64 needs no check, a proven wider one picks a wider
+    dtype.  Compiler-made index and extent arithmetic carries no
+    ``source_type``.
+    """
+
+    return (
+        python_int_operation(instruction)
+        and _python_int_exact()
+        and not python_int_proven_within(instruction, _INT64_BOUNDS)
+    )
+
+
+def python_int_operation(instruction: _Any) -> bool:
+    """Whether a scalar int64 op is authored Python ``int`` arithmetic.
+
+    Proven or not, it keeps Python's semantics: ``>>`` floors, ``//`` and
+    ``%`` by zero raise, a negative shift count raises.
+    """
+
+    result = getattr(instruction, "res", None)
+    attributes = getattr(instruction, "attributes", None) or {}
+    return (
+        result is not None
+        and str(getattr(result, "dtype", "")) == "int64"
+        and not tuple(getattr(result, "shape", None) or ())
+        and (
+            str(attributes.get("source_type") or "")
+            in {"BinOp", "AugAssign", "UnaryOp"}
+            # Authored builtins whose int result is Python arithmetic:
+            # ``abs(-2**63)``, ``sum(xs)`` and ``pow(n, 2)`` leave int64.
+            or attributes.get("extraction_identity") in _PYTHON_INT_BUILTINS
+        )
+    )
+
+
+_INT64_MIN = "-9223372036854775808"
+
+
+def _python_int_lines(
+    operation: str, operands: list[str], register: str,
+) -> list[str] | None:
+    """Python's ``<< >> // %`` and ``abs`` on a checked i64, else ``None``.
+
+    Program: ``a << b``, ``a >> b``, ``a // b``, ``a % b``, ``abs(a)`` on
+    ints no interval bounds.  Wrong records: ``shl`` wrapped (and is poison
+    past 63), ``>>`` was ``lshr`` (``-8 >> 1`` gave 2**63 - 4), ``sdiv`` by
+    zero or of ``-2**63 // -1`` trapped the host, ``abs(-2**63)`` wrapped.
+    Rule: Python's value or a named fault -- ``NEGATIVE_SHIFT_COUNT``,
+    ``INT_ZERO_DIVISION``, ``INT_OVERFLOW``; the faulting lanes compute on
+    a safe operand so no instruction is undefined.
+    """
+
+    from .native_faults import INT_ZERO_DIVISION, NEGATIVE_SHIFT_COUNT
+
+    r = register
+    if operation in {"Shl", "Shr"} and len(operands) == 2:
+        value, count = operands
+        lines = [
+            f"{r}.negative = icmp slt i64 {count}, 0",
+            f"call void @turing_int_fault(i1 {r}.negative, "
+            f"i32 {NEGATIVE_SHIFT_COUNT})",
+            f"{r}.inrange = icmp ult i64 {count}, 64",
+        ]
+        if operation == "Shr":
+            # Python ``>>`` floors: arithmetic, and 0 / -1 past 63 bits.
+            return lines + [
+                f"{r}.amount = select i1 {r}.inrange, i64 {count}, i64 63",
+                f"{r} = ashr i64 {value}, {r}.amount",
+            ]
+        return lines + [
+            f"{r}.amount = select i1 {r}.inrange, i64 {count}, i64 0",
+            f"{r} = shl i64 {value}, {r}.amount",
+            f"{r}.back = ashr i64 {r}, {r}.amount",
+            f"{r}.lost = icmp ne i64 {r}.back, {value}",
+            f"{r}.nonzero = icmp ne i64 {value}, 0",
+            f"{r}.far = select i1 {r}.inrange, i1 {r}.lost, i1 {r}.nonzero",
+            f"{r}.counted = xor i1 {r}.negative, true",
+            f"{r}.overflow = and i1 {r}.far, {r}.counted",
+            f"call void @turing_int_overflow(i1 {r}.overflow)",
+        ]
+    if operation in {"FloorDiv", "Mod"} and len(operands) == 2:
+        dividend, divisor = operands
+        lines = [
+            f"{r}.zero = icmp eq i64 {divisor}, 0",
+            f"call void @turing_int_fault(i1 {r}.zero, "
+            f"i32 {INT_ZERO_DIVISION})",
+            f"{r}.minimum = icmp eq i64 {dividend}, {_INT64_MIN}",
+            f"{r}.minus_one = icmp eq i64 {divisor}, -1",
+            f"{r}.wide = and i1 {r}.minimum, {r}.minus_one",
+        ]
+        if operation == "FloorDiv":
+            # -2**63 // -1 == 2**63.  (-2**63 % -1 == 0 needs no report:
+            # the safe divisor 1 below gives exactly that remainder.)
+            lines.append(f"call void @turing_int_overflow(i1 {r}.wide)")
+        lines += [
+            f"{r}.unsafe = or i1 {r}.zero, {r}.wide",
+            f"{r}.divisor = select i1 {r}.unsafe, i64 1, i64 {divisor}",
+        ]
+        floored = integer_scalar_lines(
+            operation, "i64", [dividend, f"{r}.divisor"], r,
+        )
+        assert floored is not None
+        return lines + floored[0]
+    if operation in {"Abs", "abs"} and len(operands) == 1:
+        magnitude = integer_scalar_lines(operation, "i64", operands, r)
+        assert magnitude is not None
+        return magnitude[0] + [
+            f"{r}.overflow = icmp eq i64 {operands[0]}, {_INT64_MIN}",
+            f"call void @turing_int_overflow(i1 {r}.overflow)",
+        ]
+    return None
+
+
+#: The ints a target's integer storage holds exactly.
+INT32_EXACT = (-(1 << 31), (1 << 31) - 1)
+DOUBLE_EXACT = (-(1 << 53), 1 << 53)
+
+
+def python_int_unchecked_refusal(
+    instruction: _Any, target: str, exact: tuple[int, int],
+) -> str | None:
+    """Why ``target`` refuses ``instruction``: Python int arithmetic it can't hold.
+
+    A target whose int storage is 32-bit ``int`` or a double holds exactly
+    the ints in ``exact``.  Python int arithmetic whose result no interval
+    proves inside ``exact`` would return a value Python never computes, so
+    it refuses by name; a proven one lowers as before.
+    """
+
+    if not python_int_operation(instruction) or python_int_proven_within(
+        instruction, exact,
+    ):
+        return None
+    return (
+        f"Python int arithmetic with no interval proven inside {target}'s "
+        f"exact ints [{exact[0]}, {exact[1]}] must not wrap, and {target} has "
+        "no checked int64 spelling (python_int_overflow_checked)"
+    )
+
+
+def _python_int_exact() -> bool:
+    """The numeric contract asks int64 results to stay Python ``int``.
+
+    ``integer_arithmetic`` in the numeric contract
+    (``ssa_call_input_adapters._NUMERIC_CONVERSION_MODES``) is the one switch:
+    ``python_exact`` checks, ``wrap`` computes NumPy's two's-complement lane.
+    """
+
+    from .ssa_call_input_adapters import integer_arithmetic_policy
+
+    return integer_arithmetic_policy() == "python_exact"
+
+
+def _integer_layout_bounds(dtype: _Any) -> tuple[int, int] | None:
+    from ..transmogrifier.dtype_layout import resolve
+
+    layout = resolve(dtype)
+    if layout is None or layout.kind not in {"int", "uint"}:
+        return None
+    bits = 8 * int(layout.byte_size)
+    if layout.kind == "uint":
+        return 0, (1 << bits) - 1
+    return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+
+
+def integer_narrowing_bounds(
+    source_dtype: _Any, target_dtype: _Any,
+) -> tuple[int | None, int | None] | None:
+    """The ``(low, high)`` an int must lie in to enter ``target_dtype``.
+
+    Program: a record field settled int64 that one method assigns a uint64
+    (``self.v = h * 2**32 + h``).  Wrong record: the store wrote the uint64
+    bits into the int64 slot and the field read back ``v - 2**64``.  Rule:
+    an integer value stored into, or converted to, an integer layout that
+    does not hold every value of its own layout is range-checked under the
+    numeric contract's ``integer_narrowing`` (``trap`` reports
+    ``INT_OVERFLOW``).  A side the target holds is ``None``; ``None`` when
+    no check is needed (either side not an integer layout, the target holds
+    the source, or the contract says ``wrap``).
+    """
+
+    source = _integer_layout_bounds(source_dtype)
+    target = _integer_layout_bounds(target_dtype)
+    if source is None or target is None:
+        return None
+    from .ssa_call_input_adapters import integer_narrowing_policy
+
+    if integer_narrowing_policy() != "trap":
+        return None
+    low = target[0] if source[0] < target[0] else None
+    high = target[1] if source[1] > target[1] else None
+    return None if low is None and high is None else (low, high)
+
+
+def python_int_true_division(instruction: _Any) -> bool:
+    """Whether ``Div`` is Python's ``int / int`` on two int64 scalars.
+
+    Program: ``a / b`` on ints.  Wrong records: ``1 / 0`` returned ``inf``
+    (Python raises ``ZeroDivisionError``), and ``(2**53 + 1) / 3`` returned
+    ``float(a) / float(b)`` -- rounded twice, one ulp from Python's
+    correctly rounded quotient of the exact ints.  Rule: a zero divisor
+    reports ``INT_ZERO_DIVISION``; when both operands are exactly float64
+    the one IEEE division is Python's quotient, otherwise
+    ``INT_TRUE_DIVISION_INEXACT`` is reported (``python_int_true_division_lines``).
+    """
+
+    result = getattr(instruction, "res", None)
+    attributes = getattr(instruction, "attributes", None) or {}
+    arguments = tuple(getattr(instruction, "args", None) or ())
+    return (
+        getattr(instruction, "op", None) in {"Div", "TrueDiv"}
+        and result is not None
+        and str(getattr(result, "dtype", "")) == "float64"
+        and not tuple(getattr(result, "shape", None) or ())
+        and len(arguments) == 2
+        and all(
+            str(getattr(argument, "dtype", "")) == "int64"
+            and not tuple(getattr(argument, "shape", None) or ())
+            for argument in arguments
+        )
+        and str(attributes.get("source_type") or "") in {"BinOp", "AugAssign"}
+        and _python_int_exact()
+    )
+
+
+#: 2**63 as a float64, in LLVM's hexadecimal spelling.
+_DOUBLE_TWO_63 = "0x43E0000000000000"
+
+
+def python_int_true_division_lines(
+    integers: list[str], doubles: list[str], register: str,
+) -> list[str]:
+    """LLVM checks for ``python_int_true_division`` ahead of its ``fdiv``.
+
+    ``integers`` are the i64 operands, ``doubles`` their ``sitofp``.  A
+    double is the int exactly when it is below 2**63 and converts back to
+    it; ``fptosi`` reads a guarded operand, so nothing is poison.
+    """
+
+    from .native_faults import INT_TRUE_DIVISION_INEXACT, INT_ZERO_DIVISION
+
+    r = register
+    lines = [
+        f"{r}.zero = icmp eq i64 {integers[1]}, 0",
+        f"call void @turing_int_fault(i1 {r}.zero, i32 {INT_ZERO_DIVISION})",
+    ]
+    for position, (integer, double) in enumerate(zip(integers, doubles)):
+        p = f"{r}.exact{position}"
+        lines += [
+            f"{p}.fits = fcmp olt double {double}, {_DOUBLE_TWO_63}",
+            f"{p}.safe = select i1 {p}.fits, double {double}, double 0.0",
+            f"{p}.back = fptosi double {p}.safe to i64",
+            f"{p}.same = icmp eq i64 {p}.back, {integer}",
+            f"{p} = and i1 {p}.fits, {p}.same",
+        ]
+    lines += [
+        f"{r}.exact = and i1 {r}.exact0, {r}.exact1",
+        f"{r}.inexact = xor i1 {r}.exact, true",
+        f"{r}.counted = xor i1 {r}.zero, true",
+        f"{r}.report = and i1 {r}.inexact, {r}.counted",
+        f"call void @turing_int_fault(i1 {r}.report, "
+        f"i32 {INT_TRUE_DIVISION_INEXACT})",
+    ]
+    return lines
+
+
+def contract_integer_narrowing(instruction: _Any) -> bool:
+    """Whether a Cast is an integer conversion the numeric contract traps.
+
+    The call-input adapter stamps every numeric conversion edge with the
+    contract's attributes (``_numeric_conversion_attributes``); an
+    ``integer_conversion`` carries ``overflow = integer_narrowing``.
+    """
+
+    attributes = getattr(instruction, "attributes", None) or {}
+    return (
+        attributes.get("conversion_kind") == "integer_conversion"
+        and attributes.get("overflow") == "trap"
+    )
+
+
+def _integer_storage_dtype(llvm_type: str, unsigned: bool) -> str | None:
+    """The integer dtype an ``iN`` slot of the given signedness spells."""
+
+    widths = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "i128": 128}
+    bits = widths.get(str(llvm_type))
+    if bits is None:
+        return None
+    return f"{'uint' if unsigned else 'int'}{bits}"
+
+
+def integer_narrowing_lines(
+    source_dtype: _Any, target_dtype: _Any, llvm_type: str, value: str,
+    register: str,
+) -> list[str]:
+    """LLVM lines reporting ``INT_OVERFLOW`` when ``value`` leaves the target.
+
+    ``value`` is the source in its own ``llvm_type``; see
+    ``integer_narrowing_bounds``.
+    """
+
+    bounds = integer_narrowing_bounds(source_dtype, target_dtype)
+    if bounds is None:
+        return []
+    low, high = bounds
+    source = _integer_layout_bounds(source_dtype)
+    unsigned = source is not None and source[0] == 0
+    lines, tests = [], []
+    if low is not None:
+        lines.append(
+            f"{register}.below = icmp {'ult' if unsigned else 'slt'} "
+            f"{llvm_type} {value}, {low}"
+        )
+        tests.append(f"{register}.below")
+    if high is not None:
+        lines.append(
+            f"{register}.above = icmp {'ugt' if unsigned else 'sgt'} "
+            f"{llvm_type} {value}, {high}"
+        )
+        tests.append(f"{register}.above")
+    if len(tests) == 2:
+        lines.append(f"{register}.outside = or i1 {tests[0]}, {tests[1]}")
+        tests = [f"{register}.outside"]
+    lines.append(f"call void @turing_int_overflow(i1 {tests[0]})")
+    return lines
+
+
+def integer_narrowing_c_check(
+    source_dtype: _Any, target_dtype: _Any, c_type: str, value: str,
+) -> str | None:
+    """The C statement reporting ``INT_OVERFLOW`` for a narrowing ``value``.
+
+    The C spelling of ``integer_narrowing_lines``: ``value`` is compared in
+    its own ``c_type``, into which every target bound converts exactly.
+    """
+
+    bounds = integer_narrowing_bounds(source_dtype, target_dtype)
+    if bounds is None:
+        return None
+    low, high = bounds
+
+    def literal(bound: int) -> str:
+        if -(1 << 63) <= bound < (1 << 63):
+            return f"(({c_type})INT64_C({bound}))"
+        if 0 <= bound < (1 << 64):
+            return f"(({c_type})UINT64_C({bound}))"
+        bits = bound & ((1 << 128) - 1)
+        return (
+            f"(({c_type})(((__uint128_t)UINT64_C({bits >> 64}) << 64) "
+            f"| (__uint128_t)UINT64_C({bits & ((1 << 64) - 1)})))"
+        )
+
+    tests = []
+    if low is not None:
+        tests.append(f"(({c_type})({value})) < {literal(low)}")
+    if high is not None:
+        tests.append(f"(({c_type})({value})) > {literal(high)}")
+    return f"if ({' || '.join(tests)}) turing_validation_error({_INT_OVERFLOW_CODE}u);"
+
+
+_LANE_CHECKED_OPERATIONS = frozenset({"add", "sub", "mul", "neg", "abs"})
+
+
+def python_int_lane_overflow_checked(
+    instruction: _Any, *, operation: str | None = None,
+) -> bool:
+    """Whether an elementwise int64 tensor op must fault instead of wrapping.
+
+    Program: ``token * 1103515245 + 12345`` on an int64 AbstractTensor.
+    Wrong record: every lane wrapped at int64 on C and LLVM, so a lane
+    leaving int64 returned a value Python's ``int`` never computes.  Rule:
+    under the numeric contract's ``integer_arithmetic: python_exact``, authored (``source_type``)
+    signed int64 Add/Sub/Mul/Neg/Abs over a span checks every lane and
+    reports code 86.  No interval proves a lane's range, so every such lane
+    is checked.  The scalar rule is ``python_int_overflow_checked``.
+    """
+
+    result = getattr(instruction, "res", None)
+    attributes = getattr(instruction, "attributes", None) or {}
+    from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+
+    operation = str(operation or getattr(instruction, "op", "") or "")
+    operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+        operation.casefold(), operation,
+    )
+    return (
+        result is not None
+        and operation.casefold() in _LANE_CHECKED_OPERATIONS
+        and str(getattr(result, "dtype", "")).casefold() == "int64"
+        and not _unsigned_value(result)
+        and bool(
+            tuple(getattr(result, "shape", None) or ())
+            or _declared_span_rank(result) > 0
+        )
+        and (
+            str(attributes.get("source_type") or "")
+            in {"BinOp", "AugAssign", "UnaryOp", "Call"}
+            # ``abs(tokens)`` is the authored builtin, ingested as such.
+            or attributes.get("extraction_identity") == "builtins.abs"
+        )
+        and _python_int_exact()
+    )
+
+
 def integer_scalar_lines(
     operation: str,
     operand_type: str,
     operands: list[str],
     register: str,
-    *, unsigned: bool = False,
+    *, unsigned: bool = False, checked: bool = False, proven: bool = False,
+    saturating: bool = False,
 ) -> tuple[list[str], str] | None:
     """(lines, result type) for an integer-domain scalar op, else ``None``.
 
     ``None`` means this opcode has no exact integer spelling; the caller
     decides whether that is a shortfall or a documented double-domain
-    evaluation converted back to the declared integer type.
+    evaluation converted back to the declared integer type.  ``checked``
+    (``python_int_operation``) spells Python's ``<< >> // %`` on a signed
+    i64, and -- unless ``proven`` (an interval inside int64) -- signed
+    ``Add``/``Sub``/``Mul``/``Neg``/``Abs`` with the overflow intrinsics,
+    reporting an overflow.
     """
+
+    if (
+        saturating and not unsigned and operand_type == "i64"
+        and operation == "Add" and len(operands) == 2
+    ):
+        # A range loop's induction step (``loop_induction_step``).
+        return ([
+            f"{register} = call i64 @llvm.sadd.sat.i64"
+            f"(i64 {operands[0]}, i64 {operands[1]})",
+        ], operand_type)
+    if checked and not unsigned and operand_type == "i64" and not (
+        proven and operation in {"Abs", "abs"}
+    ):
+        python_lines = _python_int_lines(operation, operands, register)
+        if python_lines is not None:
+            return python_lines, operand_type
+    if (
+        checked and not proven and not unsigned and operand_type == "i64"
+        and (
+            (operation in _CHECKED_INTEGER_INTRINSICS and len(operands) == 2)
+            or (operation == "Neg" and len(operands) == 1)
+        )
+    ):
+        intrinsic = _CHECKED_INTEGER_INTRINSICS.get(operation, "ssub")
+        left, right = (
+            ("0", operands[0]) if operation == "Neg" else tuple(operands)
+        )
+        return ([
+            f"{register}.pair = call {{i64, i1}} "
+            f"@llvm.{intrinsic}.with.overflow.i64(i64 {left}, i64 {right})",
+            f"{register} = extractvalue {{i64, i1}} {register}.pair, 0",
+            f"{register}.overflow = extractvalue {{i64, i1}} {register}.pair, 1",
+            f"call void @turing_int_overflow(i1 {register}.overflow)",
+        ], operand_type)
 
     if (
         str(operation).casefold() in {"floor", "ceil", "round", "trunc"}
@@ -894,6 +1396,28 @@ def integer_scalar_lines(
             f"{register} = select i1 {register}.below, "
             f"{operand_type} {register}.neg, {operand_type} {operands[0]}",
         ], operand_type)
+    if operation == "BitLength" and len(operands) == 1:
+        # Program: ``a.bit_length() * 100 + b.bit_length()`` (c695) and a
+        # loop-carried ``v.bit_length()`` (c696).  Wrong record: LLVM had no
+        # spelling and refused what C runs through ``turing_bit_length``.
+        # Rule: the same helper, called the way C calls it -- the operand
+        # converted to ``long long`` (sign- or zero-extended from a narrower
+        # integer), an i64 bit count back.  No wider operand has a C form.
+        width = int(operand_type[1:])
+        if width > 64:
+            return None
+        if width == 64:
+            argument, lines = operands[0], []
+        else:
+            argument = f"{register}.wide"
+            lines = [
+                f"{argument} = {'zext' if unsigned else 'sext'} "
+                f"{operand_type} {operands[0]} to i64"
+            ]
+        return ([
+            *lines,
+            f"{register} = call i64 @turing_bit_length(i64 {argument})",
+        ], "i64")
     if operation == "Invert" and len(operands) == 1:
         # The canonical authored ``~mask`` opcode preserves its integer
         # domain. The old double fallback rejected it, despite an i64
@@ -968,6 +1492,7 @@ from .output_publication import (
     publication_surface_plan,
 )
 from .ssa_aggregate_abi import is_storage_view
+from .native_faults import INT_OVERFLOW as _INT_OVERFLOW_CODE
 
 
 # Target intrinsics reached by the scalar tables, plus the block-copy the
@@ -1013,6 +1538,58 @@ exit:
     "turing_validation_error": (
         "declare void @turing_validation_error(i32)"
     ),
+    # A range loop's induction step saturates (``loop_induction_step``).
+    "llvm.sadd.sat.i64": "declare i64 @llvm.sadd.sat.i64(i64, i64)",
+    # Python's ``int.bit_length``, the C backend's ``turing_bit_length``
+    # statement for statement: the unsigned magnitude (``0 - v`` for a
+    # negative v, so INT64_MIN answers 64), then count shifts to zero.
+    # (c695, c696; lane G)
+    "turing_bit_length": """define internal i64 @turing_bit_length(i64 %v) {
+entry:
+  %negative = icmp slt i64 %v, 0
+  %negated = sub i64 0, %v
+  %magnitude = select i1 %negative, i64 %negated, i64 %v
+  br label %scan
+scan:
+  %m = phi i64 [ %magnitude, %entry ], [ %shifted, %count ]
+  %n = phi i64 [ 0, %entry ], [ %counted, %count ]
+  %done = icmp eq i64 %m, 0
+  br i1 %done, label %exit, label %count
+count:
+  %counted = add i64 %n, 1
+  %shifted = lshr i64 %m, 1
+  br label %scan
+exit:
+  ret i64 %n
+}""",
+    **{
+        f"llvm.{name}.with.overflow.i64": (
+            f"declare {{i64, i1}} @llvm.{name}.with.overflow.i64(i64, i64)"
+        )
+        for name in ("sadd", "ssub", "smul")
+    },
+    # Python ``int`` never wraps.  An unproven int64 result that left int64
+    # is reported (native_faults.INT_OVERFLOW) instead of returned wrapped.
+    # Python's other int exceptions (native_faults NEGATIVE_SHIFT_COUNT,
+    # INT_ZERO_DIVISION): report ``code`` when ``fault`` holds.
+    "turing_int_fault": """define internal void @turing_int_fault(i1 %fault, i32 %code) {
+entry:
+  br i1 %fault, label %report, label %exit
+report:
+  call void @turing_validation_error(i32 %code)
+  br label %exit
+exit:
+  ret void
+}""",
+    "turing_int_overflow": f"""define internal void @turing_int_overflow(i1 %overflow) {{
+entry:
+  br i1 %overflow, label %report, label %exit
+report:
+  call void @turing_validation_error(i32 {_INT_OVERFLOW_CODE})
+  br label %exit
+exit:
+  ret void
+}}""",
 }
 
 
@@ -1162,6 +1739,14 @@ def _value_llvm_type(value: _Any) -> str:
     # names. Resolve them before consulting the scalar layout catalogue.
     if str(getattr(value, "dtype", "")) in {"ssa.aggregate", "ptrptr_float64"}:
         return "ptr"
+    if (
+        str(getattr(value, "dtype", "")).casefold() == "none"
+        and not accounting.get("physical_dtype")
+    ):
+        # Structural absence is not a numeric dtype: it is the inert scalar
+        # carrier cell the C emitter spells ``double`` for ``none`` (see
+        # ``_scalar_c_type``), holding the zero sentinel.
+        return "double"
     if accounting.get("heap_owner") or accounting.get("heap_element_dtype") is not None:
         # These are declared native pointer CELLS, not a typed address whose
         # dtype names the pointee. Raw ptr spelling alone historically means
@@ -1736,6 +2321,7 @@ def _emit_repository_call_module(
             callee_aggregate_parameter_positions[callee_name] = positions
 
     function_outputs: dict[str, tuple[_Any, ...]] = {}
+    function_output_ret_positions: dict[str, tuple[int, ...]] = {}
     # A linked LLVM piece is not emitted, but its call sites need its
     # outputs: the piece root's Ret names them, in the artifact's order.
     for name in piece_records:
@@ -1771,15 +2357,22 @@ def _emit_repository_call_module(
                 )
         positions = aggregate_output_positions.get(name)
         if physical_returned:
+            selects_positions = positions is not None and all(
+                position < len(physical_returned) for position in positions
+            )
             function_outputs[name] = (
                 tuple(physical_returned[position] for position in positions)
-                if positions is not None
-                and all(
-                    position < len(physical_returned)
-                    for position in positions
-                )
+                if selects_positions
                 else physical_returned
             )
+            # Declared output i is the Ret's argument at position
+            # positions[i], not at i: the publication must read that same
+            # record.  c467: make(k, m) returns (closure, k, m); the call
+            # selects slots (0, 2), and reading Ret position 1 (the
+            # passed-through k) for output 1 overwrote m with k, so
+            # 3*5 - 5*2 came back -10 on LLVM while C returned 5.
+            if selects_positions and returned is physical_returned:
+                function_output_ret_positions[name] = tuple(positions)
         else:
             declared_ids = aggregate_output_ids.get(name, ())
             function_outputs[name] = tuple(
@@ -1929,7 +2522,9 @@ def _emit_repository_call_module(
             ring_id, count_id = history_ids(raw_id)
             appended_history.append(_SSAValue(
                 ring_id,
-                dtype=getattr(value, "dtype", None) or "float64",
+                dtype=_settled_dtype(
+                    getattr(value, "dtype", None), raw_id,
+                    "watched history value dtype"),
                 shape=(depth,),
             ))
             appended_history.append(_SSAValue(count_id, dtype="int64"))
@@ -2034,7 +2629,25 @@ def _emit_repository_call_module(
 
         seen: set[tuple[str, int]] = set()
         current = (str(name), int(value_id))
-        while current[0] != function_name:
+        root_formals = {
+            int(value.id) for value in module.functions[function_name].args
+        }
+        while True:
+            if current[0] == function_name:
+                if current[1] in root_formals:
+                    return current[1]
+                # Program: ``(x * y).sum()`` over runtime-sized spans.  The
+                # product is a region's result that the root projects under
+                # the same id and feeds to the reducing region: its extents
+                # are its producer's, so follow the producing region's edge.
+                produced = next((
+                    key for key in elementwise_runtime_results
+                    if key[1] == current[1] and key[0] != function_name
+                    and key in shape_extent_origin
+                ), None)
+                if produced is None:
+                    return current[1]
+                current = produced
             if current in seen:
                 return None
             seen.add(current)
@@ -2044,7 +2657,6 @@ def _emit_repository_call_module(
             if origin is None:
                 return None
             current = origin
-        return current[1]
 
     # Functions that address a span across more than one axis need the extents
     # vector, and so does every function that calls one.
@@ -2060,6 +2672,13 @@ def _emit_repository_call_module(
     # extents vector. Such a function needs %extents even when it never
     # addresses an element itself -- region_4 does exactly this: four
     # whole-array assignments and not one GetElementPtr.
+    # A reduction of a runtime-sized span counts it from the extents vector.
+    extent_users.update(
+        name for name in reachable
+        for block in module.functions[name].blocks.values()
+        for instruction in block.instrs
+        if instruction.args and _runtime_sized_span(instruction.args[0])
+    )
     extent_users.update(
         name for name in reachable
         for block in module.functions[name].blocks.values()
@@ -2239,6 +2858,12 @@ def _emit_repository_call_module(
                     count = max(count, int(requirement.element_count))
             if value_id not in allocated and (
                 (str(name), value_id) in elementwise_runtime_results
+                # A region's runtime-sized span result, projected here and
+                # fed on to its consumer (``(x * y).sum()``).
+                or (_runtime_sized_span(value) and any(
+                    key[1] == value_id and key[0] != str(name)
+                    for key in elementwise_runtime_results
+                ))
             ):
                 # Program: ``x + y * 2.0`` over runtime-sized rank-2 spans.
                 # Wrong record: the intermediate ``y * 2.0`` is a local span
@@ -2522,8 +3147,14 @@ def _emit_repository_call_module(
         def emit_return_values(
             returned_values: tuple = (),
         ) -> None:
+            ret_positions = function_output_ret_positions.get(name)
             for output_index, output in enumerate(outputs):
                 destination = f"%out.{output_index}"
+                ret_position = (
+                    ret_positions[output_index]
+                    if ret_positions is not None and returned_values
+                    else output_index
+                )
                 # The Ret instruction's own arguments are the authoritative
                 # publication objects: a carried reduction returns its PHI,
                 # whose id differs from the declared output id (the port /
@@ -2531,9 +3162,9 @@ def _emit_repository_call_module(
                 # port's unwritten cell and returned zero for every carried
                 # maximum.
                 source = None
-                if output_index < len(returned_values):
+                if ret_position < len(returned_values):
                     source = pointers.get(
-                        int(returned_values[output_index].id)
+                        int(returned_values[ret_position].id)
                     )
                 if source is None:
                     # A watch shadow, when one exists, is the ONLY readable
@@ -2551,8 +3182,8 @@ def _emit_repository_call_module(
                     # storage at all.
                     for candidate in (
                         *(
-                            (int(returned_values[output_index].id),)
-                            if output_index < len(returned_values) else ()
+                            (int(returned_values[ret_position].id),)
+                            if ret_position < len(returned_values) else ()
                         ),
                         int(output.id),
                     ):
@@ -3288,6 +3919,13 @@ def _emit_repository_call_module(
                     )
                 continue
 
+            if operation == "Trap" and instruction.attributes.get("fault_exit"):
+                # A checked fault already recorded its validation code; the
+                # exit publishes no outputs.
+                span.take_pending()
+                body.append("  ret void")
+                continue
+
             if operation in {"Ret", "ret", "Return", "return"}:
                 span.take_pending()
                 emit_return_values(tuple(instruction.args))
@@ -3558,6 +4196,34 @@ def _emit_repository_call_module(
                     None if formal_index is None
                     else function.args[formal_index]
                 )
+                if addressed is None and declared_formal is not None:
+                    # A physical member of this function's own sequence
+                    # descriptor is a caller-owned address by the table's
+                    # claim, whatever accounting a linking pass stamped on
+                    # the formal.  A constructor call (``Bag(a)``) hands the
+                    # caller's frame slots to ``__init__``, so the formal
+                    # carries ``linked_call_frame_storage`` and not the
+                    # ``compiler_frame_*`` identity; the descriptor still
+                    # names it.  The C emitter reads every shaped formal as
+                    # its buffer; this reads the same fact from the table.
+                    function_sequences = getattr(
+                        module, "sequence_tables", {},
+                    ).get(name)
+                    for descriptor in (
+                        () if function_sequences is None
+                        else function_sequences.sequences.values()
+                    ):
+                        if int(address_argument.id) in {
+                            int(member) for member in (
+                                *descriptor.column_value_ids,
+                                descriptor.length_address_id,
+                                descriptor.capacity_value_id,
+                                descriptor.status_address_id,
+                                descriptor.live_flags_value_id,
+                            ) if member is not None
+                        }:
+                            addressed = pointer(address_argument)
+                            break
                 if (
                     addressed is None
                     and declared_formal is not None
@@ -3696,6 +4362,22 @@ def _emit_repository_call_module(
                 destination_type = span_address_types.get(
                     int(address.id), _value_llvm_type(source),
                 )
+                source_dtype = _integer_storage_dtype(
+                    _value_llvm_type(source), _unsigned_value(source),
+                )
+                destination_dtype = _integer_storage_dtype(
+                    destination_type,
+                    span_address_unsigned.get(int(address.id), _unsigned_value(source)),
+                )
+                if integer_narrowing_bounds(source_dtype, destination_dtype) is not None:
+                    own_type = _value_llvm_type(source)
+                    body.extend(
+                        f"  {line}" for line in integer_narrowing_lines(
+                            source_dtype, destination_dtype, own_type,
+                            load_as(source, own_type, f"store.narrow.{tag}"),
+                            f"%store.narrow.{tag}",
+                        )
+                    )
                 loaded_value = load_as(
                     source, destination_type, f"store.{tag}",
                     target_unsigned=span_address_unsigned.get(int(address.id), False),
@@ -4496,6 +5178,15 @@ def _emit_repository_call_module(
 
             if operation in {"Cast", "CastLike", "cast_like"} and result is not None and instruction.args:
                 result_type = _value_llvm_type(result)
+                if contract_integer_narrowing(instruction):
+                    own_type = _value_llvm_type(instruction.args[0])
+                    body.extend(
+                        f"  {line}" for line in integer_narrowing_lines(
+                            instruction.args[0].dtype, result.dtype, own_type,
+                            load_as(instruction.args[0], own_type, f"cast.narrow.{tag}"),
+                            f"%cast.narrow.{tag}",
+                        )
+                    )
                 rendered = load_as(
                     instruction.args[0], result_type, f"cast.{tag}",
                     target_unsigned=_unsigned_value(result)
@@ -4536,6 +5227,188 @@ def _emit_repository_call_module(
                     f"  store {result_type} {register}, "
                     f"ptr {pointer(result)}, align 8"
                 )
+                continue
+
+            axis = (instruction.attributes or {}).get("axis")
+            if axis is None:
+                axis = (instruction.attributes or {}).get("dim")
+            if (
+                str(operation).casefold() in {"sum", "prod", "mean", "max", "min"}
+                and axis is not None
+                and result is not None
+                and instruction.args
+                # builtin ``min(n, 3)`` carries its second operand as
+                # ``dim``; a scalar has no axis to reduce.
+                and (
+                    tuple(instruction.args[0].shape or ())
+                    or int((instruction.args[0].accounting or {}).get(
+                        "program_abi_rank"
+                    ) or 0)
+                )
+            ):
+                # Program: ``def f(y): return y.max(axis=0)`` with y (2, 3).
+                # Rule (as in C): one result per lane of the kept axes,
+                # row-major, folded along the axis in index order; max/min
+                # take numpy's rule, so a NaN in the lane is its result.
+                reduced_op = str(operation).casefold()
+                source = instruction.args[0]
+                shape = tuple(source.shape or ())
+                if (
+                    not isinstance(axis, int) or not shape
+                    or not all(isinstance(item, int) for item in shape)
+                    or not -len(shape) <= axis < len(shape)
+                ):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"{operation} over axis {axis!r} of shape {shape!r} "
+                        "needs one in-range integer axis of a static shape",
+                    ))
+                    continue
+                axis %= len(shape)
+                length = shape[axis]
+                inner = _math.prod(shape[axis + 1:])
+                lanes = _math.prod(shape[:axis]) * inner
+                if _math.prod(tuple(result.shape or ())) != lanes or (
+                    length == 0 and reduced_op in {"max", "min"}
+                ):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"{operation} over axis {axis} of {shape!r} into "
+                        f"{tuple(result.shape or ())!r} (an empty max/min "
+                        "axis raises in numpy)",
+                    ))
+                    continue
+                source_type = _value_llvm_type(source)
+                result_type = _value_llvm_type(result)
+                accumulator_type = "double" if (
+                    result_type == "double" or reduced_op == "mean"
+                ) else result_type
+                if accumulator_type not in {"i32", "i64", "double"}:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"{operation} over an axis into {accumulator_type}",
+                    ))
+                    continue
+                floating = accumulator_type == "double"
+                entry_label = block_exit_label.get(
+                    active_block or "", active_block or "entry",
+                )
+                lane, lane_next = f"%ax.l.{tag}", f"%ax.l.next.{tag}"
+                step, step_next = f"%ax.k.{tag}", f"%ax.k.next.{tag}"
+                acc, acc_next = f"%ax.acc.{tag}", f"%ax.acc.next.{tag}"
+                outer_head, outer_body = f"ax.oh.{tag}", f"ax.ob.{tag}"
+                inner_head, inner_body = f"ax.ih.{tag}", f"ax.ib.{tag}"
+                inner_done, done = f"ax.id.{tag}", f"ax.done.{tag}"
+
+                def lane_element(at: str, label: str) -> str:
+                    body.append(
+                        f"  %ax.addr.{label}.{tag} = getelementptr "
+                        f"{source_type}, ptr {pointer(source)}, i64 {at}"
+                    )
+                    body.append(
+                        f"  %ax.v.{label}.{tag} = load {source_type}, ptr "
+                        f"%ax.addr.{label}.{tag}, align {_align(source_type)}"
+                    )
+                    return convert_loaded(
+                        f"%ax.v.{label}.{tag}", source_type, accumulator_type,
+                        f"ax.{label}.{tag}",
+                    )
+
+                ordered = reduced_op in {"max", "min"}
+                body.append(f"  br label %{outer_head}")
+                body.append(f"{outer_head}:")
+                body.append(
+                    f"  {lane} = phi i64 [ 0, %{entry_label} ], "
+                    f"[ {lane_next}, %{inner_done} ]"
+                )
+                body.append(f"  %ax.omore.{tag} = icmp slt i64 {lane}, {lanes}")
+                body.append(
+                    f"  br i1 %ax.omore.{tag}, label %{outer_body}, label %{done}"
+                )
+                body.append(f"{outer_body}:")
+                body.append(f"  %ax.lo.{tag} = udiv i64 {lane}, {inner}")
+                body.append(f"  %ax.li.{tag} = urem i64 {lane}, {inner}")
+                body.append(
+                    f"  %ax.lb.{tag} = mul i64 %ax.lo.{tag}, {length * inner}"
+                )
+                body.append(f"  %ax.base.{tag} = add i64 %ax.lb.{tag}, %ax.li.{tag}")
+                if ordered:
+                    initial = lane_element(f"%ax.base.{tag}", "first")
+                    first = "1"
+                else:
+                    initial = literal(1 if reduced_op == "prod" else 0, accumulator_type)
+                    first = "0"
+                body.append(f"  br label %{inner_head}")
+                body.append(f"{inner_head}:")
+                body.append(
+                    f"  {step} = phi i64 [ {first}, %{outer_body} ], "
+                    f"[ {step_next}, %{inner_body} ]"
+                )
+                body.append(
+                    f"  {acc} = phi {accumulator_type} [ {initial}, %{outer_body} ], "
+                    f"[ {acc_next}, %{inner_body} ]"
+                )
+                body.append(f"  %ax.imore.{tag} = icmp slt i64 {step}, {length}")
+                body.append(
+                    f"  br i1 %ax.imore.{tag}, label %{inner_body}, label %{inner_done}"
+                )
+                body.append(f"{inner_body}:")
+                body.append(f"  %ax.ko.{tag} = mul i64 {step}, {inner}")
+                body.append(f"  %ax.at.{tag} = add i64 %ax.base.{tag}, %ax.ko.{tag}")
+                item = lane_element(f"%ax.at.{tag}", "row")
+                if reduced_op in {"sum", "mean"}:
+                    body.append(
+                        f"  {acc_next} = {'fadd' if floating else 'add'} "
+                        f"{accumulator_type} {acc}, {item}"
+                    )
+                elif reduced_op == "prod":
+                    body.append(
+                        f"  {acc_next} = {'fmul' if floating else 'mul'} "
+                        f"{accumulator_type} {acc}, {item}"
+                    )
+                else:
+                    greatest = reduced_op == "max"
+                    if floating:
+                        for rendered_line in _max_template(
+                            max_step_rule(instruction) or NUMPY, greatest,
+                        ).format(acc, item, out=acc_next).splitlines():
+                            body.append(f"  {rendered_line}")
+                    else:
+                        body.append(
+                            f"  %ax.keep.{tag} = icmp {'sgt' if greatest else 'slt'} "
+                            f"{accumulator_type} {item}, {acc}"
+                        )
+                        body.append(
+                            f"  {acc_next} = select i1 %ax.keep.{tag}, "
+                            f"{accumulator_type} {item}, {accumulator_type} {acc}"
+                        )
+                body.append(f"  {step_next} = add i64 {step}, 1")
+                body.append(f"  br label %{inner_head}")
+                body.append(f"{inner_done}:")
+                value = acc
+                if reduced_op == "mean":
+                    body.append(
+                        f"  %ax.mean.{tag} = fdiv double {acc}, "
+                        f"{literal(float(length), 'double')}"
+                    )
+                    value = f"%ax.mean.{tag}"
+                stored = convert_loaded(
+                    value, accumulator_type, result_type, f"ax.store.{tag}",
+                )
+                body.append(
+                    f"  %ax.dst.{tag} = getelementptr {result_type}, "
+                    f"ptr {pointer(result)}, i64 {lane}"
+                )
+                body.append(
+                    f"  store {result_type} {stored}, ptr %ax.dst.{tag}, "
+                    f"align {_align(result_type)}"
+                )
+                body.append(f"  {lane_next} = add i64 {lane}, 1")
+                body.append(f"  br label %{outer_head}")
+                body.append(f"{done}:")
+                if active_block is not None:
+                    block_exit_label[active_block] = done
+                register_cache.clear()
                 continue
 
             selector = _reduction_read_as_selector(operation, instruction)
@@ -4760,10 +5633,30 @@ def _emit_repository_call_module(
                     # times a scalar reached ``fmul double`` with i64
                     # operands. The scalar emitter already owns the integer
                     # law; span rank changes the sweep, not the declared dtype.
-                    integer = integer_scalar_lines(
-                        operation, compute_type, operands, computed,
-                        unsigned=_unsigned_value(instruction.args[0]),
+                    lane_checked = (
+                        compute_type == "i64"
+                        and python_int_lane_overflow_checked(instruction)
                     )
+                    if lane_checked and operation in {"Abs", "abs"}:
+                        # |x| leaves int64 only at INT64_MIN, the one lane
+                        # whose checked negation reports.
+                        negated = integer_scalar_lines(
+                            "Neg", compute_type, operands,
+                            f"{computed}.neg", checked=True,
+                        )
+                        integer = None if negated is None else ([
+                            *negated[0],
+                            f"{computed}.below = icmp slt i64 "
+                            f"{operands[0]}, 0",
+                            f"{computed} = select i1 {computed}.below, "
+                            f"i64 {computed}.neg, i64 {operands[0]}",
+                        ], compute_type)
+                    else:
+                        integer = integer_scalar_lines(
+                            operation, compute_type, operands, computed,
+                            unsigned=_unsigned_value(instruction.args[0]),
+                            checked=lane_checked,
+                        )
                     if integer is None:
                         shortfalls.append(LLVMEmissionShortfall(
                             name, operation,
@@ -4875,6 +5768,17 @@ def _emit_repository_call_module(
                         ) or lengths
                     if len(lengths) == 1:
                         count = load_as(lengths[0], "i64", f"red.n.{tag}")
+                if count is None and _runtime_sized_span(source):
+                    # ``(x * y).sum()`` over runtime-sized spans: the span
+                    # reduces over its element count, read from the extents
+                    # vector as its elementwise producer is sized.
+                    measured = _span_element_count(
+                        name, source, f"red.{tag}", body,
+                        public_span_value, module_extent_slot,
+                    )
+                    if measured is not None:
+                        body.append(f"  %red.n64.{tag} = sext i32 {measured} to i64")
+                        count = f"%red.n64.{tag}"
                 if count is None:
                     shortfalls.append(LLVMEmissionShortfall(
                         name, operation,
@@ -4975,7 +5879,18 @@ def _emit_repository_call_module(
                 )
                 body.append(f"{loop_body}:")
                 item = element(index, "row")
-                if operation == "sum":
+                if (
+                    operation == "sum" and accumulator_type == "i64"
+                    and not _unsigned_value(result)
+                    and python_int_overflow_checked(instruction)
+                ):
+                    # ``sum(xs)`` of Python ints: each step is int ``+``.
+                    body.extend(
+                        f"  {line}" for line in integer_scalar_lines(
+                            "Add", "i64", [acc, item], acc_next, checked=True,
+                        )[0]
+                    )
+                elif operation == "sum":
                     body.append(
                         f"  {acc_next} = {'fadd' if floating else 'add'} "
                         f"{accumulator_type} {acc}, {item}"
@@ -5080,6 +5995,21 @@ def _emit_repository_call_module(
                     # of the wrapped zero. The declared result owns this
                     # arithmetic domain; predicates and logical ops keep i1.
                     operand_type = result_type
+                if (
+                    operation in {"Add", "Sub", "Mul", "Neg"}
+                    and result_type in _INTEGER_LLVM_TYPES
+                    and operand_type in _INTEGER_LLVM_TYPES
+                    and int(result_type[1:]) > int(operand_type[1:])
+                ):
+                    # Program: ``def root(n): return n * n`` whose product
+                    # is declared int128 (an int64 x int64 interval, or the
+                    # int overflow union's exact arm).  Wrong record: the
+                    # multiply ran in the operands' i64 and its wrapped
+                    # result was sign-extended, so 3037000500**2 came back
+                    # negative.  Rule: the declared integer result is the
+                    # domain; widening each operand first is exact, which is
+                    # the module lane's rule.
+                    operand_type = result_type
                 # The logical templates are spelled over i1; an operand that
                 # arrives in its double storage type must be coerced to a
                 # boolean, not passed through in whatever width it was
@@ -5098,6 +6028,16 @@ def _emit_repository_call_module(
                     for position, argument in enumerate(instruction.args)
                 ]
                 register = f"%scalar.{tag}"
+                if operand_type == "double" and python_int_true_division(instruction):
+                    body.extend(
+                        f"  {line}" for line in python_int_true_division_lines(
+                            [
+                                load_as(argument, "i64", f"{tag}.int.{position}")
+                                for position, argument in enumerate(instruction.args)
+                            ],
+                            operands, register,
+                        )
+                    )
                 integer_cast = {
                     "SiToFp": "sitofp",
                     "UiToFp": "uitofp",
@@ -5119,6 +6059,10 @@ def _emit_repository_call_module(
                     integer = integer_scalar_lines(
                         operation, operand_type, operands, register,
                         unsigned=compute_unsigned,
+                        checked=python_int_operation(instruction),
+                        proven=not python_int_overflow_checked(instruction),
+                        saturating=(instruction.attributes or {}).get("binding")
+                        == "loop_induction_step",
                     )
                     if integer is None:
                         shortfalls.append(LLVMEmissionShortfall(
@@ -5477,6 +6421,37 @@ def _emit_repository_call_module(
             wrapper.append(f"  store {llvm_type} {rows}, ptr {public_pointer[capacity_id]}, align {_align(llvm_type)}")
             entry_span.take(UnitKind.STATEMENT, args=(capacity, *(root_arguments[int(column)]
                 for column in sequence.column_value_ids)), spelling=public_pointer[capacity_id])
+    # Program: ``g = [[1, 2], [3, 4]]; return g[i][j]`` (c860-c869e; lane
+    # G).  Wrong record: the C wrapper publishes a root-owned list of lists'
+    # child-table pool capacity and row stride from the root's
+    # ``child_pool_static_extents``; this wrapper never read that record, so
+    # both cells stayed 0 and the first row allocation reported code 75
+    # (capacity exhausted) where C ran.  Rule: publish the same two cells
+    # from the same record before the entry call.
+    if root_sequences is not None:
+        for outer_id, rows, stride in tuple(
+            root.metadata.get("child_pool_static_extents", ())
+        ):
+            outer = root_sequences.sequences.get(int(outer_id))
+            pool = None if outer is None else outer.child_table_pool
+            if pool is None:
+                continue
+            for member_id, member_value in (
+                (pool.capacity_value_id, int(rows) * int(stride)),
+                (pool.row_stride_value_id, int(stride)),
+            ):
+                if int(member_id) not in allocated_counts:
+                    continue
+                member = root_arguments[int(member_id)]
+                member_type = _value_llvm_type(member)
+                wrapper.append(
+                    f"  store {member_type} {member_value}, ptr "
+                    f"{public_pointer[int(member_id)]}, align {_align(member_type)}"
+                )
+                entry_span.take(
+                    UnitKind.STATEMENT, args=(member,),
+                    spelling=public_pointer[int(member_id)],
+                )
     internal_call_records.append((
         None,
         internal_symbols[function_name],
@@ -5880,8 +6855,11 @@ class LLVMExecution:
         self.artifact.entry()(self.pointers, self.extents)
         validation_error = self.artifact.take_validation_error()
         if validation_error:
-            raise RuntimeError(
-                f"LLVM runtime validation failed with code {validation_error}"
+            from .native_faults import validation_fault
+
+            raise validation_fault(
+                validation_error,
+                f"LLVM runtime validation failed with code {validation_error}",
             )
         if self.artifact.external_slots:
             from .external_functions import check_external_faults
@@ -7560,6 +8538,19 @@ def emit_ssa_function_to_llvm(
 
             if operation in {"Cast", "CastLike", "cast_like"} and instruction.res is not None and instruction.args:
                 target_type = _value_llvm_type(instruction.res)
+                if contract_integer_narrowing(instruction):
+                    own_type = _value_llvm_type(instruction.args[0])
+                    own = as_type(
+                        int(instruction.args[0].id), own_type,
+                        f"cast.narrow.{result_id}",
+                    )
+                    if own is not None:
+                        lines.extend(
+                            f"  {line}" for line in integer_narrowing_lines(
+                                instruction.args[0].dtype, instruction.res.dtype,
+                                own_type, own, f"%cast.narrow.{result_id}",
+                            )
+                        )
                 rendering = as_type(
                     int(instruction.args[0].id), target_type,
                     f"cast.{result_id}",
@@ -7680,6 +8671,10 @@ def emit_ssa_function_to_llvm(
                     None if domain == "double"
                     else integer_scalar_lines(
                         str(operation), domain, operands, register,
+                        checked=python_int_operation(instruction),
+                        proven=not python_int_overflow_checked(instruction),
+                        saturating=(instruction.attributes or {}).get("binding")
+                        == "loop_induction_step",
                     )
                 )
                 if integer is not None:
@@ -7687,6 +8682,21 @@ def emit_ssa_function_to_llvm(
                     lines.extend(f"  {line}" for line in integer_lines)
                     scalars[result_id] = (register, produced)
                     continue
+                if domain == "double" and python_int_true_division(instruction):
+                    integers = [
+                        as_type(int(argument.id), "i64", f"{result_id}.int.{position}")
+                        for position, argument in enumerate(instruction.args)
+                    ]
+                    if any(value is None for value in integers):
+                        shortfalls.append(LLVMEmissionShortfall(
+                            function_name, str(operation),
+                            "int / int operand has no i64 rendering",
+                        ))
+                        continue
+                    lines.extend(
+                        f"  {line}" for line in
+                        python_int_true_division_lines(integers, operands, register)
+                    )
                 # What the TEMPLATE yields, which is not always the declared
                 # type. `Lt` renders as `fcmp`, and fcmp yields i1 no matter
                 # what the value was declared as. Recording "double" below

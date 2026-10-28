@@ -175,6 +175,18 @@ def _c_type_for(dtype: str | None) -> tuple[str, str]:
     return c_abi_type(dtype)
 
 
+def _recorded_dtype(value: SSAValue) -> str:
+    """The dtype the pipeline settled for ``value``; refuse a missing one."""
+
+    if not value.dtype:
+        raise ValueError(
+            f"compiled program ABI: parameter value %t{int(value.id)} has "
+            "no recorded dtype; the pipeline never settled its type, so the "
+            "ABI refuses to invent one"
+        )
+    return str(value.dtype)
+
+
 def describe_fortran_function(
     name: str,
     function: Function,
@@ -237,7 +249,7 @@ def describe_fortran_function(
     output_ids = {value.id for value in outputs}
     for occurrence in function.args:
         value = declared(occurrence)
-        c_type, ctypes_name = _c_type_for(value.dtype)
+        c_type, ctypes_name = _c_type_for(_recorded_dtype(value))
         dynamic_extent = dynamic_array_extents.get(int(value.id))
         array = (
             bool(value.shape)
@@ -284,7 +296,7 @@ def describe_fortran_function(
                     if workspace
                     else "inout" if int(value.id) in output_ids else "input"
                 ),
-                dtype=str(value.dtype or "float64"),
+                dtype=_recorded_dtype(value),
                 c_type=c_type,
                 ctypes_name=ctypes_name,
                 # A scalar dummy is declared `value` by the emitter; an array
@@ -317,14 +329,14 @@ def describe_fortran_function(
     for value in outputs:
         if value.id in {argument.id for argument in function.args}:
             continue
-        c_type, ctypes_name = _c_type_for(value.dtype)
+        c_type, ctypes_name = _c_type_for(_recorded_dtype(value))
         dimensions = dynamic_array_dimensions.get(int(value.id), ()) or tuple(
             f"extent_{int(size)}" for size in value.shape)
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
                 role="output",
-                dtype=str(value.dtype or "float64"),
+                dtype=_recorded_dtype(value),
                 c_type=c_type,
                 ctypes_name=ctypes_name,
                 passing="reference",

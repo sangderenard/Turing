@@ -172,11 +172,19 @@ class Handler(Enum):
     IndexedStore  = "IndexedStore"
 
     # Casts & Conversions
+    # Casts & Conversions
     Cast          = "Cast"
     # Convert the first operand to the schema/dtype represented by the second.
     # The second edge is compile-time type evidence, not discarded Python
     # control flow around isinstance/type/constructor calls.
     CastLike      = "CastLike"
+
+    # Explicit numeric rounding. The numeric contract selects the operation;
+    # backends implement the stated semantics rather than choosing a policy.
+    RoundNearestEven = "RoundNearestEven"
+    RoundNearestAway = "RoundNearestAway"
+    RoundStochastic  = "RoundStochastic"
+
     Trunc         = "Trunc"
     ZExt          = "ZExt"
     SExt          = "SExt"

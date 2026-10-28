@@ -22,6 +22,17 @@ from .wasm_binary import (
 )
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 @dataclass(frozen=True, slots=True)
 class WasmEmissionShortfall:
     operation: str
@@ -80,6 +91,9 @@ def emit_ssa_function_to_wasm(
     Both are available deliberately -- a table costs memory and an interpolation,
     a series costs multiplies, and which is cheaper depends on the target.
     """
+    from .ssa_llvm_backend import (
+        DOUBLE_EXACT, INT32_EXACT, python_int_unchecked_refusal,
+    )
     from .work_contract import PRESETS, active_contract
 
     function: Function = module.functions[function_name]
@@ -188,6 +202,12 @@ def emit_ssa_function_to_wasm(
         if instruction.res is None:
             shortfalls.append(WasmEmissionShortfall(op, "instruction has no result"))
             continue
+        unchecked = python_int_unchecked_refusal(
+            instruction, "direct scalar WASM f64", DOUBLE_EXACT,
+        )
+        if unchecked is not None:
+            shortfalls.append(WasmEmissionShortfall(op, unchecked))
+            continue
         result_id = int(instruction.res.id)
         if op == "Const":
             value = float(instruction.attributes.get("constant", instruction.attributes.get("value")))
@@ -220,8 +240,9 @@ def emit_ssa_function_to_wasm(
         if op in {"Cast", "CastLike", "cast_like"} and len(args) >= 1:
             target = str(
                 instruction.attributes.get("target_dtype")
-                or instruction.res.dtype
-                or "float64"
+                or _settled_dtype(
+                    instruction.res.dtype, instruction.res.id,
+                    "Cast target_dtype attribute or result dtype")
             ).casefold()
             get(args[0])
             if target in {"bool", "i1"}:
@@ -553,6 +574,9 @@ def emit_ssa_module_to_wasm_core(
     """Emit ``function_name`` plus its inlined callees as one wasm function."""
 
     from .ir_identities import precision_backend_shortfalls
+    from .ssa_llvm_backend import (
+        DOUBLE_EXACT, INT32_EXACT, python_int_unchecked_refusal,
+    )
 
     name = str(entry_name or function_name)
     root: Function = module.functions[function_name]
@@ -683,6 +707,12 @@ def emit_ssa_module_to_wasm_core(
 
         nonlocal precision_present
         operation = str(instruction.op)
+        unchecked = python_int_unchecked_refusal(
+            instruction, "core WASM i32", INT32_EXACT,
+        )
+        if unchecked is not None:
+            shortfalls.append(WasmEmissionShortfall(operation, unchecked))
+            return
         if instruction.attributes.get("precision_section"):
             precision_present = True
         if operation in {"NoneValue", "nonevalue"}:

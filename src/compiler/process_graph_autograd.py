@@ -238,11 +238,17 @@ def abstract_tensor_program_to_process_graph(
     def post_program_value(
         value_id: int, op: str, callee: str, shape: Any, dtype: Any,
     ) -> None:
+        if not dtype:
+            raise ProcessGraphAutogradError(
+                f"SSA AbstractTensor value {int(value_id)} ({op} {callee}) "
+                "has no recorded dtype; the forward program never settled "
+                "its type"
+            )
         program_cells[int(value_id)] = book.post(
             ABSTRACT_TENSOR_PROGRAM_VALUE, (scope, int(value_id)),
             AbstractTensorValueFact(
                 str(op), str(callee), tuple(map(int, shape or ())),
-                str(dtype or "float64"),
+                str(dtype),
             ),
             stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
             mode=Mode.CONCORD,
@@ -254,12 +260,17 @@ def abstract_tensor_program_to_process_graph(
         parents: Iterable[int] = (),
         *,
         shape: Iterable[int] = (),
-        dtype: str | None = "float64",
+        dtype: str | None,
         attributes: Mapping[str, Any] | None = None,
         constant: Any = None,
         sources: Iterable[int] = (),
     ) -> None:
         value_id = int(value_id)
+        if not dtype:
+            raise ProcessGraphAutogradError(
+                f"SSA AbstractTensor node {value_id} ({op}) has no recorded "
+                "dtype; the forward program never settled its type"
+            )
         node_sources[value_id] = tuple(dict.fromkeys(
             (value_id, *map(int, sources))
         ))
@@ -275,7 +286,7 @@ def abstract_tensor_program_to_process_graph(
             attributes=dict(attributes or {}), extra_args={},
             tensor={
                 "shape": tuple(map(int, shape or ())),
-                "dtype": str(dtype or "float64"),
+                "dtype": str(dtype),
             },
             control={}, constant=copy.deepcopy(constant),
             expr_obj=None, store_id=None,
@@ -662,6 +673,11 @@ def _program_adjoint_binding_graph(
         data = forward.G.nodes[value_id]
         attributes = dict(data.get("attributes") or {})
         tensor = dict(data.get("tensor") or {})
+        if not tensor.get("dtype"):
+            raise ProcessGraphAutogradError(
+                f"{path} retains control value {value_id} whose forward "
+                "tensor record has no dtype"
+            )
         if value_id not in graph:
             graph.add_node(
                 value_id,
@@ -670,7 +686,7 @@ def _program_adjoint_binding_graph(
                 kind=kind,
                 storage="resident",
                 shape=tuple(tensor.get("shape") or ()),
-                dtype=str(tensor.get("dtype") or "float64"),
+                dtype=str(tensor["dtype"]),
                 binding_name=str(
                     attributes.get("binding_name")
                     or attributes.get("name")
@@ -1631,6 +1647,11 @@ class _AdjointBindingGraphBuilder:
             "product"
         )
         tensor = dict(data.get("tensor") or {})
+        if not tensor.get("dtype"):
+            raise ProcessGraphAutogradError(
+                f"forward value {forward_id} reaches the adjoint graph with "
+                "no recorded tensor dtype"
+            )
         existing = self.graph.nodes.get(forward_id, {})
         effective_storage = (
             "resident"
@@ -1644,7 +1665,7 @@ class _AdjointBindingGraphBuilder:
             kind=kind,
             storage=effective_storage,
             shape=tuple(tensor.get("shape") or ()),
-            dtype=str(tensor.get("dtype") or "float64"),
+            dtype=str(tensor["dtype"]),
             binding_name=str(
                 attributes.get("binding_name")
                 or identity
@@ -2593,6 +2614,12 @@ def differentiate_process_graph(
         )
     _annotate_numeric_metadata(builder.backward)
     binding_graph = builder.bindings.finish()
+    for forward_id in builder.saved:
+        if not (forward.G.nodes[forward_id].get("tensor") or {}).get("dtype"):
+            raise ProcessGraphAutogradError(
+                f"saved forward value {int(forward_id)} has no recorded "
+                "tensor dtype"
+            )
     saved_contracts = {
         int(forward_id): SavedValueContract(
             forward_value_id=int(forward_id),
@@ -2601,10 +2628,7 @@ def differentiate_process_graph(
                 (forward.G.nodes[forward_id].get("tensor") or {}).get("shape")
                 or ()
             ),
-            dtype=str(
-                (forward.G.nodes[forward_id].get("tensor") or {}).get("dtype")
-                or "float64"
-            ),
+            dtype=str(forward.G.nodes[forward_id]["tensor"]["dtype"]),
             storage=builder.saved_storage.get(int(forward_id), "resident"),
         )
         for forward_id, backward_id in builder.saved.items()

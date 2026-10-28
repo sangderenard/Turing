@@ -136,6 +136,10 @@ class ConditionalBlock(TiledObject):
     # (true-arm value, false-arm value, expression result). Unlike a carried
     # assignment, an expression has no pre-branch value to snapshot or rebind.
     result_aliases: tuple[tuple[int, int, int], ...] = ()
+    # Merged ids of ``result_aliases`` that are lists merged from branches:
+    # the merge is a handle onto the taken arm's own storage, each descriptor
+    # member one Phi of the arms' members (not a copy of the arm).
+    sequence_handle_results: tuple[int, ...] = ()
     # Scheduled regions that produce the predicate value: prerequisites of
     # this block wherever the flat schedule places them.  A conditional's
     # membership is its arm regions; without this, ordering placed the
@@ -1608,6 +1612,12 @@ def post_control_program(
         for ordinal, block in enumerate(blocks):
             block_cell = post_block(block)
             if block_cell is None:
+                continue
+            # Program: ``xs.extend([a, b, b])``.  A repeated display member
+            # births twice from one producer: the same block fact on the
+            # same row, so the same cell.  A cell has one placement; its
+            # first occurrence in this arm holds it.
+            if any(block_cell.key == item.key for item in placed):
                 continue
             posted_block_cells.add(block_cell.key)
             predecessors = tuple(placed)
@@ -3406,6 +3416,7 @@ def project_control_regions(
                 body_callsite_ids=block.body_callsite_ids,
                 orelse_callsite_ids=block.orelse_callsite_ids,
                 result_aliases=block.result_aliases,
+                sequence_handle_results=block.sequence_handle_results,
                 predicate_region_indices=block.predicate_region_indices,
                 # Filtered in lockstep with ``carried_aliases`` above so the
                 # index alignment between the two survives the projection.

@@ -172,9 +172,13 @@ def test_integer_span_scalar_arithmetic_matches_c_and_llvm(
         artifact, execution = _run(backend, module, entry, feeds, tmp_path)
         assert np.asarray(execution.buffers[result.id]).reshape(-1).tolist() == expected
         if backend == "llvm":
-            spelling = {"x * n": "mul i64", "x - n": "sub i64",
-                        "x % n": "srem i64"}[expression]
-            assert spelling in artifact.llvm_ir
+            # Integer domain, never ``fmul double``.  Python ``int`` lanes
+            # (``python_int_lane_overflow_checked``) spell * and - with the
+            # signed overflow intrinsics.
+            spellings = {"x * n": ("mul i64", "smul.with.overflow.i64"),
+                         "x - n": ("sub i64", "ssub.with.overflow.i64"),
+                         "x % n": ("srem i64",)}[expression]
+            assert any(spelling in artifact.llvm_ir for spelling in spellings)
         abi = artifact.runtime_abi()
         assert abi["schema"] == "turing-runtime-abi-v1"
         buffers = {item["value_id"]: item for item in abi["buffers"]}
@@ -585,12 +589,11 @@ def test_builtin_max_of_one_static_tensor_is_its_largest_element(
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("source", [
     "def f(x, y):\n    return max(y)\n",
-    "def f(x, y):\n    return y.max(axis=0)\n",
 ])
 def test_rank_two_max_reductions_are_refused_not_guessed(tmp_path, backend, source):
-    """``max(y)`` of a (2, 3) tensor raises in Python, and no backend spells
-    ``y.max(axis=0)`` yet: each is refused by name, never one row or a
-    broadcast whole-array maximum."""
+    """``max(y)`` of a (2, 3) tensor raises in Python: it is refused by
+    name, never one row or a broadcast whole-array maximum. (``y.max(axis=0)``
+    is now spelled; tests/test_axis_reductions.py checks it.)"""
 
     module, entry, parameters, _result = _lower(
         tmp_path, source, f"two_max_{backend}", 2, shape=(2, 3),

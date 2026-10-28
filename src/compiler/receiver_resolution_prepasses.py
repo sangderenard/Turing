@@ -14,6 +14,7 @@ from .concordance_declarations import (
     SCALAR_INTRINSIC_RECEIVER as _SCALAR_INTRINSIC_RECEIVER,
 )
 from ..transmogrifier.function_table import FunctionReference
+from .loop_ir import SEQUENCE_MUTATION_OPERATORS
 
 
 def _syntax_copy(node: Any) -> Any:
@@ -634,19 +635,86 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                ))
         or host_callback_call(data)
     }
+    # Program: ``t = same(a)`` (``def same(a: list[int]): return a``) then
+    # ``for i in range(n): t.append(i)``.  Wrong record: the reducer saw a
+    # call result with no collection kind, so the append was an OPAQUE state
+    # effect on ``t`` and the loop minted a value-carried port (LoopResult)
+    # for it, a second identity for ``a``'s list that no region could type.
+    # Rule 8: a call whose callee returns its formal IS the actual's storage,
+    # so the effect is the actual's sequence mutation (one owner, no port).
+    from .resident_sequence_materialization import (
+        _identity_return_aliases, _receiver_collection_kind,
+    )
+
+    returned_actuals = {
+        int(call_id): int(actual_id)
+        for call_id, actual_id in _identity_return_aliases(
+            graph.G, getattr(graph, "function_table", None),
+        ).items()
+        if (graph.G.nodes[int(call_id)].get("attributes") or {}).get(
+            "callee_ref"
+        ) is not None
+        and _receiver_collection_kind(graph.G.nodes.get(int(actual_id), {}))
+        == "list"
+        and (graph.G.nodes[int(actual_id)].get("attributes") or {}).get(
+            "sequence_writable", True
+        )
+    }
+
+    # Program: ``def _trim(out): while len(out) > 1: out.pop()`` called
+    # with ``[1, n, 0, 0]`` (``out`` unannotated).  Wrong record: the
+    # reducer classified the loop's ``pop`` before the call actual gave the
+    # formal its class, so the effect stayed OPAQUE and the loop refused
+    # ("receiver's class is unresolved").  Rule: as for any receiver, a
+    # state whose class is now a builtin list is that list, and its
+    # in-place method is the list's own sequence mutation.
+    def resolved_list(state_id: int) -> bool:
+        data = graph.G.nodes.get(int(state_id), {})
+        return (
+            _receiver_collection_kind(data) == "list"
+            and (data.get("attributes") or {}).get("sequence_writable", True)
+        )
+
+    def forwarded_effect(effect):
+        actual = returned_actuals.get(int(effect["state_input_id"]))
+        if (
+            actual is None
+            and effect.get("effect_mode", "opaque") == "opaque"
+            and str(effect["operator"]) in SEQUENCE_MUTATION_OPERATORS
+            and resolved_list(int(effect["state_input_id"]))
+        ):
+            return {
+                **effect,
+                "effect_mode": "sequence_mutation",
+                "sequence_policy": "duplicates",
+            }
+        if (
+            actual is None
+            or effect.get("effect_mode", "opaque") != "opaque"
+            or str(effect["operator"]) not in SEQUENCE_MUTATION_OPERATORS
+        ):
+            return effect
+        return {
+            **effect,
+            "state_input_id": actual,
+            "effect_mode": "sequence_mutation",
+            "sequence_policy": "duplicates",
+        }
+
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
         effects = attributes.get("loop_state_effects")
         if not effects:
             continue
+        forwarded = tuple(forwarded_effect(effect) for effect in effects)
         retained = tuple(
-            effect for effect in effects
+            effect for effect in forwarded
             if not (
                 effect.get("effect_mode", "opaque") == "opaque"
                 and int(effect["effect_node_id"]) in linked_calls
             )
         )
-        if len(retained) != len(effects):
+        if retained != tuple(effects):
             data["attributes"] = {**attributes, "loop_state_effects": retained}
 
 
