@@ -1674,6 +1674,36 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
     return result
 
 
+def _returned_formal_sequence_aliases(
+    graph_obj: Any, function_table: Any, *,
+    call_result_kinds: Mapping[int, str] | None = None,
+) -> dict[int, tuple[int, str]]:
+    """Rule 8 for a whole sequence result.
+
+    A call whose result is its caller argument's own list (``def mk(a):
+    return a``) is that list: the planner's identity forwarding of a
+    returned formal, read for a sequence actual.  The call owns no storage
+    of its own, so it names the actual's arena and kind.
+    """
+
+    forwarded = {}
+    for call_id, actual_id in _identity_return_aliases(
+        graph_obj, function_table,
+    ).items():
+        call_data = graph_obj.nodes.get(int(call_id), {})
+        if (call_data.get("attributes") or {}).get("callee_ref") is None:
+            continue
+        actual_data = graph_obj.nodes.get(int(actual_id), {})
+        value_id = int(actual_data.get("value_id", actual_id))
+        kind = str(
+            (actual_data.get("attributes") or {}).get("aggregate_kind")
+            or dict(call_result_kinds or {}).get(value_id, "")
+        )
+        if kind in {"list", "bytes", "bytearray"}:
+            forwarded[int(call_data.get("value_id", call_id))] = (value_id, kind)
+    return forwarded
+
+
 def _static_mapping_capacity_bounds(
     graph_obj: Any,
     *,
