@@ -1126,7 +1126,7 @@ def _canonical_sequence_dtype(dtype: str | None) -> str | None:
     construction instead of requiring them to be reconciled after the
     fact.
     """
-    if dtype in {"int", "int8", "int16", "int32", "i32"}:
+    if dtype in {"int", "int8", "int16", "int32"}:
         return "int64"
     return dtype
 
@@ -23340,7 +23340,7 @@ def lower_class_navigation_to_ssa(
                 dtype=dtype, stage=CONTROL_SSA_ENTRY,
             )
 
-        def emit(self, operation: Handler, args=(), *, dtype="i32", **attributes):
+        def emit(self, operation: Handler, args=(), *, dtype="int32", **attributes):
             result = SSAValue(self._mint(
                 CONTROL_CONST if operation is Handler.Const else CONTROL_EXPRESSION,
                 args, dtype,
@@ -23350,7 +23350,7 @@ def lower_class_navigation_to_ssa(
             ))
             return result
 
-        def constant(self, value: int, *, dtype="i32"):
+        def constant(self, value: int, *, dtype="int32"):
             return self.emit(Handler.Const, dtype=dtype, value=int(value))
 
         def finish(self, results: list[SSAValue]):
@@ -23359,7 +23359,7 @@ def lower_class_navigation_to_ssa(
                 "entry": BasicBlock("entry", self.instructions),
             })
 
-    lookup = Builder(f"{namespace}.lookup", ("i32",))
+    lookup = Builder(f"{namespace}.lookup", ("int32",))
     lookup_result = lookup.constant(-1)
     for record in lut_classes:
         class_id = lookup.constant(record["class_index"])
@@ -23371,7 +23371,7 @@ def lower_class_navigation_to_ssa(
     lookup_function = lookup.finish([lookup_result])
 
     permission = Builder(
-        f"{namespace}.evaluate_permission", ("i32", "i32"),
+        f"{namespace}.evaluate_permission", ("int32", "int32"),
     )
     present = permission.emit(Handler.And, permission.args)
     permitted = permission.emit(
@@ -23380,7 +23380,7 @@ def lower_class_navigation_to_ssa(
     permission_function = permission.finish([permitted])
 
     resolve = Builder(
-        f"{namespace}.resolve_member", ("i32", "i32", "i32"),
+        f"{namespace}.resolve_member", ("int32", "int32", "int32"),
     )
     resolved_kind = resolve.constant(-1)
     resolved_reference = resolve.constant(-1)
@@ -23426,7 +23426,7 @@ def lower_class_navigation_to_ssa(
     ])
 
     instantiate = Builder(
-        f"{namespace}.instantiate", ("i32", "i32"),
+        f"{namespace}.instantiate", ("int32", "int32"),
     )
     new_reference = instantiate.constant(-1)
     init_reference = instantiate.constant(-1)

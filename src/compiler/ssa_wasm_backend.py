@@ -22,6 +22,17 @@ from .wasm_binary import (
 )
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 @dataclass(frozen=True, slots=True)
 class WasmEmissionShortfall:
     operation: str
@@ -220,8 +231,9 @@ def emit_ssa_function_to_wasm(
         if op in {"Cast", "CastLike", "cast_like"} and len(args) >= 1:
             target = str(
                 instruction.attributes.get("target_dtype")
-                or instruction.res.dtype
-                or "float64"
+                or _settled_dtype(
+                    instruction.res.dtype, instruction.res.id,
+                    "Cast target_dtype attribute or result dtype")
             ).casefold()
             get(args[0])
             if target in {"bool", "i1"}:

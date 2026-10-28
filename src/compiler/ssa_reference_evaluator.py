@@ -58,6 +58,17 @@ from typing import Any, Callable, Iterable, Mapping
 import numpy as np
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 class SSAEvaluationError(RuntimeError):
     """An instruction this evaluator cannot execute faithfully."""
 
@@ -539,7 +550,7 @@ def bind_program_abi_arguments(
                 a for a in function.args if int(a.id) == value_id
             )
             shape = tuple(argument.shape or ())
-            dtype = str(argument.dtype or "float64")
+            dtype = str(_settled_dtype(argument.dtype, argument.id, "function argument dtype"))
             if shape:
                 arguments[value_id] = np.zeros(
                     int(np.prod(shape)),
@@ -987,8 +998,9 @@ class SSAReferenceEvaluator:
                 payload,
                 str(
                     (instruction.attributes or {}).get("target_dtype")
-                    or getattr(result, "dtype", None)
-                    or "float64"
+                    or _settled_dtype(
+                        getattr(result, "dtype", None), result.id,
+                        "Cast target_dtype attribute or result dtype")
                 ),
             )
             return
@@ -1129,7 +1141,7 @@ class SSAReferenceEvaluator:
                         values, instruction.args[count_position],
                     )).reshape(-1)[0])
                 count = max(1, count)
-                dtype = str(formal.dtype or actual.dtype or "float64").lower()
+                dtype = str(formal.dtype or _settled_dtype(actual.dtype, actual.id, "actual argument dtype")).lower()
                 held = np.zeros(
                     count,
                     dtype=(

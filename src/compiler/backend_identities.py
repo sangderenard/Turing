@@ -240,7 +240,7 @@ def _shader_float32_storage(
     targets = ("glsl", "webgpu")
     before = _topology_sha(module)
     found = sum(
-        dtype in {"float64", "double", "f64"}
+        dtype == "float64"
         for _function, _value, dtype in _dtype_topology(module)
     )
     reasons = []
@@ -269,7 +269,7 @@ def _shader_float32_storage(
                 if id(value) in seen:
                     continue
                 seen.add(id(value))
-                if str(value.dtype).lower() in {"float64", "double", "f64"}:
+                if value.dtype == "float64":
                     value.dtype = "float32"
         applied = True
         reasons.append(

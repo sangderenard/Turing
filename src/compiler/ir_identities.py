@@ -572,8 +572,8 @@ def drop_dead_pure_region_calls(functions) -> int:
 #: cannot be allowed to disagree.
 _NARROW_LIMB_ELEMENTS = frozenset({"float32", "f32", "single"})
 
-_FLOAT64_SPELLINGS = frozenset({"float64", "double", "f64"})
-_INT64_SPELLINGS = frozenset({"int64", "i64", "long"})
+_FLOAT64_SPELLINGS = frozenset({"float64"})
+_INT64_SPELLINGS = frozenset({"int64"})
 
 
 def narrow_float64_to_float32(module) -> int:
@@ -612,9 +612,13 @@ def narrow_float64_to_float32(module) -> int:
             "sections: there are no limbs carrying the precision that "
             "narrowing would rely on, so this would only lose digits"
         )
-    declared = {
-        str(contract.get("element") or "float64") for contract in contracts
-    }
+    for contract in contracts:
+        if not contract.get("element"):
+            raise ValueError(
+                "narrow_float64_to_float32 refuses a precision section "
+                f"contract with no recorded limb element: {contract!r}"
+            )
+    declared = {str(contract["element"]) for contract in contracts}
     unsupported = {
         element for element in declared
         if element not in _NARROW_LIMB_ELEMENTS
