@@ -11546,11 +11546,19 @@ def _field_slot_ops(
                         source_data.setdefault("attributes", {})[
                             "sequence_column_dtypes"
                         ] = (str(declared_dtype),)
-                sequence_initializations.append((
-                    int(source_id),
-                    "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
-                    int(constructor_mapping_contracts.get(int(source_id), {}).get("mapping_key_column_count", 1)) + _mapping_value_column_count(constructor_mapping_contracts.get(int(source_id), {})) if aggregate_kind == "dict" else 1,
-                ))
+                # A field written from a constructor PARAMETER is the
+                # caller's own list (rule 8: one owner, the actual's
+                # storage).  Its descriptor is the formal's, born by the
+                # caller; initializing it here would reset the caller's
+                # length to zero (``Bag(a)`` read back an empty ``a``).
+                if (source_data.get("attributes") or {}).get(
+                    "binding_kind"
+                ) != "parameter":
+                    sequence_initializations.append((
+                        int(source_id),
+                        "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
+                        int(constructor_mapping_contracts.get(int(source_id), {}).get("mapping_key_column_count", 1)) + _mapping_value_column_count(constructor_mapping_contracts.get(int(source_id), {})) if aggregate_kind == "dict" else 1,
+                    ))
                 storage_identity = f"{owner}.{canonical_field(str(attribute))}"
                 if storage_identity in retained_storage_identities:
                     retained_sequence_ids.add(int(source_id))
@@ -11798,9 +11806,14 @@ def _field_slot_ops(
                 # REAL(8) to the helper's INTEGER(8) formal.  Rule: the
                 # default keeps the authored literal's own type.
                 table_lookup_defaults[result_id] = literal
-            elif isinstance(literal, tuple) and not literal or isinstance(default_data.get("expr_obj"), ast.Tuple) and not default_data["expr_obj"].elts:
+            elif isinstance(literal, (tuple, list)) and not literal or isinstance(default_data.get("expr_obj"), (ast.Tuple, ast.List)) and not default_data["expr_obj"].elts:
                 # Keep the authored empty alternative. Integer handle zero
                 # is a valid child row, not the missing tuple.
+                # Program: ``for t in self.d.get(k, []): s += t`` over a
+                # dict-of-lists field.  Wrong record: only ``()`` was kept,
+                # so ``[]`` was dropped and a missing key read child row 0
+                # (silent 77 for 70).  Rule: an empty list is the same empty
+                # alternative.
                 table_lookup_defaults[result_id] = ()
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
@@ -22408,6 +22421,17 @@ def _settle_linked_dynamic_sequences(
             # capacity (code 75).  Rule: a merged list is a local list
             # like a display; its leaf rows bound it when nothing grows it.
             if isinstance(data.get("expr_obj"), ast.List)
+            # A dict display with a runtime value.  An all-literal dict passed
+            # to a call binds as a static literal whose callee table differs
+            # from the caller's (``k in d`` answered False), so it keeps its
+            # refusal until that binding is one descriptor.
+            or (
+                isinstance(data.get("expr_obj"), ast.Dict)
+                and not all(
+                    isinstance(item, ast.Constant)
+                    for item in data["expr_obj"].values
+                )
+            )
             or (
                 (data.get("attributes") or {}).get("producer_kind")
                 == "aggregate_phi"
@@ -44646,6 +44670,22 @@ def _class_surface_ssa_program(
                     caller_aliases = _concordant_function_aliases(caller)
                     for parameter_id in constructor_parameter_ids:
                         actual_id = int(remap[parameter_id])
+                        # Rule 8: an actual that is a forwarded call result
+                        # (``Bag(same(a))``) is the argument's own list.  The
+                        # constructor's list field is that ONE sequence, so
+                        # the formal binds the resident root's descriptor, not
+                        # a second sequence naming the same members.
+                        resident_actual = int(caller_aliases.get(actual_id, actual_id))
+                        if (
+                            resident_actual != actual_id
+                            and caller_sequences.by_id(actual_id) is None
+                            and caller_sequences.by_id(resident_actual) is not None
+                            and constructor_sequences.by_id(int(constructor_aliases.get(
+                                parameter_id, parameter_id,
+                            ))) is not None
+                        ):
+                            actual_id = resident_actual
+                            remap[parameter_id] = actual_id
                         _bind_sequence_storage_members(
                             remap,
                             constructor_sequences.by_id(int(constructor_aliases.get(

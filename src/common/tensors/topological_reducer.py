@@ -4937,6 +4937,60 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
                         ))),
                     )
                     changed = True
+        if (
+            not conditional_phi
+            and str(data.get("type") or data.get("op") or "").casefold() == "phi"
+            and (data.get("attributes") or {}).get("aggregate_index") is not None
+        ):
+            # Program: ``return (x + 1, y * 2)`` beside ``return None``
+            # (corpus c306, c689, c30).  Wrong record: the returned tuple's
+            # member merge (``aggregate_index`` k of the tuple's
+            # ``aggregate_phi``) had its arms' classes but no class of its
+            # own, so ``a, b = f`` after the ``None`` guard had members
+            # described by nothing.  Rule: a member merge has the builtin
+            # scalar class its present arms ALL carry (an arm with no class,
+            # or two classes, leaves it classless), DERIVED from its own cell
+            # and the arm class cells; it is a plain class agreement, not the
+            # tagged-union merge.
+            member_id = int(data.get("value_id", node_id))
+            if page.latest((scope, member_id)) is None:
+                member_arms = tuple(
+                    int(parent) for parent, role in data.get("parents") or ()
+                    if str(role) != "test" and int(parent) in target
+                )
+                arm_cells = tuple(
+                    book.latest_ref(SOURCE_VALUE_CLASS, (scope, int(
+                        target.nodes[arm].get("value_id", arm)
+                    )))
+                    for arm in member_arms
+                )
+                if member_arms and all(cell is not None for cell in arm_cells):
+                    arm_facts = {
+                        (
+                            _canonical_source_class_identity(
+                                page.cell(cell.row, cell.column)[0]
+                            ),
+                            int(page.cell(cell.row, cell.column)[1]),
+                        )
+                        for cell in arm_cells
+                    }
+                    if len(arm_facts) == 1 and next(iter(arm_facts))[0] in {
+                        "builtins.int", "builtins.bool", "builtins.float",
+                    }:
+                        member_class, member_limbs = next(iter(arm_facts))
+                        _concord_source_value_class(
+                            scope, member_id, member_class,
+                            precision_limbs=member_limbs,
+                            source="aggregate member arm classes",
+                            provenance=_Derived(tuple(dict.fromkeys(
+                                cell for cell in (
+                                    node_identity_cell(graph, int(node_id)),
+                                    *arm_cells,
+                                ) if cell is not None
+                            ))),
+                        )
+                        changed = True
+            continue
         if conditional_phi:
             roles = ("body", "orelse")
         elif isinstance(expression, ast.BinOp):
@@ -6334,6 +6388,12 @@ def _normalize_lexical_values(
             if isinstance(literal_expression.value, float)
             else "builtins.str"
             if isinstance(literal_expression.value, str)
+            # The literal ``None`` is the one value of ``NoneType``: its
+            # class is the literal's own, DERIVED from its literal cell, so
+            # an ``x if c else None`` arm or ``f is None`` operand is a
+            # described producer rather than a classless one.
+            else "builtins.NoneType"
+            if literal_expression.value is None
             else None
         )
         if literal_class is not None:
@@ -25611,10 +25671,71 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 output_count = len(tuple(
                     callee.graph.get("function_outputs") or ()
                 ))
-                if 1 < output_count == len(returned_value_ids):
+                # One returned value that is a tuple (``return (a, b)`` or
+                # the merge of several return sites) is its own members:
+                # the aggregate's recorded leaf ids.
+                member_value_ids = (
+                    returned_value_ids
+                    if 1 < output_count == len(returned_value_ids) else None
+                )
+                if member_value_ids is None and output_count == 1 == len(
+                    returned_value_ids
+                ):
+                    returned_attributes = callee.nodes[
+                        returned_value_ids[0]
+                    ].get("attributes") or {}
+                    if returned_attributes.get("aggregate_kind") == "tuple":
+                        member_value_ids = tuple(
+                            int(leaf) for leaf in returned_attributes.get(
+                                "aggregate_leaf_value_ids"
+                            ) or ()
+                            if int(leaf) in callee
+                        ) or None
+                if member_value_ids is not None:
+                    output_count = len(member_value_ids)
                     member_book = current_identity_book()
                     member_page = member_book.page(_SOURCE_VALUE_CLASS)
-                    for member_id in tuple(caller.successors(int(call_id))):
+                    # Program: ``f = pair(n, m) if m > 0 else None`` then
+                    # ``f[0]`` after an ``is None`` guard (corpus c306, c689).
+                    # The member's base is the conditional expression whose
+                    # one arm is this call and whose other arm is the literal
+                    # ``None``; the guard leaves only the call arm, so the
+                    # member is the callee's returned value at that position.
+                    # An arm pair that is anything else is no such wrapper.
+                    def _call_or_none_wrapper(wrapper_id):
+                        wrapper = caller.nodes[wrapper_id]
+                        if str(wrapper.get("type") or "").casefold() != "ifexp":
+                            return False
+                        arms = {
+                            str(role): int(parent)
+                            for parent, role in wrapper.get("parents") or ()
+                            if str(role) in {"body", "orelse"}
+                        }
+                        if set(arms) != {"body", "orelse"} or int(
+                            call_id
+                        ) not in arms.values():
+                            return False
+                        other = next(
+                            arm for arm in arms.values() if arm != int(call_id)
+                        )
+                        other_expression = caller.nodes[other].get("expr_obj")
+                        return (
+                            isinstance(other_expression, ast.Constant)
+                            and other_expression.value is None
+                        )
+
+                    member_candidates = tuple(
+                        (member_id, int(base_id))
+                        for base_id in (
+                            int(call_id), *(
+                                wrapper_id
+                                for wrapper_id in caller.successors(int(call_id))
+                                if _call_or_none_wrapper(wrapper_id)
+                            ),
+                        )
+                        for member_id in tuple(caller.successors(base_id))
+                    )
+                    for member_id, member_base in member_candidates:
                         member = caller.nodes[member_id]
                         if str(member.get("type") or "").casefold() != "indexed":
                             continue
@@ -25623,7 +25744,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             for parent, role in member.get("parents") or ()
                         }
                         if (
-                            member_parents.get("base") != int(call_id)
+                            member_parents.get("base") != member_base
                             or member_parents.get("index") not in caller
                         ):
                             continue
@@ -25636,7 +25757,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             -output_count <= position < output_count
                         ):
                             continue
-                        returned_id = returned_value_ids[position]
+                        returned_id = member_value_ids[position]
                         member_class, member_limbs = (
                             _resolved_source_value_class(callee, returned_id)
                         )
@@ -25655,6 +25776,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                                 cell for cell in (
                                     node_identity_cell(
                                         caller_entry.graph, int(member_id),
+                                    ),
+                                    node_identity_cell(
+                                        caller_entry.graph, int(member_base),
                                     ),
                                     member_book.latest_ref(
                                         _SOURCE_VALUE_CLASS,
@@ -25701,6 +25825,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         "graph": callee,
                         "facts": [],
                     })
+                    # What this call record says of the actual's elements
+                    # (None for an actual that carries no element class).
+                    actual_sequence = caller.nodes[int(actual_id)].get(
+                        "attributes"
+                    ) or {}
+                    evidence.setdefault("elements", []).append((
+                        actual_sequence.get("sequence_element_class_ref"),
+                        actual_sequence.get("sequence_element_annotation_cell"),
+                    ))
                     class_page = current_identity_book().page(
                         "source_value_class_concordance"
                     )
@@ -25753,6 +25886,68 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             transfer_cells,
                         ))
         for (callee_scope, formal_id), evidence in formal_evidence.items():
+            # Program: ``span_total(atoms, ...)`` unannotated, called with
+            # ``xs: list[int]`` (corpus c690).  Wrong record: the formal had
+            # no element class, so ``atoms[index]`` had none.  Rule: where
+            # EVERY call record reaching the formal names the same element
+            # class (the called inventory), the formal's rows are that class;
+            # a record naming none, or another, leaves the formal alone.
+            records = tuple(evidence.get("elements") or ())
+            named = {record[0] for record in records}
+            callee_graph = evidence["graph"]
+            formal_attributes = callee_graph.nodes[int(formal_id)].setdefault(
+                "attributes", {}
+            )
+            if (
+                records and len(named) == 1 and None not in named
+                and "sequence_element_class_ref" not in formal_attributes
+                and isinstance(records[0][1], _Ref)
+                and all(isinstance(record[1], _Ref) for record in records)
+            ):
+                element_class = str(next(iter(named)))
+                formal_attributes.update({
+                    "sequence_element_class_ref": element_class,
+                    "sequence_element_annotation_cell": records[0][1],
+                })
+                for index_id in tuple(callee_graph.successors(int(formal_id))):
+                    index_data = callee_graph.nodes[index_id]
+                    index_parents = {
+                        str(role): int(parent)
+                        for parent, role in index_data.get("parents") or ()
+                    }
+                    index_expression = index_data.get("expr_obj")
+                    if (
+                        str(index_data.get("type") or "").casefold() != "indexed"
+                        or index_parents.get("base") != int(formal_id)
+                        or isinstance(getattr(
+                            index_expression, "slice", None
+                        ), ast.Slice)
+                    ):
+                        continue
+                    index_value = int(index_data.get("value_id", index_id))
+                    if current_identity_book().page(
+                        _SOURCE_VALUE_CLASS
+                    ).latest((callee_scope, index_value)) is not None:
+                        continue
+                    index_data.setdefault("attributes", {})[
+                        "result_class_ref"
+                    ] = element_class
+                    _concord_source_value_class(
+                        callee_scope, index_value, element_class,
+                        source="called inventory element class",
+                        provenance=_Derived(tuple(dict.fromkeys(
+                            cell for cell in (
+                                *(record[1] for record in records),
+                                node_identity_cell(
+                                    callee_graph, int(formal_id)
+                                ),
+                                node_identity_cell(
+                                    callee_graph, int(index_id)
+                                ),
+                            ) if cell is not None
+                        ))),
+                    )
+                changed = True
             facts = tuple(evidence["facts"])
             class_page = current_identity_book().page(
                 "source_value_class_concordance"

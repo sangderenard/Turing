@@ -3135,11 +3135,11 @@ class _ControlSSABuilder(TiledObject):
             if target.dtype in {None, "", "unknown"}:
                 continue
             # A row of a list of lists is selected by its row load where the
-            # loop runs, not before any descriptor exists (corpus c777).
+            # loop runs, not before any descriptor exists (corpus c867b).
             if int(iterable_id) in self.consumer_row_loads:
                 continue
             # ... and so is a loop target iterating such a list's rows:
-            # its value is the row handle the loop loads (corpus c779).
+            # its value is the row handle the loop loads (corpus c868b).
             if any(
                 int(outer_id) in self.sequence_child_table_layouts
                 and self.sequence_child_table_layouts[int(outer_id)][0] == 0
@@ -10418,7 +10418,7 @@ class _ControlSSABuilder(TiledObject):
                 return selected_extent
             # An iterated row of a list of lists is selected by its row
             # load, which runs where the row is first asked for (corpus
-            # c777).
+            # c867b).
             row_load = self.consumer_row_loads.pop(iterable_id, None)
             if row_load is not None and iterable_id not in self.external_values:
                 self._emit_sequence_row_load(*row_load)
@@ -19865,7 +19865,7 @@ class _ControlSSABuilder(TiledObject):
             location=f"{path}.step",
         )
         # An extent that loads a row of a list of lists checks its index,
-        # which leaves the preheader in a later block (corpus c777).
+        # which leaves the preheader in a later block (corpus c867b).
         preheader = self.current
         # A resident sequence extent is int64. The old header hard-coded
         # int (i32), while its latch's indexed use settled to i64, producing
@@ -20288,7 +20288,7 @@ class _ControlSSABuilder(TiledObject):
                 )
                 continue
             # The rows of a born list of lists are pool rows: the outer's
-            # column holds their handles (corpus c779), whatever queries
+            # column holds their handles (corpus c868b), whatever queries
             # the loop target.
             outer_descriptor = self.sequence_descriptors.get(int(iterable_id))
             if int(target_id) in self.nested_row_target_ids and not (
@@ -20314,7 +20314,7 @@ class _ControlSSABuilder(TiledObject):
                 },
             )
             # Program: ``for r in g: for x in r`` over a list of lists
-            # (corpus c778).  The outer's column holds row handles, so the
+            # (corpus c868).  The outer's column holds row handles, so the
             # loop target is the handle of a pool row: the inner loop and
             # its queries read that row as any selected child.
             outer = self.sequence_descriptors.get(int(iterable_id))
@@ -26312,7 +26312,7 @@ def _schedule_loop_callsites(
                     if int(target_id) in targets
                 } | {
                     # Program: ``for x in g[n % 3]`` over a list of lists
-                    # (corpus c777).  The iterated row is selected by a row
+                    # (corpus c867b).  The iterated row is selected by a row
                     # load no region owns, so the loop reads that load's
                     # sequence and index.
                     int(read_id)

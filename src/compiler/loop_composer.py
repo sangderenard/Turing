@@ -6383,7 +6383,12 @@ def analyze_shader_loop_reductions(
         # ``previous = value`` is a control-owned iterable load and carried
         # Phi, even when every numerical predicate region folded away. Its
         # exact carried binding is work; no shader closure is required.
-        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings:
+        # Program: ``for t in xs: return t`` then ``return 0``.  Wrong
+        # record: the body has no numerical region, so the loop was blocked
+        # as region-less and dropped with its authored return; the function
+        # always fell through (silent 0 for 70 in a dict-of-lists ``.get``
+        # read).  Rule: a source ``return`` edge is loop work too.
+        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings and not loop.return_controls:
             blockers.append("no-shader-region")
         if (
             loop.source_type == "While"
