@@ -2499,11 +2499,44 @@ def _planned_scalar_dtypes_from(
                             or linked_class or ""
                         ).removeprefix("builtins.")
                     ))
+                    # Program: ``span_total(atoms, ...)`` with ``atoms``
+                    # unannotated, called as ``span_total([n + 1, 4], 0,
+                    # 2)`` (corpus c690).  Wrong record: the callsite
+                    # specialization splits the literal actual into member
+                    # formals (``atoms[1]``) that carry no class of their
+                    # own, so the row read from them had no dtype.  Rule: a
+                    # member formal has the element class the call edge
+                    # settled on the aggregate it belongs to
+                    # (``sequence_element_class_ref``).
+                    if (
+                        attributes.get("aggregate_parent_binding") is not None
+                        and node_id not in scalar
+                    ):
+                        member_classes = {
+                            str((G.nodes[owner].get("attributes") or {}).get(
+                                "sequence_element_class_ref"
+                            ) or "").removeprefix("builtins.")
+                            for owner in G.successors(node_id)
+                            if (G.nodes[owner].get("attributes") or {}).get(
+                                "binding_name"
+                            ) == attributes["aggregate_parent_binding"]
+                        }
+                        if len(member_classes) == 1:
+                            settle(scalar, node_id, classes.get(
+                                next(iter(member_classes))
+                            ))
                     # An annotated collection parameter (``xs: list[int]``)
                     # is a collection: its element class joins its
                     # annotation with its writers, in the collection rule.
+                    # An unannotated one takes its class from its call edge
+                    # (c690): the same ``sequence_element_class_ref``, on a
+                    # parameter whose settled class is the collection's.
                     if (
-                        attributes.get("aggregate_kind") in collection_kinds
+                        (
+                            attributes.get("aggregate_kind") in collection_kinds
+                            or str(attributes.get("result_class_ref") or "")
+                            .removeprefix("builtins.") in collection_kinds
+                        )
                         and (
                             attributes.get("sequence_element_class_ref")
                             or attributes.get("mapping_value_class_ref")
@@ -4984,6 +5017,18 @@ def _build_shell_hierarchy_plan(
                 return record
             node = graph.G.nodes.get(int(value_id), {})
             attributes = node.get("attributes") or {}
+            # A collection the callsite specialization folded from its
+            # actual (an unannotated ``atoms`` bound to ``[a, b]``) keeps
+            # the element class the call edge settled
+            # (``sequence_element_class_ref``): its row is that class.
+            if attributes.get("aggregate_kind") in {"list", "tuple"} and (
+                str(attributes.get("sequence_element_class_ref") or "")
+                .removeprefix("builtins.") in {"int", "float", "bool"}
+            ):
+                return (record[0], record[1], {
+                    "int": "int64", "float": "float64", "bool": "bool",
+                }[str(attributes["sequence_element_class_ref"])
+                  .removeprefix("builtins.")])
             if attributes.get("program_abi_record_identity"):
                 # A record value is a handle onto its fields' storage.
                 return (record[0], record[1], "opaque_ref")
@@ -5050,6 +5095,30 @@ def _build_shell_hierarchy_plan(
                     )
                 )
                 for source in nx.ancestors(graph.G, int(value_id))
+            ):
+                return None
+            # An unannotated collection parameter (``atoms``): its element
+            # class is the callers' actuals', carried by the call edge
+            # (``numeric_identity_source`` names it) and settled in the
+            # linked ABI after this plan; the rows read from it get their
+            # row then.  A formal with no call edge has no such evidence.
+            if any(
+                (graph.G.nodes[source].get("attributes") or {}).get(
+                    "binding_kind"
+                ) == "parameter"
+                and str((graph.G.nodes[source].get("attributes") or {}).get(
+                    "result_class_ref"
+                ) or "").removeprefix("builtins.")
+                in {"list", "tuple", "set", "dict"}
+                and not (graph.G.nodes[source].get("attributes") or {}).get(
+                    "sequence_element_class_ref"
+                )
+                and "call actual" in str((graph.G.nodes[source].get(
+                    "attributes"
+                ) or {}).get("numeric_identity_source") or "")
+                for source in (
+                    int(value_id), *nx.ancestors(graph.G, int(value_id)),
+                )
             ):
                 return None
             raise ValueError(
@@ -29423,6 +29492,42 @@ def _post_callsite_loop_element_classes(
         cells = tuple(cell for cell in cells if cell is not None)
         return (element_class, cells) if cells else None
 
+    def declared_actual_element_class(
+        actual_id: int, formal_id: int,
+    ) -> tuple[str, tuple[Any, ...]] | None:
+        """Read the element class an annotated actual declares.
+
+        Program: ``def span_total(atoms, ...)`` (no annotation) called as
+        ``span_total(xs, ...)`` from ``def forward(xs: list[int], ...)``
+        (corpus c690).  Wrong record: the formal states no element class
+        and the actual's ``list[int]`` annotation, the one place the
+        class is written, was not read at this call edge, so the rows read
+        from ``atoms`` had no dtype.  Rule: a formal with no element class
+        of its own takes the one its actual's annotation records, with
+        that annotation's cell as the source.
+        """
+
+        formal = (specialized.G.nodes[formal_id].get("attributes") or {})
+        if (
+            formal.get("sequence_element_class_ref")
+            or formal.get("sequence_element_annotation_cell") is not None
+        ):
+            return None
+        actual = (caller.G.nodes.get(int(actual_id)) or {}).get(
+            "attributes"
+        ) or {}
+        annotation_cell = actual.get("sequence_element_annotation_cell")
+        element_class = str(actual.get("sequence_element_class_ref") or "")
+        if (
+            actual.get("binding_kind") != "parameter"
+            or element_class not in {
+                "builtins.int", "builtins.float", "builtins.bool",
+            }
+            or annotation_cell is None
+        ):
+            return None
+        return element_class, (annotation_cell,)
+
     receiver, positional, _all = _method_parameter_layout(specialized.G)
     formal_ids = {
         str(name): tuple(map(int, history or ()))
@@ -29455,6 +29560,10 @@ def _post_callsite_loop_element_classes(
         if len(formal_candidates) != 1:
             continue
         formal_id = int(formal_candidates[0])
+        if abi_element_class is None:
+            abi_element_class = declared_actual_element_class(
+                int(actual_id), formal_id,
+            )
         leaves = _authored_aggregate_leaves(caller, int(actual_id))
         if leaves and not _aggregate_binds_by_member(
             caller.G, int(actual_id), specialized.G, parameter, int(call_id),
@@ -29564,6 +29673,26 @@ def _post_callsite_loop_element_classes(
             # shell key and its exact member/ProgramABI cells are the source
             # of this derived formal view.
             formal_attributes["sequence_element_class_ref"] = exact_class
+            # An unannotated formal is an aggregate only through its
+            # actual (c690): when the actual is itself an aggregate
+            # parameter, the formal is bound to that storage and has its
+            # aggregate record, so a read of it is a load from that
+            # storage and not a scalar read.
+            actual_record = caller.G.nodes[int(actual_id)].get(
+                "attributes"
+            ) or {}
+            if (
+                formal_attributes.get("aggregate_kind") is None
+                and actual_record.get("producer_kind")
+                == "aggregate_parameter"
+                and actual_record.get("aggregate_kind") in {"list", "tuple"}
+            ):
+                for record_key in (
+                    "producer_kind", "aggregate_kind",
+                    "sequence_key_columns", "sequence_column_count",
+                    "sequence_writable",
+                ):
+                    formal_attributes[record_key] = actual_record[record_key]
             formal_attributes[
                 "callsite_sequence_element_class_fact"
             ] = class_fact
