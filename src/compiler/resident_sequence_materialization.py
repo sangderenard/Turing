@@ -1912,18 +1912,39 @@ def _static_mapping_capacity_bounds(
                 keys[int(node_id)] = set(attributes["value"])
             except TypeError:
                 unknown.add(int(node_id))
+    # Program: ``d[(1, n, 2)] = 5; d[(1, n + 1, 2)] = 6`` (string core
+    # ``key = (domain, hi, lo, count)``).  Wrong record: a tuple subscript's
+    # store names one ``index`` parent per component, and the role map kept
+    # only the last one, so both stores read as the literal key ``2``; the
+    # universe bound was one row and the second insert reported full
+    # (validation 75).  Rule: a store's key is all its index components,
+    # in order; it is literal only when every component is.
+    def literal_store_key(index_ids):
+        components = tuple(
+            ast.literal_eval(graph_obj.nodes[int(index)].get("expr_obj"))
+            for index in index_ids
+        )
+        return components[0] if len(components) == 1 else components
+
+    store_index_ids = {}
+    for store_id, store in graph_obj.nodes(data=True):
+        if str(store.get("type") or store.get("op") or "").casefold() == "indexedstore":
+            store_index_ids[int(store.get("value_id", store_id))] = tuple(
+                int(parent) for parent, role in store.get("parents") or ()
+                if str(role) == "index"
+            )
     for mutation in _source_mapping_mutations(graph_obj):
         destination = int(mutation.sequence_value_id)
         if mutation.operator == "replace":
             copies[destination] = int(mutation.argument_value_ids[0])
             keys.setdefault(destination, set())
         elif mutation.operator == "update":
+            store_key = store_index_ids.get(int(mutation.effect_node_id))
             for key_id in mutation.argument_value_ids[::2]:
-                data = graph_obj.nodes.get(int(key_id), {})
                 try:
-                    key = ast.literal_eval(data.get("expr_obj"))
+                    key = literal_store_key(store_key or (key_id,))
                     keys.setdefault(destination, set()).add(key)
-                except (ValueError, TypeError):
+                except (KeyError, ValueError, TypeError):
                     unknown.add(destination)
     # Program: ``s = {1, 2}; for i in ...: s.add(i * 3)`` (scratch c_s2).
     # Wrong record: the add's node is a method call of the recorded
@@ -1984,7 +2005,10 @@ def _static_mapping_capacity_bounds(
             destination = int(aliases.get(roles.get("base"), roles.get("base", -1)))
             if destination in keys:
                 try:
-                    key = ast.literal_eval(graph_obj.nodes[roles["index"]].get("expr_obj"))
+                    key = literal_store_key(tuple(
+                        int(parent) for parent, role in data.get("parents") or ()
+                        if str(role) == "index"
+                    ) or (roles["index"],))
                     keys[destination].add(key)
                 except (KeyError, ValueError, TypeError):
                     unknown.add(destination)
