@@ -572,8 +572,8 @@ def drop_dead_pure_region_calls(functions) -> int:
 #: cannot be allowed to disagree.
 _NARROW_LIMB_ELEMENTS = frozenset({"float32", "f32", "single"})
 
-_FLOAT64_SPELLINGS = frozenset({"float64", "double", "f64"})
-_INT64_SPELLINGS = frozenset({"int64", "i64", "long"})
+_FLOAT64_SPELLINGS = frozenset({"float64"})
+_INT64_SPELLINGS = frozenset({"int64"})
 
 
 def narrow_float64_to_float32(module) -> int:

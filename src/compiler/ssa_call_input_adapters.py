@@ -697,7 +697,6 @@ def _infer_pointer_storage(functions, native_storage=None):
     two authorities depending on which implementation was installed.  Rule:
     the witness scan below is the one publisher; the accelerator's answer is
     a cross-check, and a disagreement refuses."""
-    canonical = {'double': 'float64', 'float': 'float32', 'i64': 'int64', 'i32': 'int32', 'i1': 'bool'}
     for function in functions.values():
         instructions = [instruction for block in function.blocks.values() for instruction in block.instrs]
         for formal in function.args:
@@ -731,14 +730,14 @@ def _infer_pointer_storage(functions, native_storage=None):
                     dtype = instruction.args[0].dtype
                     witnesses.append(instruction.args[0])
                 if dtype is not None:
-                    types.add(canonical.get(dtype, dtype))
+                    types.add(dtype)
             native = (
                 None if native_storage is None
                 else native_storage.get((function.name, int(formal.id)))
             )
             if len(types) == 1 and 'ptr' not in types:
                 inferred = next(iter(types))
-                if native is not None and canonical.get(native, native) != inferred:
+                if native is not None and native != inferred:
                     from .identity_concordance import ConcordanceRefusal
                     raise ConcordanceRefusal(
                         'pointer storage inference disagrees with the native '
@@ -820,10 +819,6 @@ def scalar_region_formal(callee, formal):
 
 def physical_call_input_conflicts(functions):
     """Collect the whole frontier before inference mutates any value types."""
-    canonical = {
-        'double': 'float64', 'float': 'float32',
-        'i64': 'int64', 'i32': 'int32', 'i1': 'bool',
-    }
     conflicts = []
     for caller in functions.values():
         for block in caller.blocks.values():
@@ -847,8 +842,6 @@ def physical_call_input_conflicts(functions):
                     formal_type = (formal.accounting or {}).get('physical_dtype') or formal.dtype
                     if scalar_region_formal(callee, formal):
                         formal_type = formal.dtype
-                    actual_type = canonical.get(actual_type, actual_type)
-                    formal_type = canonical.get(formal_type, formal_type)
                     if (actual_type in {None, '', 'unknown', 'ptr'} or formal_type in {None, '', 'unknown', 'ptr'}
                             or actual_type == formal_type):
                         continue
@@ -876,7 +869,6 @@ def _read_only_module_inputs(functions):
     blocked = [0] * len(identities)
     kinds, results, offsets, operands, formals, writes = [], [], [0], [], [], []
     active, memory_addresses, memory_dtypes = [], [], []
-    canonical = {'double': 'float64', 'float': 'float32', 'i64': 'int64', 'i32': 'int32', 'i1': 'bool'}
     dtype_ids = {'ptr': 1}
     for function in functions.values():
         interface = function.metadata.get('native_interface') or function.metadata.get('linked_piece_interface')
@@ -903,7 +895,7 @@ def _read_only_module_inputs(functions):
                 if memory_dtype is None:
                     memory_dtypes.append(0)
                 else:
-                    dtype = canonical.get(memory_dtype, memory_dtype)
+                    dtype = memory_dtype
                     memory_dtypes.append(dtype_ids.setdefault(dtype, len(dtype_ids) + 1))
                 callee = functions.get(str(instruction.attributes.get('callee', '')))
                 matched = callee is not None and len(instruction.args) == len(callee.args)
