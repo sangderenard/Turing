@@ -24453,12 +24453,12 @@ def _class_surface_ssa_program(
                     primitive_receipt = receipt
                 if not storage and primitive_receipt is not None:
                     storage = str(primitive_receipt["storage"])
-            if storage in {"keyed", "table"}:
-                # Keyed/table are ProgramABI access policies over the existing
-                # descriptor-backed resident sequence storage.  A semantic
-                # union arm records the physical kind, while storage_identity
-                # below retains the exact authored table/key declaration.
-                storage = "sequence"
+            # Keyed/table are ProgramABI access policies over the existing
+            # descriptor-backed resident sequence storage.  A semantic
+            # union arm records the physical kind, while storage_identity
+            # below retains the exact authored table/key declaration.
+            from .concordance_declarations import POLICY_PHYSICAL_KIND
+            storage = POLICY_PHYSICAL_KIND.get(storage, storage)
             dtype = str(
                 contract.get("dtype") or node_abi.get("program_abi_dtype")
                 or (primitive_receipt or {}).get("dtype")
@@ -29010,7 +29010,61 @@ def _class_surface_ssa_program(
                 sequence_declarations
             ):
                 sequence_id = int(sequence_id)
-                if sequence_id in native_value_type_abi:
+                settled_abi = native_value_type_abi.get(sequence_id)
+                # Program: ``excluded: frozenset[Any]`` read by ``in`` on a
+                # record (test_sequence_contract_concordance).  Wrong record:
+                # the linked snapshot arm stated the ProgramABI field's
+                # declared ``span`` while SEQUENCE_CONTRACT made the value a
+                # descriptor-backed resident, and the SSA row says
+                # ``sequence``.  Rule: SEQUENCE_CONTRACT owns a resident
+                # collection's physical kind; the settled arm keeps its
+                # dtype/shape and takes its storage from that contract.
+                if settled_abi is not None:
+                    settled_arms = tuple(settled_abi.physical_alternatives)
+                    if len(settled_arms) != 1 or settled_arms[0].storage != "span":
+                        continue
+                    from .identity_concordance import (
+                        committed_sequence_contract as _late_committed,
+                    )
+                    if _late_committed(str(symbol), sequence_id) is None:
+                        continue
+                    # The arm and the SSA row describe one resident.  An arm
+                    # sourced from a ``parameter_annotation`` cell is a
+                    # declared parameter's own value: its physical kind is
+                    # the parameter's ProgramABI declaration
+                    # (``parameter_abi_kind``, where the SSA row posts
+                    # ``span``), so SEQUENCE_CONTRACT does not restate it.
+                    if any(
+                        getattr(cell.page, "name", cell.page) == "parameter_annotation"
+                        for cell in settled_arms[0].source_cells
+                    ):
+                        continue
+                    from dataclasses import replace as _replace
+                    contract_cell = late_book.latest_ref(
+                        _LATE_SEQUENCE_CONTRACT, (str(symbol), sequence_id),
+                    )
+                    arm = _replace(
+                        settled_arms[0], storage="sequence",
+                        source_cells=tuple(dict.fromkeys((
+                            *settled_arms[0].source_cells, *((contract_cell,) if contract_cell is not None else ()),
+                        ))),
+                    )
+                    fact = _LateValueTypeABIFact(
+                        settled_abi.alternatives, settled_abi.tags, (arm,),
+                    )
+                    row = (tuple(late_type_scope), sequence_id)
+                    incumbent = late_book.latest_ref(_LATE_VALUE_TYPE_ABI, row)
+                    late_book.post(
+                        _LATE_VALUE_TYPE_ABI, row, fact,
+                        stage=SHELL_HANDOFF,
+                        provenance=_LateDerived(tuple(dict.fromkeys(cell for cell in (
+                            incumbent,
+                            _identity_cell(graph_obj, sequence_id),
+                            *arm.source_cells,
+                        ) if cell is not None))),
+                        mode=Mode.REVISE,
+                    )
+                    native_value_type_abi[sequence_id] = fact
                     continue
                 class_row = (late_numeric_scope, sequence_id)
                 class_cell = late_book.latest_ref(
