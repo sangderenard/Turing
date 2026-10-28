@@ -20,3 +20,12 @@
   7. The caller's value keeps its own interval (it is compared before the guard). The narrowed interval at the call is posted on `guarded_call_actual_range`. The call edge converts int64 into a uint64 formal only where that row (or the value's own row) proves it non-negative, and int64 into int128 always. That conversion loses nothing; any other mismatch stays a named conflict.
 - Measured: c795 refuses on main and passes here on C and LLVM (3 inputs).
 - Still open: an unproven caller-side product such as `given_hi * 4294967296` is int64 arithmetic, so it wraps when a Python caller passes values past int64. That is the overflow-checked int64 promoting to Precision decided for the next step.
+
+## A tuple no caller passes (corpus c796)
+
+- Program: in the whole-core product, `_intern_validated_span`'s only caller (`intern_batch`) omits `fingerprint` (default `None`). So `hi, lo = fingerprint` never runs, and `hi, lo` are exactly the uint64 pair from `_fingerprint_span`.
+- Refusal on main: "sequence row dtype concordance disagreement ... value 78: recorded=('int64', 'int64', 'int64', 'int64', 'int64') ... table store operands says ('int64', 'uint64', 'uint64', 'int64', 'int64')". The `_candidates` key columns settled int64 because the unpacked members were unbounded, which made the `hi, lo` merge unbounded.
+- Rules:
+  8. When every callsite binds a formal to `None` (or omits it with a `None` default), its unpacked members never hold a value and join as nothing.
+  9. A specialized copy's interval is met with its authored function's interval, because the copy runs a subset of the authored executions. A copy cannot see the callsites, but the authored proof can.
+- Measured: c796 gives the audit's exact error on main and passes here. The whole-core audit gets past value 78 and stops at the next one: "declared call storage for %t... (callee intern_batch) has no recorded dtype".
