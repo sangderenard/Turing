@@ -175,6 +175,14 @@ class Generator:
                 if rng.random() < 0.3:
                     exit_ = f"return {self.result(1)}"
                 lines.append(f"{indent}if ({self.condition(1)}) {{ {exit_}; }}")
+            elif not self.loops and choice < 0.1:
+                # An early return in an arm; the other paths fall through
+                # into the rest of the function.
+                lines.append(
+                    f"{indent}if ({self.condition(1)}) {{ return {self.result(1)}; }}"
+                )
+            elif depth > 0 and choice < 0.18:
+                lines.extend(self.switch_statement(depth - 1, indent))
             elif depth > 0 and choice < 0.25:
                 lines.extend(self.loop_statement(depth - 1, indent))
             elif depth > 0 and choice < 0.5:
@@ -201,7 +209,18 @@ class Generator:
         self.numbers.append(counter)
         label = f"L{self.loop_index}" if rng.random() < 0.35 else None
         prefix = f"{label}: " if label else ""
-        if rng.random() < 0.7:
+        form = rng.random()
+        if form < 0.15:
+            # A do loop tests after its body; it gets no continue, which
+            # would skip the trailing counter increment.
+            lines = [f"{indent}let {counter} = 0;", f"{indent}{prefix}do {{"]
+            self.loops.append(("while", label))
+            lines.extend(self.block(depth, indent + "  "))
+            lines.append(f"{indent}  {counter}++;")
+            self.loops.pop()
+            lines.append(f"{indent}}} while ({guard});")
+            return lines
+        if form < 0.7:
             lines = [
                 f"{indent}{prefix}for ({rng.choice(('let', 'let', 'var'))} "
                 f"{counter} = 0; {guard}; {counter}++) {{"
@@ -220,6 +239,22 @@ class Generator:
         if "for (" in lines[0]:
             # A for-head let is scoped to the loop (a var is not read after).
             self.numbers.remove(counter)
+        return lines
+
+    def switch_statement(self, depth: int, indent: str) -> list[str]:
+        """A switch over a small number, with fallthrough and a default."""
+
+        rng = self.rng
+        lines = [f"{indent}switch ({self.number(1)}) {{"]
+        labels = rng.sample(("0", "1", "2", "-0", "0.5"), rng.randint(1, 3))
+        if rng.random() < 0.6:
+            labels.insert(rng.randint(0, len(labels)), None)
+        for value in labels:
+            lines.append(f"{indent}  {'default' if value is None else 'case ' + value}:")
+            lines.append(f"{indent}    {self.assignment(2)}")
+            if rng.random() < 0.6:
+                lines.append(f"{indent}    break;")
+        lines.append(f"{indent}}}")
         return lines
 
     def if_statement(self, depth: int, indent: str) -> list[str]:
