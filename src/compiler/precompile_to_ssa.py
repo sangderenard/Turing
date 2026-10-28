@@ -5003,6 +5003,12 @@ class _ControlSSABuilder(TiledObject):
                 f"sequence {sequence_id} is declared read-only",
             ))
             return
+        # A selected pool row's columns are the slice addresses built where
+        # the row was selected (see ``_emit_sequence_row_load``).
+        selected_row = (
+            int(sequence_id) in self.child_table_selections
+            and int(sequence_id) in self.sequence_storage_values
+        )
         index = self._sequence_row_index(
             int(sequence_id), int(index_id), index_literal
         )
@@ -5014,7 +5020,10 @@ class _ControlSSABuilder(TiledObject):
             # the other payloads or inventing a temporary row allocation.
             if value_id is None:
                 continue
-            column_value = self.external_value(int(column_id))
+            column_value = (
+                self.sequence_storage_values[int(sequence_id)][int(column)]
+                if selected_row else self.external_value(int(column_id))
+            )
             address = self.fresh_value(
                 dtype="ptr", transform=ADDRESS, operands=(column_value, index),
             )
@@ -5039,7 +5048,9 @@ class _ControlSSABuilder(TiledObject):
             )
         if all(value_id is not None for value_id in row_value_ids):
             self._bind(
-                int(result_id), self.external_value(int(sequence_id)),
+                int(result_id),
+                self.sequence_storage_values[int(sequence_id)][0] if selected_row
+                else self.external_value(int(sequence_id)),
                 BindingKind.SEQUENCE_RESULT,
                 self._sequence_contract_cell(int(sequence_id)), index,
             )
@@ -28242,6 +28253,30 @@ def lower_control_sections_to_ssa(
                 if instruction.res is not None
                 and int(instruction.res.id) in row_store_by_result
             )
+            # Program: ``g[i][1] = v; g[1][0] = g[i][1] + 1`` (corpus c740).
+            # Wrong record: every row load ran before every row store, so a
+            # read after a store saw the old element.  Rule: loads and stores
+            # run in the region's own instruction order, a row's selecting
+            # load placed before its first user.
+            _position = {
+                int(instruction.res.id): index
+                for index, instruction in enumerate(instructions)
+                if instruction.res is not None
+            }
+            _keys = {
+                int(operation[0]): float(_position.get(int(operation[0]), 0))
+                for operation in (*row_loads, *row_stores)
+            }
+            for _ in range(len(_keys) + 1):
+                for operation in (*row_loads, *row_stores):
+                    selector = int(operation[1])
+                    if selector in _keys and _keys[selector] >= _keys[int(operation[0])]:
+                        _keys[selector] = _keys[int(operation[0])] - 0.5
+            _merged = sorted(
+                [("load", operation) for operation in row_loads]
+                + [("store", operation) for operation in row_stores],
+                key=lambda item: _keys[int(item[1][0])],
+            )
             if row_loads or row_stores:
                 removed_results = {
                     int(operation[0]) for operation in (*row_loads, *row_stores)
@@ -28271,21 +28306,27 @@ def lower_control_sections_to_ssa(
                         if instruction.res is None
                         or int(instruction.res.id) not in dead_constants
                     ]
-                for operation in row_loads:
-                    result_id = int(operation[0])
-                    table_region_operations.setdefault(
-                        region_index, []
-                    ).append((
-                        "row_load_capture" if instructions else "row_load",
-                        operation,
-                    ))
-                for operation in row_stores:
+                for role, operation in _merged:
+                    if role == "load":
+                        table_region_operations.setdefault(
+                            region_index, []
+                        ).append((
+                            "row_load_capture" if instructions else "row_load",
+                            operation,
+                        ))
+                        continue
                     result_id, sequence_id = map(int, operation[:2])
                     # Whole-row assignment returns the sequence; a sparse
                     # column assignment retains its already-concorded row
                     # view. Rebinding Store12 from Indexed11 to Sequence10
                     # would publish a second identity for the same effect.
-                    if all(value is not None for value in operation[4]):
+                    # A row of a born list of lists already resolves, by the
+                    # graph, to the list that owns the row (``g[i][1] = v``
+                    # versions ``g``); its row view is not a second identity.
+                    if all(value is not None for value in operation[4]) and (
+                        value_concordance.resolve_alias(control_name, result_id)
+                        == result_id
+                    ):
                         bind_resident(result_id, sequence_id)
                     table_region_operations.setdefault(
                         region_index, []

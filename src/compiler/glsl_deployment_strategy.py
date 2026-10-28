@@ -2881,6 +2881,9 @@ def _planned_scalar_dtypes_from(
                 # Rule: a carried result is the body's value; it holds that
                 # value's element class (and its scalar class).
                 carried = parents(data, "value")[0]
+                if carried in row_element:
+                    # A carried list of lists keeps its row class.
+                    settle(row_element, node_id, row_element[carried])
                 settle(element, node_id, element.get(carried))
                 settle(scalar, node_id, scalar.get(carried))
                 continue
@@ -3123,7 +3126,16 @@ def _planned_scalar_dtypes_from(
                 continue
             if op in {"indexedstore", "setitem"}:
                 base = parents(data, "base")
-                if base:
+                # ``g[i][1] = v`` is a new version of the list of lists
+                # ``g`` (corpus c740): it keeps ``g``'s row class.
+                outer = (
+                    parents(G.nodes[base[0]], "base")
+                    if base and operation(G.nodes[base[0]]) == "indexed" else ()
+                )
+                if outer and outer[0] in row_element:
+                    settle(row_element, node_id, row_element[outer[0]])
+                    settle(element, node_id, "int64")
+                elif base:
                     settle(element, node_id, element.get(base[0]))
                 continue
             if op in {"indexed", "getitem", "subscript"}:

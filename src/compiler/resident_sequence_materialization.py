@@ -777,6 +777,20 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
                  if str(role) == "base" and parent in graph_obj),
                 None,
             )
+            if base is not None and node_kind(base) == "indexed":
+                # ``g[i][1] = v`` writes a row of the list ``g``: its version
+                # is the outer list's storage, not the row view's.
+                outer = next(
+                    (parent for parent, role in graph_obj.nodes[base].get("parents") or ()
+                     if str(role) == "base" and parent in graph_obj
+                     and ((graph_obj.nodes[parent].get("attributes") or {}).get(
+                         "aggregate_kind") == "list"
+                         or (graph_obj.nodes[parent].get("attributes") or {}).get(
+                             "row_store_of_list"))),
+                    None,
+                )
+                if outer is not None:
+                    base = outer
             if base is not None:
                 aliases[value_id_of(node_id)] = value_id_of(base)
             continue
@@ -3676,6 +3690,17 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
     """
 
     outers = set(list_row_displays(graph_obj))
+    # ``g[i][1] = v`` is a new version of ``g`` (a loop may carry it): reads
+    # of any version are reads of the same list of lists.
+    aliases = _loop_carried_storage_aliases(graph_obj)
+    for version in tuple(aliases):
+        root = int(version)
+        for _ in range(len(aliases) + 1):
+            if root not in aliases:
+                break
+            root = int(aliases[root])
+        if root in outers:
+            outers.add(int(version))
     reads = []
     for node_id, data in graph_obj.nodes(data=True):
         if str(data.get("op") or data.get("type") or "").casefold() != "indexed":

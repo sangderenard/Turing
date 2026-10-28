@@ -17663,6 +17663,7 @@ def _sequence_row_operations(
     }
     if not widths:
         return ()
+    nested_row_reads = set(map(int, list_row_reads(graph_obj)))
     identities = graph_obj.graph.get("identity_table") or {}
     resident_by_value = {
         int(value_id): int(sequence_id)
@@ -17811,6 +17812,23 @@ def _sequence_row_operations(
             if base_node is None or row_index_node is None or row_value_node is None:
                 continue
             sequence_id = resident_by_value.get(value_id(base_node))
+            # Program: ``g = [[1, 2], [3, 4]]; g[i][1] = v`` (corpus c740).
+            # Wrong record: the row ``g[i]`` is a declared one-column row
+            # sequence, but the store fell through to the region, where the
+            # row view was an arena formal with no contract.  Rule: a store
+            # into a row read of a born list of lists is a row store on that
+            # row's own sequence, exactly as its reads are row loads.
+            if (
+                sequence_id in positional_sequences
+                and widths[sequence_id] == 1
+                and value_id(base_node) in nested_row_reads
+            ):
+                operations.append((
+                    "store", value_id(node_id), int(sequence_id),
+                    value_id(row_index_node), integer_literal(row_index_node),
+                    (value_id(row_value_node),), value_id(base_node),
+                ))
+                continue
             if sequence_id is None:
                 # ``item.members[index][1]=value`` is a column write to the
                 # existing row, not a dereference of a scalar row payload.
