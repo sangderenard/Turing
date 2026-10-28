@@ -21022,10 +21022,15 @@ def _select_handle_result(
     from ..transmogrifier.ssa import BasicBlock, Instr, SSAValue
 
     (
-        _predicate_id, tag_id, list_id, _true_id, _false_id, roles,
+        predicate_id, tag_id, list_id, _true_id, _false_id, roles,
     ) = selection
     tag = native_call.res
-    if tag is None or int(tag.id) != int(tag_id):
+    if int(predicate_id) in actual_by_formal:
+        # ``def h(a, b, c): return a if c else b``: the predicate the callee
+        # returns is its own formal, so the call's result aliases the
+        # caller's actual for it (frame-aliased); that actual IS the tag.
+        tag = actual_by_formal[int(predicate_id)]
+    elif tag is None or int(tag.id) != int(tag_id):
         raise FortranEmissionError(
             "a call that returns which list arm it took has no tag result: "
             f"callee={record.callee_symbol!r} callsite="
@@ -22350,9 +22355,17 @@ def _settle_linked_dynamic_sequences(
                 (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
             )
         }
+        # ``r = [0] * 3; return r``: a replicated list is born here as a
+        # display is, and is returned to the caller the same way.
+        returned_born_lists = local_lists | {
+            int(node_id) for node_id, data in graph_obj.nodes(data=True)
+            if (data.get("attributes") or {}).get("aggregate_kind") == "list"
+            and (data.get("attributes") or {}).get("producer_kind")
+            == "sequence_replication"
+        }
         seeds.update(
             (id(graph_obj), value_id)
-            for value_id in local_lists & output_ids
+            for value_id in returned_born_lists & output_ids
         )
         # Program: ``a = [n, 1]; t = a if n > 2 else [7, n, 2]; return t``
         # (c743).  The returned merge owns the result storage its arms are
@@ -49940,6 +49953,18 @@ def _class_surface_ssa_program(
                         ), None)
                         if pair is None:
                             continue
+                        caller_lists = all_sequence_tables.get(str(record.caller))
+                        if (
+                            int(pair[0]) == int(predicate_id)
+                            and caller_lists is not None
+                            and caller_lists.by_id(int(pair[1])) is None
+                        ):
+                            # An earlier round of this link already rebound
+                            # the list result to the tag it minted (the
+                            # predicate's caller value is no list): the
+                            # selection exists, and a second tag would
+                            # orphan the first.
+                            break
                         tag_id = mint_compiler_value_id(
                             caller, FRAME_SCAFFOLD,
                             (_frame_value_cell(callee, int(predicate_id)),),

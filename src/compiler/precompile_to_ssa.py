@@ -5007,11 +5007,15 @@ class _ControlSSABuilder(TiledObject):
         fault_exit = self._fault_exit
         returning = self.current
         values = None if returned is None else list(returned)
+        # A returned list (``out[0] = x; return out``) is its sequence
+        # handle, typed by its element dtype: a zero is not that list, so
+        # only scalar outputs are zeroed.
         if values is not None and all(
             value is not None and str(value.dtype) in {
                 "int", "int8", "int16", "int32", "int64", "bool",
                 "float32", "float64",
             }
+            and int(value.id) not in self.sequence_descriptors
             for value in values
         ):
             self.current = fault_exit

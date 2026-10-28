@@ -91,6 +91,7 @@ from .hierarchical_plan import (
 from ..common.tensors.topological_reducer import (
     _append_operand,
     _set_operands,
+    _indexed_store_source,
     _widest_element,
     indexed_store_site_span,
 )
@@ -1235,7 +1236,9 @@ def _returned_parameter_names(callee_graph: Any) -> frozenset[str]:
         for slot in site if slot is not None
     ]
     while pending:
-        node_id = pending.pop()
+        # ``xs[i] = v; return xs`` returns the store version: the list it
+        # writes, by its ``base`` edges, is the returned object.
+        node_id = _indexed_store_source(callee_graph, pending.pop())
         if node_id in seen or node_id not in callee_graph:
             continue
         seen.add(node_id)
@@ -1263,6 +1266,68 @@ def _formal_is_returned(callee_graph: Any, parameter: str) -> bool:
     """
 
     return str(parameter) in _returned_parameter_names(callee_graph)
+
+
+def _call_returned_actuals(caller: Any, call_id: int) -> tuple[int, ...] | None:
+    """The caller actuals a call can return as THEMSELVES, when that is all
+    it can return (rule 8), else ``None``.
+
+    Every return slot of the callee is a formal (``return a``), a store
+    version of one (``a[0] = x; return a``) or a branch merge whose arms are
+    (``return a if c else b``); each formal names the actual bound to it at
+    this call.  A slot that is anything else (a list the callee builds) is
+    not the caller's storage, so nothing is proved.
+    """
+
+    function_table = getattr(caller, "function_table", None)
+    data = caller.G.nodes.get(int(call_id), {})
+    attributes = data.get("attributes") or {}
+    reference = attributes.get("callee_ref", attributes.get("method_ref"))
+    if function_table is None or reference is None:
+        return None
+    try:
+        callee = getattr(function_table.entry(int(reference)).graph, "G", None)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if callee is None:
+        return None
+    names: set[str] = set()
+    seen: set[int] = set()
+    pending = [
+        int(slot)
+        for site in (callee.graph.get("return_slot_values") or {}).values()
+        for slot in site if slot is not None
+    ]
+    if not pending:
+        return None
+    while pending:
+        node_id = _indexed_store_source(callee, pending.pop())
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        if node_id not in callee:
+            return None
+        node = callee.nodes[node_id]
+        node_attributes = node.get("attributes") or {}
+        if node_attributes.get("binding_kind") == "parameter":
+            names.add(str(node_attributes.get("binding_name")))
+        elif node_attributes.get("producer_kind") in {
+            "aggregate_phi", "aggregate_merge",
+        }:
+            pending.extend(
+                int(parent) for parent, role in node.get("parents") or ()
+                if str(role) in {"body", "orelse"}
+            )
+        else:
+            return None
+    receiver, positional, _all = _method_parameter_layout(callee)
+    actuals = {
+        _callsite_parameter_name(str(role), receiver, positional): int(parent)
+        for parent, role in data.get("parents") or ()
+    }
+    if not names or not names <= set(actuals):
+        return None
+    return tuple(sorted(actuals[name] for name in names))
 
 
 def _call_returns_argument(caller: Any, call_id: int, argument_id: int) -> bool:
@@ -1872,8 +1937,10 @@ _MUTABLE_RETURN_KINDS = frozenset({"list", "set", "dict", "bytearray"})
 
 def _born_in_callee_list(child_graph: Any, value_id: int) -> bool:
     """A list this function creates (a display, a materialization or a
-    comprehension), not a parameter's or another object's storage."""
+    comprehension), not a parameter's or another object's storage.  A store
+    version (``r[1] = n; return r``) is the list it writes."""
 
+    value_id = _indexed_store_source(child_graph, value_id)
     data = child_graph.nodes[value_id] if value_id in child_graph else {}
     attributes = data.get("attributes") or {}
     return (
@@ -1881,7 +1948,7 @@ def _born_in_callee_list(child_graph: Any, value_id: int) -> bool:
         and attributes.get("binding_kind") != "parameter"
         and (
             attributes.get("producer_kind")
-            in {"aggregate", "sequence_materialization"}
+            in {"aggregate", "sequence_materialization", "sequence_replication"}
             or data.get("type") == "LoopResult"
             or isinstance(data.get("expr_obj"), ast.ListComp)
         )
@@ -1903,10 +1970,14 @@ def _refuse_divergent_collection_returns(child_graph: Any) -> None:
         if len(value_ids) < 2:
             continue
         kinds = {
-            (child_graph.nodes[value_id].get("attributes") or {}).get(
+            (child_graph.nodes[stored].get("attributes") or {}).get(
                 "aggregate_kind"
             )
-            for value_id in value_ids if value_id in child_graph
+            for stored in (
+                _indexed_store_source(child_graph, value_id)
+                for value_id in value_ids
+            )
+            if stored in child_graph
         }
         if not kinds & _MUTABLE_RETURN_KINDS:
             continue
@@ -1942,14 +2013,18 @@ def _authored_output_paths(graph, outputs):
     paths = {}
 
     def expand(path, value_id):
+        # A store version is the collection it writes (``r[1] = n; return
+        # r``): the output is that one storage, the list the callee's SSA
+        # returns, never the store node.
+        stored = _indexed_store_source(graph, int(value_id))
         attributes = (
-            graph.G.nodes[int(value_id)].get("attributes") or {}
-            if int(value_id) in graph.G else {}
+            graph.G.nodes[int(stored)].get("attributes") or {}
+            if stored in graph.G else {}
         )
-        leaves = (
-            () if attributes.get("aggregate_kind") in _MUTABLE_RETURN_KINDS
-            else _authored_aggregate_leaves(graph, int(value_id))
-        )
+        if attributes.get("aggregate_kind") in _MUTABLE_RETURN_KINDS:
+            paths[path] = int(stored)
+            return
+        leaves = _authored_aggregate_leaves(graph, int(value_id))
         if not leaves:
             paths[path] = int(value_id)
             return
@@ -2368,7 +2443,10 @@ def _callee_return_scalar_dtype(
         values = tuple(values)
         if len(values) != 1 or int(values[0]) not in callee_graph:
             return None
-        node = callee_graph.nodes[int(values[0])]
+        # A store version (``out[0] = x; return out``) returns the list it
+        # writes: that list's record states the element class.
+        returned_id = int(_indexed_store_source(callee_graph, int(values[0])))
+        node = callee_graph.nodes[returned_id]
         returned = node.get("expr_obj")
         if isinstance(returned, ast.Constant) and returned.value is None:
             continue
@@ -2380,7 +2458,7 @@ def _callee_return_scalar_dtype(
         ):
             return None
         kinds.add("element" if aggregate else "scalar")
-        found.append(dtypes.get(int(values[0])))
+        found.append(dtypes.get(returned_id))
     if (
         not found or None in found or len(set(found)) != 1
         or len(kinds) != 1
@@ -2565,6 +2643,17 @@ def _planned_scalar_dtypes_from(
         elif rank == 0 and storage in {"scalar", ""}:
             scalar.setdefault(int(value_id), dtype)
     get_default_phase = False
+    returned_actuals: dict[int, tuple[int, ...] | None] = {}
+
+    def call_returned_actuals(call_id: int) -> tuple[int, ...] | None:
+        """The actuals whose own lists this call returns (rule 8), if any."""
+
+        if int(call_id) not in returned_actuals:
+            returned_actuals[int(call_id)] = _call_returned_actuals(
+                graph, int(call_id),
+            )
+        return returned_actuals[int(call_id)]
+
     for _round in range(64):
         changed = False
 
@@ -2720,6 +2809,19 @@ def _planned_scalar_dtypes_from(
                         scalar if callee_dtype[0] == "scalar" else element,
                         node_id, callee_dtype[1],
                     )
+                elif call_returned_actuals(node_id):
+                    # Program: ``def f(out, x): out[0] = x; return out``
+                    # (unannotated) then ``t = f(a, n); t[0]``, or ``return
+                    # a if c else b``.  Wrong record: the callee's formals
+                    # state no element class of their own, so ``t[0]`` had no
+                    # dtype and was refused.  Rule 8: the result IS one of
+                    # the actuals' lists, so it holds the class they agree on.
+                    arm_elements = {
+                        element.get(actual)
+                        for actual in call_returned_actuals(node_id)
+                    }
+                    if len(arm_elements) == 1:
+                        settle(element, node_id, next(iter(arm_elements)))
             # A generator expression is a read-only sequence of its ``elt``:
             # nothing can append to it, so its element type is the ``elt``'s
             # class (corpus c27).  List and set comprehensions are not typed
