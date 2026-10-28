@@ -2215,7 +2215,22 @@ def _static_sequence_capacity_survey(
         for node_id, data in graph_obj.nodes(data=True)
         for attributes in ((data.get("attributes") or {}),)
         if attributes.get("materialization_kind") == "unrolled_loop"
+        and attributes.get("aggregate_kind") in {"list", "set"}
+    })
+    # Program: ``xs = [1, 5, 9]; for x in xs: ...`` (c156).  Wrong record:
+    # the structural fold turns an unchanged list display into a Constant
+    # whose literal still names its members, and no bound covered it, so C
+    # refused its private arena ("no proven capacity").  Rule: a folded list
+    # display is a lexical birth, one row per member, like the display it
+    # replaced; later growth is counted below exactly as for a display.
+    local_lists.update({
+        int(data.get("value_id", node_id)): len(attributes["value"])
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in ((data.get("attributes") or {}),)
+        if str(data.get("type")) in {"Constant", "Const", "const"}
         and attributes.get("aggregate_kind") == "list"
+        and isinstance(attributes.get("value"), (list, tuple))
+        and int(data.get("value_id", node_id)) not in local_lists
     })
     # A list merged from equal-length arm displays (an ``aggregate_phi``)
     # is born at the merge from its member Phis (``_list_literal_
