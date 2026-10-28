@@ -1087,12 +1087,42 @@ def _promote_conditional_sequence_aliases(
                 resident_by_value[merged_id] = destination
                 kind_by_value[merged_id] = initial_kind
                 promoted_aliases[merged_id] = (destination, initial_kind)
+            # Program: ``if n > 2: t = [n, 1, 2] else: t = [7, n]`` then
+            # ``len(t)``, ``total(t)`` (corpus c654).  Wrong record: a list
+            # first bound in both arms, to displays of different lengths,
+            # published a scalar result merge of two handles and no member
+            # layout, so the merge had no birth (it was refused by name as
+            # "different shapes").  Python's list length is dynamic; that is
+            # no reason to refuse.  Rule: the merge is its own storage and
+            # each arm copies its display into it (the ``replace`` a
+            # carried sequence alias lowers), so its length is the taken
+            # arm's and its capacity the longest arm's (the arms' own
+            # bounds, surveyed as a copy source).
+            results = []
+            for result in block.result_aliases:
+                true_id, false_id, merged_id = map(int, result)
+                if not _list_merged_from_unequal_displays(
+                    graph_obj, node_by_value.get(merged_id, -1),
+                ):
+                    results.append(result)
+                    continue
+                true_resident = resident_by_value.get(true_id)
+                false_resident = resident_by_value.get(false_id)
+                if true_resident is None or false_resident is None:
+                    results.append(result)
+                    continue
+                sequences.append((
+                    int(true_resident), int(false_resident),
+                    merged_id, merged_id,
+                ))
+                destination_ids.add(merged_id)
             return replace(
                 block,
                 body=promote(block.body),
                 orelse=(
                     None if block.orelse is None else promote(block.orelse)
                 ),
+                result_aliases=tuple(results),
                 carried_aliases=tuple(scalar),
                 carried_field_cells=tuple(scalar_field_cells),
                 carried_sequence_aliases=tuple(sequences),
@@ -2444,6 +2474,12 @@ def _static_sequence_capacity_survey(
         settled = True
         for destination, sources in copies.items():
             own = sequence_bound(destination)
+            # A list merged from displays of different lengths owns no rows
+            # of its own: its arms' copies are all it holds (c654).
+            if own is None and _list_merged_from_unequal_displays(
+                graph_obj, destination,
+            ):
+                own = 0
             if own is None:
                 continue
             source_bounds = [sequence_bound(source) for source in sources]
@@ -3011,6 +3047,45 @@ def _scalar_constant_member(row: Mapping[str, Any]) -> Any:
     return literal if isinstance(literal, (bool, int, float, str)) else None
 
 
+def _list_merged_from_unequal_displays(graph_obj: Any, node_id: int) -> bool:
+    """Whether a list merge joins two list displays of different lengths.
+
+    Both arms are list displays (``aggregate_leaf_value_ids`` published) and
+    the merge is first bound there (no initial list).  Equal-length arms
+    publish member Phis and are born from them; an arm that is no display is
+    not this shape.
+    """
+
+    data = graph_obj.nodes.get(int(node_id)) or {}
+    attributes = data.get("attributes") or {}
+    if (
+        attributes.get("producer_kind") != "aggregate_phi"
+        or attributes.get("aggregate_kind") != "list"
+        or attributes.get("initial_value_id") is not None
+        or attributes.get("aggregate_leaf_value_ids") is not None
+    ):
+        return False
+    arms = tuple(
+        graph_obj.nodes[parent]
+        for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and parent in graph_obj
+    )
+    if len(arms) != 2:
+        return False
+    lengths = []
+    for arm in arms:
+        arm_attributes = arm.get("attributes") or {}
+        leaves = arm_attributes.get("aggregate_leaf_value_ids")
+        if (
+            arm_attributes.get("producer_kind") != "aggregate"
+            or arm_attributes.get("aggregate_kind") != "list"
+            or leaves is None
+        ):
+            return False
+        lengths.append(len(leaves))
+    return lengths[0] != lengths[1]
+
+
 def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
     """Whether a list merge is one branch rebinding its initial list.
 
@@ -3245,6 +3320,10 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 rebound_on_one_branch = _list_rebound_on_one_branch(
                     graph_obj, int(node_id),
                 )
+                if _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+                    # Born by the arms' copies into this storage
+                    # (``_promote_conditional_sequence_aliases``).
+                    continue
                 if attributes.get("aggregate_kind") == "list" and not (
                     rebound_on_one_branch
                 ):
