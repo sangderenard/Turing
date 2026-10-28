@@ -45,6 +45,15 @@ def string_token(text: str) -> int:
 NONE_TOKEN = fnv1a_64("\x00turing.sentinel.None\x00")
 
 
+class StringTokenCollision(ValueError):
+    """Two different words reached one content-addressed token.
+
+    The token is a 64-bit hash, so it can collide. A collision is refused,
+    never resolved by keeping whichever word arrived first: that silently
+    gave the second word the first word's identity and reverse lookup.
+    """
+
+
 class StringTable:
     """Persistent token -> string map for the lowered common representation."""
 
@@ -57,7 +66,16 @@ class StringTable:
     def intern(self, text: str) -> int:
         """Return the word's token, recording token -> text for reverse lookup."""
         token = string_token(text)
-        self._entries.setdefault(token, text)
+        # "TOK0": a second word under one token is refused by name. The book
+        # refuses it too, but only inside one compile; this table outlives
+        # every book (it persists across builds), so it holds the rule itself.
+        incumbent = self._entries.get(token)
+        if incumbent is not None and incumbent != text:
+            raise StringTokenCollision(
+                "StringTable token collision: "
+                f"token={int(token)} recorded={incumbent!r} proposed={text!r}"
+            )
+        self._entries[token] = text
         from .concordance_declarations import (
             INGESTION, STRING_TABLE_ENTRY, STRING_TABLE_INGESTION,
         )

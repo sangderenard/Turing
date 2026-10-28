@@ -28,16 +28,32 @@ def _dependency_order(graph: Any) -> tuple[int, ...]:
         for parent, _role in (data.get("parents") or ())
         if int(parent) in G and int(parent) != int(node_id)
     )
+    # Host callbacks are observable effects in source order; nothing but this
+    # published order connects two of them (``_host_callback_order_edges``).
+    effect_order_edges = tuple(
+        (int(earlier), int(later))
+        for earlier, later in G.graph.get("host_callback_order_edges", ())
+        if int(earlier) in G and int(later) in G
+    )
+    # In-place sequence effects are ordered against the later reads of their
+    # storage exactly as callbacks are (``_sequence_effect_read_edges``).
+    effect_order_edges += tuple(
+        (int(earlier), int(later))
+        for earlier, later in G.graph.get("sequence_effect_order_edges", ())
+        if int(earlier) in G and int(later) in G
+    )
     fingerprint = (
         tuple(sorted(map(int, G.nodes))),
         tuple(sorted((int(left), int(right)) for left, right in G.edges)),
         tuple(sorted(set(semantic_parent_edges))),
+        effect_order_edges,
     )
     cached = G.graph.get("_dependency_order_cache")
     if cached is not None and cached[0] == fingerprint:
         return cached[1]
     dependency_graph = G.copy()
     dependency_graph.add_edges_from(semantic_parent_edges)
+    dependency_graph.add_edges_from(effect_order_edges)
     try:
         order = tuple(nx.lexicographical_topological_sort(
             dependency_graph, key=lambda value_id: int(value_id)

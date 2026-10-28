@@ -376,6 +376,65 @@ _TENSOR_CONTRACT_KEYS = (
 )
 
 
+def _int64_lane_checked(instruction: Any, operation: str, result: Any) -> bool:
+    """An int64 tensor ``add``/``sub``/``mul`` whose lanes must not wrap
+    (``python_int_lane_overflow_checked``); ``binary_int64`` cannot check."""
+
+    from .ssa_llvm_backend import python_int_lane_overflow_checked
+
+    return (
+        str(operation) in {"add", "sub", "mul"}
+        and str(result.dtype or "").casefold() in {"int64", "i64", "long"}
+        and python_int_lane_overflow_checked(instruction, operation=operation)
+    )
+
+
+def _int64_lane_stays_elementwise(
+    instruction: Any, operation: str, result: Any, operands: Any,
+) -> bool:
+    """Whether an int64 tensor op stays the instruction itself.
+
+    Each backend's elementwise span loop then spells it on the integer path.
+    Program: ``-tokens`` / ``abs(tokens)`` on an int64 tensor.  Wrong record:
+    the only repository unary kernel is ``unary_double``; the lanes were cast
+    to float64 (2**53 + 1 came back 2**53) or, after an int64 producer, had
+    their bits negated as a double's sign.  And ``tokens * 1103515245``
+    through ``binary_int64`` wrapped every lane leaving int64.  Rule: int64
+    ``neg``/``abs`` always stay; int64 ``add``/``sub``/``mul`` stay when
+    ``python_int_lane_overflow_checked`` asks for per-lane checks and no
+    operand needs a broadcast kernel (each is the result's shape or rank 0).
+    """
+
+    operands = list(operands or ())
+    operation = str(operation)
+    int64 = {"int64", "i64", "long"}
+    if (
+        operation in {"neg", "abs"}
+        and len(operands) == 1
+        and all(
+            str(value.dtype or "").casefold() in int64
+            for value in (result, operands[0])
+        )
+    ):
+        return True
+    if not _int64_lane_checked(instruction, operation, result):
+        return False
+    shape = tuple(result.shape or ())
+    return bool(shape) and all(
+        str(value.dtype or "").casefold() in int64 | {"int", "int32", "i32"}
+        and (
+            tuple(value.shape or ()) == shape
+            or (
+                not tuple(value.shape or ())
+                and int((value.accounting or {}).get(
+                    "program_abi_rank", 0
+                ) or 0) == 0
+            )
+        )
+        for value in (getattr(instruction, "args", None) or operands)
+    )
+
+
 def _elementwise_result_physical(
     owner: Any, operands: Any, *, book: Any,
 ) -> dict[str, Any]:
@@ -704,9 +763,15 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                         or not tuple(contract_row[2] or ())
                     ):
                         return
+                    if not contract_row[1]:
+                        raise ValueError(
+                            "native call result contract for owner "
+                            f"{owner_name!r} value {int(output_id)} carries "
+                            f"shape {tuple(contract_row[2])} but no dtype"
+                        )
                     proposed = (
                         tuple(contract_row[2]),
-                        str(contract_row[1] or "float64"),
+                        str(contract_row[1]),
                     )
                     incumbent = native_result_shapes.get(int(output_id))
                     if incumbent is not None and incumbent != proposed:
@@ -779,12 +844,20 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                     )
                     if not extents:
                         continue
-                    fact = (extents, str(
+                    fact_dtype = (
                         (None if native_result is None else native_result[1])
                         or actual.dtype
                         or (None if descriptor is None else descriptor.dtype)
-                        or "float64"
-                    ))
+                    )
+                    if not fact_dtype:
+                        raise ValueError(
+                            f"callsite {caller_name!r} -> {callee_name!r}: "
+                            f"actual %t{int(actual.id)} for formal "
+                            f"%t{int(formal.id)} has extents {extents} but "
+                            "no recorded dtype (native result, actual and "
+                            "descriptor all lack one)"
+                        )
+                    fact = (extents, str(fact_dtype))
                     row = (
                         callee_name, int(formal.id),
                         str(caller_name), int(actual.id),
@@ -1030,6 +1103,10 @@ def settle_canonical_value_metadata(module: IRModule) -> bool:
         numerical = [
             value for value in occurrences
             if str(value.dtype or "") not in excluded
+            # The generated VJP's bw_matmul reshape has storage id 81 but
+            # view shape (2, 2).  Its view is not a writer of storage 81's
+            # shape, including while that storage's shape is unresolved.
+            and not (value.accounting or {}).get("ssa_storage_view")
         ]
         exact_writer_shapes = {
             tuple(value.shape)
@@ -1904,6 +1981,18 @@ def propagate_repository_ssa_call_metadata(
                 live_source_shape, target_shape, declared_view,
                 int(value.id),
             ):
+                continue
+            if (
+                int(source.id) == int(value.id)
+                and shape_scope_of(
+                    function if source_function is None else source_function
+                ) == shape_scope_of(function)
+            ):
+                # expand_to's planned region and enclosing function both
+                # name value 2 in one shape scope.  Transporting its updated
+                # SSA row is a view refresh, not a transformation from the
+                # value to itself; a self-edge would invent a second shape
+                # writer with no distinct source cell.
                 continue
             shape_transformation_records.append((
                 (
@@ -2926,6 +3015,80 @@ def lower_tensor_calls_to_repository_ssa(
         # at the same boundary.  Keeping an id only in accounting would name a
         # value the planned function cannot read; the concordance contract is
         # complete only when its shape/rank/count values cross the call too.
+        # ``Tensor.real`` of a non-complex tensor is an identity view: its
+        # result is the source's dtype and tensor contract.  Settle that on
+        # every occurrence of the result in the source function's regions now,
+        # so a consumer region's formal receives the same extents below.
+        for view_function_name, view_function in module.functions.items():
+            for view_block in view_function.blocks.values():
+                for view_instr in view_block.instrs:
+                    if (
+                        str(view_instr.op).casefold() != "real"
+                        or view_instr.res is None
+                        or len(view_instr.args) != 1
+                    ):
+                        continue
+                    view_source = view_instr.args[0]
+                    view_root = str(view_function_name).split(
+                        "__planned_region_"
+                    )[0]
+                    # The source's proven dtype and tensor contract live on
+                    # its producing occurrence in the source function.
+                    family = tuple(
+                        member
+                        for sibling_name, sibling in module.functions.items()
+                        if str(sibling_name).split("__planned_region_")[0]
+                        == view_root
+                        for member in (
+                            *sibling.args,
+                            *(
+                                m for block in sibling.blocks.values()
+                                for instr in block.instrs
+                                for m in (*instr.args, instr.res)
+                                if m is not None
+                            ),
+                        )
+                        if int(member.id) == int(view_source.id)
+                    )
+                    view_dtypes = {
+                        str(member.dtype) for member in family
+                        if member.dtype not in {None, "unknown"}
+                    }
+                    if len(view_dtypes) != 1:
+                        continue
+                    view_dtype = next(iter(view_dtypes))
+                    if view_dtype.casefold().startswith(
+                        ("complex", "c64", "c128")
+                    ):
+                        continue
+                    view_contract = {}
+                    for member in family:
+                        for key in _TENSOR_CONTRACT_KEYS:
+                            if key in (member.accounting or {}):
+                                view_contract.setdefault(
+                                    key, member.accounting[key]
+                                )
+                    for sibling_name, sibling in module.functions.items():
+                        if str(sibling_name).split("__planned_region_")[0] != view_root:
+                            continue
+                        for value in (
+                            *sibling.args,
+                            *(
+                                member
+                                for block in sibling.blocks.values()
+                                for instr in block.instrs
+                                for member in (*instr.args, instr.res)
+                                if member is not None
+                            ),
+                        ):
+                            if int(value.id) != int(view_instr.res.id):
+                                continue
+                            if value.dtype in {None, "unknown"}:
+                                value.dtype = view_dtype
+                            value.accounting = {
+                                **view_contract,
+                                **dict(value.accounting or {}),
+                            }
         function_values: dict[str, dict[int, SSAValue]] = {}
         for function_name, function in module.functions.items():
             occurrences = [*function.args]
@@ -3136,7 +3299,22 @@ def lower_tensor_calls_to_repository_ssa(
     #: made for that tensor operation, inside that function.
     lowering_at: list[Any] = [None, None]
 
-    def fresh(*, shape=(), dtype: str | None = "float64") -> SSAValue:
+    def recorded_dtype(value: SSAValue, role: str) -> str:
+        if not value.dtype:
+            owner, source = lowering_at
+            raise ValueError(
+                f"tensor lowering of {None if source is None else source.op!r}"
+                f": {role} %t{int(value.id)} has no recorded dtype; the "
+                "pipeline never settled its type"
+            )
+        return str(value.dtype)
+
+    def fresh(*, shape=(), dtype: str | None) -> SSAValue:
+        if not dtype:
+            raise ValueError(
+                "tensor lowering minted a value with no dtype for an "
+                f"operation lowered at {lowering_at[1]!r}"
+            )
         # Minted through the book (plan 100, 4.1 item 2): a NOVEL
         # ``ssa_value`` row under the function's scope, from the cell of the
         # tensor operation being lowered (its result's, else its first
@@ -3214,10 +3392,22 @@ def lower_tensor_calls_to_repository_ssa(
         kernel = module.functions.get(callee)
         kernel_owner = lowering_at[0]
         kernel_book = identity_book(module)
+        int64_buffer_positions = {
+            "binary_int64": frozenset({0, 1, 2}),
+            "binary_scalar_int64": frozenset({0, 2}),
+            "broadcast_int64": frozenset({0, 1}),
+            "create_arange_int64": frozenset({3}),
+        }.get(callee, frozenset())
         for position, value in enumerate((*arguments, result)):
+            typed_kernel_physical = (
+                "int64" if position in int64_buffer_positions else None
+            )
             if (
                 tuple(value.shape or ())
-                and str(value.dtype or "").casefold() in {"bool", "i1"}
+                and (
+                    typed_kernel_physical is not None
+                    or str(value.dtype or "").casefold() in {"bool", "i1"}
+                )
             ):
                 formal_position = (
                     position if position < len(arguments) else output_argument
@@ -3237,7 +3427,11 @@ def lower_tensor_calls_to_repository_ssa(
                             ),
                         ),
                         book=kernel_book,
-                        physical={"physical_dtype": "float64"},
+                        physical={
+                            "physical_dtype": (
+                                typed_kernel_physical or "float64"
+                            ),
+                        },
                     )
                 value.accounting = _accounting_view(kernel_owner, value, module)
         linked_roots.add(callee)
@@ -3439,6 +3633,63 @@ def lower_tensor_calls_to_repository_ssa(
         _settle_operand_shapes(
             function, function.args, owner_tensor_descriptor,
         )
+        # In the generated bw_tanh VJP, planned-region formal %3 is the
+        # leading data operand of tanh and has neither extents nor a scalar
+        # receipt during section lowering.  Treating that absence as rank
+        # zero freezes tanh, square and subtraction at one element, although
+        # its exact call feed later proves (2, 2).
+        #
+        # Defer only when that unresolved formal is a tensor operation's
+        # leading data operand (or one of the three data operands of where or
+        # scatter).  Constructor shape/dtype/fill formals and operation
+        # metadata are scalars by contract; deferring the whole region for
+        # those structural formals prevents the same pass from settling its
+        # real tensor operands and leaves downstream shaped arithmetic scalar.
+        if (function.metadata or {}).get("source_region_integral"):
+            scalar_formals = set(map(int, (
+                (function.metadata or {}).get("scalar_variant_argument_ids")
+                or ()
+            )))
+            unresolved_formals = {
+                int(formal.id)
+                for formal in function.args
+                if (
+                not tuple(formal.shape or ())
+                and (formal.accounting or {}).get("tensor_extent_for") is None
+                and int(formal.id) not in scalar_formals
+                and (formal.accounting or {}).get("program_abi_storage")
+                is None
+                and (formal.accounting or {}).get("exact_region_feed_source")
+                is None
+                )
+            }
+            unresolved_data_formals = set()
+            constructor_operations = {
+                "arange", "empty", "fill", "full", "ones", "zeros",
+            }
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    operation = (
+                        instruction.attributes.get("tensor_operation")
+                        or instruction.attributes.get("tensor")
+                        or instruction.attributes.get("tensor_candidate")
+                        or _SHAPED_SSA_OPERATIONS.get(instruction.op)
+                    )
+                    if operation is None or str(operation) in constructor_operations:
+                        continue
+                    data_positions = (
+                        range(min(3, len(instruction.args)))
+                        if str(operation) in {"scatter", "where"}
+                        else range(min(1, len(instruction.args)))
+                    )
+                    unresolved_data_formals.update(
+                        int(instruction.args[position].id)
+                        for position in data_positions
+                        if int(instruction.args[position].id)
+                        in unresolved_formals
+                    )
+            if unresolved_data_formals:
+                continue
         function_argument_ids = {int(value.id) for value in function.args}
         unresolved_argument_ids = {
             int(value.id)
@@ -3503,10 +3754,16 @@ def lower_tensor_calls_to_repository_ssa(
                 else "static"
             )
             owner = tensor_table.by_id(alias_of) if alias_of is not None else None
-            physical_dtype = str(
-                (value.accounting or {}).get(
-                    "physical_dtype", value.dtype or "float64"
+            if (
+                "physical_dtype" not in (value.accounting or {})
+                and not value.dtype
+            ):
+                raise ValueError(
+                    f"tensor descriptor for %t{int(value.id)} has neither a "
+                    "recorded dtype nor a physical dtype"
                 )
+            physical_dtype = str(
+                (value.accounting or {}).get("physical_dtype", value.dtype)
             ).lower()
             dtype_bytes = dtype_byte_size(physical_dtype)
             element_count = prod(shape) if shape else 1
@@ -3546,7 +3803,7 @@ def lower_tensor_calls_to_repository_ssa(
                 data_value_id=int(
                     tensor_id if data_value_id is None else data_value_id
                 ),
-                dtype=str(value.dtype or "float64"),
+                dtype=str(value.dtype),
                 shape=shape,
                 strides=strides(shape),
                 storage=storage,
@@ -4720,6 +4977,7 @@ def lower_tensor_calls_to_repository_ssa(
                 # result's shape/dtype annotation while aliasing its storage.
                 if operation in _VIEW_OPERATIONS and args:
                     source = args[0]
+                    explicit_reshape_shape = False
                     if operation in {"unsqueeze", "squeeze"}:
                         # These CHANGE the axes, and the annotation they were
                         # given may predate the moment the operand's shape was
@@ -4791,6 +5049,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     )
                                 if -1 not in resolved:
                                     result.shape = tuple(resolved)
+                                    explicit_reshape_shape = True
                     source_descriptor = register_tensor(
                         source,
                         storage=(
@@ -4827,16 +5086,16 @@ def lower_tensor_calls_to_repository_ssa(
                             tuple(source.shape or ())
                             and tuple(view_shape) != tuple(source.shape or ())
                         )
-                        # ``unsqueeze`` adds an axis, so its result differs
-                        # from its source by construction even while the
-                        # source's extents are still unsettled here (a call
-                        # result whose shape the concordance proves later).
-                        # Left unflagged, the alias carried the view's shape
-                        # under the owner's id and the module-wide settlement
-                        # then reported a disagreement with the owner.
+                        # The generated VJP's bw_matmul reshapes an as-yet
+                        # unshaped call result (storage id 81) to the exact
+                        # requested (2, 2).  Like unsqueeze, that result is
+                        # a view even before the storage shape settles.
                         or (
                             not tuple(source.shape or ())
-                            and str(operation) == "unsqueeze"
+                            and (
+                                str(operation) == "unsqueeze"
+                                or explicit_reshape_shape
+                            )
                         )
                     ):
                         view_accounting["ssa_storage_view"] = {
@@ -5043,6 +5302,18 @@ def lower_tensor_calls_to_repository_ssa(
                     result.shape = ()
                 if (
                     source is not None
+                    and operation in {"sum", "mean"}
+                    and str(result.dtype or "unknown") == "unknown"
+                ):
+                    # Tensor semantics: summing or averaging a floating
+                    # tensor keeps its floating dtype.  (Integer/bool sums
+                    # promote and are left to their own evidence.)
+                    if str(source.dtype or "").casefold() in {
+                        "float64", "float32", "float16", "f64", "f32", "f16",
+                    }:
+                        result.dtype = source.dtype
+                if (
+                    source is not None
                     and tuple(source.shape or ())
                     and (operation in _REDUCTION_CODES or operation == "mean")
                 ):
@@ -5135,19 +5406,33 @@ def lower_tensor_calls_to_repository_ssa(
                         "arange_step", 1.0,
                     )
                     if count_value is not None and int(count_value) > 0:
+                        arange_dtype = str(
+                            _attribute(instruction.attributes, "dtype")
+                            or recorded_dtype(result, "arange result")
+                        ).casefold()
+                        integer_arange = arange_dtype in {
+                            "int64", "i64", "long",
+                        }
                         start, start_def = constant(
-                            float(start_value), "float64",
+                            int(start_value) if integer_arange else float(start_value),
+                            "int64" if integer_arange else "float64",
                         )
                         step, step_def = constant(
-                            float(step_value), "float64",
+                            int(step_value) if integer_arange else float(step_value),
+                            "int64" if integer_arange else "float64",
                         )
                         count, count_def = constant(
                             int(count_value), "int32",
                         )
                         result.shape = (int(count_value),)
+                        if integer_arange:
+                            result.dtype = "int64"
                         prefix.extend((start_def, step_def, count_def))
                         emitted.append(call(
-                            "create_arange",
+                            (
+                                "create_arange_int64"
+                                if integer_arange else "create_arange"
+                            ),
                             [start, step, count, result],
                             result,
                             instruction,
@@ -5196,12 +5481,98 @@ def lower_tensor_calls_to_repository_ssa(
                         ],
                         result, instruction, output_argument=1,
                     ))
+                elif operation == "scatter" and len(data_args) >= 3:
+                    indices = data_args[1]
+                    values = data_args[2]
+                    reduction = _attribute(instruction.attributes, "reduce")
+                    # Graphs captured before scatter recorded its reduction
+                    # policy carry no attribute.  The AbstractTensor API's
+                    # declared default is sum, so absence has that one exact
+                    # meaning.  Every declared policy selects its own wrapper
+                    # around the shared repository reduction kernel.
+                    reduction = "sum" if reduction is None else str(reduction)
+                    if reduction not in {"sum", "mean", "max", "min"}:
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name,
+                            block_name,
+                            operation,
+                            (
+                                f"scatter reduce={reduction!r} is not one of "
+                                "('sum', 'mean', 'max', 'min')"
+                            ),
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    source_shape = tuple(source.shape or ())
+                    index_count = _known_count(indices)
+                    if not source_shape or index_count is None:
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name,
+                            block_name,
+                            operation,
+                            (
+                                "scatter-add needs a declared destination "
+                                "shape and index extent; "
+                                f"source=%{source.id}, indices=%{indices.id}, "
+                                "argument_shapes="
+                                f"{tuple(tuple(arg.shape or ()) for arg in data_args)!r}"
+                            ),
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    raw_dim = _attribute(
+                        instruction.attributes, "axis", "dim"
+                    )
+                    if raw_dim is None:
+                        raw_dim = next((
+                            item for item in metadata
+                            if isinstance(item, (int, float))
+                        ), 0)
+                    axis = int(raw_dim) % len(source_shape)
+                    expected_values_shape = list(source_shape)
+                    expected_values_shape[axis] = int(index_count)
+                    if tuple(values.shape or ()) != tuple(expected_values_shape):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name,
+                            block_name,
+                            operation,
+                            (
+                                "scatter-add values must replace the indexed "
+                                f"axis with the index extent; values=%{values.id} "
+                                f"has {tuple(values.shape or ())!r}, expected "
+                                f"{tuple(expected_values_shape)!r}"
+                            ),
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    result.shape = source_shape
+                    shape_value, shape_def = int_vector(source_shape)
+                    rank, rank_def = constant(len(source_shape), "int32")
+                    axis_value, axis_def = constant(axis, "int32")
+                    index_count_value, index_count_def = constant(
+                        int(index_count), "int32"
+                    )
+                    prefix.extend((
+                        shape_def, rank_def, axis_def, index_count_def,
+                    ))
+                    emitted.append(call(
+                        f"scatter_{reduction}_double",
+                        [
+                            source, result, shape_value, rank, axis_value,
+                            indices, index_count_value, values,
+                        ],
+                        result, instruction, output_argument=1,
+                    ))
                 opcode_contract = (
                     None if emitted else c_tensor_opcode(operation)
                 )
                 if (
                     source is not None
                     and opcode_contract is not None
+                    and not _int64_lane_stays_elementwise(
+                        instruction, operation, result, data_args,
+                    )
+                    and not _int64_lane_checked(instruction, operation, result)
                 ):
                     if str(result.dtype or "").casefold() not in {
                         "float32", "float16", "f32", "f16",
@@ -5345,7 +5716,25 @@ def lower_tensor_calls_to_repository_ssa(
                         _post_double_backed_boolean(
                             lowering_at[0], value, module,
                         )
-                if operation == "tensor" and source is not None:
+                if operation == "real" and source is not None:
+                    # ``Tensor.real`` of a non-complex tensor is the tensor
+                    # itself: same dtype, same storage, an identity view.  A
+                    # complex source's component dtype has no lowering in the
+                    # repository reference (no ``real`` entry), so it is a
+                    # named refusal, never a default.
+                    source_dtype = str(source.dtype or "").casefold()
+                    if not source_dtype or source_dtype in {"unknown", "none"} \
+                            or source_dtype.startswith(("complex", "c64", "c128")):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "real part of a tensor whose dtype is "
+                            f"{source.dtype!r} (complex or unproven) has no "
+                            f"lowering; source=%{source.id}",
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    result.dtype = source.dtype
+                if operation in {"tensor", "real"} and source is not None:
                     sequence = resident_sequence(source)
                     row_shape: tuple[int, ...] | None = None
                     if sequence is not None:
@@ -5452,6 +5841,11 @@ def lower_tensor_calls_to_repository_ssa(
                                 **dict(result.accounting or {}),
                             },
                         )
+                        if operation == "real":
+                            # The authored property stays an instruction
+                            # (consumers read its source span); its result
+                            # is the typed identity view registered above.
+                            rewritten.append(instruction)
                         continue
                 source_descriptor = None
                 if source is not None:
@@ -5552,9 +5946,10 @@ def lower_tensor_calls_to_repository_ssa(
                         ))
                 elif operation == "cbrt" and source is not None:
                     count = need_count(source, source_count)
-                    abs_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
-                    sign_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
-                    power_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
+                    cbrt_dtype = recorded_dtype(source, "cbrt operand")
+                    abs_result = fresh(shape=source.shape, dtype=cbrt_dtype)
+                    sign_result = fresh(shape=source.shape, dtype=cbrt_dtype)
+                    power_result = fresh(shape=source.shape, dtype=cbrt_dtype)
                     unary_abs, abs_def = constant(c_tensor_opcode("abs")[1], "int32")
                     binary_pow, pow_def = constant(c_tensor_opcode("pow")[1], "int32")
                     third, third_def = constant(1.0 / 3.0, "float64")
@@ -5620,6 +6015,12 @@ def lower_tensor_calls_to_repository_ssa(
                             callee = "cast_double_to_double_values"
                         else:
                             callee = "cast_double_to_float_values"
+                    if (
+                        callee == "cast_double_to_double_values"
+                        and str(source.dtype or "").casefold()
+                        in {"int64", "i64", "long"}
+                    ):
+                        callee = "cast_int64_to_double_values"
                     if not tuple(source.shape or ()) and int(
                         (source.accounting or {}).get("program_abi_rank", 0)
                         or 0
@@ -5755,7 +6156,7 @@ def lower_tensor_calls_to_repository_ssa(
                         elif count is not None:
                             # mean = flat sum scaled by the element count; the
                             # division is ordinary scalar SSA, not a kernel.
-                            total = fresh(dtype=result.dtype or "float64")
+                            total = fresh(dtype=recorded_dtype(result, "mean result"))
                             emitted.append(call("sum_double", [source, count], total, instruction))
                             emitted.append(Instr(
                                 "Div", [total, count], result,
@@ -6086,7 +6487,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 and isinstance(payload, (int, float))
                                 and not isinstance(payload, bool)
                                 and str(operand.dtype or "").casefold()
-                                not in {"double", "float64"}
+                                != "float64"
                             ):
                                 respelled, respelled_def = constant(
                                     float(payload), "float64"
@@ -6096,7 +6497,7 @@ def lower_tensor_calls_to_repository_ssa(
                             conformed.append(operand)
                             continue
                         temporary = fresh(
-                            dtype=result.dtype or "float64",
+                            dtype=recorded_dtype(result, "where result"),
                             shape=tuple(result.shape or ()),
                         )
                         register_tensor(temporary, storage="temporary")
@@ -6107,7 +6508,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 isinstance(payload, (int, float))
                                 and not isinstance(payload, bool)
                                 and str(operand.dtype or "").casefold()
-                                not in {"double", "float64"}
+                                != "float64"
                             ):
                                 scalar, scalar_def = constant(
                                     float(payload), "float64"
@@ -6506,10 +6907,49 @@ def lower_tensor_calls_to_repository_ssa(
                             instruction, output_argument=2,
                         ))
 
+                elif _int64_lane_stays_elementwise(
+                    instruction, operation, result, data_args,
+                ):
+                    # Program: ``-tokens`` / ``abs(tokens)`` on an int64
+                    # tensor.  Wrong record: the only repository unary kernel
+                    # is ``unary_double``, so the lanes were cast to float64
+                    # (2**53 + 1 came back 2**53, the result buffer float64)
+                    # or, after an int64 producer, their bits were negated as
+                    # a double's sign.  Rule: int64 Neg/Abs stay the
+                    # instruction itself, which each backend's elementwise
+                    # span loop spells on the integer path, wrapping at
+                    # INT64_MIN exactly as the NumPy reference does.
+                    rewritten.append(instruction)
+                    continue
+
                 else:
                     opcode = c_tensor_opcode(operation)
                     if opcode is not None and source is not None:
                         kind, opcode_value = opcode
+                        int64_binary = (
+                            kind == "binary"
+                            and operation in {"add", "sub", "mul", "mod"}
+                            and str(result.dtype or "").casefold()
+                            in {"int64", "i64", "long"}
+                            and all(
+                                str(operand.dtype or "").casefold()
+                                in {"int", "int32", "i32", "int64", "i64", "long"}
+                                for operand in data_args
+                            )
+                        )
+                        binary_kernel = (
+                            "binary_int64" if int64_binary
+                            else "binary_double"
+                        )
+                        scalar_kernel = (
+                            "binary_scalar_int64" if int64_binary
+                            else "binary_scalar_double"
+                        )
+                        broadcast_kernel = (
+                            "broadcast_int64" if int64_binary
+                            else "broadcast_double"
+                        )
+                        kernel_dtype = "int64" if int64_binary else "float64"
                         count_value = source_count if kind == "unary" else result_count
                         count = need_count(source if kind == "unary" else result, count_value)
                         opcode_ssa, opcode_instruction = constant(opcode_value, "int32")
@@ -6542,12 +6982,16 @@ def lower_tensor_calls_to_repository_ssa(
                                     # existing scalar kernel, exactly as the
                                     # right-literal path below already does.
                                     scalar, scalar_def = constant(
-                                        float(left_constant), "float64"
+                                        (
+                                            int(left_constant) if int64_binary
+                                            else float(left_constant)
+                                        ),
+                                        kernel_dtype,
                                     )
                                     reverse, reverse_def = constant(1, "int32")
                                     prefix.extend((scalar_def, reverse_def))
                                     emitted.append(call(
-                                        "binary_scalar_double",
+                                        scalar_kernel,
                                         [
                                             data_args[1], scalar, result,
                                             count, opcode_ssa, reverse,
@@ -6590,9 +7034,11 @@ def lower_tensor_calls_to_repository_ssa(
                                         (result, scalar),
                                     )
                                     array = data_args[1 - scalar_position]
-                                    if str(scalar.dtype or "").casefold() not in {
-                                        "double", "float64",
-                                    }:
+                                    if (
+                                        not int64_binary
+                                        and str(scalar.dtype or "").casefold()
+                                        != "float64"
+                                    ):
                                         promoted = fresh(shape=(), dtype="float64")
                                         prefix.append(Instr(
                                             "Cast", [scalar], promoted,
@@ -6620,7 +7066,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     )
                                     prefix.append(reverse_def)
                                     emitted.append(call(
-                                        "binary_scalar_double",
+                                        scalar_kernel,
                                         [array, scalar, result, count, opcode_ssa, reverse],
                                         result,
                                         instruction,
@@ -6634,6 +7080,8 @@ def lower_tensor_calls_to_repository_ssa(
                                             continue
                                         broadcast_source = operand
                                         if (
+                                            not int64_binary
+                                            and
                                             not tuple(operand.shape or ())
                                             and str(operand.dtype or "").casefold()
                                             in {
@@ -6725,10 +7173,10 @@ def lower_tensor_calls_to_repository_ssa(
                                             result_extents = ensure_dynamic(prefix, result)
                                             broadcasted = fresh(
                                                 shape=result.shape,
-                                                dtype="float64",
+                                                dtype=kernel_dtype,
                                             )
                                             emitted.append(call(
-                                                "broadcast_double",
+                                                broadcast_kernel,
                                                 [
                                                     broadcast_source,
                                                     broadcasted,
@@ -6750,7 +7198,7 @@ def lower_tensor_calls_to_repository_ssa(
                                             continue
                                         broadcasted = fresh(
                                             shape=result.shape,
-                                            dtype="float64",
+                                            dtype=kernel_dtype,
                                         )
                                         input_shape, input_shape_def = int_vector(
                                             operand.shape
@@ -6771,7 +7219,7 @@ def lower_tensor_calls_to_repository_ssa(
                                             output_rank_def,
                                         ))
                                         emitted.append(call(
-                                            "broadcast_double",
+                                            broadcast_kernel,
                                             [
                                                 broadcast_source,
                                                 broadcasted,
@@ -6788,19 +7236,38 @@ def lower_tensor_calls_to_repository_ssa(
                                             broadcasted, storage="temporary"
                                         )
                                         conformed_args.append(broadcasted)
-                                    emitted.append(call(
-                                        "binary_double", [conformed_args[0], conformed_args[1], result, count, opcode_ssa],
-                                        result, instruction, output_argument=2,
-                                    ))
+                                    if _int64_lane_checked(
+                                        instruction, operation, result,
+                                    ):
+                                        # The operands are conformed by the
+                                        # int64 broadcast kernel; the
+                                        # arithmetic stays the instruction, so
+                                        # the backend's span loop checks each
+                                        # lane (``binary_int64`` would wrap).
+                                        emitted.append(dataclasses.replace(
+                                            instruction,
+                                            args=list(conformed_args),
+                                        ))
+                                    else:
+                                        emitted.append(call(
+                                            binary_kernel, [conformed_args[0], conformed_args[1], result, count, opcode_ssa],
+                                            result, instruction, output_argument=2,
+                                        ))
                             elif kind == "binary" and len(data_args) == 1:
                                 scalar_key = next((key for key in ("right_scalar", "left_scalar") if key in instruction.attributes), None)
                                 scalar_payload = instruction.attributes.get(scalar_key) if scalar_key else (metadata[-1] if metadata else None)
                                 if scalar_payload is not None and not isinstance(scalar_payload, (tuple, list)):
-                                    scalar, scalar_def = constant(float(scalar_payload), "float64")
+                                    scalar, scalar_def = constant(
+                                        (
+                                            int(scalar_payload) if int64_binary
+                                            else float(scalar_payload)
+                                        ),
+                                        kernel_dtype,
+                                    )
                                     reverse, reverse_def = constant(int(scalar_key == "left_scalar"), "int32")
                                     prefix.extend((scalar_def, reverse_def))
                                     emitted.append(call(
-                                        "binary_scalar_double", [source, scalar, result, count, opcode_ssa, reverse],
+                                        scalar_kernel, [source, scalar, result, count, opcode_ssa, reverse],
                                         result, instruction, output_argument=2,
                                     ))
 

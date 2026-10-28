@@ -514,17 +514,30 @@ def _elementwise_runtime_rank(
     return rank, None
 
 
+@dataclass(frozen=True)
+class _MapReducePlan:
+    """``maps`` feed one runtime-sized span to ``reduction``; ``posts``
+    finish its scalar into the one output."""
+
+    maps: tuple[Instr, ...]
+    reduction: Instr
+    posts: tuple[Instr, ...]
+
+
 def _runtime_reduction(
     function: Function, outputs: Sequence[SSAValue],
-) -> tuple[Instr | None, str | None]:
-    """The one whole-span reduction ``function`` computes, if that is all.
+) -> tuple[_MapReducePlan | None, str | None]:
+    """The map-reduce a function over runtime-sized spans computes, if any.
 
-    Reduction mode applies when the function's only instruction (besides
-    ``Ret``) is ``sum``/``prod``/``max``/``min``/``mean``/``all``/``any`` of
-    a runtime-sized span argument to its one scalar output, with no axis;
-    ``sum`` may carry a scalar ``start`` argument. Returns ``(instr, None)``,
+    Reduction mode applies when the function's one block is: elementwise
+    ``maps`` over runtime-sized span feeds of one rank (scalar feeds and
+    constants broadcast), then ONE whole-span ``sum``/``prod``/``max``/
+    ``min``/``mean``/``all``/``any`` of a feed or a map's result (``sum``
+    may carry a scalar ``start`` feed), then scalar ``posts`` over that
+    total, scalar feeds and constants, ending in the one scalar output.
+    Program: ``(x * y).sum() * 2.0``. Returns ``(plan, None)``,
     ``(None, reason)`` for a reduction it cannot carry, or ``(None, None)``
-    when the function is not a reduction at all.
+    when the function reduces no runtime-sized span.
     """
 
     if len(function.blocks) != 1:
@@ -534,37 +547,92 @@ def _runtime_reduction(
         instr for instr in block.instrs
         if instr.op not in ("Ret", "ret", "Return", "return")
     ]
-    if len(body) != 1:
+
+    def operation(instr: Instr) -> str:
+        return str(instr.attributes.get("tensor_operation") or instr.op)
+
+    position = next((
+        index for index, instr in enumerate(body)
+        if operation(instr) in _REDUCTION_OPS and instr.args
+        and _runtime_sized(instr.args[0])
+        and not (operation(instr) in ("max", "min") and len(instr.args) > 1)
+    ), None)
+    if position is None:
         return None, None
-    (instr,) = body
-    op = str(instr.attributes.get("tensor_operation") or instr.op)
-    if op not in _REDUCTION_OPS or not instr.args or not _runtime_sized(instr.args[0]):
-        return None, None
+    instr = body[position]
+    op = operation(instr)
     source = instr.args[0]
     arguments = {int(value.id) for value in function.args}
-    if (
-        instr.res is None
-        or tuple(instr.res.shape or ())
-        or _runtime_sized(instr.res)
-        or [int(value.id) for value in outputs] != [int(instr.res.id)]
-    ):
-        return None, f"{op} of %t{source.id} must be the one scalar output"
     if instr.attributes.get("axis") is not None or instr.attributes.get("dim") is not None:
         return None, f"{op} over an axis of a runtime-sized span"
-    if int(source.id) not in arguments:
+    rank = _declared_rank(source)
+    spans = {int(value.id) for value in function.args if _runtime_sized(value)}
+    scalars = {
+        int(value.id) for value in function.args
+        if not _runtime_sized(value) and not tuple(value.shape or ())
+    }
+    maps: list[Instr] = []
+    for item in body[:position]:
+        if operation(item) in ("Const", "const") and item.res is not None:
+            if tuple(item.res.shape or ()) or _runtime_sized(item.res):
+                return None, f"constant %t{item.res.id} is not a scalar"
+            scalars.add(int(item.res.id))
+            maps.append(item)
+            continue
+        if (
+            item.res is None or not _runtime_sized(item.res)
+            or _declared_rank(item.res) != rank
+            or not item.args
+            or any(
+                int(value.id) not in spans | scalars for value in item.args
+            )
+            or any(
+                int(value.id) in spans and _declared_rank(value) != rank
+                for value in item.args
+            )
+        ):
+            return None, (
+                f"{operation(item)} before the reduction is not elementwise "
+                f"over rank-{rank} runtime-sized spans"
+            )
+        spans.add(int(item.res.id))
+        maps.append(item)
+    if int(source.id) not in spans:
         return None, f"%t{source.id} is not a feed of {function.name}"
+    if (
+        instr.res is None or tuple(instr.res.shape or ())
+        or _runtime_sized(instr.res)
+    ):
+        return None, f"{op} of %t{source.id} must be a scalar"
     if len(instr.args) > (2 if op == "sum" else 1) or any(
         int(value.id) not in arguments or value.shape or _runtime_sized(value)
         for value in instr.args[1:]
     ):
         return None, f"{op} takes one span (and for sum a scalar start feed)"
-    if str(instr.res.dtype or DEFAULT_DTYPE) == "bool":
+    scalars.add(int(instr.res.id))
+    posts: list[Instr] = []
+    for item in body[position + 1:]:
+        if (
+            item.res is None or tuple(item.res.shape or ())
+            or _runtime_sized(item.res)
+            or any(int(value.id) not in scalars for value in item.args)
+        ):
+            return None, (
+                f"{operation(item)} after the reduction reads a span; only "
+                "scalars may follow it"
+            )
+        scalars.add(int(item.res.id))
+        posts.append(item)
+    last = (posts[-1] if posts else instr).res
+    if [int(value.id) for value in outputs] != [int(last.id)]:
+        return None, f"{op} of %t{source.id} must lead to the one scalar output"
+    if str(last.dtype or DEFAULT_DTYPE) == "bool":
         return None, f"a bool {op} result has no storage-buffer spelling"
     if op == "mean" and _DTYPE_KIND.get(str(instr.res.dtype or DEFAULT_DTYPE)) != "float":
         return None, "mean needs a float result"
     if op not in ("all", "any") and _DTYPE_KIND.get(str(source.dtype or DEFAULT_DTYPE)) == "bool":
         return None, f"a {op} over bool elements"
-    return instr, None
+    return _MapReducePlan(tuple(maps), instr, tuple(posts)), None
 
 
 class _FunctionEmitter:
@@ -888,6 +956,44 @@ class _FunctionEmitter:
         )
         body.append(f"    OpStore {access} {value_id}")
 
+    def _max_step(
+        self, rule: str, greatest: bool, running: str, value: str,
+        value_type: str, floating: bool, body: list[str],
+        result_id: str | None = None,
+    ) -> str:
+        """One ``max``/``min`` step under ``rule`` (see ``max_semantics``).
+
+        ``PYTHON``: ``value`` replaces ``running`` only when strictly
+        better, so a NaN never wins and a tie keeps ``running``. ``NUMPY``:
+        a NaN on either side is the result (``running``'s first), otherwise
+        the better, with a tie taking ``value``. ``FMax`` is not used: its
+        NaN result is undefined by GLSL.std.450.
+        """
+
+        from .max_semantics import PYTHON
+
+        bool_type = self.builder.scalar_type("bool")
+        if floating:
+            compare = "OpFOrdGreaterThan" if greatest else "OpFOrdLessThan"
+        else:
+            compare = "OpSGreaterThan" if greatest else "OpSLessThan"
+        out = result_id or self.builder.fresh("v")
+        if rule == PYTHON or not floating:
+            wins = self.builder.fresh("v")
+            body.append(f"    {wins} = {compare} {bool_type} {value} {running}")
+            body.append(f"    {out} = OpSelect {value_type} {wins} {value} {running}")
+            return out
+        keeps, pick = self.builder.fresh("v"), self.builder.fresh("v")
+        nan_value, after = self.builder.fresh("v"), self.builder.fresh("v")
+        nan_running = self.builder.fresh("v")
+        body.append(f"    {keeps} = {compare} {bool_type} {running} {value}")
+        body.append(f"    {pick} = OpSelect {value_type} {keeps} {running} {value}")
+        body.append(f"    {nan_value} = OpIsNan {bool_type} {value}")
+        body.append(f"    {after} = OpSelect {value_type} {nan_value} {value} {pick}")
+        body.append(f"    {nan_running} = OpIsNan {bool_type} {running}")
+        body.append(f"    {out} = OpSelect {value_type} {nan_running} {running} {after}")
+        return out
+
     def _convert(
         self, value_id: str, source: str, target: str, body: list[str]
     ) -> str | None:
@@ -911,6 +1017,153 @@ class _FunctionEmitter:
         )
         return converted
 
+    def _emit_max_pair(
+        self, instr: Instr, block: BasicBlock, body: list[str],
+        rule: str, greatest: bool,
+    ) -> None:
+        """A stamped two-operand ``max``/``min``, per element over arrays."""
+
+        result_dtype = instr.res.dtype or self.dtype
+        result_type = self.builder.scalar_type(result_dtype)
+        floating = _DTYPE_KIND.get(result_dtype) == "float"
+        result_shape = tuple(int(size) for size in instr.res.shape)
+        if not result_shape:
+            self._max_step(
+                rule, greatest, self._name(instr.args[0]), self._name(instr.args[1]),
+                result_type, floating, body, result_id=self._name(instr.res),
+            )
+            return
+        pointer = self._array_pointer.get(instr.res.id)
+        if pointer is None:
+            self._shortfall(
+                instr.op, block.name, "internal: no storage allocated for this array result"
+            )
+            return
+        for index in itertools.product(*(range(size) for size in result_shape)):
+            operands = []
+            for argument in instr.args:
+                shape = tuple(int(size) for size in argument.shape)
+                if not shape:
+                    operands.append(self._name(argument))
+                    continue
+                at = self._broadcast_index(shape, result_shape, index)
+                source = self._array_pointer.get(argument.id)
+                if at is None or source is None:
+                    self._shortfall(
+                        instr.op, block.name,
+                        "operand shape does not broadcast to the result shape",
+                    )
+                    return
+                operands.append(self._load_element(
+                    source, at, self.builder.scalar_type(argument.dtype or self.dtype), body,
+                ))
+            value = self._max_step(
+                rule, greatest, operands[0], operands[1], result_type, floating, body,
+            )
+            self._store_element(pointer, index, result_type, value, body)
+
+    def _emit_axis_reduction(
+        self, op: str, axis, instr: Instr, block: BasicBlock, body: list[str]
+    ) -> None:
+        """``y.sum(axis=k)`` (and prod/mean/max/min) over a static shape.
+
+        Unrolled like the whole-array form: one result per lane of the
+        kept axes, row-major, folded along axis k in index order; max/min
+        take numpy's rule (a NaN in the lane is its result), as in C.
+        """
+
+        source = instr.args[0]
+        shape = tuple(int(size) for size in source.shape or ())
+        result_shape = tuple(int(size) for size in instr.res.shape or ())
+        if not isinstance(axis, int) or not shape or not -len(shape) <= axis < len(shape):
+            self._shortfall(
+                op, block.name,
+                f"{op} over axis {axis!r} needs one in-range integer axis of a "
+                "static shape",
+            )
+            return
+        axis %= len(shape)
+        kept = shape[:axis] + shape[axis + 1:]
+        if math.prod(result_shape) != math.prod(kept) or (
+            shape[axis] == 0 and op in ("max", "min")
+        ):
+            self._shortfall(
+                op, block.name,
+                f"{op} over axis {axis} of {shape!r} into {result_shape!r} "
+                "(an empty max/min axis raises in numpy)",
+            )
+            return
+        pointer = self._array_pointer.get(source.id)
+        target = self._array_pointer.get(instr.res.id)
+        if pointer is None or target is None:
+            self._shortfall(op, block.name, "array operand has no known storage")
+            return
+        source_dtype = source.dtype or self.dtype
+        result_dtype = instr.res.dtype or self.dtype
+        result_kind = _DTYPE_KIND.get(result_dtype)
+        if "bool" in (_DTYPE_KIND.get(source_dtype), result_kind) or (
+            op == "mean" and result_kind != "float"
+        ):
+            self._shortfall(
+                op, block.name, f"{op} over an axis into {result_dtype}",
+            )
+            return
+        source_type = self.builder.scalar_type(source_dtype)
+        result_type = self.builder.scalar_type(result_dtype)
+        lanes = list(itertools.product(*(range(size) for size in kept)))
+        stored_shape = result_shape or (1,)
+        for flat, lane in enumerate(lanes):
+            elements = []
+            for step in range(shape[axis]):
+                index = lane[:axis] + (step,) + lane[axis:]
+                value = self._load_element(pointer, index, source_type, body)
+                converted = self._convert(value, source_dtype, result_dtype, body)
+                if converted is None:
+                    self._shortfall(
+                        op, block.name,
+                        f"no conversion from {source_dtype} to {result_dtype}",
+                    )
+                    return
+                elements.append(converted)
+            if op in ("max", "min"):
+                from .max_semantics import NUMPY, max_step_rule
+
+                accumulator = elements[0]
+                for value in elements[1:]:
+                    accumulator = self._max_step(
+                        max_step_rule(instr) or NUMPY, op == "max", accumulator,
+                        value, result_type, result_kind == "float", body,
+                    )
+            else:
+                kind, payload = self._resolve(
+                    "mul" if op == "prod" else "add", result_dtype, 2,
+                )
+                accumulator = self.builder.constant(
+                    result_dtype, 1 if op == "prod" else 0,
+                )
+                for value in elements:
+                    folded = self.builder.fresh("v")
+                    self._apply(
+                        kind, payload, result_type, folded,
+                        [accumulator, value], instr, body,
+                    )
+                    accumulator = folded
+                if op == "mean":
+                    count = self.builder.constant(result_dtype, len(elements))
+                    kind, payload = self._resolve("Div", result_dtype, 2)
+                    averaged = self.builder.fresh("v")
+                    self._apply(
+                        kind, payload, result_type, averaged,
+                        [accumulator, count], instr, body,
+                    )
+                    accumulator = averaged
+            at = []
+            remainder = flat
+            for size in reversed(stored_shape):
+                at.append(remainder % size)
+                remainder //= size
+            self._store_element(target, tuple(reversed(at)), result_type, accumulator, body)
+
     def _emit_reduction(
         self, op: str, instr: Instr, block: BasicBlock, body: list[str]
     ) -> None:
@@ -927,10 +1180,16 @@ class _FunctionEmitter:
         """
 
         source = instr.args[0]
+        axis = instr.attributes.get("axis")
+        if axis is None:
+            axis = instr.attributes.get("dim")
+        if axis is not None and op in ("sum", "prod", "mean", "max", "min"):
+            self._emit_axis_reduction(op, axis, instr, block, body)
+            return
         if (
             len(instr.args) > (2 if op == "sum" else 1)
             or any(a.shape for a in instr.args[1:])
-            or instr.attributes.get("axis") is not None
+            or axis is not None
         ):
             self._shortfall(
                 op, block.name,
@@ -1008,26 +1267,15 @@ class _FunctionEmitter:
             elements.append(converted)
 
         if op in ("max", "min"):
-            bool_type = self.builder.scalar_type("bool")
-            if result_kind == "float":
-                compare = "OpFOrdGreaterThan" if op == "max" else "OpFOrdLessThan"
-            else:
-                compare = "OpSGreaterThan" if op == "max" else "OpSLessThan"
+            from .max_semantics import NUMPY, max_step_rule
+
+            rule = max_step_rule(instr) or NUMPY
             accumulator = elements[0]
             for value in elements[1:]:
-                wins = self.builder.fresh("v")
-                body.append(f"    {wins} = {compare} {bool_type} {value} {accumulator}")
-                if result_kind == "float":
-                    nan = self.builder.fresh("v")
-                    body.append(f"    {nan} = OpIsNan {bool_type} {value}")
-                    either = self.builder.fresh("v")
-                    body.append(f"    {either} = OpLogicalOr {bool_type} {wins} {nan}")
-                    wins = either
-                chosen = self.builder.fresh("v")
-                body.append(
-                    f"    {chosen} = OpSelect {result_type} {wins} {value} {accumulator}"
+                accumulator = self._max_step(
+                    rule, op == "max", accumulator, value, result_type,
+                    result_kind == "float", body,
                 )
-                accumulator = chosen
             body.append(f"    {name} = OpCopyObject {result_type} {accumulator}")
             return
 
@@ -1172,6 +1420,36 @@ class _FunctionEmitter:
 
         if not result_shape and any(a.shape for a in instr.args) and op in _REDUCTION_OPS:
             self._emit_reduction(op, instr, block, body)
+            return
+        if (
+            op in ("sum", "prod", "mean", "max", "min")
+            and instr.args and instr.args[0].shape
+            and (
+                instr.attributes.get("axis") is not None
+                or instr.attributes.get("dim") is not None
+            )
+        ):
+            self._emit_axis_reduction(
+                op,
+                instr.attributes.get("axis")
+                if instr.attributes.get("axis") is not None
+                else instr.attributes.get("dim"),
+                instr, block, body,
+            )
+            return
+
+        from .max_semantics import is_max, max_step_rule
+
+        greatest = is_max(op)
+        rule = max_step_rule(instr)
+        if (
+            greatest is not None and rule is not None and len(instr.args) == 2
+            and not any(
+                instr.attributes.get(key) is not None
+                for key in ("right_scalar", "left_scalar")
+            )
+        ):
+            self._emit_max_pair(instr, block, body, rule, greatest)
             return
 
         operand_dtype = instr.args[0].dtype if instr.args else result_dtype
@@ -1558,8 +1836,8 @@ def emit_deployable_compute_shader(
         return refused()
     if reduction is not None:
         return _emit_runtime_reduction_shader(
-            function, reduction, dtype=dtype, local=local, name=name,
-            module=module,
+            function, reduction.reduction, dtype=dtype, local=local, name=name,
+            module=module, maps=reduction.maps, posts=reduction.posts,
         )
     # Element mode: an elementwise function over runtime-sized spans of one
     # rank runs one ELEMENT per invocation instead of one instance; its
@@ -1888,6 +2166,8 @@ def _emit_runtime_reduction_shader(
     local: tuple[int, int, int],
     name: str,
     module: IRModule | None,
+    maps: Sequence[Instr] = (),
+    posts: Sequence[Instr] = (),
 ) -> SPIRVDeployableShader:
     """Reduction mode: one invocation folds a runtime-sized span.
 
@@ -1900,10 +2180,17 @@ def _emit_runtime_reduction_shader(
     ``all``/``any``), and writes element 0 of ``output_0``. The launch is one
     group. ``max``, ``min`` and ``mean`` of no elements have no value: the
     shader then writes nothing, and the record says ``minimum`` 1.
+
+    Map-reduce: the ``maps`` (see ``_MapReducePlan``) run per element inside
+    the loop, so ``(x * y).sum()`` reads ``x[i]`` and ``y[i]`` and folds
+    their product without storing the product span; scalar feeds and
+    constants broadcast. The ``posts`` then finish the total into the one
+    output, in order.
     """
 
     op = str(instr.attributes.get("tensor_operation") or instr.op)
     source, result = instr.args[0], instr.res
+    last = (list(posts)[-1] if posts else instr).res
     shortfalls = list(_precision_shortfalls(
         module if module is not None else function, (function.name,)
     ).get(function.name, ()))
@@ -1913,7 +2200,7 @@ def _emit_runtime_reduction_shader(
         )
     builder = _ModuleBuilder(linkage=False)
     folding = _FunctionEmitter(
-        function, builder, dtype=dtype, outputs=(result,), runtime_elements=True,
+        function, builder, dtype=dtype, outputs=(last,), runtime_elements=True,
     )
     uint = builder.uint_type()
     boolean = builder.scalar_type("bool")
@@ -1951,7 +2238,7 @@ def _emit_runtime_reduction_shader(
     bindings: list[SPIRVStorageBinding] = []
     variables: dict[int, tuple[str, str, str]] = {}
     for binding, (role, value) in enumerate(
-        [("feed", value) for value in function.args] + [("output", result)]
+        [("feed", value) for value in function.args] + [("output", last)]
     ):
         value_dtype = str(value.dtype or dtype)
         spelling, stride = _STORAGE_ELEMENT[value_dtype]
@@ -1995,7 +2282,48 @@ def _emit_runtime_reduction_shader(
 
     logical = op in ("all", "any")
     accumulator_type = boolean if logical else result_type
-    span_variable, _span_type, span_pointer = variables[int(source.id)]
+    from .max_semantics import NUMPY, is_max, max_step_rule
+
+    def operation(item: Instr) -> str:
+        return str(item.attributes.get("tensor_operation") or item.op)
+
+    def compute(item: Instr, values: dict[int, str], tag: str) -> str:
+        """``item`` over the scalar ids in ``values``, as a fresh id."""
+
+        item_dtype = str(item.res.dtype or dtype)
+        item_type = builder.scalar_type(item_dtype)
+        if operation(item) in ("Const", "const"):
+            literal = item.attributes.get("constant")
+            if literal is None:
+                literal = item.attributes.get("value")
+            return builder.constant(item_dtype, literal)
+        operand_dtype = str(item.args[0].dtype or item_dtype)
+        ids = [values[int(value.id)] for value in item.args]
+        target = f"%{tag}_{item.res.id}"
+        greatest = is_max(operation(item))
+        if greatest is not None and len(ids) == 2:
+            folding._max_step(
+                max_step_rule(item) or NUMPY, greatest, ids[0], ids[1],
+                item_type, _DTYPE_KIND.get(item_dtype) == "float", body,
+                result_id=target,
+            )
+            return target
+        ids = folding._augment_scalar_attrs(item, ids, operand_dtype)
+        resolved = folding._resolve(operation(item), operand_dtype, len(ids))
+        if resolved is None:
+            raise SPIRVEmissionError(
+                f"no SPIR-V spelling for {operation(item)} in a map-reduce"
+            )
+        folding._apply(*resolved, item_type, target, ids, item, body)
+        return target
+
+    def load(value: SSAValue, at: str, tag: str) -> str:
+        variable, value_type, pointer = variables[int(value.id)]
+        body.append(f"%{tag}_ptr = OpAccessChain {pointer} {variable} {zero} {at}")
+        body.append(f"%{tag} = OpLoad {value_type} %{tag}_ptr")
+        return f"%{tag}"
+
+    broadcast: dict[int, str] = {}
     body = [
         f"%main = OpFunction {void} None {builder.function_type(void, ())}",
         "%main_entry = OpLabel",
@@ -2020,9 +2348,18 @@ def _emit_runtime_reduction_shader(
         "%main_body = OpLabel",
     ])
 
+    for value in function.args:
+        if not _runtime_sized(value):
+            broadcast[int(value.id)] = load(value, zero, f"s{value.id}")
+
     def element(at: str, tag: str) -> str:
-        body.append(f"%{tag}_ptr = OpAccessChain {span_pointer} {span_variable} {zero} {at}")
-        body.append(f"%{tag} = OpLoad {source_type} %{tag}_ptr")
+        values = dict(broadcast)
+        for value in function.args:
+            if _runtime_sized(value):
+                values[int(value.id)] = load(value, at, f"{tag}_f{value.id}")
+        for item in maps:
+            values[int(item.res.id)] = compute(item, values, tag)
+        body.append(f"%{tag} = OpCopyObject {source_type} {values[int(source.id)]}")
         if logical:
             if source_kind == "float":
                 test = builder.constant(source_dtype, 0.0)
@@ -2046,11 +2383,8 @@ def _emit_runtime_reduction_shader(
         initial = element(zero, "e0")
     elif op == "sum" and len(instr.args) == 2:
         start = instr.args[1]
-        start_variable, start_type, start_pointer = variables[int(start.id)]
-        body.append(f"%start_ptr = OpAccessChain {start_pointer} {start_variable} {zero} {zero}")
-        body.append(f"%start = OpLoad {start_type} %start_ptr")
         initial = folding._convert(
-            "%start", str(start.dtype or dtype), result_dtype, body,
+            broadcast[int(start.id)], str(start.dtype or dtype), result_dtype, body,
         )
         if initial is None:
             raise SPIRVEmissionError(
@@ -2077,18 +2411,10 @@ def _emit_runtime_reduction_shader(
         folded = "OpLogicalAnd" if op == "all" else "OpLogicalOr"
         body.append(f"%next_acc = {folded} {boolean} %acc {value}")
     elif op in ("max", "min"):
-        compare = (
-            ("OpFOrdGreaterThan" if op == "max" else "OpFOrdLessThan")
-            if result_kind == "float"
-            else ("OpSGreaterThan" if op == "max" else "OpSLessThan")
+        folding._max_step(
+            max_step_rule(instr) or NUMPY, op == "max", "%acc", value,
+            result_type, result_kind == "float", body, result_id="%next_acc",
         )
-        body.append(f"%wins = {compare} {boolean} {value} %acc")
-        wins = "%wins"
-        if result_kind == "float":
-            body.append(f"%nan = OpIsNan {boolean} {value}")
-            body.append(f"%wins_or_nan = OpLogicalOr {boolean} %wins %nan")
-            wins = "%wins_or_nan"
-        body.append(f"%next_acc = OpSelect {result_type} {wins} {value} %acc")
     else:
         kind, payload = folding._resolve(
             "mul" if op == "prod" else "add", result_dtype, 2,
@@ -2117,6 +2443,11 @@ def _emit_runtime_reduction_shader(
         kind, payload = folding._resolve("Div", result_dtype, 2)
         folding._apply(kind, payload, result_type, "%final", ["%total", "%count_f"], instr, body)
         final = "%final"
+    finished = dict(broadcast)
+    finished[int(result.id)] = final
+    for item in posts:
+        finished[int(item.res.id)] = compute(item, finished, "post")
+    final = finished[int(last.id)]
     body.extend([
         f"%out_ptr = OpAccessChain {output_pointer} {output_variable} {zero} {zero}",
         f"OpStore %out_ptr {final}",

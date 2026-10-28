@@ -41,6 +41,11 @@ Findings (each is one concrete disagreement, with the two claims):
 ``use-not-dominated``
     an instruction reads a value whose definition does not dominate the
     read (Phi operands exempt; they arrive over predecessor edges).
+``phi-edge-not-predecessor``
+    a Phi names an incoming block that has no CFG edge to its owner.
+``child-selection-not-guarded``
+    a selected child view or allocation effect is outside its declared
+    capacity/selection predicate's true CFG edge.
 ``alias-target-missing``
     a recorded value alias points at neither a physical definition nor an
     owned structural record descriptor.
@@ -432,9 +437,15 @@ def publish_program_abi_graph_identities(
                         declared_shape = (int(field["fixed_length"]),)
                     if storage == "span" and declared_shape is not None:
                         declared_shape = tuple(map(int, declared_shape))
+                        if not field.get("dtype"):
+                            raise ValueError(
+                                f"class field {field_name!r} declares a span "
+                                f"of shape {declared_shape} but records no "
+                                "element dtype"
+                            )
                         declared_state = {
                             "shape": declared_shape,
-                            "dtype": str(field.get("dtype") or "float64"),
+                            "dtype": str(field["dtype"]),
                             "rank": int(field.get(
                                 "rank", len(declared_shape),
                             )),
@@ -685,9 +696,16 @@ def publish_projected_iterable_layouts(module: Any) -> None:
     objects.
     """
 
+    from .ssa_record_return_state import accepted_ssa_component
+
     functions = getattr(module, "functions", {}) or {}
     sequence_tables = getattr(module, "sequence_tables", {}) or {}
     for function_name, function in functions.items():
+        if accepted_ssa_component(function):
+            # A linked, digest-pinned body published its own internal call
+            # edges in its owning book; the enclosing unit settles only the
+            # edges it owns.
+            continue
         occurrences = (
             *tuple(function.args),
             *tuple(
@@ -1481,6 +1499,35 @@ class CorrelationTable:
                             sequences is None or sequences.by_id(record_field.sequence_id) is None):
                         found.append(Finding("record-sequence-unknown", str(name), int(record.record_id),
                             f"field {record_field.storage_identity!r} names absent sequence {record_field.sequence_id}"))
+                    elif record_field.sequence_id is not None:
+                        sequence = sequences.by_id(record_field.sequence_id)
+                        from ..transmogrifier.ssa import sequence_member_roles
+
+                        # Page.clock's provisional descriptor was retired but
+                        # its field kept the old column/length/capacity IDs.
+                        # A field's physical surface must belong to the SAME
+                        # descriptor its sequence_id names, even when all old
+                        # IDs still have historical alias receipts.
+                        stale_members = sorted(
+                            set(map(int, record_field.value_ids))
+                            - set(sequence_member_roles(sequence))
+                        )
+                        if stale_members:
+                            found.append(Finding(
+                                "record-sequence-member-disagreement", str(name),
+                                int(record.record_id),
+                                f"field {record_field.storage_identity!r} names "
+                                f"nonmembers {stale_members!r} of sequence "
+                                f"{int(sequence.sequence_id)}",
+                            ))
+                        owner = sequence.heap_owner_value_id
+                        if owner is not None and int(owner) not in record_field.value_ids:
+                            found.append(Finding(
+                                "record-sequence-owner-missing", str(name),
+                                int(record.record_id),
+                                f"field {record_field.storage_identity!r} omits "
+                                f"sequence heap owner {int(owner)} from its physical members",
+                            ))
         found.extend(self._native_interface_findings(module))
         found.extend(self._region_instruction_residency_findings(module))
         found.extend(self._repository_ssa_signature_findings(module))
@@ -1509,18 +1556,24 @@ class CorrelationTable:
         found.extend(self._tile_storage_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
+        found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._source_numeric_component_findings(module))
+        found.extend(self._source_numeric_specialization_findings(module))
         found.extend(self._source_numeric_intrinsic_findings(module))
         found.extend(self._source_numeric_type_dependency_findings(module))
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
+        found.extend(self._mapping_child_contract_findings(module))
         found.extend(self._unborn_display_findings(module))
         found.extend(self._unreturned_output_findings(module))
         found.extend(self._live_structure_findings(module))
         found.extend(self._ssa_publication_findings(module))
         found.extend(self._value_type_abi_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
+        found.extend(self._frame_aliased_result_findings(module))
+        found.extend(self._physical_call_input_conversion_findings(module))
+        found.extend(self._formal_actual_occurrence_findings(module))
         found.extend(self._source_precision_boundary_findings(module))
         found.extend(self._source_precision_operator_findings(module))
         found.extend(self._source_precision_region_findings(module))
@@ -1529,6 +1582,7 @@ class CorrelationTable:
         found.extend(self._tensor_reduction_domain_findings(module))
         found.extend(self._callable_identity_findings(module))
         found.extend(self._post_ssa_numeric_identity_findings(module))
+        found.extend(self._constant_materialization_findings(module))
         found.extend(self._table_member_findings(module))
         found.extend(self._layout_table_findings(module))
         found.extend(self._operand_position_orphan_findings(module))
@@ -2603,6 +2657,37 @@ class CorrelationTable:
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         pages = getattr(book, "pages", {}) or {}
         found: list[Finding] = []
+        if book is not None:
+            from .ssa_record_return_state import accepted_ssa_component
+
+            owned = []
+            for attribute, rows_attribute in (
+                ("sequence_tables", "sequences"),
+                ("record_tables", "records"),
+                ("value_union_tables", "unions"),
+            ):
+                for name, table in (getattr(module, attribute, {}) or {}).items():
+                    function = module.functions.get(name)
+                    expected = book
+                    if function is not None and accepted_ssa_component(function):
+                        expected = function.metadata["accepted_ssa_component"]["identity_book"]
+                    if getattr(table, rows_attribute, {}):
+                        owned.append((str(name), attribute, table, expected))
+            for attribute, rows_attribute in (
+                ("struct_table", "_rows"), ("union_table", "_rows"),
+                ("call_table", None),
+            ):
+                table = getattr(module, attribute, None)
+                rows = table if rows_attribute is None else getattr(table, rows_attribute, {})
+                if rows:
+                    owned.append(("<module>", attribute, table, book))
+            for name, attribute, table, expected in owned:
+                if getattr(table, "book", None) is not expected:
+                    found.append(Finding(
+                        "concordance-table-owner-disagreement", name, None,
+                        f"{attribute} owner {getattr(table, 'owner', None)!r} "
+                        "is a view of a different identity book than its owning module/component",
+                    ))
         for descriptor_page, member_page, claims_of in (
             ("record_descriptor", "record_member", record_member_claims),
             ("sequence_descriptor", "sequence_member", sequence_member_roles),
@@ -2636,6 +2721,139 @@ class CorrelationTable:
                         f"{sorted(recorded.get(member, ()), key=repr)!r}; "
                         f"{descriptor_page} implies "
                         f"{sorted(expected.get(member, ()), key=repr)!r}",
+                    ))
+        found.extend(CorrelationTable._native_heap_storage_findings(module))
+        return found
+
+    @staticmethod
+    def _native_heap_storage_findings(module: Any) -> list[Finding]:
+        """Native cells and resident views must agree with their descriptor.
+
+        The real forwarded StringCore child pool kept the descriptor but
+        lost optional resident heap labels. Missing labels are not missing
+        authority; contradictory owner/layout labels are a disagreement.
+        """
+        from .structural_concordance import storage_structure
+        from .concordance_declarations import SEQUENCE_DESCRIPTOR
+        from .ir_sequence_tables import _storage_values
+
+        found = []
+        for function_name, table in (getattr(module, "sequence_tables", {}) or {}).items():
+            function = module.functions.get(function_name)
+            if function is None:
+                continue
+            occurrences = {}
+            for value in (*function.args, *(candidate
+                    for block in function.blocks.values() for instruction in block.instrs
+                    for candidate in (*instruction.args, instruction.res) if candidate is not None)):
+                occurrences.setdefault(int(value.id), []).append(value)
+            native_claims = {}
+            for descriptor in table.sequences.values():
+                if descriptor.heap_owner_value_id is None:
+                    continue
+                sequence_id = int(descriptor.sequence_id)
+                def issue(detail, member=sequence_id):
+                    found.append(Finding("native-heap-storage-disagreement", str(function_name),
+                                         int(member), detail))
+                try:
+                    view, _cell = storage_structure("sequence", table.owner, sequence_id, book=table.book)
+                except ConcordanceRefusal as error:
+                    issue(str(error))
+                    continue
+                source = table.book.latest_ref(SEQUENCE_DESCRIPTOR, (table.owner, sequence_id))
+                native = dict(view.children).get("native_storage")
+                if (native is None or native.kind != "product" or native.source != source
+                        or native.value_id != sequence_id or native.storage != "native_storage"):
+                    issue("owned sequence lacks its resolved exact descriptor native-storage view")
+                    continue
+                expected = {int(value.id): value for value in _storage_values(descriptor)}
+                members = dict(native.children)
+                if set(members) != set(expected):
+                    issue(f"native members {tuple(members)!r} differ from descriptor members {tuple(expected)!r}")
+                for member_id, declared in expected.items():
+                    member = members.get(member_id)
+                    if member is None:
+                        continue
+                    labels = dict(declared.accounting or {})
+                    if member.value_id != member_id or member.source != source:
+                        issue("native member does not retain its exact descriptor identity", member_id)
+                    if (member.dtype != str(declared.dtype) or member.physical_dtype != str(declared.dtype)
+                            or tuple(member.shape) != tuple(declared.shape) or member.rank != len(declared.shape)):
+                        issue("native member physical type/shape differs from its descriptor storage", member_id)
+                    role = ("heap_owner" if labels.get("heap_owner") else
+                            "heap_cell" if labels.get("heap_element_dtype") is not None else None)
+                    if role is None:
+                        continue
+                    claim = (role, labels.get("heap_element_dtype"), labels.get("heap_owner_value_id"))
+                    prior = native_claims.setdefault(member_id, claim)
+                    if prior != claim:
+                        issue(f"one native identity has conflicting descriptor roles/layouts/owners: {prior!r} versus {claim!r}", member_id)
+                    if (member.kind != "reference" or member.storage != role
+                            or member.dtype != "ptr" or member.physical_dtype != "ptr"):
+                        issue(f"native member is not its declared {role} pointer cell", member_id)
+                    if role == "heap_cell":
+                        children = dict(member.children)
+                        element, owner = children.get("element"), children.get("owner")
+                        if (element is None or element.source != source or element.value_id != member_id
+                                or element.kind != "scalar" or element.rank != 0 or element.shape != ()
+                                or element.dtype != labels["heap_element_dtype"]
+                                or element.physical_dtype != labels["heap_element_dtype"]):
+                            issue("heap cell element layout differs from its exact descriptor", member_id)
+                        if (owner is None or owner.source != source or owner.storage != "heap_owner"
+                                or owner.value_id != labels["heap_owner_value_id"]
+                                or owner.kind != "reference" or owner.shape != (1,) or owner.rank != 1
+                                or owner.dtype != "ptr" or owner.physical_dtype != "ptr"
+                                or owner.value_id not in members
+                                or members[owner.value_id].storage != "heap_owner"):
+                            issue("heap cell context owner differs from its exact descriptor", member_id)
+                    for occurrence in occurrences.get(member_id, ()):
+                        resident = dict(occurrence.accounting or {})
+                        mismatch = str(occurrence.dtype) != "ptr"
+                        mismatch |= bool(resident.get("heap_owner")) and role != "heap_owner"
+                        if resident.get("heap_element_dtype") is not None:
+                            mismatch |= role != "heap_cell" or resident["heap_element_dtype"] != labels.get("heap_element_dtype")
+                        if resident.get("heap_owner_value_id") is not None:
+                            mismatch |= role != "heap_cell" or resident["heap_owner_value_id"] != labels.get("heap_owner_value_id")
+                        if mismatch:
+                            issue("resident native cell type/owner/layout disagrees with its descriptor view", member_id)
+                            break
+        return found
+
+    @staticmethod
+    def _formal_actual_occurrence_findings(module: Any) -> list[Finding]:
+        """A changed occurrence must retain its exact control transition."""
+        from .concordance_declarations import FORMAL_ACTUAL_OCCURRENCE, LOOP_RESULT_USE_REBINDING, SSA_VALUE
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = None if book is None else book.pages.get(FORMAL_ACTUAL_OCCURRENCE.name)
+        if page is None:
+            return []
+        found = []
+        for row in page.rows():
+            if len(row) != 7:
+                continue
+            _callee, formal, caller, block, index, position, scope = row
+            history = page.history(row)
+            for (old_column, old), (column, current) in zip(history, history[1:]):
+                if old == current:
+                    continue
+                cell = Ref(FORMAL_ACTUAL_OCCURRENCE, row, column)
+                causes = tuple(parent for parent, _stage in book.edges_into(cell))
+                previous = Ref(FORMAL_ACTUAL_OCCURRENCE, row, old_column)
+                transition_key = (scope, block, index, position)
+                transitions = tuple(parent for parent in causes
+                    if parent.page == LOOP_RESULT_USE_REBINDING and parent.row == transition_key)
+                valid_transition = any(
+                    isinstance((fact := book.page(parent.page).cell(parent.row, parent.column)), tuple)
+                    and len(fact) == 3 and fact[:2] == (old, current)
+                    for parent in transitions
+                )
+                actual_sources = tuple(parent for parent in causes
+                    if parent.page == SSA_VALUE and parent.row == (scope, current))
+                if previous not in causes or not valid_transition or not actual_sources:
+                    found.append(Finding(
+                        "formal-actual-transition-disagreement", str(caller), int(formal),
+                        f"occurrence {(block, index, position)!r} changed {old!r}->{current!r} "
+                        "without its prior occurrence, exact loop-use transition and actual SSA causes",
                     ))
         return found
 
@@ -2703,6 +2921,91 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _constant_materialization_findings(module: Any) -> list[Finding]:
+        """Keep a materialized integer's exact native domain on its identity.
+
+        ``ssa_constant_materialization`` is the incumbent record of the
+        literal value and selected dtype.  Its consumers may not reclassify
+        that identity from a generic Python ``int`` spelling or leave the
+        corresponding SSA value at a different width.
+        """
+
+        from .concordance_declarations import (
+            SSA_CONSTANT_MATERIALIZATION, SSA_VALUE,
+        )
+        from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None:
+            return []
+        pages = getattr(book, "pages", {}) or {}
+        materializations = pages.get(SSA_CONSTANT_MATERIALIZATION.name)
+        values = pages.get(SSA_VALUE.name)
+        if materializations is None or values is None:
+            return []
+        found: list[Finding] = []
+        for row in materializations.rows():
+            if not (isinstance(row, tuple) and len(row) == 4):
+                continue
+            scope, function_name, _block, value_id = row
+            latest = materializations.latest(row)
+            if not (isinstance(latest, tuple) and len(latest) == 3):
+                continue
+            operation, dtype, literal_repr = latest
+            if str(operation).casefold() not in {"const", "constant"}:
+                continue
+            try:
+                literal = ast.literal_eval(str(literal_repr))
+            except (ValueError, SyntaxError, TypeError):
+                continue
+            if type(literal) is not int:
+                continue
+            try:
+                expected_dtype = python_int_literal_dtype(literal)
+            except (TypeError, OverflowError):
+                expected_dtype = None
+            discrepancies = []
+            if expected_dtype is None or str(dtype) != expected_dtype:
+                discrepancies.append(
+                    f"materialization dtype={dtype!r}, exact integer domain="
+                    f"{expected_dtype!r}"
+                )
+            value_row = (scope, int(value_id))
+            value_fact = values.latest(value_row)
+            if value_fact is None or str(
+                getattr(value_fact, "dtype", None)
+            ) != str(dtype):
+                discrepancies.append(
+                    f"ssa_value={value_fact!r}, materialization dtype={dtype!r}"
+                )
+            function = (getattr(module, "functions", {}) or {}).get(
+                str(function_name)
+            )
+            if function is not None:
+                occurrences = tuple(
+                    instruction.res
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.res is not None
+                    and int(instruction.res.id) == int(value_id)
+                    and str(instruction.op).casefold() in {"const", "constant"}
+                    and (instruction.attributes or {}).get("value") == literal
+                )
+                if any(str(value.dtype) != str(dtype) for value in occurrences):
+                    discrepancies.append(
+                        "resident Const occurrence dtype differs from the "
+                        f"materialization: {tuple(value.dtype for value in occurrences)!r}"
+                    )
+            if discrepancies:
+                found.append(Finding(
+                    "constant-materialization-domain-disagreement",
+                    str(function_name), int(value_id), "; ".join(discrepancies),
+                ))
+        return found
+
+    @staticmethod
     def _source_callsite_activation_findings(module: Any) -> list[Finding]:
         """Report a source callsite resolved to multiple function identities."""
 
@@ -2735,6 +3038,156 @@ class CorrelationTable:
                 "source callsite changed function-table identity across "
                 f"planning stages: {distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _frame_aliased_result_findings(module: Any) -> list[Finding]:
+        """A frame-result index is a view of one exact call's storage edge."""
+        from .ssa_record_return_state import frame_aliased_result_binding
+        functions = getattr(module, "functions", {}) or {}
+        table = getattr(module, "call_table", None)
+        book = getattr(table, "book", None) or identity_book(module)
+        found = []
+        for caller_name, caller in functions.items():
+            records = () if table is None else table.get(str(caller_name), ())
+            for block_name, block in caller.blocks.items():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Call", "call"} or not instruction.attributes.get("result_aliases_frame"):
+                        continue
+                    callee_name = str(instruction.attributes.get("callee") or "")
+                    callee = functions.get(callee_name)
+                    matching = tuple(record for record in records
+                                     if record.callsite_id == instruction.attributes.get("plan_callsite_id")
+                                     and str(record.callee_symbol) == callee_name)
+                    detail = None
+                    try:
+                        if callee is None or len(matching) != 1:
+                            raise ConcordanceRefusal("frame result lacks its unique callee/call record")
+                        formal, position, actual, _cell = frame_aliased_result_binding(
+                            instruction, callee, book=book, record=matching[0],
+                        )
+                        if (instruction.attributes.get("ssa_output_formal_id") != formal
+                                or instruction.attributes.get("ssa_output_argument") != position):
+                            detail = (f"record binds callee formal {formal} to caller {actual.id} "
+                                      f"at position {position}; emitted formal/index are "
+                                      f"{instruction.attributes.get('ssa_output_formal_id')!r}/"
+                                      f"{instruction.attributes.get('ssa_output_argument')!r}")
+                        else:
+                            # The emitted projection cites the same activation,
+                            # not another call's equal-looking storage ids.
+                            proof = instruction.attributes.get("ssa_output_call_record")
+                            if not isinstance(proof, Ref) or proof.row[1] != str(caller_name):
+                                raise ConcordanceRefusal("frame result proof belongs to another caller scope")
+                            frame_aliased_result_binding(instruction, callee, book=book)
+                    except ConcordanceRefusal as error:
+                        detail = str(error)
+                    if detail is not None:
+                        found.append(Finding(
+                            "frame-aliased-result-disagreement", str(caller_name),
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}: {detail}",
+                        ))
+        return found
+
+    @staticmethod
+    def _physical_call_input_conversion_findings(module: Any) -> list[Finding]:
+        """A converted native argument retains its exact activation and cause."""
+        from .concordance_declarations import CALL_RECORD, CALL_INPUT_CONVERSION, CELL_SET, SSA_VALUE
+        from .ssa_record_return_state import ssa_value_identity_cell
+        table = getattr(module, "call_table", None)
+        if table is None:
+            return []
+        book = table.book
+        functions = getattr(module, "functions", {}) or {}
+        conversion_index = defaultdict(list)
+        page = book.pages.get(CALL_INPUT_CONVERSION.name)
+        if page is not None:
+            for row in page.rows():
+                for column, fact in page.history(row):
+                    if len(fact) == 6:
+                        conversion_index[(str(row[0]), str(row[2]), int(fact[4]))].append(
+                            (Ref(CALL_INPUT_CONVERSION, row, column), fact))
+        found = []
+        for caller_name, records in table.items():
+            caller = functions.get(str(caller_name))
+            if caller is None:
+                continue
+            definitions = {int(ins.res.id): (str(label), index, ins)
+                           for label, block in caller.blocks.items()
+                           for index, ins in enumerate(block.instrs) if ins.res is not None}
+            dominance = CorrelationTable._dominators(caller)
+            for record in records:
+                # A cloned table cites its original exact row. Follow only
+                # those record revisions/cell sets, never a latest conversion
+                # selected from another call sharing the same source/formal.
+                pending, causes = [record.cell], set()
+                while pending:
+                    cell = pending.pop()
+                    if cell is None or cell in causes:
+                        continue
+                    causes.add(cell)
+                    for parent, _stage in book.edges_into(cell):
+                        if parent.page in {CALL_RECORD, CELL_SET}:
+                            pending.append(parent)
+                        else:
+                            causes.add(parent)
+                conversions = conversion_index.get((str(caller_name), str(record.callee_symbol), int(record.callsite_id)), ())
+                if not conversions:
+                    continue
+                sites = tuple((str(label), index, ins)
+                              for label, block in caller.blocks.items()
+                              for index, ins in enumerate(block.instrs)
+                              if ins.op in {"Call", "call"}
+                              and ins.attributes.get("plan_callsite_id") == record.callsite_id
+                              and ins.attributes.get("callee") == record.callee_symbol)
+                if not sites:
+                    continue  # Existing dead-call accounting owns removed calls.
+                callee = functions.get(str(record.callee_symbol))
+                if len(sites) != 1 or callee is None:
+                    found.append(Finding("physical-call-conversion-frame", str(caller_name), None,
+                                         "converted frame has no unique current native call"))
+                    continue
+                block, call_index, call = sites[0]
+                inputs = tuple(map(int, call.attributes.get("callee_input_ids", ())))
+                frame = {int(formal): (kind, source) for formal, kind, source in record.frame_bindings}
+                formals = {int(value.id): value for value in callee.args}
+                for formal_id in {int(cell.row[3]) for cell, _fact in conversions}:
+                    formal = formals.get(formal_id)
+                    if formal is None:
+                        continue  # Existing formal-pruning audit owns retirement.
+                    target = (formal.accounting or {}).get("physical_dtype") or formal.dtype
+                    candidates = tuple((cell, fact) for cell, fact in conversions
+                                       if int(cell.row[3]) == formal_id and str(fact[2]) == str(target))
+                    if not candidates:
+                        continue
+                    binding = frame.get(formal_id)
+                    matching = tuple((cell, fact) for cell, fact in candidates
+                                     if binding is not None and binding[0] == "caller_value"
+                                     and int(binding[1]) == int(fact[0]))
+                    detail = None
+                    if len(matching) != 1 or inputs.count(formal_id) != 1:
+                        detail = "physical frame discarded its exact recorded input conversion"
+                    else:
+                        cell, fact = matching[0]
+                        converted = int(fact[0])
+                        position = inputs.index(formal_id)
+                        producer = definitions.get(converted)
+                        value_cell = ssa_value_identity_cell(caller, converted, book=book)
+                        sourced = value_cell is not None and any(
+                            ref.page == SSA_VALUE and ref.row == value_cell.row for ref in causes)
+                        valid = (cell in causes and position < len(call.args) and int(call.args[position].id) == converted
+                                 and producer is not None and producer[2].op == "Cast"
+                                 and len(producer[2].args) == 1
+                                 and int(producer[2].args[0].id) == int(cell.row[1])
+                                 and producer[0] == str(fact[5]) and sourced
+                                 and producer[0] in dominance.get(block, set())
+                                 and (producer[0] != block or producer[1] < call_index))
+                        if not valid:
+                            detail = "native argument disagrees with its sourced, control-owned Cast"
+                    if detail is not None:
+                        found.append(Finding("physical-call-conversion-frame", str(caller_name),
+                                             None if call.res is None else int(call.res.id),
+                                             f"callsite {record.callsite_id}, formal {formal_id}: {detail}"))
         return found
 
     @staticmethod
@@ -2954,6 +3407,27 @@ class CorrelationTable:
                             if any(
                                 argument is resident
                                 for resident in resident_objects.get(inner, ())
+                            ):
+                                continue
+                            # Program: ``h, l = step(h, l, i)`` with
+                            # ``step`` returning ``low ^ byte, high``.  The
+                            # updated ``l`` is the callee's bare formal, so
+                            # the passthrough fold rebinds the call output
+                            # to the actual -- the carried Phi of ``h`` --
+                            # as a projection occurrence of that same id.
+                            # Wrong record: that occurrence is a distinct
+                            # object, so it read as a private resident.
+                            # Rule: an occurrence the aggregate passthrough
+                            # rebinding minted for a resident the function
+                            # defines is that resident, not a private one.
+                            if (
+                                resident_objects.get(inner)
+                                and (argument.accounting or {}).get(
+                                    "ssa_aggregate_passthrough"
+                                ) is not None
+                                and (argument.accounting or {}).get(
+                                    "ssa_storage_alias"
+                                ) == inner
                             ):
                                 continue
                             found.append(Finding(
@@ -3191,6 +3665,46 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _annotation_class_admission_findings(module: Any) -> list[Finding]:
+        """Imported annotation classes retain callable, declaration and field causes."""
+        from .concordance_declarations import (
+            PARAMETER_ANNOTATION, FUNCTION_RETURN_ANNOTATION, CLASS_DECLARATION,
+            CLASS_FIELD_DECLARATION, SOURCE_SPAN, STATIC_SYMBOL_DEFINITION,
+        )
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        fields = book.pages.get(CLASS_FIELD_DECLARATION.name)
+        found = []
+        for authority in (PARAMETER_ANNOTATION, FUNCTION_RETURN_ANNOTATION):
+            page = book.pages.get(authority.name)
+            for row in (() if page is None else page.rows()):
+                cell = book.latest_ref(authority, row)
+                causes = tuple(source for source, _stage in book.edges_into(cell))
+                callables = tuple(source for source in causes if source.page == STATIC_SYMBOL_DEFINITION)
+                if not callables:
+                    continue
+                declarations = tuple(source for source in causes if source.page == CLASS_DECLARATION)
+                spans = tuple(source for source in causes if source.page == SOURCE_SPAN and source.row[:2] == row[:2])
+                problems = []
+                if not declarations or not spans or any(source.row[:2] != row[:2] for source in callables):
+                    problems.append("annotation lacks its exact callable, source occurrence or class declaration")
+                for declaration in declarations:
+                    parents = {source for source, _stage in book.edges_into(declaration)}
+                    if not set(callables).issubset(parents) or not parents.intersection(spans):
+                        problems.append("class admission lacks the annotation's callable and occurrence causes")
+                    for field_row in (() if fields is None else fields.scope_rows(declaration.row[0])):
+                        if field_row[:2] != declaration.row or fields.latest(field_row) is None:
+                            continue
+                        field_cell = book.latest_ref(CLASS_FIELD_DECLARATION, field_row)
+                        if declaration not in {source for source, _stage in book.edges_into(field_cell)}:
+                            problems.append(f"field {field_row[-1]!r} lacks its exact admitted class cause")
+                if problems:
+                    found.append(Finding("annotation-class-admission-disagreement", str(row[1]), None,
+                                         "; ".join(dict.fromkeys(problems))))
+        return found
+
+    @staticmethod
     def _source_parameter_identity_findings(module: Any) -> list[Finding]:
         """Report a static parameter whose discovered identity changed."""
 
@@ -3258,6 +3772,84 @@ class CorrelationTable:
                 "numeric coefficient projection changed receiver, path, or "
                 f"descriptor across source stages: {distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _source_numeric_specialization_findings(module: Any) -> list[Finding]:
+        """Check the exact target/class causes of iterable specialization keys."""
+        import hashlib
+        from .concordance_declarations import (
+            SOURCE_NUMERIC_SPECIALIZATION_PAGE, SOURCE_VALUE_CLASS, CELL_SET,
+            FUNCTION_ADDRESS,
+        )
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        page = None if book is None else book.pages.get(SOURCE_NUMERIC_SPECIALIZATION_PAGE.name)
+        if page is None:
+            return []
+
+        def unpack(cells):
+            result, pending = set(), list(cells)
+            while pending:
+                cell = pending.pop()
+                if cell in result:
+                    continue
+                result.add(cell)
+                if cell.page == CELL_SET:
+                    parents = tuple(parent for parent, _ in book.edges_into(cell))
+                    fact = book.page(CELL_SET).cell(cell.row, cell.column)
+                    if set(fact) != {parent.key for parent in parents}:
+                        raise ValueError("CELL_SET members disagree with its exact source edges")
+                    pending.extend(parents)
+            return result
+
+        found = []
+        for row in page.rows():
+            scope, receipt = page.latest(row)
+            entries = [entry for entry in receipt if isinstance(entry, tuple)
+                       and len(entry) == 2 and isinstance(entry[0], tuple)
+                       and entry[0] and entry[0][0] == "iterated_class"]
+            if not entries:
+                continue
+            try:
+                digest = hashlib.sha256(repr(receipt).encode()).hexdigest()[:16]
+                if row != (scope[0], digest) or scope != (row[0], "specialization", digest):
+                    raise ValueError("receipt does not identify its recorded specialization")
+                ref = book.latest_ref(SOURCE_NUMERIC_SPECIALIZATION_PAGE, row)
+                mint = book.mint_of(ref)
+                direct = () if mint is None else mint[1]
+                if not any(parent.page == CELL_SET for parent in direct):
+                    raise ValueError("iterable domain has no exact CELL_SET cause")
+                causes = unpack(direct)
+                if not any(parent.page == FUNCTION_ADDRESS for parent in causes):
+                    raise ValueError("specialization has no authored function authority")
+                for key, domain in entries:
+                    if len(key) != 2 or not isinstance(key[1], tuple) or len(key[1]) != 3:
+                        raise ValueError("iterable target is not a complete canonical Ref key")
+                    targets = [cell for cell in causes if cell.key == key[1]
+                               and cell.page.name in _IDENTITY_PAGES]
+                    if len(targets) != 1 or _canonical_identity_base(book, targets[0]) != targets[0]:
+                        raise ValueError("iterable target has no exact canonical subject cause")
+                    target = targets[0]
+                    if (not isinstance(domain, tuple) or len(domain) != 2
+                            or not isinstance(domain[0], str) or type(domain[1]) is not int
+                            or domain[1] < 1):
+                        raise ValueError("invalid iterable class/precision domain")
+                    matches = []
+                    for cell in causes:
+                        if cell.page != SOURCE_VALUE_CLASS:
+                            continue
+                        fact = book.page(SOURCE_VALUE_CLASS).cell(cell.row, cell.column)
+                        if tuple(fact[:2]) != domain:
+                            continue
+                        subjects = unpack(parent for parent, _ in book.edges_into(cell))
+                        if any(parent.page.name in _IDENTITY_PAGES
+                               and _canonical_identity_base(book, parent) == target
+                               for parent in subjects):
+                            matches.append(cell)
+                    if not matches:
+                        raise ValueError("iterable class has no matching exact subject/class cause")
+            except (ValueError, TypeError, KeyError, IndexError) as error:
+                found.append(Finding("source-numeric-specialization-disagreement", str(scope), None, str(error)))
         return found
 
     @staticmethod
@@ -3547,22 +4139,152 @@ class CorrelationTable:
                 fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
                 if not isinstance(fact, SSAValueFact):
                     continue
+                from .structural_concordance import ssa_structure
+                try:
+                    physical, physical_cell = ssa_structure(
+                        scope, value_id, shape_scope=shape_scope_of(function),
+                        storage_scope=str(function.name), book=book,
+                    )
+                except ConcordanceRefusal as error:
+                    found.append(Finding(
+                        "ssa-publication-type-disagreement", str(name), value_id,
+                        str(error),
+                    ))
+                    continue
                 for (key, field), resident in zip(fields, view):
-                    posted = getattr(fact, field, None)
+                    posted = getattr(physical, "declared_storage" if field == "storage"
+                                     else field, None)
+                    if field == "device":
+                        posted = fact.device
                     if _physical_unset(key, resident):
                         continue
                     if _physical_unset(key, posted):
                         found.append(Finding(
                             "ssa-physical-unposted", str(name), value_id,
-                            f"{cell!r} has no {field}; resident accounting "
+                            f"{physical_cell!r} has no {field}; resident accounting "
                             f"{key}={resident!r} at {tuple(positions)!r}",
                         ))
                     elif posted != resident:
                         found.append(Finding(
                             "ssa-publication-type-disagreement", str(name), value_id,
-                            f"{cell!r} records {field}={posted!r}; resident "
+                            f"{physical_cell!r} records {field}={posted!r}; resident "
                             f"accounting {key}={resident!r} at {tuple(positions)!r}",
                         ))
+        return found
+
+    @staticmethod
+    def _mapping_child_contract_findings(module: Any) -> list[Finding]:
+        """Check shared child views against their exact source class/layout."""
+        from .concordance_declarations import (
+            CLASS_FIELD_DECLARATION, SOURCE_VALUE_CLASS,
+            SOURCE_AGGREGATE_LAYOUT, SourceAggregateLayout,
+        )
+        metadata = dict(getattr(module, "metadata", {}) or {})
+        book = metadata.get("identity_book")
+        found = []
+        # An ``int`` key column is the narrowest width holding the join of
+        # every writer's member interval: each view cites the
+        # ``source_int_range_concordance`` cells it read (none: the int64
+        # range).  Re-derive that join from the cited cells.
+        from .concordance_declarations import SOURCE_INT_RANGE
+        from ..transmogrifier.dtype_layout import python_int_range_dtype
+
+        int64_bounds = (-(1 << 63), (1 << 63) - 1)
+        joined_key_widths: dict = {}
+        if book is not None:
+            joins: dict = {}
+            for view in metadata.get("mapping_child_contract_evidence") or ():
+                for index, cell in enumerate(view.get("key_range_cells") or ()):
+                    interval = int64_bounds
+                    if isinstance(cell, Ref) and cell.page == SOURCE_INT_RANGE:
+                        fact = book.page(SOURCE_INT_RANGE).cell(cell.row, cell.column)
+                        interval = (int(fact[0]), int(fact[1]))
+                    key = (view.get("field_cell"), index)
+                    low, high = joins.get(key, interval)
+                    joins[key] = (min(low, interval[0]), max(high, interval[1]))
+            joined_key_widths = {
+                key: python_int_range_dtype(*interval)
+                for key, interval in joins.items()
+            }
+
+        def int_key_dtype(view, index, cell, expected):
+            if expected != "int64":
+                return expected
+            range_cells = tuple(view.get("key_range_cells") or ())
+            if index < len(range_cells):
+                range_cell = range_cells[index]
+                if range_cell is not None and (
+                    not isinstance(range_cell, Ref)
+                    or range_cell.page != SOURCE_INT_RANGE
+                    or int(range_cell.row[1]) != int(cell.row[1])
+                ):
+                    return None
+                return joined_key_widths.get(
+                    (view.get("field_cell"), index), expected,
+                )
+            return expected
+
+        for view in metadata.get("mapping_child_contract_evidence") or ():
+            field, scalar, key = (view.get(name) for name in (
+                "field_cell", "class_cell", "key_layout_cell",
+            ))
+            problem = None
+            # A scalar key has no aggregate layout: its one key column is
+            # its own exact source class.
+            scalar_key = key is None and view.get("key_width") == 1
+            if book is None or any(
+                not isinstance(cell, Ref) or cell.page != page
+                for cell, page in ((field, CLASS_FIELD_DECLARATION),
+                                   (scalar, SOURCE_VALUE_CLASS),
+                                   *(() if scalar_key else ((key, SOURCE_AGGREGATE_LAYOUT),)))
+            ):
+                problem = "child view lacks its field/class/key-layout authority"
+            elif scalar_key:
+                class_fact = book.page(SOURCE_VALUE_CLASS).cell(scalar.row, scalar.column)
+                expected = {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(class_fact[0]))
+                key_cells = tuple(view.get("key_class_cells", ()))
+                key_cell = key_cells[0] if len(key_cells) == 1 else None
+                key_fact = (None if not isinstance(key_cell, Ref)
+                            or key_cell.page != SOURCE_VALUE_CLASS
+                            or key_cell.row[0] != scalar.row[0]
+                            else book.page(SOURCE_VALUE_CLASS).cell(key_cell.row, key_cell.column))
+                if expected != view.get("dtype") or int(class_fact[1]) != 1:
+                    problem = f"child dtype {view.get('dtype')!r} disagrees with operand class {class_fact!r}"
+                elif key_fact is None or int(key_fact[1]) != 1 or tuple(view.get("key_dtypes", ())) != (
+                    int_key_dtype(view, 0, key_cell, {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]))),
+                ):
+                    problem = "scalar key dtype disagrees with its exact key class"
+            else:
+                try:
+                    class_fact = book.page(SOURCE_VALUE_CLASS).cell(scalar.row, scalar.column)
+                    layout = book.page(SOURCE_AGGREGATE_LAYOUT).cell(key.row, key.column)
+                    expected = {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(class_fact[0]))
+                    if expected != view.get("dtype") or int(class_fact[1]) != 1:
+                        problem = f"child dtype {view.get('dtype')!r} disagrees with operand class {class_fact!r}"
+                    elif not isinstance(layout, SourceAggregateLayout) or layout.aggregate_kind != "tuple" or len(layout.members) != view.get("key_width"):
+                        problem = "child key width disagrees with its ordered tuple layout"
+                    elif len(view.get("key_class_cells", ())) != len(layout.members) or len(view.get("key_dtypes", ())) != len(layout.members):
+                        problem = "child key column type view has the wrong member count"
+                    else:
+                        for index, (member, cell, dtype) in enumerate(zip(layout.members, view["key_class_cells"], view["key_dtypes"], strict=True)):
+                            if cell is None:
+                                if dtype != "unknown":
+                                    problem = "unproved key member was assigned a physical dtype"
+                                continue
+                            if not isinstance(cell, Ref) or cell.page != SOURCE_VALUE_CLASS or int(cell.row[1]) != int(member.value_id) or cell.row[0] != scalar.row[0]:
+                                problem = "key class does not name its exact ordered member"
+                                break
+                            key_fact = book.page(SOURCE_VALUE_CLASS).cell(cell.row, cell.column)
+                            expected_key = int_key_dtype(view, index, cell, {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]), "unknown"))
+                            if dtype != expected_key:
+                                problem = "key dtype disagrees with its exact member class"
+                                break
+                    if book.page(CLASS_FIELD_DECLARATION).cell(field.row, field.column) is None:
+                        problem = "child field declaration is absent"
+                except (KeyError, IndexError, TypeError, ValueError) as error:
+                    problem = f"child authority cannot be read: {error}"
+            if problem is not None:
+                found.append(Finding("mapping-child-contract-disagreement", str(getattr(field, "row", "<source>")), None, problem))
         return found
 
     @staticmethod
@@ -3950,15 +4672,26 @@ class CorrelationTable:
         if page is None:
             return []
         found: list[Finding] = []
-        # Step 7 keys one row per (callee, formal, callsite); rows written
-        # before it key (callee, formal, "binding") with the callsite as the
-        # column.  Both are read per (callee, formal).
+        # Step 7 keys one row per (callee, caller, formal, callsite); older
+        # rows key (callee, formal, callsite), or (callee, formal, "binding")
+        # with callsite in the column. Caller-local ids and callsite ids are
+        # not identities outside their caller.
         formals: dict[tuple, dict[Any, dict[str, list]]] = {}
         for row in page.rows():
-            if not (isinstance(row, tuple) and len(row) >= 2):
+            if not isinstance(row, tuple):
                 continue
-            kinds_by_source = formals.setdefault((row[0], row[1]), {})
-            for callsite, fact in argument_binding_history(page, row[0], row[1], rows=(row,)):
+            if len(row) == 4:
+                caller_symbol, formal_id = str(row[1]), int(row[2])
+            elif len(row) == 3:
+                caller_symbol, formal_id = None, int(row[1])
+            else:
+                continue
+            kinds_by_source = formals.setdefault(
+                (row[0], caller_symbol, formal_id), {},
+            )
+            for callsite, fact in argument_binding_history(
+                page, row[0], formal_id, rows=(row,),
+            ):
                 if not (isinstance(fact, tuple) and len(fact) == 2):
                     continue
                 kind, source = fact
@@ -3967,13 +4700,20 @@ class CorrelationTable:
                 kinds_by_source.setdefault(int(source), {}).setdefault(
                     str(kind), []
                 ).append(callsite)
-        for (function_name, value_id), kinds_by_source in formals.items():
+        for (
+            function_name, caller_symbol, value_id,
+        ), kinds_by_source in formals.items():
             for source, by_kind in sorted(kinds_by_source.items()):
                 if len(by_kind) < 2:
                     continue
+                resolution_row = (
+                    (str(function_name), caller_symbol, int(value_id), int(source))
+                    if caller_symbol is not None
+                    else (str(function_name), int(value_id), int(source))
+                )
                 resolution = book.page(
                     "argument_binding_resolution"
-                ).latest((str(function_name), int(value_id), int(source)))
+                ).latest(resolution_row)
                 if (
                     isinstance(resolution, tuple)
                     and resolution
@@ -4017,13 +4757,277 @@ class CorrelationTable:
         # Native identity-keyed tables legitimately compare these handles;
         # a second spelling inventory incorrectly called them float keys.
         from ..transmogrifier.dtype_layout import layout_for
+        from .concordance_declarations import CALL_RECORD, SEQUENCE_DESCRIPTOR, RESULT_STORAGE_BINDING
+        from .ssa_record_return_state import map_sequence_descriptor, map_child_pool
+        from .ssa_record_return_state import ssa_value_identity_cell
+        from .concordance_declarations import (
+            SSA_VALUE, CELL_SET, CANONICAL_VALUE, INGESTION_VALUE, VALUE_TYPE_ABI,
+            SOURCE_AGGREGATE_LAYOUT, SOURCE_VALUE_CLASS,
+        )
+        from ..transmogrifier.dtype_layout import resolve
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+
+        def numeric_dtype(dtype):
+            layout = resolve(dtype)
+            return (layout.name if layout is not None
+                    and layout.kind in {"bool", "int", "uint", "float"} else None)
+
+        def sequence_source_type(function, value_id, owner):
+            """Read this SSA identity's lexical ABI, never a same-number row.
+
+            validate_batch_envelope's static iterable names source2. Its
+            adopted SSA row was int64, but its exact lexical ABI was a bool
+            span. The old audit checked each page independently and missed
+            the int64 Load through that iterable's concrete bool column.
+            """
+            start = ssa_value_identity_cell(function, int(value_id), book=owner)
+            if start is None:
+                return None, None, (), ()
+            pending, seen, abis, lexical_abis, products = [start], set(), set(), set(), set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                if cell.page in {SSA_VALUE, CANONICAL_VALUE, INGESTION_VALUE}:
+                    abi = owner.latest_ref(VALUE_TYPE_ABI, cell.row)
+                    if abi is not None:
+                        (lexical_abis if cell.page in {CANONICAL_VALUE, INGESTION_VALUE} else abis).add(abi)
+                        if owner.page(SOURCE_AGGREGATE_LAYOUT).latest(cell.row) is not None:
+                            products.add(abi)
+                if cell.page == VALUE_TYPE_ABI:
+                    abis.add(cell)
+                    continue
+                if cell.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                    continue
+                for parent, _stage in owner.edges_into(cell):
+                    if (parent.page in {CELL_SET, CANONICAL_VALUE, INGESTION_VALUE, VALUE_TYPE_ABI}
+                            or (parent.page == SSA_VALUE and parent.row == start.row)):
+                        pending.append(parent)
+            dtypes, evidence = set(), []
+            for abi in lexical_abis or abis:
+                # source_structure defines an aggregate as its member
+                # product before considering its outer ABI carrier. That
+                # carrier's integer type is not a row-element declaration.
+                if abi in products:
+                    continue
+                fact = owner.page(VALUE_TYPE_ABI).cell(abi.row, abi.column)
+                arms = tuple(getattr(fact, "physical_alternatives", ()))
+                if not arms or any(arm.storage not in {"span", "sequence"} or arm.rank < 1 for arm in arms):
+                    continue
+                types = tuple(numeric_dtype(arm.dtype) for arm in arms)
+                if all(dtype is not None for dtype in types):
+                    dtypes.update(types)
+                    evidence.append(abi)
+            fact = owner.page(SSA_VALUE).cell(start.row, start.column)
+            # Explicit physical views (including packed storage and a
+            # recorded input conversion) own native representation. A
+            # provisional resident dtype alone cannot override lexical ABI.
+            physical = numeric_dtype(getattr(fact, "physical_dtype", None))
+            return (next(iter(dtypes)) if len(dtypes) == 1 else None,
+                    physical, tuple(evidence), tuple(lexical_abis or abis))
+
+        def static_member_class(owner, abi_refs):
+            claims = set()
+            for abi_ref in abi_refs:
+                abi = owner.page(VALUE_TYPE_ABI).cell(abi_ref.row, abi_ref.column)
+                for arm in getattr(abi, "physical_alternatives", ()):
+                    classes = tuple(cell for cell in arm.source_cells if cell.page == SOURCE_VALUE_CLASS)
+                    for source in arm.source_cells:
+                        if source.page not in {CANONICAL_VALUE, INGESTION_VALUE}:
+                            continue
+                        layout = owner.page(SOURCE_AGGREGATE_LAYOUT).latest(source.row)
+                        if layout is None or layout.aggregate_kind not in {"list", "tuple"} or not layout.members:
+                            continue
+                        members = []
+                        for member in layout.members:
+                            anchors = {_canonical_identity_base(owner, cell)
+                                       for cell in (member.value_cell, *member.source_cells)
+                                       if cell.page in {CANONICAL_VALUE, INGESTION_VALUE}}
+                            identities = set()
+                            for cls in classes:
+                                pending, seen = [cls], set()
+                                while pending:
+                                    cell = pending.pop()
+                                    if cell in seen:
+                                        continue
+                                    seen.add(cell)
+                                    for parent, _stage in owner.edges_into(cell):
+                                        if parent.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                                            if _canonical_identity_base(owner, parent) in anchors:
+                                                fact = owner.page(cls.page).cell(cls.row, cls.column)
+                                                identities.add(str(fact[0]))
+                                        else:
+                                            pending.append(parent)
+                            if len(identities) != 1:
+                                break
+                            members.append(next(iter(identities)))
+                        if len(members) == len(layout.members) and len(set(members)) == 1:
+                            claims.add(members[0])
+            return next(iter(claims)) if len(claims) == 1 else None
+
+        def column_and_load_findings(function_name, table):
+            function = (getattr(module, "functions", {}) or {}).get(function_name)
+            if function is None:
+                return []
+            owner = table.book
+            issues, column_types = [], {}
+            for descriptor in table.sequences.values():
+                for column, dtype in zip(descriptor.column_value_ids, descriptor.column_dtypes):
+                    declared = numeric_dtype(dtype)
+                    if declared is not None:
+                        column_types.setdefault(int(column), set()).add(declared)
+                # A scalar-row ABI describes one payload column. Multi-column
+                # records/unions retain their existing per-member audits.
+                if len(descriptor.column_value_ids) != 1:
+                    continue
+                column = int(descriptor.column_value_ids[0])
+                lexical, physical, sources, _abis = sequence_source_type(function, column, owner)
+                if not sources and int(descriptor.sequence_id) != column:
+                    lexical, physical, sources, _abis = sequence_source_type(function, descriptor.sequence_id, owner)
+                expected = {dtype for dtype in (lexical, physical) if dtype is not None}
+                declared = numeric_dtype(descriptor.column_dtypes[0]) if descriptor.column_dtypes else None
+                if sources and expected and declared is not None and declared not in expected:
+                    issues.append(Finding(
+                        "sequence-column-abi-disagreement", str(function_name), int(descriptor.sequence_id),
+                        f"column {column} descriptor={declared}, exact incoming ABI/native views={tuple(sorted(expected))}; sources={sources!r}",
+                    ))
+            definitions = {int(ins.res.id): ins for block in function.blocks.values()
+                           for ins in block.instrs if ins.res is not None}
+            for label, block in function.blocks.items():
+                for instruction in block.instrs:
+                    if instruction.op not in {"Load", "load"} or instruction.res is None or len(instruction.args) != 1:
+                        continue
+                    address = definitions.get(int(instruction.args[0].id))
+                    if address is None or address.op not in {"GetElementPtr", "getelementptr"} or not address.args:
+                        continue
+                    base = address.args[0]
+                    producer = definitions.get(int(base.id))
+                    expected, evidence = None, ()
+                    if (producer is not None and producer.op in {"Const", "const"}
+                            and producer.attributes.get("binding") == "static_iterable"
+                            and producer.attributes.get("source_value_id") is not None):
+                        lexical, _source_physical, evidence, abis = sequence_source_type(
+                            function, int(producer.attributes["source_value_id"]), owner)
+                        materialized = ssa_value_identity_cell(function, int(base.id), book=owner)
+                        fact = None if materialized is None else owner.page(SSA_VALUE).cell(materialized.row, materialized.column)
+                        expected = numeric_dtype(getattr(fact, "physical_dtype", None)) or lexical
+                        kind = "static-iterable-load-type-disagreement"
+                        member_class = static_member_class(owner, abis)
+                        _dtype, _physical, _sources, result_abis = sequence_source_type(function, instruction.res.id, owner)
+                        alternatives = {identity for cell in result_abis
+                                        for identity in owner.page(VALUE_TYPE_ABI).cell(cell.row, cell.column).alternatives}
+                        materialized = dict(function.metadata.get("native_value_type_abi", {}) or {}).get(int(instruction.res.id))
+                        materialized_alternatives = tuple(getattr(materialized, "alternatives", ()))
+                        disagreement = (alternatives and member_class not in alternatives) or (
+                            materialized_alternatives and member_class not in materialized_alternatives)
+                        if member_class is not None and disagreement:
+                            issues.append(Finding(
+                                "static-iterable-element-class-disagreement", str(function_name), int(instruction.res.id),
+                                f"{label}: exact aggregate members are {member_class}, current loop ABI={tuple(sorted(alternatives))}, materialized loop ABI={materialized_alternatives}; source ABI={abis!r}",
+                            ))
+                    elif len(column_types.get(int(base.id), ())) == 1:
+                        expected = next(iter(column_types[int(base.id)]))
+                        kind = "sequence-column-load-type-disagreement"
+                    else:
+                        continue
+                    actual = numeric_dtype(instruction.res.dtype)
+                    if expected is not None and actual is not None and expected != actual:
+                        issues.append(Finding(
+                            kind, str(function_name), int(instruction.res.id),
+                            f"{label}: Load {actual} from column {int(base.id)} whose exact native element is {expected}; sources={evidence!r}",
+                        ))
+            return issues
+
+        def returned_frame_findings(function_name, table, sequence_id, descriptor):
+            if book is None:
+                return []
+            current = book.latest_ref(SEQUENCE_DESCRIPTOR, (table.owner, int(sequence_id)))
+            if current is None:
+                return []
+            # Revisions retain the original derivation. Follow this view's
+            # own descriptor history/cell sets, stopping at the exact source
+            # descriptor and call-record authorities rather than following
+            # unrelated value ancestry or schema names.
+            pending, seen, calls, sources = [current], set(), set(), set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                for parent, _stage in book.edges_into(cell):
+                    if parent.page == CALL_RECORD:
+                        calls.add(parent.row)
+                    elif parent.page == SEQUENCE_DESCRIPTOR:
+                        if parent.row == current.row:
+                            pending.append(parent)
+                        else:
+                            sources.add((book, parent.row))
+                    elif parent.page.name == "imported_cell":
+                        receipt = book.page(parent.page).cell(parent.row, parent.column)
+                        if receipt.source.page == SEQUENCE_DESCRIPTOR:
+                            sources.add((receipt.owner, receipt.source.row))
+                    elif parent.page.name == "cell_set":
+                        pending.append(parent)
+            issues = []
+            for row in calls:
+                for record in book.page(CALL_RECORD).latest(row) or ():
+                    if record.caller != function_name:
+                        continue
+                    source_table = (getattr(module, "sequence_tables", {}) or {}).get(record.callee_symbol)
+                    if source_table is None:
+                        continue
+                    for source_id, target_id in record.result_bindings:
+                        if (int(target_id) != int(sequence_id)
+                                or (source_table.book, (source_table.owner, int(source_id))) not in sources):
+                            continue
+                        source = source_table.by_id(int(source_id))
+                        if source is None:
+                            continue
+                        frame = {}
+                        contradictory = False
+                        for formal, kind, actual in record.frame_bindings:
+                            if kind in {"caller_value", "caller_alias", "caller_storage"}:
+                                prior = frame.setdefault(int(formal), int(actual))
+                                contradictory |= prior != int(actual)
+                        result_page = book.pages.get(RESULT_STORAGE_BINDING.name)
+                        for binding_row in (() if result_page is None else result_page.rows()):
+                            if binding_row[:2] != (function_name, int(record.callsite_id)):
+                                continue
+                            ref = result_page.latest(binding_row)
+                            if not isinstance(ref, Ref) or ref.page.name != "ssa_value":
+                                continue
+                            prior = frame.setdefault(int(binding_row[2]), int(ref.row[1]))
+                            contradictory |= prior != int(ref.row[1])
+                        try:
+                            expected = map_sequence_descriptor(
+                                source, frame, sequence_id=int(sequence_id),
+                                child_table_pool=map_child_pool(source.child_table_pool, frame),
+                            )
+                        except KeyError as error:
+                            issues.append(Finding(
+                                "returned-sequence-frame-disagreement", str(function_name), int(sequence_id),
+                                f"callsite {record.callsite_id} has no binding for sequence member {error}",
+                            ))
+                            continue
+                        if contradictory or descriptor != expected:
+                            issues.append(Finding(
+                                "returned-sequence-frame-disagreement", str(function_name), int(sequence_id),
+                                f"callsite {record.callsite_id} sequence view differs from its exact callee frame: "
+                                f"observed={descriptor!r}; expected={expected!r}",
+                            ))
+            return issues
+
         found: list[Finding] = []
         for function_name, table in (
             getattr(module, "sequence_tables", {}) or {}
         ).items():
+            found.extend(column_and_load_findings(function_name, table))
             for sequence_id, descriptor in sorted(
                 getattr(table, "sequences", {}).items()
             ):
+                found.extend(returned_frame_findings(function_name, table, sequence_id, descriptor))
                 dtypes = tuple(getattr(descriptor, "column_dtypes", ()) or ())
                 for column in getattr(descriptor, "key_columns", ()) or ():
                     if int(column) >= len(dtypes):
@@ -4305,6 +5309,15 @@ class CorrelationTable:
             key = self._abi_or_member_key(name, formal)
             if key is not None:
                 caller_by_key[key].append(value_id)
+
+        def sequence_roles_of(symbol, value_id):
+            table = (getattr(module, "sequence_tables", {}) or {}).get(symbol)
+            return frozenset(
+                role for _sequence_id, role in (
+                    () if table is None else table.member_claims(value_id)
+                )
+            )
+
         for block_name, block in function.blocks.items():
             for index, instruction in enumerate(block.instrs):
                 if instruction.op not in {"Call", "call"}:
@@ -4322,10 +5335,24 @@ class CorrelationTable:
                     accounting = dict(getattr(argument, "accounting", {}) or {})
                     if not accounting.get("linked_call_frame_storage"):
                         continue
-                    owned = [
-                        owner for owner in caller_by_key.get(key, ())
-                        if owner != argument_id
-                    ]
+                    formal_roles = sequence_roles_of(callee_name, int(callee_id))
+                    owned = []
+                    for owner in caller_by_key.get(key, ()):
+                        if owner == argument_id:
+                            continue
+                        owner_roles = sequence_roles_of(name, owner)
+                        # c631: the callee's operational status lease is
+                        # not the caller's column/length/capacity storage.
+                        # The same field identity alone erased those roles
+                        # and falsely reported a duplicate. Compare the
+                        # descriptor-owned roles when both endpoints state
+                        # them; absent role evidence keeps the old check.
+                        if (
+                            formal_roles and owner_roles
+                            and formal_roles.isdisjoint(owner_roles)
+                        ):
+                            continue
+                        owned.append(owner)
                     if owned:
                         found.append(Finding(
                             "duplicate-storage-across-call", name, argument_id,
@@ -4517,17 +5544,84 @@ class CorrelationTable:
         if not dominators:
             return found
         definition_sites: dict[int, list[tuple[str, int]]] = defaultdict(list)
+        predecessors: dict[str, set[str]] = defaultdict(set)
+        for predecessor_name, predecessor in function.blocks.items():
+            for successor in predecessor.successors:
+                predecessors[str(successor)].add(str(predecessor_name))
         for block_name, block in function.blocks.items():
             for index, instruction in enumerate(block.instrs):
                 if instruction.res is not None:
                     definition_sites[int(instruction.res.id)].append(
                         (block_name, index)
                     )
+        definitions = {
+            int(instruction.res.id): instruction
+            for block in function.blocks.values() for instruction in block.instrs
+            if instruction.res is not None
+        }
+        selection_validities = {
+            int(instruction.attributes["source_value_id"]): int(instruction.res.id)
+            for instruction in definitions.values()
+            if instruction.attributes.get("binding") == "selected_child_validity"
+        }
+
+        def implies_guard(condition_id: int, guard_id: int, seen=None) -> bool:
+            if condition_id == guard_id:
+                return True
+            visited = set() if seen is None else seen
+            if condition_id in visited:
+                return False
+            visited.add(condition_id)
+            producer = definitions.get(condition_id)
+            # A true conjunction entails each of its explicit Boolean inputs.
+            return bool(producer is not None and producer.op == "LAnd"
+                        and str(producer.res.dtype) == "bool" and any(
+                implies_guard(int(argument.id), guard_id, visited)
+                for argument in producer.args
+            ))
+
+        def guarded_by_true_edge(block_name: str, guard_id: int) -> bool:
+            owner_dominators = dominators.get(block_name, set())
+            for candidate in owner_dominators:
+                for branch in function.blocks[candidate].instrs:
+                    if branch.op != "CondBr" or not branch.args:
+                        continue
+                    target = str(branch.attributes.get("true_target"))
+                    if target in owner_dominators and implies_guard(int(branch.args[0].id), guard_id):
+                        return True
+            return False
         for block_name, block in function.blocks.items():
             if block_name not in dominators:
                 continue
             for index, instruction in enumerate(block.instrs):
+                guard_id = instruction.attributes.get("child_selection_guard_value_id")
+                if guard_id is not None:
+                    producer = definitions.get(int(guard_id))
+                    guard_value = producer.res if producer is not None else formals.get(int(guard_id))
+                    if guard_value is None or str(guard_value.dtype) != "bool":
+                        found.append(Finding("child-selection-not-guarded", name,
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}#{index} guard {int(guard_id)} is not an existing Boolean SSA value"))
+                if instruction.attributes.get("binding") == "selected_child_row_view":
+                    source_id = int(instruction.attributes["source_value_id"])
+                    expected = selection_validities.get(source_id)
+                    if expected is not None and guard_id != expected:
+                        found.append(Finding("child-selection-not-guarded", name,
+                            int(instruction.res.id),
+                            f"selected view {source_id} claims guard {guard_id!r}, but its selection owns {expected}"))
+                if guard_id is not None and not guarded_by_true_edge(block_name, int(guard_id)):
+                    found.append(Finding("child-selection-not-guarded", name,
+                        None if instruction.res is None else int(instruction.res.id),
+                        f"{block_name}#{index} {instruction.op} is outside guard {int(guard_id)}'s true edge"))
                 if instruction.op in {"Phi", "phi"}:
+                    incoming = tuple(map(str, instruction.attributes.get("incoming_blocks") or ()))
+                    invalid = tuple(edge for edge in incoming if edge not in predecessors[str(block_name)])
+                    if invalid:
+                        found.append(Finding(
+                            "phi-edge-not-predecessor", name,
+                            None if instruction.res is None else int(instruction.res.id),
+                            f"{block_name}#{index} Phi names {invalid!r}; actual CFG predecessors are {tuple(sorted(predecessors[str(block_name)]))!r}",
+                        ))
                     continue
                 for argument in instruction.args:
                     argument_id = getattr(argument, "id", None)
@@ -4706,6 +5800,10 @@ class ConcordanceRefusal(ValueError):
 
     Raised at the call; nothing is recorded.
     """
+
+    def to_failure_mapping(self) -> dict[str, Any]:
+        """Expose retained diagnostic artifacts through the product's existing hook."""
+        return dict(getattr(self, "compiler_failure_artifacts", {}))
 
 
 class ProjectedScopeRead(LookupError):
@@ -4994,6 +6092,8 @@ class DerivationSnapshot:
     stage: Stage
     target: Ref
     reads: tuple  # (Page, row, Ref | None), including observed absence
+    edge_reads: tuple = ()  # (exact historical Ref, incoming Refs)
+    dependent_reads: tuple = ()  # (exact Ref, authority Page, outgoing Refs)
 
 
 class Registry:
@@ -6232,10 +7332,25 @@ class IdentityBook:
                     (source_page, source_row, self.current_ref(source_page, source_row))
                     for source_page, source_row, _cell in previous.reads
                 )
+                current_edges = tuple(
+                    (source, tuple(parent for parent, _stage in self.edges_into(source)))
+                    for source, _parents in getattr(previous, "edge_reads", ())
+                )
+                current_dependents = tuple(
+                    (source, authority, tuple(dict.fromkeys(
+                        child for child, _stage in self.edges_out_of(source)
+                        if child.page == authority
+                    )))
+                    for source, authority, _children in getattr(previous, "dependent_reads", ())
+                )
                 if (current_reads == previous.reads
+                        and current_edges == getattr(previous, "edge_reads", ())
+                        and current_dependents == getattr(previous, "dependent_reads", ())
                         and self.latest_ref(page, row) == previous.target):
                     return previous.target
             reads = {}
+            edge_reads = {}
+            dependent_reads = {}
 
             def read(source_page, source_row, default=None):
                 cell = self.current_ref(source_page, source_row)
@@ -6248,6 +7363,48 @@ class IdentityBook:
                 return reads[(source_page, source_row)]
 
             read.ref = read_ref
+
+            def read_sources(source_page, source_row=None):
+                """The current claim's exact incoming identities.
+
+                A concordance recipe must follow the recorded trajectory,
+                rather than reconstruct a value from an id or dtype. Reading
+                the owning row also tracks a changed generation; the recipe
+                reads any selected authority through this same reader.
+                """
+                if isinstance(source_page, Ref):
+                    source = source_page
+                    read(source.page, source.row)
+                else:
+                    source = read_ref(source_page, source_row)
+                if source is None:
+                    return ()
+                parents = tuple(
+                    parent for parent, _source_stage in self.edges_into(source)
+                )
+                edge_reads[source] = parents
+                return parents
+
+            read.sources = read_sources
+
+            def read_dependents(source, authority):
+                """Exact outgoing claims on a declared authority page.
+
+                Selecting the authority is essential: the derived view's own
+                publication must not become one of its inputs merely because
+                it also cites the source. No scope or numeric id is rebuilt.
+                """
+                if not isinstance(source, Ref) or not isinstance(authority, Page):
+                    raise ConcordanceRefusal("dependent read requires a source Ref and authority Page")
+                read(source.page, source.row)
+                children = tuple(dict.fromkeys(
+                    child for child, _source_stage in self.edges_out_of(source)
+                    if child.page == authority
+                ))
+                dependent_reads[(source, authority)] = children
+                return children
+
+            read.dependents = read_dependents
 
             fact = recipe(read, *arguments)
             cells = tuple(dict.fromkeys(cell for cell in reads.values() if cell is not None))
@@ -6264,6 +7421,9 @@ class IdentityBook:
                 recipe, tuple(arguments), stage, target,
                 tuple((source_page, source_row, cell)
                       for (source_page, source_row), cell in reads.items()),
+                tuple(edge_reads.items()),
+                tuple((source, authority, children)
+                      for (source, authority), children in dependent_reads.items()),
             )
             self.post(
                 LIVE_DERIVATION, key, snapshot, stage=stage,
@@ -6303,6 +7463,13 @@ class IdentityBook:
                     (page.name, source_row) in stale
                     or self.latest_ref(page, source_row) != cell
                     for page, source_row, cell in snapshot.reads
+                ) or any(
+                    tuple(parent for parent, _stage in self.edges_into(source)) != parents
+                    for source, parents in getattr(snapshot, "edge_reads", ())
+                ) or any(
+                    tuple(dict.fromkeys(child for child, _stage in self.edges_out_of(source)
+                                        if child.page == authority)) != children
+                    for source, authority, children in getattr(snapshot, "dependent_reads", ())
                 )):
                     stale.add(row)
                     changed = True
@@ -8913,20 +10080,35 @@ def concord_compiler_frame_formals(module: Any) -> tuple[dict, ...]:
                                 CALL_RECORD,
                                 (call_table.owner, str(caller_name)),
                             )
+                    occurrence_row = (
+                        callee_name, int(formal.id), str(caller_name),
+                        str(block_name), int(instruction_index), int(position), scope,
+                    )
+                    occurrence_sources = () if actual_cell is None else (actual_cell,)
+                    occurrence_mode = Mode.CONCORD
+                    previous = book.latest_ref(occurrence_page, occurrence_row)
+                    if previous is not None and incoming_page.latest(occurrence_row) != int(actual.id):
+                        # The storage-effects bootstrap's targets span is
+                        # rebound to its control-owned loop header Phi after
+                        # the first formal/actual census. The transition is
+                        # already authoritative; retain this occurrence as
+                        # its derived current view, not an immutable old id.
+                        from .concordance_declarations import LOOP_RESULT_USE_REBINDING
+                        transition_row = (scope, str(block_name), int(instruction_index), int(position))
+                        transition_ref = book.latest_ref(LOOP_RESULT_USE_REBINDING, transition_row)
+                        transition = book.page(LOOP_RESULT_USE_REBINDING).latest(transition_row)
+                        if (actual_cell is not None and actual_cell.page == SSA_VALUE
+                                and transition_ref is not None and isinstance(transition, tuple)
+                                and len(transition) == 3
+                                and transition[0] == incoming_page.latest(occurrence_row)
+                                and transition[1] == int(actual.id)):
+                            occurrence_mode = Mode.REVISE
+                            occurrence_sources = (previous, transition_ref, actual_cell)
                     book.post(
-                        occurrence_page,
-                        (
-                            callee_name, int(formal.id), str(caller_name),
-                            str(block_name), int(instruction_index),
-                            int(position), scope,
-                        ),
-                        int(actual.id),
-                        stage=FRAME_BINDING,
-                        provenance=(
-                            Derived((actual_cell,)) if actual_cell is not None
-                            else Unsourced(FRAME_SOURCE_CELL_ABSENT)
-                        ),
-                        mode=Mode.CONCORD,
+                        occurrence_page, occurrence_row, int(actual.id), stage=FRAME_BINDING,
+                        provenance=(Derived(occurrence_sources) if occurrence_sources
+                                    else Unsourced(FRAME_SOURCE_CELL_ABSENT)),
+                        mode=occurrence_mode,
                     )
 
     receipts: list[dict] = []
@@ -9171,39 +10353,58 @@ def concord_program_abi_frame_transitions(module: Any) -> tuple[dict, ...]:
 
 def argument_binding_history(
     page: Any, callee_symbol: Any, formal_id: int, *, rows: Any = None,
+    caller_symbol: Any = None,
 ) -> tuple[tuple[Any, Any], ...]:
-    """Every ``(callsite, fact)`` recorded for one callee formal on the
-    ``argument_binding`` page, in page order.
+    """Every caller-qualified ``(callsite, fact)`` for one callee formal.
 
-    Step 7 keys one row per ``(callee, formal, callsite)``; rows written
-    before it key ``(callee, formal, "binding")`` with the callsite as the
-    column.  ``rows`` restricts the read to those rows (a caller iterating
-    the page); by default the formal's rows are read from the page's scope
-    index.  An ``Unresolved`` fact is returned as such.
+    Current rows key ``(callee, caller, formal, callsite)`` and return
+    ``((caller, callsite), fact)``. Older step-7 rows key
+    ``(callee, formal, callsite)``; pre-step-7 rows key
+    ``(callee, formal, "binding")`` with callsite in the column. ``rows``
+    restricts the read to those rows; an ``Unresolved`` fact is preserved.
     """
 
     callee_symbol = str(callee_symbol)
     formal_id = int(formal_id)
+    caller_filter = None if caller_symbol is None else str(caller_symbol)
     if rows is None:
         rows = tuple(
             row for row in page.scope_rows(callee_symbol)
-            if len(row) == 3 and row[1] == formal_id
+            if (
+                len(row) == 4 and int(row[2]) == formal_id
+                or len(row) == 3 and int(row[1]) == formal_id
+            )
         )
     history: list[tuple[Any, Any]] = []
     for row in rows:
-        if not (isinstance(row, tuple) and len(row) == 3):
+        if not isinstance(row, tuple):
             continue
-        if str(row[0]) != callee_symbol or int(row[1]) != formal_id:
+        if str(row[0]) != callee_symbol:
+            continue
+        if len(row) == 4:
+            if int(row[2]) != formal_id:
+                continue
+            row_caller = str(row[1])
+            if caller_filter is not None and row_caller != caller_filter:
+                continue
+            callsite = (row_caller, row[3])
+        elif len(row) == 3:
+            if int(row[1]) != formal_id:
+                continue
+            row_caller = None
+            callsite = None if row[2] == "binding" else row[2]
+        else:
             continue
         for column, fact in page.history(row):
-            history.append((column if row[2] == "binding" else row[2], fact))
+            history.append((column if row[2] == "binding" else callsite, fact))
     return tuple(history)
 
 
 def materializing_binding_kind(
     book: Any, callee_symbol: Any, formal_id: int, source_id: int, kind: Any,
+    *, caller_symbol: Any = None,
 ) -> str:
-    """The kind that can materialize one caller slot, across every callsite.
+    """The kind that can materialize one caller slot across its callsites.
 
     A frame binding's kind is not a label on the slot; it selects which
     machinery may supply the argument.  ``caller_storage`` can restore a slot
@@ -9214,9 +10415,10 @@ def materializing_binding_kind(
     refuses the call -- after which the callee's output is never written and
     whatever reads it gets uninitialized memory, with no shortfall anywhere.
 
-    The decisions are already written to the shared page precisely so this is
-    answerable.  If any callsite proved the slot is caller storage, that is
-    what it is, and every callsite naming it gets the kind that works.
+    Current rows include caller identity because callsite IDs and local value
+    IDs are scoped to that caller. If any callsite in this caller proved the
+    slot is caller storage, every callsite in this caller naming that exact
+    slot gets the kind that works.
     """
 
     from .concordance_declarations import ARGUMENT_BINDING
@@ -9224,8 +10426,23 @@ def materializing_binding_kind(
 
     page = book.page("argument_binding")
     callee_symbol = str(callee_symbol)
+    caller_filter = None if caller_symbol is None else str(caller_symbol)
     for row in page.scope_rows(callee_symbol):
-        if not (len(row) == 3 and row[1] == int(formal_id)):
+        if len(row) == 4:
+            if int(row[2]) != int(formal_id):
+                continue
+            row_caller = str(row[1])
+            if caller_filter is not None and row_caller != caller_filter:
+                continue
+        elif len(row) == 3:
+            if caller_filter is not None and len(page.row_fields) == 4:
+                # Current pages cannot safely join a caller-blind legacy
+                # row to a caller-qualified physical frame.
+                continue
+            if int(row[1]) != int(formal_id):
+                continue
+            row_caller = None
+        else:
             continue
         for column, fact in page.history(row):
             if not (isinstance(fact, tuple) and len(fact) == 2):
@@ -9237,7 +10454,9 @@ def materializing_binding_kind(
                 continue
             if str(recorded_kind) == "caller_storage":
                 resolution_row = (
-                    callee_symbol, int(formal_id), int(source_id),
+                    (callee_symbol, row_caller, int(formal_id), int(source_id))
+                    if row_caller is not None
+                    else (callee_symbol, int(formal_id), int(source_id))
                 )
                 resolution = (
                     "caller_storage", str(kind), "materializing_binding_kind",
@@ -9278,6 +10497,13 @@ def record_proven_shape(
     extents = tuple(int(extent) for extent in (extents or ()))
     if not extents:
         return
+    if not dtype:
+        raise ValueError(
+            f"proven shape for value {int(value_id)} of "
+            f"{_shape_key(function)!r} (extents {extents}) was posted with "
+            "no dtype; the caller never recorded the element type, so the "
+            "proof refuses to invent one"
+        )
     book = current_identity_book()
     page = book.page(PROVEN_SHAPE_PAGE)
     row = (_shape_key(function), int(value_id))
@@ -9298,7 +10524,7 @@ def record_proven_shape(
         max(recorded_levels, default=0)
         if level is None else int(level)
     )
-    fact = ("proven", extents, str(dtype or "float64"), target_level)
+    fact = ("proven", extents, str(dtype), target_level)
     if not recorded:
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
@@ -9323,7 +10549,7 @@ def record_proven_shape(
         target_level = max(recorded_levels, default=-1) + 1
         if level is not None:
             target_level = max(target_level, int(level))
-        fact = ("proven", extents, str(dtype or "float64"), target_level)
+        fact = ("proven", extents, str(dtype), target_level)
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
             book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
@@ -9345,7 +10571,7 @@ def record_proven_shape(
         # confirmed more deeply; retain that depth and let the duplicate
         # source check below decide whether any new evidence was added.
         target_level = deepest_level
-        fact = ("proven", extents, str(dtype or "float64"), target_level)
+        fact = ("proven", extents, str(dtype), target_level)
     if (
         tuple(deepest[1][1]) == extents
         or target_level > deepest_level

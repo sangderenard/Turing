@@ -22,6 +22,17 @@ from .wasm_binary import (
 )
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 @dataclass(frozen=True, slots=True)
 class WasmEmissionShortfall:
     operation: str
@@ -80,6 +91,9 @@ def emit_ssa_function_to_wasm(
     Both are available deliberately -- a table costs memory and an interpolation,
     a series costs multiplies, and which is cheaper depends on the target.
     """
+    from .ssa_llvm_backend import (
+        DOUBLE_EXACT, INT32_EXACT, python_int_unchecked_refusal,
+    )
     from .work_contract import PRESETS, active_contract
 
     function: Function = module.functions[function_name]
@@ -188,6 +202,12 @@ def emit_ssa_function_to_wasm(
         if instruction.res is None:
             shortfalls.append(WasmEmissionShortfall(op, "instruction has no result"))
             continue
+        unchecked = python_int_unchecked_refusal(
+            instruction, "direct scalar WASM f64", DOUBLE_EXACT,
+        )
+        if unchecked is not None:
+            shortfalls.append(WasmEmissionShortfall(op, unchecked))
+            continue
         result_id = int(instruction.res.id)
         if op == "Const":
             value = float(instruction.attributes.get("constant", instruction.attributes.get("value")))
@@ -220,8 +240,9 @@ def emit_ssa_function_to_wasm(
         if op in {"Cast", "CastLike", "cast_like"} and len(args) >= 1:
             target = str(
                 instruction.attributes.get("target_dtype")
-                or instruction.res.dtype
-                or "float64"
+                or _settled_dtype(
+                    instruction.res.dtype, instruction.res.id,
+                    "Cast target_dtype attribute or result dtype")
             ).casefold()
             get(args[0])
             if target in {"bool", "i1"}:
@@ -516,6 +537,9 @@ _I32_OPS = {"Add": 0x6A, "Sub": 0x6B, "Mul": 0x6C, "Div": 0x6D}
 _I32_COMPARISONS = {
     "Lt": 0x48, "Le": 0x4C, "Gt": 0x4A, "Ge": 0x4E, "Eq": 0x46, "Ne": 0x47,
 }
+# Python int is i64 here (Lane X2), so int arithmetic proven inside int64
+# lowers; unproven arithmetic still refuses by name (no checked spelling).
+_INT64_EXACT = (-(1 << 63), (1 << 63) - 1)
 _I64_OPS = {"Add": 0x7C, "Sub": 0x7D, "Mul": 0x7E}
 _I64_COMPARISONS = {
     "Lt": 0x53, "Le": 0x57, "Gt": 0x55, "Ge": 0x59, "Eq": 0x51, "Ne": 0x52,
@@ -584,6 +608,9 @@ def emit_ssa_module_to_wasm_core(
     """Emit ``function_name`` plus its inlined callees as one wasm function."""
 
     from .ir_identities import precision_backend_shortfalls
+    from .ssa_llvm_backend import (
+        python_int_unchecked_refusal,
+    )
 
     name = str(entry_name or function_name)
     root: Function = module.functions[function_name]
@@ -760,6 +787,12 @@ def emit_ssa_module_to_wasm_core(
 
         nonlocal precision_present
         operation = str(instruction.op)
+        unchecked = python_int_unchecked_refusal(
+            instruction, "core WASM i64", _INT64_EXACT,
+        )
+        if unchecked is not None:
+            shortfalls.append(WasmEmissionShortfall(operation, unchecked))
+            return
         if instruction.attributes.get("precision_section"):
             precision_present = True
         if operation in {"NoneValue", "nonevalue"}:
@@ -1003,9 +1036,15 @@ def emit_ssa_module_to_wasm_core(
     label_local = builder.declare_local("i32")  # zero-initialised: entry
 
     def edge_assignments(source_block: str, target_block: str) -> None:
+        # Every Phi on an edge reads its incoming value before any Phi on
+        # that edge is written: a parallel copy.  Writing them one by one let
+        # ``j = phi(.., i)`` read the ``i`` the same edge had just advanced
+        # (c125 returned 10 where Python returns 9).  All incoming values go
+        # on the Wasm stack first; the locals are set from the top down.
         target = root.blocks.get(target_block)
         if target is None:
             return
+        destinations = []
         for instruction in target.instrs:
             if str(instruction.op) != "Phi" or instruction.res is None:
                 continue
@@ -1016,14 +1055,15 @@ def emit_ssa_module_to_wasm_core(
                 if str(origin) == source_block and position < len(
                     instruction.args
                 ):
-                    destination = slot_for(
+                    destinations.append(slot_for(
                         root_env, instruction.res, phi_kind(instruction),
-                    )
-                    if push_as(
+                    ))
+                    push_as(
                         root_env, instruction.args[position],
                         phi_kind(instruction), "Phi",
-                    ):
-                        builder.local_set(destination)
+                    )
+        for destination in reversed(destinations):
+            builder.local_set(destination)
 
     def phi_kind(instruction) -> str:
         return value_kind(instruction.res) or next((

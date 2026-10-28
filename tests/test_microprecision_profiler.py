@@ -30,8 +30,18 @@ def test_nonllvm_profile_stops_at_its_own_backend_frontier(tmp_path):
     assert len(rows) == 6
     assert {row.backend for row in rows} == {"c", "fortran", "webgpu"}
     assert not any(row.backend == "llvm" for row in rows)
-    assert {row.status for row in rows if row.backend == "c"} == {"unavailable"}
-    assert {row.status for row in rows if row.backend != "c"} == {"unsupported"}
+    # The C lane runs the lowered core and writes every output limb.
+    assert {row.status for row in rows if row.backend == "c"} == {"passed"}
+    # Fortran and WebGPU emit the core now; each stops at its own runtime
+    # frontier on a host without one, and never falls back to another lane.
+    for row in rows:
+        if row.backend == "webgpu":
+            assert row.status == "unavailable", row
+        elif row.backend == "fortran":
+            assert row.status == "passed" or (
+                row.status == "failed"
+                and "no Fortran compiler" in str(row.reason)
+            ), row
     assert builds["sin w2"]["emit_ns"] == 0
     assert builds["sin w2"]["native_compile_ns"] == 0
 

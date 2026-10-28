@@ -1,9 +1,12 @@
-2026-10-24 WASM CORE CARRIES PYTHON INT AS I64 — WIP, UNGATED (MEASURED, cloud Linux):
-Lane X2. On main the independent Wasm core typed int formals as i32: c601 silently
-returned the other branch for a = 2**31 and 2**32 + 1. Branch 18ca38b makes int an
-i64, tracks each local's kind, and turns kind mismatches into named shortfalls.
-Typed corpus through c,wasm (new TYPED_CHECK_BACKENDS=wasm): main 1/381 PASS;
-branch 41 PASS, 335 named refusals, 5 WRONG newly exposed (were invalid modules
-before): c124/c125/c126 (loop break target, got 10 want 9) and c427/c537 (crossed or
-swapped fields; inferred: edge_assignments writes Phis sequentially, not as a
-parallel copy). NOT GREEN: those 5 must be fixed before merge; gate not run (parked).
+2026-10-28 WASM CORE CARRIES PYTHON INT AS I64; PHIS COPY IN PARALLEL (MEASURED, cloud Linux):
+Lane X2, resumed and merged with main. On main the independent Wasm core typed int
+formals as i32: c961 silently returned the other branch for a = 2**31 and 2**32 + 1.
+Int is now an i64 formal, local and output cell; each local carries its kind and a
+kind mismatch is a named shortfall instead of a module node rejects. Unproven int
+arithmetic still refuses by name (main's python_int_unchecked_refusal, now against
+int64). Loop-header Phis were written one by one, so a Phi reading another Phi on
+the same edge saw its new value (c125 gave 10 for 9; c962 holds it): edge copies
+are now parallel. TYPED_CHECK_BACKENDS=wasm runs the core in the typed check.
+Measured: c125, c961, c962 PASS through wasm; the wasm/mobile test files show the
+same 101 failure names on main and on this branch (unrelated, pre-existing). Not
+gated, no full corpus (per the 2026-10-28 merge flow).

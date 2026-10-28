@@ -224,6 +224,8 @@ def _authored_parameter_sequence_contracts(graph_obj: Any):
         ):
             raise ValueError(f"parameter {name!r} declared and linked keyed contracts disagree")
         receipts[str(name)] = receipt
+    for name, contract in _linked_list_parameter_contracts(graph_obj).items():
+        contracts.setdefault(name, contract)
     for parameter, receipt in receipts.items():
         if receipt.get("storage") != "keyed":
             continue
@@ -235,6 +237,59 @@ def _authored_parameter_sequence_contracts(graph_obj: Any):
         if incumbent is not None and (incumbent[0:2], incumbent[3]) != (contract[0:2], contract[3]):
             raise ValueError(f"parameter {parameter!r} annotation and ProgramABI disagree about sequence row layout")
         contracts[str(parameter)] = contract
+    return contracts
+
+
+def _linked_list_parameter_contracts(graph_obj: Any) -> dict[str, tuple]:
+    """Row contracts of unannotated parameters the call bindings prove lists.
+
+    Program: ``def put(xs, t): xs.append(t)`` called with a caller's ``[]``.
+    Wrong record: an unannotated parameter had no row contract, so
+    ``len(xs)`` had no sequence to read and vanished from the return.  Rule:
+    the call-edge ABI (``linked_value_abi``) names the argument's class; a
+    ``list`` whose storage the call bindings settle (its element type joined
+    across the linked views, ``linked_sequence_element_dtypes``) is that
+    list: one duplicates column, writable when it grows.  It is the caller's
+    storage viewed as a list, as an annotated ``list[T]`` parameter is, not a
+    retained authored arena.
+    """
+
+    linked = graph_obj.graph.get("linked_value_abi") or {}
+    linked_elements = dict(graph_obj.graph.get("linked_sequence_element_dtypes") or {})
+    linked_dynamic = set(map(int, graph_obj.graph.get("linked_dynamic_sequence_ids", ())))
+    annotated = _current_authored_parameter_annotations(graph_obj)
+    contracts = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if str(data.get("type") or data.get("op") or "").casefold() != "input":
+            continue
+        name = attributes.get("binding_name")
+        value_id = int(data.get("value_id", node_id))
+        receipt = linked.get(value_id) or {}
+        # Program: ``def _trim(out): if out[-1] == 0: out.pop()`` called
+        # with ``[1, n, 0, 0]``.  Wrong record: the call edge gives a
+        # non-empty list argument its element type as a ``span`` receipt
+        # (``aggregate_kind`` list), and only a list with no storage
+        # receipt got this row contract, so ``out[-1]`` read a raw span
+        # while ``pop`` made ``out`` a heap sequence: two views of one
+        # storage that disagree.  Rule: a list's span receipt is that list,
+        # and takes the list row contract as an empty list's does.
+        storage = receipt.get("storage")
+        if (
+            name is None or str(name) in annotated
+            or not (
+                storage is None
+                or (storage == "span"
+                    and receipt.get("aggregate_kind") == "list")
+            )
+            or receipt.get("python_type") != "builtins.list"
+            or value_id not in linked_elements
+        ):
+            continue
+        contracts[str(name)] = (
+            "duplicates", 1, value_id in linked_dynamic,
+            (str(linked_elements[value_id]),),
+        )
     return contracts
 
 

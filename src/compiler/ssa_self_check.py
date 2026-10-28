@@ -694,6 +694,117 @@ def check_structural_outputs(module: Any) -> list[Finding]:
     return findings
 
 
+_SCALAR_CLASS = {
+    "bool": "bool", "int": "int", "int32": "int", "int64": "int",
+    "float": "float", "float16": "float", "float32": "float",
+    "float64": "float", "double": "float",
+}
+_CLASS_RANK = {"bool": 0, "int": 1, "float": 2}
+
+
+def check_loop_carried_class_widening(module: Any) -> list[Finding]:
+    """A loop-carried scalar Phi narrower than its backedge update.
+
+    Program: ``acc = n (bool); for i in range(k): acc = acc * 2 + i``.
+    Wrong record: the header Phi (and the loop-result port) took the
+    initial value's class, bool, while the settled update is int64; the
+    native product kept the bool and returned True for 2037.  Python's
+    carried name is bool only when the loop runs zero times and int
+    otherwise: the result class depends on the trip count, a
+    runtime-varying type that needs the tagged union (or a peeled
+    zero-trip path), not a narrower Phi.  Rule: run after the last writer
+    of physical scalar dtypes (late call-result settlement); a carried
+    Phi whose class (bool < int < float) is narrower than its update's is
+    a finding naming both value ids.
+    """
+
+    findings: list[Finding] = []
+    for name, function in _functions(module):
+        for block in (getattr(function, "blocks", {}) or {}).values():
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op).casefold() != "phi"
+                    or (instruction.attributes or {}).get("binding")
+                    != "loop_carried"
+                    or len(instruction.args) < 2
+                    or instruction.res is None
+                ):
+                    continue
+                header, update = instruction.res, instruction.args[1]
+                header_class = _SCALAR_CLASS.get(str(header.dtype))
+                update_class = _SCALAR_CLASS.get(str(update.dtype))
+                if (
+                    header_class is None or update_class is None
+                    or tuple(header.shape or ()) or tuple(update.shape or ())
+                    or _CLASS_RANK[header_class] >= _CLASS_RANK[update_class]
+                ):
+                    continue
+                findings.append(Finding(
+                    "loop_carried_class_widening", str(name),
+                    f"loop-carried value joins {header_class} and "
+                    f"{update_class} arms; result class depends on trip "
+                    f"count (header Phi value={int(header.id)} is "
+                    f"{header.dtype!r}, update value={int(update.id)} is "
+                    f"{update.dtype!r}); the union of the carried name's "
+                    "classes is not represented",
+                ))
+    return findings
+
+
+def check_phi_narrower_than_arm(module: Any) -> list[Finding]:
+    """A scalar Phi of a narrower class than one of its incoming values.
+
+    Program: ``s = 0; for v in xs: if v < 3.0: continue; s += v``
+    (``test_ssa_numeric_joins``).  Wrong record: the latch Phi joining the edge past the
+    ``continue`` (the header, int) with the edge after ``s += v`` was
+    minted with the reserved update's class (int64) before late call-result
+    settlement made that update a float; C converted 4.5 to 4 and LLVM
+    refused the Phi.  Python's ``s`` is an int on one path and a float on
+    the other, a runtime-varying class that needs the tagged union.  Rule:
+    run after the last writer of physical scalar dtypes; a scalar Phi whose
+    class (bool < int < float) is narrower than an incoming value's is a
+    finding naming both.  The loop header against its update is
+    ``check_loop_carried_class_widening``'s.
+    """
+
+    findings: list[Finding] = []
+    for name, function in _functions(module):
+        for block in (getattr(function, "blocks", {}) or {}).values():
+            for instruction in block.instrs:
+                result = instruction.res
+                if (
+                    str(instruction.op).casefold() != "phi"
+                    or result is None
+                    or (instruction.attributes or {}).get("binding")
+                    == "loop_carried"
+                    or tuple(result.shape or ())
+                ):
+                    continue
+                result_class = _SCALAR_CLASS.get(str(result.dtype))
+                if result_class is None:
+                    continue
+                for incoming in instruction.args:
+                    incoming_class = _SCALAR_CLASS.get(str(incoming.dtype))
+                    if (
+                        incoming_class is None
+                        or tuple(incoming.shape or ())
+                        or _CLASS_RANK[incoming_class]
+                        <= _CLASS_RANK[result_class]
+                    ):
+                        continue
+                    findings.append(Finding(
+                        "phi_narrower_than_arm", str(name),
+                        f"a join of {result_class} and {incoming_class} "
+                        f"arms (Phi value={int(result.id)} is "
+                        f"{result.dtype!r}, incoming value="
+                        f"{int(incoming.id)} is {incoming.dtype!r}); Python "
+                        "keeps each arm's class, and the int-or-float union "
+                        "lowering is not built",
+                    ))
+                    break
+    return findings
+
+
 def run_all(module: Any) -> list[Finding]:
     """Every decisive check; the candidate reporter is separate on purpose.
 
@@ -713,6 +824,7 @@ def run_all(module: Any) -> list[Finding]:
         *check_phi_cfg_contract(module),
         *check_definition_dominance(module),
         *check_structural_outputs(module),
+        *check_loop_carried_class_widening(module),
     ]
 
 
@@ -723,6 +835,7 @@ __all__ = [
     "check_definition_dominance",
     "check_structural_outputs",
     "check_formal_parity",
+    "check_loop_carried_class_widening",
     "check_optional_merges",
     "check_phi_cfg_contract",
     "check_value_union_storage",

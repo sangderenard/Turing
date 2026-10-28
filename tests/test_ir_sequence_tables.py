@@ -34,11 +34,9 @@ from src.compiler.control_source import (
 )
 from src.compiler.precompile_to_ssa import (
     lower_control_sections_to_ssa,
-    ssa_module_dictionary,
 )
 from src.compiler.ssa_fortran_backend import FortranEmissionError, emit_module
 from src.compiler.ssa_fortran_backend import fortran_compiler
-from src.compiler.ssa_llvm_backend import emit_ssa_function_to_llvm
 from src.compiler.fortran_c_shell import (
     _authored_complete_record_schemas,
     _authored_dataclass_record_views,
@@ -90,6 +88,45 @@ def _seed_value(scope, value_id, dtype="int64"):
         stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
         mode=Mode.CONCORD,
     )
+
+def _assert_native_feeds_match_python(source, feeds, tmp_path):
+    """Compile authored ``source`` through the public entry to C and require
+    each native output to equal Python's answer in value and Python type."""
+
+    import numpy as np
+
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    namespace = {"__name__": "authored_probe"}
+    exec(compile(source, "authored_probe", "exec", dont_inherit=True), namespace)
+    expected = namespace["root"](**feeds)
+    expected = list(expected) if isinstance(expected, tuple) else [expected]
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="authored_probe",
+        extraction_contract="extraction_contracts/program_extraction.yaml",
+        progress=lambda _message: None,
+    )
+    root = module.functions[exports[0]]
+    parameters = dict(root.metadata["parameter_names"])
+    (returned,) = [
+        instruction.args
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    ]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native")
+    execution = artifact.prepare_execution({
+        parameters[name]: np.array([value]) for name, value in feeds.items()
+    }).run()
+    assert len(returned) == len(expected)
+    for value, want in zip(returned, expected):
+        buffer = execution.buffers[value.id]
+        got = buffer.reshape(-1)[0].item()
+        if isinstance(want, bool):
+            got = bool(got) if buffer.dtype.kind in "biu" else got
+        assert got == want and type(got) is type(want), (got, want, buffer.dtype)
 
 
 def _ops(function):
@@ -309,12 +346,11 @@ class Builder:
     }
 
 
-def test_authored_ordinary_class_infers_only_proven_receiver_state():
-    views = _authored_dataclass_record_views(ast.parse("""
+def test_authored_ordinary_class_infers_only_proven_receiver_state(tmp_path):
+    _assert_native_feeds_match_python("""
 class Builder:
-    def __init__(self, first_value_id, opaque):
-        self.next_value_id = int(first_value_id)
-        self.opaque = opaque
+    def __init__(self, first_value_id: int):
+        self.next_value_id = first_value_id
 
     def fresh(self):
         value = self.next_value_id
@@ -324,24 +360,13 @@ class Builder:
     def delegated(self):
         return self.fresh()
 
-    def unsupported(self):
-        return self.opaque
-"""))
 
-    expected = {
-        "self": {
-            "identity": "Builder",
-            "fields": {
-                "next_value_id": {
-                    "storage": "scalar", "dtype": "int64", "rank": 0,
-                    "mutable": True,
-                },
-            },
-        }
-    }
-    assert views["Builder.fresh"] == expected
-    assert views["Builder.delegated"] == expected
-    assert "Builder.unsupported" not in views
+def root(first: int):
+    builder = Builder(first)
+    a = builder.fresh()
+    b = builder.delegated()
+    return a, b, builder.next_value_id
+""", {"first": 7}, tmp_path)
 
 
 def test_authored_dataclass_annotation_infers_exact_parameter_fields():
@@ -1026,6 +1051,51 @@ def test_sequence_append_slice_normalizes_bounds_and_copies_between_arenas():
     assert "capacity_exhausted" in function.blocks
 
 
+def test_dynamic_sequence_append_slice_reserves_clipped_result_before_copy():
+    destination = SSASequenceDescriptor(
+        sequence_id=23,
+        column_value_ids=(230,),
+        length_address_id=231,
+        capacity_value_id=232,
+        status_address_id=233,
+        column_dtypes=("int64",),
+        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
+        heap_owner_value_id=234,
+    )
+    source = SSASequenceDescriptor(
+        sequence_id=24,
+        column_value_ids=(240,),
+        length_address_id=241,
+        capacity_value_id=242,
+        status_address_id=243,
+        column_dtypes=("int64",),
+        capacity_policy=SSASequenceCapacityPolicy.DYNAMIC,
+        heap_owner_value_id=244,
+        writable=False,
+    )
+
+    lowering = lower_sequence_append_slice(
+        destination, source, function_name="dynamic_slice_copy",
+    )
+
+    assert lowering.complete, lowering.shortfalls
+    function, reserve = lowering.functions
+    assert function.metadata["ssa_sequence_operation"] == "append_slice"
+    assert reserve.metadata["ssa_sequence_operation"] == "reserve"
+    calls = [
+        instruction for block in function.blocks.values()
+        for instruction in block.instrs if instruction.op == "Call"
+    ]
+    assert [call.attributes.get("callee") for call in calls] == [reserve.name]
+    assert "append_slice_reserve" in function.blocks
+    assert "capacity_exhausted" in function.blocks
+    assert not any(
+        instruction.attributes.get("failure") == "fixed_capacity_exhausted"
+        for block in function.blocks.values()
+        for instruction in block.instrs
+    )
+
+
 def test_sequence_pack_bits_is_nested_iterative_memory_ssa():
     destination = _sequence(15, 150)
     source = SSASequenceDescriptor(
@@ -1231,64 +1301,63 @@ def test_record_table_merges_access_capability_over_exact_storage():
     assert merged.fields[0].writable
 
 
-def test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table():
-    program = _loop_with_mutation(ControlSequenceMutation(
-        sequence_value_id=10,
-        operator="append",
-        argument_value_ids=(11,),
-        effect_node_id=12,
-        policy="duplicates",
-    ))
-    module, shortfalls, _outputs = lower_control_sections_to_ssa(
-        program,
-        identity_table={"items": (10,), "value": (11,)},
-    )
+_NATIVE_CONTRACT = (
+    Path(__file__).resolve().parents[1]
+    / "extraction_contracts" / "program_extraction.yaml"
+)
 
-    assert shortfalls == ()
-    helper = next(function for function in module.functions.values()
-                  if function.metadata.get("ssa_sequence_operation") == "append"
-                  and function.metadata.get("sequence_id") == 10)
-    assert module.sequence_tables["planned_control"].by_id(10).allows_duplicates
-    control_calls = [
-        instruction
-        for block in module.functions["planned_control"].blocks.values()
-        for instruction in block.instrs
-        if instruction.attributes.get("ssa_sequence_operation") == "append"
-    ]
-    assert len(control_calls) == 1
-    descriptor = module.sequence_tables["planned_control"].by_id(10)
-    assert descriptor.status_address_id is not None
-    assert not any(
-        instruction.attributes.get("callee") == "turing_sequence_capacity_error"
-        for function in module.functions.values()
-        for block in function.blocks.values()
-        for instruction in block.instrs
+
+def _assert_native_matches_python(source, argument, tmp_path):
+    """Run authored ``root(argument)`` natively and in Python; compare both
+    the value and its Python type (bool, int or float)."""
+    import numpy as np
+
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    namespace = {"__name__": "sequence_table_program"}
+    exec(compile(source, "<program>", "exec", dont_inherit=True), namespace)
+    expected = namespace["root"](argument)
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="sequence_table_program",
+        extraction_contract=str(_NATIVE_CONTRACT), progress=lambda _: None,
     )
-    assert any(
-        instruction.op == "Store"
-        and instruction.attributes.get("binding") == "ssa_sequence_status"
-        for block in module.functions["planned_control"].blocks.values()
+    root = module.functions[exports[0]]
+    parameter = next(iter(dict(root.metadata["parameter_names"]).values()))
+    (returned,) = next(
+        instruction.args
+        for block in root.blocks.values()
         for instruction in block.instrs
+        if instruction.op == "Ret"
     )
-    helper_ops = set(_ops(helper))
-    assert {"GetElementPtr", "Load", "Store", "Lt", "CondBr"} <= helper_ops
-    emitted = emit_module(
-        module,
-        name="sequence_append_probe",
-        extra_roots=tuple(module.functions),
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native")
+    buffer = np.asarray(
+        artifact.prepare_execution({parameter: np.array([argument])})
+        .run().buffers[returned.id]
+    ).reshape(-1)
+    native = buffer.tolist()[0]
+    kind = buffer.dtype.kind
+    assert native == expected
+    if isinstance(expected, bool):
+        assert kind in "biu"
+    elif isinstance(expected, int):
+        assert kind in "iu"
+    else:
+        assert kind == "f"
+
+
+def test_retained_loop_append_becomes_internal_sequence_ssa_call_and_table(
+    tmp_path,
+):
+    source = (
+        "def root(v: int) -> int:\n"
+        "    items = []\n"
+        "    for i in range(4):\n"
+        "        items.append(v + i)\n"
+        "    return len(items) * 100 + items[3]\n"
     )
-    assert emitted.complete, [item.format() for item in emitted.shortfalls]
-    descriptor_record = emitted.api.metadata["sequence_tables"][
-        "planned_control"
-    ][0]
-    assert descriptor_record["sequence_id"] == 10
-    assert descriptor_record["source_names"] == ["items"]
-    entry = emitted.api.entry_point("planned_control")
-    parameters = {parameter.name: parameter for parameter in entry.parameters}
-    assert parameters[f"t{descriptor.column_value_ids[0]}"].passing == "reference"
-    assert parameters[f"t{descriptor.length_address_id}"].passing == "reference"
-    assert parameters[f"t{descriptor.status_address_id}"].passing == "reference"
-    assert parameters[f"t{descriptor.capacity_value_id}"].passing == "value"
+    _assert_native_matches_python(source, 3, tmp_path)
 
 
 @pytest.mark.skipif(
@@ -1377,42 +1446,26 @@ def test_compiled_retained_loop_mutates_caller_sequence_record(tmp_path):
     assert list(arena) == [7.5, 7.5, 7.5, 7.5]
 
 
-def test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it():
-    add_program = _loop_with_mutation(ControlSequenceMutation(
-        sequence_value_id=20,
-        operator="add",
-        argument_value_ids=(21,),
-        effect_node_id=22,
-        policy="unique",
-    ))
-    add_module, add_shortfalls, _ = lower_control_sections_to_ssa(
-        add_program,
-        identity_table={"seen": (20,), "value": (21,)},
+def test_retained_loop_set_add_keeps_unique_scan_and_extend_inherits_it(
+    tmp_path,
+):
+    add_source = (
+        "def root(v: int) -> int:\n"
+        "    seen = set()\n"
+        "    for i in range(4):\n"
+        "        seen.add(v + i % 2)\n"
+        "    return len(seen)\n"
     )
-    assert add_shortfalls == ()
-    add_helper = next(function for function in add_module.functions.values()
-                      if function.metadata.get("ssa_sequence_operation") == "add"
-                      and function.metadata.get("sequence_id") == 20)
-    assert "unique_scan_header" in add_helper.blocks
-
-    extend_program = _loop_with_mutation(ControlSequenceMutation(
-        sequence_value_id=30,
-        operator="extend",
-        argument_value_ids=(31,),
-        effect_node_id=32,
-        policy="unique",
-        argument_kind="sequence",
-    ))
-    extend_module, extend_shortfalls, _ = lower_control_sections_to_ssa(
-        extend_program,
-        identity_table={"seen": (30,), "incoming": (31,)},
+    _assert_native_matches_python(add_source, 3, tmp_path / "add")
+    extend_source = (
+        "def root(v: int) -> int:\n"
+        "    seen = set()\n"
+        "    for i in range(4):\n"
+        "        seen.add(v + i % 2)\n"
+        "    seen.update([v, v + 5, v + 5])\n"
+        "    return len(seen) * 100 + (v + 5 in seen)\n"
     )
-    assert extend_shortfalls == ()
-    insert = next(function for function in extend_module.functions.values()
-                  if function.metadata.get("ssa_sequence_operation") == "insert"
-                  and function.metadata.get("sequence_id") == 30)
-    assert "unique_scan_header" in insert.blocks
-    assert extend_module.sequence_tables["planned_control"].by_id(30).key_columns == (0,)
+    _assert_native_matches_python(extend_source, 3, tmp_path / "extend")
 
 
 def test_retained_generator_extend_is_typed_shortfall_not_opaque_or_fallback():
@@ -1452,44 +1505,16 @@ def test_filtered_eager_comprehension_requires_compact_materialization():
     assert "predicated compact materialization" in shortfalls[0].reason
 
 
-def test_empty_aggregate_const_becomes_explicit_sequence_arena_argument():
-    arena = SSAValue(60)
-    function = Function(
-        "empty_sequence",
-        [],
-        {"entry": BasicBlock("entry", [
-            Instr("Const", [], arena, attributes={"value": []}),
-            Instr("Ret", [], None),
-        ])},
+def test_empty_aggregate_const_becomes_explicit_sequence_arena_argument(
+    tmp_path,
+):
+    source = (
+        "def total(xs, n: int) -> int:\n"
+        "    return len(xs) + n\n"
+        "def root(n: int) -> int:\n"
+        "    return total([], n) + total((), n)\n"
     )
-    descriptor = _sequence(60, 60)
-
-    lower_sequence_aggregate_constants(
-        {function.name: function},
-        {function.name: SSASequenceTable({60: descriptor})},
-    )
-
-    assert [instruction.op for instruction in function.blocks["entry"].instrs] == ["Ret"]
-    assert [argument.id for argument in function.args] == [60]
-    assert function.metadata["sequence_aggregate_inputs"] == (60,)
-    module = IRModule(
-        {function.name: function},
-        sequence_tables={
-            function.name: SSASequenceTable({60: descriptor})
-        },
-    )
-    emitted = emit_module(
-        module,
-        name="empty_sequence_probe",
-        extra_roots=(function.name,),
-    )
-    assert emitted.complete, [item.format() for item in emitted.shortfalls]
-    assert emitted.api.metadata["sequence_table_schema"] == (
-        "turing.repository-ssa-sequence-table.v1"
-    )
-    assert emitted.api.metadata["sequence_tables"] == {
-        function.name: [{**descriptor.to_mapping(), "source_names": []}]
-    }
+    _assert_native_matches_python(source, 3, tmp_path)
 
 
 def test_initialized_literal_table_replaces_structural_dict_with_frame_arena():
@@ -1672,114 +1697,191 @@ def test_record_table_rejects_storage_references_absent_from_function():
         emit_module(module, name="broken_record_probe", extra_roots=(function.name,))
 
 
-def test_retained_field_sequence_populates_typed_record_from_lowered_storage():
-    program = _loop_with_mutation(ControlSequenceMutation(
-        sequence_value_id=10,
-        operator="append",
-        argument_value_ids=(11,),
-        effect_node_id=12,
-        policy="duplicates",
-    ))
-    module, shortfalls, _ = lower_control_sections_to_ssa(
-        program,
-        identity_table={"self": (5,), "self.items": (10,), "value": (11,)},
-        self_value_id=5,
-        field_ops=(("read", 10, 0),),
-        field_count=1,
-        field_names=("items",),
-        record_identity="Accumulator",
+def test_retained_field_sequence_populates_typed_record_from_lowered_storage(
+    tmp_path,
+):
+    source = (
+        "from dataclasses import dataclass, field\n"
+        "@dataclass\n"
+        "class Accumulator:\n"
+        "    items: list = field(default_factory=list)\n"
+        "def root(v: int) -> int:\n"
+        "    acc = Accumulator()\n"
+        "    for i in range(4):\n"
+        "        acc.items.append(v + i)\n"
+        "    return len(acc.items) * 100 + acc.items[3]\n"
     )
+    _assert_native_matches_python(source, 3, tmp_path)
 
-    assert shortfalls == ()
-    record = module.record_tables["planned_control"].records[5]
-    (field,) = record.fields
-    descriptor = module.sequence_tables["planned_control"].by_id(10)
-    assert record.identity == "Accumulator"
-    assert field.name == "items"
-    assert field.storage is SSARecordFieldStorage.SEQUENCE
-    assert field.sequence_id == descriptor.sequence_id
-    assert set(field.value_ids) == {
-        *descriptor.column_value_ids,
-        descriptor.length_address_id,
-        descriptor.capacity_value_id,
-        descriptor.status_address_id,
-    }
-    emitted = emit_module(
-        module,
-        name="retained_field_record",
-        extra_roots=tuple(module.functions),
+
+def test_declared_array_receiver_refines_raw_span_before_method_linking(tmp_path):
+    _assert_native_feeds_match_python("""
+from array import array
+
+
+class Vocabulary:
+    def __init__(self):
+        self.exact_begin = array("Q")
+
+    def inspect(self):
+        return len(self.exact_begin)
+
+    def relay(self):
+        return self.inspect()
+
+
+def root(n: int):
+    vocabulary = Vocabulary()
+    vocabulary.exact_begin.append(n)
+    vocabulary.exact_begin.append(9223372036854775808)
+    return vocabulary.relay()
+""", {"n": 3}, tmp_path)
+
+
+def test_empty_dict_constructor_keeps_accepted_receiver_table_roles(tmp_path):
+    _assert_native_feeds_match_python("""
+class Index:
+    def __init__(self):
+        self._candidates = {}
+
+    def batch(self, a: int, b: int, c: int, d: int, token: int):
+        self._candidates.setdefault((a, b, c, d), []).append(token)
+        return len(self._candidates)
+
+
+def root(a: int, b: int, c: int, d: int, token: int):
+    index = Index()
+    return index.batch(a, b, c, d, token)
+""", {"a": 1, "b": 2, "c": 3, "d": 4, "token": 5}, tmp_path)
+
+
+def test_guarded_array_lengths_and_append_keep_one_resident_sequence():
+    from src.compiler.identity_concordance import concordance_report
+
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c632_guarded_record_length.py"
+    ).read_text(encoding="utf-8")
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="guarded_array_lengths",
+        extraction_contract=(Path(__file__).resolve().parents[1]
+                             / "extraction_contracts" / "program_extraction.yaml"),
+        progress=lambda _message: None, progress_bars=False,
     )
-    assert emitted.complete
-    assert emitted.api.metadata["record_tables"]["planned_control"] == [
-        record.to_mapping()
-    ]
+    function = next(function for function in module.functions.values()
+                    if "__add__specialized" in function.name
+                    and "__planned_region_" not in function.name
+                    and "__ssa_sequence_" not in function.name)
+    instructions = [instruction for block in function.blocks.values()
+                    for instruction in block.instrs]
+    lengths = [instruction for instruction in instructions
+               if instruction.attributes.get("binding") == "ssa_sequence_length_value"]
+    assert len(lengths) == 3
+    addresses = {instruction.res.id: instruction.args[0].id
+                 for instruction in instructions
+                 if instruction.attributes.get("binding") == "ssa_sequence_length_address"}
+    assert len({addresses[instruction.args[0].id] for instruction in lengths}) == 1
+    append = next(instruction for instruction in instructions
+                  if instruction.attributes.get("ssa_sequence_operation") == "append")
+    assert append.args[-1].dtype == "uint8"
+    assert any(instruction.op == "Cast" and instruction.res.dtype == "uint8"
+               and instruction.attributes.get("binding") == "ssa_sequence_uint8_range"
+               for instruction in instructions)
+    report = concordance_report(module)
+    assert "0 finding(s)" in report, report
 
 
-def test_static_program_reference_is_typed_ssa_and_native_handle_storage():
-    handle = -734_921
-    module, shortfalls, _ = lower_control_sections_to_ssa(
-        ControlProgram(SequenceBlock(())),
-        identity_table={"self": (5,)},
-        self_value_id=5,
-        field_ops=(("write", 11, 0), ("write", 12, 1)),
-        field_const_sources={
-            11: {
-                "ssa_reference_identity": "autograd.tape",
-                "reference_kind": "static-python",
-                "reference_handle": handle,
-                "host_resident": True,
-            },
-            12: 2.5,
-        },
-        field_count=2,
-        field_names=("_tape", "gain"),
-        record_identity="AbstractTensor",
-        record_field_dtypes={"gain": "float64"},
-        record_field_contracts={
-            "_tape": {"storage": "reference", "mutable": True},
-            "gain": {
-                "storage": "scalar", "dtype": "float64", "mutable": True,
-            },
-        },
+def test_readonly_forwarding_keeps_typed_mutable_sequence_owner():
+    from dataclasses import replace
+
+    source = (
+        Path(__file__).parent / "record_view_corpus"
+        / "c628_dict_readonly_forwarding.py"
+    ).read_text(encoding="utf-8")
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="dict_readonly_forwarding",
+        extraction_contract=(
+            Path(__file__).resolve().parents[1]
+            / "extraction_contracts" / "program_extraction.yaml"
+        ),
+        progress=lambda _message: None, progress_bars=False,
     )
-
-    assert shortfalls == ()
-    function = module.functions["planned_control"]
-    instructions = [
-        instruction
-        for block in function.blocks.values()
-        for instruction in block.instrs
-    ]
-    reference = next(item for item in instructions if item.op == "StaticRef")
-    store = next(item for item in instructions if item.op == "Store")
-    assert reference.res.dtype == "opaque_ref"
-    assert reference.attributes["reference_identity"] == "autograd.tape"
-    assert store.args[0].dtype == "opaque_ref"
-    descriptor = module.reference_tables["planned_control"].references[handle]
-    assert descriptor.identity == "autograd.tape"
-    assert descriptor.host_resident
-    assert ssa_module_dictionary(module)["reference_tables"]["planned_control"] == [
-        descriptor.to_mapping()
-    ]
-    record = module.record_tables["planned_control"].records[5]
-    assert record.fields[0].storage is SSARecordFieldStorage.REFERENCE
-    assert record.fields[0].dtype == "opaque_ref"
-    assert record.fields[1].storage is SSARecordFieldStorage.SCALAR
-    assert record.fields[1].dtype == "float64"
-
-    fortran = emit_module(
-        module, name="opaque_reference_probe",
-        extra_roots=("planned_control",),
+    batch = next(name for name in module.functions if "__batch__" in name)
+    field = next(
+        field for record in module.record_tables[batch].records.values()
+        for field in record.fields
+        if field.storage_identity == "Index._candidates"
     )
-    assert fortran.complete
-    assert f"{handle}_c_int64_t" in fortran.source
-    assert f"transfer({handle}_c_int64_t, 0.0_c_double)" in fortran.source
-
-    llvm = emit_ssa_function_to_llvm(
-        module, "planned_control", entry_name="opaque_reference_probe",
+    table = module.sequence_tables[batch]
+    owner = table.by_id(field.sequence_id)
+    assert owner.column_dtypes == ("int64",) * 4 + ("unknown",)
+    assert owner.writable
+    assert owner.status_address_id is not None
+    assert owner.child_table_pool is not None
+    history = module.metadata["identity_book"].page(
+        "sequence_descriptor"
+    ).history((table.owner, owner.sequence_id))
+    original = history[0][1]
+    assert original.column_dtypes == (
+        "unknown", "int64", "unknown", "unknown", "unknown",
     )
-    assert llvm.shortfalls == ()
-    assert f"store i64 {handle}" in llvm.llvm_ir
+    assert replace(original, column_dtypes=owner.column_dtypes) == owner
+    relay = next(name for name in module.functions if "__relay__" in name)
+    forwarded_field = next(
+        field for record in module.record_tables[relay].records.values()
+        for field in record.fields
+        if field.storage_identity == "Index._candidates"
+    )
+    forwarded = module.sequence_tables[relay].by_id(
+        forwarded_field.sequence_id
+    )
+    assert forwarded.column_dtypes == owner.column_dtypes
+    assert not forwarded.writable
+    assert forwarded.status_address_id is None
+
+
+def test_array_u32_receiver_column_keeps_authored_dtype_before_append(tmp_path):
+    # 4_000_000_000 + i exceeds int32: a column that lost its uint32 element
+    # type would read back a different value.
+    _assert_native_feeds_match_python("""
+from array import array
+
+
+class Vocabulary:
+    def __init__(self):
+        self.exact_atoms = array("I")
+
+    def put(self, n: int):
+        for i in range(n):
+            self.exact_atoms.append(4000000000 + i)
+        return self.exact_atoms[n - 1]
+
+
+def root(n: int):
+    vocabulary = Vocabulary()
+    return vocabulary.put(n)
+""", {"n": 5}, tmp_path)
+
+
+def test_static_program_reference_is_typed_ssa_and_native_handle_storage(tmp_path):
+    _assert_native_feeds_match_python("""
+class Tape:
+    pass
+
+
+TAPE = Tape()
+
+
+class AbstractTensor:
+    def __init__(self, gain: float):
+        self._tape = TAPE
+        self.gain = gain
+
+
+def root(g: float):
+    tensor = AbstractTensor(g)
+    return tensor.gain
+""", {"g": 2.5}, tmp_path)
 
 
 def test_declared_reference_read_never_requires_scalar_dtype():

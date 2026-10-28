@@ -14,7 +14,10 @@ import subprocess
 import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, OpStep
-from src.compiler.string_table import StringTable, string_token
+from src.compiler import string_table as string_table_module
+from src.compiler.string_table import (
+    StringTable, StringTokenCollision, string_token,
+)
 from src.compiler.concordance_declarations import STRING_TABLE_ENTRY
 from src.compiler.identity_concordance import (
     RowFieldKind, begin_identity_book, end_identity_book,
@@ -32,6 +35,32 @@ def test_string_table_token_row_is_a_content_label(tmp_path):
         assert book.page(STRING_TABLE_ENTRY).latest((value,)) == "content-row"
     finally:
         end_identity_book(token)
+
+
+def test_string_table_refuses_a_second_word_for_one_token(tmp_path, monkeypatch):
+    """TOK0: a hash collision is refused, never resolved by keeping the first
+    word. The table persists across builds, so the second word may arrive
+    under a fresh identity book that has no row to disagree with."""
+    colliding = {"alpha", "beta"}
+    real_token = string_table_module.string_token
+    monkeypatch.setattr(
+        string_table_module, "string_token",
+        lambda text: 42 if text in colliding else real_token(text),
+    )
+    first_book, first = begin_identity_book()
+    try:
+        table = StringTable(root=tmp_path)
+        assert table.intern("alpha") == 42
+        assert table.intern("alpha") == 42
+    finally:
+        end_identity_book(first)
+    _book, second = begin_identity_book()
+    try:
+        with pytest.raises(StringTokenCollision, match="recorded='alpha' proposed='beta'"):
+            table.intern("beta")
+    finally:
+        end_identity_book(second)
+    assert table.get(42) == "alpha"
 
 
 def test_intern_fold_replaces_strings_and_tags_comparison(tmp_path):

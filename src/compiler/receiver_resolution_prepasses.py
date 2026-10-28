@@ -14,6 +14,7 @@ from .concordance_declarations import (
     SCALAR_INTRINSIC_RECEIVER as _SCALAR_INTRINSIC_RECEIVER,
 )
 from ..transmogrifier.function_table import FunctionReference
+from .loop_ir import SEQUENCE_MUTATION_OPERATORS
 
 
 def _syntax_copy(node: Any) -> Any:
@@ -610,6 +611,21 @@ def _resolve_grounded_method_references(graph: Any) -> None:
     # resolve. Apply the reducer's source-linked-call rule again now: the
     # resolved callee owns its effects, rather than a second opaque mutation
     # at the callsite. Unresolved external calls keep their original effects.
+    from .glsl_deployment_strategy import _stored_callable_field_call
+
+    def host_callback_call(data: Any) -> bool:
+        # A call through a callable slot (class table ``field_callables``)
+        # runs host code given only its arguments: it is not a mutation of
+        # the receiver whose field names it.
+        field = _stored_callable_field_call(graph.G, data)
+        if field is None:
+            return False
+        owner, name = field
+        return name in dict(
+            dict((graph.G.graph.get("class_table") or {}).get(owner) or {})
+            .get("field_callables") or {}
+        )
+
     linked_calls = {
         int(node_id) for node_id, data in graph.G.nodes(data=True)
         if any((data.get("attributes") or {}).get(key) is not None
@@ -617,21 +633,152 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                    "method_ref", "callee_ref", "resolved_ast_parent",
                    "indirect_callable_id",
                ))
+        or host_callback_call(data)
     }
+    # Program: ``t = same(a)`` (``def same(a: list[int]): return a``) then
+    # ``for i in range(n): t.append(i)``.  Wrong record: the reducer saw a
+    # call result with no collection kind, so the append was an OPAQUE state
+    # effect on ``t`` and the loop minted a value-carried port (LoopResult)
+    # for it, a second identity for ``a``'s list that no region could type.
+    # Rule 8: a call whose callee returns its formal IS the actual's storage,
+    # so the effect is the actual's sequence mutation (one owner, no port).
+    from .resident_sequence_materialization import (
+        _identity_return_aliases, _receiver_collection_kind,
+    )
+
+    returned_actuals = {
+        int(call_id): int(actual_id)
+        for call_id, actual_id in _identity_return_aliases(
+            graph.G, getattr(graph, "function_table", None),
+        ).items()
+        if (graph.G.nodes[int(call_id)].get("attributes") or {}).get(
+            "callee_ref"
+        ) is not None
+        and _receiver_collection_kind(graph.G.nodes.get(int(actual_id), {}))
+        == "list"
+        and (graph.G.nodes[int(actual_id)].get("attributes") or {}).get(
+            "sequence_writable", True
+        )
+    }
+
+    # Program: ``def _trim(out): while len(out) > 1: out.pop()`` called
+    # with ``[1, n, 0, 0]`` (``out`` unannotated).  Wrong record: the
+    # reducer classified the loop's ``pop`` before the call actual gave the
+    # formal its class, so the effect stayed OPAQUE and the loop refused
+    # ("receiver's class is unresolved").  Rule: as for any receiver, a
+    # state whose class is now a builtin list is that list, and its
+    # in-place method is the list's own sequence mutation.
+    def resolved_list(state_id: int) -> bool:
+        data = graph.G.nodes.get(int(state_id), {})
+        return (
+            _receiver_collection_kind(data) == "list"
+            and (data.get("attributes") or {}).get("sequence_writable", True)
+        )
+
+    def forwarded_effect(effect):
+        actual = returned_actuals.get(int(effect["state_input_id"]))
+        if (
+            actual is None
+            and effect.get("effect_mode", "opaque") == "opaque"
+            and str(effect["operator"]) in SEQUENCE_MUTATION_OPERATORS
+            and resolved_list(int(effect["state_input_id"]))
+        ):
+            return {
+                **effect,
+                "effect_mode": "sequence_mutation",
+                "sequence_policy": "duplicates",
+            }
+        if (
+            actual is None
+            or effect.get("effect_mode", "opaque") != "opaque"
+            or str(effect["operator"]) not in SEQUENCE_MUTATION_OPERATORS
+        ):
+            return effect
+        return {
+            **effect,
+            "state_input_id": actual,
+            "effect_mode": "sequence_mutation",
+            "sequence_policy": "duplicates",
+        }
+
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
         effects = attributes.get("loop_state_effects")
         if not effects:
             continue
+        forwarded = tuple(forwarded_effect(effect) for effect in effects)
         retained = tuple(
-            effect for effect in effects
+            effect for effect in forwarded
             if not (
                 effect.get("effect_mode", "opaque") == "opaque"
                 and int(effect["effect_node_id"]) in linked_calls
             )
         )
-        if len(retained) != len(effects):
+        if retained != tuple(effects):
             data["attributes"] = {**attributes, "loop_state_effects": retained}
+
+
+#: ``max_semantics`` values (docs: "What max means in Turing").  Each names
+#: one authored meaning of ``max``/``min``; backends spell exactly that one.
+MAX_SEMANTICS = (
+    "select", "scan", "reduce", "reduce_axis", "elementwise", "emax",
+)
+
+
+def max_semantics_of_call(expression: Any) -> str | None:
+    """The meaning of ``max``/``min`` the authored call states, or ``None``.
+
+    Program: ``max(x, y)``, ``max(xs)``, ``y.max()``, ``y.max(axis=0)`` and
+    ``x.maximum(y)`` all reach the backends as one op name, and each backend
+    guessed between them from the operand count and shapes.  Rule: the call
+    FORM decides, never a name or a shape.  A builtin ``max`` with two or
+    more positional arguments is Python's ``select`` scan over them; with
+    one it is a ``scan`` over that iterable; a ``.max()``/``.amax()`` method
+    with no positional argument is a whole ``reduce``, or ``reduce_axis``
+    when an axis is named; ``maximum``/``minimum`` is ``elementwise`` (numpy's
+    rule) and ``emax``/``emin`` is ``emax`` (the builtin's rule per element).
+    Any other form is left unstamped.
+    """
+
+    if not isinstance(expression, ast.Call):
+        return None
+    function = expression.func
+    keywords = {str(item.arg) for item in expression.keywords if item.arg}
+    positional = [item for item in expression.args if not isinstance(item, ast.Starred)]
+    if len(positional) != len(expression.args):
+        return None
+    if isinstance(function, ast.Name) and function.id in {"max", "min"}:
+        if keywords:  # ``key=``/``default=`` are not spelled
+            return None
+        if len(positional) >= 2:
+            return "select"
+        if len(positional) == 1:
+            return "scan"
+        return None
+    if not isinstance(function, ast.Attribute):
+        return None
+    if function.attr in {"maximum", "minimum"}:
+        return "elementwise"
+    if function.attr in {"emax", "emin"}:
+        return "emax"
+    if function.attr in {"max", "min", "amax", "amin"} and not positional:
+        if keywords & {"axis", "dim"}:
+            return "reduce_axis"
+        if not keywords - {"keepdims", "keepdim"}:
+            return "reduce"
+    return None
+
+
+def _stamp_max_semantics(graph: Any) -> None:
+    """Post ``max_semantics`` on every ``max``/``min`` call node it states."""
+
+    for _node_id, data in graph.G.nodes(data=True):
+        semantics = max_semantics_of_call(data.get("expr_obj"))
+        if semantics is None:
+            continue
+        attributes = dict(data.get("attributes") or {})
+        attributes["max_semantics"] = semantics
+        data["attributes"] = attributes
 
 
 def _resolve_grounded_tensor_operations(graph: Any) -> None:

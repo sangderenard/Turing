@@ -11,6 +11,18 @@ import hashlib
 import json
 import pickle
 from pathlib import Path
+
+
+def _scalar_field_dtype(name, value):
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int64"
+    if isinstance(value, float):
+        return "float64"
+    raise ValueError(
+        f"validator state field {name!r} holds {type(value).__name__}: "
+        "no recorded scalar dtype")
 from types import SimpleNamespace
 
 import numpy as np
@@ -327,7 +339,7 @@ def simulation_contract(inputs):
             fields[name] = dict(storage="span", dtype=str(value.dtype), rank=value.ndim,
                                 shape=list(value.shape), mutable=name in STATE_FIELDS or name in {"telemetry", "last_displacement"})
         else:
-            fields[name] = dict(storage="scalar", dtype="bool" if isinstance(value, bool) else "float64",
+            fields[name] = dict(storage="scalar", dtype=_scalar_field_dtype(name, value),
                                 mutable=name == "microstep_count")
     records["ValidatorSimulationState"] = {
         "identity": __name__ + ".ValidatorSimulationState", "fields": fields}

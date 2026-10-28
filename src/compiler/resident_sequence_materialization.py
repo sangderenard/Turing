@@ -280,10 +280,12 @@ def _glyph_component_resident_sequence_ids(component: Any) -> tuple[int, ...]:
         )
     )
     formatted = getattr(component, "formatted_sequence_value_id", None)
+    format_spec = getattr(component, "format_spec_value_id", None)
     return tuple(dict.fromkeys((
         *nested,
         *alternatives,
         *(() if formatted is None else (int(formatted),)),
+        *(() if format_spec is None else (int(format_spec),)),
     )))
 
 
@@ -333,30 +335,43 @@ def _compiled_validation_diagnostic_sequence_ids(
     # their operands (for example ``position`` in ``_validate_row``).
     source_page = book.page("source_glyph_sequence")
 
-    # Only the cells published by the ValidationBlock are top-level
-    # diagnostic glyphs.  Members added from one glyph recipe below are
-    # resident formatter sequences, not further JoinedStr owners.  Iterating
-    # the growing set made a later formatter node (``id_space.compose`` value
-    # 36) demand a second ``source_glyph_sequence`` row it cannot own.
-    diagnostic_glyph_ids = frozenset(diagnostic_ids)
-    for node_id, data in graph_obj.nodes(data=True):
-        value_id = int(data.get("value_id", node_id))
-        if value_id not in diagnostic_glyph_ids:
-            continue
-        row = (data.get("attributes") or {}).get(
+    # id_space.compose's diagnostic row 29 owns a formatted component
+    # whose exact format_spec_value_id is JoinedStr 8 ("#x"). The previous
+    # closure omitted that edge, so 8 became an unbounded FIXED arena leased
+    # to the caller, although native validation never consumes its glyphs.
+    # Follow resident recipe edges, and recurse only into graph values that
+    # carry their own source_glyph_sequence row. Formatter result sequences
+    # (compose's value 36) are marked diagnostic too, but cannot be asked to
+    # own a JoinedStr row merely because they belong to that same closure.
+    glyph_rows = {
+        int(data.get("value_id", node_id)): tuple(row)
+        for node_id, data in graph_obj.nodes(data=True)
+        for row in ((data.get("attributes") or {}).get(
             "source_glyph_sequence_row"
-        )
-        fact = None if row is None else source_page.latest(tuple(row))
+        ),)
+        if row is not None
+    }
+    pending = list(diagnostic_ids)
+    visited = set()
+    while pending:
+        value_id = pending.pop()
+        if value_id in visited:
+            continue
+        visited.add(value_id)
+        row = glyph_rows.get(value_id)
+        fact = None if row is None else source_page.latest(row)
         if fact is None:
             raise ValueError(
                 "compiled validation diagnostic has no glyph concordance: "
                 f"value={value_id} row={row!r}"
             )
-        diagnostic_ids.update(
+        members = tuple(
             member
             for component in tuple(getattr(fact, "components", ()) or ())
             for member in _glyph_component_resident_sequence_ids(component)
         )
+        diagnostic_ids.update(members)
+        pending.extend(member for member in members if member in glyph_rows)
     return frozenset(diagnostic_ids)
 
 
@@ -762,6 +777,20 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
                  if str(role) == "base" and parent in graph_obj),
                 None,
             )
+            if base is not None and node_kind(base) == "indexed":
+                # ``g[i][1] = v`` writes a row of the list ``g``: its version
+                # is the outer list's storage, not the row view's.
+                outer = next(
+                    (parent for parent, role in graph_obj.nodes[base].get("parents") or ()
+                     if str(role) == "base" and parent in graph_obj
+                     and ((graph_obj.nodes[parent].get("attributes") or {}).get(
+                         "aggregate_kind") == "list"
+                         or (graph_obj.nodes[parent].get("attributes") or {}).get(
+                             "row_store_of_list"))),
+                    None,
+                )
+                if outer is not None:
+                    base = outer
             if base is not None:
                 aliases[value_id_of(node_id)] = value_id_of(base)
             continue
@@ -811,6 +840,29 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
     while changed:
         changed = False
         for node_id, data in graph_obj.nodes(data=True):
+            # Program: ``d = {1: n, 2: 5}; for i in range(3): if i == n:
+            # d[2] = i`` then ``d[2]`` (corpus c670).  Wrong record: the
+            # loop's result names the body's ``if`` merge, which is no
+            # store version, so the post-loop read of ``d`` was claimed by
+            # no table and lowered as a positional row read (0 for 5).
+            # Rule: a loop result whose carried value is a merge already
+            # proven to be one dict's storage is that dict's storage.
+            if node_kind(node_id) in {"loopresult", "loopexit"}:
+                carried = next((
+                    parent for preferred_role in ("updated", "value")
+                    for parent, role in data.get("parents") or ()
+                    if str(role) == preferred_role and parent in graph_obj
+                ), None)
+                if carried is None or node_kind(carried) != "phi":
+                    continue
+                resident = root(value_id_of(carried))
+                if (graph_obj.nodes.get(resident, {}).get("attributes") or {}).get("aggregate_kind") != "dict":
+                    continue
+                value = value_id_of(node_id)
+                if value != resident and aliases.get(value) != resident:
+                    aliases[value] = resident
+                    changed = True
+                continue
             if node_kind(node_id) != "phi":
                 continue
             parents = [root(value_id_of(parent)) for parent, role in data.get("parents") or ()
@@ -1049,12 +1101,76 @@ def _promote_conditional_sequence_aliases(
                 resident_by_value[merged_id] = destination
                 kind_by_value[merged_id] = initial_kind
                 promoted_aliases[merged_id] = (destination, initial_kind)
+            # Program: ``if n > 2: t = [n, 1, 2] else: t = [7, n]`` then
+            # ``len(t)``, ``total(t)`` (corpus c654).  Wrong record: a list
+            # first bound in both arms, to displays of different lengths,
+            # published a scalar result merge of two handles and no member
+            # layout, so the merge had no birth (it was refused by name as
+            # "different shapes").  Python's list length is dynamic; that is
+            # no reason to refuse.  Rule: the merge is its own storage and
+            # each arm copies its display into it (the ``replace`` a
+            # carried sequence alias lowers), so its length is the taken
+            # arm's and its capacity the longest arm's (the arms' own
+            # bounds, surveyed as a copy source).
+            results = []
+            handles = list(block.sequence_handle_results)
+            for result in block.result_aliases:
+                true_id, false_id, merged_id = map(int, result)
+                if not _list_merged_from_branches(
+                    graph_obj, node_by_value.get(merged_id, -1),
+                ):
+                    results.append(result)
+                    continue
+                true_resident = resident_by_value.get(true_id)
+                false_resident = resident_by_value.get(false_id)
+                if true_resident is None or false_resident is None:
+                    results.append(result)
+                    continue
+                # Program: ``a = [n, 1]; t = a if n > 2 else [7, n, 2];
+                # return t`` (c743).  The returned merge IS the function's
+                # result list, whose storage the caller passes in.  When
+                # every arm is a private display of this function, both die
+                # at the return, so the taken arm's rows copied into the
+                # result are Python's object exactly.  Any other arm
+                # (c787-c789: a parameter list) is the caller's object, so
+                # the merge stays a handle merge and the function returns
+                # its arm predicate; the caller selects among its actuals.
+                node_id = node_by_value.get(merged_id, -1)
+                if (
+                    _returned_list_merge(graph_obj, node_id)
+                    and _arms_private_displays(graph_obj, node_id)
+                ):
+                    destination = merged_id
+                    sequences.append((
+                        int(true_resident), int(false_resident),
+                        destination, merged_id,
+                    ))
+                    destination_ids.add(destination)
+                    continue
+                # Program: ``a = [n, 1]; if n > 2: t = a else: t = [7, n,
+                # 2]`` then ``a[0] = a[0] + 5; return t[0] + len(t)``
+                # (c737).  Wrong record: the merge was its own storage,
+                # each arm copied into it, so a change through ``a`` after
+                # the branch never reached ``t`` (silent), though Python's
+                # ``t`` IS ``a`` on one path.  Rule: the merge owns no
+                # rows.  It is a handle: the alias keeps the arms' resident
+                # storage (not a version spelling) and lowering selects the
+                # taken arm's descriptor members with one Phi each
+                # (``_lower_sequence_handle_merge``).  The component
+                # {arms, merge} grows together (``_settle_linked_dynamic_
+                # sequences``).
+                results.append((
+                    int(true_resident), int(false_resident), merged_id,
+                ))
+                handles.append(merged_id)
             return replace(
                 block,
                 body=promote(block.body),
                 orelse=(
                     None if block.orelse is None else promote(block.orelse)
                 ),
+                result_aliases=tuple(results),
+                sequence_handle_results=tuple(handles),
                 carried_aliases=tuple(scalar),
                 carried_field_cells=tuple(scalar_field_cells),
                 carried_sequence_aliases=tuple(sequences),
@@ -1222,6 +1338,59 @@ def _promote_conditional_sequence_aliases(
     return promoted, promoted_aliases, tuple(sorted(destination_ids))
 
 
+def _retarget_forwarded_sequence_effects(
+    control: Any, forwarded: Mapping[int, tuple[int, str]],
+) -> Any:
+    """Name the argument's storage in every effect on a forwarded call result.
+
+    Rule 8: a call whose result is its argument's own list owns no storage,
+    so an effect on the result (``t.append(5)``, ``len(t)``) is an effect on
+    the argument's sequence.  The retained mutation records were written
+    before the call's callee was specialized for its constant actuals
+    (``pick(a, 5)`` returns ``a`` only in that copy), so the control program
+    may still name the result: this retargets those effects onto the one
+    owner, the actual's sequence, once the specialized forwarding is proven.
+    """
+
+    from .control_source import (
+        ConditionalBlock, ControlSequenceMutation, SequenceQueryBlock,
+    )
+
+    resident = {
+        int(value_id): int(target)
+        for value_id, (target, _kind) in dict(forwarded).items()
+        if int(value_id) != int(target)
+    }
+    if not resident:
+        return control
+
+    def retarget(item):
+        if isinstance(item, (ControlSequenceMutation, SequenceQueryBlock)):
+            target = resident.get(int(item.sequence_value_id))
+            if target is not None:
+                item = replace(item, sequence_value_id=target)
+            if isinstance(item, SequenceQueryBlock):
+                return item
+        if isinstance(item, tuple):
+            entries = tuple(retarget(entry) for entry in item)
+            return item if all(
+                new is old for new, old in zip(entries, item)
+            ) else entries
+        if (dataclasses.is_dataclass(item) and not isinstance(item, type)
+                and type(item).__module__ == ConditionalBlock.__module__):
+            changes = {}
+            for field in dataclasses.fields(item):
+                value = getattr(item, field.name)
+                if isinstance(value, tuple) or dataclasses.is_dataclass(value):
+                    retargeted = retarget(value)
+                    if retargeted is not value:
+                        changes[field.name] = retargeted
+            return replace(item, **changes) if changes else item
+        return item
+
+    return replace(control, root=retarget(control.root))
+
+
 def _constant_struct_pack_materializations(graph_obj: Any):
     """Fold fully source-static ``struct.pack`` calls to byte-sequence facts."""
 
@@ -1352,6 +1521,13 @@ def _source_sequence_slices(graph_obj: Any):
         return value is None or (isinstance(value, int) and not isinstance(value, bool))
 
     mutations = []
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
+    nodes_by_value: dict[int, list[int]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        nodes_by_value.setdefault(
+            int(data.get("value_id", node_id)), [],
+        ).append(int(node_id))
+
     for node_id, data in graph_obj.nodes(data=True):
         attrs = data.get("attributes") or {}
         if (attrs.get("aggregate_kind") != "list"
@@ -1361,11 +1537,32 @@ def _source_sequence_slices(graph_obj: Any):
         source, selector = roles.get("base"), roles.get("index")
         if source is None or selector is None or source not in graph_obj or selector not in graph_obj:
             continue
-        if (graph_obj.nodes[source].get("attributes") or {}).get("aggregate_kind") != "list":
+        source_value_id = value_id(source)
+        storage_value_id = source_value_id
+        seen_storage_ids = set()
+        cyclic_storage_alias = False
+        while storage_value_id in storage_aliases:
+            if storage_value_id in seen_storage_ids:
+                cyclic_storage_alias = True
+                break
+            seen_storage_ids.add(storage_value_id)
+            storage_value_id = int(storage_aliases[storage_value_id])
+        if cyclic_storage_alias:
+            continue
+        storage_nodes = nodes_by_value.get(storage_value_id, ())
+        if len(storage_nodes) != 1:
+            continue
+        storage_node = graph_obj.nodes[storage_nodes[0]]
+        if (storage_node.get("attributes") or {}).get("aggregate_kind") != "list":
             continue
         selector_data = graph_obj.nodes[selector]
         folded, selector_literal = literal_of(selector)
-        arguments, spellings = [value_id(source)], []
+        # A slice after an in-place loop update can name an IndexedStore or
+        # LoopResult as its base.  The exact graph storage-alias chain maps
+        # that version to the resident sequence descriptor; use that identity
+        # for the slice operation so its row type and storage come from the
+        # same existing sequence contract.
+        arguments, spellings = [storage_value_id], []
         if folded:
             if not (isinstance(selector_literal, slice) and selector_literal.step is None
                     and integer_or_none(selector_literal.start)
@@ -1461,17 +1658,31 @@ def _source_mapping_mutations(graph_obj: Any):
     return tuple(mutations)
 
 
-def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, int]:
-    """Prove caller aliases using callee return slots that return a formal."""
+def _identity_return_aliases(
+    graph_obj: Any, function_table: Any, callsite_graphs: Any = None,
+) -> dict[int, int]:
+    """Prove caller aliases using callee return slots that return a formal.
+
+    ``callsite_graphs`` maps a call node to the callee graph the planner
+    specialized for THAT call.  A call whose constant actuals decide the
+    callee's branch (``pick(a, 5)``) returns the formal in its specialized
+    copy while the shared callee's slot is a merge; the call's own copy is
+    the callee it runs, so it is the one read here.
+    """
+    from ..common.tensors.topological_reducer import _indexed_store_source
+
     if function_table is None:
         return {}
+    callsite_graphs = {} if callsite_graphs is None else callsite_graphs
     result = {}
     for call_id, data in graph_obj.nodes(data=True):
         reference = (data.get("attributes") or {}).get("callee_ref")
         if reference is None:
             continue
-        child = getattr(function_table.entry(reference), "graph", None)
-        child = getattr(child, "G", None)
+        child = callsite_graphs.get(int(call_id))
+        if child is None:
+            child = getattr(function_table.entry(reference), "graph", None)
+            child = getattr(child, "G", None)
         if child is None:
             continue
         sites = tuple((child.graph.get("return_slot_values") or {}).values())
@@ -1479,8 +1690,31 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
             continue
         parameters = tuple(child.graph.get("function_parameters") or ())
         actuals = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+        # Program: ``def f(v): r = 0; while v < 100: (if v > 3: r = v; break);
+        # v = v + 1; return r`` (and a direct tail call, which normalizes to
+        # that loop).  Wrong record: the return slot names the parameter's
+        # graph node, because ``r = v`` and the name ``v`` after a loop both
+        # resolve to the pre-loop node; the call was folded into its actual
+        # and the caller read the seed.  Rule: a parameter a loop carries or
+        # a break binds is not the returned identity -- its node names only
+        # the seed, so it is never a proved identity return.
+        loop_rebound = set()
+        for _loop_id, loop_data in child.nodes(data=True):
+            loop_attrs = loop_data.get("attributes") or {}
+            for pair in (loop_attrs.get("loop_carried_bindings") or {}).values():
+                loop_rebound.add(int(pair[0]))
+            for pair in (loop_attrs.get("loop_break_bindings") or {}).values():
+                loop_rebound.update(int(item) for item in pair)
         for index, slots in enumerate(zip(*sites)):
+            # ``a[0] = x; return a`` returns the store version of ``a``: the
+            # list it writes (its ``base`` chain) is the returned object.
+            slots = tuple(
+                None if slot is None else _indexed_store_source(child, int(slot))
+                for slot in slots
+            )
             if len(set(slots)) != 1 or slots[0] is None:
+                continue
+            if int(slots[0]) in loop_rebound:
                 continue
             formal = child.nodes.get(int(slots[0]), {})
             attrs = formal.get("attributes") or {}
@@ -1492,6 +1726,12 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
                 continue
             if len(sites[0]) == 1:
                 result[int(call_id)] = actual
+            # A subscript of the call result selects a return SLOT only when
+            # the callee returns a tuple/list display of slots.  ``def
+            # same(a): return a`` returns one value: ``same(xs)[0]`` is
+            # ELEMENT zero of that value, never the whole forwarded actual.
+            if not set((child.graph.get("return_container_kinds") or {}).values()) & {"tuple", "list"}:
+                continue
             for node_id, projection in graph_obj.nodes(data=True):
                 if str(projection.get("type") or projection.get("op") or "").casefold() in {"indexedstore", "subscriptstore", "setitem"}:
                     continue
@@ -1504,10 +1744,119 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
     return result
 
 
+def _returned_tuple_member_kinds(
+    graph_obj: Any, function_table: Any,
+) -> dict[int, str]:
+    """Collection kind of each unpacked member of a tuple-returning call.
+
+    Program: ``def mk(n): xs = [n, 1]; return xs, n + 1`` then
+    ``xs, k = mk(n); xs.append(5); return len(xs)`` (c822).  Wrong record:
+    the member projection ``call[0]`` carries no ``aggregate_kind`` (only the
+    callee's return slot knows it is a list), so the in-place method on it
+    was no mutation record and the append vanished (silent wrong value).
+    Rule: a constant-index projection of a call result is the collection the
+    callee returns at that position, whenever every return site agrees.
+    """
+
+    if function_table is None:
+        return {}
+    kinds = {}
+    for call_id, data in graph_obj.nodes(data=True):
+        reference = (data.get("attributes") or {}).get("callee_ref")
+        if reference is None:
+            continue
+        child = getattr(
+            getattr(function_table.entry(reference), "graph", None), "G", None,
+        )
+        if child is None:
+            continue
+        sites = tuple((child.graph.get("return_slot_values") or {}).values())
+        if not sites or len({len(site) for site in sites}) != 1:
+            continue
+        member_kinds = []
+        for slots in zip(*sites):
+            site_kinds = {
+                None if slot is None else _receiver_collection_kind(
+                    child.nodes.get(int(slot), {})
+                )
+                for slot in slots
+            }
+            member_kinds.append(
+                site_kinds.pop() if len(site_kinds) == 1 else None
+            )
+        for node_id, projection in graph_obj.nodes(data=True):
+            if str(projection.get("type") or projection.get("op") or "").casefold() in {
+                "indexedstore", "subscriptstore", "setitem",
+            }:
+                continue
+            roles = {
+                str(role): int(parent)
+                for parent, role in projection.get("parents") or ()
+            }
+            if roles.get("base") != int(call_id) or "index" not in roles:
+                continue
+            key = (graph_obj.nodes.get(roles["index"], {}).get("attributes") or {}).get("value")
+            if (
+                isinstance(key, int) and not isinstance(key, bool)
+                and 0 <= key < len(member_kinds)
+                and member_kinds[key] in {"list", "bytes", "bytearray"}
+            ):
+                kinds[int(projection.get("value_id", node_id))] = member_kinds[key]
+    return kinds
+
+
+def _returned_formal_sequence_aliases(
+    graph_obj: Any, function_table: Any, *,
+    call_result_kinds: Mapping[int, str] | None = None,
+    callsite_graphs: Any = None,
+) -> dict[int, tuple[int, str]]:
+    """Rule 8 for a whole sequence result.
+
+    A call whose result is its caller argument's own list (``def mk(a):
+    return a``) is that list: the planner's identity forwarding of a
+    returned formal, read for a sequence actual.  The call owns no storage
+    of its own, so it names the actual's arena and kind.
+    """
+
+    forwarded = {}
+    for call_id, actual_id in _identity_return_aliases(
+        graph_obj, function_table, callsite_graphs,
+    ).items():
+        call_data = graph_obj.nodes.get(int(call_id), {})
+        # A tuple member ``b`` of ``b, k = f(a, n)`` (``return a, n``) is the
+        # call's authored projection: it names the actual's storage as the
+        # whole-result call does.
+        if (
+            (call_data.get("attributes") or {}).get("callee_ref") is None
+            and not (call_data.get("attributes") or {}).get(
+                "authored_call_result_projection"
+            )
+        ):
+            continue
+        actual_data = graph_obj.nodes.get(int(actual_id), {})
+        value_id = int(actual_data.get("value_id", actual_id))
+        kind = str(
+            (actual_data.get("attributes") or {}).get("aggregate_kind")
+            or dict(call_result_kinds or {}).get(value_id, "")
+        )
+        if kind in {"list", "bytes", "bytearray"}:
+            forwarded[int(call_data.get("value_id", call_id))] = (value_id, kind)
+    # ``u = same(same(a))``: the actual of one forwarding call may itself be
+    # a forwarded result.  The list is still ``a``'s one storage.
+    for result_id, (actual_id, kind) in tuple(forwarded.items()):
+        seen = {int(result_id)}
+        while int(actual_id) in forwarded and int(actual_id) not in seen:
+            seen.add(int(actual_id))
+            actual_id = forwarded[int(actual_id)][0]
+        forwarded[result_id] = (int(actual_id), kind)
+    return forwarded
+
+
 def _static_mapping_capacity_bounds(
     graph_obj: Any,
     *,
     nonmutating_call_ids: Iterable[int] = (),
+    linked_bounded_ids: Iterable[int] = (),
 ) -> dict[int, int]:
     """Bound local keyed arenas by their complete constant-key universe.
 
@@ -1517,6 +1866,10 @@ def _static_mapping_capacity_bounds(
     """
     aliases = _loop_carried_storage_aliases(graph_obj)
     nonmutating_calls = set(map(int, nonmutating_call_ids))
+    # A dict display passed to callees that add no keys (``total({1: n})``):
+    # every escape is an exact argument binding into a component no function
+    # grows (``_settle_linked_dynamic_sequences``), so its keys bound it.
+    linked_bounded = set(map(int, linked_bounded_ids))
     keys, copies, unknown = {}, {}, set()
     set_universes: set[int] = set()
     for node_id, data in graph_obj.nodes(data=True):
@@ -1567,18 +1920,39 @@ def _static_mapping_capacity_bounds(
                 keys[int(node_id)] = set(attributes["value"])
             except TypeError:
                 unknown.add(int(node_id))
+    # Program: ``d[(1, n, 2)] = 5; d[(1, n + 1, 2)] = 6`` (string core
+    # ``key = (domain, hi, lo, count)``).  Wrong record: a tuple subscript's
+    # store names one ``index`` parent per component, and the role map kept
+    # only the last one, so both stores read as the literal key ``2``; the
+    # universe bound was one row and the second insert reported full
+    # (validation 75).  Rule: a store's key is all its index components,
+    # in order; it is literal only when every component is.
+    def literal_store_key(index_ids):
+        components = tuple(
+            ast.literal_eval(graph_obj.nodes[int(index)].get("expr_obj"))
+            for index in index_ids
+        )
+        return components[0] if len(components) == 1 else components
+
+    store_index_ids = {}
+    for store_id, store in graph_obj.nodes(data=True):
+        if str(store.get("type") or store.get("op") or "").casefold() == "indexedstore":
+            store_index_ids[int(store.get("value_id", store_id))] = tuple(
+                int(parent) for parent, role in store.get("parents") or ()
+                if str(role) == "index"
+            )
     for mutation in _source_mapping_mutations(graph_obj):
         destination = int(mutation.sequence_value_id)
         if mutation.operator == "replace":
             copies[destination] = int(mutation.argument_value_ids[0])
             keys.setdefault(destination, set())
         elif mutation.operator == "update":
+            store_key = store_index_ids.get(int(mutation.effect_node_id))
             for key_id in mutation.argument_value_ids[::2]:
-                data = graph_obj.nodes.get(int(key_id), {})
                 try:
-                    key = ast.literal_eval(data.get("expr_obj"))
+                    key = literal_store_key(store_key or (key_id,))
                     keys.setdefault(destination, set()).add(key)
-                except (ValueError, TypeError):
+                except (KeyError, ValueError, TypeError):
                     unknown.add(destination)
     # Program: ``s = {1, 2}; for i in ...: s.add(i * 3)`` (scratch c_s2).
     # Wrong record: the add's node is a method call of the recorded
@@ -1639,7 +2013,10 @@ def _static_mapping_capacity_bounds(
             destination = int(aliases.get(roles.get("base"), roles.get("base", -1)))
             if destination in keys:
                 try:
-                    key = ast.literal_eval(graph_obj.nodes[roles["index"]].get("expr_obj"))
+                    key = literal_store_key(tuple(
+                        int(parent) for parent, role in data.get("parents") or ()
+                        if str(role) == "index"
+                    ) or (roles["index"],))
                     keys[destination].add(key)
                 except (KeyError, ValueError, TypeError):
                     unknown.add(destination)
@@ -1678,8 +2055,10 @@ def _static_mapping_capacity_bounds(
                   and _collection_call_identity(data)
                   in _NONESCAPING_COLLECTION_CALLS
               )):
-            for parent in roles.values():
+            for role, parent in roles.items():
                 destination = int(aliases.get(parent, parent))
+                if destination in linked_bounded and role.startswith("arg:"):
+                    continue
                 if destination in keys:
                     unknown.add(destination)
     # Program: ``d = {1: 5, 2: n}; del d[1]; d[1] = 4`` (scratch s42/t2).
@@ -1898,7 +2277,7 @@ _NONESCAPING_COLLECTION_CALLS = frozenset({
 
 
 _BUILTIN_COLLECTION_KINDS = frozenset({
-    "list", "dict", "set", "frozenset", "tuple", "str", "bytes", "bytearray",
+    "list", "array", "dict", "set", "frozenset", "tuple", "str", "bytes", "bytearray",
 })
 
 
@@ -1980,7 +2359,7 @@ _RECEIVER_READING_METHODS = frozenset({
     "startswith", "endswith", "find", "rfind",
 })
 
-_MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray"})
+_MUTABLE_COLLECTION_KINDS = frozenset({"list", "dict", "set", "bytearray", "array"})
 
 
 def _receiver_collection_kind(data: Any) -> str | None:
@@ -2083,6 +2462,7 @@ def _static_sequence_capacity_survey(
     bounds = _static_mapping_capacity_bounds(
         graph_obj,
         nonmutating_call_ids=nonmutating_call_ids,
+        linked_bounded_ids=linked_bounded_ids,
     )
     local_lists = {int(node_id): len(data["expr_obj"].elts)
                    for node_id, data in graph_obj.nodes(data=True)
@@ -2102,7 +2482,22 @@ def _static_sequence_capacity_survey(
         for node_id, data in graph_obj.nodes(data=True)
         for attributes in ((data.get("attributes") or {}),)
         if attributes.get("materialization_kind") == "unrolled_loop"
+        and attributes.get("aggregate_kind") in {"list", "set"}
+    })
+    # Program: ``xs = [1, 5, 9]; for x in xs: ...`` (c156).  Wrong record:
+    # the structural fold turns an unchanged list display into a Constant
+    # whose literal still names its members, and no bound covered it, so C
+    # refused its private arena ("no proven capacity").  Rule: a folded list
+    # display is a lexical birth, one row per member, like the display it
+    # replaced; later growth is counted below exactly as for a display.
+    local_lists.update({
+        int(data.get("value_id", node_id)): len(attributes["value"])
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in ((data.get("attributes") or {}),)
+        if str(data.get("type")) in {"Constant", "Const", "const"}
         and attributes.get("aggregate_kind") == "list"
+        and isinstance(attributes.get("value"), (list, tuple))
+        and int(data.get("value_id", node_id)) not in local_lists
     })
     # A list merged from equal-length arm displays (an ``aggregate_phi``)
     # is born at the merge from its member Phis (``_list_literal_
@@ -2152,6 +2547,29 @@ def _static_sequence_capacity_survey(
                 and not any(isinstance(element, ast.Starred)
                             for element in expression.elts)):
             bounds.setdefault(int(node_id), len(expression.elts))
+    # Program: ``a = [1, 2]; t = a if n > 2 else [3, 4]`` then ``len(a)``
+    # (corpus c271).  Wrong record: the merge (an ``aggregate_phi``) was
+    # bounded, but each folded literal arm is a resident arena of its own
+    # (it is the phi's member), and no arm had a bound, so C refused it as
+    # a private sequence with no capacity.  Rule: an arm of a list merge
+    # that is a folded literal and that nothing grows is bounded by its
+    # literal length.
+    grown_arms = {
+        int(mutation.sequence_value_id)
+        for mutation in _sequence_append_call_mutations(graph_obj)
+    }
+    for _node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if (attributes.get("producer_kind") != "aggregate_phi"
+                or attributes.get("aggregate_kind") != "list"):
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) not in {"body", "orelse"} or int(parent) in grown_arms:
+                continue
+            arm = graph_obj.nodes.get(int(parent), {}).get("attributes") or {}
+            if (arm.get("aggregate_kind") == "list"
+                    and isinstance(arm.get("value"), (list, tuple))):
+                bounds.setdefault(int(parent), len(arm["value"]))
     if control is not None:
         bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
             control, local_lists,
@@ -2195,6 +2613,19 @@ def _static_sequence_capacity_survey(
             continue
         if source in bounds:
             bounds[destination] = bounds[source] + snapshot_growth[destination]
+        elif str(
+            (graph_obj.nodes.get(source) or {}).get("type") or ""
+        ).casefold() == "input":
+            # Program: ``def add(self, values, b, e):
+            # self.cover.extend(values[b:e])`` (token orchard core).  Wrong
+            # record: the slice's source is a caller's list (a parameter),
+            # which no survey here bounds, so the slice was neither bounded
+            # nor unbounded and C/LLVM refused it as a private sequence with
+            # no proven capacity.  Rule: a snapshot of a parameter holds the
+            # caller's run-time rows (at most ``len(values)``, clipped to
+            # ``e - b`` for a slice); it takes the dynamic contract, whose
+            # append reserves exactly the rows it copies.
+            unbounded_snapshots.add(destination)
     # Program: ``xs = [5, 7] + [n, 7]; len(xs)`` (fuzzer p3_54).  Wrong
     # record: nothing bounded the concatenation, so its arena took the
     # planner's elementwise-add extent (2,) and the second operand's rows
@@ -2338,6 +2769,12 @@ def _static_sequence_capacity_survey(
         settled = True
         for destination, sources in copies.items():
             own = sequence_bound(destination)
+            # A list merged from displays of different lengths owns no rows
+            # of its own: its arms' copies are all it holds (c654).
+            if own is None and _list_merged_from_branches(
+                graph_obj, destination,
+            ):
+                own = 0
             if own is None:
                 continue
             source_bounds = [sequence_bound(source) for source in sources]
@@ -2362,9 +2799,58 @@ def _static_sequence_capacity_survey(
         key for key in copies_unbounded
         if key not in _call_escaped_argument_ids(graph_obj)
     )
-    return bounds, unbounded
+    # c632: the exact imported array constructor was concorded to a local
+    # sequence materializer before extraction.  Its empty allocation owns
+    # storage even when the next operation stores it into a record field;
+    # the field read is a borrowed view and must not mint another owner.
+    owned_empty_arrays = frozenset(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        for attributes in (data.get("attributes") or {},)
+        if attributes.get("aggregate_kind") == "array"
+        and attributes.get("producer_kind") == "sequence_materialization"
+        and tuple(role for _parent, role in data.get("parents") or () if role != "callee")
+        == ("arg:0",)
+    )
+    # Vocabulary.__init__ hands its empty lookup dictionaries to exact
+    # declared record slots. That handoff transfers the constructor's owned
+    # storage; treating it as an escaped borrowed argument left every later
+    # setdefault at capacity zero. Keep the allocation in its native context,
+    # as for an empty typed array, and let the established heap contract wait
+    # for its proved column layouts before binding pointer cells.
+    from .concordance_declarations import CLASS_FIELD_DECLARATION
+    from .identity_concordance import Ref
 
+    owned_record_initializers = {
+        int(parent)
+        for _node_id, target in graph_obj.nodes(data=True)
+        if str(target.get("type") or target.get("op") or "").casefold() == "setattr"
+        and isinstance((target.get("attributes") or {}).get("field_declaration_cell"), Ref)
+        and (target.get("attributes") or {})["field_declaration_cell"].page
+            == CLASS_FIELD_DECLARATION
+        for parent, role in target.get("parents") or ()
+        if str(role) == "value"
+    }
+    owned_record_dicts = frozenset(
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Dict)
+        and not data["expr_obj"].keys
+        and int(node_id) in owned_record_initializers
+    )
+    return bounds, unbounded | owned_empty_arrays | owned_record_dicts
 
+def _source_extraction_identity(
+    graph_obj: Any,
+    node_id: int,
+) -> str | None:
+    """Return the exact extraction identity retained by one source graph node."""
+
+    attributes = (
+        graph_obj.nodes.get(int(node_id), {}).get("attributes") or {}
+    )
+    identity = attributes.get("extraction_identity")
+    return None if identity is None else str(identity)
 def _linked_sequence_propagation_kind(
     mapped_arguments: Iterable[Any],
 ) -> str | None:
@@ -2426,6 +2912,63 @@ def source_sort_contract(graph_obj: Any, call_node_id: int):
     return fact, cell
 
 
+def _discarded_dict_pop(graph_obj: Any, node_id: int, storage_aliases: Mapping[int, int]):
+    """``(dict node, argument nodes, argument kind)`` for a dict ``pop``
+    statement whose result nothing reads, else None.
+
+    Program: ``d = {1: 10, 2: 20}; d.pop(1, None); d[3] = n`` then
+    ``len(d)`` (corpus c708).  Wrong record: a dict ``pop`` statement had no
+    mutation record outside a retained loop's state effects, so it lowered
+    to an empty region and the key stayed (3 for 2; clean audit).  Rule: a
+    dict ``pop`` whose result nothing reads is a keyed delete of its key, as
+    the loop lowering already states it: lookup-and-delete, an absent key
+    tolerated only when a default is given.  A statement after a store in
+    the same body names the store's version of the dict: the same storage,
+    by the storage aliases.
+    """
+
+    data = graph_obj.nodes[node_id]
+    expression = data.get("expr_obj")
+    if not (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr == "pop"
+    ):
+        return None
+    parents = tuple(data.get("parents") or ())
+    receiver = next((
+        int(parent) for parent, role in parents
+        if str(role) == "operand" and int(parent) in graph_obj
+    ), None)
+    arguments = tuple(
+        int(parent) for parent, role in parents
+        if str(role).startswith("arg:") and int(parent) in graph_obj
+    )
+    if receiver is None or len(arguments) not in {1, 2}:
+        return None
+    receiver = int(storage_aliases.get(receiver, receiver))
+    if (graph_obj.nodes[receiver].get("attributes") or {}).get(
+        "aggregate_kind"
+    ) != "dict":
+        return None
+    for successor in graph_obj.successors(node_id):
+        # A statement's only consumer is the control construct that holds it
+        # as a ``body``/``orelse`` member.
+        if str(graph_obj.nodes[successor].get("type") or "") not in {
+            "For", "While", "If"
+        } or any(
+            str(role) not in {"body", "orelse"}
+            for parent, role in (
+                graph_obj.nodes[successor].get("parents") or ()
+            )
+            if int(parent) == int(node_id)
+        ):
+            return None
+    return receiver, arguments, (
+        "mapping_pop_default_none" if len(arguments) == 2 else "mapping_pop"
+    )
+
+
 def _sequence_append_call_mutations(graph_obj: Any):
     """Recover authored resident sequence calls as lexical effects."""
 
@@ -2454,7 +2997,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         # unexplained function formal for the vanished node id.
         return (ControlExpression("const", literal=literal),)
 
-    sequence_kinds = {"list", "set", "bytes", "bytearray"}
+    sequence_kinds = {"list", "set", "bytes", "bytearray", "array"}
     mutations = []
     from .concordance_declarations import (
         SOURCE_SORT_CONTRACT, SourceSortContract,
@@ -2500,7 +3043,7 @@ def _sequence_append_call_mutations(graph_obj: Any):
         operation = str(record["operator"])
         if operation == "sort":
             continue
-        argument_kind = "value"
+        argument_kind = str(record.get("argument_kind", "value"))
         argument_ids = tuple(map(int, record["argument_value_ids"]))
         key_column = None
         reverse = False
@@ -2512,6 +3055,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
             policy=record.get("policy"),
             argument_kind=argument_kind,
             argument_expressions=retained_argument_expressions(record),
+            extraction_identity=_source_extraction_identity(
+                graph_obj, node_id,
+            ),
             sort_key_column=key_column,
             sort_reverse=reverse,
         ))
@@ -2521,13 +3067,14 @@ def _sequence_append_call_mutations(graph_obj: Any):
     recorded_effect_ids = {
         int(mutation.effect_node_id) for mutation in mutations
     }
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         expression = data.get("expr_obj")
         if not (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Attribute)
-            and expression.func.attr in {"append", "add", "clear"}
+            and expression.func.attr in {"append", "add", "clear", "pop"}
         ):
             continue
         if int(node_id) in recorded_effect_ids:
@@ -2543,10 +3090,23 @@ def _sequence_append_call_mutations(graph_obj: Any):
         )
         operation = str(expression.func.attr)
         arity = 0 if operation == "clear" else 1
+        discarded_pop = (
+            _discarded_dict_pop(graph_obj, int(node_id), storage_aliases)
+            if operation == "pop" else None
+        )
+        if operation == "pop":
+            if discarded_pop is None:
+                continue
+            destination_node, arguments, pop_argument_kind = discarded_pop
+            arity = len(arguments)
+        destination = (
+            graph_obj.nodes[destination_node]
+            if destination_node is not None else {}
+        )
+        attributes = destination.get("attributes") or {}
+        pops_dict = discarded_pop is not None
         if destination_node is None or len(arguments) != arity:
             continue
-        destination = graph_obj.nodes[destination_node]
-        attributes = destination.get("attributes") or {}
         # Program: ``cells = {1: 10, 2: 20}; if n: cells.clear();
         # return len(cells)``.  Wrong record: a dict's clear was not a
         # mutation at all (dicts were outside ``sequence_kinds``), so the
@@ -2555,9 +3115,14 @@ def _sequence_append_call_mutations(graph_obj: Any):
         clears_dict = (
             operation == "clear" and attributes.get("aggregate_kind") == "dict"
         )
-        if attributes.get("aggregate_kind") not in sequence_kinds and not clears_dict:
+        if (
+            attributes.get("aggregate_kind") not in sequence_kinds
+            and not clears_dict and not pops_dict
+        ):
             continue
         argument_kind = "value"
+        if pops_dict:
+            argument_kind = pop_argument_kind
         argument_ids = tuple(
             int(graph_obj.nodes[argument].get("value_id", argument))
             for argument in arguments
@@ -2577,6 +3142,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
                 else "duplicates"
             ),
             argument_kind=argument_kind,
+            extraction_identity=_source_extraction_identity(
+                graph_obj, node_id,
+            ),
             sort_key_column=key_column,
             sort_reverse=reverse,
         ))
@@ -2774,6 +3342,131 @@ def _scalar_constant_member(row: Mapping[str, Any]) -> Any:
     return literal if isinstance(literal, (bool, int, float, str)) else None
 
 
+def _list_merged_from_branches(graph_obj: Any, node_id: int) -> bool:
+    """Whether a list merge is first bound on two branches (a handle merge).
+
+    Both arms are lists and the merge is first bound there (no initial
+    list).  Python's merged name is the taken arm's own list whatever the
+    arms' lengths (displays of equal or different length, a parameter,
+    another local list), so every such merge is a handle onto the taken
+    arm's storage and publishes no member layout (corpus c733, c734,
+    c870-c874).
+    """
+
+    data = graph_obj.nodes.get(int(node_id)) or {}
+    attributes = data.get("attributes") or {}
+    # ``aggregate_phi`` is the statement/name merge, ``aggregate_merge`` the
+    # conditional expression's (``t = a if c else [3, 4, 5]``): the same
+    # aggregate semantics (reducer, expression-form conditional selection).
+    if (
+        attributes.get("producer_kind") not in {"aggregate_phi", "aggregate_merge"}
+        or attributes.get("aggregate_kind") != "list"
+        or attributes.get("initial_value_id") is not None
+        or attributes.get("aggregate_leaf_value_ids") is not None
+    ):
+        return False
+    arms = tuple(
+        graph_obj.nodes[parent]
+        for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and parent in graph_obj
+    )
+    return len(arms) == 2 and all(
+        (arm.get("attributes") or {}).get("aggregate_kind") == "list"
+        for arm in arms
+    )
+
+
+def _returned_list_merge(graph_obj: Any, node_id: int) -> bool:
+    """Whether the merge's value is one of the function's returned values."""
+
+    value_id = int((graph_obj.nodes.get(int(node_id)) or {}).get("value_id", node_id))
+    return value_id in {
+        int(returned)
+        for name in tuple(graph_obj.graph.get("function_outputs") or ())
+        for returned in tuple(
+            (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
+        )
+    }
+
+
+def _arms_private_displays(graph_obj: Any, node_id: int) -> bool:
+    """Whether every arm of a list merge is a display only the merge reads."""
+
+    data = graph_obj.nodes[int(node_id)]
+    arms = tuple(
+        int(parent) for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and int(parent) in graph_obj
+    )
+    for arm in arms:
+        attributes = graph_obj.nodes[arm].get("attributes") or {}
+        if (
+            attributes.get("producer_kind") != "aggregate"
+            or attributes.get("aggregate_leaf_value_ids") is None
+        ):
+            return False
+        for reader, reader_data in graph_obj.nodes(data=True):
+            if int(reader) != int(node_id) and any(
+                int(parent) == arm
+                for parent, _role in reader_data.get("parents") or ()
+            ):
+                return False
+    return True
+
+
+def _returned_copy_merge(graph_obj: Any, node_id: int) -> bool:
+    """A returned unequal-arm list merge whose arms are private displays.
+
+    It owns the result storage and each arm is copied into it; every other
+    unequal-arm merge is a handle onto the taken arm's storage.
+    """
+
+    return (
+        _list_merged_from_branches(graph_obj, int(node_id))
+        and _returned_list_merge(graph_obj, int(node_id))
+        and _arms_private_displays(graph_obj, int(node_id))
+    )
+
+
+def _handle_merge_storage_roots(graph_obj: Any) -> dict[int, int]:
+    """One storage key for a list merged from branches and each of its arms.
+
+    A list merge is a handle onto the taken arm's own storage
+    (``_lower_sequence_handle_merge``), so the merge and its arms name ONE
+    storage: a call that changes ``t`` changes ``a`` where ``t`` is ``a``.
+    Program: ``t = a if n > 2 else [7, n, 2]`` as an if/else, ``grow(t, k)``
+    then ``len(a) * 100 + a[0]`` (c739).  Wrong record: readers and effects
+    were keyed by the receiver's own value id, so the reducer fused the
+    reads of ``a`` into a region placed before the call (silent).  Rule: the
+    key of every member of a handle component is one value id (the smallest),
+    read from the graph's own merge edges.
+    """
+
+    parent: dict[int, int] = {}
+
+    def find(value_id):
+        parent.setdefault(value_id, value_id)
+        while parent[value_id] != value_id:
+            parent[value_id] = parent[parent[value_id]]
+            value_id = parent[value_id]
+        return value_id
+
+    for node_id, data in graph_obj.nodes(data=True):
+        if not _list_merged_from_branches(graph_obj, int(node_id)):
+            continue
+        if _returned_copy_merge(graph_obj, int(node_id)):
+            continue
+        merged = int(data.get("value_id", node_id))
+        for arm, role in data.get("parents") or ():
+            if str(role) not in {"body", "orelse"} or arm not in graph_obj:
+                continue
+            left = find(int(graph_obj.nodes[arm].get("value_id", arm)))
+            right = find(merged)
+            if left != right:
+                parent[max(left, right)] = min(left, right)
+    roots = {value_id: find(value_id) for value_id in list(parent)}
+    return roots
+
+
 def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
     """Whether a list merge is one branch rebinding its initial list.
 
@@ -2837,6 +3530,11 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
     from .string_table import string_token
 
     accepted = set(map(int, sequence_ids))
+    # The rows of a list of lists are born at the outer display and own no
+    # declaration of their own (``list_row_displays``).
+    for outer_id, rows in list_row_displays(graph_obj).items():
+        if outer_id in accepted:
+            accepted.update(row for row, _node in rows)
     aggregate_scope = graph_obj.graph.get("source_aggregate_layout_scope")
 
     def layout_members_of(layout):
@@ -3008,6 +3706,13 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 rebound_on_one_branch = _list_rebound_on_one_branch(
                     graph_obj, int(node_id),
                 )
+                if _list_merged_from_branches(graph_obj, int(node_id)):
+                    # No birth here: the merge is a handle onto the taken
+                    # arm's own storage, or (returned over private displays)
+                    # the result storage each arm is copied into
+                    # (``_promote_conditional_sequence_aliases``,
+                    # ``_lower_sequence_handle_merge``).
+                    continue
                 if attributes.get("aggregate_kind") == "list" and not (
                     rebound_on_one_branch
                 ):
@@ -3084,6 +3789,24 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                         else row.get("expr_obj") is element
                     )
                 )
+            # Program: ``a = [n, 7, n, 7]; a[1] = n + 1`` (corpus c725).
+            # Wrong record: one value used for two members has one producer
+            # node and two ``elts`` edges, so both edges matched the second
+            # occurrence's ordinal and the list was refused as lacking one
+            # exact producer.  Rule: the k-th member that names a value is
+            # that value's k-th edge, in source order; a value with fewer
+            # edges than members is still refused.
+            if (
+                member_id is not None and element is not None
+                and len(exact) > 1
+                and not isinstance(element, ast.Starred)
+            ):
+                earlier = sum(
+                    1 for position in range(ordinal)
+                    if int(layout_members[position]) == int(member_id)
+                )
+                if earlier < len(exact):
+                    exact = (exact[earlier],)
             if len(exact) != 1 or isinstance(element, ast.Starred):
                 raise ValueError(
                     f"{'Set' if is_set else 'List'} {sequence_id} lacks one "
@@ -3092,22 +3815,28 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             parent, row = exact[0]
             value_id = int(row.get("value_id", parent))
             row_attributes = row.get("attributes") or {}
-            # Program: ``g = [[0, 0], [0, 0]]; g[1][0] = n`` (corpus c375,
-            # plan C6).  Wrong record: the inner display's member birth is
-            # owned by the inner display's node, which also owns that
-            # display's own ``clear``; the two facts met on one control
-            # block row and the program was refused with an uncaused
-            # revision naming neither.  A resident row is a scalar or a
-            # tuple's leaves; a list, set or dict row has no birth here.
-            # Rule: refuse it by name, as the comprehension birth does.
+            # Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  A
+            # list row is a child sequence of its own, born by its own
+            # display; the outer list stores the row's handle in the
+            # child-table pool and copies the row's members into it
+            # (``child_sequence`` append).  Set, dict and tuple rows have
+            # no pool row layout and stay refused by name.
+            if row_attributes.get("aggregate_kind") == "list" and not is_set:
+                rows.append(ControlSequenceMutation(
+                    sequence_value_id=sequence_id, operator="append",
+                    argument_value_ids=(value_id,), effect_node_id=parent,
+                    policy="duplicates", argument_kind="child_sequence",
+                    display_member=(int(node_id), int(ordinal)),
+                ))
+                continue
             if row_attributes.get("aggregate_kind") in {
-                "list", "set", "frozenset", "dict",
+                "set", "frozenset", "dict",
             }:
                 raise ValueError(
                     f"{'Set' if is_set else 'List'} {sequence_id} member "
                     f"{ordinal} is a {row_attributes['aggregate_kind']} "
-                    "display; a sequence whose rows are collections has no "
-                    "resident birth (nested collections are not lowered)"
+                    "display; only list rows have a resident birth "
+                    "(nested collections are not lowered)"
                 )
             leaves = tuple(map(int, row_attributes.get(
                 "aggregate_leaf_value_ids", ())))
@@ -3140,7 +3869,300 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             policy="unique" if is_set else "duplicates",
         ))
         mutations.extend(rows)
-    return tuple(mutations)
+    return _list_rows_born_by_outer_display(graph_obj, tuple(mutations))
+
+
+def list_row_displays(graph_obj: Any) -> dict[int, tuple[tuple[int, int], ...]]:
+    """Each list display whose members are all list displays, by value id.
+
+    The value is its rows in member order as ``(row value id, row node)``.
+    Such a list is a nested table: its one column holds row handles and each
+    row is a slice of the child-table pool.  A display with any member that
+    is not a list display is not one (and is refused at birth if it mixes).
+    """
+
+    result: dict[int, tuple[tuple[int, int], ...]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if attributes.get("aggregate_kind") != "list":
+            continue
+        members = tuple(
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role).startswith("elts") and parent in graph_obj
+        )
+        if not members:
+            # An all-constant list of lists folds to one constant that keeps
+            # its rows' value ids as its aggregate leaves.
+            members = tuple(
+                producer
+                for leaf in attributes.get("aggregate_leaf_value_ids") or ()
+                for producer in (next((
+                    int(candidate) for candidate, candidate_data
+                    in graph_obj.nodes(data=True)
+                    if int(candidate_data.get("value_id", candidate))
+                    == int(leaf)
+                ), None),)
+                if producer is not None
+            )
+            if len(members) != len(
+                attributes.get("aggregate_leaf_value_ids") or ()
+            ):
+                continue
+        if not members or not all(
+            (graph_obj.nodes[member].get("attributes") or {}).get(
+                "aggregate_kind"
+            ) == "list"
+            for member in members
+        ):
+            continue
+        result[int(data.get("value_id", node_id))] = tuple(
+            (int(graph_obj.nodes[member].get("value_id", member)), member)
+            for member in members
+        )
+    return result
+
+
+def dict_row_displays(graph_obj: Any) -> dict[int, tuple[tuple[int, int], ...]]:
+    """Each dict display whose values are all list displays, by value id.
+
+    The value is its rows in entry order as ``(row value id, row node)``.
+    Such a mapping's value column holds child-pool row handles, as a
+    ``setdefault(key, [])`` receiver's does.
+    """
+
+    result: dict[int, tuple[tuple[int, int], ...]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if not (
+            attributes.get("aggregate_kind") == "dict"
+            and attributes.get("mapping_value_aggregate_kind") == "list"
+            and isinstance(data.get("expr_obj"), ast.Dict)
+        ):
+            continue
+        rows = tuple(
+            (int(graph_obj.nodes[parent].get("value_id", parent)), int(parent))
+            for parent, role in data.get("parents") or ()
+            if str(role).startswith("values") and parent in graph_obj
+        )
+        if rows:
+            result[int(data.get("value_id", node_id))] = rows
+    return result
+
+
+def list_row_pool_extents(graph_obj: Any) -> dict[int, tuple[int, int]]:
+    """``(rows, stride)`` of each list of lists' child-table pool.
+
+    The pool holds one fixed-stride slice per row: ``rows`` is the outer
+    display's member count and ``stride`` the longest row display.  A row
+    whose display length the source does not state is refused by name: its
+    slice would have no proven extent.
+    """
+
+    extents: dict[int, tuple[int, int]] = {}
+    for outer, rows in (
+        *list_row_displays(graph_obj).items(),
+        *dict_row_displays(graph_obj).items(),
+    ):
+        stride = 0
+        for row, node in rows:
+            data = graph_obj.nodes[node]
+            attributes = data.get("attributes") or {}
+            members = [
+                parent for parent, role in data.get("parents") or ()
+                if str(role).startswith("elts")
+            ]
+            count = (
+                len(members) if members
+                else len(attributes["aggregate_leaf_value_ids"])
+                if attributes.get("aggregate_leaf_value_ids")
+                else len(attributes["compile_time_sequence_items"])
+                if attributes.get("compile_time_sequence_items") is not None
+                else len(attributes["value"])
+                if isinstance(attributes.get("value"), (list, tuple))
+                else None
+            )
+            if count is None:
+                raise ValueError(
+                    f"list {row} is a row of list {outer} and its display "
+                    "length is not stated by the source; a row slice has "
+                    "no proven extent"
+                )
+            stride = max(stride, count)
+        extents[int(outer)] = (len(rows), max(1, stride))
+    return extents
+
+
+def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
+    """Value ids of ``g[i]`` for each list of lists ``g``: a row read.
+
+    A row read is a positional load of a row handle from the outer list's
+    one column and selects the row's pool slice; the element reads that
+    index it are positional loads from that slice.
+    """
+
+    outers = set(list_row_displays(graph_obj))
+    # A dict display of lists: ``d[k]`` is its keyed lookup, the row a
+    # selected pool slice.  (Iterating the dict yields keys, not rows.)
+    mapping_outers = set(dict_row_displays(graph_obj))
+    # ``g[i][1] = v`` is a new version of ``g`` (a loop may carry it): reads
+    # of any version are reads of the same list of lists.
+    aliases = _loop_carried_storage_aliases(graph_obj)
+    for version in tuple(aliases):
+        root = int(version)
+        for _ in range(len(aliases) + 1):
+            if root not in aliases:
+                break
+            root = int(aliases[root])
+        if root in outers:
+            outers.add(int(version))
+        if root in mapping_outers:
+            mapping_outers.add(int(version))
+    reads = []
+    for node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("op") or data.get("type") or "").casefold() != "indexed":
+            continue
+        base = next((
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role) == "base" and parent in graph_obj
+        ), None)
+        if base is not None and int(
+            graph_obj.nodes[base].get("value_id", base)
+        ) in (outers | mapping_outers):
+            reads.append(int(data.get("value_id", node_id)))
+    # ``for r in g``: the loop target is a row of the list of lists.
+    for node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("op") or data.get("type") or "").casefold() != "for":
+            continue
+        iterable = next((
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role) == "iterable" and parent in graph_obj
+        ), None)
+        if iterable is None or int(
+            graph_obj.nodes[iterable].get("value_id", iterable)
+        ) not in outers:
+            continue
+        loop = data.get("expr_obj")
+        if not (isinstance(loop, ast.For) and isinstance(loop.target, ast.Name)):
+            continue
+        reads.extend(
+            int(child_data.get("value_id", child))
+            for child, child_data in graph_obj.nodes(data=True)
+            if str(child_data.get("op") or child_data.get("type") or "").casefold() == "input"
+            and (child_data.get("attributes") or {}).get("binding_kind") == "loop"
+            and (child_data.get("attributes") or {}).get("binding_name") == loop.target.id
+        )
+    return tuple(sorted(set(reads)))
+
+
+def _list_rows_born_by_outer_display(
+    graph_obj: Any, mutations: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    """Move each list row's birth to the list display that owns it.
+
+    Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  Wrong record:
+    the inner display's own ``clear`` and the outer's row append both belong
+    to the inner display's node, which holds one control block per kind, so
+    the two facts met on one block row and the program was refused with an
+    uncaused revision naming neither (corpus c375).  Rule: a list whose rows
+    are lists owns the whole birth.  At the outer display, in order: the
+    outer's ``clear``, then per row one ``child_row`` append (the row's
+    handle allocated in the child-table pool and appended to the outer),
+    then that row's member appends against the row's pool slice.  The inner
+    display keeps no birth of its own, so it is only ever consumed as a row:
+    a row that is read, changed, or listed twice elsewhere is a shared list
+    and is refused by name.
+    """
+
+    from dataclasses import replace
+    from .control_source import ControlSequenceMutation
+
+    births = [
+        item for item in mutations
+        if str(item.argument_kind) == "child_sequence"
+    ]
+    if not births:
+        return mutations
+    outer_nodes = {
+        int(item.display_member[0]): int(item.sequence_value_id)
+        for item in births
+    }
+    rows_of: dict[int, list[tuple[int, int, int]]] = {}
+    for item in births:
+        rows_of.setdefault(int(item.sequence_value_id), []).append((
+            int(item.display_member[1]), int(item.argument_value_ids[0]),
+            int(item.effect_node_id),
+        ))
+    row_slot: dict[int, tuple[int, int, int, int]] = {}
+    node_of_outer = {outer: node for node, outer in outer_nodes.items()}
+    outer_nodes_by_value = node_of_outer
+    for outer, members in rows_of.items():
+        members.sort()
+        for position, (_ordinal, inner, inner_node) in enumerate(members):
+            # A row is its pool slice: reads and stores through it
+            # (``g[1][i]`` folds to the row itself) address that slice, and
+            # nothing else may take the list as a value.
+            escapes = [
+                consumer for consumer in graph_obj.successors(inner_node)
+                if int(consumer) != outer_nodes_by_value[outer]
+                and str(
+                    graph_obj.nodes[consumer].get("op")
+                    or graph_obj.nodes[consumer].get("type") or ""
+                ).casefold() not in {"indexed", "indexedstore", "setitem"}
+            ]
+            if inner in row_slot or escapes:
+                raise ValueError(
+                    f"list {inner} is a row of list {outer} and is also "
+                    "listed twice or used as a whole list elsewhere; a "
+                    "shared row has one pool slice and is not lowered"
+                )
+            row_slot[inner] = (outer, position, inner_node, len(members))
+    mixed = [
+        item for item in mutations
+        if int(item.sequence_value_id) in rows_of
+        and str(item.operator) in {"append", "add"}
+        and str(item.argument_kind) != "child_sequence"
+    ]
+    if mixed:
+        raise ValueError(
+            f"list {int(mixed[0].sequence_value_id)} mixes list rows with "
+            "other members; a list of lists is lowered only when every row "
+            "is a list"
+        )
+    # Each row's member appends keep their producers as owners but execute
+    # at the outer display, right after that row's allocation: the display
+    # ordinal is (row position, 0 for the allocation, 1 + member ordinal).
+    row_appends: dict[int, list[Any]] = {}
+    for item in mutations:
+        sequence_id = int(item.sequence_value_id)
+        if sequence_id in row_slot and str(item.operator) != "clear":
+            outer, position, _node, _count = row_slot[sequence_id]
+            row_appends.setdefault(sequence_id, []).append(replace(
+                item, display_member=(
+                    node_of_outer[outer],
+                    (position << 16) | (1 + int(item.display_member[1])),
+                ),
+            ))
+    rewritten = []
+    for item in mutations:
+        sequence_id = int(item.sequence_value_id)
+        if str(item.argument_kind) == "child_sequence" or (
+            sequence_id in row_slot
+        ):
+            continue
+        rewritten.append(item)
+        if sequence_id in rows_of and str(item.operator) == "clear":
+            for _ordinal, inner, inner_node in rows_of[sequence_id]:
+                outer, position, _node, _count = row_slot[inner]
+                rewritten.append(ControlSequenceMutation(
+                    sequence_value_id=outer, operator="append",
+                    argument_value_ids=(), effect_node_id=inner_node,
+                    policy="duplicates", argument_kind="child_row",
+                    display_member=(
+                        node_of_outer[outer], position << 16,
+                    ),
+                ))
+                rewritten.extend(row_appends.get(inner, ()))
+    return tuple(rewritten)
 
 
 def _joined_list_literal_mutations(
@@ -3367,6 +4389,87 @@ def _dict_update_mutations(graph_obj: Any) -> tuple[Any, ...]:
     return tuple(mutations)
 
 
+def _dict_rows_born_by_display(
+    graph_obj: Any, node_id: int, data: Mapping[str, Any],
+    expression: ast.Dict, key_parents: tuple[tuple[int, int], ...],
+) -> tuple[Any, ...]:
+    """Birth of a dict display whose values are all list displays.
+
+    Program: ``d = {1: [n, 2, 3]}; d[1][2]``.  Wrong record: the list value
+    was stored as its own arena's id where the value column holds child-pool
+    handles, so a read through it returned 0 (silent).  Rule: each entry is
+    a ``setdefault`` of its key (the row's handle is allocated in the child
+    pool, as for ``d.setdefault(k, []).append(...)``), then the row's member
+    appends against that pool slice, in order, at the display.  A repeated
+    key selects the same row and clears it first, as a later entry replaces
+    an earlier one.
+    """
+
+    from .control_source import ControlExpression, ControlSequenceMutation
+    from .string_table import string_token
+
+    sequence_id = int(data.get("value_id", node_id))
+    value_parents = tuple(
+        (int(parent), int(graph_obj.nodes[parent].get("value_id", parent)))
+        for parent, role in data.get("parents") or ()
+        if str(role).startswith("values") and parent in graph_obj
+    )
+    if not (
+        len(key_parents) == len(value_parents) == len(expression.keys)
+        and None not in expression.keys
+    ):
+        raise ValueError(
+            f"dict {sequence_id} lists its rows without one exact key and "
+            "list producer per entry; a mapping of lists is lowered only "
+            "from keyed list displays"
+        )
+    rows = {value_id for _node, value_id in value_parents}
+    if len(rows) != len(value_parents):
+        raise ValueError(
+            f"dict {sequence_id} stores one list under two keys; a shared "
+            "row has one pool slice and is not lowered"
+        )
+    births = _list_literal_mutations(graph_obj, rows)
+    members_of: dict[int, list[Any]] = {}
+    for item in births:
+        if str(item.operator) != "clear":
+            members_of.setdefault(int(item.sequence_value_id), []).append(item)
+    mutations = []
+    for position, (key_expression, (key_node, key_value), (row_node, row_value)) in enumerate(zip(
+        expression.keys, key_parents, value_parents,
+    )):
+        key_literal = (
+            key_expression.value
+            if isinstance(key_expression, ast.Constant) else None
+        )
+        key_ir = None
+        if isinstance(key_literal, (bool, int, float, str)):
+            key_ir = ControlExpression(
+                "const", value_id=key_value,
+                literal=(
+                    string_token(key_literal)
+                    if isinstance(key_literal, str) else key_literal
+                ),
+            )
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=sequence_id, operator="setdefault",
+            # The pool path reads no default (the row is born empty and
+            # filled by the appends below); naming the row here would make
+            # the setdefault consume what its own appends produce.
+            argument_value_ids=(key_value, key_value),
+            effect_node_id=row_node, policy="unique",
+            argument_kind="mapping_child_row",
+            argument_expressions=(key_ir, None),
+            display_member=(int(node_id), position << 16),
+        ))
+        for item in members_of.get(row_value, ()):
+            mutations.append(replace(item, display_member=(
+                int(node_id),
+                (position << 16) | (1 + int(item.display_member[1])),
+            )))
+    return tuple(mutations)
+
+
 def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
     """Materialize authored dynamic dict rows at the literal's source site.
 
@@ -3457,6 +4560,11 @@ def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
             sequence_value_id=sequence_id, operator="clear",
             argument_value_ids=(), effect_node_id=int(node_id), policy="unique",
         ))
+        if attributes.get("mapping_value_aggregate_kind") == "list":
+            mutations.extend(_dict_rows_born_by_display(
+                graph_obj, int(node_id), data, expression, key_parents,
+            ))
+            continue
         value_parents = tuple(
             (int(parent), int(graph_obj.nodes[parent].get("value_id", parent)))
             for parent, role in data.get("parents") or ()

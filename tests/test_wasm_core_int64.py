@@ -2,8 +2,9 @@
 
 Receipt (2026-10-24): the core typed every integer formal as i32, so
 ``a > b`` with a = 2**32 + 1 compared 1 > 3 and returned the other branch,
-silently.  Corpus c601 is the program; c600 adds int-to-float conversions
-and true division.  These run it in node and compare with Python exactly.
+silently.  Corpus c961 is that program; c962 holds the loop-header Phis'
+parallel copy.  (c960's unproven ``a - b`` is refused by name: the core has
+no checked int64 spelling.)  These run in node and compare exactly.
 """
 
 from __future__ import annotations
@@ -31,9 +32,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("program", [
-    "c600_wide_int_formal_branch", "c601_wide_int_formal_selects_branch",
+    "c961_wide_int_formal_selects_branch", "c962_loop_swaps_float_pair",
 ])
-def test_wide_int_formals_return_python_values(program):
+def test_wasm_core_returns_python_values(program):
     source = (CORPUS / f"{program}.py").read_text(encoding="utf-8")
     rows = ast.literal_eval(source.split("# INPUTS", 1)[1].strip())
     namespace = {"__name__": f"wasm_{program}"}
@@ -50,7 +51,8 @@ def test_wide_int_formals_return_python_values(program):
     assert artifact.complete, artifact.shortfalls
     kinds = dict((value_id, kind) for kind, value_id in artifact.parameters)
     names = dict(module.functions[entry].metadata["parameter_names"])
-    assert {kinds[int(names[name])] for name in ("a", "b")} == {"i64"}
+    int_formals = [name for name in names if isinstance(rows[0][name], int)]
+    assert {kinds[int(names[name])] for name in int_formals} <= {"i64"}
     (result,) = outputs[entry]
 
     for row in rows:
