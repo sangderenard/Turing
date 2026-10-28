@@ -81,3 +81,48 @@ def test_record_field_read_after_storing_call_uses_declared_slot(source, has_slo
     assert CorrelationTable.build(module).findings(module) == []
     assert all(instruction.args for block in module.functions[exports[0]].blocks.values()
                for instruction in block.instrs if instruction.op == 'Ret')
+
+
+_STORED_ALIAS_PRELUDE = '''
+from dataclasses import dataclass
+@dataclass
+class Acc:
+    total: int
+def add(acc: Acc, v: int) -> int:
+    acc.total = acc.total + v
+    return acc.total
+'''
+
+
+@pytest.mark.parametrize("body", [
+    '''
+def root(a: int, b: int) -> int:
+    acc = Acc(a)
+    old = acc
+    add(acc, b)
+    return old.total
+''',
+    '''
+def root(a: int, b: int) -> int:
+    acc = Acc(a)
+    old = acc
+    add(acc, b)
+    acc = Acc(b * 3)
+    return old.total * 100 + acc.total
+''',
+    '''
+def root(a: int, b: int) -> int:
+    acc = Acc(a)
+    old = acc
+    t = 0
+    for _ in range(3):
+        t = t * 10 + old.total
+        add(acc, b)
+    return t
+''',
+], ids=["alias", "alias_then_rebound", "alias_in_loop"])
+def test_alias_of_record_stored_by_call_is_refused(body):
+    # Each answered the construction's ``a`` for ``old.total`` (silent): the
+    # storing-call mark named ``acc``, not the record ``old`` also names.
+    with pytest.raises(ValueError, match="record_stored_by_call"):
+        _lower(_STORED_ALIAS_PRELUDE + body, "stored_alias_refused")
