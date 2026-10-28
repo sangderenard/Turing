@@ -722,6 +722,14 @@ CALLEE_UNRESOLVED = declare_reason("callee_unresolved")
 #: ``place_loop_carried_region_producers.owned_regions``' marker-region
 #: fallback.
 REGION_OWNERSHIP_UNKNOWN = declare_reason("region_ownership_unknown")
+#: A region value whose dtype no record settled when the hierarchy plan was
+#: frozen BEFORE callsite planning / actual-to-formal binding / linked-ABI
+#: settlement.  The structure is frozen; the type is an outstanding
+#: obligation until the strict (post-settlement) freeze settles or refuses it.
+REGION_VALUE_DTYPE_AWAITS_SETTLEMENT = declare_reason(
+    "region_value_dtype_awaits_settlement"
+)
+HIERARCHY_PLAN_FREEZE = declare_stage("hierarchy_plan_freeze")
 
 
 # -- facts -------------------------------------------------------------------
@@ -886,6 +894,12 @@ LOOP_CARRIED_BINDING = declare_page("loop_carried_binding", (
 LOOP_REGION_MEMBERSHIP = declare_page("loop_region_membership", (
     RowField("read_scope", K.SCOPE), RowField("loop", K.VALUE_ID),
 ), tuple)                              # mode REVISE
+#: Fact: the dtype a hierarchy-plan freeze settled for a region value, or
+#: ``Unresolved(REGION_VALUE_DTYPE_AWAITS_SETTLEMENT)`` while the freeze was
+#: non-terminal and nothing had settled it.  Mode REVISE.
+PLAN_REGION_VALUE_DTYPE = declare_page("plan_region_value_dtype", (
+    RowField("read_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), str)                                # str | Unresolved; mode REVISE
 LOOP_RESULT_PORT_BINDING = declare_page("loop_result_port_binding", (
     RowField("read_scope", K.SCOPE), RowField("port", K.VALUE_ID),
 ), str)                                # mode CONCORD
