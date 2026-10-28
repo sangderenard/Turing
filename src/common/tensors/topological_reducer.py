@@ -26418,6 +26418,25 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 "sequence_key_columns": (),
                 "sequence_writable": True,
             })
+            # The typecode literal is the array's authored element layout
+            # (``array("Q")`` holds uint64 rows).  Post it on the allocation
+            # itself, the same column contract a typed record field's
+            # constructor edge stamps, so an element read of a local array
+            # is typed by its typecode and not by its append operands.
+            from ...transmogrifier.dtype_layout import array_typecode_dtype
+
+            typecode_dtype = next((
+                array_typecode_dtype(
+                    (source_wrapper.G.nodes[int(parent)].get("attributes") or {})
+                    .get("value", source_wrapper.G.nodes[int(parent)].get("constant"))
+                )
+                for parent, role in source_data.get("parents") or ()
+                if role == "arg:0" and int(parent) in source_wrapper.G
+            ), None)
+            if typecode_dtype is not None:
+                source_data["attributes"]["sequence_column_dtypes"] = (
+                    typecode_dtype,
+                )
     graph.python_bindings = canonicalize_python_static_bindings(
         graph.python_bindings
     )
