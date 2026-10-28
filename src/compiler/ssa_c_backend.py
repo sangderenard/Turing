@@ -6737,7 +6737,14 @@ def emit_ssa_module_to_c(
                     kind = (
                         _scalar_c_type(instruction.res.dtype)
                     )
-                    declared = f"const {kind} t{result_id} = (-{args[0]});"
+                    # Program: ``return -n`` declared int128 (the int
+                    # overflow union's exact arm).  Wrong record: ``-n`` ran
+                    # in n's int64 and -(-2**63) wrapped before widening.
+                    # Rule: negate in the declared domain (an exact widening
+                    # of the operand), as the binary ops do.
+                    declared = (
+                        f"const {kind} t{result_id} = (-({kind})({args[0]}));"
+                    )
                 elif (
                     op.casefold() in _UNARY_PREDICATES
                     and len(args) == 1
