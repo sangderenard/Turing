@@ -20495,12 +20495,14 @@ def _propagate_callsite_tensor_specializations(
         if function_source is not None and function_source.G is not graph.G:
             table_graph_ids.add(id(graph.G))
     isolated_callers = {}
+    isolated_sources = {}
     for caller in graphs:
         if id(caller.G) in table_graph_ids:
             isolated_callers.setdefault(
                 id(caller.G),
                 extract_clean_process_subgraph(caller, caller.G),
             )
+            isolated_sources.setdefault(id(caller.G), caller)
     if isolated_callers:
         graphs = [
             isolated_callers.get(id(caller.G), caller)
@@ -21744,6 +21746,41 @@ def _propagate_callsite_tensor_specializations(
                 **mutation_counts,
             })
         specialization_guard.round(changed, state=state_digest)
+
+    for source in isolated_sources.values():
+        from .frame_identity_book import _frame_call_cells
+
+        for _node_id, data in tuple(source.G.nodes(data=True)):
+            attributes = data.get("attributes") or {}
+            reference = attributes.get("callee_ref")
+            if reference is None:
+                reference = attributes.get("method_ref")
+            if reference is None:
+                continue
+            try:
+                callee = function_table.entry(int(reference)).graph
+            except (KeyError, TypeError, ValueError):
+                continue
+            arms_members = (
+                None if callee is None
+                else _callee_optional_aggregate_members(callee)
+            )
+            if arms_members is None:
+                continue
+            _publish_callsite_return_members(
+                source, int(_node_id),
+                tuple(
+                    _tensor_descriptor(callee, int(member))
+                    for member in arms_members
+                ),
+                "tuple",
+                return_cells=tuple(
+                    _frame_call_cells(source.G, int(_node_id))
+                    for _ in arms_members
+                ),
+            )
+        _publish_conditional_tuple_members(source, function_table)
+        _publish_conditional_call_aggregate_merges(source, function_table)
 
 
 def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:

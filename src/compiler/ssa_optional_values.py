@@ -190,6 +190,20 @@ def _lower_record_covered_call(
         )
         for item in payload_presence
     )
+    # Program: ``f = maybe_pair(n, m) if m > 0 else None`` (corpus c306).
+    # Wrong record: the call's aggregate resident was widened to the
+    # interleaved ``(p0, q0, p1, q1)`` width while its ``ssa_value`` row kept
+    # the cut-time ``()``, so the resident disagreed with its own identity.
+    # Rule: post first -- the row is revised DERIVED from the aggregate's
+    # cell and each interleaved member's cell, the resident follows.
+    from .concordance_declarations import STRUCTURAL_CONCORDANCE
+    from .ssa_record_return_state import identity_cells, revise_ssa_value
+
+    revise_ssa_value(
+        caller, int(aggregate.id), dtype="ssa.aggregate",
+        shape=(len(interleaved),), stage=STRUCTURAL_CONCORDANCE,
+        sources=identity_cells(caller, aggregate, *interleaved),
+    )
     aggregate.dtype = "ssa.aggregate"
     aggregate.shape = (len(interleaved),)
     aggregate.accounting = {
