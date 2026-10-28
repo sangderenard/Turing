@@ -2401,6 +2401,10 @@ class _ControlSSABuilder(TiledObject):
             tuple[str, int], SSAValue
         ] = {}
         self._function_exit: BasicBlock | None = None
+        # (failing block, continuing block) of each checked index; see
+        # ``_finish_fault_exits``.
+        self._index_fault_blocks: list[tuple[BasicBlock, BasicBlock]] = []
+        self._fault_exit: BasicBlock | None = None
         self.named_output_histories = {
             str(name): tuple(map(int, history))
             for name, history in (named_output_histories or {}).items()
@@ -4876,35 +4880,147 @@ class _ControlSSABuilder(TiledObject):
     def _sequence_row_index(
         self, sequence_id: int, index_id: int, literal: int | None,
     ) -> SSAValue:
-        if literal is None:
-            return self.external_value(int(index_id), dtype="int64")
-        if int(literal) >= 0:
-            return self.constant_value(int(literal))
-        descriptor = self.sequence_descriptors[int(sequence_id)]
+        """The checked, normalized row index of a positional read or write.
+
+        Python's rule: ``-len <= i < len`` selects row ``i % len`` (a negative
+        index counts from the end), anything else raises ``IndexError``.  The
+        check reads the sequence's own length cell, so it holds for a list
+        that grows or shrinks; it is the native ``IndexError`` (validation
+        code 71, as ``pop`` reports).
+        """
+
+        index = (
+            self.external_value(int(index_id), dtype="int64")
+            if literal is None else self.constant_value(int(literal))
+        )
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None:
+            if literal is not None and int(literal) < 0:
+                raise KeyError(int(sequence_id))
+            return index
         length_cell = self.sequence_storage_values[int(sequence_id)][
             len(descriptor.column_value_ids)
         ]
+        attributes = {
+            "binding": "ssa_sequence_row_bounds",
+            "sequence_id": int(sequence_id),
+        }
         length = self.fresh_value(
             dtype="int64", transform=LOAD, operands=(length_cell,),
         )
+        self.emit(Handler.Load, [length_cell], length, attributes=attributes)
+        zero = self.constant_value(0, length)
+        if literal is not None and int(literal) >= 0:
+            normalized = index
+        else:
+            negative = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(index,),
+            )
+            self.emit(Handler.Lt, [index, zero], negative, attributes=attributes)
+            wrapped = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(index, length),
+            )
+            self.emit(Handler.Add, [index, length], wrapped, attributes=attributes)
+            normalized = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(negative, wrapped, index),
+            )
+            self.emit(
+                Handler.Select, [negative, wrapped, index], normalized,
+                attributes=attributes,
+            )
+        below_length = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(normalized, length),
+        )
         self.emit(
-            Handler.Load, [length_cell], length,
+            Handler.Lt, [normalized, length], below_length,
+            attributes=attributes,
+        )
+        inside = below_length
+        if literal is None or int(literal) < 0:
+            at_least_zero = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(normalized,),
+            )
+            self.emit(
+                Handler.Ge, [normalized, zero], at_least_zero,
+                attributes=attributes,
+            )
+            inside = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(at_least_zero, below_length),
+            )
+            self.emit(
+                Handler.LAnd, [at_least_zero, below_length], inside,
+                attributes=attributes,
+            )
+        selected = self.new_block("sequence_index_in_range")
+        outside = self.new_block("sequence_index_out_of_range")
+        self.conditional_branch(inside, selected, outside)
+        self.current = outside
+        self.emit(
+            Handler.Call, [],
             attributes={
-                "binding": "ssa_sequence_row_length",
-                "sequence_id": int(sequence_id),
+                "callee": "turing_validation_error", "error_code": 71,
+                **attributes,
             },
         )
-        normalized = self.fresh_value(
-            dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
-        )
-        self.emit(
-            Handler.Add, [length, self.constant_value(int(literal), length)], normalized,
-            attributes={
-                "binding": "ssa_sequence_negative_index",
-                "sequence_id": int(sequence_id),
-            },
-        )
+        # The failing path must not touch the element: an empty heap list has
+        # no column to read.  It leaves the function; ``_finish_fault_exits``
+        # gives it the exit (or, when the outputs cannot be zeroed, lets it
+        # continue as ``pop`` does).
+        if self._fault_exit is None:
+            self._fault_exit = self.new_block("sequence_index_out_of_range")
+        self.branch(self._fault_exit)
+        self._index_fault_blocks.append((outside, selected))
+        self.current = selected
         return normalized
+
+    def _finish_fault_exits(self, returned: Any) -> None:
+        """Close the out-of-range exits of checked indices.
+
+        The validation code is already recorded when control gets here; the
+        exit returns zero outputs so nothing reads a row that is not there.
+        """
+
+        if self._fault_exit is None:
+            return
+        fault_exit = self._fault_exit
+        # Later passes publish the function's outputs on the LAST Ret in block
+        # order; the fault exit's zero outputs are not that Ret, so it sits
+        # directly after the entry block.
+        ordered = list(self.blocks.items())
+        entry_item, rest = ordered[0], [
+            item for item in ordered[1:] if item[1] is not fault_exit
+        ]
+        self.blocks.clear()
+        self.blocks[entry_item[0]] = entry_item[1]
+        self.blocks[fault_exit.name] = fault_exit
+        self.blocks.update(rest)
+        values = None if returned is None else list(returned)
+        if values is not None and all(
+            value is not None and str(value.dtype) in {
+                "int", "int8", "int16", "int32", "int64", "bool",
+                "float32", "float64",
+            }
+            for value in values
+        ):
+            self.current = fault_exit
+            self.emit(Handler.Ret, [
+                self.constant_value(0, dtype=str(value.dtype))
+                for value in values
+            ])
+            return
+        # Outputs that cannot be zeroed: continue as ``pop`` does.
+        self.current = fault_exit
+        for failing, continuing in self._index_fault_blocks:
+            terminator = failing.instrs.pop()
+            failing.successors.remove(fault_exit.name)
+            self.current = failing
+            self.branch(continuing)
+        self.current = fault_exit
+        self.emit(Handler.Ret, list(values or []))
 
     def _emit_sequence_row_load(
         self, result_id: int, sequence_id: int, index_id: int,
@@ -23054,8 +23170,10 @@ class _ControlSSABuilder(TiledObject):
                     continue
                 self._revise_semantic_output(name, int(merged_id))
             self.emit(Handler.Ret, returned)
+            self._finish_fault_exits(returned)
         elif fallthrough_open:
             self.emit(Handler.Ret, returned)
+            self._finish_fault_exits(returned)
 
         # A returned union can be widened into a physical frame before the
         # function-exit join is built.  When that join has multiple incoming

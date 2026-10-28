@@ -10199,6 +10199,7 @@ def _retain_source_sequence_mutation_records(
         _RECEIVER_READING_METHODS,
         _receiver_collection_kind,
         _returned_formal_sequence_aliases,
+        _returned_tuple_member_kinds,
     )
 
     records = dict(
@@ -10209,6 +10210,7 @@ def _retain_source_sequence_mutation_records(
     forwarded_sequences = _returned_formal_sequence_aliases(
         graph_obj, function_table,
     )
+    tuple_member_kinds = _returned_tuple_member_kinds(graph_obj, function_table)
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
         # Program: ``xs = [5, n, 9, 8]; del xs[1]`` (fuzzer p3_13).  Wrong
@@ -10266,7 +10268,8 @@ def _retain_source_sequence_mutation_records(
         ):
             continue
         destination_data = graph_obj.nodes[destination]
-        destination_kind = _receiver_collection_kind(destination_data)
+        destination_kind = _receiver_collection_kind(destination_data) or tuple_member_kinds.get(
+            int(destination_data.get("value_id", destination)))
         mapping_default = destination_kind == "dict" and expression.func.attr == "setdefault"
         if destination_kind not in {"list", "set", "bytes", "bytearray", "array"} and not mapping_default:
             continue
@@ -26992,10 +26995,27 @@ def _fold_callsite_structural_values(
             if selected is None:
                 return unresolved
             fixed = known.get(selected, unresolved)
+            # Program: ``pick(a, 1)`` whose ``if n > 2: t = a else: t =
+            # [7, n, 2]`` folds on the constant argument (corpus c820, c821).
+            # Wrong record: the merge Phi took the selected display's literal
+            # VALUE, so it became a second Constant that kept the
+            # ``aggregate_phi`` producer with no arm to merge (a list "bound
+            # to lists of different shapes" / two heap owners for one list)
+            # while the display kept its own birth.  Rule: a merge selecting
+            # a mutable collection is that arm's storage, so it aliases the
+            # arm; only an immutable value is copied.
+            selected_attributes = (
+                graph.G.nodes[selected].get("attributes") or {}
+                if selected in graph.G else {}
+            )
+            selected_is_mutable_collection = str(
+                selected_attributes.get("aggregate_kind") or ""
+            ) in {"list", "set", "dict"} or isinstance(fixed, (list, set, dict))
             return (
                 _StructuralValueAlias(selected)
                 if fixed is unresolved
                 or isinstance(fixed, _ProgramABIValueFact)
+                or selected_is_mutable_collection
                 else fixed
             )
         if isinstance(expression, ast.UnaryOp):
@@ -28199,6 +28219,7 @@ def _fold_callsite_structural_values(
                     "add", "sub", "mult", "mul", "div", "truediv",
                     "floordiv", "mod", "pow", "maximum", "minimum", "emax", "emin",
                     "max", "min",
+                    "bitand", "bitor", "bitxor", "shl", "shr",
                 } | comparison_operations
                 or semantic_operation in comparison_operations
             ) and not (

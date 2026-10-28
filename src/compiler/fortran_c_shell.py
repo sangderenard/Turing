@@ -17862,6 +17862,24 @@ def _sequence_row_operations(
                     (value_id(row_value_node),), value_id(base_node),
                 ))
                 continue
+            # Program: ``xs = [1, 2, 3]; xs[n] = 9`` with ``n`` out of range.
+            # Wrong record: the scalar store fell through to the region, a
+            # bare pointer write past the list (heap corruption).  Rule: a
+            # store into a one-column list is a row store, checked as a read
+            # is (``IndexError``, validation code 71).
+            if (
+                sequence_id in positional_sequences
+                and widths[sequence_id] == 1
+                and value_id(base_node) == sequence_id
+                and (graph_obj.nodes[row_value_node].get("attributes") or {})
+                .get("aggregate_kind") is None
+            ):
+                operations.append((
+                    "store", value_id(node_id), int(sequence_id),
+                    value_id(row_index_node), integer_literal(row_index_node),
+                    (value_id(row_value_node),), value_id(base_node),
+                ))
+                continue
             if sequence_id is None:
                 # ``item.members[index][1]=value`` is a column write to the
                 # existing row, not a dereference of a scalar row payload.
@@ -52642,6 +52660,33 @@ def _class_surface_ssa_program(
                             output_physical = _frame_physical_fields(
                                 callee, int(callee_output.id),
                             )
+                            # Program: ``e, statuses, tokens = intern(...)`` then
+                            # ``tokens[0]`` / appends in the caller (string-core
+                            # ``repeated_manager`` value 148).  Wrong record: the
+                            # callee return's ``span`` was posted over a caller
+                            # value whose SEQUENCE_CONTRACT (and so its settled
+                            # ABI arm) says ``sequence``; the physical view then
+                            # refused the two.  Rule: a caller value with a
+                            # sequence contract is a resident sequence; the
+                            # callee's span is the view it was returned through.
+                            if (
+                                isinstance(output_physical, dict)
+                                and output_physical.get("storage") == "span"
+                            ):
+                                from .concordance_declarations import (
+                                    SEQUENCE_CONTRACT_CONCORDANCE as _FRAME_SEQUENCE_CONTRACT,
+                                )
+                                from .identity_concordance import (
+                                    current_identity_book as _frame_contract_book,
+                                )
+
+                                if _frame_contract_book().latest_ref(
+                                    _FRAME_SEQUENCE_CONTRACT,
+                                    (str(caller_symbol), caller_id),
+                                ) is not None:
+                                    output_physical = {
+                                        **output_physical, "storage": "sequence",
+                                    }
                             publish_ssa_value_type(
                                 caller, output, dtype=structure.dtype, shape=structure.shape,
                                 sources=_frame_cells(
