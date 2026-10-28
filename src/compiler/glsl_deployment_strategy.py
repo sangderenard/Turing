@@ -2652,6 +2652,18 @@ def _planned_scalar_dtypes_from(
                         pass
                     else:
                         continue
+                elif kind == "loop":
+                    # Program: ``for a, b in ps`` over ``ps:
+                    # list[tuple[int, int]]``, ``for k, v in d.items()``.
+                    # A destructured target has no single element class to
+                    # read off its iterable; the reducer concorded each
+                    # name's class from the annotation's position and
+                    # stamped it as ``result_class_ref``.  That declared
+                    # class is the target's dtype.
+                    settle(scalar, node_id, classes.get(str(
+                        attributes.get("result_class_ref") or ""
+                    ).removeprefix("builtins.")))
+                    continue
                 else:
                     continue
             if op == "for":
