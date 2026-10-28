@@ -9359,7 +9359,15 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
                 "value_id", destination
             )),
             "argument_value_ids": mutation_arguments,
-            "operator": str(expression.func.attr),
+            # ``s.update(xs)`` on a set inserts each element of one
+            # iterable under the set's unique policy: the sequence
+            # ``extend``, which inherits that policy.
+            "operator": (
+                "extend"
+                if destination_kind == "set" and expression.func.attr == "update"
+                and len(arguments) == 1 and not expression.keywords
+                else str(expression.func.attr)
+            ),
             "argument_kind": "mapping_setdefault" if mapping_default else "value",
             "policy": (
                 "unique"

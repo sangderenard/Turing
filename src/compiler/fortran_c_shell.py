@@ -49855,6 +49855,40 @@ def _class_surface_ssa_program(
                             if receipt not in receipts:
                                 receipts.append(receipt)
 
+                # ``def relay(): return pair(...)`` linked into ``return
+                # relay(...)``: relay's one authored output is its own
+                # forwarded call, whose members are already relay's Ret.  The
+                # caller forwards that same aggregate, so it binds no single
+                # value; it takes every member, as a direct forward does.
+                if (
+                    len(record.result_bindings) == 1
+                    and int(record.result_bindings[0][1])
+                    == int(record.callsite_id)
+                    and int(record.callsite_id) in set(map(
+                        int,
+                        caller.metadata.get("source_output_value_ids", ()),
+                    ))
+                    and len(callee_outputs) > 1
+                    and int(record.result_bindings[0][0]) not in {
+                        int(output.id) for output in callee_outputs
+                    }
+                    and any(
+                        instruction.op in {"Call", "call"}
+                        and (instruction.attributes or {}).get(
+                            "result_convention"
+                        ) == "ssa.aggregate"
+                        and int((instruction.attributes or {}).get(
+                            "plan_callsite_id", -1
+                        )) == int(record.result_bindings[0][0])
+                        and tuple(map(int, (instruction.attributes or {}).get(
+                            "output_ids", ()
+                        ))) == tuple(int(output.id) for output in callee_outputs)
+                        for callee_block in callee.blocks.values()
+                        for instruction in callee_block.instrs
+                    )
+                ):
+                    record = replace(record, result_bindings=())
+
                 def physical_caller_storage(value_id: int) -> int:
                     current = int(value_id)
                     seen: set[int] = set()
@@ -50277,6 +50311,29 @@ def _class_surface_ssa_program(
                         caller.metadata.get("source_output_value_ids", ()),
                     ))
                 )
+                if forwarded_aggregate and not physical_result_bindings:
+                    # ``return callee(...)`` publishes the callee's whole
+                    # aggregate as the caller's outputs.  Bind every member
+                    # positionally, exactly as an unpacking caller would, so
+                    # the ordinary aggregate unpack projects each one and Ret
+                    # returns the members rather than the abstract tuple.
+                    from .concordance_declarations import REGION_CALL_RESULT
+
+                    physical_result_bindings = tuple(
+                        (
+                            int(output.id),
+                            int(mint_compiler_value_id(
+                                caller, REGION_CALL_RESULT, (
+                                    _frame_value_cell(callee, int(output.id)),
+                                ),
+                            )),
+                        )
+                        for output in callee_outputs
+                    )
+                    physical_result_positions = tuple(range(len(callee_outputs)))
+                    physical_result_slots = tuple(range(len(callee_outputs)))
+                    selected_callee_outputs = tuple(callee_outputs)
+                    has_exact_partial_aggregate = True
                 bound_aggregate_outputs = ()
                 if (
                     len(record.result_bindings) == 1
@@ -52197,6 +52254,13 @@ def _class_surface_ssa_program(
                         or forwarded_aggregate
                     ) and caller_result_id is not None and result is not None:
                         produced_results[int(caller_result_id)] = result
+                        if forwarded_aggregate:
+                            # A forwarded aggregate answers its call site's
+                            # authored output even when its result took a
+                            # fresh id.
+                            produced_results.setdefault(
+                                int(record.callsite_id), result,
+                            )
                     authored_results = {
                         value_id: produced_results[value_id]
                         for value_id in source_output_ids
@@ -52246,6 +52310,21 @@ def _class_surface_ssa_program(
                                         for _role, slot in role_slots
                                     )
                                 }
+                                if (
+                                    forwarded_aggregate and aggregate_unpack
+                                    and caller_result_id is not None
+                                ):
+                                    # The forwarded aggregate's members, in
+                                    # the callee's Ret order, stand in its
+                                    # one authored output slot: the call
+                                    # site, whatever id its result took.
+                                    members = tuple(
+                                        values[int(caller_id)]
+                                        for _callee_id, caller_id
+                                        in physical_result_bindings
+                                    )
+                                    union_outputs[int(caller_result_id)] = members
+                                    union_outputs[int(record.callsite_id)] = members
                                 selected_outputs = []
                                 for value_id in source_output_ids:
                                     union_frame = union_outputs.get(
