@@ -5424,11 +5424,19 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
-                        # A proven interval wider than int64 is the source's
-                        # width; the parents' int64 does not narrow it.
-                        proven = planned_scalar_dtypes().get(int(current))
-                        if proven in {"uint64", "int128"}:
-                            dtype = str(proven)
+                    # A proven interval wider than int64 is the source's
+                    # width; neither the parents' int64 nor a descriptor's
+                    # class-only int64 narrows it.  Program: corpus c790,
+                    # ``high * (1 << 32) + low``.  Once ``shl`` had an
+                    # elementwise descriptor, its int64 reached the product
+                    # and sum as ``tensor["dtype"]``, this rule (then inside
+                    # the no-descriptor branch) never ran, and the combine
+                    # wrapped negative with no finding.
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven in {"uint64", "int128"} and dtype in {
+                        None, "int", "int64", "uint64", "int128",
+                    }:
+                        dtype = str(proven)
                 if operation in {"floor", "ceil", "trunc", "round"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so
