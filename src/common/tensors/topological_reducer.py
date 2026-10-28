@@ -10637,7 +10637,19 @@ def _normalize_lexical_values(
                                 ))),
                                 mode=_Mode.CONCORD,
                             )
-            callee = resolved_call_argument(expression.func)
+            # ``np.asarray(xs)``: ingestion rewrote the frontend-qualified
+            # callee to the neutral AbstractTensor operation's bare name
+            # (``tensor``) and the call carries that operation.  The name is
+            # the operation's spelling, not a binding: reading it would mint
+            # a free external Input that no program bound.
+            callee = (
+                None
+                if isinstance(expression.func, ast.Name)
+                and getattr(
+                    expression, "_abstract_tensor_frontend_reference", None,
+                ) == expression.func.id
+                else resolved_call_argument(expression.func)
+            )
             if isinstance(callee, _StaticPythonReference) and node_id in graph.G:
                 identity_target = (
                     callee.value.__func__
