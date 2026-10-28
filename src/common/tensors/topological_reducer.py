@@ -5015,20 +5015,46 @@ def _builtin_int_operator_range(
     return None, ()
 
 
-def _propagate_builtin_int_ranges(graph: Any) -> bool:
-    """Publish the interval every builtin ``int`` value is proven to lie in.
+_INT_RANGE_TOP = "unbounded"
+#: Times one value's interval may grow before it is declared unbounded: a
+#: recurrence such as ``i += 1`` never closes, a ``% m`` limb closes at once.
+_INT_RANGE_WIDENING = 8
 
-    Program: Token Orchard's ``_fingerprint_span``: ``high`` and ``low`` are
-    ``... % U32_MODULUS``, then ``first = high * (1 << 32) + low``.  Wrong
-    record: every Python ``int`` operator result was int64 by class alone,
-    so ``first`` wrapped negative on C and LLVM whenever ``high >= 2**31``
-    with no finding (Python's ``first`` is a full u64).  Rule: a literal is
-    its own interval; a builtin operator over ranged operands has the
-    interval Python's arithmetic proves (``_builtin_int_operator_range``); a
-    conditional merge joins its arms.  Each row is DERIVED from the value's
-    class cell, its node cell and the operand range cells the rule read.  A
-    value the source does not bound gets no row.  Returns whether a row was
-    added.
+
+def _join_int_range(left: Any, right: Any) -> Any:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    if left == _INT_RANGE_TOP or right == _INT_RANGE_TOP:
+        return _INT_RANGE_TOP
+    return (min(left[0], right[0]), max(left[1], right[1]))
+
+
+def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
+    """Prove and publish the interval of every builtin ``int`` value.
+
+    Program: Token Orchard's fingerprint lanes.  ``fnv1a_limb_step`` returns
+    ``(next_high, next_low)``, each ``... % U32_MODULUS``; the limbs cross
+    two tuple returns, two loops and their formals before ``_fingerprint_span``
+    computes ``first = high * (1 << 32) + low``.  Wrong record: every Python
+    ``int`` operator result was int64 by class alone, so ``first`` wrapped
+    negative on C and LLVM whenever ``high >= 2**31`` with no finding
+    (Python's ``first`` is a full u64).  Rule: a literal is its own
+    interval; a builtin operator has the interval Python's arithmetic proves
+    (``_builtin_int_operator_range``); a conditional merge joins its arms; a
+    call result, or an unpacked member of one, is the callee's returned
+    value; a formal joins its actual at EVERY callsite (none known: no
+    proof); a loop-carried binding's pre-loop value, latch update and break
+    values are one value, the join of all of them.  Optimistic fixed point
+    with widening: a value whose interval keeps growing is unbounded.  Each
+    row is DERIVED from the value's class cell, its node cell and the range
+    cells the proof read.  A value the source does not bound gets no row.
+
+    ``units`` are ``(graph wrapper, function address or None)``.  With
+    ``inherited_scope`` (a specialization), a value this copy cannot prove
+    itself (a formal, a call result) keeps the authored function's interval:
+    the copy runs a subset of the authored function's executions.
     """
 
     from ...compiler.concordance_declarations import (
@@ -5036,120 +5062,345 @@ def _propagate_builtin_int_ranges(graph: Any) -> bool:
     )
 
     book = current_identity_book()
-    target = getattr(graph, "G", graph)
-    scope = _source_numeric_scope(graph)
     class_page = book.page(SOURCE_VALUE_CLASS)
     range_page = book.page(SOURCE_INT_RANGE)
 
-    def value_of(node_id: int) -> int:
-        if node_id in target:
-            return int(target.nodes[node_id].get("value_id", node_id))
-        return int(node_id)
+    class Unit:
+        def __init__(self, wrapper, address):
+            self.wrapper = wrapper
+            self.G = getattr(wrapper, "G", wrapper)
+            self.address = address
+            self.scope = _source_numeric_scope(wrapper)
 
-    def integer_class_cell(value_id: int):
-        cell = book.latest_ref(SOURCE_VALUE_CLASS, (scope, int(value_id)))
-        if cell is None:
-            return None, None
-        identity = _canonical_source_class_identity(
-            class_page.cell(cell.row, cell.column)[0]
-        )
-        if identity not in {"builtins.int", "builtins.bool"}:
-            return None, None
-        return cell, identity
+        def value_of(self, node_id):
+            if node_id in self.G:
+                return int(self.G.nodes[node_id].get("value_id", node_id))
+            return int(node_id)
 
-    # Operands before results: an acyclic graph settles in one pass, and the
-    # repeat only serves a cyclic one.
-    try:
-        order = tuple(nx.topological_sort(target))
-    except nx.NetworkXUnfeasible:
-        order = tuple(target.nodes)
-    changed = False
-    for _round in range(max(1, target.number_of_nodes())):
-        round_changed = False
-        for node_id in order:
-            data = target.nodes[node_id]
-            value_id = value_of(int(node_id))
-            if range_page.latest((scope, value_id)) is not None:
+        def key(self, node_id):
+            return (self.scope, self.value_of(int(node_id)))
+
+    units = [Unit(wrapper, address) for wrapper, address in units]
+    by_address = {
+        int(unit.address): unit for unit in units if unit.address is not None
+    }
+
+    # Integer-class nodes, keyed by their (scope, value) row.
+    members: dict = {}
+    class_cells: dict = {}
+    for unit in units:
+        for node_id in unit.G.nodes:
+            key = unit.key(node_id)
+            if key in class_cells:
+                members[key].append((unit, node_id))
                 continue
-            class_cell, identity = integer_class_cell(value_id)
-            if class_cell is None:
+            cell = book.latest_ref(SOURCE_VALUE_CLASS, key)
+            if cell is None:
                 continue
-            node_cell = node_identity_cell(graph, int(node_id))
-            expression = data.get("expr_obj")
+            identity = _canonical_source_class_identity(
+                class_page.cell(cell.row, cell.column)[0]
+            )
+            if identity not in {"builtins.int", "builtins.bool"}:
+                continue
+            class_cells[key] = (cell, identity)
+            members[key] = [(unit, node_id)]
+
+    def callee_of(unit, node_id):
+        attributes = unit.G.nodes[node_id].get("attributes") or {}
+        reference = attributes.get("callee_ref", attributes.get("method_ref"))
+        if reference is None:
+            return None
+        try:
+            return by_address.get(int(reference))
+        except (TypeError, ValueError):
+            return None
+
+    def returned_keys(unit):
+        histories = dict(unit.G.graph.get("identity_table") or {})
+        returned = []
+        for name in tuple(unit.G.graph.get("function_outputs") or ()):
+            history = tuple(histories.get(str(name)) or ())
+            if not history or int(history[-1]) not in unit.G:
+                return None
+            returned.append(unit.key(int(history[-1])))
+        return tuple(returned)
+
+    returns = {id(unit): returned_keys(unit) for unit in units}
+
+    # Every callsite's actual for every formal; a callsite that leaves a
+    # formal unbound (its default, a ``*args`` spread we cannot place) makes
+    # that formal unprovable.
+    formal_actuals: dict = {}
+    formal_incomplete: set = set()
+    for caller in units:
+        for call_id in tuple(caller.G.nodes):
+            callee = callee_of(caller, call_id)
+            if callee is None:
+                continue
+            receiver, positional, _all = _method_parameter_layout(callee.G)
+            formal_nodes = {
+                str((data.get("attributes") or {}).get("binding_name")): int(node_id)
+                for node_id, data in callee.G.nodes(data=True)
+                if data.get("type") == "Input"
+                and (data.get("attributes") or {}).get("binding_name") is not None
+            }
+            bound = set()
+            try:
+                edges = tuple(_expanded_callsite_argument_edges(caller.wrapper, call_id))
+            except Exception:
+                edges = None
+            if edges is None:
+                formal_incomplete.update(
+                    callee.key(formal) for formal in formal_nodes.values()
+                )
+                continue
+            for actual_id, role in edges:
+                name = _callsite_parameter_name(role, receiver, positional)
+                formal = formal_nodes.get(str(name)) if name is not None else None
+                if formal is None:
+                    continue
+                bound.add(formal)
+                formal_actuals.setdefault(callee.key(formal), []).append(
+                    caller.key(int(actual_id))
+                )
+            formal_incomplete.update(
+                callee.key(formal) for formal in formal_nodes.values()
+                if formal not in bound
+            )
+
+    # A function that escapes as a value (a callback, a bound method) has
+    # callers this walk cannot see: none of its formals is proven.
+    for unit in units:
+        for _node_id, data in unit.G.nodes(data=True):
             attributes = data.get("attributes") or {}
-            interval = None
-            read_cells: tuple = ()
-            literal = (
-                expression.value if isinstance(expression, ast.Constant)
-                else attributes.get("value")
-                if str(data.get("type") or data.get("op") or "").casefold()
-                in {"constant", "const"}
-                else None
+            for field in ("first_class_function_ref", "bound_method_ref"):
+                reference = attributes.get(field)
+                try:
+                    escaped = by_address.get(int(reference))
+                except (TypeError, ValueError):
+                    escaped = None
+                if escaped is None:
+                    continue
+                formal_incomplete.update(
+                    escaped.key(int(node_id))
+                    for node_id, formal in escaped.G.nodes(data=True)
+                    if formal.get("type") == "Input"
+                )
+
+    # Loop-carried bindings: one value class per binding.
+    parent_of: dict = {}
+
+    def find(key):
+        while parent_of.get(key, key) != key:
+            parent_of[key] = parent_of.get(parent_of[key], parent_of[key])
+            key = parent_of[key]
+        return key
+
+    def union(left, right):
+        left, right = find(left), find(right)
+        if left != right:
+            parent_of[right] = left
+
+    for unit in units:
+        for _node_id, data in unit.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            for pairs in (
+                attributes.get("loop_carried_bindings") or {},
+                attributes.get("loop_break_bindings") or {},
+            ):
+                for pair in dict(pairs).values():
+                    initial, updated = pair
+                    union(unit.key(int(initial)), unit.key(int(updated)))
+    classes: dict = {}
+    for key in members:
+        classes.setdefault(find(key), []).append(key)
+    for key in tuple(parent_of):
+        if key not in members:
+            classes.setdefault(find(key), []).append(key)
+
+    state: dict = {}
+    reads: dict = {}
+    changes: dict = {}
+
+    def current(key):
+        return state.get(find(key))
+
+    def inherited(key):
+        if inherited_scope is None:
+            return _INT_RANGE_TOP, ()
+        interval = range_page.latest((inherited_scope, key[1]))
+        if interval is None:
+            return _INT_RANGE_TOP, ()
+        return (int(interval[0]), int(interval[1])), ()
+
+    def transfer(key):
+        if key not in class_cells:
+            return _INT_RANGE_TOP, ()
+        if class_cells[key][1] == "builtins.bool":
+            return (0, 1), ()
+        result, read = None, ()
+        for unit, node_id in members[key]:
+            proof, used = node_transfer(unit, node_id)
+            result = _join_int_range(result, proof)
+            read = (*read, *used)
+        return result, read
+
+    def node_transfer(unit, node_id):
+        data = unit.G.nodes[node_id]
+        expression = data.get("expr_obj")
+        attributes = data.get("attributes") or {}
+        kind = str(data.get("type") or data.get("op") or "").casefold()
+        literal = (
+            expression.value if isinstance(expression, ast.Constant)
+            else attributes.get("value") if kind in {"constant", "const"}
+            else None
+        )
+        if type(literal) in {int, bool}:
+            return (int(literal), int(literal)), ()
+        parents = {
+            str(role): int(parent) for parent, role in data.get("parents") or ()
+        }
+        if kind == "phi" and attributes.get("source_conditional_id") is not None:
+            if not {"body", "orelse"} <= set(parents):
+                return _INT_RANGE_TOP, ()
+            arms = tuple(unit.key(parents[role]) for role in ("body", "orelse"))
+            joined = None
+            for arm in arms:
+                joined = _join_int_range(joined, current(arm))
+            return joined, arms
+        if isinstance(expression, (ast.BinOp, ast.UnaryOp)):
+            roles = (
+                ("lhs", "rhs") if isinstance(expression, ast.BinOp)
+                else ("operand",)
             )
-            if type(literal) in {int, bool}:
-                interval = (int(literal), int(literal))
-            elif identity == "builtins.bool":
-                interval = (0, 1)
-            else:
-                parents = {
-                    str(role): int(parent)
-                    for parent, role in data.get("parents") or ()
-                }
-                conditional_phi = (
-                    str(data.get("type") or data.get("op") or "").casefold() == "phi"
-                    and attributes.get("source_conditional_id") is not None
-                )
-                if conditional_phi:
-                    roles = ("body", "orelse")
-                elif isinstance(expression, ast.BinOp):
-                    roles = ("lhs", "rhs")
-                elif isinstance(expression, ast.UnaryOp):
-                    roles = ("operand",)
-                else:
-                    continue
-                if any(role not in parents for role in roles):
-                    continue
-                operand_cells = tuple(
-                    book.latest_ref(
-                        SOURCE_INT_RANGE, (scope, value_of(parents[role])),
-                    )
-                    for role in roles
-                )
-                operands = tuple(
-                    None if cell is None
-                    else tuple(map(int, range_page.cell(cell.row, cell.column)))
-                    for cell in operand_cells
-                )
-                if conditional_phi:
-                    if any(operand is None for operand in operands):
-                        continue
-                    interval = (
-                        min(low for low, _high in operands),
-                        max(high for _low, high in operands),
-                    )
-                    used = (0, 1)
-                else:
-                    interval, used = _builtin_int_operator_range(
-                        expression.op, operands,
-                    )
-                if interval is None:
-                    continue
-                read_cells = tuple(operand_cells[position] for position in used)
-            book.post(
-                SOURCE_INT_RANGE, (scope, value_id),
-                (int(interval[0]), int(interval[1])),
-                stage=_REDUCTION,
-                provenance=_Derived(tuple(dict.fromkeys(
-                    cell for cell in (class_cell, node_cell, *read_cells)
-                    if cell is not None
-                ))),
-                mode=_Mode.CONCORD,
+            if any(role not in parents for role in roles):
+                return _INT_RANGE_TOP, ()
+            operand_keys = tuple(unit.key(parents[role]) for role in roles)
+            operands = tuple(current(operand) for operand in operand_keys)
+            if any(operand is None for operand in operands):
+                return None, ()
+            interval, used = _builtin_int_operator_range(
+                expression.op,
+                tuple(
+                    None if operand == _INT_RANGE_TOP else operand
+                    for operand in operands
+                ),
             )
-            round_changed = True
-        changed = changed or round_changed
+            if interval is None:
+                return _INT_RANGE_TOP, ()
+            return interval, tuple(operand_keys[position] for position in used)
+        if kind in {"indexed", "getitem", "subscript"} and {"base", "index"} <= set(parents):
+            base, index = parents["base"], parents["index"]
+            callee = callee_of(unit, base) if base in unit.G else None
+            index_data = unit.G.nodes.get(index, {})
+            position = (index_data.get("attributes") or {}).get(
+                "value",
+                getattr(index_data.get("expr_obj"), "value", None),
+            )
+            returned = None if callee is None else returns.get(id(callee))
+            if returned and type(position) is int and -len(returned) <= position < len(returned) and len(returned) > 1:
+                member = returned[position]
+                return current(member), (member,)
+            if callee is not None:
+                return _INT_RANGE_TOP, ()
+        callee = callee_of(unit, node_id)
+        if callee is not None:
+            returned = returns.get(id(callee))
+            if returned is not None and len(returned) == 1:
+                return current(returned[0]), (returned[0],)
+            return inherited(unit.key(node_id))
+        if data.get("type") == "Input" and attributes.get("binding_name") is not None:
+            key = unit.key(node_id)
+            actuals = formal_actuals.get(key)
+            if actuals and key not in formal_incomplete:
+                joined = None
+                for actual in actuals:
+                    joined = _join_int_range(joined, current(actual))
+                return joined, tuple(actuals)
+            return inherited(key)
+        return inherited(unit.key(node_id))
+
+    for _round in range(64 * max(1, len(classes))):
+        round_changed = False
+        for root, keys in classes.items():
+            if state.get(root) == _INT_RANGE_TOP:
+                continue
+            joined, read = None, ()
+            for key in keys:
+                proof, used = transfer(key)
+                joined = _join_int_range(joined, proof)
+                read = (*read, *used)
+            if joined != state.get(root):
+                changes[root] = changes.get(root, 0) + 1
+                if changes[root] > _INT_RANGE_WIDENING:
+                    joined = _INT_RANGE_TOP
+                state[root] = joined
+                round_changed = True
+            reads[root] = (*read, *keys)
         if not round_changed:
             break
-    return changed
+    else:
+        return False
+
+    posted: list = []
+    for key, (class_cell, _identity) in class_cells.items():
+        interval = state.get(find(key))
+        if interval is None or interval == _INT_RANGE_TOP:
+            continue
+        incumbent = range_page.latest(key)
+        if incumbent is not None and tuple(incumbent) == tuple(interval):
+            continue
+        unit, node_id = members[key][0]
+        node_cell = node_identity_cell(unit.wrapper, int(node_id))
+        book.post(
+            SOURCE_INT_RANGE, key, (int(interval[0]), int(interval[1])),
+            stage=_REDUCTION,
+            provenance=_Derived(tuple(
+                cell for cell in (class_cell, node_cell) if cell is not None
+            )),
+            mode=_Mode.CONCORD,
+        )
+        posted.append(key)
+    # Second pass: the proof's own inputs, now that every row has a cell
+    # (a loop's recurrence reads itself).
+    for key in posted:
+        sources = tuple(dict.fromkeys(
+            cell for read in reads.get(find(key), ())
+            if read != key
+            for cell in (book.latest_ref(SOURCE_INT_RANGE, read),)
+            if cell is not None
+        ))
+        if sources:
+            book.post(
+                SOURCE_INT_RANGE, key, tuple(range_page.latest(key)),
+                stage=_REDUCTION, provenance=_Derived(sources),
+                mode=_Mode.CONCORD,
+            )
+    return bool(posted)
+
+
+def _propagate_builtin_int_ranges(graph: Any) -> bool:
+    """Prove one specialized copy's intervals (see ``_solve_int_ranges``)."""
+
+    target = getattr(graph, "G", graph)
+    authored = target.graph.get("authored_function_identity")
+    scope = _source_numeric_scope(graph)
+    inherited = (
+        tuple(authored) if authored is not None
+        and tuple(authored) != scope else None
+    )
+    return _solve_int_ranges([(graph, None)], inherited_scope=inherited)
+
+
+def _propagate_program_int_ranges(function_table: Any) -> bool:
+    """Prove every reduced function's intervals across its call edges."""
+
+    units = [
+        (entry.graph, int(entry.reference.address))
+        for entry in function_table
+        if getattr(entry, "graph", None) is not None
+    ]
+    return _solve_int_ranges(units)
 
 
 def _relink_settled_glyph_formatters(graph: Any, function_table: Any) -> None:
@@ -25028,9 +25279,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 lower_class_operator_calls(entry_wrapper)
                 if _propagate_builtin_scalar_operator_classes(entry_wrapper):
                     operator_classes_changed = True
-                _propagate_builtin_int_ranges(entry_wrapper)
         if not propagate_call_formal_numeric_types() and not operator_classes_changed:
             break
+    # Intervals are read once the classes they stand on are settled, over
+    # the whole program: a formal's interval is the join of every callsite.
+    _propagate_program_int_ranges(function_table)
     # String Core computes token = AGGREGATE_BASE + len(self.domain), then
     # appends that exact value to two field-owned child lists.  The AST survey
     # knew neither the computed payload nor a named tuple key's layout: put
