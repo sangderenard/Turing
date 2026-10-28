@@ -435,3 +435,17 @@ def root(a: int, b: int):
 def test_range_step_near_int64_ends_where_python_does(tmp_path, lane, step, a, b):
     source = RANGE_SOURCE.replace("STEP", str(step))
     assert lane(tmp_path, source, a, b) == len(range(a, b, step))
+
+
+@pytest.mark.parametrize("run", [_run_c, _run_llvm], ids=["c", "llvm"])
+def test_wrap_policy_is_twos_complement(tmp_path, run, monkeypatch):
+    from src.compiler import ssa_call_input_adapters as adapters
+
+    mode = adapters._DEFAULT_NUMERIC_MODE
+    monkeypatch.setitem(
+        adapters._NUMERIC_CONVERSION_MODES, mode,
+        {**adapters._NUMERIC_CONVERSION_MODES[mode], "integer_arithmetic": "wrap"},
+    )
+    n = 3037000500
+    wrapped = (n * n + 2**63) % 2**64 - 2**63
+    assert run(tmp_path, n) == wrapped % 1000

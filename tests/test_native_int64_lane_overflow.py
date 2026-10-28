@@ -3,10 +3,12 @@
 ``-tokens`` / ``abs(tokens)`` on an int64 tensor went through the double
 unary kernel (2**53 + 1 came back 2**53; after an int64 producer the lane's
 bits were negated as a double's sign).  ``tokens * 1103515245`` wrapped every
-lane that left int64.  Under ``INT64_LANE_POLICY == "exact"`` each lane is
+lane that left int64.  Under the numeric contract's
+``integer_arithmetic: python_exact`` each lane is
 computed on the integer path and a lane Python would carry past int64
 reports ``NativeIntOverflow`` (code 86) on C and LLVM.  The "wrap" policy is
-NumPy's lane and the same programs then match NumPy.
+NumPy's lane (``integer_arithmetic: wrap``) and the same programs then
+match NumPy.
 """
 
 from __future__ import annotations
@@ -126,9 +128,13 @@ def test_int64_lane_past_int64_is_reported_not_wrapped(backend, name):
 @pytest.mark.parametrize("backend", ["c", "llvm"])
 @pytest.mark.parametrize("name", ["neg", "abs", "lcg"])
 def test_wrap_policy_is_numpy_lane(backend, name, monkeypatch):
-    from src.compiler import ssa_llvm_backend
+    from src.compiler import ssa_call_input_adapters as adapters
 
-    monkeypatch.setattr(ssa_llvm_backend, "INT64_LANE_POLICY", "wrap")
+    mode = adapters._DEFAULT_NUMERIC_MODE
+    monkeypatch.setitem(
+        adapters._NUMERIC_CONVERSION_MODES, mode,
+        {**adapters._NUMERIC_CONVERSION_MODES[mode], "integer_arithmetic": "wrap"},
+    )
     lanes = OVERFLOWING[name]
     expected = {
         "neg": lambda x: -x,

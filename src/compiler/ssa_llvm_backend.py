@@ -842,8 +842,10 @@ def python_int_overflow_checked(instruction: _Any) -> bool:
     ``source_type``.
     """
 
-    return python_int_operation(instruction) and not python_int_proven_within(
-        instruction, _INT64_BOUNDS,
+    return (
+        python_int_operation(instruction)
+        and _python_int_exact()
+        and not python_int_proven_within(instruction, _INT64_BOUNDS)
     )
 
 
@@ -975,12 +977,18 @@ def python_int_unchecked_refusal(
     )
 
 
-#: What an int64 AbstractTensor lane means when its value leaves int64.
-#: "exact" is Python's ``int`` (Albert's decision: a lane faults with
-#: NativeIntOverflow rather than return a value Python never computes);
-#: "wrap" would be NumPy's two's-complement lane.  The one switch for the
-#: future wrap policy is this value.
-INT64_LANE_POLICY = "exact"
+def _python_int_exact() -> bool:
+    """The numeric contract asks int64 results to stay Python ``int``.
+
+    ``integer_arithmetic`` in the numeric contract
+    (``ssa_call_input_adapters._NUMERIC_CONVERSION_MODES``) is the one switch:
+    ``python_exact`` checks, ``wrap`` computes NumPy's two's-complement lane.
+    """
+
+    from .ssa_call_input_adapters import integer_arithmetic_policy
+
+    return integer_arithmetic_policy() == "python_exact"
+
 
 _LANE_CHECKED_OPERATIONS = frozenset({"add", "sub", "mul", "neg", "abs"})
 
@@ -993,7 +1001,7 @@ def python_int_lane_overflow_checked(
     Program: ``token * 1103515245 + 12345`` on an int64 AbstractTensor.
     Wrong record: every lane wrapped at int64 on C and LLVM, so a lane
     leaving int64 returned a value Python's ``int`` never computes.  Rule:
-    under ``INT64_LANE_POLICY == "exact"``, authored (``source_type``)
+    under the numeric contract's ``integer_arithmetic: python_exact``, authored (``source_type``)
     signed int64 Add/Sub/Mul/Neg/Abs over a span checks every lane and
     reports code 86.  No interval proves a lane's range, so every such lane
     is checked.  The scalar rule is ``python_int_overflow_checked``.
@@ -1008,8 +1016,7 @@ def python_int_lane_overflow_checked(
         operation.casefold(), operation,
     )
     return (
-        INT64_LANE_POLICY == "exact"
-        and result is not None
+        result is not None
         and operation.casefold() in _LANE_CHECKED_OPERATIONS
         and str(getattr(result, "dtype", "")).casefold() == "int64"
         and not _unsigned_value(result)
@@ -1023,6 +1030,7 @@ def python_int_lane_overflow_checked(
             # ``abs(tokens)`` is the authored builtin, ingested as such.
             or attributes.get("extraction_identity") == "builtins.abs"
         )
+        and _python_int_exact()
     )
 
 
