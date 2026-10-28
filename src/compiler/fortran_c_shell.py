@@ -157,6 +157,7 @@ from .resident_sequence_materialization import (
     _constant_struct_pack_materializations as _constant_struct_pack_materializations,
     _dict_literal_mutations as _dict_literal_mutations,
     _identity_return_aliases as _identity_return_aliases,
+    _returned_formal_sequence_aliases as _returned_formal_sequence_aliases,
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
@@ -27457,6 +27458,14 @@ def _class_surface_ssa_program(
                 field_sequence_aliases[int(alias_id)] = (
                     int(resident_id), aggregate_kind,
                 )
+        # Rule 8 for a whole sequence result: a call whose result is its
+        # caller argument's own list (``def mk(a): return a``) is that list,
+        # the same identity the planner forwards for scalar and member
+        # results.  The call publishes no storage of its own.
+        returned_formal_sequence_aliases = _returned_formal_sequence_aliases(
+            graph_obj, source_function_table,
+            call_result_kinds=sequence_call_result_kinds,
+        )
         (
             control,
             conditional_sequence_aliases,
@@ -27468,8 +27477,13 @@ def _class_surface_ssa_program(
             structural_aliases={
                 **source_transform_aliases,
                 **field_sequence_aliases,
+                **returned_formal_sequence_aliases,
             },
         )
+        conditional_sequence_aliases = {
+            **returned_formal_sequence_aliases,
+            **conditional_sequence_aliases,
+        }
         (
             sequence_concats,
             sequence_concat_aliases,
@@ -27802,6 +27816,8 @@ def _class_surface_ssa_program(
                 declared_sequence_ids.add(int(sequence_id))
         for call_result_id in sorted(sequence_call_result_kinds):
             if int(call_result_id) in native_handle_ids:
+                continue
+            if int(call_result_id) in returned_formal_sequence_aliases:
                 continue
             if call_result_id not in declared_sequence_ids:
                 sequence_declarations = (*sequence_declarations, (
@@ -48038,6 +48054,28 @@ def _class_surface_ssa_program(
                     # the latter, including when a call returns a frame alias.
                     from .structural_concordance import function_value_structure
                     from .ssa_record_return_state import publish_ssa_value_type
+                    from .identity_concordance import (
+                        resolved_concordant_alias_bindings,
+                    )
+
+                    # A call that returns its argument's own list is that
+                    # list (rule 8): it reads the actual's row and does not
+                    # redefine it, so the marker keeps the physical view it
+                    # was born with, which already agrees with the actual's.
+                    forwarded_actual = values.get(int(
+                        resolved_concordant_alias_bindings(
+                            str(caller_symbol),
+                        ).get(int(placeholder.id), -1)
+                    ))
+                    if (
+                        forwarded_actual is not None
+                        and forwarded_actual is not placeholder
+                        and caller_sequence_table is not None
+                        and caller_sequence_table.by_id(
+                            int(forwarded_actual.id)
+                        ) is not None
+                    ):
+                        return placeholder
 
                     structure, source_cell = function_value_structure(caller, int(produced.id))
                     # Program: ``keep`` (a callsite marker whose result the
@@ -51803,6 +51841,18 @@ def _class_surface_ssa_program(
                         result_is_caller_formal = any(
                             value is result for value in caller.args
                         )
+                        # The same holds for a whole list: a call that
+                        # returns its argument's own sequence reads the
+                        # actual's row (a display span or an arena) and
+                        # does not redefine it with the callee's view.
+                        if (
+                            aliased_return_argument_index is not None
+                            and callee_sequence_table is not None
+                            and callee_sequence_table.by_id(
+                                int(callee_output.id)
+                            ) is not None
+                        ):
+                            result_is_caller_formal = True
                         if not result_is_caller_formal:
                             # The caller-side placeholder may predate source-call
                             # linking and therefore carry no useful type.  A
