@@ -4954,14 +4954,34 @@ def lower_sequence_aggregate_constants(
     frame; the retained stores populate it on every invocation.
     """
 
-    arena_ids = {
-        int(descriptor.column_value_ids[0])
-        for table in sequence_tables.values()
-        for descriptor in table.sequences.values()
-        if descriptor.column_value_ids
-    }
+    arena_dtypes: dict[int, str | None] = {}
+    for table in sequence_tables.values():
+        for descriptor in table.sequences.values():
+            if not descriptor.column_value_ids:
+                continue
+            declared = (
+                str(descriptor.column_dtypes[0])
+                if descriptor.column_dtypes
+                and str(descriptor.column_dtypes[0]) not in {"", "unknown"}
+                else None
+            )
+            arena_dtypes.setdefault(int(descriptor.column_value_ids[0]), declared)
+    arena_ids = set(arena_dtypes)
     if not arena_ids:
         return
+
+    def arena_dtype(value: SSAValue) -> str:
+        # The arena's element type is proven by the Const's own annotation or
+        # by the sequence descriptor's declared first column; nothing else.
+        proven = value.dtype or arena_dtypes.get(int(value.id))
+        if not proven:
+            raise ValueError(
+                f"lower_sequence_aggregate_constants: sequence arena value "
+                f"%t{int(value.id)} has no proven element dtype (neither the "
+                f"aggregate Const nor its sequence descriptor declares one)"
+            )
+        return str(proven)
+
     for function in functions.values():
         locally_initialized_arena_ids = {
             int(instruction.args[0].id)
@@ -4993,7 +5013,7 @@ def lower_sequence_aggregate_constants(
                         # backend to print a Python container as one literal.
                         promoted[value_id] = SSAValue(
                             value_id,
-                            dtype=instruction.res.dtype or "unknown",
+                            dtype=arena_dtype(instruction.res),
                             accounting={
                                 "sequence_arena": True,
                                 "compile_time_initialized": True,
@@ -5005,7 +5025,7 @@ def lower_sequence_aggregate_constants(
                         continue
                     promoted[int(instruction.res.id)] = SSAValue(
                         int(instruction.res.id),
-                        dtype=instruction.res.dtype or "unknown",
+                        dtype=arena_dtype(instruction.res),
                         accounting={"sequence_arena": True},
                     )
                     continue
