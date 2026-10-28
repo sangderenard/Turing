@@ -46841,16 +46841,29 @@ def _class_surface_ssa_program(
     def frame_fixed_point_digest() -> str:
         """Fingerprint every mutable ledger governed by the frame pass."""
 
+        import io
         import pickle
+        import types
         payload = (
             all_functions,
             all_record_tables,
             all_sequence_tables,
             call_records,
         )
-        return hashlib.sha256(
-            pickle.dumps(payload, protocol=5)
-        ).hexdigest()
+
+        class _LedgerPickler(pickle.Pickler):
+            # A retained source class keeps its defining module's lexical
+            # bindings (``math`` for ``Precision``) on the ClassDef the
+            # record-class page holds. A module is immutable here and is
+            # named by its import path, so the digest records the name.
+            def persistent_id(self, value):
+                if isinstance(value, types.ModuleType):
+                    return ("module", value.__name__)
+                return None
+
+        buffer = io.BytesIO()
+        _LedgerPickler(buffer, protocol=5).dump(payload)
+        return hashlib.sha256(buffer.getvalue()).hexdigest()
 
     frame_states = {frame_fixed_point_digest(): 0}
     frame_guard = BoundedFixedPoint(
