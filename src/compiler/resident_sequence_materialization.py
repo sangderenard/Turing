@@ -3882,6 +3882,33 @@ def list_row_displays(graph_obj: Any) -> dict[int, tuple[tuple[int, int], ...]]:
     return result
 
 
+def dict_row_displays(graph_obj: Any) -> dict[int, tuple[tuple[int, int], ...]]:
+    """Each dict display whose values are all list displays, by value id.
+
+    The value is its rows in entry order as ``(row value id, row node)``.
+    Such a mapping's value column holds child-pool row handles, as a
+    ``setdefault(key, [])`` receiver's does.
+    """
+
+    result: dict[int, tuple[tuple[int, int], ...]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if not (
+            attributes.get("aggregate_kind") == "dict"
+            and attributes.get("mapping_value_aggregate_kind") == "list"
+            and isinstance(data.get("expr_obj"), ast.Dict)
+        ):
+            continue
+        rows = tuple(
+            (int(graph_obj.nodes[parent].get("value_id", parent)), int(parent))
+            for parent, role in data.get("parents") or ()
+            if str(role).startswith("values") and parent in graph_obj
+        )
+        if rows:
+            result[int(data.get("value_id", node_id))] = rows
+    return result
+
+
 def list_row_pool_extents(graph_obj: Any) -> dict[int, tuple[int, int]]:
     """``(rows, stride)`` of each list of lists' child-table pool.
 
@@ -3892,7 +3919,10 @@ def list_row_pool_extents(graph_obj: Any) -> dict[int, tuple[int, int]]:
     """
 
     extents: dict[int, tuple[int, int]] = {}
-    for outer, rows in list_row_displays(graph_obj).items():
+    for outer, rows in (
+        *list_row_displays(graph_obj).items(),
+        *dict_row_displays(graph_obj).items(),
+    ):
         stride = 0
         for row, node in rows:
             data = graph_obj.nodes[node]
@@ -3931,6 +3961,9 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
     """
 
     outers = set(list_row_displays(graph_obj))
+    # A dict display of lists: ``d[k]`` is its keyed lookup, the row a
+    # selected pool slice.  (Iterating the dict yields keys, not rows.)
+    mapping_outers = set(dict_row_displays(graph_obj))
     # ``g[i][1] = v`` is a new version of ``g`` (a loop may carry it): reads
     # of any version are reads of the same list of lists.
     aliases = _loop_carried_storage_aliases(graph_obj)
@@ -3942,6 +3975,8 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
             root = int(aliases[root])
         if root in outers:
             outers.add(int(version))
+        if root in mapping_outers:
+            mapping_outers.add(int(version))
     reads = []
     for node_id, data in graph_obj.nodes(data=True):
         if str(data.get("op") or data.get("type") or "").casefold() != "indexed":
@@ -3952,7 +3987,7 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
         ), None)
         if base is not None and int(
             graph_obj.nodes[base].get("value_id", base)
-        ) in outers:
+        ) in (outers | mapping_outers):
             reads.append(int(data.get("value_id", node_id)))
     # ``for r in g``: the loop target is a row of the list of lists.
     for node_id, data in graph_obj.nodes(data=True):
@@ -4314,6 +4349,87 @@ def _dict_update_mutations(graph_obj: Any) -> tuple[Any, ...]:
     return tuple(mutations)
 
 
+def _dict_rows_born_by_display(
+    graph_obj: Any, node_id: int, data: Mapping[str, Any],
+    expression: ast.Dict, key_parents: tuple[tuple[int, int], ...],
+) -> tuple[Any, ...]:
+    """Birth of a dict display whose values are all list displays.
+
+    Program: ``d = {1: [n, 2, 3]}; d[1][2]``.  Wrong record: the list value
+    was stored as its own arena's id where the value column holds child-pool
+    handles, so a read through it returned 0 (silent).  Rule: each entry is
+    a ``setdefault`` of its key (the row's handle is allocated in the child
+    pool, as for ``d.setdefault(k, []).append(...)``), then the row's member
+    appends against that pool slice, in order, at the display.  A repeated
+    key selects the same row and clears it first, as a later entry replaces
+    an earlier one.
+    """
+
+    from .control_source import ControlExpression, ControlSequenceMutation
+    from .string_table import string_token
+
+    sequence_id = int(data.get("value_id", node_id))
+    value_parents = tuple(
+        (int(parent), int(graph_obj.nodes[parent].get("value_id", parent)))
+        for parent, role in data.get("parents") or ()
+        if str(role).startswith("values") and parent in graph_obj
+    )
+    if not (
+        len(key_parents) == len(value_parents) == len(expression.keys)
+        and None not in expression.keys
+    ):
+        raise ValueError(
+            f"dict {sequence_id} lists its rows without one exact key and "
+            "list producer per entry; a mapping of lists is lowered only "
+            "from keyed list displays"
+        )
+    rows = {value_id for _node, value_id in value_parents}
+    if len(rows) != len(value_parents):
+        raise ValueError(
+            f"dict {sequence_id} stores one list under two keys; a shared "
+            "row has one pool slice and is not lowered"
+        )
+    births = _list_literal_mutations(graph_obj, rows)
+    members_of: dict[int, list[Any]] = {}
+    for item in births:
+        if str(item.operator) != "clear":
+            members_of.setdefault(int(item.sequence_value_id), []).append(item)
+    mutations = []
+    for position, (key_expression, (key_node, key_value), (row_node, row_value)) in enumerate(zip(
+        expression.keys, key_parents, value_parents,
+    )):
+        key_literal = (
+            key_expression.value
+            if isinstance(key_expression, ast.Constant) else None
+        )
+        key_ir = None
+        if isinstance(key_literal, (bool, int, float, str)):
+            key_ir = ControlExpression(
+                "const", value_id=key_value,
+                literal=(
+                    string_token(key_literal)
+                    if isinstance(key_literal, str) else key_literal
+                ),
+            )
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=sequence_id, operator="setdefault",
+            # The pool path reads no default (the row is born empty and
+            # filled by the appends below); naming the row here would make
+            # the setdefault consume what its own appends produce.
+            argument_value_ids=(key_value, key_value),
+            effect_node_id=row_node, policy="unique",
+            argument_kind="mapping_child_row",
+            argument_expressions=(key_ir, None),
+            display_member=(int(node_id), position << 16),
+        ))
+        for item in members_of.get(row_value, ()):
+            mutations.append(replace(item, display_member=(
+                int(node_id),
+                (position << 16) | (1 + int(item.display_member[1])),
+            )))
+    return tuple(mutations)
+
+
 def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
     """Materialize authored dynamic dict rows at the literal's source site.
 
@@ -4404,6 +4520,11 @@ def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
             sequence_value_id=sequence_id, operator="clear",
             argument_value_ids=(), effect_node_id=int(node_id), policy="unique",
         ))
+        if attributes.get("mapping_value_aggregate_kind") == "list":
+            mutations.extend(_dict_rows_born_by_display(
+                graph_obj, int(node_id), data, expression, key_parents,
+            ))
+            continue
         value_parents = tuple(
             (int(parent), int(graph_obj.nodes[parent].get("value_id", parent)))
             for parent, role in data.get("parents") or ()
