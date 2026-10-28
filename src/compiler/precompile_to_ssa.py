@@ -29505,6 +29505,39 @@ def lower_control_sections_to_ssa(
         from .identity_concordance import current_identity_book
 
         item_operand_page = current_identity_book().page("item_operand")
+    def retained_lookup_ids(block):
+        if isinstance(block, SequenceQueryBlock) and block.operation == "lookup":
+            yield int(block.result_value_id)
+        for child in getattr(block, "blocks", ()):
+            yield from retained_lookup_ids(child)
+        for name in ("condition", "body", "orelse", "callee"):
+            child = getattr(block, name, None)
+            if child is not None:
+                yield from retained_lookup_ids(child)
+
+    retained_table_lookup_ids = set(retained_lookup_ids(control.root))
+    scheduled_lookup_ids = {
+        int(operation[0])
+        for operations in (
+            *table_region_operations.values(),
+            *table_region_post_operations.values(),
+        )
+        for kind, operation in operations
+        if str(kind) in {"lookup", "lookup_capture"}
+    }
+    # Lookups the control tree retains or a loop owns are placed there.
+    unplaced_lookup_ids = {
+        int(result_id)
+        for result_id, query_ids, _sequence_id in table_lookups
+        if int(result_id) not in scheduled_lookup_ids
+        and int(result_id) not in retained_table_lookup_ids
+        and not any(
+            int(key) in (table_lookup_loop_owners or {})
+            for key in (
+                query_ids if isinstance(query_ids, tuple) else (query_ids,)
+            )
+        )
+    }
     for region_index, instructions in planned_region_instructions.items():
         # Program: ``xs1 = [4, n]; xs1[0] += n; return xs1[0]`` (fuzzer
         # p25_25; corpus c273).  Wrong record: the store's region spelled
@@ -29563,19 +29596,46 @@ def lower_control_sections_to_ssa(
                 if read_id is not None
             ),
         )))
+        # An unscheduled captured lookup likewise reads its key: ``self._d.get(k +
+        # 7, -1)`` needs the region producing ``k + 7`` first.
+        consumed = tuple(dict.fromkeys((
+            *consumed,
+            *(
+                int(query)
+                for value_id in consumed
+                if int(value_id) in unplaced_lookup_ids
+                for lookup in (lookup_by_result.get(int(value_id)),)
+                if lookup is not None
+                for query in (
+                    lookup[1] if isinstance(lookup[1], (tuple, list))
+                    else (lookup[1],)
+                )
+                if isinstance(query, int)
+            ),
+        )))
         region_dependency_signatures[int(region_index)] = (consumed, produced)
 
-    def retained_lookup_ids(block):
-        if isinstance(block, SequenceQueryBlock) and block.operation == "lookup":
-            yield int(block.result_value_id)
-        for child in getattr(block, "blocks", ()):
-            yield from retained_lookup_ids(child)
-        for name in ("condition", "body", "orelse", "callee"):
-            child = getattr(block, name, None)
-            if child is not None:
-                yield from retained_lookup_ids(child)
+    # Program: ``self._d[k] = v`` then ``return self._d.get(k + 7, -1) +
+    # len(self._d)`` in a method.  Wrong record: no region scheduled the
+    # lookup (its receiver is a record field, not a region value), so the
+    # prologue emitted it at entry, before its key's region and before the
+    # store it must observe; the final audit refused the read before the
+    # definition.  Rule: an unscheduled lookup a region captures is emitted
+    # with the first such region, as that region's captured lookup.
+    for result_id, lookup in sorted(lookup_by_result.items()):
+        if result_id not in unplaced_lookup_ids:
+            continue
+        consumers = sorted(
+            int(region_index)
+            for region_index, (consumed, _produced)
+            in region_dependency_signatures.items()
+            if int(result_id) in consumed
+        )
+        if consumers:
+            table_region_operations.setdefault(consumers[0], []).append((
+                "lookup_capture", lookup,
+            ))
 
-    retained_table_lookup_ids = set(retained_lookup_ids(control.root))
     region_scheduled_lookup_ids = {
         int(operation[0])
         for operations in (
