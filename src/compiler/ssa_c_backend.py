@@ -6505,6 +6505,14 @@ def emit_ssa_module_to_c(
                     and _scalar_c_type(instruction.res.dtype) == "int64_t"
                     and all(
                         is_integer(value) and not _is_unsigned_dtype(value.dtype)
+                        # Program: ``(a * b) % p`` with ``a * b`` proven
+                        # int128 and the remainder proven int64.  Wrong
+                        # record: the int64 statement narrowed the int128
+                        # operand before ``%``.  Rule: as the LLVM lane's
+                        # i64 operand gate, the int64 statement takes only
+                        # operands int64 holds; wider ones keep the floored
+                        # helper of their own domain.
+                        and str(value.dtype or "").casefold() != "int128"
                         for value in instruction.args
                     )
                     and _python_int_spelled(op, instruction)
