@@ -3637,7 +3637,7 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         # which the control book cannot own (as ``[n, n]`` is refused
         # below).  Rule: refuse such a replication by name.
         # Program: the tire's ``vector_cross`` (``left[..., 1]``; corpus
-        # c500), whose indexing builds ``[slice(None)] * rank``.  Wrong
+        # c970), whose indexing builds ``[slice(None)] * rank``.  Wrong
         # record: the index folded, so nothing reads the replication or
         # its row display ``[slice(None)]``; the replication was still
         # refused for its row operand (when folded too), and the display
