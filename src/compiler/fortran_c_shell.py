@@ -17663,6 +17663,7 @@ def _sequence_row_operations(
     }
     if not widths:
         return ()
+    nested_row_reads = set(map(int, list_row_reads(graph_obj)))
     identities = graph_obj.graph.get("identity_table") or {}
     resident_by_value = {
         int(value_id): int(sequence_id)
@@ -17811,6 +17812,23 @@ def _sequence_row_operations(
             if base_node is None or row_index_node is None or row_value_node is None:
                 continue
             sequence_id = resident_by_value.get(value_id(base_node))
+            # Program: ``g = [[1, 2], [3, 4]]; g[i][1] = v`` (corpus c740).
+            # Wrong record: the row ``g[i]`` is a declared one-column row
+            # sequence, but the store fell through to the region, where the
+            # row view was an arena formal with no contract.  Rule: a store
+            # into a row read of a born list of lists is a row store on that
+            # row's own sequence, exactly as its reads are row loads.
+            if (
+                sequence_id in positional_sequences
+                and widths[sequence_id] == 1
+                and value_id(base_node) in nested_row_reads
+            ):
+                operations.append((
+                    "store", value_id(node_id), int(sequence_id),
+                    value_id(row_index_node), integer_literal(row_index_node),
+                    (value_id(row_value_node),), value_id(base_node),
+                ))
+                continue
             if sequence_id is None:
                 # ``item.members[index][1]=value`` is a column write to the
                 # existing row, not a dereference of a scalar row payload.
@@ -21909,11 +21927,14 @@ def _settle_linked_dynamic_sequences(
     # grows anywhere is DYNAMIC in every view (rule 4).
     from .resident_sequence_materialization import (
         _list_merged_from_unequal_displays,
+        _returned_copy_merge,
     )
 
     for graph_obj in graphs:
         for node_id, data in graph_obj.nodes(data=True):
             if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+                continue
+            if _returned_copy_merge(graph_obj, int(node_id)):
                 continue
             merged_key = (id(graph_obj), int(data.get("value_id", node_id)))
             for arm, role in data.get("parents") or ():
@@ -21957,6 +21978,15 @@ def _settle_linked_dynamic_sequences(
         seeds.update(
             (id(graph_obj), value_id)
             for value_id in local_lists & output_ids
+        )
+        # Program: ``a = [n, 1]; t = a if n > 2 else [7, n, 2]; return t``
+        # (c743).  The returned merge owns the result storage its arms are
+        # copied into; its rows are decided at run time, so it is a returned
+        # local list in the sense above and DYNAMIC (the c56 contract).
+        seeds.update(
+            (id(graph_obj), int(data.get("value_id", node_id)))
+            for node_id, data in graph_obj.nodes(data=True)
+            if _returned_copy_merge(graph_obj, int(node_id))
         )
         # Program: ``if n > 2: return [n]`` / ``return []`` (lanes plan A6).
         # Wrong record: the result list (the ``[]``) was FIXED at its own
@@ -59733,9 +59763,22 @@ def _class_surface_ssa_program(
                         f"{(_function_name, _value_id)!r}: "
                         f"ssa={_existing!r}, concordance={_shape!r}"
                     )
+                # Program: ``a, b, c = f(...)`` then ``c[0]`` (a list
+                # returned by a callee).  Wrong record: the call ABI's
+                # ``value_shape`` storage (``span``) was restated over the
+                # row's posted ``sequence`` storage, settled from the
+                # value's SEQUENCE_CONTRACT; the physical view then refused
+                # the two.  Rule: the shape row states the shape; a storage
+                # the value's own row already carries is the posted
+                # authority and is kept.
+                _posted_fact = _posted_ssa_value_fact(
+                    _function, int(_value_id),
+                )
+                _posted_storage = getattr(_posted_fact, "storage", None)
                 _shape_physical = {
                     "rank": len(_shape),
-                    **({"storage": _storage} if _storage else {}),
+                    **({"storage": _storage}
+                       if _storage and not _posted_storage else {}),
                 }
                 publish_ssa_value_type(
                     _function, _value, dtype=_structure.dtype or _dtype or None,
