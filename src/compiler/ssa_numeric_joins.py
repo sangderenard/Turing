@@ -12,10 +12,14 @@ converts the narrower operand the same way Python does (``s + 0.25``,
 ``acc += s``; ``s + s`` is int + int on one path).  A ``For`` header that
 carries its update's class because the loop provably runs is such a join
 inside the body (the seed on the first trip) and exact at the exit when
-its update is not a join.  Anything else --
+its update is not a join.  So is the promoted read view of a numeric
+union call result (``_promote_union_call_result``: a ``Select`` on the tag
+over each arm's own payload), which is followed like a Phi.  Anything else --
 the value leaving the program, a comparison, ``//`` or ``%`` with an int,
 a store, ``type()`` -- can tell the classes apart, so it is refused by
-name.  The union lowering that keeps each arm's exact class is not built.
+name.  A join or call result that leaves the program, or a function, as
+its value-union frame keeps each arm's exact class; its other readers are
+not built yet.
 """
 
 from __future__ import annotations
@@ -137,7 +141,11 @@ def refuse_type_visible_numeric_joins(module: Any) -> int:
                         # The loop provably ran and its update is exact:
                         # the exit is the update's class, the header's.
                         continue
-                    if op in _PASS_THROUGH_OPS and instruction.res is not None:
+                    if (
+                        op in _PASS_THROUGH_OPS
+                        or instruction.attributes.get("binding")
+                        == "numeric_union_call_result"
+                    ) and instruction.res is not None:
                         pending.append((function_name, int(instruction.res.id)))
                     elif op in _ARITHMETIC_OPS:
                         others = [
