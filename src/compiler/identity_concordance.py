@@ -437,9 +437,15 @@ def publish_program_abi_graph_identities(
                         declared_shape = (int(field["fixed_length"]),)
                     if storage == "span" and declared_shape is not None:
                         declared_shape = tuple(map(int, declared_shape))
+                        if not field.get("dtype"):
+                            raise ValueError(
+                                f"class field {field_name!r} declares a span "
+                                f"of shape {declared_shape} but records no "
+                                "element dtype"
+                            )
                         declared_state = {
                             "shape": declared_shape,
-                            "dtype": str(field.get("dtype") or "float64"),
+                            "dtype": str(field["dtype"]),
                             "rank": int(field.get(
                                 "rank", len(declared_shape),
                             )),
@@ -10410,6 +10416,13 @@ def record_proven_shape(
     extents = tuple(int(extent) for extent in (extents or ()))
     if not extents:
         return
+    if not dtype:
+        raise ValueError(
+            f"proven shape for value {int(value_id)} of "
+            f"{_shape_key(function)!r} (extents {extents}) was posted with "
+            "no dtype; the caller never recorded the element type, so the "
+            "proof refuses to invent one"
+        )
     book = current_identity_book()
     page = book.page(PROVEN_SHAPE_PAGE)
     row = (_shape_key(function), int(value_id))
@@ -10430,7 +10443,7 @@ def record_proven_shape(
         max(recorded_levels, default=0)
         if level is None else int(level)
     )
-    fact = ("proven", extents, str(dtype or "float64"), target_level)
+    fact = ("proven", extents, str(dtype), target_level)
     if not recorded:
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
@@ -10455,7 +10468,7 @@ def record_proven_shape(
         target_level = max(recorded_levels, default=-1) + 1
         if level is not None:
             target_level = max(target_level, int(level))
-        fact = ("proven", extents, str(dtype or "float64"), target_level)
+        fact = ("proven", extents, str(dtype), target_level)
         state_ref = book.latest_ref(SHAPE_STATE_PAGE, row)
         _post_or_unsourced(
             book, PROVEN_SHAPE_PAGE, row, fact, PROVEN_SHAPE_STAGE,
@@ -10477,7 +10490,7 @@ def record_proven_shape(
         # confirmed more deeply; retain that depth and let the duplicate
         # source check below decide whether any new evidence was added.
         target_level = deepest_level
-        fact = ("proven", extents, str(dtype or "float64"), target_level)
+        fact = ("proven", extents, str(dtype), target_level)
     if (
         tuple(deepest[1][1]) == extents
         or target_level > deepest_level

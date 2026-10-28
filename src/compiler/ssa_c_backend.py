@@ -496,8 +496,9 @@ def emit_ssa_function_to_c(
         if op in {"Cast", "CastLike", "cast_like"} and len(args) >= 1:
             target = str(
                 instruction.attributes.get("target_dtype")
-                or instruction.res.dtype
-                or "float64"
+                or _settled_dtype(
+                    instruction.res.dtype, instruction.res.id,
+                    "Cast target_dtype attribute or result dtype")
             ).casefold()
             if target in {"bool", "i1"}:
                 rendered = f"(({args[0]}) != 0.0)"
@@ -694,8 +695,19 @@ _PRECISION_HOSTILE_FLAGS = (
 )
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 def _scalar_c_type(dtype) -> str:
-    name = str(dtype or "float64").casefold()
+    name = str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold()
     if name == "ptr":
         return "double *"
     if name == "none":
@@ -715,12 +727,12 @@ def _unsigned_c_type(dtype) -> str:
 
 
 def _is_integer_dtype(dtype) -> bool:
-    layout = resolve_dtype(str(dtype or "float64").casefold())
+    layout = resolve_dtype(str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold())
     return layout is not None and layout.kind in {"int", "uint", "bool"}
 
 
 def _is_unsigned_dtype(dtype) -> bool:
-    layout = resolve_dtype(str(dtype or "float64").casefold())
+    layout = resolve_dtype(str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold())
     return layout is not None and layout.kind == "uint"
 
 
@@ -762,7 +774,7 @@ def _buffer_c_type(dtype) -> str:
     memory, and the value widens on load rather than on the way in.
     """
 
-    name = str(dtype or "float64").casefold()
+    name = str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold()
     if name == "ptrptr_float64":
         return "double *"
     if name == "none":
@@ -2453,7 +2465,8 @@ def emit_ssa_module_to_c(
         # The native uint64 Add(2**53+1, 0) audit must retain its declaring
         # dtype after width settlement; reversing i64 alone loses signedness.
         declared = resolve_dtype(str((value.accounting or {}).get(
-            "physical_dtype") or value.dtype or "float64").casefold())
+            "physical_dtype") or _settled_dtype(
+                value.dtype, value.id, "SSAValue.dtype")).casefold())
         if declared is not None and declared.llvm_type == llvm_type:
             return declared.c_storage_type
         return c_lane_storage_for_llvm_type(llvm_type)
@@ -2465,7 +2478,8 @@ def emit_ssa_module_to_c(
         # bool and uint8 share uint8_t memory but different public value
         # classes. Preserve the declaring record, not a reverse C lookup.
         layout = resolve_dtype(str((value.accounting or {}).get(
-            "physical_dtype") or value.dtype or "float64").casefold())
+            "physical_dtype") or _settled_dtype(
+                value.dtype, value.id, "SSAValue.dtype")).casefold())
         if layout is not None and layout.c_storage_type == held:
             return layout.name
         return _dtype_for_c_storage(held)
@@ -5715,7 +5729,14 @@ def emit_ssa_module_to_c(
                         op, f"mixed signed/unsigned operands require an explicit conversion in {fn}",
                     ))
                     continue
-                declared_storage_type = _scalar_c_type(instruction.res.dtype)
+                # An address view carries no scalar dtype of its own; every
+                # other result must have its dtype settled by now.
+                declared_storage_type = (
+                    None if op in {"GetElementPtr", "getelementptr"}
+                    else _scalar_c_type(_settled_dtype(
+                        instruction.res.dtype, instruction.res.id,
+                        f"result dtype of {op}"))
+                )
                 if op in {"GetElementPtr", "getelementptr"} and len(args) >= 2:
                     # Checked sequence extend passes source length formal 11
                     # (int64[1]) as a ptr-typed address occurrence. The formal

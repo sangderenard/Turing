@@ -79,7 +79,8 @@ def return_slot_structure(scope, site, slot, *, book=None):
     return book.page(STRUCTURAL_VALUE).cell(cell.row, cell.column), cell
 
 
-def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=()):
+def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=(),
+                       storage_scope=None):
     """The current physical view of existing concordance authorities.
 
     A source annotation, a shape state and a semantic mint are views of one
@@ -170,6 +171,7 @@ def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=())
                     if isinstance(value, SSAValueFact):
                         physical = _ssa_physical_view(
                             read, *operand.row, value, shape_scope=shape_scope, active=active,
+                            storage_scope=storage_scope,
                         )
                         incoming.append((value, physical))
                         # The existing Phi law inherits storage/rank, not a
@@ -203,7 +205,8 @@ def _ssa_structure(read, scope, value_id, shape_scope=None, storage_scope=None):
     cell = read.ref(SSA_VALUE, row)
     if cell is None or not isinstance(fact, SSAValueFact):
         raise ConcordanceRefusal(f"physical structure lacks SSA identity: {row!r}")
-    physical = _ssa_physical_view(read, scope, value_id, fact, shape_scope)
+    physical = _ssa_physical_view(read, scope, value_id, fact, shape_scope,
+                                  storage_scope=storage_scope)
     dtype = None if fact.dtype in (None, "", "unknown") else str(fact.dtype)
     shape = tuple(fact.shape or ())
     if shape_scope is not None:
