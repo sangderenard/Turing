@@ -3419,79 +3419,7 @@ def _handle_merge_storage_roots(graph_obj: Any) -> dict[int, int]:
             if left != right:
                 parent[max(left, right)] = min(left, right)
     roots = {value_id: find(value_id) for value_id in list(parent)}
-    _refuse_store_through_handle_then_arm_read(graph_obj, roots)
     return roots
-
-
-def _refuse_store_through_handle_then_arm_read(
-    graph_obj: Any, roots: Mapping[int, int],
-) -> None:
-    """Refuse a store through a handle merge read later through another member.
-
-    Program: ``a = [7, 8, 9]; x = a if n > 2 else [4, 5]; grow(x, n);
-    x[0] = 100 + n; return a[0]``.  Wrong record: ``x`` is ``a`` on one
-    path, but the later row read of ``a`` was scheduled before the store
-    through ``x`` (``a[0]`` read the old row, silently), once a call that
-    changes the component precedes the store.  No exact order exists for it
-    yet, so the form is refused by name instead of lowered.
-    """
-
-    if not roots:
-        return
-    escaped = {
-        int(graph_obj.nodes[int(argument)].get("value_id", argument))
-        for _call, argument in _call_escaped_argument_edges(graph_obj)
-        if int(argument) in graph_obj
-    }
-    if not escaped & set(roots):
-        return
-
-    # Only a store through the merge itself: a store through an arm is
-    # ordered by that arm's own version chain and the merge reads it.
-    merged_values = {
-        int(data.get("value_id", node_id))
-        for node_id, data in graph_obj.nodes(data=True)
-        if _list_merged_from_branches(graph_obj, int(node_id))
-        and not _returned_copy_merge(graph_obj, int(node_id))
-    }
-
-    def position(node):
-        expression = graph_obj.nodes[node].get("expr_obj")
-        return (
-            int(getattr(expression, "lineno", 0) or 0),
-            int(getattr(expression, "col_offset", 0) or 0),
-        )
-
-    for store, data in graph_obj.nodes(data=True):
-        if str(data.get("type")) != "IndexedStore":
-            continue
-        for base, role in data.get("parents") or ():
-            if str(role) != "base" or int(base) not in graph_obj:
-                continue
-            base_value = int(graph_obj.nodes[base].get("value_id", base))
-            if base_value not in merged_values:
-                continue
-            for reader, reader_data in graph_obj.nodes(data=True):
-                if (
-                    str(reader_data.get("type")) in {"IndexedStore", "Phi"}
-                    or position(reader) <= position(store)
-                ):
-                    continue
-                for parent, _role in reader_data.get("parents") or ():
-                    member = int(
-                        graph_obj.nodes[parent].get("value_id", parent)
-                    ) if parent in graph_obj else None
-                    if (
-                        member is not None and member != base_value
-                        and roots.get(member) == roots[base_value]
-                    ):
-                        raise ValueError(
-                            f"list {base_value} is a branch merge stored "
-                            f"through after a call that changes it, and the "
-                            f"list {member} it may be is read later; the "
-                            "store cannot yet be ordered before that read "
-                            "(refused: store_through_handle_merge_then_arm_read)"
-                        )
 
 
 def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:

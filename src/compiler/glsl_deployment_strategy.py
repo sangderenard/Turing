@@ -13427,6 +13427,37 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         ):
             if start >= end and reader != int(effect_id):
                 edges.add((int(effect_id), reader))
+    # Program: ``a = [7, 8, 9]; x = a if n > 2 else [4, 5]; grow(x, n);
+    # x[0] = 100 + n`` then ``return a[0] * 10 + a[1]`` (corpus c877/c878).
+    # Wrong record: ``x`` is a handle onto ``a``'s storage, so the store
+    # through ``x`` is an effect on the one storage ``a`` is read from, but
+    # an indexed store was ordered only before the reads that precede it;
+    # the reads of ``a`` after it (and the arithmetic over them) were fused
+    # into a region placed before the store block (silent stale rows).
+    # Rule: a store through a member of a handle component precedes every
+    # later read of any member of that component, as a call's effect does
+    # (a store on an unshared version is ordered by its version edge).
+    for node_id, data in graph.G.nodes(data=True):
+        if str(data.get("type")) != "IndexedStore":
+            continue
+        expression = data.get("expr_obj")
+        if getattr(expression, "end_lineno", None) is None:
+            continue
+        end = (
+            int(expression.end_lineno),
+            int(getattr(expression, "end_col_offset", 0) or 0),
+        )
+        for parent, role in data.get("parents") or ():
+            if str(role) != "base" or parent not in graph.G:
+                continue
+            base_value = int(graph.G.nodes[parent].get("value_id", parent))
+            if base_value not in handle_roots:
+                continue
+            for start, reader in readers_by_sequence.get(
+                storage_key(base_value), (),
+            ):
+                if start >= end and int(reader) != int(node_id):
+                    edges.add((int(node_id), int(reader)))
     # Program: ``xs = [3, n]; xs.append(2); a = xs[1]; xs[1] = 9`` then
     # ``return a + 0`` (scratch lp/c_t; ``xs.pop(1)`` likewise).  Wrong
     # record: an effect was ordered only before the reads after it, so
@@ -13544,6 +13575,12 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     graph.G.graph["sequence_read_before_effect_edges"] = tuple(
         sorted(edge for edge in read_before_effect if edge in edges)
     )
+    # The region schedule orders regions by this graph's ancestry; an
+    # effect-to-read edge that is passed only to the reducer never reached
+    # it (corpus c877: the store region was called after the region that
+    # consumes a later read of its handle's storage).  Publish the edges
+    # so the schedule orders regions by them too.
+    graph.G.graph["sequence_effect_order_edges"] = tuple(sorted(edges))
     return frozenset(edges)
 
 
