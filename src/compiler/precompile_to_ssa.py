@@ -18476,10 +18476,14 @@ class _ControlSSABuilder(TiledObject):
                 merged.dtype = self._numeric_join(
                     (true_value, false_value),
                 ) or true_value.dtype or false_value.dtype
+            join_arms = (true_value, false_value)
             true_value, false_value = self._numeric_join_arms(
                 merged.dtype if not tuple(merged.shape or ()) else None,
                 ((true_exit, true_value), (false_exit, false_value)),
             )
+            # An arm converted to the join's class: where Python could tell
+            # the classes apart, ``ssa_numeric_joins`` refuses the join.
+            numeric_join_promoted = (true_value, false_value) != join_arms
             if (
                 int(result_id) not in self.region_value_meta
                 and tuple(true_value.shape) == tuple(false_value.shape)
@@ -18493,6 +18497,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_result",
+                    **({"numeric_join_promoted": True}
+                       if numeric_join_promoted else {}),
                     # The merge of a short-circuit operator IS the operator.
                     **({
                         "structural_operation": "boolop",
@@ -22628,10 +22634,12 @@ class _ControlSSABuilder(TiledObject):
                     str(value.dtype) for value in incoming_values
                     if value.dtype not in {None, "unknown", "none", "None"}
                 }
+                numeric_join_promoted = False
                 if len(merge_dtypes) > 1:
                     promoted = self._numeric_join(incoming_values)
                     if promoted is not None:
                         dtype = promoted
+                        numeric_join_promoted = True
                         incoming_values = list(self._numeric_join_arms(
                             dtype, tuple(
                                 (block, value)
@@ -22693,6 +22701,8 @@ class _ControlSSABuilder(TiledObject):
                             "incoming_blocks": tuple(incoming_blocks),
                             "binding": "return_merge",
                             "return_slot_index": slot,
+                            **({"numeric_join_promoted": True}
+                               if numeric_join_promoted else {}),
                             **(
                                 {"return_arm_absent": tuple(incoming_absent)}
                                 if member_phi else {}

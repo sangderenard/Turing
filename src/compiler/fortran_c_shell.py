@@ -59938,6 +59938,12 @@ def _class_surface_ssa_program(
     lowered_module.metadata["optional_scalar_return_lowerings"] = len(
         lower_optional_scalar_returns(lowered_module)
     )
+    # A join of int and float arms is one physical class; refuse it where
+    # Python would see each arm's own class (``ssa_numeric_joins``).
+    from .ssa_numeric_joins import refuse_type_visible_numeric_joins
+    lowered_module.metadata["numeric_join_promotions"] = (
+        refuse_type_visible_numeric_joins(lowered_module)
+    )
     from .ssa_reachability import hoist_nondominating_constants
     lowered_module.metadata["nondominating_constant_hoists"] = tuple(
         receipt
