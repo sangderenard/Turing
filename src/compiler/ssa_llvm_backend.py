@@ -6421,6 +6421,37 @@ def _emit_repository_call_module(
             wrapper.append(f"  store {llvm_type} {rows}, ptr {public_pointer[capacity_id]}, align {_align(llvm_type)}")
             entry_span.take(UnitKind.STATEMENT, args=(capacity, *(root_arguments[int(column)]
                 for column in sequence.column_value_ids)), spelling=public_pointer[capacity_id])
+    # Program: ``g = [[1, 2], [3, 4]]; return g[i][j]`` (c860-c869e; lane
+    # G).  Wrong record: the C wrapper publishes a root-owned list of lists'
+    # child-table pool capacity and row stride from the root's
+    # ``child_pool_static_extents``; this wrapper never read that record, so
+    # both cells stayed 0 and the first row allocation reported code 75
+    # (capacity exhausted) where C ran.  Rule: publish the same two cells
+    # from the same record before the entry call.
+    if root_sequences is not None:
+        for outer_id, rows, stride in tuple(
+            root.metadata.get("child_pool_static_extents", ())
+        ):
+            outer = root_sequences.sequences.get(int(outer_id))
+            pool = None if outer is None else outer.child_table_pool
+            if pool is None:
+                continue
+            for member_id, member_value in (
+                (pool.capacity_value_id, int(rows) * int(stride)),
+                (pool.row_stride_value_id, int(stride)),
+            ):
+                if int(member_id) not in allocated_counts:
+                    continue
+                member = root_arguments[int(member_id)]
+                member_type = _value_llvm_type(member)
+                wrapper.append(
+                    f"  store {member_type} {member_value}, ptr "
+                    f"{public_pointer[int(member_id)]}, align {_align(member_type)}"
+                )
+                entry_span.take(
+                    UnitKind.STATEMENT, args=(member,),
+                    spelling=public_pointer[int(member_id)],
+                )
     internal_call_records.append((
         None,
         internal_symbols[function_name],
