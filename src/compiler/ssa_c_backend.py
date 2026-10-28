@@ -253,6 +253,15 @@ _FLOORED_HELPERS = (
     "static double turing_ffloordiv(double a, double b) {",
     "    return floor(a / b);",
     "}",
+    # Python's int.bit_length: the bits of |v| (0 for 0, 64 for INT64_MIN),
+    # the C spelling of the Fortran lane's turing_python_bit_length.
+    "static long long turing_bit_length(long long v) {",
+    "    unsigned long long m = v < 0 ? 0ULL - (unsigned long long)v",
+    "                                 : (unsigned long long)v;",
+    "    long long n = 0;",
+    "    while (m != 0) { n += 1; m >>= 1; }",
+    "    return n;",
+    "}",
 )
 #: Owned heap arenas (``ssa_heap_allocation``): every block is
 #: ``[previous block][elements...]`` linked into its owner cell, so one
@@ -6325,6 +6334,18 @@ def emit_ssa_module_to_c(
                         f"(({args[0]}) < 0 ? ({kind})(0 - "
                         f"({_unsigned_c_type(instruction.res.dtype)})"
                         f"({args[0]})) : ({args[0]}));"
+                    )
+                elif (
+                    op == "BitLength" and len(args) == 1
+                    and is_integer(instruction.args[0])
+                    and _is_integer_dtype(instruction.res.dtype)
+                ):
+                    kind = _scalar_c_type(instruction.res.dtype)
+                    declared_storage_type = kind
+                    integer_ids.add(result_id)
+                    declared = (
+                        f"const {kind} t{result_id} = "
+                        f"({kind})turing_bit_length((long long)({args[0]}));"
                     )
                 elif (
                     op.casefold() in _INTEGER_VALUED_UNARY and len(args) == 1
