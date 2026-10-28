@@ -2198,17 +2198,9 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
     # members are all proven and whose element type is not assumes its
     # members' join, accepted only under the same check (its writers then
     # join to exactly that type).
-    for node_id, data in G.nodes(data=True):
-        node_id = int(node_id)
+    def members_class(node_id):
+        data = G.nodes[node_id]
         attributes = data.get("attributes") or {}
-        if node_id in proven or node_id in hypotheses:
-            continue
-        if attributes.get("aggregate_kind") not in {"list", "set", "dict"}:
-            continue
-        if str(data.get("op") or data.get("type") or "").casefold().startswith(
-            "indexed"
-        ):
-            continue
         role = (
             "values" if attributes.get("aggregate_kind") == "dict"
             else "arg"
@@ -2223,13 +2215,49 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
         if not members or None in dtypes or not dtypes <= {
             "int64", "float64", "bool",
         }:
-            continue
-        joined = (
+            return None
+        return (
             next(iter(dtypes)) if len(dtypes) == 1
             else "int64" if dtypes == {"int64", "bool"} else None
         )
+
+    for node_id, data in G.nodes(data=True):
+        node_id = int(node_id)
+        attributes = data.get("attributes") or {}
+        if node_id in proven or node_id in hypotheses:
+            continue
+        if attributes.get("aggregate_kind") not in {"list", "set", "dict"}:
+            continue
+        if str(data.get("op") or data.get("type") or "").casefold().startswith(
+            "indexed"
+        ):
+            continue
+        joined = members_class(node_id)
         if joined is not None:
             hypotheses[node_id] = joined
+    # Program: ``if n > 2: x = [1, 2, 3] else: x = [4, 5]`` then ``x[1] =
+    # x[1] + 10``.  The same cycle through a list merged from branches: its
+    # rows are its arms' rows and the store's value reads a row of the
+    # merge.  Rule: a branch-merged list whose arms' members all prove one
+    # class assumes it, accepted only under the same writers check.
+    for node_id, data in G.nodes(data=True):
+        node_id = int(node_id)
+        attributes = data.get("attributes") or {}
+        if (
+            node_id in hypotheses
+            or attributes.get("aggregate_kind") != "list"
+            or attributes.get("producer_kind") not in {
+                "aggregate_phi", "aggregate_merge",
+            }
+        ):
+            continue
+        arm_classes = {
+            hypotheses.get(int(parent)) or members_class(int(parent))
+            for parent, role in data.get("parents") or ()
+            if str(role) in {"body", "orelse"} and int(parent) in G
+        }
+        if len(arm_classes) == 1 and None not in arm_classes:
+            hypotheses[node_id] = next(iter(arm_classes))
     # The same cycle through an annotated formal (``def bump(d: dict[int,
     # int], n): d[0] += n``): the annotation states the rows' class, the
     # store's value reads a row, and the join waits on itself.  Rule: a
@@ -3223,7 +3251,7 @@ def _planned_scalar_dtypes_from(
                 # default (or refused).  Rule: an empty display that
                 # nothing writes into states no element class; the
                 # merge's rows are the other arms' (and its own writers').
-                if op == "phi":
+                if op == "phi" or attributes.get("producer_kind") == "aggregate_merge":
                     def writes_into(arm):
                         arm_value = G.nodes[arm].get("value_id", arm)
                         return any(

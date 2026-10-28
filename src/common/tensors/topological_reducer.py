@@ -7309,6 +7309,14 @@ def _normalize_lexical_values(
 
         body_layout, body_layout_cell = source_aggregate_layout(body_id)
         else_layout, else_layout_cell = source_aggregate_layout(else_id)
+        if isinstance(body_layout, _SourceAggregateLayout) and str(
+            body_layout.aggregate_kind
+        ) == "list":
+            # A list merged from branches is one Python object: the taken
+            # arm's own list.  It has no member layout (member Phis would
+            # copy the arms' rows); control lowering selects the arm's
+            # storage by handle (``_lower_sequence_handle_merge``).
+            return None
         if not (
             isinstance(body_layout, _SourceAggregateLayout)
             and isinstance(else_layout, _SourceAggregateLayout)
