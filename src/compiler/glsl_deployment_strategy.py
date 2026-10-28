@@ -4765,6 +4765,15 @@ def _build_shell_hierarchy_plan(
                         dtype = str(posted["dtype"])
                     elif value_parent in _shape_dtype_cache:
                         dtype = _shape_dtype_cache[value_parent][1]
+                if operation == "item" and dtype is None:
+                    # ``tensor.item()`` is the receiver's one element: the
+                    # source proof stands where it exists, else the
+                    # receiver's own record is its type.
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven is not None:
+                        dtype = str(proven)
+                    elif len(parent_dtypes) == 1 and parent_dtypes[0]:
+                        dtype = parent_dtypes[0]
                 # DomainNode historically pads scalars with unit axes. If it
                 # says scalar but a canonical tensor op consumes a shaped
                 # tensor, carry that shape through.
@@ -4933,18 +4942,64 @@ def _build_shell_hierarchy_plan(
                 == "staticreference"
             ):
                 return None
+            if isinstance(attributes.get("value"), slice):
+                # A slice literal is index metadata for the load it feeds:
+                # a handle, as a record identity is, not an element type.
+                return (record[0], record[1], "opaque_ref")
+            # ``range(...)`` is an intrinsic whose extraction record names
+            # its value: the arithmetic sequence of Python ints (no callee
+            # body will ever attach to settle it).  Its elements are the
+            # int64 loop-domain integers, the same Python-int rule
+            # ``python_int_literal_dtype`` applies to literals.
+            if (
+                attributes.get("extraction_identity") == "builtins.range"
+                and (
+                    attributes.get("python_identity_program") or {}
+                ).get("object_type") == "arithmetic_sequence"
+            ):
+                return (record[0], record[1], "int64")
             # A call whose callee body is not attached to this plan yet: its
             # result type is the callee's, recorded by the callsite shell
             # (``PlanCall.result_bindings``), which a later freeze attaches.
             # No row is posted for it here.
             # The same holds for whatever is computed from such a result.
             if any(
-                str(graph.G.nodes[source].get("op") or "").casefold() == "call"
+                (
+                    str(graph.G.nodes[source].get("op") or "").casefold()
+                    == "call"
+                    # A method named like a canonical op (``Ops.scale``) is
+                    # still a call; its resolved ``method_ref`` says whose.
+                    or (
+                        (graph.G.nodes[source].get("attributes") or {}).get(
+                            "source_type"
+                        ) == "Call"
+                        and (graph.G.nodes[source].get("attributes") or {})
+                        .get("method_ref") is not None
+                    )
+                )
                 and source not in call_result_dtypes
                 and (_shape_dtype_cache.get(source) or (None, None))[1] is None
                 for source in (
                     int(value_id), *nx.ancestors(graph.G, int(value_id)),
                 )
+            ):
+                return None
+            # A collection handed to a call whose body is not attached yet
+            # is written by that callee (``fill(xs, v)``); the element class
+            # its writes settle arrives with the callee, so no row is posted
+            # for what is read from it here.
+            if any(
+                (graph.G.nodes[source].get("attributes") or {}).get(
+                    "aggregate_kind"
+                )
+                and any(
+                    str(graph.G.nodes[child].get("op") or "").casefold()
+                    == "call"
+                    for child, _role in (
+                        graph.G.nodes[source].get("children") or ()
+                    )
+                )
+                for source in nx.ancestors(graph.G, int(value_id))
             ):
                 return None
             raise ValueError(
@@ -4974,7 +5029,10 @@ def _build_shell_hierarchy_plan(
                 if int(value_id) not in produced
                 and int(value_id) not in captured
             )
-            if record is not None and (record[1] or (
+            if record is not None and (record[1] or isinstance(
+                (graph.G.nodes.get(int(record[0])) or {}).get("constant"),
+                slice,
+            ) or (
                 (descriptor := planned_descriptor(int(record[0]))) is not None
                 and int(descriptor.get("rank", -1)) == 0
                 and descriptor.get("metadata_state", "static") == "static"
