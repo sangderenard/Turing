@@ -18300,6 +18300,27 @@ def _sequence_column_dtype_contracts(
     for destination, writes in row_writes.items():
         if all(None not in row for row in writes) and len(set(writes)) == 1:
             contracts[destination] = writes[0]
+    # An empty display a constructor assigns to a mapping field is written
+    # by that field's methods; the class field contract settled from those
+    # stores (``class_field_mapping_contracts``) is its row constraint.
+    field_mapping_contracts = dict(graph_obj.graph.get("class_field_mapping_contracts") or {})
+    for _node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("type") or data.get("op") or "").casefold() != "setattr":
+            continue
+        field_contract = field_mapping_contracts.get(
+            str((data.get("attributes") or {}).get("attribute"))
+        ) or {}
+        if not (field_contract.get("mapping_key_dtype") and field_contract.get("mapping_value_dtype")):
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) != "value" or parent not in graph_obj:
+                continue
+            destination = int(graph_obj.nodes[parent].get("value_id", parent))
+            if declared.get(destination) == 2 and destination not in contracts:
+                contracts[destination] = (
+                    str(field_contract["mapping_key_dtype"]),
+                    str(field_contract["mapping_value_dtype"]),
+                )
 
     for node_id, data in graph_obj.nodes(data=True):
         value_id = int(data.get("value_id", node_id))
@@ -21028,6 +21049,21 @@ def _prune_dead_local_sequences(
     return removed
 
 
+_CHILD_POOL_MEMBER_ROLES = (
+    "length_value_id", "capacity_value_id", "row_stride_value_id",
+    "shape_value_id", "rank_value_id", "shape_stride_value_id",
+    "status_value_id", "live_flags_value_id",
+)
+
+
+def _child_pool_identity_fields(pool) -> dict[str, Any]:
+    """A child-table pool's member cells, by role."""
+    return {
+        "column_value_ids": tuple(pool.column_value_ids),
+        **{role: getattr(pool, role) for role in _CHILD_POOL_MEMBER_ROLES},
+    }
+
+
 def _retire_concordant_sequence_aliases(
     all_functions: Mapping[str, Any],
     all_sequence_tables: Mapping[str, Any],
@@ -21084,6 +21120,27 @@ def _retire_concordant_sequence_aliases(
         def resident(value_id: int) -> int:
             return int(aliases.get(int(value_id), int(value_id)))
 
+        def pool_members(pool) -> tuple[int, ...]:
+            if pool is None:
+                return ()
+            return (
+                *map(int, pool.column_value_ids),
+                *(int(getattr(pool, role)) for role in _CHILD_POOL_MEMBER_ROLES
+                  if getattr(pool, role) is not None),
+            )
+
+        def bind_pool_members(bindings, stale, incumbent) -> None:
+            # A setdefault receiver re-read in one method carries a second
+            # view of the same child-table pool.  Its pool cells are the
+            # resident pool's, role by role, exactly as the outer columns.
+            if stale.child_table_pool is None or incumbent.child_table_pool is None:
+                return
+            for alias, target in zip(
+                pool_members(stale.child_table_pool),
+                pool_members(incumbent.child_table_pool),
+            ):
+                bindings.setdefault(int(alias), int(target))
+
         for sequence_id, descriptor in tuple(sequence_table.sequences.items()):
             sequence_id = int(sequence_id)
             resident_id = resident(sequence_id)
@@ -21107,6 +21164,26 @@ def _retire_concordant_sequence_aliases(
                 capacity_value_id=int(incumbent.capacity_value_id),
                 status_address_id=incumbent.status_address_id,
                 live_flags_value_id=incumbent.live_flags_value_id,
+                # The pool's member cells are the same frame bookkeeping:
+                # equal contracts with every role present on both sides
+                # are one pool.
+                child_table_pool=(
+                    incumbent.child_table_pool
+                    if descriptor.child_table_pool is not None
+                    and incumbent.child_table_pool is not None
+                    and len(descriptor.child_table_pool.column_value_ids)
+                    == len(incumbent.child_table_pool.column_value_ids)
+                    and all(
+                        (getattr(descriptor.child_table_pool, role) is None)
+                        == (getattr(incumbent.child_table_pool, role) is None)
+                        for role in _CHILD_POOL_MEMBER_ROLES
+                    )
+                    and replace(
+                        descriptor.child_table_pool,
+                        **_child_pool_identity_fields(incumbent.child_table_pool),
+                    ) == incumbent.child_table_pool
+                    else descriptor.child_table_pool
+                ),
             )
             if resolved != incumbent or sequence_id in physical_ids:
                 continue
@@ -21118,6 +21195,7 @@ def _retire_concordant_sequence_aliases(
                   if descriptor.status_address_id is not None else ()),
                 *((int(descriptor.live_flags_value_id),)
                   if descriptor.live_flags_value_id is not None else ()),
+                *pool_members(descriptor.child_table_pool),
             }
             # Prove the stale cells are only removable bookkeeping before
             # mutating the real function.  A call/return use means this is
@@ -21132,6 +21210,7 @@ def _retire_concordant_sequence_aliases(
             # removable initialization stores above must not reset the owner.
             member_bindings: dict[int, int] = {}
             _bind_sequence_storage_members(member_bindings, descriptor, incumbent)
+            bind_pool_members(member_bindings, descriptor, incumbent)
             rebind_member_reads(trial, member_bindings)
             if any(
                 int(argument.id) in stale_private
@@ -21188,6 +21267,11 @@ def _retire_concordant_sequence_aliases(
         for stale_id, resident_id in sorted(replacements.items()):
             member_bindings: dict[int, int] = {}
             _bind_sequence_storage_members(
+                member_bindings,
+                sequence_table.by_id(int(stale_id)),
+                sequence_table.by_id(int(resident_id)),
+            )
+            bind_pool_members(
                 member_bindings,
                 sequence_table.by_id(int(stale_id)),
                 sequence_table.by_id(int(resident_id)),
@@ -24363,9 +24447,21 @@ def _class_surface_ssa_program(
             if callee_graph is None:
                 continue
             for caller_id, callee_id in planned_call.argument_bindings:
-                linked_value_edges.append((
-                    caller_graph, int(caller_id), callee_graph, int(callee_id),
-                ))
+                # Program: ``intern_batch(1, [65], [1, 1])`` (Token Orchard
+                # acceptance).  Wrong record: the callsite fold folds
+                # ``validate_batch_envelope``'s body to a constant and drops
+                # the unread formal ``values``; the plan keeps the authored
+                # actual-to-formal binding from the declaration graph as
+                # provenance.  Settling a value ABI over that edge posted
+                # VALUE_TYPE_ABI for a value absent from the specialized copy,
+                # derived from no class of that copy's scope.  Rule: a value
+                # ABI crosses only to a formal the callee graph holds; the
+                # binding stays an exact site and a call-edge row.
+                if int(callee_id) in callee_graph:
+                    linked_value_edges.append((
+                        caller_graph, int(caller_id), callee_graph,
+                        int(callee_id),
+                    ))
                 linked_argument_sites.add((
                     id(caller_graph), int(planned_call.callsite_id),
                     int(caller_id),
@@ -59655,9 +59751,22 @@ def _class_surface_ssa_program(
                         f"{(_function_name, _value_id)!r}: "
                         f"ssa={_existing!r}, concordance={_shape!r}"
                     )
+                # Program: ``a, b, c = f(...)`` then ``c[0]`` (a list
+                # returned by a callee).  Wrong record: the call ABI's
+                # ``value_shape`` storage (``span``) was restated over the
+                # row's posted ``sequence`` storage, settled from the
+                # value's SEQUENCE_CONTRACT; the physical view then refused
+                # the two.  Rule: the shape row states the shape; a storage
+                # the value's own row already carries is the posted
+                # authority and is kept.
+                _posted_fact = _posted_ssa_value_fact(
+                    _function, int(_value_id),
+                )
+                _posted_storage = getattr(_posted_fact, "storage", None)
                 _shape_physical = {
                     "rank": len(_shape),
-                    **({"storage": _storage} if _storage else {}),
+                    **({"storage": _storage}
+                       if _storage and not _posted_storage else {}),
                 }
                 publish_ssa_value_type(
                     _function, _value, dtype=_structure.dtype or _dtype or None,
