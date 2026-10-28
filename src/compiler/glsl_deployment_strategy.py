@@ -2659,6 +2659,11 @@ def _planned_scalar_dtypes_from(
                                 ) == "loop"
                             ):
                                 settle(scalar, int(target_id), held)
+                                if iterable[0] in row_element:
+                                    # ``for r in g`` over a list of lists:
+                                    # ``r`` is a row of the shared class.
+                                    settle(element, int(target_id),
+                                           row_element[iterable[0]])
                 # Program: ``for p, q in zip(xs, ys): t += p * q`` (c171,
                 # c172).  Wrong record: a tuple target has no single name, so
                 # ``p`` and ``q`` were never typed and fell to the float64

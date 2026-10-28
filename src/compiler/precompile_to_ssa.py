@@ -3123,6 +3123,20 @@ class _ControlSSABuilder(TiledObject):
             target = self._value_from_meta(int(target_id))
             if target.dtype in {None, "", "unknown"}:
                 continue
+            # A row of a list of lists is selected by its row load where the
+            # loop runs, not before any descriptor exists (corpus c777).
+            if int(iterable_id) in self.consumer_row_loads:
+                continue
+            # ... and so is a loop target iterating such a list's rows:
+            # its value is the row handle the loop loads (corpus c779).
+            if any(
+                int(outer_id) in self.sequence_child_table_layouts
+                and self.sequence_child_table_layouts[int(outer_id)][0] == 0
+                for outer_id, row_target_id, _row_induction
+                in program.iterable_bindings
+                if int(row_target_id) == int(iterable_id)
+            ):
+                continue
             iterable = self.external_value(int(iterable_id))
             iterable.dtype = target.dtype
             iterable.accounting = {
@@ -10170,6 +10184,12 @@ class _ControlSSABuilder(TiledObject):
             selected_extent = self.selected_child_extent_values.get(iterable_id)
             if selected_extent is not None:
                 return selected_extent
+            # An iterated row of a list of lists is selected by its row
+            # load, which runs where the row is first asked for (corpus
+            # c777).
+            row_load = self.consumer_row_loads.pop(iterable_id, None)
+            if row_load is not None and iterable_id not in self.external_values:
+                self._emit_sequence_row_load(*row_load)
             resident_id = iterable_id
             seen_aliases: set[int] = set()
             while (
@@ -19839,7 +19859,15 @@ class _ControlSSABuilder(TiledObject):
                     attributes={"iteration_semantics": "values"},
                 )
                 continue
-            if int(target_id) in self.nested_row_target_ids:
+            # The rows of a born list of lists are pool rows: the outer's
+            # column holds their handles (corpus c779), whatever queries
+            # the loop target.
+            outer_descriptor = self.sequence_descriptors.get(int(iterable_id))
+            if int(target_id) in self.nested_row_target_ids and not (
+                outer_descriptor is not None
+                and outer_descriptor.child_table_pool is not None
+                and len(outer_descriptor.column_value_ids) == 1
+            ):
                 self.bind_nested_row(
                     self.external_value(iterable_id, dtype="int"),
                     induction,
@@ -19848,7 +19876,7 @@ class _ControlSSABuilder(TiledObject):
                     attributes={"induction": loop.induction},
                 )
                 continue
-            self.indexed_load(
+            handle_value = self.indexed_load(
                 self.external_value(iterable_id),
                 induction,
                 target_id,
@@ -19857,6 +19885,18 @@ class _ControlSSABuilder(TiledObject):
                     "induction": loop.induction,
                 },
             )
+            # Program: ``for r in g: for x in r`` over a list of lists
+            # (corpus c778).  The outer's column holds row handles, so the
+            # loop target is the handle of a pool row: the inner loop and
+            # its queries read that row as any selected child.
+            outer = self.sequence_descriptors.get(int(iterable_id))
+            outer_pool = None if outer is None else outer.child_table_pool
+            if outer_pool is not None and outer_pool.key_columns == () and (
+                len(outer.column_value_ids) == 1
+            ):
+                self.child_table_selections[int(target_id)] = (
+                    outer_pool, handle_value,
+                )
         for iterable_id, target_id, induction_name, projection in (
             self.program.projected_iterable_bindings
         ):
@@ -25745,6 +25785,16 @@ def _schedule_loop_callsites(
                     int(start_id)
                     for target_id, start_id in control.induction_offsets
                     if int(target_id) in targets
+                } | {
+                    # Program: ``for x in g[n % 3]`` over a list of lists
+                    # (corpus c777).  The iterated row is selected by a row
+                    # load no region owns, so the loop reads that load's
+                    # sequence and index.
+                    int(read_id)
+                    for iterable_id, _target_id, induction
+                    in control.iterable_bindings
+                    if induction == loop.induction
+                    for read_id in (row_load_reads or {}).get(int(iterable_id), ())
                 }
 
             consumed.update(loop_offset_starts(block))
@@ -29861,7 +29911,7 @@ def lower_control_sections_to_ssa(
         sequence_length_values=sequence_length_values,
         row_load_reads={
             int(result): tuple(
-                int(read) for read in (operation[0], operation[1])
+                int(read) for read in (operation[1], operation[2])
                 if read is not None
             )
             for result, operation in row_load_by_result.items()
