@@ -2269,7 +2269,7 @@ _NONESCAPING_COLLECTION_CALLS = frozenset({
 
 
 _BUILTIN_COLLECTION_KINDS = frozenset({
-    "list", "dict", "set", "frozenset", "tuple", "str", "bytes", "bytearray",
+    "list", "array", "dict", "set", "frozenset", "tuple", "str", "bytes", "bytearray",
 })
 
 
@@ -2605,6 +2605,19 @@ def _static_sequence_capacity_survey(
             continue
         if source in bounds:
             bounds[destination] = bounds[source] + snapshot_growth[destination]
+        elif str(
+            (graph_obj.nodes.get(source) or {}).get("type") or ""
+        ).casefold() == "input":
+            # Program: ``def add(self, values, b, e):
+            # self.cover.extend(values[b:e])`` (token orchard core).  Wrong
+            # record: the slice's source is a caller's list (a parameter),
+            # which no survey here bounds, so the slice was neither bounded
+            # nor unbounded and C/LLVM refused it as a private sequence with
+            # no proven capacity.  Rule: a snapshot of a parameter holds the
+            # caller's run-time rows (at most ``len(values)``, clipped to
+            # ``e - b`` for a slice); it takes the dynamic contract, whose
+            # append reserves exactly the rows it copies.
+            unbounded_snapshots.add(destination)
     # Program: ``xs = [5, 7] + [n, 7]; len(xs)`` (fuzzer p3_54).  Wrong
     # record: nothing bounded the concatenation, so its arena took the
     # planner's elementwise-add extent (2,) and the second operand's rows
