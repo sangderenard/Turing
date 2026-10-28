@@ -1199,6 +1199,12 @@ REVOKE_PHYSICAL = _PhysicalSentinel("REVOKE_PHYSICAL")
 SSA_VALUE_PHYSICAL_STORAGES = frozenset({
     "scalar", "span", "reference", "record", "sequence", "table", "keyed",
 })
+#: ``keyed``/``table`` are ProgramABI access policies over descriptor-backed
+#: resident ``sequence`` storage.  The SSA row keeps the declared policy; a
+#: ValueTypeABI arm states only the physical kind.  This is the one place that
+#: maps one to the other (``_physical_type_arms`` and the physical view both
+#: read it).
+POLICY_PHYSICAL_KIND = {"keyed": "sequence", "table": "sequence"}
 SSA_VALUE_PHYSICAL_FIELDS = (
     "physical_dtype", "storage", "rank", "arena", "device",
 )

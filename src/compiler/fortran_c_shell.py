@@ -24453,12 +24453,12 @@ def _class_surface_ssa_program(
                     primitive_receipt = receipt
                 if not storage and primitive_receipt is not None:
                     storage = str(primitive_receipt["storage"])
-            if storage in {"keyed", "table"}:
-                # Keyed/table are ProgramABI access policies over the existing
-                # descriptor-backed resident sequence storage.  A semantic
-                # union arm records the physical kind, while storage_identity
-                # below retains the exact authored table/key declaration.
-                storage = "sequence"
+            # Keyed/table are ProgramABI access policies over the existing
+            # descriptor-backed resident sequence storage.  A semantic
+            # union arm records the physical kind, while storage_identity
+            # below retains the exact authored table/key declaration.
+            from .concordance_declarations import POLICY_PHYSICAL_KIND
+            storage = POLICY_PHYSICAL_KIND.get(storage, storage)
             dtype = str(
                 contract.get("dtype") or node_abi.get("program_abi_dtype")
                 or (primitive_receipt or {}).get("dtype")
@@ -28579,54 +28579,54 @@ def _class_surface_ssa_program(
                 extra_mutations=held_table_deletes,
             )
             lexical_sequence_shortfalls = (*lexical_sequence_shortfalls, *held_delete_shortfalls)
-            # Numerical region order alone does not represent reads of mutable
-            # fields. Restore authored sibling order before the dependency
-            # scheduler: an early bool(field) must precede the conditional
-            # that updates the field and publishes its continuation version.
-            from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock
-            # A dispatch region is atomic and may contain early input casts
-            # together with a later authored update.  Place it where the
-            # whole region becomes complete.  Using the earliest member here
-            # undid the dependency-safe atomic region order: pi_update's
-            # final self.acc region also contains line-5 casts, so it
-            # overtook the line-7 normalization and read stale resident state.
-            region_positions = _dispatch_region_completion_positions(
-                graph_obj, getattr(shell, "dispatch_subgraphs", ()),
-            )
-            def source_position(block):
-                if isinstance(block, StatementBlock) and len(block.lines) == 1:
-                    line = block.lines[0]
-                    if line.startswith("__scheduled_region_") and line.endswith("__"):
-                        return region_positions.get(int(line[len("__scheduled_region_"):-2]), (1 << 30, 0, 0))
-                node_id = (block.effect_node_id if isinstance(block, ScalarFieldWriteBlock)
-                           else getattr(block, "source_node_id", None))
-                if node_id is None:
-                    node_id = getattr(block, "source_loop_node_id", None)
-                if node_id is not None:
-                    return _authored_node_position(graph_obj, int(node_id))
-                return (1 << 30, 0, 0)
-            def order_field_effects(block):
-                if isinstance(block, SequenceBlock):
-                    children = [order_field_effects(child) for child in block.blocks]
-                    # Unknown statements remain barriers; do not move calls
-                    # whose source ownership is supplied by the linker.
-                    result, run = [], []
-                    for child in children:
-                        if source_position(child)[0] >= (1 << 30):
-                            result.extend(sorted(run, key=source_position)); run = []
-                            result.append(child)
-                        else:
-                            run.append(child)
-                    result.extend(sorted(run, key=source_position))
-                    return replace(block, blocks=tuple(result))
-                if isinstance(block, ConditionalBlock):
-                    return replace(block, body=order_field_effects(block.body),
-                                   orelse=None if block.orelse is None else order_field_effects(block.orelse))
-                if isinstance(block, (LoopBlock, WhileBlock)):
-                    return replace(block, body=order_field_effects(block.body))
-                return block
-            control = replace(control, root=order_field_effects(control.root))
-            from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
+        # Numerical region order alone does not represent reads of mutable
+        # fields. Restore authored sibling order before the dependency
+        # scheduler: an early bool(field) must precede the conditional
+        # that updates the field and publishes its continuation version.
+        from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock
+        # A dispatch region is atomic and may contain early input casts
+        # together with a later authored update.  Place it where the
+        # whole region becomes complete.  Using the earliest member here
+        # undid the dependency-safe atomic region order: pi_update's
+        # final self.acc region also contains line-5 casts, so it
+        # overtook the line-7 normalization and read stale resident state.
+        region_positions = _dispatch_region_completion_positions(
+            graph_obj, getattr(shell, "dispatch_subgraphs", ()),
+        )
+        def source_position(block):
+            if isinstance(block, StatementBlock) and len(block.lines) == 1:
+                line = block.lines[0]
+                if line.startswith("__scheduled_region_") and line.endswith("__"):
+                    return region_positions.get(int(line[len("__scheduled_region_"):-2]), (1 << 30, 0, 0))
+            node_id = (block.effect_node_id if isinstance(block, ScalarFieldWriteBlock)
+                       else getattr(block, "source_node_id", None))
+            if node_id is None:
+                node_id = getattr(block, "source_loop_node_id", None)
+            if node_id is not None:
+                return _authored_node_position(graph_obj, int(node_id))
+            return (1 << 30, 0, 0)
+        def order_field_effects(block):
+            if isinstance(block, SequenceBlock):
+                children = [order_field_effects(child) for child in block.blocks]
+                # Unknown statements remain barriers; do not move calls
+                # whose source ownership is supplied by the linker.
+                result, run = [], []
+                for child in children:
+                    if source_position(child)[0] >= (1 << 30):
+                        result.extend(sorted(run, key=source_position)); run = []
+                        result.append(child)
+                    else:
+                        run.append(child)
+                result.extend(sorted(run, key=source_position))
+                return replace(block, blocks=tuple(result))
+            if isinstance(block, ConditionalBlock):
+                return replace(block, body=order_field_effects(block.body),
+                               orelse=None if block.orelse is None else order_field_effects(block.orelse))
+            if isinstance(block, (LoopBlock, WhileBlock)):
+                return replace(block, body=order_field_effects(block.body))
+            return block
+        control = replace(control, root=order_field_effects(control.root))
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         # Keyed values consumed directly by control have no numerical region
         # to schedule their reads.  This includes direct return operands, but
         # also branch predicates and resident sequence mutations (notably the
@@ -29010,7 +29010,69 @@ def _class_surface_ssa_program(
                 sequence_declarations
             ):
                 sequence_id = int(sequence_id)
-                if sequence_id in native_value_type_abi:
+                settled_abi = native_value_type_abi.get(sequence_id)
+                # Program: ``excluded: frozenset[Any]`` read by ``in`` on a
+                # record (test_sequence_contract_concordance).  Wrong record:
+                # the linked snapshot arm stated the ProgramABI field's
+                # declared ``span`` while SEQUENCE_CONTRACT made the value a
+                # descriptor-backed resident, and the SSA row says
+                # ``sequence``.  Rule: SEQUENCE_CONTRACT owns a resident
+                # collection's physical kind; the settled arm keeps its
+                # dtype/shape and takes its storage from that contract.
+                if settled_abi is not None:
+                    settled_arms = tuple(settled_abi.physical_alternatives)
+                    if len(settled_arms) != 1 or settled_arms[0].storage != "span":
+                        continue
+                    from .identity_concordance import (
+                        committed_sequence_contract as _late_committed,
+                    )
+                    if _late_committed(str(symbol), sequence_id) is None:
+                        continue
+                    # The arm and the SSA row describe one resident.  An arm
+                    # sourced from a ``parameter_annotation`` cell is a
+                    # declared parameter's own value: its physical kind is
+                    # the parameter's ProgramABI declaration
+                    # (``parameter_abi_kind``, where the SSA row posts
+                    # ``span``), so SEQUENCE_CONTRACT does not restate it.
+                    if any(
+                        getattr(cell.page, "name", cell.page) == "parameter_annotation"
+                        for cell in settled_arms[0].source_cells
+                    ) or any(
+                        (data.get("attributes") or {}).get("binding_kind") == "parameter"
+                        and int(data.get("value_id", node_id)) == sequence_id
+                        for node_id, data in graph_obj.nodes(data=True)
+                    ):
+                        continue
+                    from dataclasses import replace as _replace
+                    contract_cell = late_book.latest_ref(
+                        _LATE_SEQUENCE_CONTRACT, (str(symbol), sequence_id),
+                    )
+                    arm = _replace(
+                        settled_arms[0], storage="sequence",
+                        source_cells=tuple(dict.fromkeys((
+                            *settled_arms[0].source_cells, *((contract_cell,) if contract_cell is not None else ()),
+                        ))),
+                    )
+                    fact = _LateValueTypeABIFact(
+                        settled_abi.alternatives, settled_abi.tags, (arm,),
+                    )
+                    row = (tuple(late_type_scope), sequence_id)
+                    incumbent = late_book.latest_ref(_LATE_VALUE_TYPE_ABI, row)
+                    late_book.post(
+                        _LATE_VALUE_TYPE_ABI, row, fact,
+                        stage=SHELL_HANDOFF,
+                        provenance=_LateDerived(tuple(dict.fromkeys(cell for cell in (
+                            incumbent,
+                            _identity_cell(graph_obj, sequence_id),
+                            late_book.latest_ref(
+                                _LATE_SOURCE_VALUE_CLASS,
+                                (late_numeric_scope, sequence_id),
+                            ),
+                            *arm.source_cells,
+                        ) if cell is not None))),
+                        mode=Mode.REVISE,
+                    )
+                    native_value_type_abi[sequence_id] = fact
                     continue
                 class_row = (late_numeric_scope, sequence_id)
                 class_cell = late_book.latest_ref(
@@ -51575,6 +51637,24 @@ def _class_surface_ssa_program(
                         },
                     )
                     forwarded_frame_result = _retain_forwarded_aggregate_storage(native_call, callee)
+                    # The linker has revised this call's record in flight
+                    # (result bindings re-keyed to the callee's semantic
+                    # outputs, the returned formal's pair added).  The
+                    # frame-aliased projection reads the book, so publish the
+                    # revision first; its reference then proves the binding.
+                    published_row = call_records[caller_symbol]
+                    published_at = [
+                        index for index, item in enumerate(published_row)
+                        if int(item.callsite_id) == int(record.callsite_id)
+                        and str(item.callee_symbol) == str(record.callee_symbol)
+                    ]
+                    if len(published_at) == 1 and published_row[published_at[0]] != record:
+                        published_row.replace(
+                            published_at[0], record,
+                            sources=_frame_cells(published_row[published_at[0]].cell),
+                            stage=FRAME_BINDING,
+                        )
+                        record = call_records[caller_symbol][published_at[0]]
                     _refresh_frame_aliased_result(native_call, callee, record=record)
                     aggregate_unpack = []
                     if returns_aggregate and result is not None and not forwarded_frame_result:
