@@ -3,7 +3,7 @@ import subprocess
 import sys
 import pytest
 
-from src.compiler.extraction_contract import ExtractionContract, ProgramABIContract
+from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.ssa_c_backend import emit_ssa_to_c
 
@@ -41,18 +41,9 @@ def root(x, flag):
     policy = ExtractionContract(
         'extraction_contracts/program_extraction.yaml'
     ).with_execution_file('extraction_contracts/vehicle_full_native_execution.yaml')
-    # The source does not state the type of its parameters (they are fed numpy
-    # floats); nothing but the program ABI can prove it, so the test states it.
-    policy = policy.with_program_abi(ProgramABIContract.from_mapping({
-        'records': {}, 'bindings': [],
-        'values': [
-            {'function': 'root', 'parameter': name, 'storage': 'scalar',
-             'dtype': 'float64', 'rank': 0, 'python_type': 'builtins.float'}
-            for name in (('x', 'flag') if guard == 'sequential' else ('x',))
-        ],
-    }))
     module, _, exports = lower_ast_source_to_ssa(
         source, 'root', name='none_predicate', extraction_contract=policy,
+        root_calls=[{'x': float, 'flag': float} if guard == 'sequential' else {'x': float}],
     )
     artifact = emit_ssa_to_c(module, exports[0])
     assert artifact.complete, artifact.shortfalls

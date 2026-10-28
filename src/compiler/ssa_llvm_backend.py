@@ -768,6 +768,11 @@ _INTEGER_BINARY: dict[str, str] = {
     "BitAnd": "and", "BitOr": "or", "BitXor": "xor",
     "Shl": "shl", "Shr": "lshr",
 }
+# Python ``int`` arithmetic no interval proves inside int64
+# (``python_int_overflow_checked``): the signed overflow intrinsics.
+_CHECKED_INTEGER_INTRINSICS: dict[str, str] = {
+    "Add": "sadd", "Sub": "ssub", "Mul": "smul",
+}
 _INTEGER_COMPARISON: dict[str, str] = {
     "Eq": "eq", "Ne": "ne", "Lt": "slt",
     "Le": "sle", "Gt": "sgt", "Ge": "sge",
@@ -794,19 +799,62 @@ def _unsigned_value(value: _Any) -> bool:
     return layout is not None and layout.kind in {"uint", "bool"}
 
 
+def python_int_overflow_checked(instruction: _Any) -> bool:
+    """Whether a scalar op is Python ``int`` arithmetic that must not wrap.
+
+    Program: ``a * b`` on ints the interval solver does not bound.  Wrong
+    record: the native op wrapped at int64 and returned a value Python never
+    computes.  Rule: authored scalar int64 arithmetic (``source_type`` of a
+    Python expression) is overflow-checked; a proven interval inside int64
+    makes the check unreachable, a proven wider one picks a wider dtype.
+    Compiler-made index and extent arithmetic carries no ``source_type``.
+    """
+
+    result = getattr(instruction, "res", None)
+    attributes = getattr(instruction, "attributes", None) or {}
+    return (
+        result is not None
+        and str(getattr(result, "dtype", "")) == "int64"
+        and not tuple(getattr(result, "shape", None) or ())
+        and str(attributes.get("source_type") or "")
+        in {"BinOp", "AugAssign", "UnaryOp"}
+    )
+
+
 def integer_scalar_lines(
     operation: str,
     operand_type: str,
     operands: list[str],
     register: str,
-    *, unsigned: bool = False,
+    *, unsigned: bool = False, checked: bool = False,
 ) -> tuple[list[str], str] | None:
     """(lines, result type) for an integer-domain scalar op, else ``None``.
 
     ``None`` means this opcode has no exact integer spelling; the caller
     decides whether that is a shortfall or a documented double-domain
-    evaluation converted back to the declared integer type.
+    evaluation converted back to the declared integer type.  ``checked``
+    (``python_int_overflow_checked``) spells signed i64 ``Add``/``Sub``/
+    ``Mul``/``Neg`` with the overflow intrinsics and reports an overflow.
     """
+
+    if (
+        checked and not unsigned and operand_type == "i64"
+        and (
+            (operation in _CHECKED_INTEGER_INTRINSICS and len(operands) == 2)
+            or (operation == "Neg" and len(operands) == 1)
+        )
+    ):
+        intrinsic = _CHECKED_INTEGER_INTRINSICS.get(operation, "ssub")
+        left, right = (
+            ("0", operands[0]) if operation == "Neg" else tuple(operands)
+        )
+        return ([
+            f"{register}.pair = call {{i64, i1}} "
+            f"@llvm.{intrinsic}.with.overflow.i64(i64 {left}, i64 {right})",
+            f"{register} = extractvalue {{i64, i1}} {register}.pair, 0",
+            f"{register}.overflow = extractvalue {{i64, i1}} {register}.pair, 1",
+            f"call void @turing_int_overflow(i1 {register}.overflow)",
+        ], operand_type)
 
     if (
         str(operation).casefold() in {"floor", "ceil", "round", "trunc"}
@@ -979,6 +1027,7 @@ from .output_publication import (
     publication_surface_plan,
 )
 from .ssa_aggregate_abi import is_storage_view
+from .native_faults import INT_OVERFLOW as _INT_OVERFLOW_CODE
 
 
 # Target intrinsics reached by the scalar tables, plus the block-copy the
@@ -1024,6 +1073,23 @@ exit:
     "turing_validation_error": (
         "declare void @turing_validation_error(i32)"
     ),
+    **{
+        f"llvm.{name}.with.overflow.i64": (
+            f"declare {{i64, i1}} @llvm.{name}.with.overflow.i64(i64, i64)"
+        )
+        for name in ("sadd", "ssub", "smul")
+    },
+    # Python ``int`` never wraps.  An unproven int64 result that left int64
+    # is reported (native_faults.INT_OVERFLOW) instead of returned wrapped.
+    "turing_int_overflow": f"""define internal void @turing_int_overflow(i1 %overflow) {{
+entry:
+  br i1 %overflow, label %report, label %exit
+report:
+  call void @turing_validation_error(i32 {_INT_OVERFLOW_CODE})
+  br label %exit
+exit:
+  ret void
+}}""",
 }
 
 
@@ -5391,6 +5457,7 @@ def _emit_repository_call_module(
                     integer = integer_scalar_lines(
                         operation, operand_type, operands, register,
                         unsigned=compute_unsigned,
+                        checked=python_int_overflow_checked(instruction),
                     )
                     if integer is None:
                         shortfalls.append(LLVMEmissionShortfall(
@@ -7955,6 +8022,7 @@ def emit_ssa_function_to_llvm(
                     None if domain == "double"
                     else integer_scalar_lines(
                         str(operation), domain, operands, register,
+                        checked=python_int_overflow_checked(instruction),
                     )
                 )
                 if integer is not None:
