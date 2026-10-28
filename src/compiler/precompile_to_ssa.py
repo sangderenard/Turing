@@ -20331,9 +20331,30 @@ class _ControlSSABuilder(TiledObject):
                             descriptor.column_value_ids
                         )
                     ):
-                        source = self.external_value(
-                            int(descriptor.column_value_ids[int(column_projection)]),
-                            dtype=str(descriptor.column_dtypes[int(column_projection)]),
+                        # Program: ``for k, v in d.items()`` over a dict
+                        # parameter.  Wrong record: the column was asked of
+                        # ``external_value`` by id, which did not find the
+                        # descriptor's own column cell (it is an argument, not
+                        # a bound value) and appended a second formal with
+                        # the same id, so the callee's signature carried it
+                        # twice and its callers' receipt was refused.  Rule:
+                        # the column is the descriptor's own storage value.
+                        _column_id = int(
+                            descriptor.column_value_ids[int(column_projection)]
+                        )
+                        _column_cell = next((
+                            value for value in self.sequence_storage_values.get(
+                                resident_sequence_id, ()
+                            ) if int(value.id) == _column_id
+                        ), None)
+                        source = (
+                            _column_cell if _column_cell is not None else
+                            self.external_value(
+                                _column_id,
+                                dtype=str(descriptor.column_dtypes[
+                                    int(column_projection)
+                                ]),
+                            )
                         )
                     elif int(column_projection) == 0:
                         source = self.external_value(
