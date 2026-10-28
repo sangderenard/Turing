@@ -3001,6 +3001,21 @@ def _planned_scalar_dtypes_from(
                     writers.append(classes.get(str(
                         attributes["sequence_element_class_ref"]
                     ).removeprefix("builtins.")))
+                # Program: ``self._c = []`` in ``__init__``, then ``for v in
+                # self._c`` in a method that appends ints.  Wrong record:
+                # the unannotated field states no element class, so ``v``
+                # had no row though the class field contract the reducer
+                # stamps on the field's GetAttr (``sequence_column_dtypes``)
+                # holds int64 rows.  Rule: a positional record field's one
+                # column dtype is its element class.
+                elif (
+                    attributes.get("producer_kind") == "record_field"
+                    and attributes.get("aggregate_kind") in {"list", "tuple", "set"}
+                    and len(tuple(attributes.get("sequence_column_dtypes") or ())) == 1
+                    and str(attributes["sequence_column_dtypes"][0])
+                    in {"int64", "float64", "bool"}
+                ):
+                    writers.append(str(attributes["sequence_column_dtypes"][0]))
                 for record in records.values():
                     if int(record.get("sequence_value_id", -1)) == int(
                         data.get("value_id", node_id)
