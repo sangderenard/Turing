@@ -21909,11 +21909,14 @@ def _settle_linked_dynamic_sequences(
     # grows anywhere is DYNAMIC in every view (rule 4).
     from .resident_sequence_materialization import (
         _list_merged_from_unequal_displays,
+        _returned_copy_merge,
     )
 
     for graph_obj in graphs:
         for node_id, data in graph_obj.nodes(data=True):
             if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+                continue
+            if _returned_copy_merge(graph_obj, int(node_id)):
                 continue
             merged_key = (id(graph_obj), int(data.get("value_id", node_id)))
             for arm, role in data.get("parents") or ():
@@ -21957,6 +21960,15 @@ def _settle_linked_dynamic_sequences(
         seeds.update(
             (id(graph_obj), value_id)
             for value_id in local_lists & output_ids
+        )
+        # Program: ``a = [n, 1]; t = a if n > 2 else [7, n, 2]; return t``
+        # (c743).  The returned merge owns the result storage its arms are
+        # copied into; its rows are decided at run time, so it is a returned
+        # local list in the sense above and DYNAMIC (the c56 contract).
+        seeds.update(
+            (id(graph_obj), int(data.get("value_id", node_id)))
+            for node_id, data in graph_obj.nodes(data=True)
+            if _returned_copy_merge(graph_obj, int(node_id))
         )
         # Program: ``if n > 2: return [n]`` / ``return []`` (lanes plan A6).
         # Wrong record: the result list (the ``[]``) was FIXED at its own
