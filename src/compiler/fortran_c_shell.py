@@ -13917,7 +13917,22 @@ def _control_block_position(
     if isinstance(block, ScalarFieldWriteBlock):
         return node_position(int(block.effect_node_id))
     if isinstance(block, SequenceMutationBlock):
-        return node_position(_sequence_mutation_owner_id(block.mutation))
+        # Program: ``lst.extend(values[b:e])``.  Wrong record: the extend
+        # sat at its call's start, before the slice ``values[b:e]`` (a
+        # mutation of its own, authored later on the same line) had filled
+        # its arena, so the extend copied an empty sequence and ``lst``
+        # kept only its old rows (silently wrong on C and LLVM).  Rule: a
+        # method-call mutation executes after its arguments, like a query:
+        # it completes where its call ends.
+        owner_id = _sequence_mutation_owner_id(block.mutation)
+        owner = (graph_obj.nodes.get(int(owner_id)) or {}).get(
+            "expr_obj"
+        ) if int(owner_id) in graph_obj else None
+        if isinstance(owner, ast.Call):
+            return _call_completion_position(
+                graph_obj, int(owner_id), node_position,
+            )
+        return node_position(owner_id)
     if isinstance(block, SequenceQueryBlock) and block.source_call_node_id is not None:
         # A query executes after its arguments: ``d.get(i % 3, 0)`` sat at
         # the call's start, before the region computing its key ``i % 3``
