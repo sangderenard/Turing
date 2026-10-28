@@ -301,6 +301,9 @@ def _table_operation_sequence_accesses(
         reads.add(int(arguments[2]))
     elif kind in ("row_load", "row_load_capture"):
         reads.add(int(arguments[1]))
+        # The loaded row of a list of lists is a sequence: ``len(g[i])``
+        # reads it, so it follows the load that selects it.
+        writes.add(int(arguments[0]))
     elif kind == "row_store":
         writes.add(int(arguments[1]))
     elif kind == "store":
@@ -337,6 +340,12 @@ def _table_operation_value_reads(
         return {int(value) for value in arguments[2:4] if value is not None}
     if kind == "append_scalar":
         return {int(arguments[1])}
+    # Program: ``len(g[i])`` over a list of lists (corpus c800).  Wrong
+    # record: a row load whose region held nothing else read no value, so it
+    # was scheduled before the region that computes ``i``.  Rule: a row load
+    # reads its runtime index.
+    if kind in ("row_load", "row_load_capture"):
+        return {int(arguments[2])} if arguments[3] is None else set()
     return set()
 
 
@@ -3307,6 +3316,11 @@ class _ControlSSABuilder(TiledObject):
         collect_handle_merges(program.root)
 
         for sequence_id, policy, column_count, writable in sequence_declarations:
+            # A row of a list of lists is selected by its row load, which
+            # builds its descriptor where it runs (``len(g[i])``, corpus
+            # c800); declared here it would load before its index exists.
+            if int(sequence_id) in (consumer_row_loads or {}):
+                continue
             committed = commit_sequence_contract(
                 function_name,
                 int(sequence_id),
@@ -3542,6 +3556,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={"binding": "ssa_joined_sequence_initialize"},
             )
         for sequence_id, policy, column_count in sequence_initializations:
+            if int(sequence_id) in (consumer_row_loads or {}):
+                continue
             literal_table_rows = None
             descriptor_policy = (
                 "duplicates"
@@ -11592,6 +11608,18 @@ class _ControlSSABuilder(TiledObject):
                     "a selected row view from another conditional needs an explicit merged physical view",
                 ))
                 return None
+        if (
+            selected is not None
+            and selected[0].shape_value_id is None
+            and value_id in self.sequence_descriptors
+            and value_id in self.sequence_storage_values
+        ):
+            # Program: ``g = [[1, 2], [3]]; len(g[i])`` (corpus c800).  Wrong
+            # record: a query asked again for a row view the row load had
+            # built, and the general path below minted its length and
+            # capacity cells a second time, never emitted (length 0).  Rule:
+            # a selected row has one view; later requests read it.
+            return self.sequence_descriptors[value_id]
         if selected is not None and selected[0].shape_value_id is None and value_id not in self.sequence_descriptors:
             # ``d.setdefault(k, []).append(v)``: the returned collection is
             # exactly the selected pool row. Allocating an arena for this
@@ -12758,6 +12786,11 @@ class _ControlSSABuilder(TiledObject):
             self._emit_sequence_membership(*arguments)
             return
         sequence_id = int(query.sequence_value_id)
+        # A queried row of a list of lists is selected by its row load, which
+        # runs where the row is first asked for: here (corpus c800).
+        row_load = self.consumer_row_loads.pop(sequence_id, None)
+        if row_load is not None and sequence_id not in self.external_values:
+            self._emit_sequence_row_load(*row_load)
         selected_extent = self.selected_child_extent_values.get(sequence_id)
         if selected_extent is not None and query.operation in {"length", "truth"}:
             result = self.produced_value(int(query.result_value_id),
@@ -25134,6 +25167,7 @@ def _schedule_loop_callsites(
     pure_region_indices: frozenset[int] = frozenset(),
     table_region_operations: Mapping[int, Any] | None = None,
     table_region_post_operations: Mapping[int, Any] | None = None,
+    row_load_reads: Mapping[int, tuple[int, ...]] | None = None,
 ) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
     """Install this closure's PlanCalls as ordinary scheduled statements.
 
@@ -25618,6 +25652,13 @@ def _schedule_loop_callsites(
                     # generator query has a separate, explicit producer.
                     *((int(block.sequence_value_id),)
                       if block.producer_loop_node_id is not None else ()),
+                    # Program: ``len(g[i])`` over a list of lists (corpus
+                    # c800).  The queried row is selected by a row load that
+                    # no region owns, so the query is the load's consumer:
+                    # it reads the load's sequence and index.
+                    *map(int, (row_load_reads or {}).get(
+                        int(block.sequence_value_id), ()
+                    )),
                     *(
                         () if block.default_value_id is None
                         else (int(block.default_value_id),)
@@ -29878,6 +29919,13 @@ def lower_control_sections_to_ssa(
         callsite_projection_ids=callsite_projection_ids,
         callsite_stored_argument_ids=callsite_stored_argument_ids,
         sequence_length_values=sequence_length_values,
+        row_load_reads={
+            int(result): tuple(
+                int(read) for read in (operation[0], operation[1])
+                if read is not None
+            )
+            for result, operation in row_load_by_result.items()
+        },
         pure_region_indices=frozenset(
             index for index, instructions in planned_region_instructions.items()
             if all(instruction.op in _PURE_REGION_OPS for instruction in instructions)
