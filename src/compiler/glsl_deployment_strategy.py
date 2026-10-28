@@ -2874,32 +2874,44 @@ def _planned_scalar_dtypes_from(
                 # table, which this walk did not cross, so the read had no
                 # table and its class fell to the float64 default.  Rule:
                 # a merge whose arms all reach one table is that table.
-                def reaching_table(node, depth=0):
-                    if node is None or depth > 16:
-                        return None
-                    kind = operation(G.nodes[node])
-                    if kind == "phi":
-                        reached = {
-                            reaching_table(arm, depth + 1)
-                            for arm in parents(G.nodes[node], "body", "orelse")
-                        }
-                        return next(iter(reached)) if len(reached) == 1 else None
-                    if kind in {"indexedstore", "setitem"} or (
-                        kind == "loopresult"
-                        and (G.nodes[node].get("attributes") or {}).get(
-                            "result_kind"
-                        ) == "carried"
-                    ):
-                        base = parents(
-                            G.nodes[node],
-                            "value" if kind == "loopresult" else "base",
-                        )
-                        return reaching_table(
-                            base[0] if len(base) == 1 else None, depth + 1
-                        )
-                    return node
+                def reaching_table(start):
+                    # Graph identity only: each node is visited once, so a
+                    # loop's own merge cycle ends the walk down that arm
+                    # without a depth bound.
+                    visited = set()
 
-                table = reaching_table(table)
+                    def walk(node):
+                        if node is None or node in visited:
+                            return set()
+                        visited.add(node)
+                        kind = operation(G.nodes[node])
+                        if kind == "phi":
+                            reached = set()
+                            for arm in parents(G.nodes[node], "body", "orelse"):
+                                found = walk(arm)
+                                if found is None:
+                                    return None
+                                reached |= found
+                            return reached
+                        if kind in {"indexedstore", "setitem"} or (
+                            kind == "loopresult"
+                            and (G.nodes[node].get("attributes") or {}).get(
+                                "result_kind"
+                            ) == "carried"
+                        ):
+                            base = parents(
+                                G.nodes[node],
+                                "value" if kind == "loopresult" else "base",
+                            )
+                            return walk(base[0]) if len(base) == 1 else None
+                        return {node}
+
+                    reached = walk(start)
+                    return (
+                        next(iter(reached))
+                        if reached is not None and len(reached) == 1 else None
+                    )
+
                 table = reaching_table(table)
                 if (
                     table is not None and len(defaults) == 1
