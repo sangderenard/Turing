@@ -59359,6 +59359,14 @@ def _class_surface_ssa_program(
     )
     lowered_module.metadata["late_result_type_rounds"] = late_result_rounds
 
+    # Structural None has a semantic dtype only; post its zero-sentinel cell
+    # once every pass that can create or retype a None value has run.
+    from .ssa_none_sentinel import declare_none_sentinel_carriers
+
+    lowered_module.metadata["none_sentinel_carriers"] = (
+        declare_none_sentinel_carriers(lowered_module.functions)
+    )
+
     # Call-result settlement is the last writer of physical scalar dtypes.
     # A nested child-table element can therefore become concrete only here,
     # after its local control section and whole-program call frames have both
