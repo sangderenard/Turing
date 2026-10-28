@@ -15,8 +15,10 @@ Statuses: PASS, WRONG, TYPE, LOUD (a named refusal or emission shortfall),
 FINDING (anything else: lowering/emission crash, run failure, SEGV).
 WRONG and TYPE are emergencies: stop and minimize.
 
-Programs using an implementation-approximated operation (``Math.sin``,
-``**``, ...) are judged within the oracle's ulp tier.  ``%``,
+Programs using an implementation-approximated operation are judged bit for
+bit against node replaying with those calls answered by the C library
+(``Math.sin``, ``Math.log``, ...), or within the oracle's ulp tier when one
+is ``**``.  ``%``,
 ``Math.sign``, ``Math.max``/``Math.min`` and ``&&``/``||`` on Numbers
 are exact programs, judged bit for bit.  The grammar also includes a
 spelling the frontend refuses today (``&&`` on a Number and a Boolean,

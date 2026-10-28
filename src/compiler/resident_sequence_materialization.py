@@ -826,6 +826,29 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
     while changed:
         changed = False
         for node_id, data in graph_obj.nodes(data=True):
+            # Program: ``d = {1: n, 2: 5}; for i in range(3): if i == n:
+            # d[2] = i`` then ``d[2]`` (corpus c670).  Wrong record: the
+            # loop's result names the body's ``if`` merge, which is no
+            # store version, so the post-loop read of ``d`` was claimed by
+            # no table and lowered as a positional row read (0 for 5).
+            # Rule: a loop result whose carried value is a merge already
+            # proven to be one dict's storage is that dict's storage.
+            if node_kind(node_id) in {"loopresult", "loopexit"}:
+                carried = next((
+                    parent for preferred_role in ("updated", "value")
+                    for parent, role in data.get("parents") or ()
+                    if str(role) == preferred_role and parent in graph_obj
+                ), None)
+                if carried is None or node_kind(carried) != "phi":
+                    continue
+                resident = root(value_id_of(carried))
+                if (graph_obj.nodes.get(resident, {}).get("attributes") or {}).get("aggregate_kind") != "dict":
+                    continue
+                value = value_id_of(node_id)
+                if value != resident and aliases.get(value) != resident:
+                    aliases[value] = resident
+                    changed = True
+                continue
             if node_kind(node_id) != "phi":
                 continue
             parents = [root(value_id_of(parent)) for parent, role in data.get("parents") or ()
@@ -2446,7 +2469,17 @@ def _static_sequence_capacity_survey(
     )
     return bounds, unbounded | owned_empty_arrays | owned_record_dicts
 
+def _source_extraction_identity(
+    graph_obj: Any,
+    node_id: int,
+) -> str | None:
+    """Return the exact extraction identity retained by one source graph node."""
 
+    attributes = (
+        graph_obj.nodes.get(int(node_id), {}).get("attributes") or {}
+    )
+    identity = attributes.get("extraction_identity")
+    return None if identity is None else str(identity)
 def _linked_sequence_propagation_kind(
     mapped_arguments: Iterable[Any],
 ) -> str | None:
@@ -2594,6 +2627,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
             policy=record.get("policy"),
             argument_kind=argument_kind,
             argument_expressions=retained_argument_expressions(record),
+            extraction_identity=_source_extraction_identity(
+                graph_obj, node_id,
+            ),
             sort_key_column=key_column,
             sort_reverse=reverse,
         ))
@@ -2659,6 +2695,9 @@ def _sequence_append_call_mutations(graph_obj: Any):
                 else "duplicates"
             ),
             argument_kind=argument_kind,
+            extraction_identity=_source_extraction_identity(
+                graph_obj, node_id,
+            ),
             sort_key_column=key_column,
             sort_reverse=reverse,
         ))
