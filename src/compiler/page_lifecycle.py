@@ -221,6 +221,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "loop_record_layout_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "loop_record_schema_concordance": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "loop_region_membership": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
+    "plan_region_value_dtype": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
     "loop_result_port_binding": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
     "loop_result_reconciliation": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
     "loop_result_use_rebinding": PageLifecycle(FUNCTIONS, None, FUNCTIONS),

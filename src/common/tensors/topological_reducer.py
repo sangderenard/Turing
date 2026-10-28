@@ -1512,6 +1512,11 @@ def specialize_python_precision_widths(graph: Any) -> bool:
     while propagated:
         propagated = False
         for node_id, data in tuple(target.nodes(data=True)):
+            # A call or a comparison decides its own result class: a
+            # Precision-returning call was seeded above, and ``d.term(0)``
+            # or ``d > band`` reads a Precision without being one.
+            if isinstance(data.get("expr_obj"), (ast.Call, ast.Compare)):
+                continue
             parent_widths = tuple(
                 precision_flow_widths[int(parent)]
                 for parent, _role in data.get("parents", ())
@@ -9810,7 +9815,14 @@ def _normalize_lexical_values(
                             )
                         ) or operation_name in _MAPPING_MUTATION_OPERATORS
                         mutation_operation = (
-                            operation_name if known_mutation
+                            # A set's one-iterable ``update`` is ``extend``
+                            # under its unique policy.
+                            "extend"
+                            if aggregate_kind == "set"
+                            and operation_name == "update"
+                            and len(expression.args) == 1
+                            and not expression.keywords
+                            else operation_name if known_mutation
                             else f"unclassified_call:{operation_name}"
                         )
                         mutation_fact = (
@@ -16164,9 +16176,18 @@ def _normalize_lexical_values(
                             else None
                         )
                     )
+                    # ``s.update(xs)`` inserts each element of one iterable
+                    # under the set's unique policy: the sequence ``extend``.
+                    operator_name = (
+                        "extend"
+                        if aggregate_kind == "set"
+                        and call.func.attr == "update"
+                        and len(call.args) == 1 and not call.keywords
+                        else str(call.func.attr)
+                    )
                     sequence_mutation = (
                         sequence_policy is not None
-                        and call.func.attr in _SEQUENCE_MUTATION_OPERATORS
+                        and operator_name in _SEQUENCE_MUTATION_OPERATORS
                         and not (
                             aggregate_kind == "dict"
                             and call.func.attr == "pop"
@@ -16192,7 +16213,7 @@ def _normalize_lexical_values(
                         )
                         mutation_row = (value_class_scope, int(call_id))
                         mutation_fact = (
-                            int(initial), str(call.func.attr),
+                            int(initial), operator_name,
                             str(sequence_policy), tuple(argument_ids),
                             # The class is the receiver's, as at every other
                             # site that posts this fact: a dict's ``clear``
@@ -16232,7 +16253,7 @@ def _normalize_lexical_values(
                             )
                     state_effects.append({
                         "state_name": name,
-                        "operator": call.func.attr,
+                        "operator": operator_name,
                         "effect_mode": (
                             "sequence_mutation"
                             if sequence_mutation
