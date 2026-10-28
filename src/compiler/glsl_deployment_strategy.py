@@ -2230,7 +2230,9 @@ def _callee_return_scalar_dtype(
         aggregate = isinstance(returned, ast.Tuple) or (
             (node.get("attributes") or {}).get("aggregate_kind") is not None
         )
-        if aggregate and not isinstance(returned, ast.Tuple):
+        if aggregate and not isinstance(returned, ast.Tuple) and (
+            (node.get("attributes") or {}).get("aggregate_kind") != "list"
+        ):
             return None
         kinds.add("element" if aggregate else "scalar")
         found.append(dtypes.get(int(values[0])))
@@ -2576,11 +2578,25 @@ def _planned_scalar_dtypes_from(
             # class (corpus c27).  List and set comprehensions are not typed
             # here: they can be mutated after their birth, and their element
             # join belongs to the collection rule with its writers.
-            if op == "generatorexp":
+            # An INLINE list/set comprehension (``for y in [x * n for x in
+            # xs]``, corpus c265) is no different: bound to no name, its only
+            # readers are the loops that iterate it, so nothing can mutate it
+            # and its element type is the ``elt``'s class.
+            if op == "generatorexp" or (
+                op in {"listcomp", "setcomp"}
+                and isinstance(expression, (ast.ListComp, ast.SetComp))
+                and G.out_degree(node_id) > 0
+                and all(
+                    operation(G.nodes[reader]) == "for"
+                    and node_id in parents(G.nodes[reader], "iterable")
+                    for reader in G.successors(node_id)
+                )
+            ):
                 elts = parents(data, "elt")
                 if len(elts) == 1:
                     settle(element, node_id, scalar.get(elts[0]))
-                continue
+                if op == "generatorexp":
+                    continue
             if op == "input":
                 kind = attributes.get("binding_kind")
                 if kind == "parameter":
@@ -3233,6 +3249,78 @@ def _planned_scalar_dtypes_from(
                             scalar.get(value)
                             for value in parents(child_data, "value")
                         )
+                    # A retained ``xs.append(v)`` / ``s.add(v)`` /
+                    # ``xs.insert(i, v)`` call on this collection: its value
+                    # argument is a writer.  Read from the call's own record
+                    # when the graph carries no mutation-record table (a
+                    # callee planned from its caller).
+                    elif (
+                        not records
+                        and str((child_data.get("attributes") or {}).get(
+                            "extraction_identity"
+                        )) in {
+                            "builtins.list.append", "builtins.set.add",
+                            "builtins.list.insert",
+                        }
+                        and node_id in parents(child_data, "operand")
+                    ):
+                        call_arguments = sorted(
+                            (int(str(role).split(":", 1)[1]), int(parent))
+                            for parent, role in child_data.get("parents") or ()
+                            if str(role).startswith("arg:")
+                            and int(parent) in G
+                        )
+                        if call_arguments:
+                            writers.append(scalar.get(call_arguments[-1][1]))
+                    # Program: ``fill(xs, n)`` with ``def fill(dst:
+                    # list[int], ...)`` (corpus c55).  Wrong record: the
+                    # list passed to an annotated collection formal had no
+                    # element writer, so ``for x in xs`` had no class.  Rule:
+                    # the callee formal's declared element class
+                    # (``sequence_element_class_ref``) is what the callee
+                    # accepts, so it is a writer of the actual.
+                    callee_reference = (child_data.get("attributes") or {}).get(
+                        "callee_ref"
+                    )
+                    if callee_reference is not None and operation(
+                        child_data
+                    ) == "call":
+                        for parent, role in child_data.get("parents") or ():
+                            if int(parent) != int(node_id) or not str(
+                                role
+                            ).startswith("arg:"):
+                                continue
+                            try:
+                                callee_graph = graph.function_table.entry(
+                                    int(callee_reference)
+                                ).graph.G
+                                formal_name = tuple(
+                                    callee_graph.graph.get(
+                                        "function_parameters"
+                                    ) or ()
+                                )[int(str(role).split(":", 1)[1])]
+                            except (
+                                AttributeError, KeyError, ValueError,
+                                TypeError, IndexError,
+                            ):
+                                continue
+                            for formal in callee_graph.nodes.values():
+                                formal_attributes = formal.get("attributes") or {}
+                                if (
+                                    operation(formal) == "input"
+                                    and formal_attributes.get("binding_kind")
+                                    == "parameter"
+                                    and formal_attributes.get("binding_name")
+                                    == str(formal_name)
+                                    and formal_attributes.get(
+                                        "sequence_element_class_ref"
+                                    )
+                                ):
+                                    writers.append(classes.get(str(
+                                        formal_attributes[
+                                            "sequence_element_class_ref"
+                                        ]
+                                    ).removeprefix("builtins.")))
                 if node_id in (assumed_elements or {}):
                     if observed_writers is not None:
                         observed_writers[node_id] = (
@@ -25008,8 +25096,6 @@ def _tensor_descriptor_rule(
                             graph.G.graph["_host_scalar_planned"] = memo
                         host_dtype = memo[1].get(int(operand))
                     if host_dtype is None:
-                        if os.environ.get("TRAPPROG"):
-                            open("/tmp/trap2.log", "a").write(repr((os.environ["TRAPPROG"], str(graph.G.graph.get("authored_function_identity"))[-30:], operand, node.get("type"), ast.unparse(node["expr_obj"])[:40] if node.get("expr_obj") is not None else None, (node.get("attributes") or {}).get("binding_kind"))) + "\n")
                         continue
                     sides[index] = {
                         "shape": (), "dtype": host_dtype, "rank": 0,
