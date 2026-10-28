@@ -1176,6 +1176,43 @@ def _numeric_conversion_attributes(
         "signedness": contract["signedness"],
     }
 
+def _range_proven_integer_edge(caller, instruction, actual, source_dtype, target_dtype):
+    """Whether an int64 actual enters a wider integer formal losing nothing.
+
+    Program: Token Orchard's ``intern_preflighted_batch`` passes the
+    caller-supplied ``(fingerprint_hi, fingerprint_lo)`` to
+    ``_intern_validated_span`` after ``if fingerprint_hi < 0 or
+    fingerprint_hi > U64_MAX ...: raise`` (corpus c795).  The callee's
+    members settle uint64 from every actual reaching them; the caller's own
+    value stays int64 (it is compared before the guard).  Rule: int64 into
+    int128 always holds; int64 into uint64 holds exactly where the actual's
+    interval AT this callsite (``guarded_call_actual_range``, or its own
+    ``source_int_range_concordance`` row) is non-negative.  Anything else
+    is not converted here and stays a named conflict.
+    """
+    if str(source_dtype) != 'int64' or str(target_dtype) not in {'uint64', 'int128'}:
+        return False
+    if str(target_dtype) == 'int128':
+        return True
+    from .concordance_declarations import GUARDED_CALL_ACTUAL_RANGE, SOURCE_INT_RANGE
+    book = current_identity_book()
+    callsite = instruction.attributes.get('plan_callsite_id')
+    scopes = tuple(scope for scope in (
+        caller.metadata.get('source_numeric_scope'),
+        caller.metadata.get('authored_function_identity'),
+    ) if scope is not None)
+    for scope in scopes:
+        scope = tuple(scope) if isinstance(scope, list) else scope
+        rows = ((SOURCE_INT_RANGE, (scope, int(actual.id))),)
+        if callsite is not None:
+            rows = ((GUARDED_CALL_ACTUAL_RANGE, (scope, int(callsite), int(actual.id))), *rows)
+        for page, row in rows:
+            interval = book.page(page).latest(row)
+            if interval is not None:
+                return int(interval[0]) >= 0
+    return False
+
+
 def _adapt_physical_call_inputs_round(
     functions, *, progress=None, round_index=0,
     defer_unsettled_region_call_results=False,
@@ -1461,14 +1498,26 @@ def _adapt_physical_call_inputs_round(
                             or _call_writes_argument(instruction, index)
                             or not read_only(callee, formal.id)
                         )
-                        if not (logical_scalar_conversion or logical_pointer_scalar_conversion or physical_conversion):
+                        proven_integer_edge = (
+                            not actual.shape and not formal.shape
+                            and not _call_writes_argument(instruction, index)
+                            and read_only(callee, formal.id)
+                            and _range_proven_integer_edge(
+                                caller, instruction, actual,
+                                source_dtype, formal.dtype,
+                            )
+                        )
+                        if proven_integer_edge:
+                            target_dtype = formal.dtype
+                        elif not (logical_scalar_conversion or logical_pointer_scalar_conversion or physical_conversion):
                             continue
                         # Only numerical scalar representation changes belong
                         # here. Records, references and string tokens are not
                         # interchangeable numerical values.
                         if logical_scalar_conversion:
                             target_dtype = formal.dtype
-                        if source_dtype not in numeric or target_dtype not in numeric:
+                        if not proven_integer_edge and (
+                                source_dtype not in numeric or target_dtype not in numeric):
                             continue
                         # Program: ``ys = [n]; ys.append(n * 0.5); ys[1]``
                         # (c265).  Wrong record: the append helper's row

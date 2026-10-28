@@ -5114,7 +5114,7 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
     """
 
     from ...compiler.concordance_declarations import (
-        SOURCE_INT_RANGE, SOURCE_VALUE_CLASS,
+        GUARDED_CALL_ACTUAL_RANGE, SOURCE_INT_RANGE, SOURCE_VALUE_CLASS,
     )
 
     book = current_identity_book()
@@ -5191,11 +5191,136 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
 
     returns = {id(unit): returned_keys(unit) for unit in units}
 
+    # Raising guards.  Program: Token Orchard's ``intern_preflighted_batch``:
+    # ``if fingerprint_hi < 0 or fingerprint_hi > U64_MAX ...: raise
+    # ValueError(...)`` and then ``self._intern_validated_span(..., (
+    # fingerprint_hi, fingerprint_lo))``.  Wrong record: the guard was not
+    # read, so the caller-supplied pair was unbounded, the callee's ``hi,
+    # lo`` joined it with the proven uint64 fingerprint and kept int64, and
+    # the dict key column refused the uint64 store.  Rule: past ``if A or B
+    # or ...: ... raise`` (no ``else``), every statement that follows in the
+    # same body runs only where each disjunct is false, so a comparison
+    # ``v < c`` / ``v > c`` / ``v <= c`` / ``v >= c`` of a value with a
+    # constant bounds that value (the same value id: a rebinding is a new
+    # id) wherever such a statement reads it.
+    guard_cache: dict = {}
+
+    def guards_of(unit):
+        if id(unit) in guard_cache:
+            return guard_cache[id(unit)]
+        nodes_by_expression = {
+            id(data.get("expr_obj")): int(node_id)
+            for node_id, data in unit.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.AST)
+        }
+        guards = []
+
+        def leaves(node_id):
+            data = unit.G.nodes.get(node_id, {})
+            expression = data.get("expr_obj")
+            if isinstance(expression, ast.BoolOp):
+                if not isinstance(expression.op, ast.Or):
+                    return []
+                found = []
+                for parent, role in data.get("parents") or ():
+                    if str(role).startswith("value:"):
+                        found.extend(leaves(int(parent)))
+                return found
+            kind = str(data.get("type") or data.get("op") or "").casefold()
+            if kind not in {"less", "less_equal", "greater", "greater_equal"}:
+                return []
+            roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
+            if not {"lhs", "rhs"} <= set(roles):
+                return []
+            return [(kind, roles["lhs"], roles["rhs"])]
+
+        def walk(statements):
+            for index, statement in enumerate(statements):
+                if (
+                    isinstance(statement, ast.If)
+                    and not statement.orelse
+                    and statement.body
+                    and isinstance(statement.body[-1], ast.Raise)
+                    and id(statement.test) in nodes_by_expression
+                ):
+                    disjuncts = leaves(nodes_by_expression[id(statement.test)])
+                    if disjuncts:
+                        dominated = {
+                            id(node)
+                            for later in statements[index + 1:]
+                            for node in ast.walk(later)
+                        }
+                        guards.append((dominated, tuple(disjuncts)))
+                for field in ("body", "orelse", "finalbody", "handlers"):
+                    nested = getattr(statement, field, None)
+                    if isinstance(nested, list):
+                        walk([item for item in nested if isinstance(item, ast.stmt)])
+                        for handler in nested:
+                            if isinstance(handler, ast.ExceptHandler):
+                                walk(handler.body)
+
+        body = unit.G.graph.get("function_body")
+        if isinstance(body, (list, tuple)):
+            walk([item for item in body if isinstance(item, ast.stmt)])
+        guard_cache[id(unit)] = guards
+        return guards
+
+    def guarded(unit, site_id, value_key, interval):
+        """``interval`` of ``value_key`` as read at ``site_id``."""
+
+        site = unit.G.nodes.get(site_id, {}).get("expr_obj")
+        if site is None:
+            return interval, ()
+        low = high = None
+        read = []
+        for dominated, disjuncts in guards_of(unit):
+            if id(site) not in dominated:
+                continue
+            for kind, lhs, rhs in disjuncts:
+                for value, constant, flipped in ((lhs, rhs, False), (rhs, lhs, True)):
+                    if unit.key(value) != value_key:
+                        continue
+                    bound = current(unit.key(constant))
+                    if bound is None or bound == _INT_RANGE_TOP or bound[0] != bound[1]:
+                        continue
+                    c = int(bound[0])
+                    relation = {
+                        "less": "greater", "less_equal": "greater_equal",
+                        "greater": "less", "greater_equal": "less_equal",
+                    }[kind] if flipped else kind
+                    # The disjunct is FALSE past the guard.
+                    if relation == "less":
+                        low = c if low is None else max(low, c)
+                    elif relation == "less_equal":
+                        low = c + 1 if low is None else max(low, c + 1)
+                    elif relation == "greater":
+                        high = c if high is None else min(high, c)
+                    else:
+                        high = c - 1 if high is None else min(high, c - 1)
+                    read.append(unit.key(constant))
+        if low is None and high is None:
+            return interval, ()
+        if interval is None:
+            return None, tuple(read)
+        if interval == _INT_RANGE_TOP:
+            if low is None or high is None:
+                return _INT_RANGE_TOP, ()
+            return (low, high), tuple(read)
+        return (
+            interval[0] if low is None else max(interval[0], low),
+            interval[1] if high is None else min(interval[1], high),
+        ), tuple(read)
+
     # Every callsite's actual for every formal; a callsite that leaves a
     # formal unbound (its default, a ``*args`` spread we cannot place) makes
-    # that formal unprovable.
+    # that formal unprovable.  A tuple display passed to a formal binds that
+    # formal's unpacked members (``hi, lo = fingerprint``) position by
+    # position; a ``None`` actual, or an omitted ``None`` default, binds no
+    # member (unpacking ``None`` raises: it never yields a value).
     formal_actuals: dict = {}
     formal_incomplete: set = set()
+    formal_member_actuals: dict = {}
+    formal_member_incomplete: set = set()
     for caller in units:
         for call_id in tuple(caller.G.nodes):
             callee = callee_of(caller, call_id)
@@ -5217,6 +5342,9 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 formal_incomplete.update(
                     callee.key(formal) for formal in formal_nodes.values()
                 )
+                formal_member_incomplete.update(
+                    callee.key(formal) for formal in formal_nodes.values()
+                )
                 continue
             for actual_id, role in edges:
                 name = _callsite_parameter_name(role, receiver, positional)
@@ -5225,12 +5353,31 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                     continue
                 bound.add(formal)
                 formal_actuals.setdefault(callee.key(formal), []).append(
-                    caller.key(int(actual_id))
+                    (caller.key(int(actual_id)), caller, int(call_id))
                 )
-            formal_incomplete.update(
-                callee.key(formal) for formal in formal_nodes.values()
-                if formal not in bound
-            )
+                actual = caller.G.nodes.get(int(actual_id), {})
+                actual_kind = str(actual.get("type") or actual.get("op") or "")
+                if actual_kind == "Tuple":
+                    for position, member in enumerate(
+                        int(parent) for parent, member_role in actual.get("parents") or ()
+                        if str(member_role) == "elts"
+                    ):
+                        formal_member_actuals.setdefault(
+                            (callee.key(formal), position), [],
+                        ).append((caller.key(member), caller, int(call_id)))
+                elif not (
+                    actual_kind in {"Constant", "Const", "const"}
+                    and isinstance(actual.get("expr_obj"), ast.Constant)
+                    and actual["expr_obj"].value is None
+                ):
+                    formal_member_incomplete.add(callee.key(formal))
+            defaults = dict(callee.G.graph.get("parameter_defaults") or {})
+            for name, formal in formal_nodes.items():
+                if formal in bound:
+                    continue
+                formal_incomplete.add(callee.key(formal))
+                if not (name in defaults and defaults[name] is None):
+                    formal_member_incomplete.add(callee.key(formal))
 
     # A function that escapes as a value (a callback, a bound method) has
     # callers this walk cannot see: none of its formals is proven.
@@ -5245,11 +5392,13 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                     escaped = None
                 if escaped is None:
                     continue
-                formal_incomplete.update(
+                escaped_formals = tuple(
                     escaped.key(int(node_id))
                     for node_id, formal in escaped.G.nodes(data=True)
                     if formal.get("type") == "Input"
                 )
+                formal_incomplete.update(escaped_formals)
+                formal_member_incomplete.update(escaped_formals)
 
     # Loop-carried bindings: one value class per binding.
     parent_of: dict = {}
@@ -5367,6 +5516,22 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 return current(member), (member,)
             if callee is not None:
                 return _INT_RANGE_TOP, ()
+            base_data = unit.G.nodes.get(base, {})
+            if (
+                base_data.get("type") == "Input"
+                and type(position) is int
+                and unit.key(base) not in formal_member_incomplete
+            ):
+                entries = formal_member_actuals.get((unit.key(base), position))
+                if entries:
+                    joined, read = None, []
+                    for member_key, caller, call_id in entries:
+                        interval, used = guarded(
+                            caller, call_id, member_key, current(member_key),
+                        )
+                        joined = _join_int_range(joined, interval)
+                        read.extend((member_key, *used))
+                    return joined, tuple(read)
         callee = callee_of(unit, node_id)
         if callee is not None:
             returned = returns.get(id(callee))
@@ -5377,10 +5542,14 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             key = unit.key(node_id)
             actuals = formal_actuals.get(key)
             if actuals and key not in formal_incomplete:
-                joined = None
-                for actual in actuals:
-                    joined = _join_int_range(joined, current(actual))
-                return joined, tuple(actuals)
+                joined, read = None, []
+                for actual, caller, call_id in actuals:
+                    interval, used = guarded(
+                        caller, call_id, actual, current(actual),
+                    )
+                    joined = _join_int_range(joined, interval)
+                    read.extend((actual, *used))
+                return joined, tuple(read)
             return inherited(key)
         return inherited(unit.key(node_id))
 
@@ -5438,6 +5607,33 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             book.post(
                 SOURCE_INT_RANGE, key, tuple(range_page.latest(key)),
                 stage=_REDUCTION, provenance=_Derived(sources),
+                mode=_Mode.CONCORD,
+            )
+    # A guard narrows an actual only where it dominates the call: the
+    # value's own row keeps its whole interval, and the narrowed one is
+    # posted for that callsite (corpus c795: ``preflighted`` passes its
+    # guarded int64 pair to ``intern``'s uint64 members).
+    for actuals in (*formal_actuals.values(), *formal_member_actuals.values()):
+        for actual, caller, call_id in actuals:
+            interval, used = guarded(caller, call_id, actual, current(actual))
+            if not used or interval is None or interval == _INT_RANGE_TOP:
+                continue
+            row = (actual[0], int(call_id), int(actual[1]))
+            if book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, row) is not None:
+                continue
+            call_cell = node_identity_cell(caller.wrapper, int(call_id))
+            book.post(
+                GUARDED_CALL_ACTUAL_RANGE, row,
+                (int(interval[0]), int(interval[1])),
+                stage=_REDUCTION,
+                provenance=_Derived(tuple(dict.fromkeys(
+                    cell for cell in (
+                        call_cell,
+                        *(book.latest_ref(SOURCE_INT_RANGE, read)
+                          for read in (actual, *used)),
+                    )
+                    if cell is not None
+                ))),
                 mode=_Mode.CONCORD,
             )
     return bool(posted)

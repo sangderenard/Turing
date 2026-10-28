@@ -545,6 +545,17 @@ SOURCE_VALUE_CLASS = declare_page("source_value_class_concordance", (
 SOURCE_INT_RANGE = declare_page("source_int_range_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)
+#: ``_solve_int_ranges``: the interval a call actual is proven to lie in AT
+#: one callsite, ``(numeric scope, callsite id, value id)`` -> ``(low,
+#: high)``, where a raising guard dominating the call (``if v < 0 or v >
+#: U64_MAX: raise``) narrows a value whose own row is wider or absent.
+#: CONCORD, DERIVED from the guard constants' range cells, the actual's own
+#: range cell when it has one, and the callsite's node identity.  The call
+#: edge reads it to convert the actual into a wider formal losing nothing.
+GUARDED_CALL_ACTUAL_RANGE = declare_page("guarded_call_actual_range", (
+    RowField("numeric_scope", K.SCOPE), RowField("callsite_id", K.VALUE_ID),
+    RowField("value_id", K.VALUE_ID),
+), tuple)
 
 # ============================================================================
 # Step 3: reducer field state and return sites (plan 70, sections 1-3, 6)

@@ -25030,45 +25030,6 @@ def _class_surface_ssa_program(
                 and dtype == primitive_class
             ):
                 dtype = str(primitive_receipt["dtype"])
-            if (
-                identity == "builtins.int"
-                and storage == "scalar"
-                and dtype in {"", "int", "int64"}
-            ):
-                # Program: ``self.find_existing(domain, hi, lo)`` with ``hi,
-                # lo`` Token Orchard's fingerprint pair (corpus c794).
-                # Wrong record: the formal's arm took the ``int`` receipt's
-                # int64 while every actual is proven ``[0, 2**64-1]``, so
-                # the uint64 actuals were refused as incompatible call
-                # inputs.  Rule: a builtin ``int`` scalar's width is the
-                # narrowest holding its proven interval
-                # (``source_int_range_concordance``), as the planner's is.
-                from ..common.tensors.topological_reducer import (
-                    _int_range_cell as _arm_range_cell,
-                )
-                from ..transmogrifier.dtype_layout import (
-                    python_int_range_dtype as _arm_range_dtype,
-                )
-                from .concordance_declarations import (
-                    SOURCE_INT_RANGE as _ARM_INT_RANGE,
-                )
-
-                range_cell = _arm_range_cell(owner, int(value_id))
-                interval = (
-                    None if range_cell is None
-                    else shape_identity_book.page(_ARM_INT_RANGE).cell(
-                        range_cell.row, range_cell.column,
-                    )
-                )
-                proven = (
-                    None if interval is None
-                    else _arm_range_dtype(int(interval[0]), int(interval[1]))
-                )
-                if proven in {"uint64", "int128"}:
-                    dtype = str(proven)
-                    source_cells = tuple(dict.fromkeys((
-                        *source_cells, range_cell,
-                    )))
             shape = tuple(map(int, contract.get("shape") or ()))
             rank = int(contract.get(
                 "rank",
@@ -25150,6 +25111,50 @@ def _class_surface_ssa_program(
                     else tuple(map(int, contract["sequence_row_shape"]))
                 ),
             ))
+        # Program: ``self.find_existing(domain, hi, lo)`` with ``hi, lo``
+        # Token Orchard's fingerprint pair (corpus c794), and the
+        # flattened ``fingerprint[0]`` member of a tuple formal, whose arm
+        # arrives already established (corpus c795).  Wrong record: the
+        # formal's arm took the ``int`` receipt's int64 while every actual
+        # is proven ``[0, 2**64-1]``, so the uint64 actuals were refused as
+        # incompatible call inputs.  Rule: a builtin ``int`` scalar's width
+        # is the narrowest holding its proven interval
+        # (``source_int_range_concordance``), as the planner's is.
+        from ..common.tensors.topological_reducer import (
+            _int_range_cell as _arm_range_cell,
+        )
+        from ..transmogrifier.dtype_layout import (
+            python_int_range_dtype as _arm_range_dtype,
+        )
+        from .concordance_declarations import (
+            SOURCE_INT_RANGE as _ARM_INT_RANGE,
+        )
+
+        for index, arm in enumerate(arms):
+            if not (
+                arm.identity == "builtins.int"
+                and arm.storage == "scalar"
+                and arm.dtype in {"", "int", "int64"}
+            ):
+                continue
+            range_cell = _arm_range_cell(owner, int(value_id))
+            interval = (
+                None if range_cell is None
+                else shape_identity_book.page(_ARM_INT_RANGE).cell(
+                    range_cell.row, range_cell.column,
+                )
+            )
+            proven = (
+                None if interval is None
+                else _arm_range_dtype(int(interval[0]), int(interval[1]))
+            )
+            if proven in {"uint64", "int128"}:
+                arms[index] = replace(
+                    arm, dtype=str(proven),
+                    source_cells=tuple(dict.fromkeys((
+                        *arm.source_cells, range_cell,
+                    ))),
+                )
         return tuple(sorted(arms, key=lambda arm: arm.identity))
 
     # Conditional expressions are native tagged unions of their authored

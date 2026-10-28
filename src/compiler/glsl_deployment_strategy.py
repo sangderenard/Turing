@@ -30086,6 +30086,50 @@ def _retarget_all_cached_value_ids(
         _retarget_cached_value_ids(data, int(replaced_id), (int(source_id),))
 
 
+def _post_member_interval(graph: Any, leaf_id: int, projections) -> None:
+    """Post a synthesized aggregate member's proven interval.
+
+    The member formal replaces the ``formal[k]`` projections it is aliased
+    to, so its ``source_int_range_concordance`` row is the join of theirs,
+    derived from their cells.  No proven projection: no row.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _int_range_cell, _source_numeric_scope, node_identity_cell,
+    )
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, SOURCE_INT_RANGE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    book = current_identity_book()
+    cells = []
+    low = high = None
+    for projection in projections:
+        data = graph.G.nodes.get(int(projection), {})
+        cell = _int_range_cell(graph, int(data.get("value_id", projection)))
+        if cell is None:
+            return
+        interval = book.page(SOURCE_INT_RANGE).cell(cell.row, cell.column)
+        low = int(interval[0]) if low is None else min(low, int(interval[0]))
+        high = int(interval[1]) if high is None else max(high, int(interval[1]))
+        cells.append(cell)
+    if not cells:
+        return
+    leaf_cell = node_identity_cell(graph, int(leaf_id))
+    book.post(
+        SOURCE_INT_RANGE, (_source_numeric_scope(graph), int(leaf_id)),
+        (low, high),
+        stage=PLANNER_TENSOR_SPECIALIZATION,
+        provenance=Derived(tuple(dict.fromkeys((
+            *cells, *((leaf_cell,) if leaf_cell is not None else ()),
+        )))),
+        mode=Mode.CONCORD,
+    )
+
+
 def _alias_projection_to_member(
     graph: Any, projection: int, leaf_id: int,
 ) -> None:
@@ -30266,6 +30310,13 @@ def _apply_callsite_aggregate_descriptors(
                     stage=PLANNER_TENSOR_SPECIALIZATION,
                 )
                 leaves.append(leaf_id)
+                # Program: Token Orchard's ``hi, lo = fingerprint`` in the
+                # specialization whose ``fingerprint`` is the preflight pair
+                # (corpus c795).  Wrong record: the synthesized member formal
+                # had no interval, so it was int64 against the uint64 the
+                # projection it replaces is proven to hold.  Rule: the
+                # member is the projection; it carries that interval.
+                _post_member_interval(graph, leaf_id, projections.get(index, ()))
                 for projection in projections.get(index, ()):
                     _alias_projection_to_member(graph, projection, leaf_id)
                 if is_nested:
