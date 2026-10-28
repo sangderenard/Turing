@@ -13917,7 +13917,22 @@ def _control_block_position(
     if isinstance(block, ScalarFieldWriteBlock):
         return node_position(int(block.effect_node_id))
     if isinstance(block, SequenceMutationBlock):
-        return node_position(_sequence_mutation_owner_id(block.mutation))
+        # Program: ``lst.extend(values[b:e])``.  Wrong record: the extend
+        # sat at its call's start, before the slice ``values[b:e]`` (a
+        # mutation of its own, authored later on the same line) had filled
+        # its arena, so the extend copied an empty sequence and ``lst``
+        # kept only its old rows (silently wrong on C and LLVM).  Rule: a
+        # method-call mutation executes after its arguments, like a query:
+        # it completes where its call ends.
+        owner_id = _sequence_mutation_owner_id(block.mutation)
+        owner = (graph_obj.nodes.get(int(owner_id)) or {}).get(
+            "expr_obj"
+        ) if int(owner_id) in graph_obj else None
+        if isinstance(owner, ast.Call):
+            return _call_completion_position(
+                graph_obj, int(owner_id), node_position,
+            )
+        return node_position(owner_id)
     if isinstance(block, SequenceQueryBlock) and block.source_call_node_id is not None:
         # A query executes after its arguments: ``d.get(i % 3, 0)`` sat at
         # the call's start, before the region computing its key ``i % 3``
@@ -25072,11 +25087,25 @@ def _class_surface_ssa_program(
                 # as a true None-test).  Rule: a history that holds None
                 # joins its members only when the present ones hold two
                 # classes; beside one class it is an optional.
-                if len(set().union(*(
+                if (len(set().union(*(
                     returned_classes(other) for other in history
                     if not none_member(other)
                 )) - {"builtins.NoneType"}) >= 2
-                or not any(none_member(other) for other in history)
+                or not any(none_member(other) for other in history))
+                # Program: ``def pick(n): if n == 0: return [5, 6, 7];
+                # ...; return [n, n + 1, n + 2, n * 4]`` called twice
+                # (corpus c544).  Wrong record: each return site's list
+                # literal crossed as its own result edge, so its exact
+                # extent (3,) met the one result's unstated extent and the
+                # union arm refused.  Rule: every returned list is copied
+                # into the function's one result at its return site (A6);
+                # when all returns are lists that result's edge is the
+                # whole contract, and a site's own extent is not the
+                # call's.
+                and not all(
+                    returned_classes(other) == {"builtins.list"}
+                    for other in history
+                )
             )
     _settle_linked_dynamic_sequences(
         tuple(planned_graphs_by_shell.values()), tuple(linked_value_edges),
@@ -32217,6 +32246,36 @@ def _class_surface_ssa_program(
                 if desired_id in {int(value.id) for value in existing_outputs}
                 else (*existing_outputs, produced_value)
             )
+            # The region publishes what its call now declares.  Program:
+            # ``s = S(c, 4); ...; return s.n * 10 + s.m`` (c398; lane G).
+            # Wrong record: the call above gained output 1 (the constructor
+            # constant ``4``, defined inside region 2) while the region's Ret
+            # and its source_region_integral still named one output, so LLVM
+            # (which reads the Ret) refused "the call selects 2 aggregate
+            # positions but the callee produces 1"; C read the call's ids.
+            # Rule: the output is appended to the callee's Ret and integral
+            # at the position the call just gave it, one record of outputs.
+            callee_function = all_functions[callee_symbol]
+            for callee_block in callee_function.blocks.values():
+                for returned in callee_block.instrs:
+                    if (
+                        returned.op in {"Ret", "ret"}
+                        and len(returned.args) == output_index
+                        and desired_id not in {
+                            int(value.id) for value in returned.args
+                        }
+                    ):
+                        returned.args = [*returned.args, produced_value]
+            integral = callee_function.metadata.get("source_region_integral")
+            if isinstance(integral, dict):
+                published = tuple(map(
+                    int, integral.get("output_value_ids", ())
+                ))
+                if desired_id not in published:
+                    callee_function.metadata["source_region_integral"] = {
+                        **integral,
+                        "output_value_ids": (*published, desired_id),
+                    }
             available.add(desired_id)
 
     # Class construction is raw caller-owned storage plus an authored
