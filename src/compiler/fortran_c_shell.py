@@ -165,7 +165,7 @@ from .resident_sequence_materialization import (
     dict_row_displays as dict_row_displays,
     list_row_reads as list_row_reads,
     list_row_pool_extents as list_row_pool_extents,
-    _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
+    _list_merged_from_branches as _list_merged_from_branches,
     _list_rebound_on_one_branch as _list_rebound_on_one_branch,
     _loop_carried_initial_ids as _loop_carried_initial_ids,
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
@@ -10923,7 +10923,6 @@ def _field_slot_ops(
         for sequence_id, _policy, _columns, _writable
         in sequence_declarations
     }
-    linked_list_parameters = _linked_list_parameter_contracts(graph_obj)
     for parameter_name, contract in _authored_parameter_sequence_contracts(graph_obj).items():
         history = tuple(map(int, identity.get(str(parameter_name), ())))
         if not history:
@@ -10939,8 +10938,15 @@ def _field_slot_ops(
             sequence_id, policy, int(column_count), bool(writable),
         ))
         declared_sequence_ids.add(sequence_id)
-        if str(parameter_name) not in linked_list_parameters:
-            retained_sequence_ids.add(sequence_id)
+        # Program: ``def width(values: list[int]): return len(values)``
+        # called with ``[65 + r, 66]`` and with the all-literal ``[65, 67,
+        # 68]``.  Wrong record: the literal call's specialization declared
+        # the formal here as a retained arena (live flags), the schema
+        # survey joins every variant of ``width``, and the generic variant
+        # then counted live flags its runtime caller never wrote: ``len``
+        # read 0.  Rule: an authored list formal is the caller's storage
+        # viewed as a list; it keeps deleted rows only when this function
+        # deletes from it (``table_deletions``), never by being a formal.
 
     # Source-derived ``Sequence[Record]`` metadata survives graph extraction
     # independently of any one Input wrapper. Declare its caller-owned
@@ -19996,6 +20002,26 @@ def _propagate_native_type_tag_results(
                         provisional_tag_id = dict(caller.metadata.get(
                             "native_value_type_tags", ()
                         )).get(int(first_payload.id))
+                        # Side-by-side arms past the first were reserved
+                        # the same way (``reserve_pending_call_native_union``)
+                        # and are claimed by arm name.
+                        pending_payloads = dict(dict(caller.metadata.get(
+                            "native_value_union_pending_payloads", ()
+                        )).get(int(first_payload.id), ()))
+                        linked_payloads = {
+                            int(pending_payloads[arm.name]): int(
+                                arm.value_ids[0]
+                            )
+                            for arm in alternatives
+                            if arm.name in pending_payloads
+                            and len(arm.value_ids) == 1
+                        }
+                        if len(linked_payloads) != len(pending_payloads):
+                            raise ValueError(
+                                "native union result left a reserved arm "
+                                f"unclaimed at {callee.name}->{caller.name}: "
+                                f"{sorted(pending_payloads)!r}"
+                            )
                         if (
                             incumbent is not None
                             and provisional_tag_id is not None
@@ -20003,7 +20029,16 @@ def _propagate_native_type_tag_results(
                             == int(provisional_tag_id)
                             and int(provisional_tag_id) != int(tag.id)
                             and replace(
-                                incumbent, tag_value_id=int(tag.id)
+                                incumbent, tag_value_id=int(tag.id),
+                                alternatives=tuple(
+                                    replace(arm, value_ids=tuple(
+                                        linked_payloads.get(
+                                            int(value_id), int(value_id),
+                                        )
+                                        for value_id in arm.value_ids
+                                    ))
+                                    for arm in incumbent.alternatives
+                                ),
                             ) == result_descriptor
                         ):
                             caller_unions.unions.assign(
@@ -20054,10 +20089,21 @@ def _propagate_native_type_tag_results(
                                     f"value={int(first_payload.id)}, "
                                     f"tag={int(prior_tag_id)}"
                                 )
+                            claimed = {id(prior_tag): tag}
+                            for prior_id, linked_id in linked_payloads.items():
+                                prior_payload = values.get(int(prior_id))
+                                linked_payload = values.get(int(linked_id))
+                                if prior_payload is None or linked_payload is None:
+                                    raise ValueError(
+                                        "native union result lost a reserved "
+                                        f"arm payload: caller={caller.name!r}, "
+                                        f"payload={int(prior_id)}"
+                                    )
+                                claimed[id(prior_payload)] = linked_payload
                             for rewrite_block in caller.blocks.values():
                                 for consumer in rewrite_block.instrs:
                                     consumer.args = [
-                                        tag if argument is prior_tag else argument
+                                        claimed.get(id(argument), argument)
                                         for argument in consumer.args
                                     ]
                                     # Program: ``if v is not None: t = v * 3``
@@ -20084,7 +20130,7 @@ def _propagate_native_type_tag_results(
                                             }
                             caller.args = [
                                 argument for argument in caller.args
-                                if argument is not prior_tag
+                                if id(argument) not in claimed
                             ]
                             # Program: ``def wrap(r, f): return maybe(r, f)``.
                             # Wrong record: the wrapper's published return
@@ -20105,18 +20151,20 @@ def _propagate_native_type_tag_results(
                             from .identity_concordance import (
                                 current_identity_book,
                             )
+                            renamed = {
+                                int(prior_tag_id): int(tag.id),
+                                **linked_payloads,
+                            }
                             for output_id, members in tuple(
                                 aggregate_return_layouts(caller).items()
                             ):
-                                if int(prior_tag_id) not in members:
+                                if not set(map(int, members)) & set(renamed):
                                     continue
                                 book = current_identity_book()
                                 publish_aggregate_return_layout(
                                     caller, int(output_id),
                                     tuple(
-                                        int(tag.id)
-                                        if int(member) == int(prior_tag_id)
-                                        else int(member)
+                                        renamed.get(int(member), int(member))
                                         for member in members
                                     ),
                                     sources=(
@@ -20134,7 +20182,6 @@ def _propagate_native_type_tag_results(
                             # The same wrong record seen from the wrapper's
                             # callers: their linked calls name the wrapper's
                             # outputs by id, the provisional tag among them.
-                            renamed = {int(prior_tag_id): int(tag.id)}
                             for outer in all_functions.values():
                                 for outer_block in outer.blocks.values():
                                     for outer_call in outer_block.instrs:
@@ -22210,13 +22257,13 @@ def _settle_linked_dynamic_sequences(
     # component here, as an argument and its formal are: a component that
     # grows anywhere is DYNAMIC in every view (rule 4).
     from .resident_sequence_materialization import (
-        _list_merged_from_unequal_displays,
+        _list_merged_from_branches,
         _returned_copy_merge,
     )
 
     for graph_obj in graphs:
         for node_id, data in graph_obj.nodes(data=True):
-            if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+            if not _list_merged_from_branches(graph_obj, int(node_id)):
                 continue
             if _returned_copy_merge(graph_obj, int(node_id)):
                 continue
@@ -22432,17 +22479,10 @@ def _settle_linked_dynamic_sequences(
                     for item in data["expr_obj"].values
                 )
             )
-            or (
-                (data.get("attributes") or {}).get("producer_kind")
-                == "aggregate_phi"
-                and (data.get("attributes") or {}).get("aggregate_kind")
-                == "list"
-                and (data.get("attributes") or {}).get("aggregate_leaf_value_ids")
-            )
             # Program: the same merge from displays of different lengths
             # (c654).  Born by the arms' copies, it is bounded by the
             # longest arm (the survey's copy bound) when nothing grows it.
-            or _list_merged_from_unequal_displays(graph_obj, int(node_id))
+            or _list_merged_from_branches(graph_obj, int(node_id))
             for value_id in (int(node_id),)
             if value_id in escapes
             and (
@@ -24850,6 +24890,65 @@ def _class_surface_ssa_program(
                 (callee_graph, int(callee_id), caller_graph, int(caller_id))
                 for callee_id, caller_id in planned_call.result_bindings
             )
+            # Program: ``def pick(n, c): if c == 2: return n; return n *
+            # 0.5``.  Wrong record: the result edge bound only the output's
+            # last return (``n * 0.5``), so the caller's call result claimed
+            # float though one return is an int.  A positional output's
+            # history in the callee's identity table names every returned
+            # value (one per return site); each
+            # is a result edge, and the contract settlement below joins
+            # their classes into the union the call carries.  A ``return
+            # None`` member joins only when the other returns hold two
+            # classes, as the callee's return frame does
+            # (``_return_edges_scalar_union``); beside one class it is an
+            # optional whose presence is lowered on its own
+            # (``ssa_optional_values``).
+            callee_contracts = linked_value_abi_by_graph.get(
+                id(callee_graph), {}
+            )
+
+            def returned_classes(member: int) -> set:
+                contract = callee_contracts.get(int(member)) or {}
+                return {
+                    str(identity) for identity in (
+                        *(contract.get("python_types") or ()),
+                        contract.get("python_type"),
+                    )
+                    if identity is not None
+                }
+
+            def none_member(member: int) -> bool:
+                node = callee_graph.nodes[int(member)]
+                return (
+                    isinstance(node.get("expr_obj"), ast.Constant)
+                    and node["expr_obj"].value is None
+                )
+
+            output_histories = {
+                int(history[-1]): tuple(map(int, history))
+                for name, history in (
+                    callee_graph.graph.get("identity_table") or {}
+                ).items()
+                # Only a positional slot's history is its return values; a
+                # returned name's history is its rebinding chain.
+                if history and str(name) in set(map(str, (
+                    callee_graph.graph.get("positional_output_names") or ()
+                )))
+            }
+            linked_value_edges.extend(
+                (callee_graph, int(member), caller_graph, int(caller_id))
+                for callee_id, caller_id in planned_call.result_bindings
+                for history in (tuple(
+                    member
+                    for member in output_histories.get(int(callee_id), ())
+                    if int(member) in callee_graph
+                ),)
+                for member in history[:-1]
+                if not none_member(member) or len(set().union(*(
+                    returned_classes(other) for other in history
+                    if not none_member(other)
+                )) - {"builtins.NoneType"}) >= 2
+            )
     _settle_linked_dynamic_sequences(
         tuple(planned_graphs_by_shell.values()), tuple(linked_value_edges),
         frozenset(linked_argument_sites),
@@ -25135,6 +25234,50 @@ def _class_surface_ssa_program(
                     else tuple(map(int, contract["sequence_row_shape"]))
                 ),
             ))
+        # Program: ``self.find_existing(domain, hi, lo)`` with ``hi, lo``
+        # Token Orchard's fingerprint pair (corpus c794), and the
+        # flattened ``fingerprint[0]`` member of a tuple formal, whose arm
+        # arrives already established (corpus c795).  Wrong record: the
+        # formal's arm took the ``int`` receipt's int64 while every actual
+        # is proven ``[0, 2**64-1]``, so the uint64 actuals were refused as
+        # incompatible call inputs.  Rule: a builtin ``int`` scalar's width
+        # is the narrowest holding its proven interval
+        # (``source_int_range_concordance``), as the planner's is.
+        from ..common.tensors.topological_reducer import (
+            _int_range_cell as _arm_range_cell,
+        )
+        from ..transmogrifier.dtype_layout import (
+            python_int_range_dtype as _arm_range_dtype,
+        )
+        from .concordance_declarations import (
+            SOURCE_INT_RANGE as _ARM_INT_RANGE,
+        )
+
+        for index, arm in enumerate(arms):
+            if not (
+                arm.identity == "builtins.int"
+                and arm.storage == "scalar"
+                and arm.dtype in {"", "int", "int64"}
+            ):
+                continue
+            range_cell = _arm_range_cell(owner, int(value_id))
+            interval = (
+                None if range_cell is None
+                else shape_identity_book.page(_ARM_INT_RANGE).cell(
+                    range_cell.row, range_cell.column,
+                )
+            )
+            proven = (
+                None if interval is None
+                else _arm_range_dtype(int(interval[0]), int(interval[1]))
+            )
+            if proven in {"uint64", "int128"}:
+                arms[index] = replace(
+                    arm, dtype=str(proven),
+                    source_cells=tuple(dict.fromkeys((
+                        *arm.source_cells, range_cell,
+                    ))),
+                )
         return tuple(sorted(arms, key=lambda arm: arm.identity))
 
     # Conditional expressions are native tagged unions of their authored
@@ -25207,12 +25350,25 @@ def _class_surface_ssa_program(
                                 next(iter(payload_classes))
                             )
                             conditional_changed = True
-                        continue
+                        # Program: ``if c == 2: s = n else: s = n * 0.5;
+                        # return s`` (corpus c775).  A name merge whose arms
+                        # are two present classes is the same join an IfExp
+                        # is: Python keeps each arm's class, so it settles
+                        # into a tagged union below, not into either class.
+                        if not (
+                            len(arm_classes) == 2
+                            and None not in arm_classes
+                            and "builtins.NoneType" not in arm_classes
+                            and len(payload_classes) == 2
+                        ):
+                            continue
                     member_merge = (
                         str(data.get("type") or "") == "Phi"
                         and (
                             member_attributes.get("conditional_result_of") is not None
                             or member_attributes.get("aggregate_parent_value_id")
+                            is not None
+                            or member_attributes.get("source_conditional_id")
                             is not None
                         )
                     )
@@ -27463,6 +27619,19 @@ def _class_surface_ssa_program(
             specialization_contract = (
                 *specialization_contract, aggregate_specialization,
             )
+        # Program: ``head_sum(xs)`` called with ``list[int]`` and with
+        # ``list[float]`` (corpus c832).  Wrong record: both copies carried
+        # the same empty contract, so both lowered under one symbol and the
+        # int caller bound a float64 frame.  Rule: the element class every
+        # call record names for a list formal is part of the callsite
+        # contract.
+        element_specialization = (
+            graph_obj.graph.get("planner_parameter_element_classes") or {}
+        )
+        if element_specialization:
+            specialization_contract = (
+                *specialization_contract, element_specialization,
+            )
         # A record-only callsite variant IS a different executable contract.
         # root(Actual)->relay(Declared)->leaf(Declared) used to overwrite both
         # variants under one symbol because only literals/tensors were keyed.
@@ -28419,13 +28588,42 @@ def _class_surface_ssa_program(
                 parameter_value_dtypes[int(value_id)] = str(descriptor["dtype"])
             if descriptor.get("shape") is not None:
                 parameter_value_shapes[int(value_id)] = tuple(descriptor["shape"])
+        from ..common.tensors.topological_reducer import (
+            _int_range_cell as _linked_range_cell,
+        )
+        from ..transmogrifier.dtype_layout import (
+            python_int_range_dtype as _linked_range_dtype,
+        )
+        from .concordance_declarations import (
+            SOURCE_INT_RANGE as _LINKED_INT_RANGE,
+        )
+
         for value_id, value_abi in dict(
             graph_obj.graph.get("linked_value_abi") or {}
         ).items():
             if value_abi.get("dtype") is not None:
-                parameter_value_dtypes[int(value_id)] = str(
-                    value_abi["dtype"]
-                )
+                linked_dtype = str(value_abi["dtype"])
+                if linked_dtype in {"int", "int64"} and not tuple(
+                    value_abi.get("shape") or ()
+                ):
+                    # Program: ``hi, lo = self.fingerprint(mode, n)`` with
+                    # ``-> tuple[int, int]`` (corpus c794).  Wrong record:
+                    # the members' linked contract spelled the declared
+                    # class's int64, so the key built from them was int64
+                    # while both are proven ``[0, 2**64-1]``.  Rule: a
+                    # scalar ``int``'s width is the narrowest holding its
+                    # proven interval, as its ABI arm's is.
+                    range_cell = _linked_range_cell(graph_obj, int(value_id))
+                    if range_cell is not None:
+                        interval = shape_identity_book.page(
+                            _LINKED_INT_RANGE
+                        ).cell(range_cell.row, range_cell.column)
+                        proven = _linked_range_dtype(
+                            int(interval[0]), int(interval[1]),
+                        )
+                        if proven in {"uint64", "int128"}:
+                            linked_dtype = str(proven)
+                parameter_value_dtypes[int(value_id)] = linked_dtype
             if value_abi.get("shape") is not None:
                 parameter_value_shapes[int(value_id)] = tuple(map(
                     int, value_abi["shape"]
@@ -30182,7 +30380,7 @@ def _class_surface_ssa_program(
         )
 
         from ..common.tensors.topological_reducer import (
-            _source_numeric_scope as _int_range_scope,
+            _int_range_scopes as _int_range_scope,
         )
 
         module_ir, shortfalls, shell_section_outputs = (
@@ -44858,11 +45056,22 @@ def _class_surface_ssa_program(
                             mapped_sequence_id = remap[
                                 int(source_sequence.sequence_id)
                             ]
-                            _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(source_sequence, remap, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(source_sequence.child_table_pool, remap)), _frame_table_cell(
-                                constructor_sequences,
-                                source_sequence.sequence_id,
-                                SEQUENCE_DESCRIPTOR,
-                            ))
+                            mapped_descriptor = map_sequence_descriptor(source_sequence, remap, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(source_sequence.child_table_pool, remap))
+                            # One owner per list: a field bound to a
+                            # constructor parameter IS the actual's resident
+                            # sequence, whose descriptor and column claim its
+                            # owner already posted.  Every further
+                            # constructor over the same actual (``Bag(a)``
+                            # twice) maps to that identical descriptor;
+                            # re-posting it is a second writer of one claim.
+                            # A DIFFERING descriptor still registers, and
+                            # table.register refuses the disagreement.
+                            if caller_sequences.by_id(mapped_sequence_id) != mapped_descriptor:
+                                _frame_register_sequence(caller, caller_sequences, mapped_descriptor, _frame_table_cell(
+                                    constructor_sequences,
+                                    source_sequence.sequence_id,
+                                    SEQUENCE_DESCRIPTOR,
+                                ))
                             # The constructor's list display proved its row
                             # bound before remapping. Carry that same bound
                             # with its descriptor, as ordinary call frames do.
@@ -59566,13 +59775,6 @@ def _class_surface_ssa_program(
                 continue
             value.dtype = dtype
 
-    # Native heap cell/owner contracts cross the SAME exact linked call edge
-    # as its values. Raw ptr alone cannot state pointer-cell storage at the
-    # public buffer ABI; the imported formal is that declaration's authority.
-    from .ssa_heap_allocation import project_native_heap_call_contexts
-    compile_substage("project native heap call contexts")
-    project_native_heap_call_contexts(all_functions)
-
     # Sequence helper calls are physical ABI operations.  Their row argument
     # often inlines the producer expression, so updating only the Call's
     # SSAValue occurrence leaves the producer spelling at its provisional
@@ -59934,6 +60136,19 @@ def _class_surface_ssa_program(
         lowered_module.metadata[
             "post_aggregate_frame_reconciliations"
         ] = tuple(post_aggregate_frame_reconciliations)
+
+    # Native heap cell/owner contracts cross the SAME exact linked call edge
+    # as its values. Raw ptr alone cannot state pointer-cell storage at the
+    # public buffer ABI; the imported formal is that declaration's authority.
+    # Program: a copy-merge callee plus a local-merge-append callee in one root
+    # (c879).  Wrong record: this projection ran BEFORE the post-aggregate
+    # exact frame reconciliation above, which then rebinds call actuals to the
+    # frame's caller value, so the receipt (keyed by the whole edge) named
+    # actuals the live edge no longer held.  Rule: the edge actuals are settled
+    # first; the owner decision is made once, on the settled edge.
+    from .ssa_heap_allocation import project_native_heap_call_contexts
+    compile_substage("project native heap call contexts")
+    project_native_heap_call_contexts(all_functions)
 
     # Physical record/call legalization can materialize a pure field
     # projection after control lowering has already built the Phi that reads

@@ -1089,6 +1089,27 @@ def _callsite_argument_descriptor(
     return _tensor_descriptor(caller, int(argument_id))
 
 
+def _formal_is_mutated_in_place(callee_graph: Any, parameter: str) -> bool:
+    """Whether the callee mutates the collection bound to ``parameter``.
+
+    Program: ``def trim(values: list[int]): values.pop(); for v in values:
+    total += v`` called as ``trim([1, 2, 3, 4])``.  Wrong record: the
+    literal argument specialized the copy, which unrolled the loop over the
+    authored four elements and ignored the pop (10, not 6).  Rule: a literal
+    is a value of the copy only while the copy never mutates it; a mutated
+    formal stays the caller's storage.
+    """
+
+    inputs = {
+        int(node_id)
+        for node_id, data in callee_graph.nodes(data=True)
+        if data.get("type") == "Input"
+        and str((data.get("attributes") or {}).get("binding_name"))
+        == str(parameter)
+    }
+    return bool(inputs & set(_mutated_sequence_node_ids(callee_graph)))
+
+
 def _formal_storage_is_mutated(callee_graph: Any, parameter: str) -> bool:
     """Whether the callee needs the caller's storage behind ``parameter``.
 
@@ -2198,17 +2219,9 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
     # members are all proven and whose element type is not assumes its
     # members' join, accepted only under the same check (its writers then
     # join to exactly that type).
-    for node_id, data in G.nodes(data=True):
-        node_id = int(node_id)
+    def members_class(node_id):
+        data = G.nodes[node_id]
         attributes = data.get("attributes") or {}
-        if node_id in proven or node_id in hypotheses:
-            continue
-        if attributes.get("aggregate_kind") not in {"list", "set", "dict"}:
-            continue
-        if str(data.get("op") or data.get("type") or "").casefold().startswith(
-            "indexed"
-        ):
-            continue
         role = (
             "values" if attributes.get("aggregate_kind") == "dict"
             else "arg"
@@ -2223,13 +2236,49 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
         if not members or None in dtypes or not dtypes <= {
             "int64", "float64", "bool",
         }:
-            continue
-        joined = (
+            return None
+        return (
             next(iter(dtypes)) if len(dtypes) == 1
             else "int64" if dtypes == {"int64", "bool"} else None
         )
+
+    for node_id, data in G.nodes(data=True):
+        node_id = int(node_id)
+        attributes = data.get("attributes") or {}
+        if node_id in proven or node_id in hypotheses:
+            continue
+        if attributes.get("aggregate_kind") not in {"list", "set", "dict"}:
+            continue
+        if str(data.get("op") or data.get("type") or "").casefold().startswith(
+            "indexed"
+        ):
+            continue
+        joined = members_class(node_id)
         if joined is not None:
             hypotheses[node_id] = joined
+    # Program: ``if n > 2: x = [1, 2, 3] else: x = [4, 5]`` then ``x[1] =
+    # x[1] + 10``.  The same cycle through a list merged from branches: its
+    # rows are its arms' rows and the store's value reads a row of the
+    # merge.  Rule: a branch-merged list whose arms' members all prove one
+    # class assumes it, accepted only under the same writers check.
+    for node_id, data in G.nodes(data=True):
+        node_id = int(node_id)
+        attributes = data.get("attributes") or {}
+        if (
+            node_id in hypotheses
+            or attributes.get("aggregate_kind") != "list"
+            or attributes.get("producer_kind") not in {
+                "aggregate_phi", "aggregate_merge",
+            }
+        ):
+            continue
+        arm_classes = {
+            hypotheses.get(int(parent)) or members_class(int(parent))
+            for parent, role in data.get("parents") or ()
+            if str(role) in {"body", "orelse"} and int(parent) in G
+        }
+        if len(arm_classes) == 1 and None not in arm_classes:
+            hypotheses[node_id] = next(iter(arm_classes))
     # The same cycle through an annotated formal (``def bump(d: dict[int,
     # int], n): d[0] += n``): the annotation states the rows' class, the
     # store's value reads a row, and the join waits on itself.  Rule: a
@@ -2380,9 +2429,6 @@ def _planned_scalar_dtypes_from(
     # A builtin ``int`` value's native width is the narrowest layout holding
     # its proven interval (``source_int_range_concordance``), the same law a
     # literal's width follows.  An unproven value keeps the int64 rule.
-    from ..common.tensors.topological_reducer import (
-        _source_numeric_scope as _range_scope,
-    )
     from .concordance_declarations import SOURCE_INT_RANGE
     from .identity_concordance import current_identity_book as _range_book
     from ..transmogrifier.dtype_layout import (
@@ -2390,16 +2436,21 @@ def _planned_scalar_dtypes_from(
         python_int_range_dtype,
     )
 
-    range_scope = _range_scope(G)
     range_page = _range_book().page(SOURCE_INT_RANGE)
+
+    from ..common.tensors.topological_reducer import (
+        _int_range_scopes as _range_scopes,
+        _int_range_cell as _range_cell,
+    )
+
+    range_scopes = _range_scopes(G)
 
     def range_dtype(node_id):
         data = G.nodes.get(int(node_id), {})
-        interval = range_page.latest(
-            (range_scope, int(data.get("value_id", node_id)))
-        )
-        if interval is None:
+        cell = _range_cell(range_scopes, int(data.get("value_id", node_id)))
+        if cell is None:
             return None
+        interval = range_page.cell(cell.row, cell.column)
         return python_int_range_dtype(int(interval[0]), int(interval[1]))
 
     scalar: dict[int, str] = {}
@@ -3223,7 +3274,7 @@ def _planned_scalar_dtypes_from(
                 # default (or refused).  Rule: an empty display that
                 # nothing writes into states no element class; the
                 # merge's rows are the other arms' (and its own writers').
-                if op == "phi":
+                if op == "phi" or attributes.get("producer_kind") == "aggregate_merge":
                     def writes_into(arm):
                         arm_value = G.nodes[arm].get("value_id", arm)
                         return any(
@@ -5794,8 +5845,14 @@ def _build_shell_hierarchy_plan(
                       or ()),
                     attributes.get("sequence_element_annotation_cell"),
                 )
-            if attributes.get("program_abi_record_identity"):
-                # A record value is a handle onto its fields' storage.
+            if attributes.get("program_abi_record_identity") or (
+                attributes.get("aggregate_kind") == "dict"
+                and attributes.get("mapping_value_tensor")
+            ):
+                # A record value is a handle onto its fields' storage; so is
+                # a ``Mapping[K, Tensor]`` table, whose rows are child-row
+                # handles (the tensor element class is the child pool's, a
+                # separate record).
                 return (record[0], record[1], "opaque_ref"), (
                     _dtype_producer_cells(graph, int(value_id))
                 )
@@ -13378,6 +13435,37 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
         ):
             if start >= end and reader != int(effect_id):
                 edges.add((int(effect_id), reader))
+    # Program: ``a = [7, 8, 9]; x = a if n > 2 else [4, 5]; grow(x, n);
+    # x[0] = 100 + n`` then ``return a[0] * 10 + a[1]`` (corpus c877/c878).
+    # Wrong record: ``x`` is a handle onto ``a``'s storage, so the store
+    # through ``x`` is an effect on the one storage ``a`` is read from, but
+    # an indexed store was ordered only before the reads that precede it;
+    # the reads of ``a`` after it (and the arithmetic over them) were fused
+    # into a region placed before the store block (silent stale rows).
+    # Rule: a store through a member of a handle component precedes every
+    # later read of any member of that component, as a call's effect does
+    # (a store on an unshared version is ordered by its version edge).
+    for node_id, data in graph.G.nodes(data=True):
+        if str(data.get("type")) != "IndexedStore":
+            continue
+        expression = data.get("expr_obj")
+        if getattr(expression, "end_lineno", None) is None:
+            continue
+        end = (
+            int(expression.end_lineno),
+            int(getattr(expression, "end_col_offset", 0) or 0),
+        )
+        for parent, role in data.get("parents") or ():
+            if str(role) != "base" or parent not in graph.G:
+                continue
+            base_value = int(graph.G.nodes[parent].get("value_id", parent))
+            if base_value not in handle_roots:
+                continue
+            for start, reader in readers_by_sequence.get(
+                storage_key(base_value), (),
+            ):
+                if start >= end and int(reader) != int(node_id):
+                    edges.add((int(node_id), int(reader)))
     # Program: ``xs = [3, n]; xs.append(2); a = xs[1]; xs[1] = 9`` then
     # ``return a + 0`` (scratch lp/c_t; ``xs.pop(1)`` likewise).  Wrong
     # record: an effect was ordered only before the reads after it, so
@@ -13495,6 +13583,12 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     graph.G.graph["sequence_read_before_effect_edges"] = tuple(
         sorted(edge for edge in read_before_effect if edge in edges)
     )
+    # The region schedule orders regions by this graph's ancestry; an
+    # effect-to-read edge that is passed only to the reducer never reached
+    # it (corpus c877: the store region was called after the region that
+    # consumes a later read of its handle's storage).  Publish the edges
+    # so the schedule orders regions by them too.
+    graph.G.graph["sequence_effect_order_edges"] = tuple(sorted(edges))
     return frozenset(edges)
 
 
@@ -20032,7 +20126,7 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                     caller, int(parent),
                 ) and _callsite_argument_is_initializer(
                     caller, int(_node_id), int(parent),
-                ):
+                ) and not _formal_is_mutated_in_place(callee.G, parameter):
                     try:
                         value = _source_static_literal(caller, int(parent))
                     except ValueError:
@@ -21594,7 +21688,7 @@ def _propagate_callsite_tensor_specializations(
                 caller, int(parent),
             ) and _callsite_argument_is_initializer(
                 caller, int(node_id), int(parent),
-            )
+            ) and not _formal_is_mutated_in_place(callee.G, parameter)
             leaves = _authored_aggregate_leaves(caller, int(parent))
             if leaves and not static_argument and all(
                 int(leaf) in caller.G for leaf in leaves
@@ -25164,7 +25258,18 @@ def _tensor_descriptor_rule(
             and str(attributes.get("extraction_identity") or "")
             in {f"builtins.{operation}", operation}
         )
-        if operation in _ELEMENTWISE_BINARY_OPERATIONS or variadic_builtin_selector:
+        # A method call resolved to a source class's method (``bag.add(x)``)
+        # is a call whose name happens to be a canonical op; its resolved
+        # ``method_ref`` says whose it is, and its receiver is an object, not
+        # an elementwise operand.
+        resolved_method_call = bool(
+            attributes.get("source_type") == "Call"
+            and attributes.get("method_ref") is not None
+        )
+        if (
+            operation in _ELEMENTWISE_BINARY_OPERATIONS
+            and not resolved_method_call
+        ) or variadic_builtin_selector:
             operands = tuple(
                 int(parent)
                 for parent, role in data.get("parents") or ()
@@ -30193,6 +30298,50 @@ def _retarget_all_cached_value_ids(
         _retarget_cached_value_ids(data, int(replaced_id), (int(source_id),))
 
 
+def _post_member_interval(graph: Any, leaf_id: int, projections) -> None:
+    """Post a synthesized aggregate member's proven interval.
+
+    The member formal replaces the ``formal[k]`` projections it is aliased
+    to, so its ``source_int_range_concordance`` row is the join of theirs,
+    derived from their cells.  No proven projection: no row.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _int_range_cell, _source_numeric_scope, node_identity_cell,
+    )
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, SOURCE_INT_RANGE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    book = current_identity_book()
+    cells = []
+    low = high = None
+    for projection in projections:
+        data = graph.G.nodes.get(int(projection), {})
+        cell = _int_range_cell(graph, int(data.get("value_id", projection)))
+        if cell is None:
+            return
+        interval = book.page(SOURCE_INT_RANGE).cell(cell.row, cell.column)
+        low = int(interval[0]) if low is None else min(low, int(interval[0]))
+        high = int(interval[1]) if high is None else max(high, int(interval[1]))
+        cells.append(cell)
+    if not cells:
+        return
+    leaf_cell = node_identity_cell(graph, int(leaf_id))
+    book.post(
+        SOURCE_INT_RANGE, (_source_numeric_scope(graph), int(leaf_id)),
+        (low, high),
+        stage=PLANNER_TENSOR_SPECIALIZATION,
+        provenance=Derived(tuple(dict.fromkeys((
+            *cells, *((leaf_cell,) if leaf_cell is not None else ()),
+        )))),
+        mode=Mode.CONCORD,
+    )
+
+
 def _alias_projection_to_member(
     graph: Any, projection: int, leaf_id: int,
 ) -> None:
@@ -30373,6 +30522,13 @@ def _apply_callsite_aggregate_descriptors(
                     stage=PLANNER_TENSOR_SPECIALIZATION,
                 )
                 leaves.append(leaf_id)
+                # Program: Token Orchard's ``hi, lo = fingerprint`` in the
+                # specialization whose ``fingerprint`` is the preflight pair
+                # (corpus c795).  Wrong record: the synthesized member formal
+                # had no interval, so it was int64 against the uint64 the
+                # projection it replaces is proven to hold.  Rule: the
+                # member is the projection; it carries that interval.
+                _post_member_interval(graph, leaf_id, projections.get(index, ()))
                 for projection in projections.get(index, ()):
                     _alias_projection_to_member(graph, projection, leaf_id)
                 if is_nested:
@@ -30985,6 +31141,7 @@ def _callsite_specialized_shell_type(
     # What each argument is, as the caller's concordance states it.  The
     # specialization's parameters are exactly these values.
     parameter_classes: dict[str, tuple[str, int]] = {}
+    parameter_element_classes: dict[str, str] = {}
     # Keep the exact cells which proved those classes.  A specialized copy
     # must not turn an accepted caller fact back into an unsourced callee
     # fact merely because the compact metadata receipt stores the spelling
@@ -31039,6 +31196,13 @@ def _callsite_specialized_shell_type(
         parameter = str(parameter)
         bound_parameters.add(parameter)
         class_fact = caller_class_page.latest((caller_scope, int(parent)))
+        # The actual's element class (``list[int]`` against ``list[float]``)
+        # is part of the signature the copy is built for: the called
+        # inventory's classes for the formal are exact.
+        element_class = ((caller.G.nodes[int(parent)].get("attributes") or {})
+                         .get("sequence_element_class_ref"))
+        if element_class is not None:
+            parameter_element_classes[parameter] = str(element_class)
         if isinstance(class_fact, tuple) and len(class_fact) >= 2:
             parameter_classes[parameter] = (
                 str(class_fact[0]), max(int(class_fact[1]), 1),
@@ -31085,7 +31249,7 @@ def _callsite_specialized_shell_type(
             caller, int(parent),
         ) and _callsite_argument_is_initializer(
             caller, int(node_id), int(parent),
-        )
+        ) and not _formal_is_mutated_in_place(original.G, parameter)
         leaves = _authored_aggregate_leaves(caller, int(parent))
         if leaves and not static_argument and _aggregate_binds_by_member(
             caller.G, int(parent), original.G, parameter, int(node_id),
@@ -31243,6 +31407,7 @@ def _callsite_specialized_shell_type(
             for name, value in record_descriptors.items()
         )),
         tuple(sorted(parameter_classes.items())),
+        tuple(sorted(parameter_element_classes.items())),
     )
     key = (
         tuple(policy.items()), generation,
@@ -31358,6 +31523,9 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_parameter_classes"] = dict(
         parameter_classes
+    )
+    specialized.G.graph["planner_parameter_element_classes"] = dict(
+        parameter_element_classes
     )
     specialized.G.graph["planner_parameter_class_cells"] = dict(
         parameter_class_cells

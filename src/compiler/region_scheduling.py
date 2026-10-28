@@ -35,6 +35,13 @@ def _dependency_order(graph: Any) -> tuple[int, ...]:
         for earlier, later in G.graph.get("host_callback_order_edges", ())
         if int(earlier) in G and int(later) in G
     )
+    # In-place sequence effects are ordered against the later reads of their
+    # storage exactly as callbacks are (``_sequence_effect_read_edges``).
+    effect_order_edges += tuple(
+        (int(earlier), int(later))
+        for earlier, later in G.graph.get("sequence_effect_order_edges", ())
+        if int(earlier) in G and int(later) in G
+    )
     fingerprint = (
         tuple(sorted(map(int, G.nodes))),
         tuple(sorted((int(left), int(right)) for left, right in G.edges)),
