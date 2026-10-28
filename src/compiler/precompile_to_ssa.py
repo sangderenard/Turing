@@ -24099,6 +24099,37 @@ def _inject_field_slot_access(
                 position = return_position  # returned but otherwise unconsumed
             if position is None:
                 continue  # a read nothing consumes has no place and no effect
+            # Program: ``value = self.n; self.n += 1; return value`` (a
+            # counter's ``fresh``).  Wrong record: the read's only consumer is
+            # the ``return``, so its Load was placed right before it -- after
+            # the Store of the increment -- and the call returned the new
+            # value.  Rule: a read stays ahead of any LATER write to its own
+            # slot in the schedule: when that write's Store lands at or before
+            # the read's placement in the same block, the read is placed at
+            # that Store (it sorts first by schedule index).
+            for later_index in range(schedule_index + 1, len(field_ops)):
+                later_kind, later_value, later_slot = field_ops[later_index]
+                if later_kind != "write" or int(later_slot) != int(slot):
+                    continue
+                if later_index in arm_owned:
+                    store_position = arm_owned[later_index][0]
+                else:
+                    later_source = field_write_sources.get(
+                        int(later_value),
+                        produced_values.get(int(later_value)),
+                    )
+                    later_producer = (
+                        None if later_source is None
+                        else producer_position.get(int(later_source.id))
+                    )
+                    store_position = (
+                        later_producer + 1 if later_producer is not None else 0
+                    )
+                if (
+                    store_position < position
+                    and flat[store_position][0] == flat[position][0]
+                ):
+                    position = store_position
             _post_slot_read(int(value_id), int(slot), address)
         else:
             group = []
