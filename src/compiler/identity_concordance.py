@@ -4166,13 +4166,31 @@ class CorrelationTable:
                 "field_cell", "class_cell", "key_layout_cell",
             ))
             problem = None
+            # A scalar key has no aggregate layout: its one key column is
+            # its own exact source class.
+            scalar_key = key is None and view.get("key_width") == 1
             if book is None or any(
                 not isinstance(cell, Ref) or cell.page != page
                 for cell, page in ((field, CLASS_FIELD_DECLARATION),
                                    (scalar, SOURCE_VALUE_CLASS),
-                                   (key, SOURCE_AGGREGATE_LAYOUT))
+                                   *(() if scalar_key else ((key, SOURCE_AGGREGATE_LAYOUT),)))
             ):
                 problem = "child view lacks its field/class/key-layout authority"
+            elif scalar_key:
+                class_fact = book.page(SOURCE_VALUE_CLASS).cell(scalar.row, scalar.column)
+                expected = {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(class_fact[0]))
+                key_cells = tuple(view.get("key_class_cells", ()))
+                key_cell = key_cells[0] if len(key_cells) == 1 else None
+                key_fact = (None if not isinstance(key_cell, Ref)
+                            or key_cell.page != SOURCE_VALUE_CLASS
+                            or key_cell.row[0] != scalar.row[0]
+                            else book.page(SOURCE_VALUE_CLASS).cell(key_cell.row, key_cell.column))
+                if expected != view.get("dtype") or int(class_fact[1]) != 1:
+                    problem = f"child dtype {view.get('dtype')!r} disagrees with operand class {class_fact!r}"
+                elif key_fact is None or int(key_fact[1]) != 1 or tuple(view.get("key_dtypes", ())) != (
+                    {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0])),
+                ):
+                    problem = "scalar key dtype disagrees with its exact key class"
             else:
                 try:
                     class_fact = book.page(SOURCE_VALUE_CLASS).cell(scalar.row, scalar.column)
