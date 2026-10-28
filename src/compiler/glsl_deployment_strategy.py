@@ -3283,6 +3283,31 @@ def _planned_scalar_dtypes_from(
                     element.get(value) if stored else scalar.get(value)
                 ))
                 continue
+            if (
+                op == "get"
+                and len(parents(data, "operand")) == 1
+                and parents(data, "operand")[0] in row_element
+                and len(parents(data, "arg:1")) == 1
+            ):
+                # ``d.get(k, ())`` over a mapping of lists is a row of ``d``
+                # or the default: iterating either yields the join of their
+                # element classes.  An empty literal default holds no
+                # element, so it adds nothing to the join (Python iterates
+                # it zero times).
+                default = parents(data, "arg:1")[0]
+                default_attributes = G.nodes[default].get("attributes") or {}
+                empty_default = (
+                    isinstance(default_attributes.get("value"), (tuple, list))
+                    and not default_attributes.get("value")
+                ) or (
+                    isinstance(G.nodes[default].get("expr_obj"), (ast.List, ast.Tuple))
+                    and not G.nodes[default]["expr_obj"].elts
+                )
+                rows = [row_element[parents(data, "operand")[0]]]
+                if not empty_default:
+                    rows.append(element.get(default))
+                settle(element, node_id, join(rows))
+                continue
             if op == "get" and attributes.get("producer_kind") != "mapping_lookup_result" and is_collection(
                 (parents(data, "operand") or [-1])[0]
             ) and (
@@ -3370,6 +3395,50 @@ def _planned_scalar_dtypes_from(
                     ))
                     # Its own column holds the rows' handles.
                     settle(element, node_id, "int64")
+                # Program: ``d = {}; d[k] = [n, n + 1]`` and
+                # ``d.setdefault(k, []).append(v)`` (string_core core.py).
+                # Wrong record: only a display's members named a mapping's
+                # list rows, so a mapping whose lists arrive by keyed store
+                # or ``setdefault`` had no row class, and its store and every
+                # read of a row refused ("region value N has no settled
+                # dtype").  Rule: a list a store writes, and the row a
+                # ``setdefault`` selects (its appends), are rows of the
+                # mapping; it holds the one class those rows share, and its
+                # own column holds their handles.
+                if attributes.get("aggregate_kind") == "dict" or isinstance(
+                    expression, ast.Dict
+                ):
+                    row_writers = [
+                        element.get(member) for member in row_members
+                        if is_collection(member)
+                    ] if row_members and all(
+                        is_collection(member) for member in row_members
+                    ) else []
+                    for child in G.successors(node_id):
+                        child_data = G.nodes[child]
+                        child_op = operation(child_data)
+                        if (
+                            child_op in {"indexedstore", "setitem"}
+                            and node_id in parents(child_data, "base")
+                        ):
+                            row_writers.extend(
+                                element.get(value)
+                                for value in parents(child_data, "value")
+                                if is_collection(value)
+                            )
+                        elif (
+                            child_op == "setdefault"
+                            and node_id in parents(child_data, "operand")
+                            and is_collection(child)
+                        ):
+                            row_writers.append(element.get(child))
+                    if row_writers:
+                        settle(row_element, node_id, join(row_writers))
+                        settle(element, node_id, "int64")
+                        if node_id in (assumed_elements or {}):
+                            if observed_writers is not None:
+                                observed_writers[node_id] = None
+                        continue
                 writers = [scalar.get(member) for member in members]
                 # Lane D, D2 step 4.  Program: ``ys = sorted(xs); ys[0]``
                 # (corpus c127, c129).  ``sorted`` returns a new list of its
@@ -3621,6 +3690,30 @@ def _planned_scalar_dtypes_from(
                 )
                 if outer and outer[0] in row_element:
                     settle(row_element, node_id, row_element[outer[0]])
+                    settle(element, node_id, "int64")
+                elif base and any(
+                    is_collection(value) for value in parents(data, "value")
+                ) and (
+                    (G.nodes[base[0]].get("attributes") or {}).get(
+                        "aggregate_kind"
+                    ) == "dict"
+                    or (
+                        base[0] in row_element
+                        and operation(G.nodes[base[0]]) in {
+                            "indexedstore", "setitem",
+                        }
+                    )
+                ):
+                    # ``d[k] = [...]``: a new version of a mapping of lists;
+                    # it keeps the mapping's row class (that of the lists
+                    # its stores write) and its column holds row handles.
+                    stored_rows = [
+                        element.get(value) for value in parents(data, "value")
+                    ]
+                    settle(row_element, node_id, join(
+                        [row_element[base[0]], *stored_rows]
+                        if base[0] in row_element else stored_rows
+                    ))
                     settle(element, node_id, "int64")
                 elif base:
                     settle(element, node_id, element.get(base[0]))
