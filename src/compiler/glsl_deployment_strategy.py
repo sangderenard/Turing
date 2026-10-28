@@ -3371,8 +3371,9 @@ def _planned_scalar_dtypes_from(
                     ))
                     continue
                 # Program: ``v = d.get(n); a = -1 if v is None else v``
-                # (corpus c434).  Wrong record: ``d.get(n)`` is the IfExp
-                # ``d[n] if n in d else None``; its ``None`` arm is a
+                # (corpus c434; also ``s = None if c else i`` then ``t =
+                # None if s is None else -s``, corpus c367).  Wrong record:
+                # ``d.get(n)`` is the IfExp ``d[n] if n in d else None``; its ``None`` arm is a
                 # constant with no scalar class, so the join never closed
                 # and the consumer's region had no row.  Rule: an optional
                 # join's payload (the only value a region reads, its
