@@ -22354,9 +22354,17 @@ def _settle_linked_dynamic_sequences(
                 (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
             )
         }
+        # ``r = [0] * 3; return r``: a replicated list is born here as a
+        # display is, and is returned to the caller the same way.
+        returned_born_lists = local_lists | {
+            int(node_id) for node_id, data in graph_obj.nodes(data=True)
+            if (data.get("attributes") or {}).get("aggregate_kind") == "list"
+            and (data.get("attributes") or {}).get("producer_kind")
+            == "sequence_replication"
+        }
         seeds.update(
             (id(graph_obj), value_id)
-            for value_id in local_lists & output_ids
+            for value_id in returned_born_lists & output_ids
         )
         # Program: ``a = [n, 1]; t = a if n > 2 else [7, n, 2]; return t``
         # (c743).  The returned merge owns the result storage its arms are

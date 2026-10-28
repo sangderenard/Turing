@@ -6,6 +6,11 @@ the other.  The returned name is the store's version of ``out``
 (``IndexedStore``), and the readers that recognise a returned formal, its
 element class and the native output record did not follow a store version
 back to the list it writes, so the program was refused.
+
+``def g(n): r = [0] * 3; r[1] = n; return r`` returns a list born in the
+callee: a fresh list per call, whose rows the callee decides in the caller's
+storage.  The call bound the store node, not the list, so the caller's view
+named no arena; a replicated list was also not counted as born there.
 """
 
 from __future__ import annotations
@@ -46,9 +51,39 @@ def root(n: int) -> int:
     return t[0] + a[0] * 10
 '''
 
+# A list born in the callee (replicated or displayed), stored into, then
+# returned: each call returns a fresh list.
+FRESH_REPLICATED = '''
+def g(n):
+    r = [0] * 3
+    r[1] = n
+    return r
+
+
+def root(n: int) -> int:
+    t = g(n)
+    u = g(n + 1)
+    t[0] = 7
+    return t[0] + t[1] * 10 + t[2] * 100 + u[0] * 1000 + u[1] * 10000 + len(t)
+'''
+
+FRESH_DISPLAY = '''
+def g(n: int) -> list[int]:
+    r = [0, 0, 0]
+    r[1] = n
+    return r
+
+
+def root(n: int) -> int:
+    t = g(n)
+    return t[1] + len(t)
+'''
+
 PROGRAMS = {
     "stored_argument": STORED_ARGUMENT,
     "stored_argument_annotated": STORED_ARGUMENT_ANNOTATED,
+    "fresh_replicated": FRESH_REPLICATED,
+    "fresh_display": FRESH_DISPLAY,
 }
 INPUTS = (0, 4, -7)
 

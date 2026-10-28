@@ -1886,7 +1886,7 @@ def _born_in_callee_list(child_graph: Any, value_id: int) -> bool:
         and attributes.get("binding_kind") != "parameter"
         and (
             attributes.get("producer_kind")
-            in {"aggregate", "sequence_materialization"}
+            in {"aggregate", "sequence_materialization", "sequence_replication"}
             or data.get("type") == "LoopResult"
             or isinstance(data.get("expr_obj"), ast.ListComp)
         )
@@ -1951,17 +1951,18 @@ def _authored_output_paths(graph, outputs):
     paths = {}
 
     def expand(path, value_id):
-        # A store version is the collection it writes (``xs[0] = v;
-        # return xs``): one storage, read at the output itself.
+        # A store version is the collection it writes (``r[1] = n; return
+        # r``): the output is that one storage, the list the callee's SSA
+        # returns, never the store node.
         stored = _indexed_store_source(graph, int(value_id))
         attributes = (
             graph.G.nodes[int(stored)].get("attributes") or {}
             if stored in graph.G else {}
         )
-        leaves = (
-            () if attributes.get("aggregate_kind") in _MUTABLE_RETURN_KINDS
-            else _authored_aggregate_leaves(graph, int(value_id))
-        )
+        if attributes.get("aggregate_kind") in _MUTABLE_RETURN_KINDS:
+            paths[path] = int(stored)
+            return
+        leaves = _authored_aggregate_leaves(graph, int(value_id))
         if not leaves:
             paths[path] = int(value_id)
             return
