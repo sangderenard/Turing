@@ -3122,8 +3122,16 @@ def _build_shell_hierarchy_plan(
 
         for callee_id, caller_id in plan_call.result_bindings:
             dtype = settled(plan_call.callee, callee_id)
-            if dtype is not None:
-                call_result_dtypes.setdefault(int(caller_id), dtype)
+            if dtype is None:
+                continue
+            # Two callees binding one caller value must agree on its class;
+            # the first one never wins silently.
+            recorded = call_result_dtypes.setdefault(int(caller_id), dtype)
+            if recorded != dtype:
+                raise ValueError(
+                    f"caller value {int(caller_id)} is bound to call results "
+                    f"of different settled dtypes ({recorded!r} and {dtype!r})"
+                )
 
     def planned_scalar_dtypes() -> dict[int, str]:
         """``_planned_scalar_dtypes`` of this plan's graph, computed once."""
