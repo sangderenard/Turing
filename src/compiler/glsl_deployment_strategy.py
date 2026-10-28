@@ -2903,10 +2903,42 @@ def _planned_scalar_dtypes_from(
                 # branch join that is itself a collection holds its arms'
                 # rows, with its own later writers (the Phi rule below never
                 # sees it, because this rule takes every collection first).
+                # Program: ``if n > 2: t = [n, 1] else: t = []`` (corpus
+                # c732).  Wrong record: the empty display arm has no rows
+                # and no writer, so its absent element class made the
+                # join unknown and every read of ``t`` took the float64
+                # default (or refused).  Rule: an empty display that
+                # nothing writes into states no element class; the
+                # merge's rows are the other arms' (and its own writers').
                 if op == "phi":
+                    def writes_into(arm):
+                        arm_value = G.nodes[arm].get("value_id", arm)
+                        return any(
+                            int(record.get("sequence_value_id", -1))
+                            == int(arm_value)
+                            and str(record.get("operator")) in {
+                                "append", "add", "insert",
+                            }
+                            for record in records.values()
+                        ) or any(
+                            operation(G.nodes[child]) in {
+                                "indexedstore", "setitem",
+                            }
+                            for child in G.successors(arm)
+                        )
+
                     writers.extend(
                         element.get(arm)
                         for arm in parents(data, "body", "orelse")
+                        if not (
+                            (G.nodes[arm].get("attributes") or {}).get(
+                                "aggregate_leaf_value_ids"
+                            ) == ()
+                            and (G.nodes[arm].get("attributes") or {}).get(
+                                "producer_kind"
+                            ) == "aggregate"
+                            and not writes_into(arm)
+                        )
                     )
                 # Lane D, D2.  Program: ``rep = list(xs)`` on a branch, then
                 # ``rep[0] * 10 + rep[-1]`` (corpus c441).  A copy of a
@@ -4724,6 +4756,34 @@ def _build_shell_hierarchy_plan(
                 )
                 return node, tensor, attributes, logical, dtype, operation, parents
 
+            def phi_element_dtypes(attributes, parent_records, declared):
+                """The element classes a merge's arms state, or ().
+
+                Every arm's class when all are known.  A list merge also
+                answers when its only unknown arms are empty displays
+                (which state none) and another arm states one.
+                """
+
+                dtypes = [record[2] for record in parent_records]
+                if not dtypes:
+                    return ()
+                if None not in dtypes:
+                    return tuple(dtypes)
+                if attributes.get("aggregate_kind") != "list":
+                    return ()
+                if all(
+                    record[2] is not None or (
+                        declared(record[0])[2].get("producer_kind")
+                        == "aggregate"
+                        and declared(record[0])[2].get(
+                            "aggregate_leaf_value_ids"
+                        ) == ()
+                    )
+                    for record in parent_records
+                ):
+                    return tuple(d for d in dtypes if d is not None)
+                return ()
+
             states: dict[int, int] = {}
             stack: list[tuple[int, bool]] = [(root, False)]
             while stack:
@@ -4790,16 +4850,27 @@ def _build_shell_hierarchy_plan(
                         dtype = str(posted["dtype"])
                     elif len(parent_dtypes) == 1:
                         dtype = parent_dtypes[0]
-                elif operation == "phi" and parent_dtypes and None not in parent_dtypes:
+                elif operation == "phi" and phi_element_dtypes(
+                    attributes, parent_records, declared,
+                ):
                     # The guard chooses an arm; it contributes no element
                     # type. A merge's numeric arms use the substrate's
                     # existing promotion rule, not DomainNode's default.
-                    promoted = _widest_element(*parent_dtypes)
+                    # Program: ``if n > 2: t = [n, 1] else: t = []`` (corpus
+                    # c732).  Wrong record: the empty display states no
+                    # element class (its elements come from what is stored
+                    # into it), and the merge took that absence as its own,
+                    # so the merged list had no dtype.  An empty display
+                    # arm leaves the element class to the other arms.
+                    phi_dtypes = phi_element_dtypes(
+                        attributes, parent_records, declared,
+                    )
+                    promoted = _widest_element(*phi_dtypes)
                     if promoted is not None:
                         dtype = promoted
-                    elif all(value in {"int", "int64", "i64", "int32", "i32"} for value in parent_dtypes):
-                        dtype = "int64" if any(value in {"int64", "i64"} for value in parent_dtypes) else "int"
-                    elif all(value == "bool" for value in parent_dtypes):
+                    elif all(value in {"int", "int64", "i64", "int32", "i32"} for value in phi_dtypes):
+                        dtype = "int64" if any(value in {"int64", "i64"} for value in phi_dtypes) else "int"
+                    elif all(value == "bool" for value in phi_dtypes):
                         dtype = "bool"
                 if operation == "cast_like" and len(parents) >= 2:
                     # ``value.cast_like(reference)`` has the REFERENCE's
