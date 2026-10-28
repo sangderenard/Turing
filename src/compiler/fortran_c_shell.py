@@ -29037,6 +29037,10 @@ def _class_surface_ssa_program(
                     if any(
                         getattr(cell.page, "name", cell.page) == "parameter_annotation"
                         for cell in settled_arms[0].source_cells
+                    ) or any(
+                        (data.get("attributes") or {}).get("binding_kind") == "parameter"
+                        and int(data.get("value_id", node_id)) == sequence_id
+                        for node_id, data in graph_obj.nodes(data=True)
                     ):
                         continue
                     from dataclasses import replace as _replace
@@ -29060,6 +29064,10 @@ def _class_surface_ssa_program(
                         provenance=_LateDerived(tuple(dict.fromkeys(cell for cell in (
                             incumbent,
                             _identity_cell(graph_obj, sequence_id),
+                            late_book.latest_ref(
+                                _LATE_SOURCE_VALUE_CLASS,
+                                (late_numeric_scope, sequence_id),
+                            ),
                             *arm.source_cells,
                         ) if cell is not None))),
                         mode=Mode.REVISE,
