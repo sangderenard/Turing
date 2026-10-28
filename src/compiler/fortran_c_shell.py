@@ -59700,9 +59700,22 @@ def _class_surface_ssa_program(
                         f"{(_function_name, _value_id)!r}: "
                         f"ssa={_existing!r}, concordance={_shape!r}"
                     )
+                # Program: ``a, b, c = f(...)`` then ``c[0]`` (a list
+                # returned by a callee).  Wrong record: the call ABI's
+                # ``value_shape`` storage (``span``) was restated over the
+                # row's posted ``sequence`` storage, settled from the
+                # value's SEQUENCE_CONTRACT; the physical view then refused
+                # the two.  Rule: the shape row states the shape; a storage
+                # the value's own row already carries is the posted
+                # authority and is kept.
+                _posted_fact = _posted_ssa_value_fact(
+                    _function, int(_value_id),
+                )
+                _posted_storage = getattr(_posted_fact, "storage", None)
                 _shape_physical = {
                     "rank": len(_shape),
-                    **({"storage": _storage} if _storage else {}),
+                    **({"storage": _storage}
+                       if _storage and not _posted_storage else {}),
                 }
                 publish_ssa_value_type(
                     _function, _value, dtype=_structure.dtype or _dtype or None,
