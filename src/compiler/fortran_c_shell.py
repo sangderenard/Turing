@@ -25854,8 +25854,97 @@ def _class_surface_ssa_program(
                     cells=(_node_cell,), mode=_ShapeMode.REVISE,
                 )
 
+    def _post_loop_update_minimum_trips(owner: Any) -> None:
+        """``loop_update_minimum_trips``: how often each carried update a
+        ``For`` computes in its body itself (not in a branch) runs before
+        the loop exits, when the loop's own record proves it runs at least
+        once (see the page)."""
+
+        from .concordance_declarations import (
+            LOOP_UPDATE_MINIMUM_TRIPS as _MINIMUM_TRIPS,
+        )
+        from .glsl_deployment_strategy import _mutated_sequence_node_ids
+
+        mutated = None
+        for node_id, data in owner.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            if data.get("type") != "For" or attributes.get("loop_break_sites"):
+                continue
+            roles: dict[str, list[int]] = {}
+            for parent in owner.predecessors(node_id):
+                roles.setdefault(
+                    str(owner.edges[parent, node_id].get("role")), [],
+                ).append(int(parent))
+
+            def literal(role: str, default: int) -> int | None:
+                parents = roles.get(role, [])
+                if not parents:
+                    return default
+                (parent,) = parents
+                node = owner.nodes[parent]
+                value = (node.get("attributes") or {}).get("value")
+                if node.get("type") != "Constant" or type(value) is not int:
+                    return None
+                return value
+
+            if roles.get("iterable"):
+                (iterable,) = roles["iterable"]
+                if mutated is None:
+                    mutated = _mutated_sequence_node_ids(owner)
+                members = [
+                    parent for parent in owner.predecessors(iterable)
+                    if owner.edges[parent, iterable].get("role") == "elts"
+                ]
+                if (
+                    owner.nodes[iterable].get("type") not in {"List", "Tuple"}
+                    or iterable in mutated
+                    # ``[*ys]`` has as many members as ``ys``.
+                    or any(
+                        owner.nodes[member].get("type") == "Starred"
+                        for member in members
+                    )
+                ):
+                    continue
+                trips = len(members)
+            else:
+                bounds = (
+                    literal("start", 0), literal("stop", 0),
+                    literal("step", 1),
+                )
+                if None in bounds or bounds[2] == 0:
+                    continue
+                trips = len(range(*bounds))
+            if trips < 1:
+                continue
+            loop_cell = _identity_cell(owner, int(node_id))
+            scope = _copy_scope(owner)[0]
+            statements = {
+                *roles.get("body", ()), *roles.get("carried_update", ()),
+            }
+            for update in map(int, attributes.get(
+                "loop_carried_updated_ids"
+            ) or ()):
+                # Only a statement of the body itself runs on every trip; a
+                # merge is the update's value on some paths only.
+                if update not in statements or owner.nodes[update].get(
+                    "type"
+                ) in {"Phi", "If"}:
+                    continue
+                update_cell = _identity_cell(owner, update)
+                if loop_cell is None or update_cell is None:
+                    continue
+                shape_identity_book.post(
+                    _MINIMUM_TRIPS,
+                    (scope, int(owner.nodes[update].get("value_id", update))),
+                    trips,
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    provenance=_ShapeDerived((loop_cell, update_cell)),
+                    mode=_ShapeMode.CONCORD,
+                )
+
     for planned_graph in planned_graphs_by_shell.values():
         contracts = linked_value_abi_by_graph.get(id(planned_graph), {})
+        _post_loop_update_minimum_trips(planned_graph)
         if contracts:
             from .concordance_declarations import (
                 SOURCE_VALUE_CLASS as _SOURCE_VALUE_CLASS,
