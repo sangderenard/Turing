@@ -2702,6 +2702,18 @@ def _planned_scalar_dtypes_from(
                                 settle(scalar, int(target_id), "int64")
                 elif iterable and target_names:
                     held = element.get(iterable[0])
+                    if (
+                        (G.nodes[iterable[0]].get("attributes") or {}).get(
+                            "aggregate_kind"
+                        ) == "dict"
+                        and (G.nodes[iterable[0]].get("attributes") or {}).get(
+                            "mapping_key_class_ref"
+                        )
+                    ):
+                        # Iterating a mapping yields its keys: the
+                        # annotation's key class, concorded on the target,
+                        # is the dtype, not the value rows' class.
+                        held = None
                     for name in target_names:
                         for target_id, target in G.nodes(data=True):
                             if (
@@ -2756,6 +2768,55 @@ def _planned_scalar_dtypes_from(
                                 ):
                                     settle(scalar, int(target_id),
                                            element.get(argument))
+                # Program: ``ps = [(n, 2), (3, 4)]`` then ``for a, b in ps``.
+                # Wrong record: the tuple target's names had no rule over a
+                # list of tuple displays, so ``a * b`` had no dtype.  Rule:
+                # the i-th name is the join of the i-th member of every
+                # tuple the list displays (a member whose class is unknown
+                # leaves the name unknown, as any join does).
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and iterable
+                    and isinstance(
+                        G.nodes[iterable[0]].get("expr_obj"),
+                        (ast.List, ast.Tuple),
+                    )
+                ):
+                    rows = parents(G.nodes[iterable[0]], "elts")
+                    width = len(loop_expression.target.elts)
+                    row_leaves = [
+                        tuple(int(leaf) for leaf in (
+                            G.nodes[row].get("attributes") or {}
+                        ).get("aggregate_leaf_value_ids") or ())
+                        for row in rows
+                    ]
+                    if rows and all(
+                        len(leaves) == width and all(
+                            leaf in G for leaf in leaves
+                        )
+                        for leaves in row_leaves
+                    ):
+                        for position, item in enumerate(
+                            loop_expression.target.elts
+                        ):
+                            held = join([
+                                scalar.get(leaves[position])
+                                for leaves in row_leaves
+                            ])
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 # Program: ``for k, x in enumerate(xs): t += k * x`` (c351).
                 # Wrong record: as with ``zip``, the tuple target's names were
                 # never typed, so ``x`` fell to the float64 default; C

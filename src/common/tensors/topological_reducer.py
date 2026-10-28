@@ -8161,6 +8161,40 @@ def _normalize_lexical_values(
         annotation_cell = iterator_attributes.get(
             "sequence_element_annotation_cell"
         )
+        if class_identity is None:
+            # Program: ``for k in d`` / ``for v in d.values()`` over ``d:
+            # dict[K, V]``.  Iterating a mapping yields its keys; ``.values()``
+            # yields its values; the annotation states each class.
+            iterator_data = graph.G.nodes[int(iterator_value)]
+            call = iterator_data.get("expr_obj")
+            mapping_attributes = iterator_attributes
+            mapping_id = int(iterator_value)
+            projected_attribute = "mapping_key_class_ref"
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "values"
+            ):
+                owners = [
+                    int(parent) for parent, role
+                    in iterator_data.get("parents") or ()
+                    if str(role) == "operand" and int(parent) in graph.G
+                ]
+                if len(owners) == 1:
+                    mapping_id = owners[0]
+                    mapping_attributes = (
+                        graph.G.nodes[mapping_id].get("attributes") or {}
+                    )
+                    projected_attribute = "mapping_value_class_ref"
+            if mapping_attributes.get("aggregate_kind") == "dict":
+                class_identity = mapping_attributes.get(projected_attribute)
+                annotation_cell = mapping_attributes.get(
+                    "mapping_value_annotation_cell"
+                )
+                if class_identity is not None and mapping_id != int(
+                    iterator_value
+                ):
+                    iterator_value = mapping_id
         if (
             class_identity is None
             and iterator_attributes.get("extraction_identity")
@@ -25227,6 +25261,78 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     changed = changed or prior_result != (
                         str(returned_class), int(returned_limbs),
                     )
+                # Program: ``high, low = limb_step(high, low, byte)`` with an
+                # unannotated ``limb_step`` returning ``next_high, next_low``
+                # (corpus c791).  Wrong record: only a ONE-value return gave
+                # its call a class, so each unpacked member of a tuple return
+                # had none, took the float64 domain default, and the merge of
+                # the loop's int seed with it refused as "a join of int and
+                # float arms".  Rule: an unpacked member ``Indexed(call, k)``
+                # at a literal position has the class of the callee's k-th
+                # returned value, DERIVED from that value's class cell and the
+                # member's node cell.
+                output_count = len(tuple(
+                    callee.graph.get("function_outputs") or ()
+                ))
+                if 1 < output_count == len(returned_value_ids):
+                    member_book = current_identity_book()
+                    member_page = member_book.page(_SOURCE_VALUE_CLASS)
+                    for member_id in tuple(caller.successors(int(call_id))):
+                        member = caller.nodes[member_id]
+                        if str(member.get("type") or "").casefold() != "indexed":
+                            continue
+                        member_parents = {
+                            str(role): int(parent)
+                            for parent, role in member.get("parents") or ()
+                        }
+                        if (
+                            member_parents.get("base") != int(call_id)
+                            or member_parents.get("index") not in caller
+                        ):
+                            continue
+                        index_data = caller.nodes[member_parents["index"]]
+                        position = (index_data.get("attributes") or {}).get(
+                            "value",
+                            getattr(index_data.get("expr_obj"), "value", None),
+                        )
+                        if type(position) is not int or not (
+                            -output_count <= position < output_count
+                        ):
+                            continue
+                        returned_id = returned_value_ids[position]
+                        member_class, member_limbs = (
+                            _resolved_source_value_class(callee, returned_id)
+                        )
+                        if member_class is None:
+                            continue
+                        member_row = (
+                            caller_scope,
+                            int(member.get("value_id", member_id)),
+                        )
+                        prior_member = member_page.latest(member_row)
+                        _concord_source_value_class(
+                            caller_scope, member_row[1], str(member_class),
+                            precision_limbs=int(member_limbs),
+                            source=f"call result member {callee_scope}",
+                            provenance=_Derived(tuple(
+                                cell for cell in (
+                                    node_identity_cell(
+                                        caller_entry.graph, int(member_id),
+                                    ),
+                                    member_book.latest_ref(
+                                        _SOURCE_VALUE_CLASS,
+                                        (callee_scope, int(returned_id)),
+                                    ),
+                                )
+                                if cell is not None
+                            )),
+                        )
+                        # The planner's view of that class cell, as a call
+                        # result carries ``result_class_ref``.
+                        member.setdefault("attributes", {})[
+                            "call_result_member_class_ref"
+                        ] = str(member_class)
+                        changed = changed or prior_member is None
                 receiver, positional, _all_parameters = (
                     _method_parameter_layout(callee)
                 )

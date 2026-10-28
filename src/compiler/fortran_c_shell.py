@@ -24238,6 +24238,30 @@ def _class_surface_ssa_program(
                 class_cell,
             )))
             contract = contracts.setdefault(value_id, {})
+            # Program: ``high, low = limb_step(high, low, byte)`` with an
+            # unannotated tuple-returning ``limb_step`` (corpus c791).  A
+            # declared ``-> tuple[int, int]`` states each member's physical
+            # carrier (``declared_tuple_surfaces``); without it the member's
+            # carrier is its class's: the reducer posted the callee's
+            # returned value's class on it (``call result member``), and a
+            # scalar primitive class owns its receipt's storage and dtype.
+            # The graph descriptor's scalar dtype is the domain default, not
+            # a record of the member.
+            if (
+                attributes.get("call_result_member_class_ref") is not None
+                and identity in {
+                    "builtins.int", "builtins.bool", "builtins.float",
+                }
+            ):
+                member_receipt = _authored_annotation_field_receipt(
+                    ast.Name(id=identity.rsplit(".", 1)[-1], ctx=ast.Load()),
+                )
+                if (
+                    member_receipt is not None
+                    and str(member_receipt["storage"]) == "scalar"
+                ):
+                    for key in ("storage", "dtype", "rank"):
+                        contract.setdefault(key, member_receipt[key])
             admitted = set(map(str, contract.get("python_types") or ()))
             if contract.get("python_type") is not None:
                 admitted.add(str(contract["python_type"]))
