@@ -855,6 +855,54 @@ def _settled_dtype(dtype, value_id, record):
     return dtype
 
 
+def _blocks_in_definition_order(function) -> list[str]:
+    """Block names in reverse post-order from the entry block.
+
+    C binds an SSA result to its local when the defining statement is
+    emitted, so a block must be emitted after every block that dominates it.
+    The block dict is insertion ordered, and a lowering may append a block
+    (for example a sequence-index in-range arm) after the loop latch it
+    branches to; emitting in dict order then reaches the latch before the
+    definition it consumes.  Labels and ``goto`` make the textual order free,
+    so emit in reverse post-order (every dominator precedes the blocks it
+    dominates), the order the SSA's dominance already guarantees.  Blocks
+    unreachable from the entry keep their dict order at the end.
+    """
+
+    names = list(function.blocks)
+    if not names:
+        return names
+    start = "entry" if "entry" in function.blocks else names[0]
+
+    def successors(name: str) -> list[str]:
+        block = function.blocks[name]
+        targets: list[str] = []
+        for instruction in block.instrs:
+            attributes = instruction.attributes or {}
+            for key in ("target", "true_target", "false_target"):
+                target = attributes.get(key)
+                if target is not None and str(target) in function.blocks:
+                    targets.append(str(target))
+        return targets
+
+    visited: set[str] = {start}
+    post: list[str] = []
+    stack: list[tuple[str, iter]] = [(start, iter(successors(start)))]
+    while stack:
+        name, pending = stack[-1]
+        for successor in pending:
+            if successor not in visited:
+                visited.add(successor)
+                stack.append((successor, iter(successors(successor))))
+                break
+        else:
+            stack.pop()
+            post.append(name)
+    ordered = post[::-1]
+    ordered.extend(name for name in names if name not in visited)
+    return ordered
+
+
 def _scalar_c_type(dtype) -> str:
     name = str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold()
     if name == "ptr":
@@ -4143,7 +4191,7 @@ def emit_ssa_module_to_c(
             )
         }
 
-        block_names = list(function.blocks)
+        block_names = _blocks_in_definition_order(function)
         emitted_scalar_locals: set[int] = set()
         effect_guarded_blocks = set(
             function.metadata.get("pool_effect_guarded_blocks") or ()
@@ -4570,6 +4618,13 @@ def emit_ssa_module_to_c(
                     )
                     body.append(f"            goto {_c_label(on_false)};")
                     body.append("        }")
+                    continue
+                if op == "Trap" and instruction.attributes.get("fault_exit"):
+                    # A checked fault already recorded its validation code;
+                    # the exit publishes no outputs and leaves through the
+                    # activation-storage cleanup.
+                    span.take_pending()
+                    body.append(f"        goto cleanup_{_c_symbol(fn)};")
                     continue
                 if op in {"Ret", "ret", "Return", "return"}:
                     if trace_this_function:
