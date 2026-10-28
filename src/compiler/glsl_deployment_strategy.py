@@ -5026,6 +5026,15 @@ def _build_shell_hierarchy_plan(
                         and (graph.G.nodes[source].get("attributes") or {})
                         .get("method_ref") is not None
                     )
+                    # So is a call named by its static reference
+                    # (``Precision.width_of(x)``): an unlinked callee.
+                    or (
+                        (graph.G.nodes[source].get("attributes") or {}).get(
+                            "source_type"
+                        ) == "Call"
+                        and (graph.G.nodes[source].get("attributes") or {})
+                        .get("static_python_reference") is not None
+                    )
                 )
                 and source not in call_result_dtypes
                 and (_shape_dtype_cache.get(source) or (None, None))[1] is None
