@@ -184,6 +184,17 @@ def main():
 def check_group(path, src, inputs, expects, inventory, label=None):
     if True:
         label = label or path.stem
+        # The harness feeds each root parameter as a one-element array.  A
+        # container has no such form (its storage, length and capacity are
+        # its own ABI), so running it reported a false WRONG for a program
+        # nothing had judged.  Say what is true: it was not run.
+        containers = sorted({
+            k for feeds in inputs for k, v in feeds.items()
+            if isinstance(v, (list, tuple, dict, set, frozenset))
+        })
+        if containers:
+            print(f"{label}: CANNOT-FEED container root parameter(s) {containers}; not run")
+            return
         try:
             module, _, exports = lower_ast_source_to_ssa(src, "root", name="corpus_" + path.stem + ("" if inventory is None else "__" + "_".join(inventory[1].values())), extraction_contract=ROOT + "/extraction_contracts/program_extraction.yaml", progress=lambda _: None, **({} if inventory is None else dict(root_calls=inventory[0], root_signature=inventory[1])))
         except Exception as e:
