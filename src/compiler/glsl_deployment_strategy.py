@@ -2294,6 +2294,24 @@ def _planned_scalar_dtypes_from(
             op = operation(data)
             attributes = data.get("attributes") or {}
             expression = data.get("expr_obj")
+            # Program: ``k.mul(x) + k.scale`` with ``def mul(self, x: int) ->
+            # int`` (corpus c426).  Wrong record: a method call is named by
+            # its method (``mul``), so no operator rule typed it and its
+            # declared return class was unread.  Rule: a scalar call result
+            # whose callee declares exactly one return class (int, float or
+            # bool) has that class.
+            declared_returns = {
+                str(ref).removeprefix("builtins.")
+                for ref in attributes.get("declared_return_class_refs") or ()
+            }
+            if (
+                len(declared_returns) == 1
+                and next(iter(declared_returns)) in classes
+                and not attributes.get("aggregate_kind")
+                and attributes.get("method_return_declaration_cell")
+                is not None
+            ):
+                settle(scalar, node_id, classes[next(iter(declared_returns))])
             if op in {"const", "constant"}:
                 literal = attributes.get(
                     "value",
@@ -4255,8 +4273,14 @@ def _build_shell_hierarchy_plan(
                 # dtype is described by the planner's descriptor rule; the
                 # domain default is only the last resort.
                 described_dtype = None
+                # The reducer's synthesized initial read of a record field
+                # (``initial_record_field_state``) is typed the same way: by
+                # the ProgramABI field the descriptor reads.
                 if (
-                    node.get("type") == "Input"
+                    (
+                        node.get("type") == "Input"
+                        or attributes.get("initial_record_field_state")
+                    )
                     and not tensor.get("dtype")
                     and getattr(specialization, "dtype", None) is None
                     and not node.get("dtype")
@@ -4276,13 +4300,11 @@ def _build_shell_hierarchy_plan(
                     or planned_scalar_dtypes().get(int(current))
                     or getattr(domain, "dtype", None)
                 )
-                if not dtype:
-                    raise ValueError(
-                        f"region input {int(current)} has no settled dtype "
-                        "in the tensor, specialization, node, descriptor, "
-                        "planned scalar types or domain"
-                    )
-                dtype = str(dtype)
+                # No record settles it: stay unsettled (None).  A value that
+                # is never consumed as a typed region operand (a record
+                # receiver) needs none; one that is refuses by name where it
+                # is consumed (``_value_shape_dtype`` below).
+                dtype = str(dtype) if dtype else None
                 field_name = attributes.get("attribute")
                 if (
                     not logical
@@ -4453,7 +4475,7 @@ def _build_shell_hierarchy_plan(
                         dtype = str(posted["dtype"])
                     elif len(parent_dtypes) == 1:
                         dtype = parent_dtypes[0]
-                elif operation == "phi" and parent_dtypes:
+                elif operation == "phi" and parent_dtypes and None not in parent_dtypes:
                     # The guard chooses an arm; it contributes no element
                     # type. A merge's numeric arms use the substrate's
                     # existing promotion rule, not DomainNode's default.
@@ -4535,7 +4557,11 @@ def _build_shell_hierarchy_plan(
                             # incompatible operands precisely; choosing one
                             # tuple here would fabricate a region ABI.
                             pass
-                    if parent_dtypes and not tensor.get("dtype"):
+                    if (
+                        parent_dtypes
+                        and None not in parent_dtypes
+                        and not tensor.get("dtype")
+                    ):
                         # A literal Python float is a weak operand: it names
                         # no element width, so beside a typed float operand
                         # it does not widen the result (``float32 * 2.0`` is
@@ -4652,9 +4678,39 @@ def _build_shell_hierarchy_plan(
             )
             return (root, logical, dtype)
 
+        def _typed_value_shape(value_id):
+            """A region value's record; a typed value with none refuses.
+
+            A static symbol (``abs``) and a record identity are not scalar
+            values: they carry no element type and own no region formal
+            dtype, so they contribute no ``value_shapes`` row.  Anything
+            else without a settled dtype is a missing record: name it.
+            """
+
+            record = _value_shape_dtype(value_id)
+            if record[2] is not None:
+                return record
+            node = graph.G.nodes.get(int(value_id), {})
+            attributes = node.get("attributes") or {}
+            if (
+                str(node.get("op") or node.get("type") or "").casefold()
+                == "staticreference"
+                or attributes.get("program_abi_record_identity")
+            ):
+                return None
+            raise ValueError(
+                f"region value {int(value_id)} has no settled dtype in the "
+                "tensor, specialization, node, descriptor, planned scalar "
+                "types, its operands or domain"
+            )
+
         value_shapes = tuple(
-            _value_shape_dtype(value_id)
-            for value_id in (*region_nodes, *region_captures)
+            record
+            for record in (
+                _typed_value_shape(value_id)
+                for value_id in (*region_nodes, *region_captures)
+            )
+            if record is not None
         )
         # Program: ``xs = [1, 1, 1]; return sum(xs) * 10 + n``.  Wrong
         # record: the region's ``Const`` line for the list literal had no
@@ -4664,16 +4720,16 @@ def _build_shell_hierarchy_plan(
         value_shapes += tuple(
             record
             for record in (
-                _value_shape_dtype(value_id)
+                _typed_value_shape(value_id)
                 for value_id in sorted(materialised)
                 if int(value_id) not in produced
                 and int(value_id) not in captured
             )
-            if record[1] or (
+            if record is not None and (record[1] or (
                 (descriptor := planned_descriptor(int(record[0]))) is not None
                 and int(descriptor.get("rank", -1)) == 0
                 and descriptor.get("metadata_state", "static") == "static"
-            )
+            ))
         )
         value_ranks = tuple(
             (
