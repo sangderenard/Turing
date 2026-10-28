@@ -22653,6 +22653,16 @@ class _DescriptorQuery(set):
         self.cut_counter[0] += 1
 
 
+def _recorded_dtype(value: Any, record: str, value_id: Any) -> str:
+    """Return the dtype a record carries, or refuse by name."""
+    if value is None or str(value) == "":
+        raise ValueError(
+            f"value {value_id}: {record} carries no dtype; the pipeline "
+            "recorded no element type for it and none is assumed"
+        )
+    return str(value)
+
+
 def _tensor_descriptor(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -23245,7 +23255,10 @@ def _tensor_descriptor_rule(
             **tensor,
             "shape": linked_shape,
             "dtype": str(
-                linked.get("dtype") or tensor.get("dtype") or "float64"
+                _recorded_dtype(
+                    linked.get("dtype") or tensor.get("dtype"),
+                    "linked_value_abi", data.get("value_id", node_id),
+                )
             ),
             "rank": len(linked_shape),
         }
@@ -23352,7 +23365,10 @@ def _tensor_descriptor_rule(
         if isinstance(linked, Mapping) and linked.get("shape") is not None:
             tensor = {
                 "shape": tuple(map(int, linked["shape"])),
-                "dtype": str(linked.get("dtype") or "float64"),
+                "dtype": _recorded_dtype(
+                    linked.get("dtype"), "linked_value_abi",
+                    data.get("value_id", node_id),
+                ),
             }
     if "shape" not in tensor and str(
         data.get("op") or data.get("type") or ""
@@ -23415,7 +23431,10 @@ def _tensor_descriptor_rule(
             field_shape = tuple(map(int, field.get("shape") or ()))
             tensor = {
                 "shape": field_shape,
-                "dtype": str(field.get("dtype") or "float64"),
+                "dtype": _recorded_dtype(
+                    field.get("dtype"), f"record field {field_name!r}",
+                    data.get("value_id", node_id),
+                ),
                 "rank": len(field_shape),
             }
         elif field_name in {"real", "imag"} and receiver is not None:
@@ -23688,7 +23707,10 @@ def _tensor_descriptor_rule(
                 "shape": tuple(
                     int(extent) for extent in (boundary.get("shape") or ())
                 ),
-                "dtype": str(boundary.get("dtype") or "float64"),
+                "dtype": _recorded_dtype(
+                    boundary.get("dtype"), "ProgramABI boundary",
+                    data.get("value_id", node_id),
+                ),
             }
             # The declared Python type travels with the descriptor.  A
             # callee re-deriving the type from the dtype alone turned a
@@ -23865,7 +23887,10 @@ def _tensor_descriptor_rule(
                 ):
                     return {
                         "shape": (int(iterable_shape[0]), *element_shape),
-                        "dtype": str(element.get("dtype") or "float64"),
+                        "dtype": _recorded_dtype(
+                        element.get("dtype"), "comprehension element",
+                        data.get("value_id", node_id),
+                    ),
                         "rank": 1 + element_rank,
                     }
                 # The resident sequence's length cell owns the leading
@@ -23875,7 +23900,10 @@ def _tensor_descriptor_rule(
                 # leading extent to the sequence descriptor.
                 return {
                     "shape": (),
-                    "dtype": str(element.get("dtype") or "float64"),
+                    "dtype": _recorded_dtype(
+                        element.get("dtype"), "comprehension element",
+                        data.get("value_id", node_id),
+                    ),
                     "rank": 1 + element_rank,
                     "metadata_state": "dynamic",
                     "sequence_row_shape": element_shape,
@@ -23987,7 +24015,10 @@ def _tensor_descriptor_rule(
                 base = _tensor_descriptor(graph, source_id, seen)
                 if base is not None and descriptor_states_a_shape(base):
                     extents = tuple(int(e) for e in (base.get("shape") or ()))
-                    dtype = str(base.get("dtype") or "float64")
+                    dtype = _recorded_dtype(
+                        base.get("dtype"), f"{operation} source tensor",
+                        source_id,
+                    )
                     settled = None
                     first = arguments[0] if arguments else None
                     if operation == "unsqueeze" and isinstance(first, int):
@@ -24518,7 +24549,10 @@ def _tensor_descriptor_rule(
                     else:
                         reduced = None
                 if reduced is not None:
-                    dtype = str(source.get("dtype") or "float64")
+                    dtype = _recorded_dtype(
+                        source.get("dtype"), f"{operation} source tensor",
+                        data.get("value_id", node_id),
+                    )
                     if operation in {"any", "all"}:
                         dtype = "bool"
                     elif operation in {"argmin", "argmax"}:
@@ -24743,9 +24777,9 @@ def _tensor_descriptor_rule(
                         sliced = len(range(start, stop, step))
                         return {
                             "shape": (int(sliced), *base_shape[1:]),
-                            "dtype": str(
-                                (base_descriptor or {}).get("dtype")
-                                or "float64"
+                            "dtype": _recorded_dtype(
+                                (base_descriptor or {}).get("dtype"),
+                                "slice base tensor", base,
                             ),
                             "rank": len(base_shape),
                         }
@@ -24841,9 +24875,14 @@ def _tensor_descriptor_rule(
         else:
             return None
     static_shape = tuple(tensor.get("shape") or ())
+    if not tensor.get("dtype"):
+        # No element type was recorded for this value (a Phi/LoopResult whose
+        # sources publish none).  The query then states nothing about it,
+        # rather than inventing a scalar float64 descriptor.
+        return None
     return {
         "shape": static_shape,
-        "dtype": str(tensor.get("dtype") or "float64"),
+        "dtype": str(tensor["dtype"]),
         "rank": int(tensor.get("rank", len(static_shape))),
         **(
             {"metadata_state": str(tensor["metadata_state"])}
@@ -25462,7 +25501,9 @@ def _fold_callsite_structural_values(
             return None
         return {
             "shape": tuple(map(int, field["shape"])),
-            "dtype": str(field.get("dtype") or "float64"),
+            "dtype": _recorded_dtype(
+                field.get("dtype"), f"record field {field_name!r}", receiver,
+            ),
         }
 
     def descriptor_attribute(parent: int, attribute: str) -> Any:
@@ -27558,7 +27599,18 @@ def _fold_callsite_structural_values(
                         ), None)
                         data["tensor"] = {
                             "shape": (count,),
-                            "dtype": named_dtype or "float64",
+                            "dtype": named_dtype or (
+                                "float64" if any(
+                                    isinstance(v, float)
+                                    for v in positional_values
+                                ) else "int64" if all(
+                                    isinstance(v, int)
+                                    for v in positional_values
+                                ) else _recorded_dtype(
+                                    None, "arange bounds",
+                                    data.get("value_id", node_id),
+                                )
+                            ),
                         }
                         normalized = dict(data.get("attributes") or {})
                         normalized.update({
@@ -29164,7 +29216,10 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
             extra_args=dict(attributes),
             tensor={
                 "shape": tuple(shape),
-                "dtype": str(source_descriptor.get("dtype") or "float64"),
+                "dtype": _recorded_dtype(
+                    source_descriptor.get("dtype"), "unbroadcast source",
+                    current,
+                ),
             },
             control={}, constant=None, expr_obj=None, store_id=None,
         )
