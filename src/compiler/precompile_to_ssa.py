@@ -11028,8 +11028,13 @@ class _ControlSSABuilder(TiledObject):
                     dtype="ptr", transform=ADDRESS,
                     operands=(pool_length, handle),
                 )
+                # The load reads the pool's length cells, so it is typed by
+                # that storage (int64), as ``selected_child_length`` is.  A
+                # literal "int" here asked LLVM for an i32 load of an i64
+                # element (c862, c868, c868b-d; lane G).
                 extent = self.fresh_value(
-                    dtype="int", transform=LOAD, operands=(length_address,),
+                    dtype=str(pool_length.dtype), transform=LOAD,
+                    operands=(length_address,),
                 )
                 self.emit(
                     Handler.GetElementPtr,

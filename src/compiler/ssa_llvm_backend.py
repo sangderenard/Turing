@@ -101,6 +101,11 @@ _UNARY: dict[str, str] = {
     "Not": "{out} = xor i1 {0}, true",
     "LNot": "{out} = xor i1 {0}, true",
     "Invert": "{out} = xor i64 {0}, -1",
+    # Python's ``int.bit_length``: an integer opcode like ``Invert``, spelled
+    # through ``turing_bit_length`` -- the LLVM text of the C backend's own
+    # helper (c695, c696; lane G).  Its integer domain is spelled by
+    # ``integer_scalar_lines``.
+    "BitLength": "{out} = call i64 @turing_bit_length(i64 {0})",
     "SIToFP": "{out} = sitofp i32 {0} to double",
     "FPToSI": "{out} = fptosi double {0} to i32",
     "SiToFp": "{out} = sitofp i32 {0} to double",
@@ -1391,6 +1396,28 @@ def integer_scalar_lines(
             f"{register} = select i1 {register}.below, "
             f"{operand_type} {register}.neg, {operand_type} {operands[0]}",
         ], operand_type)
+    if operation == "BitLength" and len(operands) == 1:
+        # Program: ``a.bit_length() * 100 + b.bit_length()`` (c695) and a
+        # loop-carried ``v.bit_length()`` (c696).  Wrong record: LLVM had no
+        # spelling and refused what C runs through ``turing_bit_length``.
+        # Rule: the same helper, called the way C calls it -- the operand
+        # converted to ``long long`` (sign- or zero-extended from a narrower
+        # integer), an i64 bit count back.  No wider operand has a C form.
+        width = int(operand_type[1:])
+        if width > 64:
+            return None
+        if width == 64:
+            argument, lines = operands[0], []
+        else:
+            argument = f"{register}.wide"
+            lines = [
+                f"{argument} = {'zext' if unsigned else 'sext'} "
+                f"{operand_type} {operands[0]} to i64"
+            ]
+        return ([
+            *lines,
+            f"{register} = call i64 @turing_bit_length(i64 {argument})",
+        ], "i64")
     if operation == "Invert" and len(operands) == 1:
         # The canonical authored ``~mask`` opcode preserves its integer
         # domain. The old double fallback rejected it, despite an i64
@@ -1513,6 +1540,28 @@ exit:
     ),
     # A range loop's induction step saturates (``loop_induction_step``).
     "llvm.sadd.sat.i64": "declare i64 @llvm.sadd.sat.i64(i64, i64)",
+    # Python's ``int.bit_length``, the C backend's ``turing_bit_length``
+    # statement for statement: the unsigned magnitude (``0 - v`` for a
+    # negative v, so INT64_MIN answers 64), then count shifts to zero.
+    # (c695, c696; lane G)
+    "turing_bit_length": """define internal i64 @turing_bit_length(i64 %v) {
+entry:
+  %negative = icmp slt i64 %v, 0
+  %negated = sub i64 0, %v
+  %magnitude = select i1 %negative, i64 %negated, i64 %v
+  br label %scan
+scan:
+  %m = phi i64 [ %magnitude, %entry ], [ %shifted, %count ]
+  %n = phi i64 [ 0, %entry ], [ %counted, %count ]
+  %done = icmp eq i64 %m, 0
+  br i1 %done, label %exit, label %count
+count:
+  %counted = add i64 %n, 1
+  %shifted = lshr i64 %m, 1
+  br label %scan
+exit:
+  ret i64 %n
+}""",
     **{
         f"llvm.{name}.with.overflow.i64": (
             f"declare {{i64, i1}} @llvm.{name}.with.overflow.i64(i64, i64)"
@@ -2272,6 +2321,7 @@ def _emit_repository_call_module(
             callee_aggregate_parameter_positions[callee_name] = positions
 
     function_outputs: dict[str, tuple[_Any, ...]] = {}
+    function_output_ret_positions: dict[str, tuple[int, ...]] = {}
     # A linked LLVM piece is not emitted, but its call sites need its
     # outputs: the piece root's Ret names them, in the artifact's order.
     for name in piece_records:
@@ -2307,15 +2357,22 @@ def _emit_repository_call_module(
                 )
         positions = aggregate_output_positions.get(name)
         if physical_returned:
+            selects_positions = positions is not None and all(
+                position < len(physical_returned) for position in positions
+            )
             function_outputs[name] = (
                 tuple(physical_returned[position] for position in positions)
-                if positions is not None
-                and all(
-                    position < len(physical_returned)
-                    for position in positions
-                )
+                if selects_positions
                 else physical_returned
             )
+            # Declared output i is the Ret's argument at position
+            # positions[i], not at i: the publication must read that same
+            # record.  c467: make(k, m) returns (closure, k, m); the call
+            # selects slots (0, 2), and reading Ret position 1 (the
+            # passed-through k) for output 1 overwrote m with k, so
+            # 3*5 - 5*2 came back -10 on LLVM while C returned 5.
+            if selects_positions and returned is physical_returned:
+                function_output_ret_positions[name] = tuple(positions)
         else:
             declared_ids = aggregate_output_ids.get(name, ())
             function_outputs[name] = tuple(
@@ -3090,8 +3147,14 @@ def _emit_repository_call_module(
         def emit_return_values(
             returned_values: tuple = (),
         ) -> None:
+            ret_positions = function_output_ret_positions.get(name)
             for output_index, output in enumerate(outputs):
                 destination = f"%out.{output_index}"
+                ret_position = (
+                    ret_positions[output_index]
+                    if ret_positions is not None and returned_values
+                    else output_index
+                )
                 # The Ret instruction's own arguments are the authoritative
                 # publication objects: a carried reduction returns its PHI,
                 # whose id differs from the declared output id (the port /
@@ -3099,9 +3162,9 @@ def _emit_repository_call_module(
                 # port's unwritten cell and returned zero for every carried
                 # maximum.
                 source = None
-                if output_index < len(returned_values):
+                if ret_position < len(returned_values):
                     source = pointers.get(
-                        int(returned_values[output_index].id)
+                        int(returned_values[ret_position].id)
                     )
                 if source is None:
                     # A watch shadow, when one exists, is the ONLY readable
@@ -3119,8 +3182,8 @@ def _emit_repository_call_module(
                     # storage at all.
                     for candidate in (
                         *(
-                            (int(returned_values[output_index].id),)
-                            if output_index < len(returned_values) else ()
+                            (int(returned_values[ret_position].id),)
+                            if ret_position < len(returned_values) else ()
                         ),
                         int(output.id),
                     ):
@@ -6358,6 +6421,37 @@ def _emit_repository_call_module(
             wrapper.append(f"  store {llvm_type} {rows}, ptr {public_pointer[capacity_id]}, align {_align(llvm_type)}")
             entry_span.take(UnitKind.STATEMENT, args=(capacity, *(root_arguments[int(column)]
                 for column in sequence.column_value_ids)), spelling=public_pointer[capacity_id])
+    # Program: ``g = [[1, 2], [3, 4]]; return g[i][j]`` (c860-c869e; lane
+    # G).  Wrong record: the C wrapper publishes a root-owned list of lists'
+    # child-table pool capacity and row stride from the root's
+    # ``child_pool_static_extents``; this wrapper never read that record, so
+    # both cells stayed 0 and the first row allocation reported code 75
+    # (capacity exhausted) where C ran.  Rule: publish the same two cells
+    # from the same record before the entry call.
+    if root_sequences is not None:
+        for outer_id, rows, stride in tuple(
+            root.metadata.get("child_pool_static_extents", ())
+        ):
+            outer = root_sequences.sequences.get(int(outer_id))
+            pool = None if outer is None else outer.child_table_pool
+            if pool is None:
+                continue
+            for member_id, member_value in (
+                (pool.capacity_value_id, int(rows) * int(stride)),
+                (pool.row_stride_value_id, int(stride)),
+            ):
+                if int(member_id) not in allocated_counts:
+                    continue
+                member = root_arguments[int(member_id)]
+                member_type = _value_llvm_type(member)
+                wrapper.append(
+                    f"  store {member_type} {member_value}, ptr "
+                    f"{public_pointer[int(member_id)]}, align {_align(member_type)}"
+                )
+                entry_span.take(
+                    UnitKind.STATEMENT, args=(member,),
+                    spelling=public_pointer[int(member_id)],
+                )
     internal_call_records.append((
         None,
         internal_symbols[function_name],
