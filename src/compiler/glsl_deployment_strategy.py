@@ -2284,6 +2284,9 @@ def _planned_scalar_dtypes_from(
 
     scalar: dict[int, str] = {}
     element: dict[int, str] = dict(assumed_elements or {})
+    # A list of lists holds one element class per row: ``row_element`` is
+    # the class every row of a collection-of-collections shares.
+    row_element: dict[int, str] = {}
 
     def join(dtypes):
         known = {dtype for dtype in dtypes if dtype is not None}
@@ -2431,6 +2434,18 @@ def _planned_scalar_dtypes_from(
                     settle(element, node_id, join([
                         literal_dtype(member) for member in literal
                     ]))
+                    # A folded list of lists (corpus c733) holds the one
+                    # class its member rows share.
+                    if all(
+                        isinstance(member, (list, tuple)) and member
+                        for member in literal
+                    ):
+                        settle(row_element, node_id, join([
+                            join([literal_dtype(item) for item in member])
+                            for member in literal
+                        ]))
+                        # Its own column holds the rows' handles.
+                        settle(element, node_id, "int64")
                 # Program: ``sum(i * k for i in range(6))`` (corpus c27).
                 # Lane D, D2.  A folded ``range`` is a constant whose rows
                 # are Python ints by construction; nobody read that, so the
@@ -2876,6 +2891,26 @@ def _planned_scalar_dtypes_from(
                     if attributes.get("producer_kind") == "sequence_materialization"
                     else parents(data, "elts")
                 )
+                # Program: ``g = [[1, 2], [3, n]]; g[i][1] * 10`` (corpus
+                # c732).  Wrong record: a member that is itself a list has no
+                # scalar class, so the outer list joined nothing, the row
+                # ``g[i]`` had no element class, and the planner stopped at
+                # "has no settled dtype".  Rule: when every member is a
+                # collection the outer list's rows are lists, and it holds
+                # the one element class its member rows share.
+                row_members = members or [
+                    int(leaf) for leaf in
+                    attributes.get("aggregate_leaf_value_ids") or ()
+                    if int(leaf) in G
+                ]
+                if row_members and all(
+                    is_collection(member) for member in row_members
+                ):
+                    settle(row_element, node_id, join(
+                        [element.get(member) for member in row_members]
+                    ))
+                    # Its own column holds the rows' handles.
+                    settle(element, node_id, "int64")
                 writers = [scalar.get(member) for member in members]
                 # Lane D, D2 step 4.  Program: ``ys = sorted(xs); ys[0]``
                 # (corpus c127, c129).  ``sorted`` returns a new list of its
@@ -3028,7 +3063,10 @@ def _planned_scalar_dtypes_from(
                 continue
             if op in {"indexed", "getitem", "subscript"}:
                 base = parents(data, "base", "value", "object")
-                if base:
+                if base and base[0] in row_element:
+                    # A row of a list of lists is a list of the shared class.
+                    settle(element, node_id, row_element[base[0]])
+                elif base:
                     settle(scalar, node_id, element.get(base[0]))
                 continue
             # Program: ``d = {}; for i in range(n): d[i % 2] = d.get(i % 2,
@@ -5241,6 +5279,25 @@ def _build_shell_hierarchy_plan(
                 and int(descriptor.get("rank", -1)) == 0
                 and descriptor.get("metadata_state", "static") == "static"
             ))
+        )
+        # Program: ``g = [[1, 2], [3, 4]]; g[i][j]`` (corpus c733).  Wrong
+        # record: a folded list of lists has no tensor extent (its rows are
+        # lists), so its ``Const`` line got no value record and the region
+        # refused it.  Rule: such a constant is a list of row handles: one
+        # int64 per row.
+        value_shapes += tuple(
+            (int(value_id), (len(literal),), "int64")
+            for value_id in sorted(materialised)
+            if int(value_id) not in produced
+            and int(value_id) not in captured
+            and int(value_id) not in {record[0] for record in value_shapes}
+            for literal in ((
+                (graph.G.nodes.get(int(value_id)) or {}).get("attributes")
+                or {}
+            ).get("value"),)
+            if isinstance(literal, list) and literal and all(
+                isinstance(member, (list, tuple)) for member in literal
+            )
         )
         value_ranks = tuple(
             (

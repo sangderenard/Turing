@@ -4851,13 +4851,50 @@ class _ControlSSABuilder(TiledObject):
         # element type is ``heap_element_dtype``, which ``indexed_load``
         # reads); a row load demands the element dtype only of a column
         # that holds its rows.
-        source = self.external_value(
-            int(descriptor.column_value_ids[int(column)]),
-            dtype=(
-                None if descriptor.heap_owner_value_id is not None
-                else str(descriptor.column_dtypes[int(column)])
-            ),
+        # A selected pool row's columns are the slice addresses built where
+        # the row was selected; they are the descriptor's storage values and
+        # have no other binding.
+        source = (
+            self.sequence_storage_values[int(sequence_id)][int(column)]
+            if int(sequence_id) in self.child_table_selections
+            and int(sequence_id) in self.sequence_storage_values
+            else self.external_value(
+                int(descriptor.column_value_ids[int(column)]),
+                dtype=(
+                    None if descriptor.heap_owner_value_id is not None
+                    else str(descriptor.column_dtypes[int(column)])
+                ),
+            )
         )
+        pool = descriptor.child_table_pool
+        if pool is not None and int(column) == int(pool.handle_column):
+            # Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  The
+            # outer list's column holds row handles; ``g[i]`` is the pool
+            # slice that handle selects, as a keyed lookup's row is, and a
+            # region that reads it takes the slice's first column address.
+            handle = self.indexed_load(
+                source, index,
+                int(self.fresh_value(
+                    dtype="int64", transform=LOAD, operands=(source, index),
+                ).id),
+                attributes={
+                    "binding": "ssa_sequence_row_handle_load",
+                    "sequence_id": int(sequence_id),
+                    "column": int(column),
+                },
+            )
+            self.child_table_selections[int(result_id)] = (pool, handle)
+            if self._sequence_descriptor(
+                int(result_id), policy="duplicates", writable=True,
+                location=f"{self.function_name}.sequence_row_load",
+            ) is None:
+                return
+            self._bind(
+                int(result_id),
+                self.sequence_storage_values[int(result_id)][0],
+                BindingKind.SEQUENCE_RESULT, handle,
+            )
+            return
         projected_value = self.indexed_load(
             source, index, int(result_id),
             attributes={
@@ -11406,9 +11443,17 @@ class _ControlSSABuilder(TiledObject):
                                         physical={"arena": True, "storage": "span", "rank": 1})
                 self.emit(Handler.GetElementPtr, [flags, offset], live,
                           attributes={"binding": "selected_child_live_view"})
+            # Program: ``g = [[1, 2], [3, n]]; g[i][1] + g[1][i]`` (corpus
+            # c732).  Wrong record: every selected row of one pool named the
+            # pool's one stride cell as its capacity, so the descriptor audit
+            # saw one cell filling the capacity role of four sequences.  Rule:
+            # a selected row owns its capacity, which is the stride.
+            capacity = self.fresh_value(dtype="int64", transform=CONTROL_CAST, operands=(stride,))
+            self.emit(Handler.Cast, [stride], capacity,
+                      attributes={"target_dtype": "int64", "binding": "selected_child_capacity"})
             descriptor = SSASequenceDescriptor(
                 sequence_id=value_id, column_value_ids=tuple(int(v.id) for v in columns),
-                length_address_id=int(length.id), capacity_value_id=int(stride.id),
+                length_address_id=int(length.id), capacity_value_id=int(capacity.id),
                 status_address_id=None if status is None else int(status.id),
                 column_dtypes=tuple(pool.column_dtypes), column_shapes=((),) * len(columns),
                 key_columns=tuple(pool.key_columns), writable=bool(pool.writable),
@@ -11416,7 +11461,7 @@ class _ControlSSABuilder(TiledObject):
                 capacity_policy=SSASequenceCapacityPolicy.FIXED,
             )
             self.sequence_descriptors[value_id] = descriptor
-            self.sequence_storage_values[value_id] = (*columns, length, stride, *((live,) if live is not None else ()))
+            self.sequence_storage_values[value_id] = (*columns, length, capacity, *((live,) if live is not None else ()))
             if status is not None:
                 self.sequence_status_values[value_id] = status
             return descriptor
@@ -15351,7 +15396,7 @@ class _ControlSSABuilder(TiledObject):
                 "destination uniqueness policy is unresolved",
             ))
             return
-        if not mutation.argument_value_ids and operation not in {"clear", "pop", "sort", "reverse"}:
+        if not mutation.argument_value_ids and operation not in {"clear", "pop", "sort", "reverse"} and str(mutation.argument_kind) != "child_row":
             self.shortfalls.append(SSALoweringShortfall(
                 "ssa-sequence",
                 operation,
@@ -16492,6 +16537,9 @@ class _ControlSSABuilder(TiledObject):
         deferred_record_slots: tuple[tuple[int, int, str, int], ...] = ()
         indexed_record_row_source: tuple[int, int, str] | None = None
         native_type_tag_sequence_receipt: tuple = ()
+        if operation == "append" and str(mutation.argument_kind) == "child_row":
+            self._emit_child_row_birth(mutation, destination, location=location)
+            return
         if operation in {"append", "add"}:
             expected_columns = len(destination.column_value_ids)
             record_slots = self.sequence_row_record_slots.get(
@@ -17513,6 +17561,203 @@ class _ControlSSABuilder(TiledObject):
             ],
             attributes={"binding": "ssa_sequence_status"},
         )
+
+    def _emit_child_row_birth(
+        self,
+        mutation: ControlSequenceMutation,
+        destination: SSASequenceDescriptor,
+        *,
+        location: str,
+    ) -> None:
+        """Birth one row of a list of lists: a pool slice and its handle.
+
+        Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  The outer
+        list's one column holds row handles and each row is a fixed-stride
+        slice of its child-table pool, as the keyed ``setdefault(k, [])`` row
+        is.  The first row resets the outer list.  The new handle is the
+        outer length; it must fit the outer capacity and its whole stride
+        the pool (error runtime calls return, so the failure edge skips the
+        initialization and the append).  The row is then selected exactly as
+        a keyed lookup's row is, guarded by the allocation's room, so the
+        row's own member appends and every later read address the slice.
+        """
+
+        pool = destination.child_table_pool
+        # The row is the display the mutation's effect node names (its
+        # value id, as a keyed lookup's row is); it is not an argument: the
+        # row's own appends are produced after this allocation.
+        row_id = int(mutation.effect_node_id)
+        if pool is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "child_row", location,
+                f"list {int(destination.sequence_id)} has list rows but no "
+                "child-table pool",
+            ))
+            return
+        if int(mutation.display_member[1]) >> 16 == 0:
+            self._emit_sequence_reset(int(destination.sequence_id))
+        handle_dtype = "int64"
+        storage = self.sequence_storage_values[int(destination.sequence_id)]
+        width = len(destination.column_value_ids)
+        outer_length_address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(storage[width],),
+        )
+        self.emit(
+            Handler.GetElementPtr,
+            [storage[width], self.constant_value(0, storage[width])],
+            outer_length_address,
+            attributes={"binding": "ssa_child_row_length_address"},
+        )
+        outer_length = self.fresh_value(
+            dtype="int64", transform=LOAD, operands=(outer_length_address,),
+        )
+        self.emit(
+            Handler.Load, [outer_length_address], outer_length,
+            attributes={"binding": "ssa_child_row_handle"},
+        )
+        new_handle = self.fresh_value(
+            dtype=handle_dtype, transform=CONTROL_CAST, operands=(outer_length,),
+        )
+        self.emit(
+            Handler.Cast, [outer_length], new_handle,
+            attributes={"target_dtype": handle_dtype},
+        )
+        self._bind(
+            int(new_handle.id), new_handle, BindingKind.SEQUENCE_RESULT,
+            outer_length,
+        )
+        one = self.constant_value(1, outer_length, dtype="int64")
+        next_length = self.fresh_value(
+            dtype="int64", transform=CONTROL_EXPRESSION, operands=(outer_length,),
+        )
+        self.emit(Handler.Add, [outer_length, one], next_length)
+        outer_capacity = storage[width + 1]
+        stride = self.external_value(pool.row_stride_value_id)
+        pool_capacity = self.external_value(pool.capacity_value_id)
+        outer_room = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(outer_length, outer_capacity),
+        )
+        self.emit(Handler.Lt, [outer_length, outer_capacity], outer_room)
+        row_end = self.fresh_value(
+            dtype="int64", transform=CONTROL_EXPRESSION,
+            operands=(next_length, stride),
+        )
+        self.emit(Handler.Mul, [next_length, stride], row_end)
+        pool_room = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(row_end, pool_capacity),
+        )
+        self.emit(Handler.Le, [row_end, pool_capacity], pool_room)
+        room = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(outer_room, pool_room),
+        )
+        self.emit(
+            Handler.LAnd, [outer_room, pool_room], room,
+            attributes={"binding": "selected_child_allocation_bounds"},
+        )
+        # The row's view is pure address arithmetic over the new handle, so
+        # it is built here where every later use of the row is dominated by
+        # it; only the stores through it are guarded by ``room``.
+        self.child_table_selections[row_id] = (pool, new_handle)
+        if self._sequence_descriptor(
+            row_id, policy="duplicates", writable=True, location=location,
+        ) is None:
+            return
+        # A region that reads the row takes its first column's address.
+        self._bind(
+            row_id, self.sequence_storage_values[row_id][0],
+            BindingKind.SEQUENCE_RESULT, new_handle,
+        )
+        room_pass = self.new_block("validation_pass")
+        room_fail = self.new_block("validation_fail")
+        joined = self.new_block("if_merge")
+        self.conditional_branch(room, room_pass, room_fail)
+        self.current = room_fail
+        self.emit(Handler.Call, [], attributes={
+            "callee": "turing_validation_error", "error_code": 75,
+            "failure": "fixed_capacity_exhausted",
+            "binding": "selected_child_allocation_bounds",
+            "source_effect_node_id": int(mutation.effect_node_id),
+        })
+        self.branch(joined)
+        self.current = room_pass
+        guard = {"child_selection_guard_value_id": int(room.id)}
+        pool_length = self.external_value(int(pool.length_value_id))
+        child_length_address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(pool_length, new_handle),
+        )
+        self.emit(
+            Handler.GetElementPtr, [pool_length, new_handle],
+            child_length_address,
+            attributes={"binding": "ssa_child_table_length", **guard},
+        )
+        self.emit(
+            Handler.Store,
+            [self.constant_value(0, child_length_address), child_length_address],
+            attributes={"binding": "ssa_child_table_initialize", **guard},
+        )
+        if pool.status_value_id is not None:
+            pool_status = self.external_value(int(pool.status_value_id))
+            child_status_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS,
+                operands=(pool_status, new_handle),
+            )
+            self.emit(
+                Handler.GetElementPtr, [pool_status, new_handle],
+                child_status_address,
+                attributes={"binding": "ssa_child_table_status", **guard},
+            )
+            self.emit(
+                Handler.Store,
+                [self.constant_value(0, child_status_address),
+                 child_status_address],
+                attributes={"binding": "ssa_child_table_initialize", **guard},
+            )
+        from .ir_sequence_tables import lower_sequence_append
+
+        lowering = lower_sequence_append(
+            destination,
+            function_name=self._sequence_helper_name(
+                int(destination.sequence_id), "append",
+            ),
+            first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+        )
+        if not lowering.complete:
+            self.shortfalls.extend(
+                SSALoweringShortfall(
+                    "ssa-sequence", item.code.value, location, item.reason,
+                )
+                for item in lowering.shortfalls
+            )
+            return
+        self._register_sequence_lowering(lowering)
+        call_arguments = (*storage, new_handle)
+        status = self.fresh_value(
+            dtype="int", transform=REGION_CALL_RESULT,
+            operands=tuple(call_arguments),
+        )
+        self.emit(
+            Handler.Call, list(call_arguments), status,
+            attributes={
+                "callee": lowering.entry.name,
+                "source_linked": True,
+                "ssa_sequence_operation": "append",
+                "sequence_id": int(destination.sequence_id),
+                "source_effect_node_id": int(mutation.effect_node_id),
+            },
+        )
+        self.emit(
+            Handler.Store,
+            [status, self._sequence_status_address(
+                self.sequence_status_values[int(destination.sequence_id)]
+            )],
+            attributes={"binding": "ssa_sequence_status"},
+        )
+        self.branch(joined)
+        self.current = joined
+        self.child_selection_validity[row_id] = room
 
     def lower_conditional(
         self, conditional: ConditionalBlock, *, path: str,
@@ -27689,6 +27934,26 @@ def lower_control_sections_to_ssa(
                 and int(reader) not in planned_result_ids
                 and int(reader) not in captured_row_loads
             ))))
+            # Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  A
+            # row load from the row ``g[i]`` selects reads the slice that
+            # ``g[i]``'s own load binds, so it follows that load whatever
+            # order the region's instructions listed them.
+            loaded = {int(operation[0]) for operation in row_loads}
+            ordered_loads: list[tuple] = []
+            waiting = list(row_loads)
+            while waiting:
+                ready = [
+                    operation for operation in waiting
+                    if int(operation[1]) not in loaded
+                    or int(operation[1]) in {
+                        int(done[0]) for done in ordered_loads
+                    }
+                ]
+                if not ready:
+                    ready = waiting
+                ordered_loads.append(ready[0])
+                waiting.remove(ready[0])
+            row_loads = tuple(ordered_loads)
             captured_row_loads.update(int(operation[0]) for operation in row_loads)
             row_stores = tuple(
                 row_store_by_result[int(instruction.res.id)]

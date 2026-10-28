@@ -159,6 +159,9 @@ from .resident_sequence_materialization import (
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
+    list_row_displays as list_row_displays,
+    list_row_reads as list_row_reads,
+    list_row_pool_extents as list_row_pool_extents,
     _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
     _list_rebound_on_one_branch as _list_rebound_on_one_branch,
     _loop_carried_initial_ids as _loop_carried_initial_ids,
@@ -27281,6 +27284,24 @@ def _class_surface_ssa_program(
                 declaration for declaration in sequence_declarations
                 if int(declaration[0]) not in promoted_loop_ports
             )
+        # Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  Wrong
+        # record: each row display kept a declaration of its own, so the
+        # outer list's rows were separate arenas that nothing indexed.  Rule:
+        # a list whose members are all list displays is a nested table (its
+        # column holds row handles, ``nested_sequence_ids``); each row is a
+        # slice of its child-table pool and names no storage of its own.
+        local_list_rows = list_row_displays(graph_obj)
+        local_row_ids = {
+            row for rows in local_list_rows.values() for row, _node in rows
+        }
+        if local_list_rows:
+            sequence_declarations = tuple(
+                declaration for declaration in sequence_declarations
+                if int(declaration[0]) not in local_row_ids
+            )
+            nested_sequence_ids = tuple(sorted({
+                *map(int, nested_sequence_ids), *local_list_rows,
+            }))
         if conditional_sequence_destinations:
             sequence_declarations = tuple(
                 (
@@ -28245,6 +28266,9 @@ def _class_surface_ssa_program(
                 nested_descriptor_sequence_dtypes[destination_id] = (
                     "int64",
                 )
+
+        for outer_id in local_list_rows:
+            nested_descriptor_sequence_dtypes[int(outer_id)] = ("int64",)
 
         self_record_fields = dict(
             (declared_parameter_records.get("self") or {}).get("fields") or {}
@@ -29585,11 +29609,25 @@ def _class_surface_ssa_program(
                         graph_obj, sequence_declarations
                     )
                 ),
-                sequence_child_table_layouts=(
-                    _sequence_child_table_layout_contracts(
+                sequence_child_table_layouts={
+                    **_sequence_child_table_layout_contracts(
                         graph_obj, sequence_declarations
-                    )
-                ),
+                    ),
+                    # The handle is column 0 of a list's one column; a row
+                    # holds the class its member rows share.
+                    **{
+                        int(outer_id): (
+                            0,
+                            (str(
+                                planned_sequence_elements.get(
+                                    int(rows[0][0])
+                                ) or "unknown"
+                            ),),
+                            (), True,
+                        )
+                        for outer_id, rows in local_list_rows.items()
+                    },
+                },
                 sequence_row_record_slots=_sequence_row_record_slots(
                     graph_obj, sequence_declarations
                 ),
@@ -29632,7 +29670,13 @@ def _class_surface_ssa_program(
                     _sequence_inplace_bit_pack_call_ops(graph)
                 ),
                 sequence_row_operations=_sequence_row_operations(
-                    graph_obj, sequence_declarations,
+                    graph_obj,
+                    (*sequence_declarations, *(
+                        (int(row), "duplicates", 1, True)
+                        for row in sorted({
+                            *local_row_ids, *list_row_reads(graph_obj),
+                        })
+                    )),
                     {
                         int(value_id): int(resident_id)
                         for value_id, (resident_id, _kind)
@@ -30292,6 +30336,14 @@ def _class_surface_ssa_program(
             module_ir.functions[symbol].metadata["static_mapping_capacity_bounds"] = (
                 dict(sequence_capacity_bounds)
             )
+            if local_list_rows:
+                module_ir.functions[symbol].metadata[
+                    "child_pool_static_extents"
+                ] = tuple(
+                    (int(outer), int(rows), int(stride))
+                    for outer, (rows, stride)
+                    in sorted(list_row_pool_extents(graph_obj).items())
+                )
             module_ir.functions[symbol].metadata[
                 "sequence_capacity_sources"
             ] = tuple(dict.fromkeys((
@@ -30354,7 +30406,13 @@ def _class_surface_ssa_program(
                     if str(role).startswith("arg:") and parent in graph_obj
                 )
             for operation in _sequence_row_operations(
-                graph_obj, sequence_declarations
+                graph_obj,
+                (*sequence_declarations, *(
+                    (int(row), "duplicates", 1, True)
+                    for row in sorted({
+                        *local_row_ids, *list_row_reads(graph_obj),
+                    })
+                )),
             ):
                 lowered_source_value_ids.add(int(operation[1]))
                 lowered_source_value_ids.add(int(operation[-1]))
