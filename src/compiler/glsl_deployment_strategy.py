@@ -5463,7 +5463,7 @@ def _build_shell_hierarchy_plan(
                         "control",
                     }
                     and (
-                        operation != "phi"
+                        operation not in {"phi", "ifexp"}
                         or str(role).casefold() in {"body", "orelse"}
                     )
                 )
@@ -5563,9 +5563,12 @@ def _build_shell_hierarchy_plan(
                         dtype = str(posted["dtype"])
                     elif len(parent_dtypes) == 1:
                         dtype = parent_dtypes[0]
-                elif operation == "phi" and phi_element_dtypes(
+                elif operation in {"phi", "ifexp"} and phi_element_dtypes(
                     attributes, parent_records, declared,
                 ):
+                    # ``n if c == 2 else n * 0.5`` is the same merge as its
+                    # statement form (corpus c897): its carrier is the
+                    # promoted class, its arms' exact classes are its union.
                     # The guard chooses an arm; it contributes no element
                     # type. A merge's numeric arms use the substrate's
                     # existing promotion rule, not DomainNode's default.

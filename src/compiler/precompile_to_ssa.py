@@ -2216,6 +2216,7 @@ class _ControlSSABuilder(TiledObject):
             int, tuple[tuple[int, ...], tuple[int, ...]]
         ] | None,
         region_writing_indices: frozenset[int] = frozenset(),
+        region_arm_variants: Mapping[int, tuple] | None = None,
         region_feed_meta: Mapping[int, tuple[Meta, ...]] | None = None,
         region_value_meta: Mapping[int, Meta] | None = None,
         region_value_ranks: Mapping[int, int] | None = None,
@@ -2441,6 +2442,9 @@ class _ControlSSABuilder(TiledObject):
         # Regions whose body stores into memory (a sequence cell): never
         # output-less no-ops.
         self.region_writing_indices = frozenset(map(int, region_writing_indices))
+        # region index -> (union capture id, ((arm, callee, output dtypes),
+        # ...)) built by ``_region_arm_variant``.
+        self.region_arm_variants = dict(region_arm_variants or {})
         self.region_feed_meta = {
             int(region): tuple(metadata)
             for region, metadata in (region_feed_meta or {}).items()
@@ -7932,6 +7936,19 @@ class _ControlSSABuilder(TiledObject):
             for identity in payloads
         ):
             return
+        self._bind_promoted_union_view(
+            int(value_id), value, payloads, tag, tags,
+            "numeric_union_call_result",
+        )
+
+    def _bind_promoted_union_view(
+        self, value_id: int, value: SSAValue, payloads: Mapping,
+        tag: SSAValue, tags: Mapping, binding: str,
+    ) -> None:
+        """Bind ``value_id``'s reads to its widest arm's class (see
+        ``_promote_union_call_result``); ``value`` stays its frame's
+        first payload for its own return."""
+
         widest = max(payloads, key=self._NUMERIC_RANK.__getitem__)
         promoted = payloads[widest][0]
         target = str(promoted.dtype)
@@ -7959,7 +7976,7 @@ class _ControlSSABuilder(TiledObject):
             self.emit(
                 Handler.Select, [chosen, converted, promoted], selected,
                 attributes={
-                    "binding": "numeric_union_call_result",
+                    "binding": binding,
                     "source_value_id": int(value_id),
                     "numeric_join_promoted": True,
                 },
@@ -9483,6 +9500,317 @@ class _ControlSSABuilder(TiledObject):
             f"region {region_index}",
         )
 
+    def _emit_region_call_by_arm(self, region_index: int, callee: str) -> bool:
+        """Call the copy of a region the union capture's tag selects.
+
+        See ``_region_arm_variant``.  The tag chooses the block; each block
+        calls its arm's copy with that arm's own payload (exact there,
+        whatever the payload slot holds on the other path) and loads its
+        results; the merge joins each result, which every arm gives the same
+        class (``s > 3``).  Returns False, emitting nothing, when the region
+        has no copies, the capture has no payload per arm and tag, or the
+        arms' results differ in class (``s * 3``: not built yet).
+        """
+
+        dispatch = self.region_arm_variants.get(int(region_index))
+        if dispatch is None:
+            return False
+        capture_id, arms = dispatch
+        feeds, outputs = self.region_signatures.get(region_index, ((), ()))
+        if int(capture_id) not in set(map(int, feeds)) or len(arms) != 2:
+            return False
+        tag = self.native_value_type_tags.get(int(capture_id))
+        payloads = self.native_value_union_payloads.get(int(capture_id), {})
+        fact = self.native_value_type_abi.get(int(capture_id))
+        tags = dict(getattr(fact, "tags", ()) or ())
+        if tag is None or any(
+            arm not in tags or len(payloads.get(arm, ())) != 1
+            for arm, _callee, _dtypes in arms
+        ):
+            return False
+        # A result whose class differs by arm (``s * 3``: int on one path,
+        # float on the other) is itself a union of those classes, each
+        # borrowing the capture's own physical arm.
+        dtype_classes = {
+            "bool": "builtins.bool", "int64": "builtins.int",
+            "float64": "builtins.float",
+        }
+        capture_arms = {
+            str(arm.identity): arm
+            for arm in getattr(fact, "physical_alternatives", ()) or ()
+        }
+        union_outputs: dict[int, tuple] = {}
+        for output_index in range(len(outputs)):
+            dtypes = tuple(str(dtypes[output_index]) for _a, _c, dtypes in arms)
+            if len(set(dtypes)) == 1:
+                continue
+            classes = tuple(dtype_classes.get(dtype) for dtype in dtypes)
+            if (
+                None in classes or len(set(classes)) != len(classes)
+                or any(identity not in capture_arms for identity in classes)
+            ):
+                return False
+            union_outputs[output_index] = classes
+        array_feeds = self.region_array_feed_ids.get(int(region_index), set())
+        if array_feeds & set(map(int, feeds)):
+            return False
+        shared = {
+            int(value_id): self._region_feed(region_index, value_id)
+            for value_id in feeds
+            if int(value_id) != int(capture_id)
+        }
+        signature_cell = self._declared_cell(
+            REGION_SIGNATURE.name, (self._scope(), int(region_index)),
+        )
+        (first, _, _), _second = arms
+        chosen = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE, operands=(tag,),
+        )
+        self.emit(
+            Handler.Eq, [tag, self.constant_value(int(tags[first]), tag)],
+            chosen,
+        )
+        blocks = (self.new_block("if_true"), self.new_block("if_false"))
+        merge = self.new_block("if_merge")
+        self.conditional_branch(chosen, *blocks)
+        incoming = []
+        for block, (arm, arm_callee, dtypes) in zip(blocks, arms):
+            self.current = block
+            arguments = [
+                payloads[arm][0] if int(value_id) == int(capture_id)
+                else shared[int(value_id)]
+                for value_id in feeds
+            ]
+            aggregate = self.fresh_value(
+                dtype="ssa.aggregate", transform=REGION_CALL_RESULT,
+                operands=(signature_cell, *arguments),
+            )
+            self.emit(
+                Handler.Call, arguments, aggregate,
+                attributes={
+                    "callee": arm_callee,
+                    "region_index": region_index,
+                    # The capture is fed as this arm's own payload.
+                    "feed_ids": tuple(
+                        int(payloads[arm][0].id)
+                        if int(value_id) == int(capture_id) else int(value_id)
+                        for value_id in feeds
+                    ),
+                    "feed_shapes": tuple(
+                        tuple(value.shape) for value in arguments
+                    ),
+                    "feed_dtypes": tuple(
+                        str(value.dtype or "") for value in arguments
+                    ),
+                    "output_ids": outputs,
+                    "result_convention": "ssa.aggregate",
+                    "union_arm_dispatch": (int(capture_id), arm),
+                    "union_arm_variant_of": callee,
+                },
+            )
+            loaded = []
+            for output_index, (output_id, dtype) in enumerate(
+                zip(outputs, dtypes)
+            ):
+                index = self.constant_value(output_index, aggregate)
+                address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS,
+                    operands=(aggregate, index),
+                )
+                self.emit(
+                    Handler.GetElementPtr, [aggregate, index], address,
+                    attributes={
+                        "region_index": region_index,
+                        "aggregate_index": output_index,
+                    },
+                )
+                value = self.fresh_value(
+                    dtype=str(dtype), transform=LOAD, operands=(address,),
+                )
+                self.emit(Handler.Load, [address], value, attributes={
+                    "region_index": region_index,
+                    "aggregate_index": output_index,
+                })
+                loaded.append(value)
+            # The other arms' payload slots of each union result, inactive
+            # on this path.
+            inactive = {
+                (output_index, identity): self._inactive_union_payload(
+                    capture_arms[identity], int(outputs[output_index]),
+                )
+                for output_index, classes in union_outputs.items()
+                for identity in classes
+                if identity != dtype_classes[str(dtypes[output_index])]
+            }
+            incoming.append((self.current.name, loaded, inactive))
+            self.branch(merge)
+        self.current = merge
+        for output_index, classes in union_outputs.items():
+            self._merge_union_arm_result(
+                int(outputs[output_index]), output_index, classes,
+                incoming, capture_arms, int(capture_id), signature_cell,
+            )
+        for output_index, output_id in enumerate(outputs):
+            if output_index in union_outputs:
+                continue
+            arm_values = [values[output_index] for _name, values, _ in incoming]
+            joined = self.produced_value(
+                int(output_id), dtype=str(arm_values[0].dtype),
+                claim_provisional_definition=True, cause=tuple(arm_values),
+            )
+            self.emit(
+                Handler.Phi, arm_values, joined,
+                attributes={
+                    "binding": "union_arm_result",
+                    "incoming_blocks": tuple(name for name, _, _ in incoming),
+                    "source_value_id": int(output_id),
+                },
+            )
+        return True
+
+    def _inactive_union_payload(self, arm: Any, value_id: int) -> SSAValue:
+        """A zero in ``arm``'s payload slot: the slot the tag says is not
+        live on this path (as ``_native_value_union_row_payloads`` writes)."""
+
+        inactive = self.fresh_value(
+            dtype=str(arm.dtype), shape=tuple(arm.shape or ()),
+            transform=CONTROL_CONST,
+            operands=(self._canonical_cell(int(value_id)),),
+        )
+        self.emit(
+            Handler.Const, [], inactive,
+            attributes={
+                "value": 0,
+                "native_value_union_inactive_arm": str(arm.identity),
+                "native_value_union_source_id": int(value_id),
+            },
+        )
+        return inactive
+
+    def _merge_union_arm_result(
+        self, output_id: int, output_index: int, classes: tuple,
+        incoming: list, capture_arms: Mapping, capture_id: int,
+        signature_cell: Any,
+    ) -> None:
+        """Join a per-arm region result whose class differs by arm.
+
+        ``classes[k]`` is the class arm ``k``'s copy computed.  The result
+        is a union of them: its ``VALUE_TYPE_ABI`` row is revised to that
+        union (derived from the capture's row, whose arms it borrows, and
+        the region's signature), each class gets a payload Phi (that arm's
+        result on its path, the inactive zero elsewhere), and its tag Phi
+        names the class each path computed.  Its reads see the widest
+        class, checked by ``ssa_numeric_joins``; its return is the frame.
+        """
+
+        alternatives = tuple(sorted(set(classes)))
+        fact = ValueTypeABIFact(
+            alternatives,
+            tuple(
+                (identity, ordinal)
+                for ordinal, identity in enumerate(alternatives)
+            ),
+            tuple(capture_arms[identity] for identity in alternatives),
+        )
+        book = self._book()
+        identity_cell = self._canonical_cell(int(output_id))
+        capture_cell = book.latest_ref(
+            VALUE_TYPE_ABI, (self.lexical_read_scope, int(capture_id)),
+        )
+        if identity_cell is None or capture_cell is None:
+            raise ValueError(
+                "per-arm region result union has no identity/ABI cells: "
+                f"{self.function_name} value {int(output_id)}"
+            )
+        # The result's own source class rows (the reducer's class of the
+        # operator over one arm) are among the arms it unions.
+        from .concordance_declarations import SOURCE_VALUE_CLASS
+        from .identity_concordance import (
+            _canonical_identity_base, _source_class_subject_bases,
+        )
+
+        identity_base = _canonical_identity_base(book, identity_cell)
+        class_page = book.page(SOURCE_VALUE_CLASS)
+        class_cells = tuple(
+            ref for row in class_page.rows()
+            if isinstance(row, tuple) and len(row) == 2
+            and int(row[1]) == int(output_id)
+            for ref in (book.latest_ref(SOURCE_VALUE_CLASS, row),)
+            if ref is not None
+            and identity_base in _source_class_subject_bases(
+                book, ref, int(output_id),
+            )
+        )
+        book.post(
+            VALUE_TYPE_ABI, (self.lexical_read_scope, int(output_id)), fact,
+            stage=self._stage(),
+            provenance=Derived(self._cells(
+                identity_cell, capture_cell, signature_cell, *class_cells,
+                *(
+                    cell for arm in fact.physical_alternatives
+                    for cell in arm.source_cells
+                ),
+            )),
+            mode=Mode.REVISE,
+        )
+        self.native_value_type_abi[int(output_id)] = fact
+        blocks = tuple(name for name, _values, _inactive in incoming)
+        payloads: dict[str, tuple[SSAValue, ...]] = {}
+        first = None
+        for identity in alternatives:
+            arm_values = [
+                values[output_index] if classes[position] == identity
+                else inactive[(output_index, identity)]
+                for position, (_name, values, inactive) in enumerate(incoming)
+            ]
+            dtype = str(capture_arms[identity].dtype)
+            if first is None:
+                joined = self.produced_value(
+                    int(output_id), dtype=dtype,
+                    claim_provisional_definition=True,
+                    cause=tuple(arm_values),
+                )
+                first = joined
+            else:
+                joined = self.fresh_value(
+                    dtype=dtype, transform=CONTROL_EXPRESSION,
+                    operands=tuple(arm_values),
+                )
+            self.emit(
+                Handler.Phi, arm_values, joined,
+                attributes={
+                    "binding": "union_arm_result_payload",
+                    "incoming_blocks": blocks,
+                    "source_value_id": int(output_id),
+                    "native_value_union_alternative": identity,
+                },
+            )
+            payloads[identity] = (joined,)
+        capture_tag = self.native_value_type_tags[int(capture_id)]
+        arm_tags = [
+            self.constant_value(dict(fact.tags)[identity], capture_tag)
+            for identity in classes
+        ]
+        tag = self.fresh_value(
+            dtype="int64", transform=CONTROL_EXPRESSION,
+            operands=tuple(arm_tags),
+        )
+        self.emit(
+            Handler.Phi, arm_tags, tag,
+            attributes={
+                "binding": "union_arm_result_tag",
+                "incoming_blocks": blocks,
+                "source_value_id": int(output_id),
+            },
+        )
+        self.native_value_union_payloads[int(output_id)] = payloads
+        self.native_value_type_tags[int(output_id)] = tag
+        self.post_native_type_tag(int(output_id), tag, fact, first)
+        self._bind_promoted_union_view(
+            int(output_id), first, payloads, tag, dict(fact.tags),
+            "numeric_union_arm_result",
+        )
+
     def emit_region_call(self, region_index: int, *, location: str) -> None:
         if self.emit_table_region_operations(region_index):
             return
@@ -9517,6 +9845,8 @@ class _ControlSSABuilder(TiledObject):
             and int(region_index) not in self.region_writing_indices
         ):
             self._emit_region_post_operations(region_index, location=location)
+            return
+        if self._emit_region_call_by_arm(region_index, callee):
             return
         feeds, outputs = self.region_signatures.get(
             region_index, ((), ())
@@ -24484,6 +24814,7 @@ def lower_control_program_to_ssa(
         int, tuple[tuple[int, ...], tuple[int, ...]]
     ] | None = None,
     region_writing_indices: frozenset[int] = frozenset(),
+    region_arm_variants: Mapping[int, tuple] | None = None,
     region_feed_meta: Mapping[int, tuple[Meta, ...]] | None = None,
     region_value_meta: Mapping[int, Meta] | None = None,
     region_value_ranks: Mapping[int, int] | None = None,
@@ -24562,6 +24893,7 @@ def lower_control_program_to_ssa(
         region_callees=region_callees,
         region_signatures=region_signatures,
         region_writing_indices=region_writing_indices,
+        region_arm_variants=region_arm_variants,
         region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
         region_value_ranks=region_value_ranks,
@@ -28056,6 +28388,142 @@ def _type_carried_reads_by_run_class(
     return captures, formals
 
 
+_NUMERIC_ARM_DTYPES = {
+    "builtins.bool": "bool", "builtins.int": "int64",
+    "builtins.float": "float64",
+}
+_ARM_ARITHMETIC_OPS = {"add", "sub", "mul", "floordiv", "mod", "neg", "abs"}
+_ARM_COMPARISON_OPS = {"lt", "le", "gt", "ge", "eq", "ne"}
+
+
+def _numeric_union_arms(lexical_read_scope: Any, value_id: int) -> tuple:
+    """The arms of ``value_id``'s numeric union, or ``()``.
+
+    Read from its ``VALUE_TYPE_ABI`` row: two or more alternatives, each
+    ``bool``, ``int`` or ``float``.
+    """
+
+    if lexical_read_scope is None:
+        return ()
+    from .identity_concordance import current_identity_book
+
+    fact = current_identity_book().page(VALUE_TYPE_ABI).latest(
+        (lexical_read_scope, int(value_id))
+    )
+    alternatives = tuple(getattr(fact, "alternatives", ()) or ())
+    if len(alternatives) < 2 or any(
+        identity not in _NUMERIC_ARM_DTYPES for identity in alternatives
+    ):
+        return ()
+    return alternatives
+
+
+def _region_arm_variant(
+    region: Function, capture_id: int, arm_dtype: str, name: str,
+) -> Function | None:
+    """``region`` with ``capture_id`` of one arm's exact class, or None.
+
+    Program: ``s = n if c == 2 else n * 0.5; return s > 3`` (and ``s * 3``).
+    ``s`` is an int on one path and a float on the other; a region that
+    reads it is lowered once per arm, the capture typed as that arm, and
+    the caller calls the copy the tag selects
+    (``_ControlSSABuilder._emit_region_call_by_arm``).  Each result the
+    capture reaches takes the class Python gives it from its operands: a
+    comparison is a ``bool``, ``/`` a ``float``, other arithmetic a
+    ``float`` with a float operand and an ``int`` otherwise.  Any other
+    reader of a retyped value (``**``, a store, a call) has no class rule
+    here, so there is no copy and the region is refused as before.
+    """
+
+    retyped: dict[int, str] = {int(capture_id): str(arm_dtype)}
+    views: dict[int, SSAValue] = {}
+
+    def view(value: SSAValue) -> SSAValue:
+        copied = views.get(int(value.id))
+        if copied is None:
+            accounting = dict(value.accounting or {})
+            if int(value.id) in retyped:
+                # The region's view of a call result or a physical carrier
+                # names the other arm's class.
+                accounting = {
+                    key: item for key, item in accounting.items()
+                    if not key.startswith(("ssa_call_result", "physical_"))
+                }
+            copied = SSAValue(
+                int(value.id),
+                dtype=retyped.get(int(value.id), value.dtype),
+                shape=tuple(value.shape or ()), device=value.device,
+                accounting=accounting,
+            )
+            views[int(value.id)] = copied
+        return copied
+
+    instructions = []
+    for instruction in region.blocks["entry"].instrs:
+        op = str(instruction.op).casefold()
+        touched = [
+            argument for argument in instruction.args
+            if int(argument.id) in retyped
+        ]
+        if touched and instruction.res is not None:
+            dtypes = [
+                retyped.get(int(argument.id), str(argument.dtype or ""))
+                for argument in instruction.args
+            ]
+            if op in _ARM_COMPARISON_OPS:
+                result_dtype = "bool"
+            elif op == "div":
+                result_dtype = "float64"
+            elif op in _ARM_ARITHMETIC_OPS:
+                result_dtype = (
+                    "float64"
+                    if any(dtype.startswith("float") for dtype in dtypes)
+                    else "int64"
+                )
+            elif op == "cast":
+                result_dtype = str(instruction.res.dtype)
+            else:
+                return None
+            if tuple(instruction.res.shape or ()):
+                return None
+            retyped[int(instruction.res.id)] = result_dtype
+        elif touched and op != "ret":
+            return None
+        instructions.append(Instr(
+            instruction.op,
+            [view(argument) for argument in instruction.args],
+            None if instruction.res is None else view(instruction.res),
+            arg_roles=list(instruction.arg_roles),
+            attributes=dict(instruction.attributes),
+            source_span=instruction.source_span,
+        ))
+    return Function(
+        name, [view(argument) for argument in region.args],
+        {"entry": BasicBlock("entry", instructions)},
+        metadata={
+            # Its values are its own: the region's rows (keyed by the
+            # control scope the region shares with its owner) type the
+            # capture as the other arm.
+            **{
+                key: value for key, value in dict(region.metadata).items()
+                if key != "tensor_shape_concordance_scope"
+            },
+            "union_arm_variant_of": (str(region.name), int(capture_id)),
+            # The union capture's formal is fed one arm's payload, not the
+            # owner's value of that id.
+            **({"source_region_integral": {
+                **dict(region.metadata["source_region_integral"]),
+                "capture_value_ids": tuple(
+                    int(value_id) for value_id in region.metadata[
+                        "source_region_integral"
+                    ].get("capture_value_ids", ())
+                    if int(value_id) != int(capture_id)
+                ),
+            }} if region.metadata.get("source_region_integral") else {}),
+        },
+    )
+
+
 def _split_region_captures_by_binding(
     lexical_read_scope: Any,
     control_scope: Any,
@@ -28337,6 +28805,7 @@ def lower_control_sections_to_ssa(
 
     functions: dict[str, Function] = {}
     region_callees: dict[int, str] = {}
+    region_arm_variants: dict[int, tuple] = {}
     region_signatures: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
     region_feed_meta: dict[int, tuple[Meta, ...]] = {}
     region_value_meta: dict[int, Meta] = {}
@@ -30791,6 +31260,47 @@ def lower_control_sections_to_ssa(
             # renders ``equal`` as ``(a == b)`` though ``Handler`` only knows
             # ``Eq``. The target's own emit reports any op it genuinely cannot
             # express, with a message accurate to that target.
+            for capture_id in effective_captures:
+                arms = _numeric_union_arms(lexical_read_scope, capture_id)
+                if not arms:
+                    continue
+                variants = []
+                for arm in arms:
+                    variant = _region_arm_variant(
+                        region_function, int(capture_id),
+                        _NUMERIC_ARM_DTYPES[arm],
+                        f"{region_name}__{arm.rsplit('.', 1)[-1]}_arm",
+                    )
+                    if variant is None:
+                        variants = []
+                        break
+                    variants.append(variant)
+                if variants:
+                    for variant in variants:
+                        functions[variant.name] = variant
+                        _post_planned_region_identities(
+                            _book(), str(variant.name), variant,
+                            signature_cell, _graph_cell,
+                            shape_scope=shape_scope,
+                        )
+                    region_arm_variants[region_index] = (
+                        int(capture_id),
+                        tuple(
+                            (
+                                arm, variant.name,
+                                tuple(
+                                    str(value.dtype) for value in next(
+                                        instruction for instruction
+                                        in variant.blocks["entry"].instrs
+                                        if instruction.op == "Ret"
+                                    ).args
+                                ),
+                            )
+                            for arm, variant in zip(arms, variants)
+                        ),
+                    )
+                # One union capture per region is dispatched.
+                break
             report(
                 f"region {region_index}: complete; "
                 f"captures={len(effective_captures)} outputs={len(outputs)} "
@@ -31256,6 +31766,7 @@ def lower_control_sections_to_ssa(
         region_callees=region_callees,
         region_signatures=region_signatures,
         region_writing_indices=frozenset(region_writing_indices),
+        region_arm_variants=region_arm_variants,
         region_feed_meta=region_feed_meta,
         region_value_meta=region_value_meta,
         region_value_ranks=region_value_ranks,
