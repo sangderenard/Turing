@@ -25586,6 +25586,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         "graph": callee,
                         "facts": [],
                     })
+                    # What this call record says of the actual's elements
+                    # (None for an actual that carries no element class).
+                    actual_sequence = caller.nodes[int(actual_id)].get(
+                        "attributes"
+                    ) or {}
+                    evidence.setdefault("elements", []).append((
+                        actual_sequence.get("sequence_element_class_ref"),
+                        actual_sequence.get("sequence_element_annotation_cell"),
+                    ))
                     class_page = current_identity_book().page(
                         "source_value_class_concordance"
                     )
@@ -25638,6 +25647,68 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             transfer_cells,
                         ))
         for (callee_scope, formal_id), evidence in formal_evidence.items():
+            # Program: ``span_total(atoms, ...)`` unannotated, called with
+            # ``xs: list[int]`` (corpus c690).  Wrong record: the formal had
+            # no element class, so ``atoms[index]`` had none.  Rule: where
+            # EVERY call record reaching the formal names the same element
+            # class (the called inventory), the formal's rows are that class;
+            # a record naming none, or another, leaves the formal alone.
+            records = tuple(evidence.get("elements") or ())
+            named = {record[0] for record in records}
+            callee_graph = evidence["graph"]
+            formal_attributes = callee_graph.nodes[int(formal_id)].setdefault(
+                "attributes", {}
+            )
+            if (
+                records and len(named) == 1 and None not in named
+                and "sequence_element_class_ref" not in formal_attributes
+                and isinstance(records[0][1], _Ref)
+                and all(isinstance(record[1], _Ref) for record in records)
+            ):
+                element_class = str(next(iter(named)))
+                formal_attributes.update({
+                    "sequence_element_class_ref": element_class,
+                    "sequence_element_annotation_cell": records[0][1],
+                })
+                for index_id in tuple(callee_graph.successors(int(formal_id))):
+                    index_data = callee_graph.nodes[index_id]
+                    index_parents = {
+                        str(role): int(parent)
+                        for parent, role in index_data.get("parents") or ()
+                    }
+                    index_expression = index_data.get("expr_obj")
+                    if (
+                        str(index_data.get("type") or "").casefold() != "indexed"
+                        or index_parents.get("base") != int(formal_id)
+                        or isinstance(getattr(
+                            index_expression, "slice", None
+                        ), ast.Slice)
+                    ):
+                        continue
+                    index_value = int(index_data.get("value_id", index_id))
+                    if current_identity_book().page(
+                        _SOURCE_VALUE_CLASS
+                    ).latest((callee_scope, index_value)) is not None:
+                        continue
+                    index_data.setdefault("attributes", {})[
+                        "result_class_ref"
+                    ] = element_class
+                    _concord_source_value_class(
+                        callee_scope, index_value, element_class,
+                        source="called inventory element class",
+                        provenance=_Derived(tuple(dict.fromkeys(
+                            cell for cell in (
+                                *(record[1] for record in records),
+                                node_identity_cell(
+                                    callee_graph, int(formal_id)
+                                ),
+                                node_identity_cell(
+                                    callee_graph, int(index_id)
+                                ),
+                            ) if cell is not None
+                        ))),
+                    )
+                changed = True
             facts = tuple(evidence["facts"])
             class_page = current_identity_book().page(
                 "source_value_class_concordance"
