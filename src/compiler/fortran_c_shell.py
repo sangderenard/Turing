@@ -46557,6 +46557,9 @@ def _class_surface_ssa_program(
                     (int(value_id), caller_storage)
                     for value_id in field.value_ids
                 )
+        # Read by the callsite marker's result retention for any call, not
+        # only a method call that binds a receiver record.
+        caller_sequence_table = all_sequence_tables.get(caller_symbol)
         if receiver_record is not None and callee_record is not None:
             caller_fields = {
                 field.storage_identity: field
