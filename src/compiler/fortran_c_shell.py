@@ -45977,6 +45977,9 @@ def _class_surface_ssa_program(
                     {} if caller_node is None
                     else caller_node.get("attributes") or {}
                 )
+                from .glsl_deployment_strategy import (
+                    loop_carried_initial_at_call as _loop_initial_at_call,
+                )
                 if (
                     caller_node is not None
                     and str(caller_node.get("type")) in {
@@ -45985,6 +45988,10 @@ def _class_surface_ssa_program(
                     and (
                         "value" in caller_attributes
                         or "constant" in caller_node
+                    )
+                    and not _loop_initial_at_call(
+                        caller_graph, planned_call.callsite_id,
+                        caller_value_id,
                     )
                 ):
                     frame_bindings.append((
