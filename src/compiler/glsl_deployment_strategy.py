@@ -33979,6 +33979,23 @@ class ProcessGraphGLSLDeployment(TiledObject):
         return False
 
 
+def _plan_with_current_iterable(graph: Any, plan: Any) -> Any:
+    """The plan, its loop's iterable node re-read from the loop's own edges
+    when the discovered one has since left the graph."""
+
+    iterable = plan.loop.iterable_node
+    if iterable is None or int(iterable) in graph.G:
+        return plan
+    current = next((
+        int(parent)
+        for parent, role in graph.G.nodes[int(plan.loop.node_id)].get("parents") or ()
+        if str(role) in {"iterable", "iter"} and int(parent) in graph.G
+    ), None)
+    if current is None:
+        return plan
+    return replace(plan, loop=replace(plan.loop, iterable_node=current))
+
+
 def strategize_shell_deployment(
     graph: Any,
     *,
@@ -34391,6 +34408,15 @@ def strategize_shell_deployment(
         for plan in discovered_loop_plans
         if int(plan.loop.node_id) not in evaporated_loop_ids
         and int(plan.loop.node_id) in graph.G
+    )
+    # Program: ``for i in range(3): d[1] = i + n`` then ``for k in d: ...``
+    # (corpus c714).  Wrong record: the first loop unrolls and its result
+    # node is removed, the second loop's iterable is re-pointed at the value
+    # that replaced it, but the second loop's discovered plan still named
+    # the removed node, so lowering raised KeyError.  Rule: a retained loop
+    # plan names the iterable its node holds now.
+    retained_loop_plans = tuple(
+        _plan_with_current_iterable(graph, plan) for plan in retained_loop_plans
     )
     semantic_loop_plans = selection_phase(
         "materialize-loop-semantic-ir",
