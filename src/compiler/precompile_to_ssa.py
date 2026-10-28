@@ -1732,9 +1732,10 @@ def _runtime_rank_physical(
 
     from .identity_concordance import (
         SHAPE_STATE_PAGE, descriptor_from_shape_transformation_state,
+        shape_transformation_state,
     )
 
-    if shape_scope is None or tuple(value.shape or ()):
+    if shape_scope is None:
         return None
     row = (tuple(shape_scope), int(value.id))
     cell = book.latest_ref(SHAPE_STATE_PAGE, row)
@@ -1744,6 +1745,33 @@ def _runtime_rank_physical(
     if not (isinstance(fact, tuple) and fact and fact[0] == "resolved"):
         return None
     descriptor = descriptor_from_shape_transformation_state(fact[1])
+    # Program: ``acc = acc * 2 + i`` in a ``while`` (every int loop).  Wrong
+    # record: the computed update posted no storage/rank/physical dtype while
+    # the carried slot's literal initial posted them, so the loop-carry
+    # transport disagreed.  Rule: a result whose shape state is a resolved
+    # static numeric one of the value's own dtype and shape posts that
+    # state's physical view, DERIVED from the state cell (this producer
+    # owns it; the structural view no longer infers it).
+    state = shape_transformation_state(fact[1])
+    if state is not None and state[3] == "static":
+        from ..transmogrifier.dtype_layout import resolve
+
+        shape, dtype, rank, _metadata, _row_shape = state
+        layout = resolve(dtype)
+        if (
+            layout is not None
+            and layout.kind in {"bool", "int", "uint", "float"}
+            and str(dtype) == str(value.dtype)
+            and str(dtype) != "opaque_ref"
+            and rank == len(shape)
+            and tuple(shape) == tuple(value.shape or ())
+        ):
+            return {
+                "physical_dtype": str(dtype),
+                "storage": "span" if rank else "scalar", "rank": rank,
+            }, cell
+    if tuple(value.shape or ()):
+        return None
     if not (
         descriptor is not None
         and not tuple(descriptor.get("shape") or ())
@@ -19028,10 +19056,15 @@ class _ControlSSABuilder(TiledObject):
         # Program: ``d = {1: 10, 2: 20, 3: 30}; del d[2]; for k in d: ...``.
         # Wrong record: the loop ran over the physical rows, and a keyed
         # delete only clears the row's live flag, so the deleted key was
-        # still visited (57 for 37).  Nothing here skips a cleared row.
-        # Rule: iterating a table with a keyed delete is refused.  (A list
-        # formal a filtered loop reads also carries live flags, c359; those
-        # mark kept rows, not deletions, so they are not refused.)
+        # still visited (57 for 37).  Nothing here skipped a cleared row,
+        # and the loop was refused.  Rule: an iteration over a table with a
+        # keyed delete reads each row's live flag first and takes the
+        # latch for a cleared one, as a selected child table's does; the
+        # latch's carried values for that edge are the body-entry ones.
+        # (A list formal a filtered loop reads also carries live flags,
+        # c359; those mark kept rows, not deletions, so they are not
+        # skipped.)
+        table_live_block_names: set[str] = set()
         for iterable_id, _target_id, induction_name, *_projection in (
             *self.program.iterable_bindings,
             *self.program.projected_iterable_bindings,
@@ -19048,12 +19081,27 @@ class _ControlSSABuilder(TiledObject):
                 and descriptor.live_flags_value_id is not None
                 and sequence_id in self.keyed_deletion_sequence_ids
             ):
-                raise ValueError(
-                    f"{path}: loop {loop.induction} iterates table "
-                    f"{sequence_id}, whose deleted rows stay resident behind "
-                    "cleared live flags; iteration over a table with "
-                    "deletions is not lowered"
+                live_address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS, operands=(induction,),
                 )
+                live = self.fresh_value(
+                    dtype="bool", transform=LOAD, operands=(live_address,),
+                )
+                active = self.new_block("table_row_live")
+                self.emit(
+                    Handler.GetElementPtr,
+                    [self.external_value(descriptor.live_flags_value_id), induction],
+                    live_address,
+                    attributes={"binding": "table_row_live"},
+                )
+                self.emit(
+                    Handler.Load, [live_address], live,
+                    attributes={"binding": "table_row_live"},
+                )
+                self.conditional_branch(live, active, latch)
+                self.current = active
+                table_live_block_names.add(active.name)
+                break
         for iterable_id, target_id, induction_name in (
             self.program.iterable_bindings
         ):
@@ -19644,6 +19692,7 @@ class _ControlSSABuilder(TiledObject):
             candidate
             for candidate in self.blocks.values()
             if candidate.name not in blocks_before_body or candidate.name == body.name
+            or candidate.name in table_live_block_names
         ]
         # A nested retained loop may carry the same source state as this loop.
         # Its exit Phi is then the value produced by this iteration, but the

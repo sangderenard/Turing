@@ -1029,6 +1029,29 @@ def _callsite_argument_is_initializer(
     """
 
     argument_id = int(argument_id)
+    # Program: ``i = 0; while i < n: acc = step(acc, i); i += 1``.  Wrong
+    # record: the call's argument edge names ``i``'s initial ``Constant 0``,
+    # so ``step`` was specialized with ``k`` folded to 0 and returned
+    # ``acc * 2`` (-64, not -38).  Rule: the loop's own
+    # ``loop_carried_bindings`` say that initial is not the value of ``i``
+    # inside the loop; a call within that loop is not specialized on it.
+    import networkx as nx
+
+    for loop_id, loop_data in caller.G.nodes(data=True):
+        carried = (loop_data.get("attributes") or {}).get(
+            "loop_carried_bindings"
+        ) or {}
+        for pair in (*carried.values(), *(
+            (loop_data.get("attributes") or {}).get(
+                "loop_break_bindings"
+            ) or {}
+        ).values()):
+            if (
+                isinstance(pair, (tuple, list)) and pair
+                and int(pair[0]) == argument_id
+                and int(call_id) in nx.ancestors(caller.G, loop_id)
+            ):
+                return False
     if argument_id not in _mutated_sequence_node_ids(caller.G):
         return True
     from .resident_sequence_materialization import _call_escaped_argument_edges
@@ -5037,6 +5060,48 @@ def _build_shell_hierarchy_plan(
                 == "staticreference"
             ):
                 return None
+            # An external name read only as the receiver of tensor-namespace
+            # calls (``AbstractTensor`` in ``AbstractTensor.get_tensor(x)``,
+            # imported inside the method) is a static symbol, as a
+            # StaticReference is: not a value.
+            receivers = tuple(node.get("children") or ())
+            if (
+                attributes.get("binding_kind") == "external"
+                and receivers
+                and all(
+                    str(role) == "operand"
+                    and (
+                        graph.G.nodes.get(int(child), {}).get("attributes")
+                        or {}
+                    ).get("tensor_candidate") is not None
+                    for child, role in receivers
+                )
+            ):
+                return None
+            # A limb of a Precision value: Precision is a numeric value, not
+            # a record, and its ``_stack`` holds its limbs, whose element the
+            # precision library states (``Precision.term`` reads
+            # ``self._stack[k]``).
+            limb_stack = int(value_id)
+            if str(node.get("type")) == "Indexed":
+                limb_stack = next((
+                    int(parent) for parent, role in (node.get("parents") or ())
+                    if str(role) == "base"
+                ), None)
+            if limb_stack is not None:
+                cell = (
+                    graph.G.nodes.get(limb_stack, {}).get("attributes") or {}
+                ).get("field_declaration_cell")
+                if getattr(cell, "row", None) == (
+                    "src.common.tensors.extended_precision", "Precision",
+                    "_stack",
+                ):
+                    from ..common.tensors.extended_precision import (
+                        limb_element_name,
+                    )
+                    return (record[0], record[1], limb_element_name(
+                        attributes.get("precision_element")
+                    ))
             if isinstance(attributes.get("value"), slice):
                 # A slice literal is index metadata for the load it feeds:
                 # a handle, as a record identity is, not an element type.
@@ -5070,6 +5135,15 @@ def _build_shell_hierarchy_plan(
                         ) == "Call"
                         and (graph.G.nodes[source].get("attributes") or {})
                         .get("method_ref") is not None
+                    )
+                    # So is a call named by its static reference
+                    # (``Precision.width_of(x)``): an unlinked callee.
+                    or (
+                        (graph.G.nodes[source].get("attributes") or {}).get(
+                            "source_type"
+                        ) == "Call"
+                        and (graph.G.nodes[source].get("attributes") or {})
+                        .get("static_python_reference") is not None
                     )
                 )
                 and source not in call_result_dtypes
@@ -24773,6 +24847,21 @@ def _tensor_descriptor_rule(
                 inherited = _tensor_descriptor(graph, sources[0], seen)
                 if inherited is not None:
                     return inherited
+                # An authored Python scalar literal carries its own type
+                # (float -> float64, int -> int64, bool -> bool).
+                literal = graph.G.nodes[sources[0]].get("constant")
+                if literal is None:
+                    literal = (
+                        graph.G.nodes[sources[0]].get("attributes") or {}
+                    ).get("value")
+                literal_dtype = (
+                    "bool" if isinstance(literal, bool)
+                    else "int64" if isinstance(literal, int)
+                    else "float64" if isinstance(literal, float)
+                    else None
+                )
+                if literal_dtype is not None:
+                    return {"shape": (), "dtype": literal_dtype, "rank": 0}
         if operation in {
             "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
             "tanh", "clone", "copy", "identity", "real", "imag", "conj",
@@ -34019,6 +34108,23 @@ class ProcessGraphGLSLDeployment(TiledObject):
         return False
 
 
+def _plan_with_current_iterable(graph: Any, plan: Any) -> Any:
+    """The plan, its loop's iterable node re-read from the loop's own edges
+    when the discovered one has since left the graph."""
+
+    iterable = plan.loop.iterable_node
+    if iterable is None or int(iterable) in graph.G:
+        return plan
+    current = next((
+        int(parent)
+        for parent, role in graph.G.nodes[int(plan.loop.node_id)].get("parents") or ()
+        if str(role) in {"iterable", "iter"} and int(parent) in graph.G
+    ), None)
+    if current is None:
+        return plan
+    return replace(plan, loop=replace(plan.loop, iterable_node=current))
+
+
 def strategize_shell_deployment(
     graph: Any,
     *,
@@ -34431,6 +34537,15 @@ def strategize_shell_deployment(
         for plan in discovered_loop_plans
         if int(plan.loop.node_id) not in evaporated_loop_ids
         and int(plan.loop.node_id) in graph.G
+    )
+    # Program: ``for i in range(3): d[1] = i + n`` then ``for k in d: ...``
+    # (corpus c714).  Wrong record: the first loop unrolls and its result
+    # node is removed, the second loop's iterable is re-pointed at the value
+    # that replaced it, but the second loop's discovered plan still named
+    # the removed node, so lowering raised KeyError.  Rule: a retained loop
+    # plan names the iterable its node holds now.
+    retained_loop_plans = tuple(
+        _plan_with_current_iterable(graph, plan) for plan in retained_loop_plans
     )
     semantic_loop_plans = selection_phase(
         "materialize-loop-semantic-ir",

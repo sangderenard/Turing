@@ -1057,7 +1057,19 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 specialization_book.post(
                     _SOURCE_VALUE_CLASS, (scope, value_id), proposed,
                     stage=_REDUCTION,
-                    provenance=_Derived(tuple(dict.fromkeys((*sources, specialization_cell)))),
+                    provenance=_Derived(tuple(dict.fromkeys((
+                        *sources,
+                        # The inherited class is about this copy's own
+                        # value: cite that value's identity cell, as the
+                        # callsite producer does, so a type ABI settled in
+                        # a fork of this copy derives from it.
+                        *((value_cell,) if (
+                            value_cell := node_identity_cell(
+                                target_wrapper, int(value_id),
+                            )
+                        ) is not None else ()),
+                        specialization_cell,
+                    )))),
                     mode=_Mode.CONCORD,
                 )
     # The parameters are what the call passed: concord them in this scope.
@@ -2921,6 +2933,53 @@ class GraphTranslationShortfall:
 # materialized. A refused fold is not a failure: it falls through to the
 # ordinary path and reports itself there like anything else.
 _MAX_FOLDED_SEQUENCE_ELEMENTS = 1 << 20
+
+
+def _replication_name_needs_storage(graph: Any, node_id: Any, expression: Any) -> bool:
+    """Whether ``name = <expression>`` binds a list a later statement writes
+    through (``name[k] = v``, ``del name[k]``, ``name.append(v)`` ...) or
+    reads at a runtime index (``name[i]``): both need resident storage, which
+    a folded literal does not have."""
+
+    names = {
+        target.id
+        for successor in graph.G.successors(node_id)
+        for statement in (graph.G.nodes[successor].get("expr_obj"),)
+        if isinstance(statement, ast.Assign) and statement.value is expression
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    if not names:
+        return False
+    writers = {
+        "append", "extend", "insert", "pop", "remove", "clear", "sort",
+        "reverse",
+    }
+    for _node, data in graph.G.nodes(data=True):
+        other = data.get("expr_obj")
+        if (
+            isinstance(other, ast.Subscript)
+            and isinstance(other.ctx, (ast.Store, ast.Del))
+            and isinstance(other.value, ast.Name)
+            and other.value.id in names
+        ):
+            return True
+        if (
+            isinstance(other, ast.Subscript)
+            and isinstance(other.value, ast.Name)
+            and other.value.id in names
+            and not isinstance(other.slice, ast.Constant)
+        ):
+            return True
+        if (
+            isinstance(other, ast.Call)
+            and isinstance(other.func, ast.Attribute)
+            and other.func.attr in writers
+            and isinstance(other.func.value, ast.Name)
+            and other.func.value.id in names
+        ):
+            return True
+    return False
 
 
 def _static_sequence_literal(expression: Any) -> Any:
@@ -23040,6 +23099,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             data.setdefault("attributes", {})["value"] = expression.value
         elif isinstance(expression, ast.BinOp):
             folded = _static_sequence_literal(expression)
+            # Program: ``a = [0] * 5; a[2] = n`` (corpus c718).  Wrong record:
+            # the fold makes a bare literal list, which has no storage
+            # identity a store can write, so the program was refused (shape
+            # (5,) recorded, () carried).  Rule: a replication whose bound
+            # name a later statement writes through, or reads at a runtime
+            # index, stays a replication, the fill into resident storage;
+            # only literals read at constant positions fold.
+            if folded is not None and _replication_name_needs_storage(
+                graph, node_id, expression,
+            ):
+                folded = None
             if folded is not None:
                 # Sequence replication is table allocation, not arithmetic.
                 data["type"] = "Constant"

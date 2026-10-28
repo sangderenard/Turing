@@ -2235,6 +2235,29 @@ def _static_sequence_capacity_survey(
                 and not any(isinstance(element, ast.Starred)
                             for element in expression.elts)):
             bounds.setdefault(int(node_id), len(expression.elts))
+    # Program: ``a = [1, 2]; t = a if n > 2 else [3, 4]`` then ``len(a)``
+    # (corpus c271).  Wrong record: the merge (an ``aggregate_phi``) was
+    # bounded, but each folded literal arm is a resident arena of its own
+    # (it is the phi's member), and no arm had a bound, so C refused it as
+    # a private sequence with no capacity.  Rule: an arm of a list merge
+    # that is a folded literal and that nothing grows is bounded by its
+    # literal length.
+    grown_arms = {
+        int(mutation.sequence_value_id)
+        for mutation in _sequence_append_call_mutations(graph_obj)
+    }
+    for _node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if (attributes.get("producer_kind") != "aggregate_phi"
+                or attributes.get("aggregate_kind") != "list"):
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) not in {"body", "orelse"} or int(parent) in grown_arms:
+                continue
+            arm = graph_obj.nodes.get(int(parent), {}).get("attributes") or {}
+            if (arm.get("aggregate_kind") == "list"
+                    and isinstance(arm.get("value"), (list, tuple))):
+                bounds.setdefault(int(parent), len(arm["value"]))
     if control is not None:
         bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
             control, local_lists,
@@ -2558,6 +2581,63 @@ def source_sort_contract(graph_obj: Any, call_node_id: int):
     return fact, cell
 
 
+def _discarded_dict_pop(graph_obj: Any, node_id: int, storage_aliases: Mapping[int, int]):
+    """``(dict node, argument nodes, argument kind)`` for a dict ``pop``
+    statement whose result nothing reads, else None.
+
+    Program: ``d = {1: 10, 2: 20}; d.pop(1, None); d[3] = n`` then
+    ``len(d)`` (corpus c708).  Wrong record: a dict ``pop`` statement had no
+    mutation record outside a retained loop's state effects, so it lowered
+    to an empty region and the key stayed (3 for 2; clean audit).  Rule: a
+    dict ``pop`` whose result nothing reads is a keyed delete of its key, as
+    the loop lowering already states it: lookup-and-delete, an absent key
+    tolerated only when a default is given.  A statement after a store in
+    the same body names the store's version of the dict: the same storage,
+    by the storage aliases.
+    """
+
+    data = graph_obj.nodes[node_id]
+    expression = data.get("expr_obj")
+    if not (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr == "pop"
+    ):
+        return None
+    parents = tuple(data.get("parents") or ())
+    receiver = next((
+        int(parent) for parent, role in parents
+        if str(role) == "operand" and int(parent) in graph_obj
+    ), None)
+    arguments = tuple(
+        int(parent) for parent, role in parents
+        if str(role).startswith("arg:") and int(parent) in graph_obj
+    )
+    if receiver is None or len(arguments) not in {1, 2}:
+        return None
+    receiver = int(storage_aliases.get(receiver, receiver))
+    if (graph_obj.nodes[receiver].get("attributes") or {}).get(
+        "aggregate_kind"
+    ) != "dict":
+        return None
+    for successor in graph_obj.successors(node_id):
+        # A statement's only consumer is the control construct that holds it
+        # as a ``body``/``orelse`` member.
+        if str(graph_obj.nodes[successor].get("type") or "") not in {
+            "For", "While", "If"
+        } or any(
+            str(role) not in {"body", "orelse"}
+            for parent, role in (
+                graph_obj.nodes[successor].get("parents") or ()
+            )
+            if int(parent) == int(node_id)
+        ):
+            return None
+    return receiver, arguments, (
+        "mapping_pop_default_none" if len(arguments) == 2 else "mapping_pop"
+    )
+
+
 def _sequence_append_call_mutations(graph_obj: Any):
     """Recover authored resident sequence calls as lexical effects."""
 
@@ -2656,13 +2736,14 @@ def _sequence_append_call_mutations(graph_obj: Any):
     recorded_effect_ids = {
         int(mutation.effect_node_id) for mutation in mutations
     }
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         expression = data.get("expr_obj")
         if not (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Attribute)
-            and expression.func.attr in {"append", "add", "clear"}
+            and expression.func.attr in {"append", "add", "clear", "pop"}
         ):
             continue
         if int(node_id) in recorded_effect_ids:
@@ -2678,10 +2759,23 @@ def _sequence_append_call_mutations(graph_obj: Any):
         )
         operation = str(expression.func.attr)
         arity = 0 if operation == "clear" else 1
+        discarded_pop = (
+            _discarded_dict_pop(graph_obj, int(node_id), storage_aliases)
+            if operation == "pop" else None
+        )
+        if operation == "pop":
+            if discarded_pop is None:
+                continue
+            destination_node, arguments, pop_argument_kind = discarded_pop
+            arity = len(arguments)
+        destination = (
+            graph_obj.nodes[destination_node]
+            if destination_node is not None else {}
+        )
+        attributes = destination.get("attributes") or {}
+        pops_dict = discarded_pop is not None
         if destination_node is None or len(arguments) != arity:
             continue
-        destination = graph_obj.nodes[destination_node]
-        attributes = destination.get("attributes") or {}
         # Program: ``cells = {1: 10, 2: 20}; if n: cells.clear();
         # return len(cells)``.  Wrong record: a dict's clear was not a
         # mutation at all (dicts were outside ``sequence_kinds``), so the
@@ -2690,9 +2784,14 @@ def _sequence_append_call_mutations(graph_obj: Any):
         clears_dict = (
             operation == "clear" and attributes.get("aggregate_kind") == "dict"
         )
-        if attributes.get("aggregate_kind") not in sequence_kinds and not clears_dict:
+        if (
+            attributes.get("aggregate_kind") not in sequence_kinds
+            and not clears_dict and not pops_dict
+        ):
             continue
         argument_kind = "value"
+        if pops_dict:
+            argument_kind = pop_argument_kind
         argument_ids = tuple(
             int(graph_obj.nodes[argument].get("value_id", argument))
             for argument in arguments
