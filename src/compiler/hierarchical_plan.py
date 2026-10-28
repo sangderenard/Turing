@@ -491,7 +491,11 @@ def plan_region_to_ssa_instrs(
         if (
             shape_of.get(int(value_id), ()) == ()
             and rank_of.get(int(value_id), 0) == 0
-            and dtype in {"int", "int32", "int64", "i32", "i64"}
+            # uint64/int128: the width of a proven interval
+            # (``source_int_range_concordance``) beyond int64.
+            and dtype in {
+                "int", "int32", "int64", "i32", "i64", "uint64", "int128",
+            }
             and source_result_class(int(value_id)) == "builtins.int"
         ):
             return str(dtype)

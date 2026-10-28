@@ -246,6 +246,16 @@ _FLOORED_HELPERS = (
     "    long long q = a / b, r = a % b;",
     "    return (r != 0 && ((r ^ b) < 0)) ? q - 1 : q;",
     "}",
+    # The same floored law in the internal int128 domain (the exact join of
+    # int64 and uint64): narrowing it through long long kept the low bits.
+    "static __int128 turing_imod128(__int128 a, __int128 b) {",
+    "    __int128 r = a % b;",
+    "    return (r != 0 && ((r ^ b) < 0)) ? r + b : r;",
+    "}",
+    "static __int128 turing_ifloordiv128(__int128 a, __int128 b) {",
+    "    __int128 q = a / b, r = a % b;",
+    "    return (r != 0 && ((r ^ b) < 0)) ? q - 1 : q;",
+    "}",
     "static double turing_fmod(double a, double b) {",
     "    double r = fmod(a, b);",
     "    return (r != 0.0 && ((r < 0.0) != (b < 0.0))) ? r + b : r;",
@@ -283,6 +293,19 @@ _FLOORED = {
     "Mod": ("turing_imod", "turing_fmod"),
     "FloorDiv": ("turing_ifloordiv", "turing_ffloordiv"),
 }
+#: The int128 integer helper per opcode.
+_FLOORED_INT128 = {
+    "Mod": "turing_imod128",
+    "FloorDiv": "turing_ifloordiv128",
+}
+
+
+def _floored_integer_helper(op: str, operands) -> str:
+    """The floored integer helper whose domain holds every operand."""
+
+    if any(str(value.dtype or "").casefold() == "int128" for value in operands):
+        return _FLOORED_INT128[op]
+    return _FLOORED[op][0]
 
 #: C is the one destination where both halves of the precision-section API
 #: have a STANDARD answer rather than a compiler-specific one.
@@ -3370,7 +3393,10 @@ def emit_ssa_module_to_c(
                     ))
                     return
                 else:
-                    helper = _FLOORED[op][0 if integral else 1]
+                    helper = (
+                        _floored_integer_helper(op, instruction.args)
+                        if integral else _FLOORED[op][1]
+                    )
                     expression = f"{helper}({elements[0]}, {elements[1]})"
             elif op in {"Max", "Min"} and len(elements) == 2:
                 comparison = ">" if op == "Max" else "<"
@@ -6404,7 +6430,10 @@ def emit_ssa_module_to_c(
                     )
                 elif op in _FLOORED and len(args) == 2:
                     integral = all(map(is_integer, instruction.args))
-                    helper = _FLOORED[op][0 if integral else 1]
+                    helper = (
+                        _floored_integer_helper(op, instruction.args)
+                        if integral else _FLOORED[op][1]
+                    )
                     kind = _scalar_c_type(instruction.res.dtype)
                     if integral:
                         integer_ids.add(result_id)

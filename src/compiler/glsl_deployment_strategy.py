@@ -2277,10 +2277,40 @@ def _planned_scalar_dtypes_from(
         if isinstance(value, bool):
             return "bool"
         if isinstance(value, int):
-            return "int64"
+            from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+            try:
+                return python_int_literal_dtype(value)
+            except OverflowError:
+                return None
         if isinstance(value, float):
             return "float64"
         return None
+
+    # A builtin ``int`` value's native width is the narrowest layout holding
+    # its proven interval (``source_int_range_concordance``), the same law a
+    # literal's width follows.  An unproven value keeps the int64 rule.
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope as _range_scope,
+    )
+    from .concordance_declarations import SOURCE_INT_RANGE
+    from .identity_concordance import current_identity_book as _range_book
+    from ..transmogrifier.dtype_layout import (
+        common_integer_dtype as _common_integer_dtype,
+        python_int_range_dtype,
+    )
+
+    range_scope = _range_scope(G)
+    range_page = _range_book().page(SOURCE_INT_RANGE)
+
+    def range_dtype(node_id):
+        data = G.nodes.get(int(node_id), {})
+        interval = range_page.latest(
+            (range_scope, int(data.get("value_id", node_id)))
+        )
+        if interval is None:
+            return None
+        return python_int_range_dtype(int(interval[0]), int(interval[1]))
 
     scalar: dict[int, str] = {}
     element: dict[int, str] = dict(assumed_elements or {})
@@ -2303,6 +2333,9 @@ def _planned_scalar_dtypes_from(
             return "float64"
         if all(dtype in {"int64", "bool"} for dtype in dtypes):
             return "int64"
+        if all(dtype in {"int64", "uint64", "int128", "bool"} for dtype in dtypes):
+            # A proven-wide operand: the exact common integer domain.
+            return _common_integer_dtype(tuple(dtypes))
         return None
 
     def parents(data, *roles):
@@ -2399,6 +2432,16 @@ def _planned_scalar_dtypes_from(
             op = operation(data)
             attributes = data.get("attributes") or {}
             expression = data.get("expr_obj")
+            proven_width = range_dtype(node_id)
+            if (
+                proven_width not in {None, "int64"}
+                and scalar.get(node_id) in {None, "int64", "int"}
+                and scalar.get(node_id) != proven_width
+            ):
+                # The interval is the stronger proof: an int64 seed from a
+                # class-only contract does not narrow it.
+                scalar[node_id] = proven_width
+                changed = True
             # Program: ``k.mul(x) + k.scale`` with ``def mul(self, x: int) ->
             # int`` (corpus c426).  Wrong record: a method call is named by
             # its method (``mul``), so no operator rule typed it and its
@@ -2659,6 +2702,11 @@ def _planned_scalar_dtypes_from(
                                 ) == "loop"
                             ):
                                 settle(scalar, int(target_id), held)
+                                if iterable[0] in row_element:
+                                    # ``for r in g`` over a list of lists:
+                                    # ``r`` is a row of the shared class.
+                                    settle(element, int(target_id),
+                                           row_element[iterable[0]])
                 # Program: ``for p, q in zip(xs, ys): t += p * q`` (c171,
                 # c172).  Wrong record: a tuple target has no single name, so
                 # ``p`` and ``q`` were never typed and fell to the float64
@@ -5303,6 +5351,11 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
+                        # A proven interval wider than int64 is the source's
+                        # width; the parents' int64 does not narrow it.
+                        proven = planned_scalar_dtypes().get(int(current))
+                        if proven in {"uint64", "int128"}:
+                            dtype = str(proven)
                 if operation in {"floor", "ceil", "trunc", "round"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so
@@ -10042,7 +10095,9 @@ def _retain_source_control_records(graph_obj: Any) -> None:
         graph_obj.graph["source_control_records"] = records
 
 
-def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
+def _retain_source_sequence_mutation_records(
+    graph_obj: Any, function_table: Any = None,
+) -> None:
     """Snapshot authored sequence method effects before structural reduction.
 
     Program: ``xs = [5, n, 2]; xs.pop(); return xs[0] * 10 + xs[1] +
@@ -10059,10 +10114,16 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
     from .resident_sequence_materialization import (
         _RECEIVER_READING_METHODS,
         _receiver_collection_kind,
+        _returned_formal_sequence_aliases,
     )
 
     records = dict(
         graph_obj.graph.get("source_sequence_mutation_records") or {}
+    )
+    # A call whose result is its argument's own list (``t = mk(b)``) is that
+    # list (rule 8): an effect on ``t`` is an effect on ``b``'s storage.
+    forwarded_sequences = _returned_formal_sequence_aliases(
+        graph_obj, function_table,
     )
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
@@ -10149,9 +10210,10 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
                 mutation_arguments = (*key_leaves, *mutation_arguments[1:])
         records[int(node_id)] = {
             "expression": expression,
-            "sequence_value_id": int(destination_data.get(
-                "value_id", destination
-            )),
+            "sequence_value_id": forwarded_sequences.get(
+                int(destination_data.get("value_id", destination)),
+                (int(destination_data.get("value_id", destination)),),
+            )[0],
             "argument_value_ids": mutation_arguments,
             # ``s.update(xs)`` on a set inserts each element of one
             # iterable under the set's unique policy: the sequence
@@ -12662,7 +12724,9 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     effect ends.  Effects inside a loop are ordered by the loop composer.
     """
 
-    _retain_source_sequence_mutation_records(graph.G)
+    _retain_source_sequence_mutation_records(
+        graph.G, getattr(graph, "function_table", None),
+    )
     records = graph.G.graph.get("source_sequence_mutation_records") or {}
     loop_nodes = [
         (int(expression.lineno), int(getattr(expression, "end_lineno", expression.lineno)),
@@ -24267,7 +24331,9 @@ def _tensor_descriptor_rule(
                     or display_members
                 )
             ):
-                _retain_source_sequence_mutation_records(graph.G)
+                _retain_source_sequence_mutation_records(
+                    graph.G, getattr(graph, "function_table", None),
+                )
                 node_by_value = {
                     int(member_data.get("value_id", member)): int(member)
                     for member, member_data in graph.G.nodes(data=True)
@@ -25663,7 +25729,7 @@ def _remove_dead_metadata_nodes(
     # missing node, the effect was placed after every read, and ``len(s)``
     # missed the row (silently).  Rule: a node a retained sequence mutation
     # names as its effect is an effect, never dead metadata.
-    _retain_source_sequence_mutation_records(graph.G)
+    _retain_source_sequence_mutation_records(graph.G, getattr(graph, "function_table", None))
     effect_ids = {
         int(effect_id)
         for effect_id in (
@@ -25957,7 +26023,7 @@ def _fold_callsite_structural_values(
     # folds/removes structural nodes so later region overlay can reconstruct
     # the exact branch tree in each function shell.
     _retain_source_control_records(graph.G)
-    _retain_source_sequence_mutation_records(graph.G)
+    _retain_source_sequence_mutation_records(graph.G, getattr(graph, "function_table", None))
     # Resolve capability before getattr(..., default) can select its default.
     _resolve_grounded_method_references(graph)
 
@@ -30547,6 +30613,17 @@ def _callsite_specialized_shell_type(
             )
             if class_cell is not None:
                 parameter_class_cells[parameter] = (class_cell,)
+                # The called inventory (called_inventory.py): this call edge's
+                # actual is one record the callee formal's class set is
+                # gathered from.
+                from .called_inventory import post_call_edge_actual
+
+                post_call_edge_actual(
+                    current_identity_book(),
+                    str(original.G.graph.get("function_name") or ""),
+                    parameter, caller_scope, int(node_id),
+                    str(class_fact[0]), class_cell,
+                )
         declared_record_abi = dict(
             original.G.graph.get("parameter_record_abi") or {}
         ).get(parameter)
@@ -34857,7 +34934,7 @@ def strategize_shell_deployment(
     )
     selection_phase(
         "retain-source-sequence-mutation-records",
-        lambda: _retain_source_sequence_mutation_records(graph.G),
+        lambda: _retain_source_sequence_mutation_records(graph.G, getattr(graph, "function_table", None)),
     )
 
     # Inherit whatever the compilation asked for, then record it so the

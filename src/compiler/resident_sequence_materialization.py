@@ -1674,6 +1674,36 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
     return result
 
 
+def _returned_formal_sequence_aliases(
+    graph_obj: Any, function_table: Any, *,
+    call_result_kinds: Mapping[int, str] | None = None,
+) -> dict[int, tuple[int, str]]:
+    """Rule 8 for a whole sequence result.
+
+    A call whose result is its caller argument's own list (``def mk(a):
+    return a``) is that list: the planner's identity forwarding of a
+    returned formal, read for a sequence actual.  The call owns no storage
+    of its own, so it names the actual's arena and kind.
+    """
+
+    forwarded = {}
+    for call_id, actual_id in _identity_return_aliases(
+        graph_obj, function_table,
+    ).items():
+        call_data = graph_obj.nodes.get(int(call_id), {})
+        if (call_data.get("attributes") or {}).get("callee_ref") is None:
+            continue
+        actual_data = graph_obj.nodes.get(int(actual_id), {})
+        value_id = int(actual_data.get("value_id", actual_id))
+        kind = str(
+            (actual_data.get("attributes") or {}).get("aggregate_kind")
+            or dict(call_result_kinds or {}).get(value_id, "")
+        )
+        if kind in {"list", "bytes", "bytearray"}:
+            forwarded[int(call_data.get("value_id", call_id))] = (value_id, kind)
+    return forwarded
+
+
 def _static_mapping_capacity_bounds(
     graph_obj: Any,
     *,
@@ -3784,7 +3814,29 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
             graph_obj.nodes[base].get("value_id", base)
         ) in outers:
             reads.append(int(data.get("value_id", node_id)))
-    return tuple(sorted(reads))
+    # ``for r in g``: the loop target is a row of the list of lists.
+    for node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("op") or data.get("type") or "").casefold() != "for":
+            continue
+        iterable = next((
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role) == "iterable" and parent in graph_obj
+        ), None)
+        if iterable is None or int(
+            graph_obj.nodes[iterable].get("value_id", iterable)
+        ) not in outers:
+            continue
+        loop = data.get("expr_obj")
+        if not (isinstance(loop, ast.For) and isinstance(loop.target, ast.Name)):
+            continue
+        reads.extend(
+            int(child_data.get("value_id", child))
+            for child, child_data in graph_obj.nodes(data=True)
+            if str(child_data.get("op") or child_data.get("type") or "").casefold() == "input"
+            and (child_data.get("attributes") or {}).get("binding_kind") == "loop"
+            and (child_data.get("attributes") or {}).get("binding_name") == loop.target.id
+        )
+    return tuple(sorted(set(reads)))
 
 
 def _list_rows_born_by_outer_display(

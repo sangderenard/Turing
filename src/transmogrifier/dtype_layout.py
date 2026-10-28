@@ -276,6 +276,26 @@ def python_int_literal_dtype(value: object) -> str:
     )
 
 
+def python_int_range_dtype(low: int, high: int) -> str | None:
+    """The narrowest declared layout holding every int in ``[low, high]``.
+
+    The same law as ``python_int_literal_dtype``, applied to a proven
+    interval: int64 while both ends fit it, uint64 for a non-negative
+    interval above INT64_MAX, then int128.  ``None`` when no declared layout
+    holds the interval.
+    """
+
+    if type(low) is not int or type(high) is not int or low > high:
+        raise TypeError("integer range layout requires an ordered int interval")
+    if -(1 << 63) <= low and high <= (1 << 63) - 1:
+        return "int64"
+    if 0 <= low and high <= (1 << 64) - 1:
+        return "uint64"
+    if -(1 << 127) <= low and high <= (1 << 127) - 1:
+        return "int128"
+    return None
+
+
 # --------------------------------------------------------------------------
 # Layout views. Native backend support is a property of the same record.
 # --------------------------------------------------------------------------
@@ -524,6 +544,7 @@ __all__ = [
     "layout_for",
     "common_integer_dtype",
     "python_int_literal_dtype",
+    "python_int_range_dtype",
     "by_llvm_type",
     "llvm_abi_numpy_table",
     "C_ABI_NAMES",

@@ -157,6 +157,7 @@ from .resident_sequence_materialization import (
     _constant_struct_pack_materializations as _constant_struct_pack_materializations,
     _dict_literal_mutations as _dict_literal_mutations,
     _identity_return_aliases as _identity_return_aliases,
+    _returned_formal_sequence_aliases as _returned_formal_sequence_aliases,
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
@@ -7957,6 +7958,26 @@ def _authored_dataclass_record_views(
                 if isinstance(node, ast.AnnAssign):
                     target = node.target
                     receipt = field_receipt(node.annotation)
+                    # Program: ``self._d: dict[int, int] = {}`` then
+                    # ``self._d[k] = v`` in a method.  Wrong record: the
+                    # annotation alone chose the caller-supplied keyed view
+                    # (keys, values, length; exactly full), so the method
+                    # growing the class's own mapping was refused for want of
+                    # a capacity part.  Rule: a scalar mapping the initializer
+                    # births empty is the class's own growable mapping, the
+                    # same receipt as the unannotated ``self._d = {}``.
+                    if (
+                        receipt is not None
+                        and receipt.get("storage") == "keyed"
+                        and receipt.get("dtype") in {
+                            "int64", "float64", "bool",
+                        }
+                        and not receipt.get("value_record")
+                        and not receipt.get("value_tensor")
+                        and isinstance(node.value, ast.Dict)
+                        and not node.value.keys
+                    ):
+                        receipt = initialized_field_receipt(node.value)
                 elif isinstance(node, ast.Assign) and len(node.targets) == 1:
                     target = node.targets[0]
                     receipt = (
@@ -27457,6 +27478,14 @@ def _class_surface_ssa_program(
                 field_sequence_aliases[int(alias_id)] = (
                     int(resident_id), aggregate_kind,
                 )
+        # Rule 8 for a whole sequence result: a call whose result is its
+        # caller argument's own list (``def mk(a): return a``) is that list,
+        # the same identity the planner forwards for scalar and member
+        # results.  The call publishes no storage of its own.
+        returned_formal_sequence_aliases = _returned_formal_sequence_aliases(
+            graph_obj, source_function_table,
+            call_result_kinds=sequence_call_result_kinds,
+        )
         (
             control,
             conditional_sequence_aliases,
@@ -27468,8 +27497,13 @@ def _class_surface_ssa_program(
             structural_aliases={
                 **source_transform_aliases,
                 **field_sequence_aliases,
+                **returned_formal_sequence_aliases,
             },
         )
+        conditional_sequence_aliases = {
+            **returned_formal_sequence_aliases,
+            **conditional_sequence_aliases,
+        }
         (
             sequence_concats,
             sequence_concat_aliases,
@@ -27606,6 +27640,9 @@ def _class_surface_ssa_program(
             sequence_declarations = tuple(
                 declaration for declaration in sequence_declarations
                 if int(declaration[0]) not in local_row_ids
+                and int(declaration[0]) not in set(
+                    map(int, list_row_reads(graph_obj))
+                )
             )
             nested_sequence_ids = tuple(sorted({
                 *map(int, nested_sequence_ids), *local_list_rows,
@@ -27802,6 +27839,8 @@ def _class_surface_ssa_program(
                 declared_sequence_ids.add(int(sequence_id))
         for call_result_id in sorted(sequence_call_result_kinds):
             if int(call_result_id) in native_handle_ids:
+                continue
+            if int(call_result_id) in returned_formal_sequence_aliases:
                 continue
             if call_result_id not in declared_sequence_ids:
                 sequence_declarations = (*sequence_declarations, (
@@ -29827,9 +29866,19 @@ def _class_surface_ssa_program(
                         ).get("fields") or {}
                     ).items()
                 },
-                sequence_initializations=sequence_initializations,
+                sequence_initializations=tuple(
+                    initialization for initialization in sequence_initializations
+                    if int(initialization[0]) not in set(
+                        map(int, list_row_reads(graph_obj))
+                    )
+                ),
                 field_aliases=field_aliases,
-                sequence_declarations=sequence_declarations,
+                sequence_declarations=tuple(
+                    declaration for declaration in sequence_declarations
+                    if int(declaration[0]) not in set(
+                        map(int, list_row_reads(graph_obj))
+                    )
+                ),
                 sequence_capacity_sources=sequence_capacity_sources,
                 dynamic_sequence_ids=dynamic_sequence_ids,
                 sequence_column_dtypes={
@@ -48038,6 +48087,28 @@ def _class_surface_ssa_program(
                     # the latter, including when a call returns a frame alias.
                     from .structural_concordance import function_value_structure
                     from .ssa_record_return_state import publish_ssa_value_type
+                    from .identity_concordance import (
+                        resolved_concordant_alias_bindings,
+                    )
+
+                    # A call that returns its argument's own list is that
+                    # list (rule 8): it reads the actual's row and does not
+                    # redefine it, so the marker keeps the physical view it
+                    # was born with, which already agrees with the actual's.
+                    forwarded_actual = values.get(int(
+                        resolved_concordant_alias_bindings(
+                            str(caller_symbol),
+                        ).get(int(placeholder.id), -1)
+                    ))
+                    if (
+                        forwarded_actual is not None
+                        and forwarded_actual is not placeholder
+                        and caller_sequence_table is not None
+                        and caller_sequence_table.by_id(
+                            int(forwarded_actual.id)
+                        ) is not None
+                    ):
+                        return placeholder
 
                     structure, source_cell = function_value_structure(caller, int(produced.id))
                     # Program: ``keep`` (a callsite marker whose result the
@@ -51803,6 +51874,18 @@ def _class_surface_ssa_program(
                         result_is_caller_formal = any(
                             value is result for value in caller.args
                         )
+                        # The same holds for a whole list: a call that
+                        # returns its argument's own sequence reads the
+                        # actual's row (a display span or an arena) and
+                        # does not redefine it with the callee's view.
+                        if (
+                            aliased_return_argument_index is not None
+                            and callee_sequence_table is not None
+                            and callee_sequence_table.by_id(
+                                int(callee_output.id)
+                            ) is not None
+                        ):
+                            result_is_caller_formal = True
                         if not result_is_caller_formal:
                             # The caller-side placeholder may predate source-call
                             # linking and therefore carry no useful type.  A
@@ -60002,6 +60085,19 @@ def _class_surface_ssa_program(
         late_type_conflicts
     )
     lowered_module.metadata["late_result_type_rounds"] = late_result_rounds
+
+    # The last writer of physical scalar dtypes has run: a carried Phi of a
+    # narrower class than its update is a trip-count-dependent result class.
+    from .ssa_self_check import check_loop_carried_class_widening
+
+    carried_widening = check_loop_carried_class_widening(lowered_module)
+    if carried_widening:
+        raise ValueError(
+            "; ".join(
+                f"{finding.function}: {finding.detail}"
+                for finding in carried_widening
+            )
+        )
 
     # Structural None has a semantic dtype only; post its zero-sentinel cell
     # once every pass that can create or retype a None value has run.

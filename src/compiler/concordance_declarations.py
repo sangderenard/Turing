@@ -483,8 +483,18 @@ ROOT_CALL_RECORD = declare_page("root_call_record", (
 class CalledInventoryFact:
     classes: tuple          # exact class spellings, sorted, e.g. ("float", "int")
     selected: str | None    # the class this specialized copy lowers
+    root: bool = False      # a root-call contract fed it: ingestion may type
+                            # the formal from it (internal-edge inventories are
+                            # provenance; callsite specialization types those)
 
 
+#: One internal call edge's actual for one callee formal: the exact class the
+#: caller's SOURCE_VALUE_CLASS cell states for the argument.  Derived from
+#: that cell.  Mode REVISE.
+CALL_EDGE_ACTUAL = declare_page("call_edge_actual", (
+    RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("formal", K.NAME),
+), str)
 CALLED_INVENTORY = declare_page("called_inventory", (
     RowField("function_identity", K.NAME), RowField("formal", K.NAME),
 ), CalledInventoryFact)
@@ -523,6 +533,16 @@ CALLABLE_IDENTITY = declare_page("callable_identity_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("node_id", K.VALUE_ID),
 ), int)
 SOURCE_VALUE_CLASS = declare_page("source_value_class_concordance", (
+    RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), tuple)
+#: ``_propagate_builtin_int_ranges``: the closed interval a builtin ``int``
+#: value is proven to lie in, ``(numeric scope, value id)`` -> ``(low,
+#: high)``, CONCORD, DERIVED from the value's ``source_value_class`` cell, its
+#: node identity, and the operand range cells the operator rule read.  A
+#: value with no proof has no row.  The native width of a Python ``int`` is
+#: the narrowest declared layout holding this interval
+#: (``dtype_layout.python_int_range_dtype``), exactly as a literal's is.
+SOURCE_INT_RANGE = declare_page("source_int_range_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)
 

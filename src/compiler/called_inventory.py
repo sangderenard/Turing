@@ -68,7 +68,7 @@ def post_root_calls(
             chosen = next(iter(found))
         book.post(
             CALLED_INVENTORY, (function_identity, formal),
-            CalledInventoryFact(tuple(sorted(found)), chosen),
+            CalledInventoryFact(tuple(sorted(found)), chosen, True),
             stage=INGESTION, provenance=Derived(tuple(cells[formal])),
             mode=Mode.REVISE,
         )
@@ -98,7 +98,7 @@ def called_class(book: Any, function_identity: str, formal: str):
 
     row = (function_identity, formal)
     fact = book.page(CALLED_INVENTORY).latest(row)
-    if fact is None:
+    if fact is None or not fact.root:
         return None
     if not fact.classes:
         raise ValueError(
@@ -131,3 +131,49 @@ def annotate_from_inventory(tree: Any, function_identity: str, book: Any) -> Non
                     continue
                 arg.annotation = ast.copy_location(
                     ast.Name(id=got[0], ctx=ast.Load()), arg)
+
+
+def post_call_edge_actual(
+    book: Any, callee_identity: str, formal: str, caller_scope: Any,
+    call_id: int, class_spelling_: str, class_cell: Any,
+) -> None:
+    """Record one internal call edge's actual and fold it into the callee
+    formal's inventory.  The edge cell is Derived from the caller's
+    SOURCE_VALUE_CLASS cell; the inventory cell is Derived from every edge
+    cell (and root-call record) that reaches the formal, so its provenance
+    cites each call edge.  The set grows to exactly the classes found."""
+
+    from .concordance_declarations import (
+        CALL_EDGE_ACTUAL, CALLED_INVENTORY, CalledInventoryFact,
+        PLANNER_TENSOR_SPECIALIZATION,
+    )
+    from .identity_concordance import Derived, Mode
+
+    cls = str(class_spelling_)
+    if cls.startswith("builtins."):
+        cls = cls[len("builtins."):]
+    edge_row = (caller_scope, int(call_id), str(formal))
+    book.post(
+        CALL_EDGE_ACTUAL, edge_row, cls, stage=PLANNER_TENSOR_SPECIALIZATION,
+        provenance=Derived((class_cell,)), mode=Mode.REVISE,
+    )
+    edge = book.latest_ref(CALL_EDGE_ACTUAL, edge_row)
+    row = (str(callee_identity), str(formal))
+    incumbent = book.page(CALLED_INVENTORY).latest(row)
+    cell = book.latest_ref(CALLED_INVENTORY, row) if incumbent is not None else None
+    cited = [ref for ref, _stage in book.edges_into(cell)] if cell is not None else []
+    classes = set(incumbent.classes) if incumbent is not None else set()
+    if incumbent is not None and cls in classes and edge in cited:
+        return
+    classes.add(cls)
+    cited.append(edge)
+    book.post(
+        CALLED_INVENTORY, row,
+        CalledInventoryFact(
+            tuple(sorted(classes)),
+            None if incumbent is None else incumbent.selected,
+            False if incumbent is None else incumbent.root,
+        ),
+        stage=PLANNER_TENSOR_SPECIALIZATION,
+        provenance=Derived(tuple(dict.fromkeys(cited))), mode=Mode.REVISE,
+    )
