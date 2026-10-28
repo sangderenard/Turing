@@ -2408,9 +2408,6 @@ def _planned_scalar_dtypes_from(
     # A builtin ``int`` value's native width is the narrowest layout holding
     # its proven interval (``source_int_range_concordance``), the same law a
     # literal's width follows.  An unproven value keeps the int64 rule.
-    from ..common.tensors.topological_reducer import (
-        _source_numeric_scope as _range_scope,
-    )
     from .concordance_declarations import SOURCE_INT_RANGE
     from .identity_concordance import current_identity_book as _range_book
     from ..transmogrifier.dtype_layout import (
@@ -2418,16 +2415,21 @@ def _planned_scalar_dtypes_from(
         python_int_range_dtype,
     )
 
-    range_scope = _range_scope(G)
     range_page = _range_book().page(SOURCE_INT_RANGE)
+
+    from ..common.tensors.topological_reducer import (
+        _int_range_scopes as _range_scopes,
+        _int_range_cell as _range_cell,
+    )
+
+    range_scopes = _range_scopes(G)
 
     def range_dtype(node_id):
         data = G.nodes.get(int(node_id), {})
-        interval = range_page.latest(
-            (range_scope, int(data.get("value_id", node_id)))
-        )
-        if interval is None:
+        cell = _range_cell(range_scopes, int(data.get("value_id", node_id)))
+        if cell is None:
             return None
+        interval = range_page.cell(cell.row, cell.column)
         return python_int_range_dtype(int(interval[0]), int(interval[1]))
 
     scalar: dict[int, str] = {}
@@ -30240,6 +30242,50 @@ def _retarget_all_cached_value_ids(
         _retarget_cached_value_ids(data, int(replaced_id), (int(source_id),))
 
 
+def _post_member_interval(graph: Any, leaf_id: int, projections) -> None:
+    """Post a synthesized aggregate member's proven interval.
+
+    The member formal replaces the ``formal[k]`` projections it is aliased
+    to, so its ``source_int_range_concordance`` row is the join of theirs,
+    derived from their cells.  No proven projection: no row.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _int_range_cell, _source_numeric_scope, node_identity_cell,
+    )
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, SOURCE_INT_RANGE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    book = current_identity_book()
+    cells = []
+    low = high = None
+    for projection in projections:
+        data = graph.G.nodes.get(int(projection), {})
+        cell = _int_range_cell(graph, int(data.get("value_id", projection)))
+        if cell is None:
+            return
+        interval = book.page(SOURCE_INT_RANGE).cell(cell.row, cell.column)
+        low = int(interval[0]) if low is None else min(low, int(interval[0]))
+        high = int(interval[1]) if high is None else max(high, int(interval[1]))
+        cells.append(cell)
+    if not cells:
+        return
+    leaf_cell = node_identity_cell(graph, int(leaf_id))
+    book.post(
+        SOURCE_INT_RANGE, (_source_numeric_scope(graph), int(leaf_id)),
+        (low, high),
+        stage=PLANNER_TENSOR_SPECIALIZATION,
+        provenance=Derived(tuple(dict.fromkeys((
+            *cells, *((leaf_cell,) if leaf_cell is not None else ()),
+        )))),
+        mode=Mode.CONCORD,
+    )
+
+
 def _alias_projection_to_member(
     graph: Any, projection: int, leaf_id: int,
 ) -> None:
@@ -30420,6 +30466,13 @@ def _apply_callsite_aggregate_descriptors(
                     stage=PLANNER_TENSOR_SPECIALIZATION,
                 )
                 leaves.append(leaf_id)
+                # Program: Token Orchard's ``hi, lo = fingerprint`` in the
+                # specialization whose ``fingerprint`` is the preflight pair
+                # (corpus c795).  Wrong record: the synthesized member formal
+                # had no interval, so it was int64 against the uint64 the
+                # projection it replaces is proven to hold.  Rule: the
+                # member is the projection; it carries that interval.
+                _post_member_interval(graph, leaf_id, projections.get(index, ()))
                 for projection in projections.get(index, ()):
                     _alias_projection_to_member(graph, projection, leaf_id)
                 if is_nested:

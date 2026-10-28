@@ -2294,8 +2294,8 @@ class _ControlSSABuilder(TiledObject):
         )
 
         self.program = program
-        #: The ``source_int_range_concordance`` scope of this function's
-        #: values (``_source_numeric_scope``), or ``None`` when unknown.
+        #: The ``source_int_range_concordance`` scopes this function's
+        #: values are read through (``_int_range_scopes``), or ``None``.
         self.int_range_scope = int_range_scope
         #: ssa id -> the SSAValue object the book's ``ssa_value`` row names
         #: (plan 80 B2.1): the one private structure the builder keeps,
@@ -9757,6 +9757,7 @@ class _ControlSSABuilder(TiledObject):
             return None
         from .concordance_declarations import SOURCE_INT_RANGE
         from .identity_concordance import current_identity_book
+        from ..common.tensors.topological_reducer import _int_range_cell
         from ..transmogrifier.dtype_layout import python_int_range_dtype
 
         range_page = current_identity_book().page(SOURCE_INT_RANGE)
@@ -9770,9 +9771,11 @@ class _ControlSSABuilder(TiledObject):
         for value in present:
             interval = None
             if self.int_range_scope is not None:
-                interval = range_page.latest(
-                    (self.int_range_scope, int(value.id))
+                cell = _int_range_cell(
+                    tuple(self.int_range_scope), int(value.id),
                 )
+                if cell is not None:
+                    interval = range_page.cell(cell.row, cell.column)
             literal = constants.get(int(value.id))
             if interval is None and type(literal) in {int, bool}:
                 interval = (int(literal), int(literal))
