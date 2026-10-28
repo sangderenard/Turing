@@ -17783,6 +17783,16 @@ def _sequence_row_operations(
             else None
         )
 
+    # Program: ``xs[k] if k < 2 else 0`` specialized at ``k = 5`` (corpus
+    # c824).  Wrong record: the fold kept the dead arm's ``Indexed`` node, and
+    # its row load, now checked, raised IndexError for a read Python never
+    # makes.  Rule: a read nothing consumes and no return publishes is not a
+    # row load.
+    returned_ids = {
+        int(slot)
+        for slots in (graph_obj.graph.get("return_slot_values") or {}).values()
+        for slot in slots if slot is not None
+    }
     operations: list[tuple[Any, ...]] = []
     for node_id, data in sorted(graph_obj.nodes(data=True)):
         kind = str(data.get("op") or data.get("type") or "").casefold()
@@ -17791,6 +17801,12 @@ def _sequence_row_operations(
             outer_id = node_roles.get("base")
             column_node = node_roles.get("index")
             if outer_id is None or column_node is None:
+                continue
+            if (
+                not any(True for _ in graph_obj.successors(node_id))
+                and value_id(node_id) not in returned_ids
+                and int(node_id) not in returned_ids
+            ):
                 continue
             # Program: ``ys = xs[1:n]; sum(ys)`` (scratch c204).  Wrong
             # record: the slice was collected as a one-row load at index
