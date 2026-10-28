@@ -2825,21 +2825,39 @@ def _planned_scalar_dtypes_from(
                 # The receiver is the table, a store's version of it, or a
                 # loop's carried version of it.
                 table = receiver[0] if len(receiver) == 1 else None
-                while table is not None and (
-                    operation(G.nodes[table]) in {"indexedstore", "setitem"}
-                    or (
-                        operation(G.nodes[table]) == "loopresult"
-                        and (G.nodes[table].get("attributes") or {}).get(
+                # Program: ``d = {1: n, 7: 4}; for i in range(4): if i ==
+                # n: d[1] = i`` then ``d.get(7, -1) + d.get(1, 0)`` (corpus
+                # c673).  Wrong record: the loop's carried value is the
+                # body's ``if`` merge, a phi of the store and the entering
+                # table, which this walk did not cross, so the read had no
+                # table and its class fell to the float64 default.  Rule:
+                # a merge whose arms all reach one table is that table.
+                def reaching_table(node, depth=0):
+                    if node is None or depth > 16:
+                        return None
+                    kind = operation(G.nodes[node])
+                    if kind == "phi":
+                        reached = {
+                            reaching_table(arm, depth + 1)
+                            for arm in parents(G.nodes[node], "body", "orelse")
+                        }
+                        return next(iter(reached)) if len(reached) == 1 else None
+                    if kind in {"indexedstore", "setitem"} or (
+                        kind == "loopresult"
+                        and (G.nodes[node].get("attributes") or {}).get(
                             "result_kind"
                         ) == "carried"
-                    )
-                ):
-                    base = parents(
-                        G.nodes[table],
-                        "value" if operation(G.nodes[table]) == "loopresult"
-                        else "base",
-                    )
-                    table = base[0] if len(base) == 1 else None
+                    ):
+                        base = parents(
+                            G.nodes[node],
+                            "value" if kind == "loopresult" else "base",
+                        )
+                        return reaching_table(
+                            base[0] if len(base) == 1 else None, depth + 1
+                        )
+                    return node
+
+                table = reaching_table(table)
                 if (
                     table is not None and len(defaults) == 1
                     and is_collection(table)
