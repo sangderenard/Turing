@@ -50,6 +50,9 @@ def _unposted_or_unsourced(module):
 
 
 def test_keyed_tensor_lookup_helper_posts_physical_dtype():
+    from src.compiler.called_inventory import (
+            MappingClass, RecordClass, TensorClass,
+        )
     from tests.test_sequence_contract_concordance import (
         c_backend_repository_ssa_reference,
     )
@@ -68,6 +71,12 @@ def test_keyed_tensor_lookup_helper_posts_physical_dtype():
         "    return selected.real.sum()\n",
         "sample",
         name="keyed_tensor_rows",
+        root_calls=[{
+            "reading": RecordClass(
+                "Reading", voltage_v=MappingClass(str, TensorClass("float64")),
+            ),
+            "key": str,
+        }],
         extraction_contract=ExtractionContract(CONTRACT),
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         progress=lambda _message: None,

@@ -3439,7 +3439,48 @@ def emit_ssa_module_to_c(
                 )
                 for key in table if key.casefold() == op.casefold()
             ), op)
-            if op in _BINARY and len(elements) == 2:
+            from .ssa_llvm_backend import python_int_lane_overflow_checked
+
+            lane_checked = (
+                integral and result_type == "int64_t"
+                and python_int_lane_overflow_checked(instruction)
+            )
+            # A checked lane is a statement: the overflow builtin reports
+            # code 86 (NativeIntOverflow) for the lane Python's ``int``
+            # would carry past int64.
+            lane_statement = None
+            if lane_checked and op in {"Add", "Sub", "Mul", "Neg", "Abs"}:
+                prototype = "void turing_validation_error(uint32_t error_code);"
+                if prototype not in prototypes:
+                    prototypes.append(prototype)
+                needs_validation_runtime = True
+                lane = f"ew_v_{result_id}"
+                report = f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                if op in {"Add", "Sub", "Mul"} and len(elements) == 2:
+                    builtin = {
+                        "Add": "__builtin_add_overflow",
+                        "Sub": "__builtin_sub_overflow",
+                        "Mul": "__builtin_mul_overflow",
+                    }[op]
+                    lane_statement = (
+                        f"int64_t {lane}; if ({builtin}((int64_t)({elements[0]}), "
+                        f"(int64_t)({elements[1]}), &{lane})) {report}"
+                    )
+                elif op in {"Neg", "Abs"} and len(elements) == 1:
+                    lane_statement = (
+                        f"int64_t {lane}; if (__builtin_sub_overflow((int64_t)0, "
+                        f"(int64_t)({elements[0]}), &{lane})) {report}"
+                    )
+                    if op == "Abs":
+                        # |x| leaves int64 only at INT64_MIN, the one lane
+                        # whose checked negation reports.
+                        lane_statement += (
+                            f" if (({elements[0]}) >= 0) {lane} = "
+                            f"(int64_t)({elements[0]});"
+                        )
+            if lane_statement is not None:
+                expression = f"ew_v_{result_id}"
+            elif op in _BINARY and len(elements) == 2:
                 if op == "Div" and not _is_integer_dtype(result.dtype):
                     expression = (
                         f"((double){elements[0]} / (double){elements[1]})"
@@ -3486,8 +3527,28 @@ def emit_ssa_module_to_c(
                 )
             elif op == "Pow" and len(elements) == 2 and not integral:
                 expression = f"pow({elements[0]}, {elements[1]})"
+            elif op == "Neg" and len(elements) == 1 and integral:
+                # Negation through the unsigned type, as Add/Sub/Mul above:
+                # INT64_MIN wraps to itself instead of being undefined.
+                layout = dtype_layout(result.dtype)
+                unsigned = dtype_layout(
+                    f"uint{max(32, 8 * layout.byte_size)}"
+                ).c_storage_type
+                expression = f"({result_type})(0 - ({unsigned}){elements[0]})"
             elif op == "Neg" and len(elements) == 1:
                 expression = f"(-{elements[0]})"
+            elif (
+                op == "Abs" and len(elements) == 1 and integral
+                and _is_integer_dtype(result.dtype)
+            ):
+                layout = dtype_layout(result.dtype)
+                unsigned = dtype_layout(
+                    f"uint{max(32, 8 * layout.byte_size)}"
+                ).c_storage_type
+                expression = (
+                    f"(({elements[0]}) < 0 ? ({result_type})(0 - "
+                    f"({unsigned})({elements[0]})) : ({elements[0]}))"
+                )
             elif (
                 op in _UNARY and _UNARY[op] is not None
                 and len(elements) == 1 and not integral
@@ -3505,10 +3566,15 @@ def emit_ssa_module_to_c(
                     activation_array(result_type, int(count)) if static
                     else runtime_activation_array(result_type, count)
                 )
+            store = (
+                f"(({result_type} *)({destination}))[{index}] = "
+                f"({result_type})({expression});"
+            )
+            if lane_statement is not None:
+                store = f"{{ {lane_statement} {store} }}"
             loop = (
                 f"for (ptrdiff_t {index} = 0; {index} < (ptrdiff_t)({count}); "
-                f"++{index}) (({result_type} *)({destination}))[{index}] = "
-                f"({result_type})({expression});"
+                f"++{index}) {store}"
             )
             if checks:
                 prototype = "void turing_validation_error(uint32_t error_code);"

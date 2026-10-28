@@ -1276,6 +1276,14 @@ def _call_returns_argument(caller: Any, call_id: int, argument_id: int) -> bool:
     storage, so the initializer is not its contents after the call.
     """
 
+    # Program: ``def leaf(flag, limit): ... return limit`` called with a
+    # literal ``limit``.  Wrong record: the scalar was refused as an
+    # initializer, so the optional's payload lost its typed literal and the
+    # region saw an untyped feed.  Rule: only mutable storage is identity
+    # forwarded; a scalar is a value, never an owner of storage.
+    if str(((caller.G.nodes.get(int(argument_id), {}).get("attributes") or {})
+            .get("aggregate_kind"))) not in _MUTABLE_RETURN_KINDS:
+        return False
     function_table = getattr(caller, "function_table", None)
     data = caller.G.nodes.get(int(call_id), {})
     attributes = data.get("attributes") or {}
@@ -5455,7 +5463,7 @@ def _build_shell_hierarchy_plan(
                         "control",
                     }
                     and (
-                        operation != "phi"
+                        operation not in {"phi", "ifexp"}
                         or str(role).casefold() in {"body", "orelse"}
                     )
                 )
@@ -5555,9 +5563,12 @@ def _build_shell_hierarchy_plan(
                         dtype = str(posted["dtype"])
                     elif len(parent_dtypes) == 1:
                         dtype = parent_dtypes[0]
-                elif operation == "phi" and phi_element_dtypes(
+                elif operation in {"phi", "ifexp"} and phi_element_dtypes(
                     attributes, parent_records, declared,
                 ):
+                    # ``n if c == 2 else n * 0.5`` is the same merge as its
+                    # statement form (corpus c897): its carrier is the
+                    # promoted class, its arms' exact classes are its union.
                     # The guard chooses an arm; it contributes no element
                     # type. A merge's numeric arms use the substrate's
                     # existing promotion rule, not DomainNode's default.
@@ -5881,25 +5892,6 @@ def _build_shell_hierarchy_plan(
                 and receivers
                 and all(
                     str(role) == "operand"
-                    and (
-                        graph.G.nodes.get(int(child), {}).get("attributes")
-                        or {}
-                    ).get("tensor_candidate") is not None
-                    for child, role in receivers
-                )
-            ):
-                return None, ()
-            # Lane D, D8.  Program: ``a = np.asarray(xs); a[0] + a[1]``.  The
-            # external name ``np.asarray`` (an Input bound ``tensor``) is read
-            # only as the callee of tensor-namespace calls; the call carries
-            # the typed result (its ``tensor`` record).  A callee is a static
-            # symbol, as a StaticReference is: not a value, so it posts no
-            # row and opens no dtype obligation.
-            if (
-                attributes.get("binding_kind") == "external"
-                and receivers
-                and all(
-                    str(role) == "callee"
                     and (
                         graph.G.nodes.get(int(child), {}).get("attributes")
                         or {}

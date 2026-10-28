@@ -923,6 +923,57 @@ def python_int_unchecked_refusal(instruction: _Any, target: str) -> str | None:
     )
 
 
+#: What an int64 AbstractTensor lane means when its value leaves int64.
+#: "exact" is Python's ``int`` (Albert's decision: a lane faults with
+#: NativeIntOverflow rather than return a value Python never computes);
+#: "wrap" would be NumPy's two's-complement lane.  The one switch for the
+#: future wrap policy is this value.
+INT64_LANE_POLICY = "exact"
+
+_LANE_CHECKED_OPERATIONS = frozenset({"add", "sub", "mul", "neg", "abs"})
+
+
+def python_int_lane_overflow_checked(
+    instruction: _Any, *, operation: str | None = None,
+) -> bool:
+    """Whether an elementwise int64 tensor op must fault instead of wrapping.
+
+    Program: ``token * 1103515245 + 12345`` on an int64 AbstractTensor.
+    Wrong record: every lane wrapped at int64 on C and LLVM, so a lane
+    leaving int64 returned a value Python's ``int`` never computes.  Rule:
+    under ``INT64_LANE_POLICY == "exact"``, authored (``source_type``)
+    signed int64 Add/Sub/Mul/Neg/Abs over a span checks every lane and
+    reports code 86.  No interval proves a lane's range, so every such lane
+    is checked.  The scalar rule is ``python_int_overflow_checked``.
+    """
+
+    result = getattr(instruction, "res", None)
+    attributes = getattr(instruction, "attributes", None) or {}
+    from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+
+    operation = str(operation or getattr(instruction, "op", "") or "")
+    operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+        operation.casefold(), operation,
+    )
+    return (
+        INT64_LANE_POLICY == "exact"
+        and result is not None
+        and operation.casefold() in _LANE_CHECKED_OPERATIONS
+        and str(getattr(result, "dtype", "")).casefold() == "int64"
+        and not _unsigned_value(result)
+        and bool(
+            tuple(getattr(result, "shape", None) or ())
+            or _declared_span_rank(result) > 0
+        )
+        and (
+            str(attributes.get("source_type") or "")
+            in {"BinOp", "AugAssign", "UnaryOp", "Call"}
+            # ``abs(tokens)`` is the authored builtin, ingested as such.
+            or attributes.get("extraction_identity") == "builtins.abs"
+        )
+    )
+
+
 def integer_scalar_lines(
     operation: str,
     operand_type: str,
@@ -5204,10 +5255,30 @@ def _emit_repository_call_module(
                     # times a scalar reached ``fmul double`` with i64
                     # operands. The scalar emitter already owns the integer
                     # law; span rank changes the sweep, not the declared dtype.
-                    integer = integer_scalar_lines(
-                        operation, compute_type, operands, computed,
-                        unsigned=_unsigned_value(instruction.args[0]),
+                    lane_checked = (
+                        compute_type == "i64"
+                        and python_int_lane_overflow_checked(instruction)
                     )
+                    if lane_checked and operation in {"Abs", "abs"}:
+                        # |x| leaves int64 only at INT64_MIN, the one lane
+                        # whose checked negation reports.
+                        negated = integer_scalar_lines(
+                            "Neg", compute_type, operands,
+                            f"{computed}.neg", checked=True,
+                        )
+                        integer = None if negated is None else ([
+                            *negated[0],
+                            f"{computed}.below = icmp slt i64 "
+                            f"{operands[0]}, 0",
+                            f"{computed} = select i1 {computed}.below, "
+                            f"i64 {computed}.neg, i64 {operands[0]}",
+                        ], compute_type)
+                    else:
+                        integer = integer_scalar_lines(
+                            operation, compute_type, operands, computed,
+                            unsigned=_unsigned_value(instruction.args[0]),
+                            checked=lane_checked,
+                        )
                     if integer is None:
                         shortfalls.append(LLVMEmissionShortfall(
                             name, operation,

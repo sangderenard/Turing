@@ -4,7 +4,8 @@ The join is carried as one physical class (``ssa_numeric_joins``).  That
 is exact only where the joined value meets an operand of that class in
 arithmetic (corpus c770-c774).  Each program here reads it where an int
 and a float differ, and must be refused by name, never answered.  A join
-that leaves as its value-union frame keeps each class (corpus c804-c809).
+that leaves as its value-union frame keeps each class (corpus c804-c809),
+and so does one read by a region the tag dispatches per arm (c890-c898).
 """
 
 import pytest
@@ -15,22 +16,6 @@ from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 REFUSED = "int-or-float union lowering is not built"
 
 PROGRAMS = {
-    "compared": """
-def root(n: int, c: int):
-    if c == 2:
-        s = n
-    else:
-        s = n * 0.5
-    return s > 3
-""",
-    "added_to_itself": """
-def root(n: int, c: int):
-    if c == 2:
-        s = n
-    else:
-        s = n * 0.5
-    return s + s
-""",
     "carried_read_with_another_carried_read": """
 def root(t: int):
     xs = [2.5, t * 1.5]
@@ -93,7 +78,9 @@ def test_type_visible_numeric_join_is_refused(name):
 
 
 def test_join_read_by_float_arithmetic_lowers():
-    module, _outputs, _exports = _lower("""
+    # Each arm reads the join with its own class (per-arm region copies;
+    # the answers are checked by corpus c770 and c890-c898).
+    _lower("""
 def root(n: int, c: int) -> float:
     if c == 2:
         s = n
@@ -101,7 +88,6 @@ def root(n: int, c: int) -> float:
         s = n * 0.5
     return s + 0.25
 """)
-    assert module.metadata["numeric_join_promotions"] >= 1
 
 
 CONTINUE_UPDATE = """

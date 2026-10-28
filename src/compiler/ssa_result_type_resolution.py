@@ -309,8 +309,13 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                         outputs = tuple(by_id[value_id] for value_id in selected)
                     elif len(ids) != len(outputs):
                         continue
+                    # A per-arm region call (``union_arm_dispatch``) types
+                    # its own loads; the joined id is the merge of every
+                    # arm's, not this callee's output.
                     for value_id, source in zip(ids, outputs):
-                        if value_id in values:
+                        if value_id in values and not instruction.attributes.get(
+                            'union_arm_dispatch'
+                        ):
                             yield caller, values[value_id], callee, source
                     for position, target in projections.get(id(instruction.res), ()):
                         if isinstance(position, tuple):
