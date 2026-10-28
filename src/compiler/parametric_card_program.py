@@ -254,11 +254,17 @@ def build_parametric_card_program(
 
     def port(program: Any, value_id: int, role: str, name: str | None = None):
         metadata = (program.meta or {}).get(int(value_id))
+        if not getattr(metadata, "dtype", None):
+            raise ValueError(
+                f"parametric card port %t{int(value_id)} ({role}) has no "
+                "recorded dtype in the program meta; the card refuses to "
+                "invent one"
+            )
         return CardPort(
             name=str(name or names_by_id.get(int(value_id), f"value_{value_id}")),
             value_id=int(value_id),
             role=role,
-            dtype=str(getattr(metadata, "dtype", None) or "float64"),
+            dtype=str(metadata.dtype),
             shape=tuple(map(int, getattr(metadata, "shape", ()) or ())),
             storage_value_id=canonical(int(value_id)),
         )
