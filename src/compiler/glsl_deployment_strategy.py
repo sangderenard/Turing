@@ -5845,8 +5845,14 @@ def _build_shell_hierarchy_plan(
                       or ()),
                     attributes.get("sequence_element_annotation_cell"),
                 )
-            if attributes.get("program_abi_record_identity"):
-                # A record value is a handle onto its fields' storage.
+            if attributes.get("program_abi_record_identity") or (
+                attributes.get("aggregate_kind") == "dict"
+                and attributes.get("mapping_value_tensor")
+            ):
+                # A record value is a handle onto its fields' storage; so is
+                # a ``Mapping[K, Tensor]`` table, whose rows are child-row
+                # handles (the tensor element class is the child pool's, a
+                # separate record).
                 return (record[0], record[1], "opaque_ref"), (
                     _dtype_producer_cells(graph, int(value_id))
                 )
