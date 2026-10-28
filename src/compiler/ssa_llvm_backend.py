@@ -799,6 +799,9 @@ def _unsigned_value(value: _Any) -> bool:
     return layout is not None and layout.kind in {"uint", "bool"}
 
 
+_PYTHON_INT_BUILTINS = frozenset({"builtins.abs", "builtins.sum", "builtins.pow"})
+
+
 def python_int_overflow_checked(instruction: _Any) -> bool:
     """Whether a scalar op is Python ``int`` arithmetic that must not wrap.
 
@@ -816,8 +819,107 @@ def python_int_overflow_checked(instruction: _Any) -> bool:
         result is not None
         and str(getattr(result, "dtype", "")) == "int64"
         and not tuple(getattr(result, "shape", None) or ())
-        and str(attributes.get("source_type") or "")
-        in {"BinOp", "AugAssign", "UnaryOp"}
+        and (
+            str(attributes.get("source_type") or "")
+            in {"BinOp", "AugAssign", "UnaryOp"}
+            # Authored builtins whose int result is Python arithmetic:
+            # ``abs(-2**63)``, ``sum(xs)`` and ``pow(n, 2)`` leave int64.
+            or attributes.get("extraction_identity") in _PYTHON_INT_BUILTINS
+        )
+    )
+
+
+_INT64_MIN = "-9223372036854775808"
+
+
+def _python_int_lines(
+    operation: str, operands: list[str], register: str,
+) -> list[str] | None:
+    """Python's ``<< >> // %`` and ``abs`` on a checked i64, else ``None``.
+
+    Program: ``a << b``, ``a >> b``, ``a // b``, ``a % b``, ``abs(a)`` on
+    ints no interval bounds.  Wrong records: ``shl`` wrapped (and is poison
+    past 63), ``>>`` was ``lshr`` (``-8 >> 1`` gave 2**63 - 4), ``sdiv`` by
+    zero or of ``-2**63 // -1`` trapped the host, ``abs(-2**63)`` wrapped.
+    Rule: Python's value or a named fault -- ``NEGATIVE_SHIFT_COUNT``,
+    ``INT_ZERO_DIVISION``, ``INT_OVERFLOW``; the faulting lanes compute on
+    a safe operand so no instruction is undefined.
+    """
+
+    from .native_faults import INT_ZERO_DIVISION, NEGATIVE_SHIFT_COUNT
+
+    r = register
+    if operation in {"Shl", "Shr"} and len(operands) == 2:
+        value, count = operands
+        lines = [
+            f"{r}.negative = icmp slt i64 {count}, 0",
+            f"call void @turing_int_fault(i1 {r}.negative, "
+            f"i32 {NEGATIVE_SHIFT_COUNT})",
+            f"{r}.inrange = icmp ult i64 {count}, 64",
+        ]
+        if operation == "Shr":
+            # Python ``>>`` floors: arithmetic, and 0 / -1 past 63 bits.
+            return lines + [
+                f"{r}.amount = select i1 {r}.inrange, i64 {count}, i64 63",
+                f"{r} = ashr i64 {value}, {r}.amount",
+            ]
+        return lines + [
+            f"{r}.amount = select i1 {r}.inrange, i64 {count}, i64 0",
+            f"{r} = shl i64 {value}, {r}.amount",
+            f"{r}.back = ashr i64 {r}, {r}.amount",
+            f"{r}.lost = icmp ne i64 {r}.back, {value}",
+            f"{r}.nonzero = icmp ne i64 {value}, 0",
+            f"{r}.far = select i1 {r}.inrange, i1 {r}.lost, i1 {r}.nonzero",
+            f"{r}.counted = xor i1 {r}.negative, true",
+            f"{r}.overflow = and i1 {r}.far, {r}.counted",
+            f"call void @turing_int_overflow(i1 {r}.overflow)",
+        ]
+    if operation in {"FloorDiv", "Mod"} and len(operands) == 2:
+        dividend, divisor = operands
+        lines = [
+            f"{r}.zero = icmp eq i64 {divisor}, 0",
+            f"call void @turing_int_fault(i1 {r}.zero, "
+            f"i32 {INT_ZERO_DIVISION})",
+            f"{r}.minimum = icmp eq i64 {dividend}, {_INT64_MIN}",
+            f"{r}.minus_one = icmp eq i64 {divisor}, -1",
+            f"{r}.wide = and i1 {r}.minimum, {r}.minus_one",
+        ]
+        if operation == "FloorDiv":
+            # -2**63 // -1 == 2**63.  (-2**63 % -1 == 0 needs no report:
+            # the safe divisor 1 below gives exactly that remainder.)
+            lines.append(f"call void @turing_int_overflow(i1 {r}.wide)")
+        lines += [
+            f"{r}.unsafe = or i1 {r}.zero, {r}.wide",
+            f"{r}.divisor = select i1 {r}.unsafe, i64 1, i64 {divisor}",
+        ]
+        floored = integer_scalar_lines(
+            operation, "i64", [dividend, f"{r}.divisor"], r,
+        )
+        assert floored is not None
+        return lines + floored[0]
+    if operation in {"Abs", "abs"} and len(operands) == 1:
+        magnitude = integer_scalar_lines(operation, "i64", operands, r)
+        assert magnitude is not None
+        return magnitude[0] + [
+            f"{r}.overflow = icmp eq i64 {operands[0]}, {_INT64_MIN}",
+            f"call void @turing_int_overflow(i1 {r}.overflow)",
+        ]
+    return None
+
+
+def python_int_unchecked_refusal(instruction: _Any, target: str) -> str | None:
+    """Why ``target`` refuses ``instruction``, when it is checked int arithmetic.
+
+    A target whose int64 storage is 32-bit ``int`` or a double cannot hold
+    an unproven Python ``int``, let alone check its overflow; lowering it
+    anyway returns a value Python never computes, so it refuses by name.
+    """
+
+    if not python_int_overflow_checked(instruction):
+        return None
+    return (
+        f"Python int arithmetic on an unproven int64 must not wrap; {target} "
+        "has no exact checked int64 spelling (python_int_overflow_checked)"
     )
 
 
@@ -837,6 +939,10 @@ def integer_scalar_lines(
     ``Mul``/``Neg`` with the overflow intrinsics and reports an overflow.
     """
 
+    if checked and not unsigned and operand_type == "i64":
+        python_lines = _python_int_lines(operation, operands, register)
+        if python_lines is not None:
+            return python_lines, operand_type
     if (
         checked and not unsigned and operand_type == "i64"
         and (
@@ -1081,6 +1187,17 @@ exit:
     },
     # Python ``int`` never wraps.  An unproven int64 result that left int64
     # is reported (native_faults.INT_OVERFLOW) instead of returned wrapped.
+    # Python's other int exceptions (native_faults NEGATIVE_SHIFT_COUNT,
+    # INT_ZERO_DIVISION): report ``code`` when ``fault`` holds.
+    "turing_int_fault": """define internal void @turing_int_fault(i1 %fault, i32 %code) {
+entry:
+  br i1 %fault, label %report, label %exit
+report:
+  call void @turing_validation_error(i32 %code)
+  br label %exit
+exit:
+  ret void
+}""",
     "turing_int_overflow": f"""define internal void @turing_int_overflow(i1 %overflow) {{
 entry:
   br i1 %overflow, label %report, label %exit
@@ -5313,7 +5430,18 @@ def _emit_repository_call_module(
                 )
                 body.append(f"{loop_body}:")
                 item = element(index, "row")
-                if operation == "sum":
+                if (
+                    operation == "sum" and accumulator_type == "i64"
+                    and not _unsigned_value(result)
+                    and python_int_overflow_checked(instruction)
+                ):
+                    # ``sum(xs)`` of Python ints: each step is int ``+``.
+                    body.extend(
+                        f"  {line}" for line in integer_scalar_lines(
+                            "Add", "i64", [acc, item], acc_next, checked=True,
+                        )[0]
+                    )
+                elif operation == "sum":
                     body.append(
                         f"  {acc_next} = {'fadd' if floating else 'add'} "
                         f"{accumulator_type} {acc}, {item}"

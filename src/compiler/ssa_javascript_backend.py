@@ -664,6 +664,14 @@ def emit_ssa_module_to_javascript(
                 args = [f"t{int(value.id)}" for value in instruction.args]
                 result = None if instruction.res is None else f"t{int(instruction.res.id)}"
                 attributes = instruction.attributes or {}
+                from .ssa_llvm_backend import python_int_unchecked_refusal
+
+                unchecked = python_int_unchecked_refusal(
+                    instruction, "JavaScript Number",
+                )
+                if unchecked is not None:
+                    refuse(operation, unchecked, function_label, block_name)
+                    continue
 
                 if operation in {"Const", "const"}:
                     if result is None:
