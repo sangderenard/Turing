@@ -1338,6 +1338,59 @@ def _promote_conditional_sequence_aliases(
     return promoted, promoted_aliases, tuple(sorted(destination_ids))
 
 
+def _retarget_forwarded_sequence_effects(
+    control: Any, forwarded: Mapping[int, tuple[int, str]],
+) -> Any:
+    """Name the argument's storage in every effect on a forwarded call result.
+
+    Rule 8: a call whose result is its argument's own list owns no storage,
+    so an effect on the result (``t.append(5)``, ``len(t)``) is an effect on
+    the argument's sequence.  The retained mutation records were written
+    before the call's callee was specialized for its constant actuals
+    (``pick(a, 5)`` returns ``a`` only in that copy), so the control program
+    may still name the result: this retargets those effects onto the one
+    owner, the actual's sequence, once the specialized forwarding is proven.
+    """
+
+    from .control_source import (
+        ConditionalBlock, ControlSequenceMutation, SequenceQueryBlock,
+    )
+
+    resident = {
+        int(value_id): int(target)
+        for value_id, (target, _kind) in dict(forwarded).items()
+        if int(value_id) != int(target)
+    }
+    if not resident:
+        return control
+
+    def retarget(item):
+        if isinstance(item, (ControlSequenceMutation, SequenceQueryBlock)):
+            target = resident.get(int(item.sequence_value_id))
+            if target is not None:
+                item = replace(item, sequence_value_id=target)
+            if isinstance(item, SequenceQueryBlock):
+                return item
+        if isinstance(item, tuple):
+            entries = tuple(retarget(entry) for entry in item)
+            return item if all(
+                new is old for new, old in zip(entries, item)
+            ) else entries
+        if (dataclasses.is_dataclass(item) and not isinstance(item, type)
+                and type(item).__module__ == ConditionalBlock.__module__):
+            changes = {}
+            for field in dataclasses.fields(item):
+                value = getattr(item, field.name)
+                if isinstance(value, tuple) or dataclasses.is_dataclass(value):
+                    retargeted = retarget(value)
+                    if retargeted is not value:
+                        changes[field.name] = retargeted
+            return replace(item, **changes) if changes else item
+        return item
+
+    return replace(control, root=retarget(control.root))
+
+
 def _constant_struct_pack_materializations(graph_obj: Any):
     """Fold fully source-static ``struct.pack`` calls to byte-sequence facts."""
 
@@ -1605,17 +1658,29 @@ def _source_mapping_mutations(graph_obj: Any):
     return tuple(mutations)
 
 
-def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, int]:
-    """Prove caller aliases using callee return slots that return a formal."""
+def _identity_return_aliases(
+    graph_obj: Any, function_table: Any, callsite_graphs: Any = None,
+) -> dict[int, int]:
+    """Prove caller aliases using callee return slots that return a formal.
+
+    ``callsite_graphs`` maps a call node to the callee graph the planner
+    specialized for THAT call.  A call whose constant actuals decide the
+    callee's branch (``pick(a, 5)``) returns the formal in its specialized
+    copy while the shared callee's slot is a merge; the call's own copy is
+    the callee it runs, so it is the one read here.
+    """
     if function_table is None:
         return {}
+    callsite_graphs = {} if callsite_graphs is None else callsite_graphs
     result = {}
     for call_id, data in graph_obj.nodes(data=True):
         reference = (data.get("attributes") or {}).get("callee_ref")
         if reference is None:
             continue
-        child = getattr(function_table.entry(reference), "graph", None)
-        child = getattr(child, "G", None)
+        child = callsite_graphs.get(int(call_id))
+        if child is None:
+            child = getattr(function_table.entry(reference), "graph", None)
+            child = getattr(child, "G", None)
         if child is None:
             continue
         sites = tuple((child.graph.get("return_slot_values") or {}).values())
@@ -1653,6 +1718,12 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
                 continue
             if len(sites[0]) == 1:
                 result[int(call_id)] = actual
+            # A subscript of the call result selects a return SLOT only when
+            # the callee returns a tuple/list display of slots.  ``def
+            # same(a): return a`` returns one value: ``same(xs)[0]`` is
+            # ELEMENT zero of that value, never the whole forwarded actual.
+            if not set((child.graph.get("return_container_kinds") or {}).values()) & {"tuple", "list"}:
+                continue
             for node_id, projection in graph_obj.nodes(data=True):
                 if str(projection.get("type") or projection.get("op") or "").casefold() in {"indexedstore", "subscriptstore", "setitem"}:
                     continue
@@ -1729,6 +1800,7 @@ def _returned_tuple_member_kinds(
 def _returned_formal_sequence_aliases(
     graph_obj: Any, function_table: Any, *,
     call_result_kinds: Mapping[int, str] | None = None,
+    callsite_graphs: Any = None,
 ) -> dict[int, tuple[int, str]]:
     """Rule 8 for a whole sequence result.
 
@@ -1740,7 +1812,7 @@ def _returned_formal_sequence_aliases(
 
     forwarded = {}
     for call_id, actual_id in _identity_return_aliases(
-        graph_obj, function_table,
+        graph_obj, function_table, callsite_graphs,
     ).items():
         call_data = graph_obj.nodes.get(int(call_id), {})
         # A tuple member ``b`` of ``b, k = f(a, n)`` (``return a, n``) is the
@@ -1761,6 +1833,14 @@ def _returned_formal_sequence_aliases(
         )
         if kind in {"list", "bytes", "bytearray"}:
             forwarded[int(call_data.get("value_id", call_id))] = (value_id, kind)
+    # ``u = same(same(a))``: the actual of one forwarding call may itself be
+    # a forwarded result.  The list is still ``a``'s one storage.
+    for result_id, (actual_id, kind) in tuple(forwarded.items()):
+        seen = {int(result_id)}
+        while int(actual_id) in forwarded and int(actual_id) not in seen:
+            seen.add(int(actual_id))
+            actual_id = forwarded[int(actual_id)][0]
+        forwarded[result_id] = (int(actual_id), kind)
     return forwarded
 
 
@@ -3802,6 +3882,33 @@ def list_row_displays(graph_obj: Any) -> dict[int, tuple[tuple[int, int], ...]]:
     return result
 
 
+def dict_row_displays(graph_obj: Any) -> dict[int, tuple[tuple[int, int], ...]]:
+    """Each dict display whose values are all list displays, by value id.
+
+    The value is its rows in entry order as ``(row value id, row node)``.
+    Such a mapping's value column holds child-pool row handles, as a
+    ``setdefault(key, [])`` receiver's does.
+    """
+
+    result: dict[int, tuple[tuple[int, int], ...]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if not (
+            attributes.get("aggregate_kind") == "dict"
+            and attributes.get("mapping_value_aggregate_kind") == "list"
+            and isinstance(data.get("expr_obj"), ast.Dict)
+        ):
+            continue
+        rows = tuple(
+            (int(graph_obj.nodes[parent].get("value_id", parent)), int(parent))
+            for parent, role in data.get("parents") or ()
+            if str(role).startswith("values") and parent in graph_obj
+        )
+        if rows:
+            result[int(data.get("value_id", node_id))] = rows
+    return result
+
+
 def list_row_pool_extents(graph_obj: Any) -> dict[int, tuple[int, int]]:
     """``(rows, stride)`` of each list of lists' child-table pool.
 
@@ -3812,7 +3919,10 @@ def list_row_pool_extents(graph_obj: Any) -> dict[int, tuple[int, int]]:
     """
 
     extents: dict[int, tuple[int, int]] = {}
-    for outer, rows in list_row_displays(graph_obj).items():
+    for outer, rows in (
+        *list_row_displays(graph_obj).items(),
+        *dict_row_displays(graph_obj).items(),
+    ):
         stride = 0
         for row, node in rows:
             data = graph_obj.nodes[node]
@@ -3851,6 +3961,9 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
     """
 
     outers = set(list_row_displays(graph_obj))
+    # A dict display of lists: ``d[k]`` is its keyed lookup, the row a
+    # selected pool slice.  (Iterating the dict yields keys, not rows.)
+    mapping_outers = set(dict_row_displays(graph_obj))
     # ``g[i][1] = v`` is a new version of ``g`` (a loop may carry it): reads
     # of any version are reads of the same list of lists.
     aliases = _loop_carried_storage_aliases(graph_obj)
@@ -3862,6 +3975,8 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
             root = int(aliases[root])
         if root in outers:
             outers.add(int(version))
+        if root in mapping_outers:
+            mapping_outers.add(int(version))
     reads = []
     for node_id, data in graph_obj.nodes(data=True):
         if str(data.get("op") or data.get("type") or "").casefold() != "indexed":
@@ -3872,7 +3987,7 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
         ), None)
         if base is not None and int(
             graph_obj.nodes[base].get("value_id", base)
-        ) in outers:
+        ) in (outers | mapping_outers):
             reads.append(int(data.get("value_id", node_id)))
     # ``for r in g``: the loop target is a row of the list of lists.
     for node_id, data in graph_obj.nodes(data=True):
@@ -4234,6 +4349,87 @@ def _dict_update_mutations(graph_obj: Any) -> tuple[Any, ...]:
     return tuple(mutations)
 
 
+def _dict_rows_born_by_display(
+    graph_obj: Any, node_id: int, data: Mapping[str, Any],
+    expression: ast.Dict, key_parents: tuple[tuple[int, int], ...],
+) -> tuple[Any, ...]:
+    """Birth of a dict display whose values are all list displays.
+
+    Program: ``d = {1: [n, 2, 3]}; d[1][2]``.  Wrong record: the list value
+    was stored as its own arena's id where the value column holds child-pool
+    handles, so a read through it returned 0 (silent).  Rule: each entry is
+    a ``setdefault`` of its key (the row's handle is allocated in the child
+    pool, as for ``d.setdefault(k, []).append(...)``), then the row's member
+    appends against that pool slice, in order, at the display.  A repeated
+    key selects the same row and clears it first, as a later entry replaces
+    an earlier one.
+    """
+
+    from .control_source import ControlExpression, ControlSequenceMutation
+    from .string_table import string_token
+
+    sequence_id = int(data.get("value_id", node_id))
+    value_parents = tuple(
+        (int(parent), int(graph_obj.nodes[parent].get("value_id", parent)))
+        for parent, role in data.get("parents") or ()
+        if str(role).startswith("values") and parent in graph_obj
+    )
+    if not (
+        len(key_parents) == len(value_parents) == len(expression.keys)
+        and None not in expression.keys
+    ):
+        raise ValueError(
+            f"dict {sequence_id} lists its rows without one exact key and "
+            "list producer per entry; a mapping of lists is lowered only "
+            "from keyed list displays"
+        )
+    rows = {value_id for _node, value_id in value_parents}
+    if len(rows) != len(value_parents):
+        raise ValueError(
+            f"dict {sequence_id} stores one list under two keys; a shared "
+            "row has one pool slice and is not lowered"
+        )
+    births = _list_literal_mutations(graph_obj, rows)
+    members_of: dict[int, list[Any]] = {}
+    for item in births:
+        if str(item.operator) != "clear":
+            members_of.setdefault(int(item.sequence_value_id), []).append(item)
+    mutations = []
+    for position, (key_expression, (key_node, key_value), (row_node, row_value)) in enumerate(zip(
+        expression.keys, key_parents, value_parents,
+    )):
+        key_literal = (
+            key_expression.value
+            if isinstance(key_expression, ast.Constant) else None
+        )
+        key_ir = None
+        if isinstance(key_literal, (bool, int, float, str)):
+            key_ir = ControlExpression(
+                "const", value_id=key_value,
+                literal=(
+                    string_token(key_literal)
+                    if isinstance(key_literal, str) else key_literal
+                ),
+            )
+        mutations.append(ControlSequenceMutation(
+            sequence_value_id=sequence_id, operator="setdefault",
+            # The pool path reads no default (the row is born empty and
+            # filled by the appends below); naming the row here would make
+            # the setdefault consume what its own appends produce.
+            argument_value_ids=(key_value, key_value),
+            effect_node_id=row_node, policy="unique",
+            argument_kind="mapping_child_row",
+            argument_expressions=(key_ir, None),
+            display_member=(int(node_id), position << 16),
+        ))
+        for item in members_of.get(row_value, ()):
+            mutations.append(replace(item, display_member=(
+                int(node_id),
+                (position << 16) | (1 + int(item.display_member[1])),
+            )))
+    return tuple(mutations)
+
+
 def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
     """Materialize authored dynamic dict rows at the literal's source site.
 
@@ -4324,6 +4520,11 @@ def _dict_literal_mutations(graph_obj: Any) -> tuple[Any, ...]:
             sequence_value_id=sequence_id, operator="clear",
             argument_value_ids=(), effect_node_id=int(node_id), policy="unique",
         ))
+        if attributes.get("mapping_value_aggregate_kind") == "list":
+            mutations.extend(_dict_rows_born_by_display(
+                graph_obj, int(node_id), data, expression, key_parents,
+            ))
+            continue
         value_parents = tuple(
             (int(parent), int(graph_obj.nodes[parent].get("value_id", parent)))
             for parent, role in data.get("parents") or ()

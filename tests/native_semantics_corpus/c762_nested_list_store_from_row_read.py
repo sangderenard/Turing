@@ -1,4 +1,4 @@
-def root(n: int) -> int:
+def root(n):
     g = [[1, 2], [3, 4]]
     i = n % 2
     g[i][1] = n + 10
