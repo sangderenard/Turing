@@ -9654,7 +9654,29 @@ class _ControlSSABuilder(TiledObject):
                         # for declared in/out storage and versions those writes.
                         claim_provisional_definition=True,
                     )
+            for output_id in outputs:
+                self._settle_int_overflow_frame(int(output_id))
         self._emit_region_post_operations(region_index, location=location)
+
+    def _settle_int_overflow_frame(self, value_id: int) -> None:
+        """Build the ``int64 | Precision`` frame of one wide region output.
+
+        Program: ``def root(n): return n * n``.  The region computes the
+        product at int128 (exact for int64 operands); the union's VALUE_TYPE_ABI
+        row (``python_int_overflow``) asks for the int64 view, the carrier
+        view and the tag that says which one is Python's value.
+        """
+
+        from .python_int_overflow import (
+            emit_carrier_frame, is_int_overflow_union,
+        )
+
+        fact = self.native_value_type_abi.get(int(value_id))
+        if not is_int_overflow_union(getattr(fact, "alternatives", ()) or ()):
+            return
+        if int(value_id) in self.native_value_type_tags:
+            return
+        emit_carrier_frame(self, int(value_id), fact)
 
     def _emit_region_post_operations(
         self, region_index: int, *, location: str,

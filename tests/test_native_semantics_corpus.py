@@ -31,19 +31,28 @@ CONTRACT = Path(__file__).resolve().parents[1] / "extraction_contracts" / "progr
 _RUNNER = r'''
 import pickle, sys
 import numpy as np
-artifact, parameters, outputs, cases = pickle.load(open(sys.argv[1], "rb"))
+from src.compiler.output_publication import python_return_values
+artifact, parameters, plan, cases = pickle.load(open(sys.argv[1], "rb"))
 for feeds, expected in cases:
     execution = artifact.prepare_execution({
         parameters[name]: np.array([value]) for name, value in feeds.items()
     }).run()
+    # A union output (an int|float join, an int past int64) is read through
+    # its frame: ``return_value_plan``.
     got = [
-        float(item)
-        for value_id in outputs
-        for item in execution.buffers[value_id].reshape(-1).tolist()
+        item
+        for value in python_return_values(plan, execution.buffers)
+        for item in (
+            value.reshape(-1).tolist() if hasattr(value, "reshape") else [value]
+        )
     ]
-    want = [float(item) for item in expected]
+    want = list(expected)
     assert len(got) == len(want), (feeds, got, want)
     for left, right in zip(got, want):
+        if type(left) is int and type(right) is int:
+            assert left == right, (feeds, got, want)
+            continue
+        left, right = float(left), float(right)
         assert abs(left - right) <= 1e-12 * max(1.0, abs(right)), (feeds, got, want)
 '''
 
@@ -134,14 +143,16 @@ def test_native_program_matches_python(program, tmp_path):
             for instruction in block.instrs
             if instruction.op == "Ret" and not instruction.attributes.get("fault_exit")
         ]) == 1
-        outputs = [int(value.id) for value in returns[0]]
+        from src.compiler.output_publication import return_value_plan
+
+        plan = return_value_plan(root)
         artifact = emit_ssa_to_c(module, exports[0])
         assert artifact.complete, artifact.shortfalls
         run_dir = tmp_path / f"run{index}"
         run_dir.mkdir()
         artifact.compile(run_dir / "native")
         saved = run_dir / "artifact.pkl"
-        saved.write_bytes(pickle.dumps((artifact, parameters, outputs, group)))
+        saved.write_bytes(pickle.dumps((artifact, parameters, plan, group)))
         result = subprocess.run(
             [sys.executable, "-c", _RUNNER, str(saved)],
             capture_output=True, text=True, timeout=120,

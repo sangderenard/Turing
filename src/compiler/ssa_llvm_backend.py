@@ -5418,6 +5418,21 @@ def _emit_repository_call_module(
                     # of the wrapped zero. The declared result owns this
                     # arithmetic domain; predicates and logical ops keep i1.
                     operand_type = result_type
+                if (
+                    operation in {"Add", "Sub", "Mul", "Neg"}
+                    and result_type in _INTEGER_LLVM_TYPES
+                    and operand_type in _INTEGER_LLVM_TYPES
+                    and int(result_type[1:]) > int(operand_type[1:])
+                ):
+                    # Program: ``def root(n): return n * n`` whose product
+                    # is declared int128 (an int64 x int64 interval, or the
+                    # int overflow union's exact arm).  Wrong record: the
+                    # multiply ran in the operands' i64 and its wrapped
+                    # result was sign-extended, so 3037000500**2 came back
+                    # negative.  Rule: the declared integer result is the
+                    # domain; widening each operand first is exact, which is
+                    # the module lane's rule.
+                    operand_type = result_type
                 # The logical templates are spelled over i1; an operand that
                 # arrives in its double storage type must be coerced to a
                 # boolean, not passed through in whatever width it was

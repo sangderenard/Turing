@@ -3267,6 +3267,72 @@ def lower_precision_operations(
                     emitted.append(instruction)
                     continue
 
+                union_layouts = tuple(
+                    function.metadata.get("native_value_union_return_layouts")
+                    or ()
+                )
+                if (
+                    operation in ("Ret", "ret")
+                    and union_layouts
+                    and not instruction.attributes.get(
+                        "precision_union_limbs_bound"
+                    )
+                    and any(
+                        role[0] == "alternative"
+                        and int(slot) < len(instruction.args)
+                        and len(limbs.get(
+                            int(instruction.args[int(slot)].id), ()
+                        )) > 1
+                        for _declared, role_slots in union_layouts
+                        for role, slot in role_slots
+                    )
+                ):
+                    # Program: ``def root(n): return n * n`` whose overflow
+                    # arm is ``Precision`` (``python_int_overflow``).  Wrong
+                    # record: the union frame's Precision payload collapsed
+                    # to the sum of its limbs, one float64, so the exact
+                    # value was rounded at the public boundary.  Rule: a
+                    # union arm's Precision payload is its limbs; they are
+                    # appended after every existing slot (no slot moves) and
+                    # the frame layout names them as the arm's cells 0..n-1.
+                    revised = []
+                    collapsed = set(map(int, function.metadata.get(
+                        "precision_union_collapsed_slots", ()
+                    )))
+                    for declared, role_slots in union_layouts:
+                        rows = []
+                        for role, slot in role_slots:
+                            held = (
+                                limbs.get(
+                                    int(instruction.args[int(slot)].id), ()
+                                )
+                                if role[0] == "alternative"
+                                and int(slot) < len(instruction.args)
+                                else ()
+                            )
+                            if len(held) <= 1:
+                                rows.append((role, slot))
+                                continue
+                            # The slot keeps the collapsed head (one float)
+                            # for readers that name it; no frame role does.
+                            collapsed.add(int(slot))
+                            for position, limb in enumerate(held):
+                                rows.append((
+                                    (role[0], role[1], int(position)),
+                                    len(instruction.args),
+                                ))
+                                instruction.args.append(limb)
+                        revised.append((declared, tuple(rows)))
+                    instruction.attributes["precision_union_limbs_bound"] = True
+                    function.metadata["native_value_union_return_layouts"] = (
+                        tuple(revised)
+                    )
+                    function.metadata["precision_union_collapsed_slots"] = (
+                        tuple(sorted(collapsed))
+                    )
+                    emitted.append(instruction)
+                    continue
+
                 if (
                     operation in ("Ret", "ret")
                     and str(function_name) in aggregate_callees
@@ -3623,7 +3689,9 @@ def apply_precision_pipeline(
         finally:
             end_identity_book(token)
 
-    from ..common.tensors.topological_reducer import PRECISION_SINGULAR_NAMES
+    from ..common.tensors.topological_reducer import (
+        PRECISION_PACK_NAME, PRECISION_SINGULAR_NAMES,
+    )
 
     if two_product_flavor is None:
         two_product_flavor = active_two_product_flavor()
@@ -3646,7 +3714,11 @@ def apply_precision_pipeline(
             )
         return prior
 
-    precision_ops = frozenset(PRECISION_SINGULAR_NAMES.values())
+    # A pack alone is a Precision value too: ``int`` overflow continues as
+    # one (``python_int_overflow``) with no Precision arithmetic after it.
+    precision_ops = frozenset((
+        *PRECISION_SINGULAR_NAMES.values(), PRECISION_PACK_NAME,
+    ))
     before = sum(
         str(instruction.op) in precision_ops
         for function in functions.values()

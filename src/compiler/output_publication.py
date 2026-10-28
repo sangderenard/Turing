@@ -169,6 +169,129 @@ def publication_surface_plan(
     }
 
 
+def return_value_plan(function: Any) -> tuple:
+    """How to read ``function``'s public return buffers as Python values.
+
+    Program: ``def root(n): return n * n`` whose result is the union
+    ``int64 | Precision`` (``python_int_overflow``).  The public buffers are
+    the union's frame (one payload per arm and the tag), not one number, so
+    reading them positionally returned the payloads beside each other.  Rule:
+    a slot the function's ``native_value_union_return_layouts`` names is read
+    through its frame: the tag selects the arm, the arm's cells are its
+    value.  Every other returned slot is its own value (its buffer).
+
+    The plan is plain data (it pickles with an artifact); one row per Python
+    value: ``("value", value_id)`` or ``("union", tag_id, {tag: (kind,
+    (cell ids...))})`` with ``kind`` one of ``bool``/``int``/``float``/
+    ``none``/``int_carrier``.
+    """
+
+    from .python_int_overflow import is_int_overflow_union
+
+    returns = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret" and not instruction.attributes.get("fault_exit")
+    ]
+    if len(returns) != 1:
+        raise ValueError(
+            f"{function.name} has {len(returns)} public returns, expected one"
+        )
+    slots = [int(value.id) for value in returns[0].args]
+    metadata = dict(getattr(function, "metadata", {}) or {})
+    facts = dict(metadata.get("native_value_type_abi") or {})
+    union_layouts = tuple(metadata.get("native_value_union_return_layouts", ()))
+    layouts = {
+        min(int(slot) for _role, slot in role_slots): (int(declared), role_slots)
+        for declared, role_slots in union_layouts
+    }
+    framed = {
+        int(slot)
+        for _declared, role_slots in union_layouts
+        for _role, slot in role_slots
+    } | set(map(int, metadata.get("precision_union_collapsed_slots", ())))
+    kinds = {
+        "builtins.bool": "bool", "builtins.int": "int",
+        "builtins.float": "float", "builtins.NoneType": "none",
+    }
+    plan = []
+    for position in range(len(slots)):
+        if position not in layouts:
+            if position not in framed:
+                plan.append(("value", slots[position]))
+            continue
+        declared, role_slots = layouts[position]
+        fact = facts.get(declared)
+        if fact is None:
+            raise ValueError(
+                f"{function.name}: union output {declared} has no ABI fact"
+            )
+        tag_slot = next(
+            int(slot) for role, slot in role_slots if tuple(role) == ("tag",)
+        )
+        arms = {}
+        for name, ordinal in fact.tags:
+            name = str(name)
+            cell_ids = tuple(
+                slots[int(slot)]
+                for _role, slot in sorted(
+                    (
+                        (tuple(role), int(slot)) for role, slot in role_slots
+                        if tuple(role)[:2] == ("alternative", name)
+                    ),
+                    key=lambda row: row[0][2],
+                )
+            )
+            if name == "Precision" and is_int_overflow_union(fact.alternatives):
+                kind = "int_carrier"
+            elif name in kinds:
+                kind = kinds[name]
+            else:
+                raise ValueError(
+                    f"{function.name}: union arm {name!r} has no host value"
+                )
+            arms[int(ordinal)] = (kind, cell_ids)
+        plan.append(("union", slots[tag_slot], arms))
+    return tuple(plan)
+
+
+def python_return_values(plan: tuple, buffers: Mapping[int, Any]) -> list:
+    """Read the Python values of ``return_value_plan`` from ``buffers``."""
+
+    from .python_int_overflow import python_int_from_carrier
+
+    def cells(value_ids) -> list:
+        out = []
+        for value_id in value_ids:
+            buffer = buffers[int(value_id)]
+            reshape = getattr(buffer, "reshape", None)
+            out.extend(reshape(-1).tolist() if reshape is not None else [buffer])
+        return out
+
+    values = []
+    for row in plan:
+        if row[0] == "value":
+            values.append(buffers[int(row[1])])
+            continue
+        _union, tag_id, arms = row
+        kind, cell_ids = arms[int(cells((tag_id,))[0])]
+        arm_cells = cells(cell_ids)
+        if kind == "none":
+            values.append(None)
+        elif kind == "int_carrier":
+            values.append(python_int_from_carrier(arm_cells))
+        elif len(arm_cells) == 1:
+            values.append({"bool": bool, "int": int, "float": float}[kind](
+                arm_cells[0]
+            ))
+        else:
+            raise ValueError(
+                f"union arm {kind!r} has {len(arm_cells)} cells, expected one"
+            )
+    return values
+
+
 __all__ = [
     "SCHEMA",
     "SURFACE_SCHEMA",
@@ -176,4 +299,6 @@ __all__ = [
     "module_output_publications",
     "publication_metadata",
     "publication_surface_plan",
+    "python_return_values",
+    "return_value_plan",
 ]

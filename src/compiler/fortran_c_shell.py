@@ -25280,6 +25280,103 @@ def _class_surface_ssa_program(
                 )
         return tuple(sorted(arms, key=lambda arm: arm.identity))
 
+    def _settle_int_overflow_unions(planned_graph, contracts) -> None:
+        """Give an unproven returned int result its exact overflow arm.
+
+        Program: ``def root(n): return n * n`` with ``n`` an int64 formal no
+        interval bounds.  Wrong record: the product was int64 arithmetic,
+        which wraps (stage 1 reports it as ``NativeIntOverflow`` instead).
+        Rule (``python_int_overflow``): under the ``exact`` policy, a builtin
+        ``int`` result of ``+``, ``-``, ``*`` or unary ``-`` on int64
+        operands whose interval nothing proves is the native value union
+        ``int64 | Precision``.  The op is computed at int128, which is exact
+        for int64 operands, and the control builder splits it into the
+        union frame (``_settle_int_overflow_frame``).
+
+        Only a result whose sole reader is its function's public return is
+        settled so: no union reader dispatches on the carrier arm yet (the
+        limb kernels), so every other reader keeps the checked int64 op and
+        its named fault.  A result some linked call reads is likewise left
+        checked.
+        """
+
+        from ..common.tensors.topological_reducer import (
+            _int_range_cell as _overflow_range_cell,
+        )
+        from .python_int_overflow import (
+            PRECISION_INT_CARRIER, carrier_arm, python_int_overflow_policy,
+            widening_operand_roles,
+        )
+
+        function_name = planned_graph.graph.get("function_name")
+        if python_int_overflow_policy(function_name) != "exact":
+            return
+        returned = {
+            int(member)
+            for members in dict(
+                planned_graph.graph.get("return_slot_values") or {}
+            ).values()
+            for member in members
+        }
+        call_read = {
+            int(callee_id)
+            for callee_graph, callee_id, _caller_graph, _caller_id
+            in linked_value_edges
+            if callee_graph is planned_graph
+        }
+
+        def int64_arm(value_id):
+            contract = contracts.get(int(value_id))
+            if (
+                contract is None
+                or contract.get("python_type") != "builtins.int"
+                or contract.get("python_types")
+            ):
+                return None
+            arms = _physical_type_arms(planned_graph, int(value_id), contract)
+            if len(arms) != 1 or arms[0].dtype != "int64":
+                return None
+            return arms[0]
+
+        for node_id, data in planned_graph.nodes(data=True):
+            roles = widening_operand_roles(data.get("expr_obj"))
+            value_id = int(data.get("value_id", node_id))
+            if (
+                roles is None
+                or value_id not in returned
+                or value_id in call_read
+                or any(True for _ in planned_graph.successors(node_id))
+                or _overflow_range_cell(planned_graph, value_id) is not None
+            ):
+                continue
+            parents = {
+                str(role): int(parent)
+                for parent, role in data.get("parents") or ()
+            }
+            if set(parents) != set(roles) or any(
+                int64_arm(int(planned_graph.nodes[parent].get(
+                    "value_id", parent,
+                ))) is None
+                for parent in parents.values()
+                if parent in planned_graph
+            ) or any(parent not in planned_graph for parent in parents.values()):
+                continue
+            int_arm = int64_arm(value_id)
+            if int_arm is None:
+                continue
+            contract = contracts[value_id]
+            contract.pop("python_type", None)
+            carrier = carrier_arm(int_arm)
+            contract["python_types"] = tuple(sorted(
+                ("builtins.int", carrier.identity)
+            ))
+            contract["python_type_abis"] = tuple(sorted(
+                (("builtins.int", int_arm), (carrier.identity, carrier)),
+                key=lambda item: item[0],
+            ))
+            # The value itself, in its region, is the exact wide result.
+            contract["dtype"] = PRECISION_INT_CARRIER.wide_dtype
+
     # Conditional expressions are native tagged unions of their authored
     # arms.  Settle them from the two already-concorded arm contracts before
     # VALUE_TYPE_ABI publication.  Per-arm physical receipts are retained
@@ -26437,6 +26534,7 @@ def _class_surface_ssa_program(
                         id(planned_graph), {},
                     ).get(value_id, ()), *class_cells,
                 )))
+            _settle_int_overflow_unions(planned_graph, contracts)
             for value_id, contract in contracts.items():
                 alternatives = tuple(sorted(set(
                     _canonical_program_abi_type_identity(
