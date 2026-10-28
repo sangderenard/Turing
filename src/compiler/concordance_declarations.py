@@ -495,6 +495,15 @@ CALL_EDGE_ACTUAL = declare_page("call_edge_actual", (
     RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
     RowField("formal", K.NAME),
 ), str)
+#: ``called_inventory.post_call_edge_range``: the interval one internal call
+#: edge's actual is proven to lie in, ``(caller scope, callsite id, formal)``
+#: -> ``(low, high)``.  DERIVED from the actual's ``source_int_range`` (or
+#: ``guarded_call_actual_range``) cell.  A callsite-specialized copy minted
+#: for that interval reads it as its formal's interval.
+CALL_EDGE_INT_RANGE = declare_page("call_edge_int_range", (
+    RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("formal", K.NAME),
+), tuple)
 CALLED_INVENTORY = declare_page("called_inventory", (
     RowField("function_identity", K.NAME), RowField("formal", K.NAME),
 ), CalledInventoryFact)

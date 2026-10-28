@@ -329,6 +329,36 @@ def _python_int_spelled(op: str, instruction) -> bool:
     return python_int_operation(instruction)
 
 
+def _python_int_true_division(instruction) -> bool:
+    from .ssa_llvm_backend import python_int_true_division
+
+    return python_int_true_division(instruction)
+
+
+def _python_int_true_division_statement(args, target: str) -> str:
+    """C for Python's ``int / int`` (the LLVM lane's
+    ``python_int_true_division_lines``): one IEEE division of operands that
+    are exactly float64, else ``INT_ZERO_DIVISION`` or
+    ``INT_TRUE_DIVISION_INEXACT``."""
+
+    from .native_faults import INT_TRUE_DIVISION_INEXACT, INT_ZERO_DIVISION
+
+    left, right = (f"((int64_t)({argument}))" for argument in args)
+
+    def exact(value: str) -> str:
+        return (
+            f"((double){value} < 9223372036854775808.0 "
+            f"&& (int64_t)(double){value} == {value})"
+        )
+
+    return (
+        f"double {target} = ((double){left} / (double){right}); "
+        f"if ({right} == 0) turing_validation_error({INT_ZERO_DIVISION}u); "
+        f"else if (!({exact(left)} && {exact(right)})) "
+        f"turing_validation_error({INT_TRUE_DIVISION_INEXACT}u);"
+    )
+
+
 def _python_int_statement(op: str, args, target: str) -> str:
     """C for Python's ``<< >> // %``, ``abs`` and unary ``-`` on an int64.
 
@@ -825,6 +855,54 @@ def _settled_dtype(dtype, value_id, record):
     return dtype
 
 
+def _blocks_in_definition_order(function) -> list[str]:
+    """Block names in reverse post-order from the entry block.
+
+    C binds an SSA result to its local when the defining statement is
+    emitted, so a block must be emitted after every block that dominates it.
+    The block dict is insertion ordered, and a lowering may append a block
+    (for example a sequence-index in-range arm) after the loop latch it
+    branches to; emitting in dict order then reaches the latch before the
+    definition it consumes.  Labels and ``goto`` make the textual order free,
+    so emit in reverse post-order (every dominator precedes the blocks it
+    dominates), the order the SSA's dominance already guarantees.  Blocks
+    unreachable from the entry keep their dict order at the end.
+    """
+
+    names = list(function.blocks)
+    if not names:
+        return names
+    start = "entry" if "entry" in function.blocks else names[0]
+
+    def successors(name: str) -> list[str]:
+        block = function.blocks[name]
+        targets: list[str] = []
+        for instruction in block.instrs:
+            attributes = instruction.attributes or {}
+            for key in ("target", "true_target", "false_target"):
+                target = attributes.get(key)
+                if target is not None and str(target) in function.blocks:
+                    targets.append(str(target))
+        return targets
+
+    visited: set[str] = {start}
+    post: list[str] = []
+    stack: list[tuple[str, iter]] = [(start, iter(successors(start)))]
+    while stack:
+        name, pending = stack[-1]
+        for successor in pending:
+            if successor not in visited:
+                visited.add(successor)
+                stack.append((successor, iter(successors(successor))))
+                break
+        else:
+            stack.pop()
+            post.append(name)
+    ordered = post[::-1]
+    ordered.extend(name for name in names if name not in visited)
+    return ordered
+
+
 def _scalar_c_type(dtype) -> str:
     name = str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold()
     if name == "ptr":
@@ -884,6 +962,29 @@ def supported_tensor_operations() -> frozenset[str]:
     # Keeping this derived from that shared basis prevents target selection
     # from accidentally auditing the older AbstractTensor C runtime instead.
     return llvm_tensor_ops()
+
+
+def integer_narrowing_c_check(*arguments):
+    from .ssa_llvm_backend import integer_narrowing_c_check as check
+
+    return check(*arguments)
+
+
+def _contract_integer_narrowing(instruction) -> bool:
+    from .ssa_llvm_backend import contract_integer_narrowing
+
+    return contract_integer_narrowing(instruction)
+
+
+def _c_storage_dtype(c_type: str) -> str | None:
+    """The integer dtype a C storage type spells (``uint8_t`` is uint8)."""
+
+    from ..transmogrifier.dtype_layout import DTYPES
+
+    for layout in DTYPES.values():
+        if layout.kind in {"int", "uint"} and layout.c_storage_type == c_type:
+            return layout.name
+    return None
 
 
 def _buffer_c_type(dtype) -> str:
@@ -4090,7 +4191,7 @@ def emit_ssa_module_to_c(
             )
         }
 
-        block_names = list(function.blocks)
+        block_names = _blocks_in_definition_order(function)
         emitted_scalar_locals: set[int] = set()
         effect_guarded_blocks = set(
             function.metadata.get("pool_effect_guarded_blocks") or ()
@@ -4517,6 +4618,13 @@ def emit_ssa_module_to_c(
                     )
                     body.append(f"            goto {_c_label(on_false)};")
                     body.append("        }")
+                    continue
+                if op == "Trap" and instruction.attributes.get("fault_exit"):
+                    # A checked fault already recorded its validation code;
+                    # the exit publishes no outputs and leaves through the
+                    # activation-storage cleanup.
+                    span.take_pending()
+                    body.append(f"        goto cleanup_{_c_symbol(fn)};")
                     continue
                 if op in {"Ret", "ret", "Return", "return"}:
                     if trace_this_function:
@@ -6004,6 +6112,18 @@ def emit_ssa_module_to_c(
                                 int(addressed_value.id),
                                 carried_type(stored_value),
                             )
+                            source_type = carried_type(stored_value)
+                            narrowing = integer_narrowing_c_check(
+                                _c_storage_dtype(source_type),
+                                _c_storage_dtype(stored_type),
+                                source_type, value,
+                            )
+                            if narrowing is not None:
+                                prototype = "void turing_validation_error(uint32_t error_code);"
+                                if prototype not in prototypes:
+                                    prototypes.append(prototype)
+                                needs_validation_runtime = True
+                                body.append(f"        {narrowing}")
                             body.append(
                                 f"        *(({stored_type} *)({where})) = {value};"
                             )
@@ -6315,6 +6435,19 @@ def emit_ssa_module_to_c(
                         f"const {result_type} t{result_id} = "
                         f"({result_type})({cast_source});"
                     )
+                    narrowing = (
+                        integer_narrowing_c_check(
+                            instruction.args[0].dtype, instruction.res.dtype,
+                            _scalar_c_type(instruction.args[0].dtype), args[0],
+                        )
+                        if _contract_integer_narrowing(instruction) else None
+                    )
+                    if narrowing is not None:
+                        prototype = "void turing_validation_error(uint32_t error_code);"
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        declared = f"{narrowing} {declared}"
                 elif (
                     op.casefold() == "item"
                     and len(args) == 1
@@ -6499,12 +6632,24 @@ def emit_ssa_module_to_c(
                         )
                         + ";"
                     )
+                elif _python_int_true_division(instruction):
+                    prototype = "void turing_validation_error(uint32_t error_code);"
+                    if prototype not in prototypes:
+                        prototypes.append(prototype)
+                    needs_validation_runtime = True
+                    declared_storage_type = "double"
+                    declared = _python_int_true_division_statement(
+                        args, f"t{result_id}",
+                    )
                 elif (
                     op in _PYTHON_INT_OPERATIONS
                     and len(args) == _PYTHON_INT_OPERATIONS[op]
                     and _scalar_c_type(instruction.res.dtype) == "int64_t"
                     and all(
-                        is_integer(value) and not _is_unsigned_dtype(value.dtype)
+                        # The spelling computes on int64 operands; an int128
+                        # operand (a uint64 widened for ``%``) is not narrowed
+                        # through it but takes the int128 floored helper.
+                        is_integer(value) and str(value.dtype) == "int64"
                         for value in instruction.args
                     )
                     and _python_int_spelled(op, instruction)
@@ -6737,7 +6882,14 @@ def emit_ssa_module_to_c(
                     kind = (
                         _scalar_c_type(instruction.res.dtype)
                     )
-                    declared = f"const {kind} t{result_id} = (-{args[0]});"
+                    # Program: ``return -n`` declared int128 (the int
+                    # overflow union's exact arm).  Wrong record: ``-n`` ran
+                    # in n's int64 and -(-2**63) wrapped before widening.
+                    # Rule: negate in the declared domain (an exact widening
+                    # of the operand), as the binary ops do.
+                    declared = (
+                        f"const {kind} t{result_id} = (-({kind})({args[0]}));"
+                    )
                 elif (
                     op.casefold() in _UNARY_PREDICATES
                     and len(args) == 1
