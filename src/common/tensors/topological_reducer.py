@@ -16005,11 +16005,20 @@ def _normalize_lexical_values(
                     parents = list(
                         graph.G.nodes[member_id].get("parents") or ()
                     )
+                    # Program: ``for alias, resident in pairs: alias =
+                    # int(alias); ...; owners.setdefault(alias, source)``
+                    # (``identity_concordance.concordant_alias_bindings``).
+                    # Wrong record: the body's own rebinding ``int(alias)``
+                    # is a binding of the same spelling, so it was rewritten
+                    # back to the loop target; the setdefault's key became
+                    # the raw target and disagreed with its posted mutation.
+                    # Rule: only a binding from outside this body is stale.
                     replacements = {
                         old: current_loop_bindings[name]
                         for name in current_loop_bindings
                         for old in identity_bindings.get(name, ())
                         if old != current_loop_bindings[name]
+                        and old not in body_member_ids
                     }
                     rewritten = [
                         (replacements.get(parent, parent), role)
