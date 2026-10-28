@@ -3290,11 +3290,121 @@ def _planned_scalar_dtypes_from(
     return {**element, **scalar}
 
 
+def _region_value_dtype_row(graph: Any, value_id: int, *, mint: bool):
+    """The ``region_value_dtype`` row of a value, under its graph's scope."""
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        scope = graph.G.graph.get("hierarchy_settlement_scope")
+        if scope is None and mint:
+            from .concordance_declarations import PLANNER_SCOPE
+            from .identity_concordance import current_identity_book
+
+            scope = current_identity_book().mint_scope(
+                "hierarchy_settlement", PLANNER_SCOPE,
+            )
+            graph.G.graph["hierarchy_settlement_scope"] = scope
+    return None if scope is None else (tuple(scope), int(value_id))
+
+
+def _post_region_value_obligation(graph: Any, value_id: int) -> None:
+    """Record that a non-terminal freeze left this value's dtype to settle."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        HIERARCHY_PLAN_FREEZE, PLAN_REGION_VALUE_DTYPE,
+        REGION_VALUE_DTYPE_AWAITS_SETTLEMENT,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unresolved, current_identity_book,
+    )
+
+    row = _region_value_dtype_row(graph, value_id, mint=True)
+    try:
+        cells = (node_identity_cell(graph, int(value_id)),)
+    except ValueError:
+        cells = ()
+    book = current_identity_book()
+    incumbent = book.page(PLAN_REGION_VALUE_DTYPE).latest(row)
+    if incumbent is not None:
+        return  # already owed (or settled): one row per value
+    book.post(
+        PLAN_REGION_VALUE_DTYPE, row,
+        Unresolved(
+            REGION_VALUE_DTYPE_AWAITS_SETTLEMENT,
+            read=tuple(cell for cell in cells if cell is not None),
+        ),
+        stage=HIERARCHY_PLAN_FREEZE,
+        provenance=Derived(tuple(cell for cell in cells if cell is not None)),
+        mode=Mode.REVISE,
+    )
+
+
+def _settle_region_value_obligation(
+    graph: Any, value_id: int, dtype: str,
+) -> None:
+    """Close an outstanding obligation with the dtype the strict freeze read."""
+
+    from .concordance_declarations import (
+        HIERARCHY_PLAN_FREEZE, PLAN_REGION_VALUE_DTYPE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unresolved, current_identity_book,
+    )
+
+    row = _region_value_dtype_row(graph, value_id, mint=False)
+    if row is None:
+        return
+    book = current_identity_book()
+    page = book.page(PLAN_REGION_VALUE_DTYPE)
+    if not isinstance(page.latest(row), Unresolved):
+        return
+    cell = book.latest_ref(PLAN_REGION_VALUE_DTYPE, row)
+    book.post(
+        PLAN_REGION_VALUE_DTYPE, row, str(dtype),
+        stage=HIERARCHY_PLAN_FREEZE,
+        provenance=Derived((cell,) if cell is not None else ()),
+        mode=Mode.REVISE,
+    )
+
+
+def outstanding_region_value_obligations(graph: Any) -> tuple[int, ...]:
+    """Region values of ``graph`` whose dtype is still an open obligation."""
+
+    from .concordance_declarations import PLAN_REGION_VALUE_DTYPE
+    from .identity_concordance import Unresolved, current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    scopes = [
+        item for item in (
+            scope, graph.G.graph.get("hierarchy_settlement_scope"),
+        ) if item is not None
+    ]
+    page = current_identity_book().page(PLAN_REGION_VALUE_DTYPE)
+    return tuple(
+        int(row[1]) for item in scopes
+        for row in page.scope_rows(tuple(item))
+        if isinstance(page.latest(row), Unresolved)
+    )
+
+
 def _build_shell_hierarchy_plan(
     shell: Any,
     _memo: dict[int, PlanClosure] | None = None,
+    *,
+    terminal: bool = False,
 ) -> PlanClosure:
-    """Freeze call/region ownership before backend source composition."""
+    """Freeze call/region ownership before backend source composition.
+
+    ``terminal`` is the phase.  A freeze made while callsite planning,
+    actual-to-formal binding and linked-ABI settlement are still ahead
+    (``terminal=False``, the default: shell construction) freezes STRUCTURE
+    only: a region value no record has typed yet is posted as an outstanding
+    obligation (``region_value_dtype`` row, ``Unresolved``) and gets no
+    ``value_shapes`` row and no invented dtype.  The post-settlement freeze
+    (``refresh_hierarchy_plan``: ``terminal=True``) reads the settled
+    sources and refuses by name what is still unsettled.
+    """
 
     memo = {} if _memo is None else _memo
     incumbent_plan = memo.get(id(shell))
@@ -4009,7 +4119,7 @@ def _build_shell_hierarchy_plan(
                     name=str(child_graph.graph.get("function_name")),
                     captures=tuple(dict.fromkeys(callee for _caller, callee in argument_bindings)),
                     items=(),
-                ) if recursive_target is not None else _build_shell_hierarchy_plan(child, memo)),
+                ) if recursive_target is not None else _build_shell_hierarchy_plan(child, memo, terminal=terminal)),
                 parents,
                 tuple(caller for _callee, caller in result_bindings),
                 tuple(argument_bindings),
@@ -5037,6 +5147,10 @@ def _build_shell_hierarchy_plan(
 
             record = _value_shape_dtype(value_id)
             if record[2] is not None:
+                if terminal:
+                    _settle_region_value_obligation(
+                        graph, int(value_id), record[2],
+                    )
                 return record
             node = graph.G.nodes.get(int(value_id), {})
             attributes = node.get("attributes") or {}
@@ -5060,6 +5174,14 @@ def _build_shell_hierarchy_plan(
                 == "staticreference"
             ):
                 return None
+            if (
+                str(node.get("op") or node.get("type") or "").casefold()
+                == "slice"
+            ):
+                # ``xs[:k]``: the Slice is the index-metadata handle of
+                # the load it feeds (as a folded slice literal is, above);
+                # its bounds are the typed values.  It is not an element.
+                return (record[0], record[1], "opaque_ref")
             # An external name read only as the receiver of tensor-namespace
             # calls (``AbstractTensor`` in ``AbstractTensor.get_tensor(x)``,
             # imported inside the method) is a static symbol, as a
@@ -5171,34 +5293,21 @@ def _build_shell_hierarchy_plan(
                 for source in nx.ancestors(graph.G, int(value_id))
             ):
                 return None
-            # An unannotated collection parameter (``atoms``): its element
-            # class is the callers' actuals', carried by the call edge
-            # (``numeric_identity_source`` names it) and settled in the
-            # linked ABI after this plan; the rows read from it get their
-            # row then.  A formal with no call edge has no such evidence.
-            if any(
-                (graph.G.nodes[source].get("attributes") or {}).get(
-                    "binding_kind"
-                ) == "parameter"
-                and str((graph.G.nodes[source].get("attributes") or {}).get(
-                    "result_class_ref"
-                ) or "").removeprefix("builtins.")
-                in {"list", "tuple", "set", "dict"}
-                and not (graph.G.nodes[source].get("attributes") or {}).get(
-                    "sequence_element_class_ref"
-                )
-                and "call actual" in str((graph.G.nodes[source].get(
-                    "attributes"
-                ) or {}).get("numeric_identity_source") or "")
-                for source in (
-                    int(value_id), *nx.ancestors(graph.G, int(value_id)),
-                )
-            ):
+            if not terminal:
+                _post_region_value_obligation(graph, int(value_id))
                 return None
+            function_name = graph.G.graph.get("function_name")
+            source = str(
+                node.get("op") or node.get("type") or "?"
+            )
+            binding = attributes.get("binding_name")
             raise ValueError(
-                f"region value {int(value_id)} has no settled dtype in the "
-                "tensor, specialization, node, descriptor, planned scalar "
-                "types, its operands or domain"
+                f"region value {int(value_id)} "
+                f"({source}"
+                + (f" {binding!r}" if binding is not None else "")
+                + f" in function {function_name!r}) has no settled dtype "
+                "in the tensor, specialization, node, descriptor, planned "
+                "scalar types, its operands, its call actuals or domain"
             )
 
         value_shapes = tuple(
@@ -5637,6 +5746,19 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         fields={},
     )
     shell.hierarchical_compose_failure = None
+    # A region is lowered only from a strict (post-settlement) freeze: a
+    # value still owed its dtype by a non-terminal freeze is refused by name.
+    for planned in _walk_planned_shells(shell):
+        owed = outstanding_region_value_obligations(planned.process_graph)
+        if owed:
+            raise ValueError(
+                "hierarchy plan of function "
+                f"{planned.process_graph.G.graph.get('function_name')!r} "
+                f"was frozen before settlement and region value(s) "
+                f"{sorted(owed)} still await a dtype; "
+                "refresh_hierarchy_plan() was not run after linked-ABI "
+                "settlement"
+            )
     hierarchy = shell.hierarchy_plan
     value_table = shell.hierarchy_value_table
 
@@ -31162,13 +31284,19 @@ class ProcessGraphGLSLDeployment(TiledObject):
             capture=True,
         )
 
-    def refresh_hierarchy_plan(self):
+    def refresh_hierarchy_plan(self, terminal: bool = True):
         # Freeze hierarchy only after all callsite shells are attached.
+        # ``terminal`` is False for the structural precompile that runs
+        # BEFORE linked-ABI settlement: it freezes structure and leaves
+        # unsettled region dtypes as outstanding obligations; the
+        # post-settlement refresh is terminal and refuses what is left.
 
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
-        ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self), shell=self)
+        ) = assign_hierarchy_ids(
+            _build_shell_hierarchy_plan(self, terminal=terminal), shell=self,
+        )
         return self.hierarchy_plan
 
     def prepare_graph_precompile(
@@ -31194,7 +31322,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
         _note(
             "aot: refreshing root hierarchy before structural precompile"
         )
-        self.refresh_hierarchy_plan()
+        self.refresh_hierarchy_plan(terminal=not structural_ssa_only)
         _note(
             "aot: refreshed root hierarchy before structural precompile "
             f"in {time.perf_counter() - hierarchy_started:.3f}s"
@@ -31242,7 +31370,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
             # Match hierarchy freezing, which folds only function graphs.
             if target.process_graph.G.graph.get("function_name"):
                 _fold_callsite_structural_values(target.process_graph)
-            target.refresh_hierarchy_plan()
+            target.refresh_hierarchy_plan(terminal=not structural_ssa_only)
             _note(
                 f"aot: shell {shell_index}/{len(planned_shells)} "
                 f"{shell_name} hierarchy ready in "
