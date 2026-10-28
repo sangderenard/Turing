@@ -119,7 +119,22 @@ def test_transcendentals_compile_to_repository_operations_within_the_ulp_tier():
     assert {"sin", "exp", "log", "atan"} <= operations
     assert "Call" not in operations
     status = check_program(source, "[[0.5], [1], [2.5], [-1.5], [10], [-0], [NaN], [Infinity]]")
-    assert status.startswith("PASS (approximated"), status
+    # Bit for bit against node replaying with the C library's answers.
+    assert status == "PASS (libm-pinned: atan, exp, log, sin)", status
+
+
+@needs_node
+def test_pinned_oracle_judges_amplified_approximations_exactly():
+    # V8's Math.log(3) is one ulp from glibc's; the remainder amplifies it
+    # ~7e4 ulp, which a ulp tier on the result called WRONG.  Replaying
+    # node with libm's answers leaves only JavaScript semantics to judge.
+    source = (
+        "/** @param {number} b */ function root(b) "
+        "{ return Math.exp(10) % Math.log(b); }"
+    )
+    assert check_program(source, "[[3], [2], [0.5], [-1], [NaN]]") == (
+        "PASS (libm-pinned: exp, log)"
+    )
 
 
 @needs_node
@@ -127,11 +142,13 @@ def test_transcendentals_compile_to_repository_operations_within_the_ulp_tier():
     "path", sorted(CORPUS.glob("c*.js")), ids=lambda path: path.stem,
 )
 def test_javascript_corpus_matches_node(path):
-    # Bit for bit, or within the ulp tier when the program uses an
-    # implementation-approximated operation (the status then says so).
+    # Bit for bit (approximated calls pinned to libm), or within the ulp
+    # tier when the program uses ``**`` / Math.pow (the status says which).
     source, inputs = split_program(path.read_text(encoding="utf-8"))
     status = check_program(source, inputs)
-    assert status == "PASS" or status.startswith("PASS (approximated"), status
+    assert status == "PASS" or status.startswith((
+        "PASS (approximated", "PASS (libm-pinned",
+    )), status
 
 
 @needs_node

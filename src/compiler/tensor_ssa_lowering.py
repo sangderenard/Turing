@@ -704,9 +704,15 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                         or not tuple(contract_row[2] or ())
                     ):
                         return
+                    if not contract_row[1]:
+                        raise ValueError(
+                            "native call result contract for owner "
+                            f"{owner_name!r} value {int(output_id)} carries "
+                            f"shape {tuple(contract_row[2])} but no dtype"
+                        )
                     proposed = (
                         tuple(contract_row[2]),
-                        str(contract_row[1] or "float64"),
+                        str(contract_row[1]),
                     )
                     incumbent = native_result_shapes.get(int(output_id))
                     if incumbent is not None and incumbent != proposed:
@@ -779,12 +785,20 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                     )
                     if not extents:
                         continue
-                    fact = (extents, str(
+                    fact_dtype = (
                         (None if native_result is None else native_result[1])
                         or actual.dtype
                         or (None if descriptor is None else descriptor.dtype)
-                        or "float64"
-                    ))
+                    )
+                    if not fact_dtype:
+                        raise ValueError(
+                            f"callsite {caller_name!r} -> {callee_name!r}: "
+                            f"actual %t{int(actual.id)} for formal "
+                            f"%t{int(formal.id)} has extents {extents} but "
+                            "no recorded dtype (native result, actual and "
+                            "descriptor all lack one)"
+                        )
+                    fact = (extents, str(fact_dtype))
                     row = (
                         callee_name, int(formal.id),
                         str(caller_name), int(actual.id),
@@ -3152,7 +3166,22 @@ def lower_tensor_calls_to_repository_ssa(
     #: made for that tensor operation, inside that function.
     lowering_at: list[Any] = [None, None]
 
-    def fresh(*, shape=(), dtype: str | None = "float64") -> SSAValue:
+    def recorded_dtype(value: SSAValue, role: str) -> str:
+        if not value.dtype:
+            owner, source = lowering_at
+            raise ValueError(
+                f"tensor lowering of {None if source is None else source.op!r}"
+                f": {role} %t{int(value.id)} has no recorded dtype; the "
+                "pipeline never settled its type"
+            )
+        return str(value.dtype)
+
+    def fresh(*, shape=(), dtype: str | None) -> SSAValue:
+        if not dtype:
+            raise ValueError(
+                "tensor lowering minted a value with no dtype for an "
+                f"operation lowered at {lowering_at[1]!r}"
+            )
         # Minted through the book (plan 100, 4.1 item 2): a NOVEL
         # ``ssa_value`` row under the function's scope, from the cell of the
         # tensor operation being lowered (its result's, else its first
@@ -3592,10 +3621,16 @@ def lower_tensor_calls_to_repository_ssa(
                 else "static"
             )
             owner = tensor_table.by_id(alias_of) if alias_of is not None else None
-            physical_dtype = str(
-                (value.accounting or {}).get(
-                    "physical_dtype", value.dtype or "float64"
+            if (
+                "physical_dtype" not in (value.accounting or {})
+                and not value.dtype
+            ):
+                raise ValueError(
+                    f"tensor descriptor for %t{int(value.id)} has neither a "
+                    "recorded dtype nor a physical dtype"
                 )
+            physical_dtype = str(
+                (value.accounting or {}).get("physical_dtype", value.dtype)
             ).lower()
             dtype_bytes = dtype_byte_size(physical_dtype)
             element_count = prod(shape) if shape else 1
@@ -3635,7 +3670,7 @@ def lower_tensor_calls_to_repository_ssa(
                 data_value_id=int(
                     tensor_id if data_value_id is None else data_value_id
                 ),
-                dtype=str(value.dtype or "float64"),
+                dtype=str(value.dtype),
                 shape=shape,
                 strides=strides(shape),
                 storage=storage,
@@ -5228,7 +5263,7 @@ def lower_tensor_calls_to_repository_ssa(
                     if count_value is not None and int(count_value) > 0:
                         arange_dtype = str(
                             _attribute(instruction.attributes, "dtype")
-                            or result.dtype or "float64"
+                            or recorded_dtype(result, "arange result")
                         ).casefold()
                         integer_arange = arange_dtype in {
                             "int64", "i64", "long",
@@ -5739,9 +5774,10 @@ def lower_tensor_calls_to_repository_ssa(
                         ))
                 elif operation == "cbrt" and source is not None:
                     count = need_count(source, source_count)
-                    abs_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
-                    sign_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
-                    power_result = fresh(shape=source.shape, dtype=source.dtype or "float64")
+                    cbrt_dtype = recorded_dtype(source, "cbrt operand")
+                    abs_result = fresh(shape=source.shape, dtype=cbrt_dtype)
+                    sign_result = fresh(shape=source.shape, dtype=cbrt_dtype)
+                    power_result = fresh(shape=source.shape, dtype=cbrt_dtype)
                     unary_abs, abs_def = constant(c_tensor_opcode("abs")[1], "int32")
                     binary_pow, pow_def = constant(c_tensor_opcode("pow")[1], "int32")
                     third, third_def = constant(1.0 / 3.0, "float64")
@@ -5948,7 +5984,7 @@ def lower_tensor_calls_to_repository_ssa(
                         elif count is not None:
                             # mean = flat sum scaled by the element count; the
                             # division is ordinary scalar SSA, not a kernel.
-                            total = fresh(dtype=result.dtype or "float64")
+                            total = fresh(dtype=recorded_dtype(result, "mean result"))
                             emitted.append(call("sum_double", [source, count], total, instruction))
                             emitted.append(Instr(
                                 "Div", [total, count], result,
@@ -6279,7 +6315,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 and isinstance(payload, (int, float))
                                 and not isinstance(payload, bool)
                                 and str(operand.dtype or "").casefold()
-                                not in {"double", "float64"}
+                                != "float64"
                             ):
                                 respelled, respelled_def = constant(
                                     float(payload), "float64"
@@ -6289,7 +6325,7 @@ def lower_tensor_calls_to_repository_ssa(
                             conformed.append(operand)
                             continue
                         temporary = fresh(
-                            dtype=result.dtype or "float64",
+                            dtype=recorded_dtype(result, "where result"),
                             shape=tuple(result.shape or ()),
                         )
                         register_tensor(temporary, storage="temporary")
@@ -6300,7 +6336,7 @@ def lower_tensor_calls_to_repository_ssa(
                                 isinstance(payload, (int, float))
                                 and not isinstance(payload, bool)
                                 and str(operand.dtype or "").casefold()
-                                not in {"double", "float64"}
+                                != "float64"
                             ):
                                 scalar, scalar_def = constant(
                                     float(payload), "float64"
@@ -6814,7 +6850,7 @@ def lower_tensor_calls_to_repository_ssa(
                                     if (
                                         not int64_binary
                                         and str(scalar.dtype or "").casefold()
-                                        not in {"double", "float64"}
+                                        != "float64"
                                     ):
                                         promoted = fresh(shape=(), dtype="float64")
                                         prefix.append(Instr(

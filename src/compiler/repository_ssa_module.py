@@ -44,10 +44,16 @@ def _logical_abi(
         outputs = tuple(f"output{index}" for index in range(len(returned)))
 
     def value_record(name: str, value: SSAValue) -> dict[str, Any]:
+        if not value.dtype:
+            raise ValueError(
+                f"repository SSA module ABI: value %t{int(value.id)} "
+                f"({name!r}) has no recorded dtype; the pipeline never "
+                "settled its type, so the ABI refuses to invent one"
+            )
         return {
             "name": name,
             "ssa_value_id": int(value.id),
-            "dtype": str(value.dtype or "float64"),
+            "dtype": str(value.dtype),
             "shape": list(map(int, value.shape or ())),
         }
 

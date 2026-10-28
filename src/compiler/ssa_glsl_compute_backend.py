@@ -49,6 +49,17 @@ from typing import Any, Mapping
 from ..transmogrifier.ssa import Function, IRModule
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 @dataclass(frozen=True, slots=True)
 class GLSLComputeShortfall:
     """One operation this emitter refused, and why. Mirrors CEmissionShortfall."""
@@ -794,7 +805,7 @@ def emit_ssa_module_to_glsl_compute(
     ]
     for held in array_formals:
         formal = next(v for v in region.args if int(v.id) == held)
-        if str(formal.dtype or "float64").casefold() not in ("float64", "double"):
+        if str(_settled_dtype(formal.dtype, formal.id, "array formal dtype")).casefold() not in ("float64", "double"):
             shortfalls.append(GLSLComputeShortfall(
                 "buffer",
                 f"array formal %t{held} has dtype {formal.dtype!r}; this "

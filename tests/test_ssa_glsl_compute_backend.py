@@ -182,7 +182,20 @@ def test_gpu_matches_c_lane_fma_flavour(gl, fma_core, tmp_path):
     # A kernel that ran but wrote nothing would compare zeros against zeros
     # in the low limbs and could still slip through; demand real signal.
     assert np.count_nonzero(gpu[::WIDTH]) > COUNT // 2
-    _assert_matches_c("sin w2 fma", gpu, cpu)
+    # C99 fma() rounds once, so the C lane is the once-rounded evaluation of
+    # the module, bit for bit, and computes the double-double sine.
+    feeds = m._feeds(core, WIDTH, x.copy(), np.zeros(COUNT * WIDTH), COUNT)
+    once = _evaluate_reference(core, wrapper, feeds)
+    assert cpu.tobytes() == once.tobytes()
+    _assert_two_limb_sine(x, cpu)
+    # GLSL fma() may round twice (Mesa does), and then the low limbs carry
+    # no exact product error: the GPU equals the C lane only where its fma
+    # rounded once. Each element must be one rule or the other.
+    twice = _evaluate_reference(core, wrapper, feeds, fma_rounds_once=False)
+    assert np.all((gpu == cpu) | (gpu == twice))
+    if not np.array_equal(gpu, cpu):
+        print("[sin w2 fma] GPU fma() rounds twice; it matches the C lane "
+              f"in {int(np.count_nonzero(gpu == cpu))} of {gpu.size} values")
 
 
 def test_gpu_matches_c_lane_split_flavour(gl, split_core, tmp_path):
@@ -191,6 +204,7 @@ def test_gpu_matches_c_lane_split_flavour(gl, split_core, tmp_path):
     gpu = _run_glsl(core, wrapper, x)
     cpu = _run_c(core, wrapper, x, tmp_path)
     assert np.count_nonzero(gpu[::WIDTH]) > COUNT // 2
+    _assert_two_limb_sine(x, cpu)
     _assert_matches_c("sin w2 split", gpu, cpu)
 
 
@@ -280,6 +294,26 @@ def _evaluate_reference(core, wrapper: str, feeds, *, fma_rounds_once=True):
     return arrays[int(core.roles["output"].id)]
 
 
+def _assert_two_limb_sine(x: np.ndarray, y: np.ndarray):
+    """y holds sin(x) per element to far better than one double."""
+
+    import mpmath
+
+    with mpmath.workdps(60):
+        for index in range(COUNT):
+            point = mpmath.mpf(float(x[WIDTH * index])) + mpmath.mpf(
+                float(x[WIDTH * index + 1])
+            )
+            truth = mpmath.sin(point)
+            got = mpmath.mpf(float(y[WIDTH * index])) + mpmath.mpf(
+                float(y[WIDTH * index + 1])
+            )
+            assert abs(got - truth) <= abs(truth) * mpmath.mpf(2) ** -95, (
+                index, float(x[WIDTH * index]), float(y[WIDTH * index]),
+                float(y[WIDTH * index + 1]),
+            )
+
+
 @pytest.mark.parametrize("flavour", ["fma", "split"])
 def test_gpu_matches_reference_evaluation_of_the_lowered_core(gl, flavour, fma_core, split_core):
     """The current lowering: a Cast bound and a load/compute/store body."""
@@ -295,16 +329,21 @@ def test_gpu_matches_reference_evaluation_of_the_lowered_core(gl, flavour, fma_c
     gpu = _run_glsl(core, wrapper, x)
     feeds = m._feeds(core, WIDTH, x.copy(), np.zeros(COUNT * WIDTH), COUNT)
     once = _evaluate_reference(core, wrapper, feeds)
-    assert np.count_nonzero(gpu[:COUNT]) > COUNT // 4
-    # It is a sine core: element i reads x[i] (the lowering's indexing).
-    np.testing.assert_allclose(gpu[:COUNT], np.sin(x[:COUNT]), rtol=1e-13, atol=1e-300)
+    # It is a two-limb sine core: element i is limbs 2i and 2i+1 of x and
+    # of y, and both of y's limbs are written.
+    assert np.count_nonzero(gpu[1::WIDTH]) > COUNT // 2
+    _assert_two_limb_sine(x, once)
     if flavour == "split":
+        _assert_two_limb_sine(x, gpu)
         # No fma anywhere: every operation is one IEEE operation in a
         # precise variable, so the GPU must agree bit for bit.
         assert gpu.tobytes() == once.tobytes()
         return
     twice = _evaluate_reference(core, wrapper, feeds, fma_rounds_once=False)
     # GLSL lets fma() round twice; each element must be one rule or the
-    # other, never anything else.
+    # other, never anything else. Twice-rounded, fma no longer yields a
+    # product's exact error, so a device that rounds twice (Mesa does)
+    # computes this flavour to about one double -- which is why fma use
+    # is a precision obligation the record states.
     assert np.all((gpu == once) | (gpu == twice))
 

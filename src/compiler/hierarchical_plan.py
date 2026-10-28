@@ -675,9 +675,14 @@ def plan_region_to_ssa_instrs(
         existing = values.get(value_id)
         if existing is not None:
             return existing
+        if value_id not in dtype_of:
+            raise ValueError(
+                f"region value {value_id} has no settled dtype in the "
+                "region's value records"
+            )
         made = SSAValue(
             value_id,
-            dtype=dtype_of.get(value_id, "float64"),
+            dtype=dtype_of[value_id],
             shape=shape_of.get(value_id, ()),
             accounting={
                 "program_abi_rank": rank_of[value_id],
@@ -896,9 +901,13 @@ def plan_region_to_ssa_instrs(
             # a same-value cast carrying the schema promise; target code does
             # not reconstruct or invoke a Python object.
             attributes.setdefault("source_operator", opcode)
-            attributes.setdefault("target_dtype", dtype_of.get(
-                int(item.outputs[0]) if item.outputs else -1, "float64"
-            ))
+            tensor_output = int(item.outputs[0]) if item.outputs else -1
+            if tensor_output not in dtype_of:
+                raise ValueError(
+                    f"tensor() output value {tensor_output} has no settled "
+                    "dtype in the region's value records"
+                )
+            attributes.setdefault("target_dtype", dtype_of[tensor_output])
             opcode = "Cast"
         elif opcode == "const":
             # A plan line the planner folded to a literal (``0.5 * step`` of
@@ -917,10 +926,8 @@ def plan_region_to_ssa_instrs(
             ) == 0
             and all(
                 max(
-                    len(tuple(value(value_id).shape)),
-                    int((value(value_id).accounting or {}).get(
-                        "program_abi_rank", 0
-                    )),
+                    len(tuple(shape_of.get(int(value_id), ()))),
+                    int(rank_of.get(int(value_id), 0)),
                 ) == 0
                 for value_id in semantic_inputs
             )

@@ -42,6 +42,13 @@ def frame_aliased_result_binding(instruction, callee, *, book=None, record=None,
         raise ConcordanceRefusal("frame-aliased result lacks its exact call record")
     current = book.latest_ref(CALL_RECORD, cell.row)
     records = () if current is None else book.page(CALL_RECORD).cell(current.row, current.column) or ()
+    if record is not None and record not in records:
+        # The linker acts on a record it has revised in flight (result
+        # bindings re-keyed to the callee's semantic outputs, formals pruned)
+        # and publishes the caller's row only after the whole round.  The
+        # record in hand is the exact record this call was built from; the
+        # book's incumbent row is its pre-revision predecessor.
+        records = (record,)
     matching = tuple(item for item in records
                      if int(item.callsite_id) == int(instruction.attributes.get("plan_callsite_id", -1))
                      and str(item.callee_symbol) == str(callee.name))
@@ -51,7 +58,12 @@ def frame_aliased_result_binding(instruction, callee, *, book=None, record=None,
     result_id = instruction.attributes.get("semantic_result_id")
     if result_id is None and instruction.res is not None:
         result_id = int(instruction.res.id)
-    outputs = tuple(int(formal) for formal, result in record.result_bindings if int(result) == result_id)
+    # A result binding may also name the semantic record handle (a callee
+    # id that is not a formal); only a pair naming a callee formal can be
+    # the frame alias.
+    callee_formal_ids = {int(formal.id) for formal in callee.args}
+    outputs = tuple(int(formal) for formal, result in record.result_bindings
+                    if int(result) == result_id and int(formal) in callee_formal_ids)
     if len(outputs) != 1:
         raise ConcordanceRefusal("frame-aliased result has no unique recorded result binding")
     formal_id = outputs[0]
@@ -396,31 +408,24 @@ def publish_ssa_value_type(function, value, *, dtype, shape, sources, stage, boo
         raise ConcordanceRefusal(
             f"SSA type change was not published: {function.name!r}/{value.id}"
         )
-    previous = (value.dtype, tuple(value.shape or ()))
     value.dtype, value.shape = fact.dtype, fact.shape
-    if previous != (fact.dtype, tuple(fact.shape)):
-        # Program: ``xs = [3, 1, 4, 7]; return sum(xs) + n``.  Wrong record:
-        # the folded list's Const result settled to int64 (4,) but the
-        # ``sum`` operand, another occurrence of the same identity, kept the
-        # provisional () and C reduced one element (7 for 19).  Rule: a
-        # published type is the identity's, so every occurrence in the
-        # function that carried the previous type carries the new one.
-        for block in function.blocks.values():
-            for instruction in block.instrs:
-                for occurrence in (*instruction.args, instruction.res):
-                    if (
-                        occurrence is not None and occurrence is not value
-                        and int(occurrence.id) == int(value.id)
-                        and (occurrence.dtype, tuple(occurrence.shape or ()))
-                        == previous
-                    ):
-                        occurrence.dtype, occurrence.shape = fact.dtype, fact.shape
-        for occurrence in function.args:
-            if (
-                occurrence is not value and int(occurrence.id) == int(value.id)
-                and (occurrence.dtype, tuple(occurrence.shape or ())) == previous
-            ):
-                occurrence.dtype, occurrence.shape = fact.dtype, fact.shape
+    # Program: ``xs = [3, 1, 4, 7]; return sum(xs) + n``.  Wrong record:
+    # the folded list's Const result settled to int64 (4,) but the
+    # ``sum`` operand, another occurrence of the same identity, kept the
+    # provisional () and C reduced one element (7 for 19).  Rule: a
+    # published type is the identity's, so every occurrence of that
+    # identity is a view of the published row.
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            for occurrence in (*instruction.args, instruction.res):
+                if (
+                    occurrence is not None and occurrence is not value
+                    and int(occurrence.id) == int(value.id)
+                ):
+                    occurrence.dtype, occurrence.shape = fact.dtype, fact.shape
+    for occurrence in function.args:
+        if occurrence is not value and int(occurrence.id) == int(value.id):
+            occurrence.dtype, occurrence.shape = fact.dtype, fact.shape
     return cell
 
 
