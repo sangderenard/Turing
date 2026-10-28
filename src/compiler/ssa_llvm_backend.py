@@ -2272,6 +2272,7 @@ def _emit_repository_call_module(
             callee_aggregate_parameter_positions[callee_name] = positions
 
     function_outputs: dict[str, tuple[_Any, ...]] = {}
+    function_output_ret_positions: dict[str, tuple[int, ...]] = {}
     # A linked LLVM piece is not emitted, but its call sites need its
     # outputs: the piece root's Ret names them, in the artifact's order.
     for name in piece_records:
@@ -2307,15 +2308,22 @@ def _emit_repository_call_module(
                 )
         positions = aggregate_output_positions.get(name)
         if physical_returned:
+            selects_positions = positions is not None and all(
+                position < len(physical_returned) for position in positions
+            )
             function_outputs[name] = (
                 tuple(physical_returned[position] for position in positions)
-                if positions is not None
-                and all(
-                    position < len(physical_returned)
-                    for position in positions
-                )
+                if selects_positions
                 else physical_returned
             )
+            # Declared output i is the Ret's argument at position
+            # positions[i], not at i: the publication must read that same
+            # record.  c467: make(k, m) returns (closure, k, m); the call
+            # selects slots (0, 2), and reading Ret position 1 (the
+            # passed-through k) for output 1 overwrote m with k, so
+            # 3*5 - 5*2 came back -10 on LLVM while C returned 5.
+            if selects_positions and returned is physical_returned:
+                function_output_ret_positions[name] = tuple(positions)
         else:
             declared_ids = aggregate_output_ids.get(name, ())
             function_outputs[name] = tuple(
@@ -3090,8 +3098,14 @@ def _emit_repository_call_module(
         def emit_return_values(
             returned_values: tuple = (),
         ) -> None:
+            ret_positions = function_output_ret_positions.get(name)
             for output_index, output in enumerate(outputs):
                 destination = f"%out.{output_index}"
+                ret_position = (
+                    ret_positions[output_index]
+                    if ret_positions is not None and returned_values
+                    else output_index
+                )
                 # The Ret instruction's own arguments are the authoritative
                 # publication objects: a carried reduction returns its PHI,
                 # whose id differs from the declared output id (the port /
@@ -3099,9 +3113,9 @@ def _emit_repository_call_module(
                 # port's unwritten cell and returned zero for every carried
                 # maximum.
                 source = None
-                if output_index < len(returned_values):
+                if ret_position < len(returned_values):
                     source = pointers.get(
-                        int(returned_values[output_index].id)
+                        int(returned_values[ret_position].id)
                     )
                 if source is None:
                     # A watch shadow, when one exists, is the ONLY readable
@@ -3119,8 +3133,8 @@ def _emit_repository_call_module(
                     # storage at all.
                     for candidate in (
                         *(
-                            (int(returned_values[output_index].id),)
-                            if output_index < len(returned_values) else ()
+                            (int(returned_values[ret_position].id),)
+                            if ret_position < len(returned_values) else ()
                         ),
                         int(output.id),
                     ):
