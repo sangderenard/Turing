@@ -2812,7 +2812,19 @@ def _planned_scalar_dtypes_from(
                         )
                     continue
                 if writers:
-                    settle(element, node_id, join(writers))
+                    joined = join(writers)
+                    # Program: ``for g in (1, n * 0.5): s += g`` (corpus
+                    # c382).  A tuple display is never written after its
+                    # birth, and its rows share one arena, so mixed int and
+                    # float members take the numeric tower's promotion
+                    # (the substrate's ``promote``), not nothing.
+                    if (
+                        joined is None
+                        and attributes.get("aggregate_kind") == "tuple"
+                        and None not in writers
+                    ):
+                        joined = promote(writers)
+                    settle(element, node_id, joined)
                 continue
             if op in {"indexedstore", "setitem"}:
                 base = parents(data, "base")
@@ -2842,28 +2854,42 @@ def _planned_scalar_dtypes_from(
                 defaults = parents(data, "arg:1")
                 # The receiver is the table, a store's version of it, or a
                 # loop's carried version of it.
-                table = receiver[0] if len(receiver) == 1 else None
-                while table is not None and (
-                    operation(G.nodes[table]) in {"indexedstore", "setitem"}
-                    or (
-                        operation(G.nodes[table]) == "loopresult"
+                # Program: ``cells = {1: 10}; if n > 1: cells[n] = ..;
+                # cells.get(5, big)`` (corpus c302).  A branch join of two
+                # versions of a table is that table when every arm is one.
+                def is_dict_table(table, seen=()):
+                    while table is not None and (
+                        operation(G.nodes[table]) in {"indexedstore", "setitem"}
+                        or (
+                            operation(G.nodes[table]) == "loopresult"
+                            and (G.nodes[table].get("attributes") or {}).get(
+                                "result_kind"
+                            ) == "carried"
+                        )
+                    ):
+                        base = parents(
+                            G.nodes[table],
+                            "value" if operation(G.nodes[table]) == "loopresult"
+                            else "base",
+                        )
+                        table = base[0] if len(base) == 1 else None
+                    if table is None or table in seen:
+                        return False
+                    if operation(G.nodes[table]) == "phi":
+                        arms = parents(G.nodes[table], "body", "orelse")
+                        return bool(arms) and all(
+                            is_dict_table(arm, (*seen, table)) for arm in arms
+                        )
+                    return bool(
+                        is_collection(table)
                         and (G.nodes[table].get("attributes") or {}).get(
-                            "result_kind"
-                        ) == "carried"
+                            "aggregate_kind"
+                        ) == "dict"
                     )
-                ):
-                    base = parents(
-                        G.nodes[table],
-                        "value" if operation(G.nodes[table]) == "loopresult"
-                        else "base",
-                    )
-                    table = base[0] if len(base) == 1 else None
+
                 if (
-                    table is not None and len(defaults) == 1
-                    and is_collection(table)
-                    and (G.nodes[table].get("attributes") or {}).get(
-                        "aggregate_kind"
-                    ) == "dict"
+                    len(receiver) == 1 and len(defaults) == 1
+                    and is_dict_table(receiver[0])
                 ):
                     held = element.get(receiver[0])
                     default_dtype = scalar.get(defaults[0])
@@ -4305,6 +4331,9 @@ def _build_shell_hierarchy_plan(
                 # receiver) needs none; one that is refuses by name where it
                 # is consumed (``_value_shape_dtype`` below).
                 dtype = str(dtype) if dtype else None
+                import os
+                if os.environ.get("DBGA") and not (tensor.get("dtype") or getattr(specialization,"dtype",None) or node.get("dtype") or described_dtype or planned_scalar_dtypes().get(int(current))):
+                    print("DOMDEF", int(current), node.get("op"), dtype, (node.get("attributes") or {}).get("binding_name"), node.get("parents"))
                 field_name = attributes.get("attribute")
                 if (
                     not logical
@@ -4681,9 +4710,9 @@ def _build_shell_hierarchy_plan(
         def _typed_value_shape(value_id):
             """A region value's record; a typed value with none refuses.
 
-            A static symbol (``abs``) and a record identity are not scalar
-            values: they carry no element type and own no region formal
-            dtype, so they contribute no ``value_shapes`` row.  Anything
+            A static symbol (``abs``) is not a value: it contributes no
+            ``value_shapes`` row.  A record identity is a handle
+            (``opaque_ref``), not a scalar.  Anything
             else without a settled dtype is a missing record: name it.
             """
 
@@ -4692,18 +4721,28 @@ def _build_shell_hierarchy_plan(
                 return record
             node = graph.G.nodes.get(int(value_id), {})
             attributes = node.get("attributes") or {}
+            if attributes.get("program_abi_record_identity"):
+                # A record value is a handle onto its fields' storage.
+                return (record[0], record[1], "opaque_ref")
             if (
                 str(node.get("op") or node.get("type") or "").casefold()
                 == "staticreference"
-                or attributes.get("program_abi_record_identity")
             ):
                 return None
+            import os
+            if os.environ.get("DBGA"):
+                print("RV", int(value_id)); [print("  ANC", n, graph.G.nodes[n].get("op"), {k:v for k,v in (graph.G.nodes[n].get("attributes") or {}).items() if k in ("aggregate_kind","producer_kind","binding_kind","static_python_reference","value")}, _shape_dtype_cache.get(n), planned_scalar_dtypes().get(n), graph.G.nodes[n].get("parents")) for n in sorted(__import__("networkx").ancestors(graph.G,int(value_id)))]
             raise ValueError(
                 f"region value {int(value_id)} has no settled dtype in the "
                 "tensor, specialization, node, descriptor, planned scalar "
                 "types, its operands or domain"
             )
 
+        import os
+        if os.environ.get("DBGA"):
+            print("PLANNED", planned_scalar_dtypes())
+            print("NODES", {n:(d.get("op"), d.get("parents")) for n,d in graph.G.nodes(data=True)})
+            print("VS", [ _typed_value_shape(v) for v in (*region_nodes, *region_captures)])
         value_shapes = tuple(
             record
             for record in (
