@@ -4827,6 +4827,24 @@ def _build_shell_hierarchy_plan(
                 )
             ):
                 return None
+            # A collection handed to a call whose body is not attached yet
+            # is written by that callee (``fill(xs, v)``); the element class
+            # its writes settle arrives with the callee, so no row is posted
+            # for what is read from it here.
+            if any(
+                (graph.G.nodes[source].get("attributes") or {}).get(
+                    "aggregate_kind"
+                )
+                and any(
+                    str(graph.G.nodes[child].get("op") or "").casefold()
+                    == "call"
+                    for child, _role in (
+                        graph.G.nodes[source].get("children") or ()
+                    )
+                )
+                for source in nx.ancestors(graph.G, int(value_id))
+            ):
+                return None
             raise ValueError(
                 f"region value {int(value_id)} has no settled dtype in the "
                 "tensor, specialization, node, descriptor, planned scalar "
