@@ -296,6 +296,24 @@ def python_int_range_dtype(low: int, high: int) -> str | None:
     return None
 
 
+# ``array.array(typecode)``: the typecode is the authored element layout of
+# the array's one column.  ``l``/``L`` are platform-sized in CPython and are
+# deliberately absent: no declared width is stated for them.
+ARRAY_TYPECODE_DTYPES = {
+    "b": "int8", "B": "uint8",
+    "h": "int16", "H": "uint16",
+    "i": "int32", "I": "uint32",
+    "q": "int64", "Q": "uint64",
+    "f": "float32", "d": "float64",
+}
+
+
+def array_typecode_dtype(typecode: object) -> str | None:
+    """The element dtype ``array(typecode)`` declares, or ``None``."""
+
+    return ARRAY_TYPECODE_DTYPES.get(typecode) if isinstance(typecode, str) else None
+
+
 # --------------------------------------------------------------------------
 # Layout views. Native backend support is a property of the same record.
 # --------------------------------------------------------------------------

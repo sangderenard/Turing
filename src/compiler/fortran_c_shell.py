@@ -7890,13 +7890,9 @@ def _authored_dataclass_record_views(
             # declared row contract as B/I/Q. Retain that contract at its
             # authored constructor; later consumers must not infer it from
             # an append operand or a native register width.
-            dtype = {
-                "b": "int8", "B": "uint8",
-                "h": "int16", "H": "uint16",
-                "i": "int32", "I": "uint32",
-                "q": "int64", "Q": "uint64",
-                "f": "float32", "d": "float64",
-            }.get(value.args[0].value)
+            from ..transmogrifier.dtype_layout import array_typecode_dtype
+
+            dtype = array_typecode_dtype(value.args[0].value)
 
             if dtype is not None:
                 return {

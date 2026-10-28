@@ -3206,6 +3206,26 @@ def _planned_scalar_dtypes_from(
                 if len(held) == 1:
                     settle(element, node_id, held[0])
                 continue
+            # Program: ``a = array("Q"); a.append(n); return a[0]``.  Wrong
+            # record: an array is not a list/tuple/set/dict collection, so
+            # its rows had no class and ``a[0]`` reached its region with no
+            # settled dtype.  Rule: ``array(typecode)`` declares its one
+            # column's layout (``sequence_column_dtypes``, posted at the
+            # allocation from the typecode literal and on a typed array
+            # field's handle); that is its element class, whatever Python
+            # ints its appends carry.
+            declared_array_columns = tuple(
+                attributes.get("sequence_column_dtypes") or ()
+            )
+            if (
+                attributes.get("aggregate_kind") == "array"
+                and len(declared_array_columns) == 1
+                and str(declared_array_columns[0]) not in {
+                    "", "None", "unknown",
+                }
+            ):
+                settle(element, node_id, str(declared_array_columns[0]))
+                continue
             if (
                 is_collection(node_id)
                 or attributes.get("sequence_element_class_ref")
