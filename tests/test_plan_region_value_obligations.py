@@ -84,26 +84,47 @@ def test_obligation_is_posted_unresolved_then_settled_with_producer():
 
 def test_every_typed_return_settles_its_obligation(monkeypatch):
     """Through the single exit, each obligation a non-terminal freeze posted
-    is closed by the terminal freeze, citing at least one producer cell."""
+    on a graph that then gets its terminal freeze is closed by that freeze,
+    citing at least one producer cell.  (A graph never frozen terminally --
+    a generic original replaced by its callsite copies -- owes nothing.)"""
 
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
-    posted, settled = set(), {}
+    posted, settled, terminal_graphs = {}, {}, set()
     original_post = strategy._post_region_value_obligation
     original_settle = strategy._settle_region_value_obligation
+    original_build = strategy._build_shell_hierarchy_plan
+    inside_host_scalar = [0]
+    original_owe = strategy._owe_host_scalar_class
+
+    def owe(graph, value_id):
+        # Host-scalar owes are the descriptor query's, not the freeze's.
+        inside_host_scalar[0] += 1
+        try:
+            return original_owe(graph, value_id)
+        finally:
+            inside_host_scalar[0] -= 1
 
     def post(graph, value_id):
-        posted.add((id(graph.G), int(value_id)))
+        if not inside_host_scalar[0]:
+            posted[(id(graph.G), int(value_id))] = graph
         return original_post(graph, value_id)
 
     def settle(graph, value_id, dtype, producer_cells=()):
         settled[(id(graph.G), int(value_id))] = tuple(producer_cells)
         return original_settle(graph, value_id, dtype, producer_cells)
 
+    def build(shell, *args, terminal=False, **kwargs):
+        if terminal:
+            terminal_graphs.add(id(shell.process_graph.G))
+        return original_build(shell, *args, terminal=terminal, **kwargs)
+
+    monkeypatch.setattr(strategy, "_owe_host_scalar_class", owe)
     monkeypatch.setattr(strategy, "_post_region_value_obligation", post)
     monkeypatch.setattr(strategy, "_settle_region_value_obligation", settle)
+    monkeypatch.setattr(strategy, "_build_shell_hierarchy_plan", build)
     source = (ROOT / "tests/native_semantics_corpus"
-              / "c55_list_filled_by_callee.py").read_text()
+              / "c464_two_closure_variants.py").read_text()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         lower_ast_source_to_ssa(
@@ -113,9 +134,11 @@ def test_every_typed_return_settles_its_obligation(monkeypatch):
             ),
             progress=lambda _: None,
         )
-    assert posted, "the probe must exercise a non-terminal obligation"
-    assert posted <= set(settled)
-    assert all(settled[key] for key in posted)
+    owed = {key for key in posted if key[0] in terminal_graphs}
+    assert owed, "the probe must exercise a non-terminal obligation"
+    assert owed <= set(settled)
+    assert all(settled[key] for key in owed)
+
 
 
 def _owed_host_scalar_graph(value_id):
