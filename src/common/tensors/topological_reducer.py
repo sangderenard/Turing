@@ -6426,15 +6426,27 @@ def _normalize_lexical_values(
     #: at a loop, so the first pass over a body sees no cursor for a field
     #: the body itself rewrites later; that read is not the construction's.
     loop_body_field_writes: list[frozenset[tuple[str, str]]] = []
-    #: Local names passed (as an argument or a method receiver) to a call
-    #: that may store into them.  A record this function constructs has no
-    #: field storage the reducer reloads after such a call, so a later read
-    #: of its field is refused rather than answered from the cursor.
-    storing_call_receivers: set[str] = set()
+    #: Values passed (as an argument or a method receiver) to a call that
+    #: may store into them.  A record this function constructs has no field
+    #: storage the reducer reloads after such a call, so a later read of its
+    #: field is refused rather than answered from the cursor.
+    #:
+    #: Program: ``old = acc; add(acc, b); return old.total`` (c933), and
+    #: ``level = IdentityLogLevel(level); level.name`` (bootstrap
+    #: ``iter_identity_book_lines``, c932).  Wrong record: the mark named the
+    #: binding, not the value.  An alias read the construction's stale
+    #: argument (silent), and a fresh record rebound to the passed name was
+    #: refused.  Rule: a call stores into the value its argument names when
+    #: the call runs; every name bound to that value sees the store, and a
+    #: later binding of the name to another value does not.
+    storing_call_values: set[int] = set()
     storing_call_effects: dict[int, list[int]] = {}
-    #: The same names for each loop being reduced, innermost last: a call
+    #: For each loop being reduced, innermost last: the names a call in the
+    #: body may store into, and the values they hold at loop entry.  A call
     #: later in the body stores before the next iteration's read.
-    loop_body_storing_receivers: list[frozenset[str]] = []
+    loop_body_storing_receivers: list[
+        tuple[frozenset[str], frozenset[int]]
+    ] = []
     storing_definitions = dict(authored_definitions_by_name or {})
     #: ``acc.add`` in ``acc.add(b)`` is a method lookup, not a field read.
     method_lookup_ids = {
@@ -9457,7 +9469,10 @@ def _normalize_lexical_values(
             # operands. Recursive expression resolution preserves left/right
             # order, so acc.add(b) + acc.total still refuses its stale read.
             names = storing_call_names(expression)
-            storing_call_receivers.update(names)
+            storing_call_values.update(
+                int(environment[name]) for name in names
+                if isinstance(environment.get(name), int)
+            )
             if isinstance(result, int) and result in graph.G and isinstance(
                 graph.G.nodes[result].get("expr_obj"), ast.Call,
             ):
@@ -10199,10 +10214,11 @@ def _normalize_lexical_values(
                     and isinstance(expression.value, ast.Name)
                     and id(expression) not in method_lookup_ids
                     and (
-                        str(expression.value.id) in storing_call_receivers
+                        int(receiver) in storing_call_values
                         or any(
                             str(expression.value.id) in names
-                            for names in loop_body_storing_receivers
+                            or int(receiver) in values
+                            for names, values in loop_body_storing_receivers
                         )
                     )
                 )
@@ -15562,11 +15578,20 @@ def _normalize_lexical_values(
     def reduce_statement(body_statement: ast.stmt) -> int | None:
         # Individual Call resolution publishes stores after its operands;
         # premarking a whole statement invalidates reads before the call.
-        result = reduce_statement_body(body_statement)
-        if not isinstance(body_statement, (
+        if isinstance(body_statement, (
             ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
         )):
-            storing_call_receivers.update(storing_call_names(body_statement))
+            return reduce_statement_body(body_statement)
+        names = storing_call_names(body_statement)
+        entry_values = {name: environment.get(name) for name in names}
+        result = reduce_statement_body(body_statement)
+        # The statement's calls ran on the values bound when it began.  A
+        # name it binds first was marked by its call's own resolution, at
+        # the value the call received; its value now may be a new binding.
+        storing_call_values.update(
+            int(stored) for stored in entry_values.values()
+            if isinstance(stored, int)
+        )
         return result
 
     def reduce_statement_body(body_statement: ast.stmt) -> int | None:
@@ -17025,10 +17050,17 @@ def _normalize_lexical_values(
                 if isinstance(target, ast.Attribute)
                 and isinstance(target.value, ast.Name)
             ))
-            loop_body_storing_receivers.append(frozenset(
+            loop_storing_names = frozenset(
                 name
                 for nested in body_statement.body
                 for name in storing_call_names(nested)
+            )
+            loop_body_storing_receivers.append((
+                loop_storing_names,
+                frozenset(
+                    int(environment[name]) for name in loop_storing_names
+                    if isinstance(environment.get(name), int)
+                ),
             ))
             try:
                 for nested in body_statement.body:
