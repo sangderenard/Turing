@@ -59761,6 +59761,7 @@ def _class_surface_ssa_program(
         drop_dead_pure_structural_instructions,
         drop_dead_pure_region_calls,
         reduce_constant_exponent_pow,
+        reduce_integer_pow,
     )
 
     compile_substage("reduce constant powers and dead pure work")
@@ -59770,6 +59771,10 @@ def _class_surface_ssa_program(
     # results nothing reads (the materialized comprehension ``range``) must
     # not force a backend to spell code nothing runs.
     drop_dead_pure_region_calls(all_functions)
+    # Python ``int`` powers become checked square-and-multiply SSA after
+    # the dead sweeps: its guards call the validation runtime, which a
+    # pure-region sweep must not see as removable work.
+    reduce_integer_pow(all_functions)
 
     # Sequence descriptors are the canonical physical ABI.  A source value
     # may have been captured provisionally by a numerical region before its
