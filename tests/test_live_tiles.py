@@ -1000,3 +1000,30 @@ def test_failed_compile_setup_restores_active_storage_context(monkeypatch):
             regulator.budget_bytes = None
             regulation.end_regulation(regulator, token, releases_book_state=False)
         set_active_contract(previous_contract)
+
+
+def test_bulk_adoption_matches_one_by_one_insertion(tmp_path):
+    # ``manage`` adopts a whole mapping or list at once (the tire's
+    # 1.56M-entry identity page took hours one key at a time).  The adopted
+    # trie, its insertion order and its chunk index must behave exactly like
+    # the structure ``_set``/``_append`` would have built.
+    owner = arena(tmp_path)
+    source = {("scope", i, "x"): (i, ("a", i)) for i in range(300)}
+    members = [(i, str(i)) for i in range(70)]
+    table = owner.manage(source)
+    rows = owner.manage(members)
+    owner.offload_to_disk()
+    assert list(table) == list(source)
+    assert all(table[key] == value for key, value in source.items())
+    assert list(rows) == members and rows[69] == members[69]
+    table[("scope", 7, "x")] = 0
+    del table[("scope", 8, "x")]
+    table[("late",)] = 1
+    rows.append((70, "70"))
+    assert list(table)[-1] == ("late",) and ("scope", 8, "x") not in table
+    assert table[("scope", 7, "x")] == 0 and len(table) == 300
+    assert len(rows) == 71 and rows[70] == (70, "70")
+    for index in range(len(owner._tiles)):
+        for record in tuple(owner._page(index)):
+            if isinstance(record, tuple) and len(record) == 2 and record[0] == "leaf":
+                assert len(record[1]) <= owner.bucket_rows
