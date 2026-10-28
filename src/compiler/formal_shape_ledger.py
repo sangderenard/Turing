@@ -192,20 +192,17 @@ def _proven_formal_shape(graph: Any, name: Any) -> Any:
 
     if not name:
         return None
-    try:
-        from .identity_concordance import (
-            authored_function_name,
-            current_identity_book,
-        )
+    from .identity_concordance import (
+        authored_function_name,
+        current_identity_book,
+    )
 
-        page = current_identity_book().page("formal_shape")
-        row = (
-            authored_function_name(graph.G.graph.get("function_name")),
-            str(name),
-        )
-        proven = page.latest(row)
-    except Exception:
-        return None
+    page = current_identity_book().page("formal_shape")
+    row = (
+        authored_function_name(graph.G.graph.get("function_name")),
+        str(name),
+    )
+    proven = page.latest(row)
     # ``Unresolved(FORMAL_SHAPE_CONFLICT)`` is the conflicting fact.
     if not isinstance(proven, tuple) or proven[0] != "proven":
         return None
@@ -221,14 +218,11 @@ def _proven_formal_literal(graph: Any, name: Any) -> Any:
 
     if not name:
         return _FORMAL_LITERAL_CONFLICT
-    try:
-        from .identity_concordance import current_identity_book
+    from .identity_concordance import current_identity_book
 
-        page = current_identity_book().page("formal_literal")
-        row = (str(graph.G.graph.get("function_name")), str(name))
-        proven = page.latest(row)
-    except Exception:
-        return _FORMAL_LITERAL_CONFLICT
+    page = current_identity_book().page("formal_literal")
+    row = (str(graph.G.graph.get("function_name")), str(name))
+    proven = page.latest(row)
     # ``Unresolved(FORMAL_LITERAL_CONFLICT)`` is the conflicting fact.
     if not isinstance(proven, tuple) or proven[0] != "proven":
         return _FORMAL_LITERAL_CONFLICT
