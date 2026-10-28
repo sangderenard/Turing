@@ -21026,10 +21026,15 @@ def _select_handle_result(
     from ..transmogrifier.ssa import BasicBlock, Instr, SSAValue
 
     (
-        _predicate_id, tag_id, list_id, _true_id, _false_id, roles,
+        predicate_id, tag_id, list_id, _true_id, _false_id, roles,
     ) = selection
     tag = native_call.res
-    if tag is None or int(tag.id) != int(tag_id):
+    if int(predicate_id) in actual_by_formal:
+        # ``def h(a, b, c): return a if c else b``: the predicate the callee
+        # returns is its own formal, so the call's result aliases the
+        # caller's actual for it (frame-aliased); that actual IS the tag.
+        tag = actual_by_formal[int(predicate_id)]
+    elif tag is None or int(tag.id) != int(tag_id):
         raise FortranEmissionError(
             "a call that returns which list arm it took has no tag result: "
             f"callee={record.callee_symbol!r} callsite="
@@ -49885,6 +49890,18 @@ def _class_surface_ssa_program(
                         ), None)
                         if pair is None:
                             continue
+                        caller_lists = all_sequence_tables.get(str(record.caller))
+                        if (
+                            int(pair[0]) == int(predicate_id)
+                            and caller_lists is not None
+                            and caller_lists.by_id(int(pair[1])) is None
+                        ):
+                            # An earlier round of this link already rebound
+                            # the list result to the tag it minted (the
+                            # predicate's caller value is no list): the
+                            # selection exists, and a second tag would
+                            # orphan the first.
+                            break
                         tag_id = mint_compiler_value_id(
                             caller, FRAME_SCAFFOLD,
                             (_frame_value_cell(callee, int(predicate_id)),),

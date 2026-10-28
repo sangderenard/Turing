@@ -11,6 +11,12 @@ back to the list it writes, so the program was refused.
 callee: a fresh list per call, whose rows the callee decides in the caller's
 storage.  The call bound the store node, not the list, so the caller's view
 named no arena; a replicated list was also not counted as born there.
+
+``def h(a, b, c): return a if c else b`` returns which arm it took (its
+predicate) and the caller selects its own actual.  The predicate is the
+callee's formal ``c``, so the call's result aliased the caller's actual for
+``c``; the selection looked for a minted tag instead, and a second link round
+minted another tag that orphaned the first.
 """
 
 from __future__ import annotations
@@ -79,7 +85,36 @@ def root(n: int) -> int:
     return t[1] + len(t)
 '''
 
+# A list chosen by a conditional between two arguments: the result IS the
+# chosen argument, so growth through it lands in that caller list only.
+CHOSEN_ARGUMENT = '''
+def h(a: list[int], b: list[int], c: bool) -> list[int]:
+    return a if c else b
+
+
+def root(n: int) -> int:
+    a = [1, 2]
+    b = [5, 6]
+    t = h(a, b, n > 2)
+    t.append(9)
+    return a[0] + len(a) * 10 + b[0] * 100 + len(b) * 1000 + t[-1] * 10000
+'''
+
+CHOSEN_ARGUMENT_READ = '''
+def h(a: list[int], b: list[int], c: bool) -> list[int]:
+    return a if c else b
+
+
+def root(n: int) -> int:
+    a = [1, 2]
+    b = [5, 6]
+    t = h(a, b, n > 2)
+    return t[0]
+'''
+
 PROGRAMS = {
+    "chosen_argument": CHOSEN_ARGUMENT,
+    "chosen_argument_read": CHOSEN_ARGUMENT_READ,
     "stored_argument": STORED_ARGUMENT,
     "stored_argument_annotated": STORED_ARGUMENT_ANNOTATED,
     "fresh_replicated": FRESH_REPLICATED,
