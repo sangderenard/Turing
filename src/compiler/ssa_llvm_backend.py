@@ -3609,6 +3609,34 @@ def _emit_repository_call_module(
                     None if formal_index is None
                     else function.args[formal_index]
                 )
+                if addressed is None and declared_formal is not None:
+                    # A physical member of this function's own sequence
+                    # descriptor is a caller-owned address by the table's
+                    # claim, whatever accounting a linking pass stamped on
+                    # the formal.  A constructor call (``Bag(a)``) hands the
+                    # caller's frame slots to ``__init__``, so the formal
+                    # carries ``linked_call_frame_storage`` and not the
+                    # ``compiler_frame_*`` identity; the descriptor still
+                    # names it.  The C emitter reads every shaped formal as
+                    # its buffer; this reads the same fact from the table.
+                    function_sequences = getattr(
+                        module, "sequence_tables", {},
+                    ).get(name)
+                    for descriptor in (
+                        () if function_sequences is None
+                        else function_sequences.sequences.values()
+                    ):
+                        if int(address_argument.id) in {
+                            int(member) for member in (
+                                *descriptor.column_value_ids,
+                                descriptor.length_address_id,
+                                descriptor.capacity_value_id,
+                                descriptor.status_address_id,
+                                descriptor.live_flags_value_id,
+                            ) if member is not None
+                        }:
+                            addressed = pointer(address_argument)
+                            break
                 if (
                     addressed is None
                     and declared_formal is not None
