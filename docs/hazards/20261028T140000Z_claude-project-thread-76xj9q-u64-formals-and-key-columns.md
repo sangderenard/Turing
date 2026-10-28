@@ -29,3 +29,24 @@
   8. When every callsite binds a formal to `None` (or omits it with a `None` default), its unpacked members never hold a value and join as nothing.
   9. A specialized copy's interval is met with its authored function's interval, because the copy runs a subset of the authored executions. A copy cannot see the callsites, but the authored proof can.
 - Measured: c796 gives the audit's exact error on main and passes here. The whole-core audit gets past value 78 and stops at the next one: "declared call storage for %t... (callee intern_batch) has no recorded dtype".
+
+## A loop return the late fold disproves (corpus c797)
+
+`validate_batch_envelope`'s `if not isinstance(offset, int) or
+isinstance(offset, bool): return 1, 0` sits in its offsets loop.  The loop
+is composed during deployment selection; only the hierarchy plan's later
+structural fold proves the branch false, removes the `1, 0` literals and
+revises the return site to `RETURN_SITE_UNREACHABLE`.  The loop's return
+block still named the removed literals, and control lowering minted them as
+untyped caller storage ("declared call storage ... has no recorded dtype").
+The SSA builder now reads the site's slot rows and emits no edge for a site
+the record calls unreachable.
+
+## A name rebound after a carried `while` (corpus c798)
+
+`while ...: checksum += x` then `checksum += 100; return checksum`.  The
+loop composer appended the loop's result port to `checksum`'s version
+history after the post-loop version, so the returned name resolved to the
+loop's exit value and the add was dropped with no error.  The port is now
+inserted right after the loop's last version of the name; its
+`name_binding` row still takes the next free row.
