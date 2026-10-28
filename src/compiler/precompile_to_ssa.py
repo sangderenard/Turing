@@ -232,6 +232,18 @@ _REGION_MARKER = re.compile(r"^__scheduled_region_(\d+)__$")
 _CALLSITE_MARKER = re.compile(r"^__plan_callsite_(\d+)__$")
 
 
+def _region_value_dtype(value_id, value_dtypes, existing, control_name):
+    """The dtype the region's value record carries, or a named refusal."""
+    declared = (value_dtypes or {}).get(value_id)
+    if declared is not None:
+        return declared
+    if existing is not None and existing.dtype is not None:
+        return existing.dtype
+    raise ValueError(
+        f"region value %{value_id} in {control_name} has a shape record but "
+        "no dtype record (value_dtypes and region_value_meta both lack it)")
+
+
 def _region_table_operations(
     region_index: int,
     table_region_operations: Mapping[int, Any] | None,
@@ -23607,7 +23619,7 @@ def _inject_field_slot_access(
     field_count: int,
     field_const_sources: Mapping[int, Any] | None = None,
     output_value_ids: tuple[int, ...] = (),
-    dtype: str = "float64",
+    dtype: str | None = None,
     field_dtypes: Mapping[int, str] | None = None,
     separate_field_storage: bool = False,
     field_accounting: Mapping[int, Mapping[str, Any]] | None = None,
@@ -23679,7 +23691,7 @@ def _inject_field_slot_access(
         SSA_VALUE, (_slot_scope, int(self_value_id)),
     )
 
-    def fresh(*causes: Any, value_dtype: str | None = None) -> int:
+    def fresh(*causes: Any, value_dtype: str) -> int:
         book = _slot_book()
         operand = (
             _receiver_cell if _receiver_cell is not None
@@ -23687,7 +23699,7 @@ def _inject_field_slot_access(
         )
         return _mint_ssa_id(
             book, _slot_scope, FIELD_SLOT_ACCESS, (operand, *causes),
-            dtype=dtype if value_dtype is None else value_dtype,
+            dtype=value_dtype,
             stage=CONTROL_SSA_FINISH,
         )
 
@@ -23766,7 +23778,7 @@ def _inject_field_slot_access(
                 raise ValueError("resident record field loads require exact separate slot locations")
             column_arrays[key] = resident_field_locations[int(key[1])][0]
             continue
-        arena_id = int(self_value_id) if index == 0 else fresh()
+        arena_id = int(self_value_id) if index == 0 else fresh(value_dtype=column_dtype)
         column_arrays[key] = SSAValue(
             arena_id, dtype=column_dtype,
             shape=(len(slots_by_column[key]),),
@@ -23840,7 +23852,7 @@ def _inject_field_slot_access(
         producer = producers[0]
         original = producer.res
         version = SSAValue(
-            fresh(),
+            fresh(value_dtype=original.dtype),
             dtype=original.dtype,
             shape=tuple(original.shape),
             device=original.device,
@@ -23878,7 +23890,7 @@ def _inject_field_slot_access(
         # it with the receiver dtype typed it ``bool`` on a bool-first
         # receiver, and Fortran refused ``logical + 1`` as an index.
         index = SSAValue(fresh(*causes, value_dtype="int64"), dtype="int64")
-        address = SSAValue(fresh(*causes))
+        address = SSAValue(fresh(*causes, value_dtype=slot_dtype))
         return (
             [
                 Instr("Const", [], index, attributes={"value": int(offset)}),
@@ -24078,7 +24090,7 @@ def _inject_field_slot_access(
             if literal is not None and flat[literal][1].op == "Const" and (
                 not flat[literal][1].args
             ):
-                source = SSAValue(fresh(*causes), dtype=slot_dtype)
+                source = SSAValue(fresh(*causes, value_dtype=slot_dtype), dtype=slot_dtype)
                 publish_row(source)
                 group.append(Instr(
                     "Const", [], source,
@@ -24302,6 +24314,12 @@ def _inject_field_slot_access(
     # and child-pool ABI arguments above retain their exact shapes and dtypes.
     for param_id in non_self_param_ids:
         if int(param_id) not in seen_argument_ids and int(param_id) not in field_read_ids:
+            if dtype is None:
+                raise ValueError(
+                    f"parameter value %{int(param_id)} is absent from the "
+                    f"lowered receiver method {control_function.name} and its "
+                    "dtype is not recorded"
+                )
             arguments.append(SSAValue(int(param_id), dtype=dtype))
             seen_argument_ids.add(int(param_id))
 
@@ -28905,10 +28923,7 @@ def lower_control_sections_to_ssa(
                 value_id,
                 tuple(existing.shape or ()) if existing is not None else (),
             )),
-            str((value_dtypes or {}).get(
-                value_id,
-                existing.dtype if existing is not None else "float64",
-            )),
+            str(_region_value_dtype(value_id, value_dtypes, existing, control_name)),
             existing.device if existing is not None else None,
         )
     # Keep the hierarchy's pre-rewrite dataflow as scheduling authority.  A
@@ -29478,13 +29493,41 @@ def lower_control_sections_to_ssa(
             + ", ".join(undeclared_scalar_fields)
             + f"; declared={tuple(sorted(declared_field_dtypes))!r}"
         )
+    # A receiver with no authored record declaration (``record_identity`` is
+    # None) settles each scalar slot's dtype from the values its field
+    # operations move: the read result / written value carry the settled
+    # dtype in the function.  Disagreement or absence is a named refusal.
+    _function_value_dtypes: dict[int, set[str]] = {}
+    for _block in control_function.blocks.values():
+        for _instruction in _block.instrs:
+            for _value in (*_instruction.args, _instruction.res):
+                if _value is not None and _value.dtype is not None:
+                    _function_value_dtypes.setdefault(
+                        int(_value.id), set()
+                    ).add(str(_value.dtype))
+    for _name in undeclared_scalar_fields:
+        _slot = field_names.index(_name)
+        _seen = set()
+        for _kind, _value_id, _op_slot in field_ops:
+            if int(_op_slot) == _slot:
+                _seen |= _function_value_dtypes.get(int(_value_id), set())
+        if len(_seen) != 1:
+            raise ValueError(
+                f"record scalar slot ABI lacks dtype in {control_function.name} "
+                f"for record {record_identity!r}: field {_name!r}; its field "
+                f"operations carry dtypes {tuple(sorted(_seen))!r}"
+            )
+        declared_field_dtypes[_name] = next(iter(_seen))
+    scalar_dtypes = set(scalar_dtypes) | {
+        declared_field_dtypes[name] for name in undeclared_scalar_fields
+    }
     receiver_scalar_dtype = (
-        sorted(scalar_dtypes)[0] if scalar_dtypes else "float64"
+        sorted(scalar_dtypes)[0] if len(scalar_dtypes) == 1 else None
     )
     scalar_slot_dtypes = {
         compact_slot[old_slot]: (
             "opaque_ref" if old_slot in reference_slots
-            else declared_field_dtypes.get(name, receiver_scalar_dtype)
+            else declared_field_dtypes[name]
         )
         for old_slot, name in enumerate(field_names)
         if old_slot in compact_slot

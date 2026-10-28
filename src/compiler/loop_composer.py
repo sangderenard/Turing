@@ -1131,6 +1131,31 @@ def evaporate_unrolled_loops(
         loop_id = int(plan.loop.node_id)
         if loop_id in handled_loop_ids:
             continue
+        # Program: ``d = {1: 5, 2: 6}; for i in range(1): d[3] = n + i;
+        # del d[2]`` then ``len(d)`` (corpus c711).  Wrong record: unrolling
+        # copies the body's values and collection effects, and a keyed
+        # ``del`` is neither (it produces no value and is no state effect),
+        # so the pruning below deleted it and the key stayed (3 for 2).
+        # Rule: a loop whose body holds a keyed delete is not unrolled; the
+        # retained loop runs the delete where the body states it.
+        # The same holds for a dict ``pop`` statement, a keyed delete.
+        from .resident_sequence_materialization import (
+            _discarded_dict_pop,
+            _loop_carried_storage_aliases,
+        )
+
+        storage_aliases = _loop_carried_storage_aliases(graph.G)
+        if any(
+            int(node_id) in graph.G
+            and (
+                graph.G.nodes[int(node_id)].get("type") == "DelItem"
+                or _discarded_dict_pop(
+                    graph.G, int(node_id), storage_aliases,
+                ) is not None
+            )
+            for node_id in plan.loop.body_nodes
+        ):
+            continue
         group = nested_groups.get(loop_id)
         if group is not None and plan is not group[0]:
             continue

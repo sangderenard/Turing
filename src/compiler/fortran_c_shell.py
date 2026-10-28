@@ -6559,6 +6559,12 @@ def _canonical_program_abi_type_identity(
     # resolve through the record table.
     if canonical in _BUILTIN_PRIMITIVE_TYPE_IDENTITIES:
         return canonical
+    # ``Precision`` is a numeric value type with no ProgramABI record, so
+    # the record table cannot join its two spellings: an annotation names
+    # it ``Precision`` and a contract ``src.common.tensors.
+    # extended_precision.Precision``. Both are one type, never a union.
+    if canonical == "src.common.tensors.extended_precision.Precision":
+        return "Precision"
     return _program_abi_record_for_type_identity(
         canonical, program_abi,
     ) or canonical
@@ -61433,6 +61439,13 @@ def _lower_ast_source_to_ssa_impl(
             return None
 
         def _numeric_descriptor_element(descriptor: Any) -> str:
+            # A precision numeral's coefficients are limbs, and the limb
+            # element is stated by the precision library itself.
+            if "precision" in set(map(str, descriptor.features)):
+                from ..common.tensors.extended_precision import (
+                    limb_element_name,
+                )
+                return limb_element_name(descriptor.element_type)
             if not descriptor.element_type:
                 raise ValueError(
                     f"numeric descriptor {descriptor.type_name!r} records no "

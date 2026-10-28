@@ -146,9 +146,11 @@ def _load_cached_network(directory: Path, *, batch: int, in_dim: int,
                 or payload.get("build_fingerprint") != _compiler_fingerprint()
                 or payload.get("network", {}).get("dendrites_per_neuron") != branches):
             return None
+        if any("dtype" not in port for port in payload["inputs"]):
+            return None  # manifest predates recorded port dtypes: a miss
         inputs = tuple(TensorPort(
             port["name"], int(port["value_id"]), tuple(port["shape"]),
-            port["role"], port.get("dtype", "float64"),
+            port["role"], port["dtype"],
             port.get("layout", "row-major-contiguous"))
             for port in payload["inputs"])
         ports = {port.name: port for port in inputs}
