@@ -464,6 +464,30 @@ METHOD_RETURN_ANNOTATION = declare_page("method_return_annotation", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
     RowField("method", K.NAME),
 ), str)
+#: One known call of a function, supplied from outside the source (the
+#: root-call contract: a harness or host is the caller).  Fact: a tuple of
+#: ``(formal, class)`` pairs, the exact Python class of each argument.
+#: Novel(CONTRACT_DEMAND): the contract row is the only source.  Mode CONCORD.
+ROOT_CALL_RECORD = declare_page("root_call_record", (
+    RowField("function_identity", K.NAME), RowField("ordinal", K.INDEX),
+), tuple)
+#: What the CALLERS of a function pass for one formal.  The compiler takes
+#: this inventory itself: every call record (an internal call edge's actual,
+#: or a root-call contract row a caller of the entry supplies) that reaches
+#: the formal contributes the exact Python class of its argument.  The fact
+#: is exactly the classes found -- never wider; an empty inventory is a
+#: named refusal at the reader, never a default.  ``selected`` is the one
+#: class this lowering's specialized copy of the function is built for
+#: (None while the inventory has a single class).  Mode REVISE.
+@dataclass(frozen=True)
+class CalledInventoryFact:
+    classes: tuple          # exact class spellings, sorted, e.g. ("float", "int")
+    selected: str | None    # the class this specialized copy lowers
+
+
+CALLED_INVENTORY = declare_page("called_inventory", (
+    RowField("function_identity", K.NAME), RowField("formal", K.NAME),
+), CalledInventoryFact)
 SCALAR_PARAMETER = declare_page("scalar_parameter", (
     RowField("scope", K.SCOPE), RowField("input_id", K.VALUE_ID),
 ), ValueKind)

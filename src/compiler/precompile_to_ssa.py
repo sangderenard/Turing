@@ -301,6 +301,9 @@ def _table_operation_sequence_accesses(
         reads.add(int(arguments[2]))
     elif kind in ("row_load", "row_load_capture"):
         reads.add(int(arguments[1]))
+        # The loaded row of a list of lists is a sequence: ``len(g[i])``
+        # reads it, so it follows the load that selects it.
+        writes.add(int(arguments[0]))
     elif kind == "row_store":
         writes.add(int(arguments[1]))
     elif kind == "store":
@@ -337,6 +340,12 @@ def _table_operation_value_reads(
         return {int(value) for value in arguments[2:4] if value is not None}
     if kind == "append_scalar":
         return {int(arguments[1])}
+    # Program: ``len(g[i])`` over a list of lists (corpus c800).  Wrong
+    # record: a row load whose region held nothing else read no value, so it
+    # was scheduled before the region that computes ``i``.  Rule: a row load
+    # reads its runtime index.
+    if kind in ("row_load", "row_load_capture"):
+        return {int(arguments[2])} if arguments[3] is None else set()
     return set()
 
 
@@ -3307,6 +3316,11 @@ class _ControlSSABuilder(TiledObject):
         collect_handle_merges(program.root)
 
         for sequence_id, policy, column_count, writable in sequence_declarations:
+            # A row of a list of lists is selected by its row load, which
+            # builds its descriptor where it runs (``len(g[i])``, corpus
+            # c800); declared here it would load before its index exists.
+            if int(sequence_id) in (consumer_row_loads or {}):
+                continue
             committed = commit_sequence_contract(
                 function_name,
                 int(sequence_id),
@@ -3542,6 +3556,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={"binding": "ssa_joined_sequence_initialize"},
             )
         for sequence_id, policy, column_count in sequence_initializations:
+            if int(sequence_id) in (consumer_row_loads or {}):
+                continue
             literal_table_rows = None
             descriptor_policy = (
                 "duplicates"
@@ -5003,6 +5019,12 @@ class _ControlSSABuilder(TiledObject):
                 f"sequence {sequence_id} is declared read-only",
             ))
             return
+        # A selected pool row's columns are the slice addresses built where
+        # the row was selected (see ``_emit_sequence_row_load``).
+        selected_row = (
+            int(sequence_id) in self.child_table_selections
+            and int(sequence_id) in self.sequence_storage_values
+        )
         index = self._sequence_row_index(
             int(sequence_id), int(index_id), index_literal
         )
@@ -5014,7 +5036,10 @@ class _ControlSSABuilder(TiledObject):
             # the other payloads or inventing a temporary row allocation.
             if value_id is None:
                 continue
-            column_value = self.external_value(int(column_id))
+            column_value = (
+                self.sequence_storage_values[int(sequence_id)][int(column)]
+                if selected_row else self.external_value(int(column_id))
+            )
             address = self.fresh_value(
                 dtype="ptr", transform=ADDRESS, operands=(column_value, index),
             )
@@ -5039,7 +5064,9 @@ class _ControlSSABuilder(TiledObject):
             )
         if all(value_id is not None for value_id in row_value_ids):
             self._bind(
-                int(result_id), self.external_value(int(sequence_id)),
+                int(result_id),
+                self.sequence_storage_values[int(sequence_id)][0] if selected_row
+                else self.external_value(int(sequence_id)),
                 BindingKind.SEQUENCE_RESULT,
                 self._sequence_contract_cell(int(sequence_id)), index,
             )
@@ -9451,6 +9478,121 @@ class _ControlSSABuilder(TiledObject):
             self._function_exit = self.new_block("function_exit")
         return self._function_exit
 
+    def _cast_on_edge(
+        self, block: BasicBlock, value: SSAValue, dtype: str,
+    ) -> SSAValue:
+        """``value`` converted to ``dtype`` at the end of ``block``.
+
+        The conversion is emitted before ``block``'s terminator, so it is
+        the merge's incoming value on that edge.  A value already of
+        ``dtype``, or one with no class (an absent arm), is returned as is.
+        """
+
+        if (
+            value.dtype in {None, "unknown", "none", "None"}
+            or str(value.dtype) == str(dtype)
+        ):
+            return value
+        widened = self.fresh_value(
+            dtype=str(dtype), transform=CONTROL_CAST, operands=(value,),
+        )
+        self.current = block
+        terminator = block.instrs.pop()
+        self.emit(
+            Handler.Cast, [value], widened,
+            attributes={"target_dtype": str(dtype)},
+        )
+        block.instrs.append(terminator)
+        return widened
+
+    _NUMERIC_CLASS = {
+        "bool": "bool", "int": "int", "int32": "int", "int64": "int",
+        "float": "float", "float16": "float", "float32": "float",
+        "float64": "float", "double": "float",
+    }
+
+    def _numeric_join(self, values: Iterable[SSAValue]) -> str | None:
+        """The class a scalar numeric join of ``values`` has, or ``None``.
+
+        The planner's branch-join rule (``_value_shape_dtype``, ``phi``):
+        the widest float when any arm is float, int64 when the arms are
+        ints and bools.  Absent arms (``None``) state nothing.  Shaped or
+        non-numeric arms, or arms that already agree, answer ``None``.
+        """
+
+        present = tuple(
+            value for value in values
+            if value.dtype not in {None, "unknown", "none", "None"}
+        )
+        dtypes = {str(value.dtype) for value in present}
+        if (
+            len(dtypes) < 2
+            or any(tuple(value.shape or ()) for value in present)
+            or not dtypes <= set(self._NUMERIC_CLASS)
+        ):
+            return None
+        floats = tuple(
+            {"float": "float64", "double": "float64"}.get(dtype, dtype)
+            for dtype in dtypes if self._NUMERIC_CLASS[dtype] == "float"
+        )
+        if floats:
+            from ..common.tensors.topological_reducer import _widest_element
+
+            return _widest_element(*floats) or "float64"
+        return "int64"
+
+    def _numeric_join_arms(
+        self,
+        dtype: str | None,
+        arms: tuple[tuple[BasicBlock, SSAValue], ...],
+    ) -> tuple[SSAValue, ...]:
+        """A scalar numeric join's arms, each in the join's class ``dtype``.
+
+        Program: ``if c == 2: s = n else: s = n * 0.5; return s + 0.25``
+        (corpus c770).  The join's class is the planner's (the widest float
+        when an arm is float), and an int arm entered the Phi as an int:
+        C converted it implicitly, LLVM refused the Phi.  Rule: an arm of
+        a narrower numeric class converts on its own edge; an arm of a
+        wider class than the join is refused, never narrowed.  Anything
+        but scalar int/bool/float arms is left as it is.
+        """
+
+        numeric_class = self._NUMERIC_CLASS
+        absent = {"None", "unknown", "none"}
+        values = tuple(value for _block, value in arms)
+        merged_class = numeric_class.get(str(dtype))
+        if (
+            merged_class is None
+            or any(tuple(value.shape or ()) for value in values)
+            or not all(
+                str(value.dtype) in numeric_class or str(value.dtype) in absent
+                for value in values
+            )
+        ):
+            return values
+        rank = {"bool": 0, "int": 1, "float": 2}
+        narrowed = tuple(
+            str(value.dtype) for value in values
+            if str(value.dtype) in numeric_class
+            and rank[numeric_class[str(value.dtype)]] > rank[merged_class]
+        )
+        if narrowed:
+            # A conversion here would drop what Python keeps (3.5 -> 3).
+            raise ValueError(
+                f"{self.function_name}: a scalar join of class {dtype!r} "
+                f"has arms of a wider class {narrowed!r}; no record "
+                "settles the join's class to hold them"
+            )
+        current = self.current
+        converted = tuple(
+            self._cast_on_edge(block, value, str(dtype))
+            if numeric_class.get(str(value.dtype), merged_class)
+            != merged_class else value
+            for block, value in arms
+        )
+        self.current = current
+        return converted
+
     def _value_dominates_block(
         self, value: SSAValue, current_name: str,
     ) -> bool:
@@ -11466,6 +11608,18 @@ class _ControlSSABuilder(TiledObject):
                     "a selected row view from another conditional needs an explicit merged physical view",
                 ))
                 return None
+        if (
+            selected is not None
+            and selected[0].shape_value_id is None
+            and value_id in self.sequence_descriptors
+            and value_id in self.sequence_storage_values
+        ):
+            # Program: ``g = [[1, 2], [3]]; len(g[i])`` (corpus c800).  Wrong
+            # record: a query asked again for a row view the row load had
+            # built, and the general path below minted its length and
+            # capacity cells a second time, never emitted (length 0).  Rule:
+            # a selected row has one view; later requests read it.
+            return self.sequence_descriptors[value_id]
         if selected is not None and selected[0].shape_value_id is None and value_id not in self.sequence_descriptors:
             # ``d.setdefault(k, []).append(v)``: the returned collection is
             # exactly the selected pool row. Allocating an arena for this
@@ -12632,6 +12786,11 @@ class _ControlSSABuilder(TiledObject):
             self._emit_sequence_membership(*arguments)
             return
         sequence_id = int(query.sequence_value_id)
+        # A queried row of a list of lists is selected by its row load, which
+        # runs where the row is first asked for: here (corpus c800).
+        row_load = self.consumer_row_loads.pop(sequence_id, None)
+        if row_load is not None and sequence_id not in self.external_values:
+            self._emit_sequence_row_load(*row_load)
         selected_extent = self.selected_child_extent_values.get(sequence_id)
         if selected_extent is not None and query.operation in {"length", "truth"}:
             result = self.produced_value(int(query.result_value_id),
@@ -18343,7 +18502,21 @@ class _ControlSSABuilder(TiledObject):
                 cause=(true_value, false_value, predicate),
             )
             if merged.dtype in {None, "unknown"}:
-                merged.dtype = true_value.dtype or false_value.dtype
+                # Program: ``if c == 2: s = n else: s = n * 0.5`` (corpus
+                # c770).  Wrong record: the merge took its TRUE arm's class,
+                # so a float arm could be narrowed to int64.
+                # Rule: a scalar numeric join promotes (``_numeric_join``).
+                merged.dtype = self._numeric_join(
+                    (true_value, false_value),
+                ) or true_value.dtype or false_value.dtype
+            join_arms = (true_value, false_value)
+            true_value, false_value = self._numeric_join_arms(
+                merged.dtype if not tuple(merged.shape or ()) else None,
+                ((true_exit, true_value), (false_exit, false_value)),
+            )
+            # An arm converted to the join's class: where Python could tell
+            # the classes apart, ``ssa_numeric_joins`` refuses the join.
+            numeric_join_promoted = (true_value, false_value) != join_arms
             if (
                 int(result_id) not in self.region_value_meta
                 and tuple(true_value.shape) == tuple(false_value.shape)
@@ -18357,6 +18530,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_result",
+                    **({"numeric_join_promoted": True}
+                       if numeric_join_promoted else {}),
                     # The merge of a short-circuit operator IS the operator.
                     **({
                         "structural_operation": "boolop",
@@ -22477,6 +22652,43 @@ class _ControlSSABuilder(TiledObject):
                      if value.dtype not in {None, "unknown", "none"}),
                     str(incoming_values[0].dtype or "unknown"),
                 )
+                # Program: ``def pick(n, c): if c == 2: return n; return n *
+                # 0.5`` read as ``pick(n, c) + 0.25`` (corpus c772, c773).
+                # Wrong record: the exit merge took its FIRST return's
+                # dtype, so the float arm was stored into an int64 slot (3.5
+                # became 3); with a ``None`` arm too, the mismatched
+                # payloads left the optional unlowered and its presence was
+                # lost.  Rule:
+                # scalar returns of differing numeric class merge as a
+                # branch join does (``_value_shape_dtype``'s ``phi`` rule):
+                # the widest float when any arm is float, int64 when the
+                # arms are ints and bools.  Any other disagreement is named.
+                merge_dtypes = {
+                    str(value.dtype) for value in incoming_values
+                    if value.dtype not in {None, "unknown", "none", "None"}
+                }
+                numeric_join_promoted = False
+                if len(merge_dtypes) > 1:
+                    promoted = self._numeric_join(incoming_values)
+                    if promoted is not None:
+                        dtype = promoted
+                        numeric_join_promoted = True
+                        incoming_values = list(self._numeric_join_arms(
+                            dtype, tuple(
+                                (block, value)
+                                for (block, _values), value in zip(
+                                    edges, incoming_values, strict=True,
+                                )
+                            ),
+                        ))
+                        self.current = exit_block
+                    else:
+                        self.shortfalls.append(SSALoweringShortfall(
+                            "control", "return_arms_dtype_disagree",
+                            f"{self.function_name}.return_slot[{slot}]",
+                            "return statements disagree on the slot's "
+                            f"physical class: {tuple(sorted(merge_dtypes))!r}",
+                        ))
                 member_phi = (
                     record_kind is ReturnArmsKind.OPTIONAL_AGGREGATE
                     and len(edges) > 1
@@ -22522,6 +22734,8 @@ class _ControlSSABuilder(TiledObject):
                             "incoming_blocks": tuple(incoming_blocks),
                             "binding": "return_merge",
                             "return_slot_index": slot,
+                            **({"numeric_join_promoted": True}
+                               if numeric_join_promoted else {}),
                             **(
                                 {"return_arm_absent": tuple(incoming_absent)}
                                 if member_phi else {}
@@ -24963,6 +25177,7 @@ def _schedule_loop_callsites(
     pure_region_indices: frozenset[int] = frozenset(),
     table_region_operations: Mapping[int, Any] | None = None,
     table_region_post_operations: Mapping[int, Any] | None = None,
+    row_load_reads: Mapping[int, tuple[int, ...]] | None = None,
 ) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
     """Install this closure's PlanCalls as ordinary scheduled statements.
 
@@ -25447,6 +25662,13 @@ def _schedule_loop_callsites(
                     # generator query has a separate, explicit producer.
                     *((int(block.sequence_value_id),)
                       if block.producer_loop_node_id is not None else ()),
+                    # Program: ``len(g[i])`` over a list of lists (corpus
+                    # c800).  The queried row is selected by a row load that
+                    # no region owns, so the query is the load's consumer:
+                    # it reads the load's sequence and index.
+                    *map(int, (row_load_reads or {}).get(
+                        int(block.sequence_value_id), ()
+                    )),
                     *(
                         () if block.default_value_id is None
                         else (int(block.default_value_id),)
@@ -28242,6 +28464,30 @@ def lower_control_sections_to_ssa(
                 if instruction.res is not None
                 and int(instruction.res.id) in row_store_by_result
             )
+            # Program: ``g[i][1] = v; g[1][0] = g[i][1] + 1`` (corpus c740).
+            # Wrong record: every row load ran before every row store, so a
+            # read after a store saw the old element.  Rule: loads and stores
+            # run in the region's own instruction order, a row's selecting
+            # load placed before its first user.
+            _position = {
+                int(instruction.res.id): index
+                for index, instruction in enumerate(instructions)
+                if instruction.res is not None
+            }
+            _keys = {
+                int(operation[0]): float(_position.get(int(operation[0]), 0))
+                for operation in (*row_loads, *row_stores)
+            }
+            for _ in range(len(_keys) + 1):
+                for operation in (*row_loads, *row_stores):
+                    selector = int(operation[1])
+                    if selector in _keys and _keys[selector] >= _keys[int(operation[0])]:
+                        _keys[selector] = _keys[int(operation[0])] - 0.5
+            _merged = sorted(
+                [("load", operation) for operation in row_loads]
+                + [("store", operation) for operation in row_stores],
+                key=lambda item: _keys[int(item[1][0])],
+            )
             if row_loads or row_stores:
                 removed_results = {
                     int(operation[0]) for operation in (*row_loads, *row_stores)
@@ -28271,21 +28517,27 @@ def lower_control_sections_to_ssa(
                         if instruction.res is None
                         or int(instruction.res.id) not in dead_constants
                     ]
-                for operation in row_loads:
-                    result_id = int(operation[0])
-                    table_region_operations.setdefault(
-                        region_index, []
-                    ).append((
-                        "row_load_capture" if instructions else "row_load",
-                        operation,
-                    ))
-                for operation in row_stores:
+                for role, operation in _merged:
+                    if role == "load":
+                        table_region_operations.setdefault(
+                            region_index, []
+                        ).append((
+                            "row_load_capture" if instructions else "row_load",
+                            operation,
+                        ))
+                        continue
                     result_id, sequence_id = map(int, operation[:2])
                     # Whole-row assignment returns the sequence; a sparse
                     # column assignment retains its already-concorded row
                     # view. Rebinding Store12 from Indexed11 to Sequence10
                     # would publish a second identity for the same effect.
-                    if all(value is not None for value in operation[4]):
+                    # A row of a born list of lists already resolves, by the
+                    # graph, to the list that owns the row (``g[i][1] = v``
+                    # versions ``g``); its row view is not a second identity.
+                    if all(value is not None for value in operation[4]) and (
+                        value_concordance.resolve_alias(control_name, result_id)
+                        == result_id
+                    ):
                         bind_resident(result_id, sequence_id)
                     table_region_operations.setdefault(
                         region_index, []
@@ -29509,6 +29761,39 @@ def lower_control_sections_to_ssa(
         from .identity_concordance import current_identity_book
 
         item_operand_page = current_identity_book().page("item_operand")
+    def retained_lookup_ids(block):
+        if isinstance(block, SequenceQueryBlock) and block.operation == "lookup":
+            yield int(block.result_value_id)
+        for child in getattr(block, "blocks", ()):
+            yield from retained_lookup_ids(child)
+        for name in ("condition", "body", "orelse", "callee"):
+            child = getattr(block, name, None)
+            if child is not None:
+                yield from retained_lookup_ids(child)
+
+    retained_table_lookup_ids = set(retained_lookup_ids(control.root))
+    scheduled_lookup_ids = {
+        int(operation[0])
+        for operations in (
+            *table_region_operations.values(),
+            *table_region_post_operations.values(),
+        )
+        for kind, operation in operations
+        if str(kind) in {"lookup", "lookup_capture"}
+    }
+    # Lookups the control tree retains or a loop owns are placed there.
+    unplaced_lookup_ids = {
+        int(result_id)
+        for result_id, query_ids, _sequence_id in table_lookups
+        if int(result_id) not in scheduled_lookup_ids
+        and int(result_id) not in retained_table_lookup_ids
+        and not any(
+            int(key) in (table_lookup_loop_owners or {})
+            for key in (
+                query_ids if isinstance(query_ids, tuple) else (query_ids,)
+            )
+        )
+    }
     for region_index, instructions in planned_region_instructions.items():
         # Program: ``xs1 = [4, n]; xs1[0] += n; return xs1[0]`` (fuzzer
         # p25_25; corpus c273).  Wrong record: the store's region spelled
@@ -29567,19 +29852,46 @@ def lower_control_sections_to_ssa(
                 if read_id is not None
             ),
         )))
+        # An unscheduled captured lookup likewise reads its key: ``self._d.get(k +
+        # 7, -1)`` needs the region producing ``k + 7`` first.
+        consumed = tuple(dict.fromkeys((
+            *consumed,
+            *(
+                int(query)
+                for value_id in consumed
+                if int(value_id) in unplaced_lookup_ids
+                for lookup in (lookup_by_result.get(int(value_id)),)
+                if lookup is not None
+                for query in (
+                    lookup[1] if isinstance(lookup[1], (tuple, list))
+                    else (lookup[1],)
+                )
+                if isinstance(query, int)
+            ),
+        )))
         region_dependency_signatures[int(region_index)] = (consumed, produced)
 
-    def retained_lookup_ids(block):
-        if isinstance(block, SequenceQueryBlock) and block.operation == "lookup":
-            yield int(block.result_value_id)
-        for child in getattr(block, "blocks", ()):
-            yield from retained_lookup_ids(child)
-        for name in ("condition", "body", "orelse", "callee"):
-            child = getattr(block, name, None)
-            if child is not None:
-                yield from retained_lookup_ids(child)
+    # Program: ``self._d[k] = v`` then ``return self._d.get(k + 7, -1) +
+    # len(self._d)`` in a method.  Wrong record: no region scheduled the
+    # lookup (its receiver is a record field, not a region value), so the
+    # prologue emitted it at entry, before its key's region and before the
+    # store it must observe; the final audit refused the read before the
+    # definition.  Rule: an unscheduled lookup a region captures is emitted
+    # with the first such region, as that region's captured lookup.
+    for result_id, lookup in sorted(lookup_by_result.items()):
+        if result_id not in unplaced_lookup_ids:
+            continue
+        consumers = sorted(
+            int(region_index)
+            for region_index, (consumed, _produced)
+            in region_dependency_signatures.items()
+            if int(result_id) in consumed
+        )
+        if consumers:
+            table_region_operations.setdefault(consumers[0], []).append((
+                "lookup_capture", lookup,
+            ))
 
-    retained_table_lookup_ids = set(retained_lookup_ids(control.root))
     region_scheduled_lookup_ids = {
         int(operation[0])
         for operations in (
@@ -29621,6 +29933,13 @@ def lower_control_sections_to_ssa(
         callsite_projection_ids=callsite_projection_ids,
         callsite_stored_argument_ids=callsite_stored_argument_ids,
         sequence_length_values=sequence_length_values,
+        row_load_reads={
+            int(result): tuple(
+                int(read) for read in (operation[0], operation[1])
+                if read is not None
+            )
+            for result, operation in row_load_by_result.items()
+        },
         pure_region_indices=frozenset(
             index for index, instructions in planned_region_instructions.items()
             if all(instruction.op in _PURE_REGION_OPS for instruction in instructions)

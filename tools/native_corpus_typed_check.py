@@ -144,33 +144,64 @@ def disagreements(inputs, c_values, other_values):
     ]
 
 
+def _unannotated_formals(src):
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "root":
+            a = node.args
+            return [x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs) if x.annotation is None]
+    return []
+
+
 def main():
     for path in sorted(pathlib.Path(sys.argv[1]).glob("c*.py")):
         src = path.read_text()
         inputs = ast.literal_eval(src.split("# INPUTS", 1)[1].strip())
-        # A class defined with no __name__ gets __module__ "builtins", which
-        # sends the static-binding walk through the builtins module itself.
         ns = {"__name__": "corpus_" + path.stem}
         exec(compile(src, str(path), "exec"), ns)
         expects = [ns["root"](**feeds) for feeds in inputs]
+        # The harness IS the caller: for formals the program leaves
+        # unannotated, each INPUTS row is a root call record whose argument
+        # classes feed the compiler's called inventory.  One exact-typed
+        # specialized copy of the entry is lowered per distinct class
+        # signature; annotated formals are untouched.
+        free = _unannotated_formals(src)
+        if not free:
+            check_group(path, src, inputs, expects, None)
+            continue
+        from src.compiler.called_inventory import class_spelling
+        groups = {}
+        for feeds, expect in zip(inputs, expects):
+            sig = tuple((k, class_spelling(feeds[k])) for k in sorted(free))
+            groups.setdefault(sig, []).append((feeds, expect))
+        calls = [{k: f[k] for k in free} for f in inputs]
+        for sig, rows in groups.items():
+            label = path.stem + ("[" + ",".join(c for _, c in sig) + "]")
+            check_group(path, src, [r[0] for r in rows], [r[1] for r in rows],
+                        (calls, dict(sig)), label)
+
+
+def check_group(path, src, inputs, expects, inventory, label=None):
+    if True:
+        label = label or path.stem
         try:
-            module, _, exports = lower_ast_source_to_ssa(src, "root", name="corpus_" + path.stem, extraction_contract=ROOT + "/extraction_contracts/program_extraction.yaml", progress=lambda _: None)
+            module, _, exports = lower_ast_source_to_ssa(src, "root", name="corpus_" + path.stem + ("" if inventory is None else "__" + "_".join(inventory[1].values())), extraction_contract=ROOT + "/extraction_contracts/program_extraction.yaml", progress=lambda _: None, **({} if inventory is None else dict(root_calls=inventory[0], root_signature=inventory[1])))
         except Exception as e:
-            print(f"{path.stem}: LOWER-FAIL {type(e).__name__}: {str(e)[:300]}"); continue
+            print(f"{label}: LOWER-FAIL {type(e).__name__}: {str(e)[:300]}"); return
         rep = " ".join(l.strip() for l in concordance_report(module, limit=3).splitlines()[:1] + [l for l in concordance_report(module, limit=3).splitlines() if l.startswith("     ")][:2])
         try:
             root = module.functions[exports[0]]
             params = dict(root.metadata['parameter_names'])
             from src.compiler.project_compilation_product import _unexplained_root_argument_ids
             if _unexplained_root_argument_ids(root):
-                print(f"{path.stem}: PRODUCT-REFUSES unexplained root inputs {_unexplained_root_argument_ids(root)} | {rep}"); continue
+                print(f"{label}: PRODUCT-REFUSES unexplained root inputs {_unexplained_root_argument_ids(root)} | {rep}"); return
             outs = [i.args for b in root.blocks.values() for i in b.instrs if i.op == 'Ret'][0]
             art = emit_ssa_to_c(module, exports[0])
             if not art.complete:
-                print(f"{path.stem}: EMIT-INCOMPLETE {art.shortfalls[:2]} | {rep}"); continue
+                print(f"{label}: EMIT-INCOMPLETE {art.shortfalls[:2]} | {rep}"); return
             d = pathlib.Path(tempfile.mkdtemp()); art.compile(d / "native")
         except Exception as e:
-            print(f"{path.stem}: EMIT-FAIL {type(e).__name__}: {str(e)[:300]} | {rep}"); continue
+            print(f"{label}: EMIT-FAIL {type(e).__name__}: {str(e)[:300]} | {rep}"); return
         results = []
         c_values = []
         for feeds, expect in zip(inputs, expects):
@@ -185,19 +216,19 @@ def main():
                 c_values.append(None)
                 results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
         bad = [r for r in results if r != "ok"]
-        print(f"{path.stem}: {'PASS' if not bad else 'FAIL'} {bad[:3]} | {rep}")
+        print(f"{label}: {'PASS' if not bad else 'FAIL'} {bad[:3]} | {rep}")
         if "llvm" in BACKENDS:
             verdict, llvm_values = run_isolated(run_llvm, module, exports[0], params, outs, inputs, expects)
-            print(f"{path.stem}: LLVM {verdict}")
+            print(f"{label}: LLVM {verdict}")
             found = disagreements(inputs, c_values, llvm_values or ())
             if found:
-                print(f"{path.stem}: DISAGREE c/llvm {found[:2]}")
+                print(f"{label}: DISAGREE c/llvm {found[:2]}")
         if "fortran" in BACKENDS:
             verdict, fortran_values = run_isolated(run_fortran, module, exports[0], params, outs, inputs, expects)
-            print(f"{path.stem}: FORTRAN {verdict}")
+            print(f"{label}: FORTRAN {verdict}")
             found = disagreements(inputs, c_values, fortran_values or ())
             if found:
-                print(f"{path.stem}: DISAGREE c/fortran {found[:2]}")
+                print(f"{label}: DISAGREE c/fortran {found[:2]}")
 
 
 if __name__ == "__main__":

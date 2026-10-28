@@ -2408,6 +2408,21 @@ def emit_ssa_module_to_c(
         )) is not None
     )
 
+    # Program: ``def f(x, y): return (x * y).sum()`` over runtime-sized
+    # spans.  The product crosses a region boundary as a runtime-sized span:
+    # its producer's caller sizes it, and its reducer counts it, from the
+    # extents array, so both carry it.
+    extent_users.update(
+        owner for owner in reachable
+        for block in module.functions[owner].blocks.values()
+        for instruction in block.instrs
+        if any(
+            _runtime_sized_span(value)
+            for value in (*instruction.args, instruction.res)
+            if value is not None
+        )
+    )
+
     def _extent_needs_runtime(owner: str, instruction) -> bool:
         """Whether an ``extent`` op will read the runtime extents array.
 
@@ -3056,7 +3071,21 @@ def emit_ssa_module_to_c(
                     # typed a double callee result as one byte).
                     element_type = solved_buffer_type(record.callee, output)
                     shape = tuple(output.shape or ())
-                    if shape:
+                    runtime_slot = (
+                        extent_slot(
+                            record.callee, int(output.id), "element_count", None,
+                        )
+                        if not shape and _runtime_sized_span(output) else None
+                    )
+                    if runtime_slot is not None:
+                        # A runtime-sized span result is owned storage of
+                        # its element count, never one scalar slot.
+                        storage = runtime_activation_array(
+                            element_type, f"extents[{runtime_slot}]",
+                        )
+                        projected_expression = storage
+                        projected_address = storage
+                    elif shape:
                         count = math.prod(shape)
                         requirement = storage_requirements_by_function.get(
                             record.callee, {}
@@ -3421,6 +3450,120 @@ def emit_ssa_module_to_c(
             object_expressions[id(result)] = destination
             object_addresses[id(result)] = destination
             address_buffer_types[result_id] = result_type
+
+        def emit_axis_reduction(instruction, op: str) -> bool:
+            """``x.sum(axis=k)`` (and prod/mean/max/min) over a static shape.
+
+            Program: ``def f(y): return y.max(axis=0)`` with y (2, 3).
+            Rule: one result per lane of the kept axes, row-major, folded
+            along axis k in index order; max/min take numpy's rule (a NaN
+            in the lane is the lane's result). Returns False when this is
+            not an axis reduction, True once spelled or refused by name.
+            """
+
+            axis = instruction.attributes.get("axis")
+            if axis is None:
+                axis = instruction.attributes.get("dim")
+            if axis is None or not instruction.args:
+                return False
+            source_value = instruction.args[0]
+            shape = tuple(source_value.shape or ())
+            if not shape and not int(
+                (source_value.accounting or {}).get("program_abi_rank") or 0
+            ):
+                # builtin ``min(n, 3)`` carries its second operand as
+                # ``dim``; a scalar has no axis to reduce.
+                return False
+            result = instruction.res
+            if isinstance(axis, (list, tuple)) or not shape or not all(
+                isinstance(item, int) for item in shape
+            ) or not isinstance(axis, int):
+                shortfalls.append(CEmissionShortfall(
+                    op, f"{op} over axis {axis!r} of %t{source_value.id} "
+                    f"(shape {shape!r}) needs one integer axis of a static "
+                    f"shape in {fn}",
+                ))
+                return True
+            rank = len(shape)
+            if not -rank <= axis < rank:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"axis {axis} is out of range for shape {shape!r} in {fn}",
+                ))
+                return True
+            axis %= rank
+            length = shape[axis]
+            outer = math.prod(shape[:axis])
+            inner = math.prod(shape[axis + 1:])
+            if math.prod(tuple(result.shape or ())) != outer * inner:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"{op} over axis {axis} of {shape!r} gives "
+                    f"{outer * inner} values but %t{result.id} holds "
+                    f"{tuple(result.shape or ())!r} in {fn}",
+                ))
+                return True
+            if length == 0 and op in {"max", "min"}:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"{op} over an empty axis raises (numpy: zero-size "
+                    f"array) in {fn}",
+                ))
+                return True
+            source = address_operand(source_value)
+            if source is None:
+                return True
+            result_id = int(result.id)
+            result_type = buffer_type(result)
+            floating = not _is_integer_dtype(result.dtype)
+            accumulator_type = "double" if floating else result_type
+            rows = f"((const {buffer_type(source_value)} *)({source}))"
+            lane = f"ax_l_{result_id}"
+            step = f"ax_k_{result_id}"
+            at = (
+                f"({lane} / {inner}) * {length * inner} + ({lane} % {inner})"
+                f" + {step} * {inner}"
+            )
+            element = f"({accumulator_type}){rows}[{at}]"
+            if op in {"max", "min"}:
+                rule = max_step_rule(instruction) or NUMPY
+                first = (
+                    f"({accumulator_type}){rows}[({lane} / {inner}) * "
+                    f"{length * inner} + ({lane} % {inner})]"
+                )
+                fold = (
+                    f"{accumulator_type} acc = {first}; "
+                    f"for (ptrdiff_t {step} = 1; {step} < {length}; ++{step}) "
+                    f"acc = " + c_step(rule, op == "max", "acc", element) + ";"
+                )
+                value = "acc"
+            elif op in {"sum", "mean", "prod"}:
+                start = "1" if op == "prod" else "0"
+                combine = "*" if op == "prod" else "+"
+                fold = (
+                    f"{accumulator_type} acc = {start}; "
+                    f"for (ptrdiff_t {step} = 0; {step} < {length}; ++{step}) "
+                    f"acc = acc {combine} {element};"
+                )
+                value = (
+                    f"(acc / (double){length})" if op == "mean" else "acc"
+                )
+            else:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"{op} over an axis has no C spelling in {fn}",
+                ))
+                return True
+            destination = output_destinations.get(result_id)
+            if destination is None or result_id in formals_by_id:
+                destination = activation_array(result_type, int(outer * inner))
+            body.append(
+                f"        for (ptrdiff_t {lane} = 0; {lane} < {outer * inner}; "
+                f"++{lane}) {{ {fold} (({result_type} *)({destination}))"
+                f"[{lane}] = ({result_type})({value}); }}"
+            )
+            expressions[result_id] = destination
+            addresses[result_id] = destination
+            object_expressions[id(result)] = destination
+            object_addresses[id(result)] = destination
+            address_buffer_types[result_id] = result_type
+            return True
 
         def heap_element(value) -> str | None:
             """Element layout of a heap arena pointer CELL, else None.
@@ -4320,6 +4463,18 @@ def emit_ssa_module_to_c(
                         parts = sequence_extent_parts(source)
                         if parts is not None and not tuple(parts[1]):
                             count = f"(ptrdiff_t)({parts[0]})"
+                            if op in {"max", "min"}:
+                                empty_guard = count
+                    if count is None and _runtime_sized_span(source):
+                        # Program: ``def f(x, y): return (x * y).sum()``
+                        # over rank-1 spans of runtime length.  Rule: a
+                        # runtime-sized span reduces over its element count,
+                        # the extent slot its elementwise producer is sized by.
+                        slot = extent_slot(
+                            fn, int(source.id), "element_count", None,
+                        )
+                        if slot is not None:
+                            count = f"(ptrdiff_t)(extents[{slot}])"
                             if op in {"max", "min"}:
                                 empty_guard = count
                     if count is None:
@@ -5720,6 +5875,15 @@ def emit_ssa_module_to_c(
                     object_expressions[id(instruction.res)] = f"t{result_id}"
                     object_addresses[id(instruction.res)] = f"t{result_id}"
                     heap_allocation_ids.add(result_id)
+                    continue
+                if (
+                    op.casefold() in {"sum", "prod", "mean", "max", "min"}
+                    and (
+                        instruction.attributes.get("axis") is not None
+                        or instruction.attributes.get("dim") is not None
+                    )
+                    and emit_axis_reduction(instruction, op.casefold())
+                ):
                     continue
                 span_op = TENSOR_OPERATION_SCALAR_SPELLING.get(
                     op.casefold(), op,

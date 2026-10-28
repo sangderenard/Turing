@@ -16179,10 +16179,22 @@ def _install_lexical_sequence_queries(
             and (data.get("attributes") or {}).get("extraction_identity")
                 == f"builtins.{expression.func.id}"
         )
+        # Program: ``g = [[1, 2], [3]]; len(g[i])`` (corpus c800).  A row of a
+        # born list of lists is a resident row sequence of its own, so its
+        # length is the resident length query, as ``len(xs)`` is.
+        list_row_query = (
+            expression.func.id in {"bool", "len"}
+            and len(arguments) == 1
+            and int(sequence_data.get("value_id", sequence_id))
+                in set(map(int, list_row_reads(graph_obj)))
+            and (data.get("attributes") or {}).get("extraction_identity")
+                == f"builtins.{expression.func.id}"
+        )
         if (
             producer_loop_node_id is None
             and not local_list_truth
             and not loop_row_query
+            and not list_row_query
         ):
             continue
         if os.environ.get("TURING_DEBUG_BUILTIN_SELECTION"):
@@ -17663,6 +17675,7 @@ def _sequence_row_operations(
     }
     if not widths:
         return ()
+    nested_row_reads = set(map(int, list_row_reads(graph_obj)))
     identities = graph_obj.graph.get("identity_table") or {}
     resident_by_value = {
         int(value_id): int(sequence_id)
@@ -17811,6 +17824,23 @@ def _sequence_row_operations(
             if base_node is None or row_index_node is None or row_value_node is None:
                 continue
             sequence_id = resident_by_value.get(value_id(base_node))
+            # Program: ``g = [[1, 2], [3, 4]]; g[i][1] = v`` (corpus c740).
+            # Wrong record: the row ``g[i]`` is a declared one-column row
+            # sequence, but the store fell through to the region, where the
+            # row view was an arena formal with no contract.  Rule: a store
+            # into a row read of a born list of lists is a row store on that
+            # row's own sequence, exactly as its reads are row loads.
+            if (
+                sequence_id in positional_sequences
+                and widths[sequence_id] == 1
+                and value_id(base_node) in nested_row_reads
+            ):
+                operations.append((
+                    "store", value_id(node_id), int(sequence_id),
+                    value_id(row_index_node), integer_literal(row_index_node),
+                    (value_id(row_value_node),), value_id(base_node),
+                ))
+                continue
             if sequence_id is None:
                 # ``item.members[index][1]=value`` is a column write to the
                 # existing row, not a dereference of a scalar row payload.
@@ -21909,11 +21939,14 @@ def _settle_linked_dynamic_sequences(
     # grows anywhere is DYNAMIC in every view (rule 4).
     from .resident_sequence_materialization import (
         _list_merged_from_unequal_displays,
+        _returned_copy_merge,
     )
 
     for graph_obj in graphs:
         for node_id, data in graph_obj.nodes(data=True):
             if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+                continue
+            if _returned_copy_merge(graph_obj, int(node_id)):
                 continue
             merged_key = (id(graph_obj), int(data.get("value_id", node_id)))
             for arm, role in data.get("parents") or ():
@@ -21957,6 +21990,15 @@ def _settle_linked_dynamic_sequences(
         seeds.update(
             (id(graph_obj), value_id)
             for value_id in local_lists & output_ids
+        )
+        # Program: ``a = [n, 1]; t = a if n > 2 else [7, n, 2]; return t``
+        # (c743).  The returned merge owns the result storage its arms are
+        # copied into; its rows are decided at run time, so it is a returned
+        # local list in the sense above and DYNAMIC (the c56 contract).
+        seeds.update(
+            (id(graph_obj), int(data.get("value_id", node_id)))
+            for node_id, data in graph_obj.nodes(data=True)
+            if _returned_copy_merge(graph_obj, int(node_id))
         )
         # Program: ``if n > 2: return [n]`` / ``return []`` (lanes plan A6).
         # Wrong record: the result list (the ``[]``) was FIXED at its own
@@ -59908,6 +59950,12 @@ def _class_surface_ssa_program(
     lowered_module.metadata["optional_scalar_return_lowerings"] = len(
         lower_optional_scalar_returns(lowered_module)
     )
+    # A join of int and float arms is one physical class; refuse it where
+    # Python would see each arm's own class (``ssa_numeric_joins``).
+    from .ssa_numeric_joins import refuse_type_visible_numeric_joins
+    lowered_module.metadata["numeric_join_promotions"] = (
+        refuse_type_visible_numeric_joins(lowered_module)
+    )
     from .ssa_reachability import hoist_nondominating_constants
     lowered_module.metadata["nondominating_constant_hoists"] = tuple(
         receipt
@@ -60861,6 +60909,15 @@ def _lower_ast_source_to_ssa_impl(
         glyph_formatter_pursuit_roots = tuple(
             definition.name for definition in formatter_definitions
         )
+    # The called inventory types the entry's unannotated formals: the class
+    # the callers pass (compiler/called_inventory.py) is read from the book's
+    # CALLED_INVENTORY record and stands where the authored annotation would.
+    # ProcessGraph ingestion cites the inventory cell in the formal's
+    # PARAMETER_ANNOTATION provenance and refuses a disagreeing annotation.
+    if entrypoint is not None:
+        from .called_inventory import annotate_from_inventory
+        from .identity_concordance import current_identity_book
+        annotate_from_inventory(tree, str(entrypoint), current_identity_book())
     # A numeric annotation is a request to compile the wrapper's existing
     # implementation, not merely a dtype label. Admit the exact eager classes
     # (and the source bases that own inherited operators) so normal class
@@ -64134,6 +64191,26 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
         )
 
 
+def lower_ast_source_by_signature(source: str, entrypoint: str, root_calls, **kwargs):
+    """One exact-typed specialized copy of the entry per distinct class
+    signature in the root-call inventory.  Returns
+    ``{signature_key: (signature, (module, outs, exports))}`` with
+    ``signature_key`` the tuple of ``(formal, class)`` pairs; each copy's
+    module names the signature (``name`` suffix)."""
+
+    from .called_inventory import distinct_signatures, signature_suffix
+    root_calls = list(root_calls)
+    result = {}
+    for signature in distinct_signatures(root_calls):
+        base = kwargs.get("name") or entrypoint
+        opts = dict(kwargs, name=f"{base}__{signature_suffix(signature)}")
+        result[tuple(sorted(signature.items()))] = (signature, lower_ast_source_to_ssa(
+            source, entrypoint, root_calls=root_calls,
+            root_signature=signature, **opts,
+        ))
+    return result
+
+
 def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
     """One book, memory regulator, progress lifetime and final gate for lowering.
 
@@ -64174,6 +64251,16 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
     ensure_graph_foundation(kwargs["progress"])
 
     _book, _token = begin_identity_book(resumed_book)
+    # Root-call contract: the known calls of the entry are call records the
+    # called inventory is gathered from (compiler/called_inventory.py).
+    _root_calls = kwargs.pop("root_calls", None)
+    _root_signature = kwargs.pop("root_signature", None)
+    if _root_calls is not None:
+        from .called_inventory import post_root_calls
+        _entry = args[1] if len(args) > 1 else kwargs.get("entrypoint")
+        if _entry is None:
+            raise ValueError("root_calls name calls of the entry; no entrypoint given")
+        post_root_calls(_book, str(_entry), _root_calls, selected=_root_signature)
     from .memory_regulation import begin_regulation, end_regulation
 
     _regulator, _regulation_token, _releases_book_state = begin_regulation(
