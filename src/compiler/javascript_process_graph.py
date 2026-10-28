@@ -227,6 +227,157 @@ def _flags_clear(names: Any, source: Mapping[str, Any]) -> dict[str, Any]:
     return test
 
 
+#: Identifier fields that name no binding: labels and dotted property names.
+_NOT_REFERENCES = frozenset({"label", "property", "key"})
+
+
+def _var_as_let(
+    statements: Sequence[Mapping[str, Any]],
+    parameters: frozenset[str],
+) -> list[Mapping[str, Any]]:
+    """``var`` declarations rewritten into ``let`` where the two agree.
+
+    A ``var`` is function scoped and hoisted (undefined until its
+    declaration runs); a ``let`` is block scoped.  Without closures the two
+    read alike when the first declaration of a name has an initializer and
+    every read and later declaration of the name lies after it, inside the
+    statement list that holds it.  That first declaration becomes a
+    ``let`` (a ``for (var ...)`` initializer is hoisted to a ``let`` just
+    before its loop, which still holds every read), later declarations
+    become assignments (``var x;`` alone is dropped), and a declaration of
+    a parameter is an assignment.  Any other ``var`` is left alone, and the
+    interpreter refuses it.
+    """
+
+    declarations: dict[str, list[tuple[int, int, tuple[int, ...], bool]]] = {}
+    references: dict[str, list[tuple[int, tuple[int, ...]]]] = {}
+    lexical: set[str] = set()
+
+    def visit(item: Any, lists: tuple[int, ...], field: str | None) -> None:
+        if isinstance(item, list):
+            if field in {"body", "consequent"} and all(
+                isinstance(child, Mapping) for child in item
+            ):
+                lists = (*lists, id(item))
+            for child in item:
+                visit(child, lists, None)
+            return
+        if not isinstance(item, Mapping):
+            return
+        kind = item.get("type")
+        if kind in _FUNCTION_NODES:
+            return
+        if kind == "Identifier":
+            if field not in _NOT_REFERENCES:
+                references.setdefault(str(item.get("name")), []).append(
+                    (int(item.get("start") or 0), lists),
+                )
+            return
+        if kind == "MemberExpression" and not item.get("computed"):
+            visit(item.get("object"), lists, "object")
+            return
+        if kind == "VariableDeclaration":
+            for declarator in item.get("declarations", ()):
+                target = declarator.get("id") or {}
+                if target.get("type") != "Identifier":
+                    continue
+                name = str(target.get("name"))
+                if item.get("kind") != "var":
+                    lexical.add(name)
+                    continue
+                declarations.setdefault(name, []).append((
+                    int(target.get("start") or 0),
+                    int(declarator.get("end") or 0), lists,
+                    declarator.get("init") is not None,
+                ))
+            for declarator in item.get("declarations", ()):
+                visit(declarator.get("init"), lists, "init")
+            return
+        for key, child in item.items():
+            if key not in {"type", "start", "end"}:
+                visit(child, lists, key)
+
+    root = list(statements)
+    visit(root, (), "body")
+    lets: set[str] = set()
+    for name, found in declarations.items():
+        if name in parameters or name in lexical:
+            continue
+        start, end, lists, initialized = min(found, key=lambda entry: entry[0])
+        scope = lists[-1] if lists else None
+        if initialized and scope is not None and all(
+            scope in where and position >= end
+            for position, where in (
+                *references.get(name, ()),
+                *((entry[0], entry[2]) for entry in found if entry[0] != start),
+            )
+        ):
+            lets.add(name)
+    if not declarations:
+        return root
+    first: dict[str, int] = {
+        name: min(entry[0] for entry in declarations[name]) for name in lets
+    }
+
+    def rewrite(declaration: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+        """The statements a ``var`` becomes, or None to leave it."""
+
+        out: list[Mapping[str, Any]] = []
+        for declarator in declaration.get("declarations", ()):
+            target = declarator.get("id") or {}
+            name = str(target.get("name"))
+            initializer = declarator.get("init")
+            if name in lets and int(target.get("start") or 0) == first[name]:
+                out.append({
+                    **declaration, "kind": "let", "declarations": [declarator],
+                })
+            elif name in lets or name in parameters:
+                if initializer is not None:
+                    out.append(_flag_assignment(name, declarator, initializer))
+            else:
+                return None
+        return out
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, list):
+            result: list[Any] = []
+            for child in item:
+                if isinstance(child, Mapping) and child.get("type") == "VariableDeclaration" and child.get("kind") == "var":
+                    replaced = rewrite(child)
+                    result.extend([child] if replaced is None else replaced)
+                    continue
+                loop = _loop_of(child) if isinstance(child, Mapping) else None
+                initializer = (loop or {}).get("init") or {}
+                if (
+                    initializer.get("type") == "VariableDeclaration"
+                    and initializer.get("kind") == "var"
+                ):
+                    replaced = rewrite(initializer)
+                    if replaced is not None and all(
+                        statement.get("type") == "VariableDeclaration"
+                        for statement in replaced
+                    ):
+                        result.extend(replaced)
+                        child = _without_init(child)
+                result.append(walk(child))
+            return result
+        if isinstance(item, Mapping):
+            if item.get("type") in _FUNCTION_NODES:
+                return item
+            return {key: walk(child) for key, child in item.items()}
+        return item
+
+    return walk(root)
+
+
+def _without_init(statement: Mapping[str, Any]) -> dict[str, Any]:
+    """``statement`` (a ``for`` loop or a label on one) with no initializer."""
+
+    if statement.get("type") == "LabeledStatement":
+        return {**statement, "body": _without_init(statement["body"])}
+    return {**statement, "init": None}
+
+
 class _JavaScriptProcessInterpreter:
     def __init__(
         self, graph: Any, *, owner: str, assumptions: Sequence[str] = (),
@@ -1719,7 +1870,10 @@ class _JavaScriptProcessInterpreter:
                     self.unsupported(
                         str(statement.get("kind")),
                         "unsupported-binding-kind",
-                        "var bindings are function scoped and hoisted",
+                        "this var can be read while still undefined (before "
+                        "its declaration, outside its block, or without an "
+                        "initializer); only a var that reads like a let is "
+                        "translated",
                         source=statement,
                     )
                     index += 1
@@ -1913,7 +2067,13 @@ class _JavaScriptProcessInterpreter:
             self.bind(parameter_name, value_node, parameter, kind="parameter")
         body = function.get("body") or {}
         if body.get("type") == "BlockStatement":
-            value, returned = self.sequence(body.get("body", ()))
+            value, returned = self.sequence(_var_as_let(
+                body.get("body", ()),
+                frozenset(
+                    str(parameter.get("name"))
+                    for parameter in function.get("params", ())
+                ),
+            ))
         else:
             value, returned = self.expression(body), True
         if not returned or value is None:

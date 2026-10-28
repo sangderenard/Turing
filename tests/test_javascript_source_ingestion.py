@@ -344,3 +344,37 @@ def test_labeled_exits_set_the_target_loops_flags(body):
     lowered = lower_javascript_source_to_ssa(source)
     assert lowered.complete, lowered.shortfall_report()
     assert check_program(source, "[[0], [2], [5], [9], [NaN], [Infinity]]") == "PASS"
+
+
+@needs_node
+def test_var_that_reads_like_let_is_rewritten_into_one():
+    source = (
+        "/** @param {number} n */ function root(n) { var s = 0; "
+        "for (var i = 0; i < n && i < 40; i++) { var t = i * 2; s += t; } "
+        "var n = n + i; return s + n; }"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(source, "[[0], [3], [9], [100], [NaN], [Infinity]]") == "PASS"
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    # Read before the declaration runs: the hoisted value is undefined.
+    "let s = x; var x = n; return s;",
+    # Read in its own initializer.
+    "var x = x + n; return x;",
+    # Read outside the block that declares it.
+    "if (n > 0) { var x = n; } return x;",
+    # Declared only in a loop body, read after the loop.
+    "for (let i = 0; i < 3; i++) { var x = i; } return x;",
+    # No initializer: undefined until assigned.
+    "var x; x = n; return x;",
+])
+def test_var_that_reads_its_hoisted_undefined_stays_a_loud_refusal(body):
+    source = f"/** @param {{number}} n */ function root(n) {{ {body} }}"
+    lowered = lower_javascript_source_to_ssa(source)
+    assert not lowered.complete
+    assert any(
+        item.code == "unsupported-binding-kind" for item in lowered.shortfalls
+    ), lowered.shortfall_report()
