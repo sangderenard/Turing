@@ -1116,7 +1116,7 @@ def _promote_conditional_sequence_aliases(
             handles = list(block.sequence_handle_results)
             for result in block.result_aliases:
                 true_id, false_id, merged_id = map(int, result)
-                if not _list_merged_from_unequal_displays(
+                if not _list_merged_from_branches(
                     graph_obj, node_by_value.get(merged_id, -1),
                 ):
                     results.append(result)
@@ -2726,7 +2726,7 @@ def _static_sequence_capacity_survey(
             own = sequence_bound(destination)
             # A list merged from displays of different lengths owns no rows
             # of its own: its arms' copies are all it holds (c654).
-            if own is None and _list_merged_from_unequal_displays(
+            if own is None and _list_merged_from_branches(
                 graph_obj, destination,
             ):
                 own = 0
@@ -3297,14 +3297,15 @@ def _scalar_constant_member(row: Mapping[str, Any]) -> Any:
     return literal if isinstance(literal, (bool, int, float, str)) else None
 
 
-def _list_merged_from_unequal_displays(graph_obj: Any, node_id: int) -> bool:
-    """Whether a list merge joins two list displays of different lengths.
+def _list_merged_from_branches(graph_obj: Any, node_id: int) -> bool:
+    """Whether a list merge is first bound on two branches (a handle merge).
 
-    Both arms are list displays (``aggregate_leaf_value_ids`` published) and
-    the merge is first bound there (no initial list).  Equal-length arms
-    publish member Phis and are born from them.  An arm that is a list but no
-    display (a parameter, another local list) has a runtime length and is
-    this shape too (corpus c733, c734).
+    Both arms are lists and the merge is first bound there (no initial
+    list).  Python's merged name is the taken arm's own list whatever the
+    arms' lengths (displays of equal or different length, a parameter,
+    another local list), so every such merge is a handle onto the taken
+    arm's storage and publishes no member layout (corpus c733, c734,
+    c870-c874).
     """
 
     data = graph_obj.nodes.get(int(node_id)) or {}
@@ -3324,25 +3325,10 @@ def _list_merged_from_unequal_displays(graph_obj: Any, node_id: int) -> bool:
         for parent, role in data.get("parents") or ()
         if str(role) in {"body", "orelse"} and parent in graph_obj
     )
-    if len(arms) != 2:
-        return False
-    lengths = []
-    for arm in arms:
-        arm_attributes = arm.get("attributes") or {}
-        if arm_attributes.get("aggregate_kind") != "list":
-            return False
-        leaves = arm_attributes.get("aggregate_leaf_value_ids")
-        if (
-            arm_attributes.get("producer_kind") == "aggregate"
-            and leaves is not None
-        ):
-            lengths.append(len(leaves))
-        else:
-            # A list that is no display here (a list parameter, another
-            # local list, a call result): its length is a runtime fact, so
-            # it is never "equal" to the other arm's.
-            lengths.append(None)
-    return None in lengths or lengths[0] != lengths[1]
+    return len(arms) == 2 and all(
+        (arm.get("attributes") or {}).get("aggregate_kind") == "list"
+        for arm in arms
+    )
 
 
 def _returned_list_merge(graph_obj: Any, node_id: int) -> bool:
@@ -3390,7 +3376,7 @@ def _returned_copy_merge(graph_obj: Any, node_id: int) -> bool:
     """
 
     return (
-        _list_merged_from_unequal_displays(graph_obj, int(node_id))
+        _list_merged_from_branches(graph_obj, int(node_id))
         and _returned_list_merge(graph_obj, int(node_id))
         and _arms_private_displays(graph_obj, int(node_id))
     )
@@ -3420,7 +3406,7 @@ def _handle_merge_storage_roots(graph_obj: Any) -> dict[int, int]:
         return value_id
 
     for node_id, data in graph_obj.nodes(data=True):
-        if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+        if not _list_merged_from_branches(graph_obj, int(node_id)):
             continue
         if _returned_copy_merge(graph_obj, int(node_id)):
             continue
@@ -3432,7 +3418,80 @@ def _handle_merge_storage_roots(graph_obj: Any) -> dict[int, int]:
             right = find(merged)
             if left != right:
                 parent[max(left, right)] = min(left, right)
-    return {value_id: find(value_id) for value_id in list(parent)}
+    roots = {value_id: find(value_id) for value_id in list(parent)}
+    _refuse_store_through_handle_then_arm_read(graph_obj, roots)
+    return roots
+
+
+def _refuse_store_through_handle_then_arm_read(
+    graph_obj: Any, roots: Mapping[int, int],
+) -> None:
+    """Refuse a store through a handle merge read later through another member.
+
+    Program: ``a = [7, 8, 9]; x = a if n > 2 else [4, 5]; grow(x, n);
+    x[0] = 100 + n; return a[0]``.  Wrong record: ``x`` is ``a`` on one
+    path, but the later row read of ``a`` was scheduled before the store
+    through ``x`` (``a[0]`` read the old row, silently), once a call that
+    changes the component precedes the store.  No exact order exists for it
+    yet, so the form is refused by name instead of lowered.
+    """
+
+    if not roots:
+        return
+    escaped = {
+        int(graph_obj.nodes[int(argument)].get("value_id", argument))
+        for _call, argument in _call_escaped_argument_edges(graph_obj)
+        if int(argument) in graph_obj
+    }
+    if not escaped & set(roots):
+        return
+
+    # Only a store through the merge itself: a store through an arm is
+    # ordered by that arm's own version chain and the merge reads it.
+    merged_values = {
+        int(data.get("value_id", node_id))
+        for node_id, data in graph_obj.nodes(data=True)
+        if _list_merged_from_branches(graph_obj, int(node_id))
+        and not _returned_copy_merge(graph_obj, int(node_id))
+    }
+
+    def position(node):
+        expression = graph_obj.nodes[node].get("expr_obj")
+        return (
+            int(getattr(expression, "lineno", 0) or 0),
+            int(getattr(expression, "col_offset", 0) or 0),
+        )
+
+    for store, data in graph_obj.nodes(data=True):
+        if str(data.get("type")) != "IndexedStore":
+            continue
+        for base, role in data.get("parents") or ():
+            if str(role) != "base" or int(base) not in graph_obj:
+                continue
+            base_value = int(graph_obj.nodes[base].get("value_id", base))
+            if base_value not in merged_values:
+                continue
+            for reader, reader_data in graph_obj.nodes(data=True):
+                if (
+                    str(reader_data.get("type")) in {"IndexedStore", "Phi"}
+                    or position(reader) <= position(store)
+                ):
+                    continue
+                for parent, _role in reader_data.get("parents") or ():
+                    member = int(
+                        graph_obj.nodes[parent].get("value_id", parent)
+                    ) if parent in graph_obj else None
+                    if (
+                        member is not None and member != base_value
+                        and roots.get(member) == roots[base_value]
+                    ):
+                        raise ValueError(
+                            f"list {base_value} is a branch merge stored "
+                            f"through after a call that changes it, and the "
+                            f"list {member} it may be is read later; the "
+                            "store cannot yet be ordered before that read "
+                            "(refused: store_through_handle_merge_then_arm_read)"
+                        )
 
 
 def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
@@ -3674,11 +3733,11 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 rebound_on_one_branch = _list_rebound_on_one_branch(
                     graph_obj, int(node_id),
                 )
-                if _list_merged_from_unequal_displays(
-                    graph_obj, int(node_id),
-                ) and not _returned_copy_merge(graph_obj, int(node_id)):
-                    # No birth: the merge is a handle onto the taken arm's
-                    # own storage (``_promote_conditional_sequence_aliases``,
+                if _list_merged_from_branches(graph_obj, int(node_id)):
+                    # No birth here: the merge is a handle onto the taken
+                    # arm's own storage, or (returned over private displays)
+                    # the result storage each arm is copied into
+                    # (``_promote_conditional_sequence_aliases``,
                     # ``_lower_sequence_handle_merge``).
                     continue
                 if attributes.get("aggregate_kind") == "list" and not (

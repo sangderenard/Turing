@@ -165,7 +165,7 @@ from .resident_sequence_materialization import (
     dict_row_displays as dict_row_displays,
     list_row_reads as list_row_reads,
     list_row_pool_extents as list_row_pool_extents,
-    _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
+    _list_merged_from_branches as _list_merged_from_branches,
     _list_rebound_on_one_branch as _list_rebound_on_one_branch,
     _loop_carried_initial_ids as _loop_carried_initial_ids,
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
@@ -22210,13 +22210,13 @@ def _settle_linked_dynamic_sequences(
     # component here, as an argument and its formal are: a component that
     # grows anywhere is DYNAMIC in every view (rule 4).
     from .resident_sequence_materialization import (
-        _list_merged_from_unequal_displays,
+        _list_merged_from_branches,
         _returned_copy_merge,
     )
 
     for graph_obj in graphs:
         for node_id, data in graph_obj.nodes(data=True):
-            if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+            if not _list_merged_from_branches(graph_obj, int(node_id)):
                 continue
             if _returned_copy_merge(graph_obj, int(node_id)):
                 continue
@@ -22432,17 +22432,10 @@ def _settle_linked_dynamic_sequences(
                     for item in data["expr_obj"].values
                 )
             )
-            or (
-                (data.get("attributes") or {}).get("producer_kind")
-                == "aggregate_phi"
-                and (data.get("attributes") or {}).get("aggregate_kind")
-                == "list"
-                and (data.get("attributes") or {}).get("aggregate_leaf_value_ids")
-            )
             # Program: the same merge from displays of different lengths
             # (c654).  Born by the arms' copies, it is bounded by the
             # longest arm (the survey's copy bound) when nothing grows it.
-            or _list_merged_from_unequal_displays(graph_obj, int(node_id))
+            or _list_merged_from_branches(graph_obj, int(node_id))
             for value_id in (int(node_id),)
             if value_id in escapes
             and (
