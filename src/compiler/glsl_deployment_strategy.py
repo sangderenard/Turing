@@ -26984,10 +26984,27 @@ def _fold_callsite_structural_values(
             if selected is None:
                 return unresolved
             fixed = known.get(selected, unresolved)
+            # Program: ``pick(a, 1)`` whose ``if n > 2: t = a else: t =
+            # [7, n, 2]`` folds on the constant argument (corpus c820, c821).
+            # Wrong record: the merge Phi took the selected display's literal
+            # VALUE, so it became a second Constant that kept the
+            # ``aggregate_phi`` producer with no arm to merge (a list "bound
+            # to lists of different shapes" / two heap owners for one list)
+            # while the display kept its own birth.  Rule: a merge selecting
+            # a mutable collection is that arm's storage, so it aliases the
+            # arm; only an immutable value is copied.
+            selected_attributes = (
+                graph.G.nodes[selected].get("attributes") or {}
+                if selected in graph.G else {}
+            )
+            selected_is_mutable_collection = str(
+                selected_attributes.get("aggregate_kind") or ""
+            ) in {"list", "set", "dict"} or isinstance(fixed, (list, set, dict))
             return (
                 _StructuralValueAlias(selected)
                 if fixed is unresolved
                 or isinstance(fixed, _ProgramABIValueFact)
+                or selected_is_mutable_collection
                 else fixed
             )
         if isinstance(expression, ast.UnaryOp):
