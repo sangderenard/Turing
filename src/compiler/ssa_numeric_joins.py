@@ -1,0 +1,169 @@
+"""Where a promoted numeric join may be read.
+
+Program: ``if c == 2: s = n else: s = n * 0.5`` (corpus c770).  Python
+never promotes at a join: ``s`` is an int on one path and a float on the
+other.  The SSA join carries one physical class (the widest float, or
+int64 for ints and bools), converting the narrower arm on its own edge
+(``_ControlSSABuilder._numeric_join_arms``), and marks the Phi
+``numeric_join_promoted``.  That is exact only where every use of the
+joined value gives the same result for either arm's class: arithmetic
+with an operand of the join's class, which converts the narrower operand
+the same way Python does (``s + 0.25``, ``acc += s``).  Anything else --
+the value leaving the program, a comparison, ``//`` or ``%`` with an int,
+a store, ``type()`` -- can tell the classes apart, so it is refused by
+name.  The union lowering that keeps each arm's exact class is not built.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+PROMOTED = "numeric_join_promoted"
+
+_ARITHMETIC_OPS = {"Add", "Sub", "Mul", "Div", "Mod", "FloorDiv", "Pow"}
+_PASS_THROUGH_OPS = {"Phi", "Cast"}
+_NUMERIC_CLASS = {
+    "bool": "bool", "int": "int", "int32": "int", "int64": "int",
+    "float": "float", "float16": "float", "float32": "float",
+    "float64": "float", "double": "float",
+}
+
+
+def refuse_type_visible_numeric_joins(module: Any) -> int:
+    """Raise when a promoted join reaches a use that can see its class.
+
+    Returns how many promoted joins were followed.  Values are followed
+    through Phi and Cast, into callees by argument position, and out of a
+    callee's ``Ret`` into each caller's projection of the call aggregate.
+    A ``Ret`` of a function no other function calls is a program output.
+    """
+
+    functions = dict(getattr(module, "functions", module) or {})
+    callers: dict[str, list[tuple[str, Any]]] = {}
+    for name, function in functions.items():
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                callee = instruction.attributes.get("callee")
+                if instruction.op == "Call" and callee in functions:
+                    callers.setdefault(str(callee), []).append(
+                        (name, instruction)
+                    )
+
+    def producers(function: Any) -> dict[int, Any]:
+        return {
+            int(instruction.res.id): instruction
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+
+    def uses(function: Any, value_id: int):
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if any(int(arg.id) == value_id for arg in instruction.args):
+                    yield instruction
+
+    def refuse(function_name: str, origin: tuple[str, int], why: str):
+        raise ValueError(
+            f"a join of int and float arms ({origin[0]} value {origin[1]}) "
+            f"{why} in {function_name!r}; Python keeps each arm's class "
+            "there, and the int-or-float union lowering is not built"
+        )
+
+    roots = [
+        (name, int(instruction.res.id), str(instruction.res.dtype))
+        for name, function in functions.items()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.attributes.get(PROMOTED)
+        and instruction.res is not None
+    ]
+    for origin_function, origin_id, join_dtype in roots:
+        join_class = _NUMERIC_CLASS.get(join_dtype)
+        origin = (origin_function, origin_id)
+        pending = [(origin_function, origin_id)]
+        seen: set[tuple[str, int]] = set()
+        while pending:
+            function_name, value_id = pending.pop()
+            if (function_name, value_id) in seen:
+                continue
+            seen.add((function_name, value_id))
+            function = functions[function_name]
+            for instruction in uses(function, value_id):
+                op = str(instruction.op)
+                if op in _PASS_THROUGH_OPS and instruction.res is not None:
+                    pending.append((function_name, int(instruction.res.id)))
+                elif op in _ARITHMETIC_OPS:
+                    others = [
+                        arg for arg in instruction.args
+                        if int(arg.id) != value_id
+                    ]
+                    if len(others) != 1 or _NUMERIC_CLASS.get(
+                        str(others[0].dtype)
+                    ) != join_class:
+                        refuse(
+                            function_name, origin,
+                            f"is an operand of {op} with an operand not of "
+                            f"its class {join_dtype!r}",
+                        )
+                elif op == "Call":
+                    callee = str(instruction.attributes.get("callee"))
+                    if callee not in functions:
+                        refuse(function_name, origin,
+                               f"is passed to {callee!r}")
+                    formals = functions[callee].args
+                    for position, arg in enumerate(instruction.args):
+                        if int(arg.id) == value_id:
+                            pending.append(
+                                (callee, int(formals[position].id))
+                            )
+                elif op == "Ret":
+                    sites = callers.get(function_name, [])
+                    if not sites:
+                        refuse(function_name, origin,
+                               "is returned from the program")
+                    slots = {
+                        position for position, arg in enumerate(
+                            instruction.args
+                        ) if int(arg.id) == value_id
+                    }
+                    for caller_name, call in sites:
+                        caller = functions[caller_name]
+                        if call.res is None:
+                            continue
+                        if str(call.res.dtype) != "ssa.aggregate":
+                            # A one-result call is its result.
+                            if slots == {0}:
+                                pending.append(
+                                    (caller_name, int(call.res.id))
+                                )
+                            continue
+                        made = producers(caller)
+                        for load in caller.blocks.values():
+                            for read in load.instrs:
+                                if read.op != "Load" or read.res is None:
+                                    continue
+                                address = made.get(int(read.args[0].id))
+                                if (
+                                    address is None
+                                    or address.op != "GetElementPtr"
+                                    or int(address.args[0].id)
+                                    != int(call.res.id)
+                                ):
+                                    continue
+                                index = made.get(int(address.args[1].id))
+                                slot = (
+                                    None if index is None
+                                    else index.attributes.get("value")
+                                )
+                                if slot is None:
+                                    refuse(caller_name, origin,
+                                           "is read at an unproven slot")
+                                if int(slot) in slots:
+                                    pending.append(
+                                        (caller_name, int(read.res.id))
+                                    )
+                else:
+                    refuse(function_name, origin, f"is read by {op}")
+    return len(roots)

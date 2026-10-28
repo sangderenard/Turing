@@ -5198,6 +5198,26 @@ def _build_shell_hierarchy_plan(
                         dtype = str(posted["dtype"])
                     elif value_parent in _shape_dtype_cache:
                         dtype = _shape_dtype_cache[value_parent][1]
+                if operation == "mean" and not tensor.get("dtype"):
+                    # ``x.mean()`` (numpy, AbstractTensor): a float operand's
+                    # width stands; an integer or bool operand means float64.
+                    # Program: ``x.mean() - y.prod()``; with the float64
+                    # domain default withdrawn the mean had no dtype at all.
+                    operand_record = _shape_dtype_cache.get(
+                        next((int(p) for p in parents[:1]), None)
+                    )
+                    operand_dtype = (
+                        str(operand_record[1]) if operand_record is not None
+                        and operand_record[1] else None
+                    )
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven is not None:
+                        dtype = str(proven)
+                    elif operand_dtype is not None:
+                        dtype = (
+                            operand_dtype if operand_dtype.startswith("float")
+                            else "float64"
+                        )
                 if operation == "item" and dtype is None:
                     # ``tensor.item()`` is the receiver's one element: the
                     # source proof stands where it exists, else the

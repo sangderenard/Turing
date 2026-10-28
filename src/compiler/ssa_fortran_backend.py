@@ -1432,16 +1432,25 @@ class _FunctionEmitter:
         no new extent crosses the ABI, and the declaration is never scalar.
         """
 
+        formal_ids = {int(value.id) for value in self.function.args}
+        adopted: set[int] = set()
         changed = True
         while changed:
             changed = False
             for value_id, source_id in aliases.items():
                 value_id, source_id = int(value_id), int(source_id)
-                if value_id in self.dynamic_array_ranks:
+                # A local (``t2 = region_0(...)`` fed on to a reducing
+                # region) may already hold extent symbols of its own, which
+                # no caller supplies; its alias's symbols replace them.
+                if value_id in adopted or (
+                    value_id in self.dynamic_array_ranks
+                    and value_id in formal_ids
+                ):
                     continue
                 extents = self.dynamic_array_leading_extents.get(source_id)
                 if source_id not in self.dynamic_array_ranks or not extents:
                     continue
+                adopted.add(value_id)
                 self.dynamic_array_ranks[value_id] = (
                     self.dynamic_array_ranks[source_id]
                 )
@@ -1955,6 +1964,9 @@ class _FunctionEmitter:
             operation in _REDUCTION
             and len(args) == 1
             and len(instr.args[0].shape) == 0
+            # A runtime-sized span (rank stated, extents at the call) is an
+            # explicit-shape array here, not a scalar: ``(x * y).sum()``.
+            and not int((instr.args[0].accounting or {}).get("program_abi_rank") or 0)
         ):
             # Reducing a scalar is the identity.  NumPy permits it (and may
             # retain a singleton result shape); Fortran's reduction
@@ -4712,6 +4724,54 @@ class _FunctionEmitter:
         elif left is not None and len(args) == 1:
             args = [_literal(left), args[0]]
 
+        axis = instr.attributes.get("axis")
+        if axis is None:
+            axis = instr.attributes.get("dim")
+        if (
+            op in ("sum", "prod", "mean", "max", "min")
+            and axis is not None
+            and instr.res is not None
+            and instr.args
+            # builtin ``min(n, 3)`` carries its second operand as ``dim``.
+            and tuple(instr.args[0].shape or ())
+        ):
+            # Program: ``def f(y): return y.max(axis=0)`` with y (2, 3).
+            # Rule: the DIM= form of the intrinsic over the same logical
+            # indices (t0(i, j) is y[i-1][j-1]), one result per kept lane;
+            # max/min take numpy's rule (a NaN in the lane is its result),
+            # which MAXVAL alone skips.
+            shape = tuple(instr.args[0].shape or ())
+            if (
+                not isinstance(axis, int) or not shape
+                or not all(isinstance(item, int) for item in shape)
+                or not -len(shape) <= axis < len(shape)
+            ):
+                return None
+            axis %= len(shape)
+            kept = shape[:axis] + shape[axis + 1:]
+            if tuple(instr.res.shape or ()) != kept or (
+                shape[axis] == 0 and op in ("max", "min")
+            ):
+                return None
+            source = self._numeric(instr, args[:1])[0]
+            dim = axis + 1
+            if op in ("max", "min"):
+                reduced = (
+                    f"{'maxval' if op == 'max' else 'minval'}({source}, dim={dim})"
+                )
+                if str(instr.args[0].dtype) not in _INTEGER_DTYPES:
+                    reduced = (
+                        f"merge(sum({source}, dim={dim}, mask={source} /= {source}), "
+                        f"{reduced}, any({source} /= {source}, dim={dim}))"
+                    )
+            elif op == "mean":
+                reduced = (
+                    f"(sum({source}, dim={dim}) / "
+                    f"real(size({source}, dim={dim}), c_double))"
+                )
+            else:
+                reduced = f"{'product' if op == 'prod' else 'sum'}({source}, dim={dim})"
+            return reduced
         if (
             op in ("max", "min")
             and len(instr.args) == 1
@@ -4742,7 +4802,15 @@ class _FunctionEmitter:
             rule = max_step_rule(instr)
             if (
                 rule is not None and op in ("max", "min")
-                and len(tuple(instr.args[0].shape or ())) == 1
+                and (
+                    len(tuple(instr.args[0].shape or ())) == 1
+                    or (
+                        not tuple(instr.args[0].shape or ())
+                        and int((instr.args[0].accounting or {}).get(
+                            "program_abi_rank"
+                        ) or 0) == 1
+                    )
+                )
             ):
                 return fortran_reduction(rule, op == "max", args[0])
             return _REDUCTION[op].format(*args)
