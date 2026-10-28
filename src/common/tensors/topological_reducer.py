@@ -5375,6 +5375,10 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
     formal_incomplete: set = set()
     formal_member_actuals: dict = {}
     formal_member_incomplete: set = set()
+    # Formals some callsite binds: a formal no callsite ever binds to a tuple
+    # (always ``None``, or omitted with a ``None`` default) has members that
+    # never hold a value, so they contribute nothing to a join.
+    formal_member_bound: set = set()
     for caller in units:
         for call_id in tuple(caller.G.nodes):
             callee = callee_of(caller, call_id)
@@ -5400,6 +5404,9 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                     callee.key(formal) for formal in formal_nodes.values()
                 )
                 continue
+            formal_member_bound.update(
+                callee.key(formal) for formal in formal_nodes.values()
+            )
             for actual_id, role in edges:
                 name = _callsite_parameter_name(role, receiver, positional)
                 formal = formal_nodes.get(str(name)) if name is not None else None
@@ -5510,6 +5517,22 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             proof, used = node_transfer(unit, node_id)
             result = _join_int_range(result, proof)
             read = (*read, *used)
+        if inherited_scope is not None and result is not None:
+            # A copy runs a subset of the authored function's executions,
+            # so the authored interval bounds every copy value it names
+            # (corpus c796: the copy cannot see that no caller passes
+            # ``fingerprint``; the authored ``hi, lo`` merge can).
+            authored = range_page.latest((inherited_scope, key[1]))
+            if authored is not None:
+                authored = (int(authored[0]), int(authored[1]))
+                if result == _INT_RANGE_TOP:
+                    result = authored
+                elif max(result[0], authored[0]) <= min(result[1], authored[1]):
+                    result = (
+                        max(result[0], authored[0]),
+                        min(result[1], authored[1]),
+                    )
+                read = (*read, (inherited_scope, key[1]))
         return result, read
 
     def node_transfer(unit, node_id):
@@ -5577,6 +5600,16 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 and unit.key(base) not in formal_member_incomplete
             ):
                 entries = formal_member_actuals.get((unit.key(base), position))
+                if not entries and unit.key(base) in formal_member_bound:
+                    # Program: Token Orchard's ``_intern_validated_span``,
+                    # whose only caller in the product omits ``fingerprint``
+                    # (default ``None``).  Wrong record: ``hi, lo =
+                    # fingerprint`` was unbounded, so the ``hi, lo`` merge
+                    # with the proven fingerprint kept the ``_candidates``
+                    # key columns int64 against their uint64 store (corpus
+                    # c796).  Rule: no callsite binds a tuple there, so the
+                    # unpacking never runs and its members join as nothing.
+                    return None, ()
                 if entries:
                     joined, read = None, []
                     for member_key, caller, call_id in entries:
