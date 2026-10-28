@@ -28996,6 +28996,17 @@ def _class_surface_ssa_program(
                     )
                     if _late_committed(str(symbol), sequence_id) is None:
                         continue
+                    # The arm and the SSA row describe one resident.  An arm
+                    # sourced from a ``parameter_annotation`` cell is a
+                    # declared parameter's own value: its physical kind is
+                    # the parameter's ProgramABI declaration
+                    # (``parameter_abi_kind``, where the SSA row posts
+                    # ``span``), so SEQUENCE_CONTRACT does not restate it.
+                    if any(
+                        getattr(cell.page, "name", cell.page) == "parameter_annotation"
+                        for cell in settled_arms[0].source_cells
+                    ):
+                        continue
                     from dataclasses import replace as _replace
                     contract_cell = late_book.latest_ref(
                         _LATE_SEQUENCE_CONTRACT, (str(symbol), sequence_id),
