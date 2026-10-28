@@ -2285,6 +2285,7 @@ class _ControlSSABuilder(TiledObject):
         native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
         native_value_type_abi: Mapping[int, Any] | None = None,
         native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+        int_range_scope: Any = None,
     ):
         TiledObject.__post_init__(self)
         from .evolution_metagraph import (
@@ -2293,6 +2294,9 @@ class _ControlSSABuilder(TiledObject):
         )
 
         self.program = program
+        #: The ``source_int_range_concordance`` scope of this function's
+        #: values (``_source_numeric_scope``), or ``None`` when unknown.
+        self.int_range_scope = int_range_scope
         #: ssa id -> the SSAValue object the book's ``ssa_value`` row names
         #: (plan 80 B2.1): the one private structure the builder keeps,
         #: because emitted instructions hold the objects and mutate them.
@@ -2397,6 +2401,10 @@ class _ControlSSABuilder(TiledObject):
             tuple[str, int], SSAValue
         ] = {}
         self._function_exit: BasicBlock | None = None
+        # (failing block, continuing block) of each checked index; see
+        # ``_finish_fault_exits``.
+        self._index_fault_blocks: list[tuple[BasicBlock, BasicBlock]] = []
+        self._fault_exit: BasicBlock | None = None
         self.named_output_histories = {
             str(name): tuple(map(int, history))
             for name, history in (named_output_histories or {}).items()
@@ -4872,35 +4880,147 @@ class _ControlSSABuilder(TiledObject):
     def _sequence_row_index(
         self, sequence_id: int, index_id: int, literal: int | None,
     ) -> SSAValue:
-        if literal is None:
-            return self.external_value(int(index_id), dtype="int64")
-        if int(literal) >= 0:
-            return self.constant_value(int(literal))
-        descriptor = self.sequence_descriptors[int(sequence_id)]
+        """The checked, normalized row index of a positional read or write.
+
+        Python's rule: ``-len <= i < len`` selects row ``i % len`` (a negative
+        index counts from the end), anything else raises ``IndexError``.  The
+        check reads the sequence's own length cell, so it holds for a list
+        that grows or shrinks; it is the native ``IndexError`` (validation
+        code 71, as ``pop`` reports).
+        """
+
+        index = (
+            self.external_value(int(index_id), dtype="int64")
+            if literal is None else self.constant_value(int(literal))
+        )
+        descriptor = self.sequence_descriptors.get(int(sequence_id))
+        if descriptor is None:
+            if literal is not None and int(literal) < 0:
+                raise KeyError(int(sequence_id))
+            return index
         length_cell = self.sequence_storage_values[int(sequence_id)][
             len(descriptor.column_value_ids)
         ]
+        attributes = {
+            "binding": "ssa_sequence_row_bounds",
+            "sequence_id": int(sequence_id),
+        }
         length = self.fresh_value(
             dtype="int64", transform=LOAD, operands=(length_cell,),
         )
+        self.emit(Handler.Load, [length_cell], length, attributes=attributes)
+        zero = self.constant_value(0, length)
+        if literal is not None and int(literal) >= 0:
+            normalized = index
+        else:
+            negative = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(index,),
+            )
+            self.emit(Handler.Lt, [index, zero], negative, attributes=attributes)
+            wrapped = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(index, length),
+            )
+            self.emit(Handler.Add, [index, length], wrapped, attributes=attributes)
+            normalized = self.fresh_value(
+                dtype="int64", transform=CONTROL_EXPRESSION,
+                operands=(negative, wrapped, index),
+            )
+            self.emit(
+                Handler.Select, [negative, wrapped, index], normalized,
+                attributes=attributes,
+            )
+        below_length = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(normalized, length),
+        )
         self.emit(
-            Handler.Load, [length_cell], length,
+            Handler.Lt, [normalized, length], below_length,
+            attributes=attributes,
+        )
+        inside = below_length
+        if literal is None or int(literal) < 0:
+            at_least_zero = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(normalized,),
+            )
+            self.emit(
+                Handler.Ge, [normalized, zero], at_least_zero,
+                attributes=attributes,
+            )
+            inside = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(at_least_zero, below_length),
+            )
+            self.emit(
+                Handler.LAnd, [at_least_zero, below_length], inside,
+                attributes=attributes,
+            )
+        selected = self.new_block("sequence_index_in_range")
+        outside = self.new_block("sequence_index_out_of_range")
+        self.conditional_branch(inside, selected, outside)
+        self.current = outside
+        self.emit(
+            Handler.Call, [],
             attributes={
-                "binding": "ssa_sequence_row_length",
-                "sequence_id": int(sequence_id),
+                "callee": "turing_validation_error", "error_code": 71,
+                **attributes,
             },
         )
-        normalized = self.fresh_value(
-            dtype="int64", transform=CONTROL_EXPRESSION, operands=(length,),
-        )
-        self.emit(
-            Handler.Add, [length, self.constant_value(int(literal), length)], normalized,
-            attributes={
-                "binding": "ssa_sequence_negative_index",
-                "sequence_id": int(sequence_id),
-            },
-        )
+        # The failing path must not touch the element: an empty heap list has
+        # no column to read.  It leaves the function; ``_finish_fault_exits``
+        # gives it the exit (or, when the outputs cannot be zeroed, lets it
+        # continue as ``pop`` does).
+        if self._fault_exit is None:
+            self._fault_exit = self.new_block("sequence_index_out_of_range")
+        self.branch(self._fault_exit)
+        self._index_fault_blocks.append((outside, selected))
+        self.current = selected
         return normalized
+
+    def _finish_fault_exits(self, returned: Any) -> None:
+        """Close the out-of-range exits of checked indices.
+
+        The validation code is already recorded when control gets here; the
+        exit returns zero outputs so nothing reads a row that is not there.
+        """
+
+        if self._fault_exit is None:
+            return
+        fault_exit = self._fault_exit
+        # Later passes publish the function's outputs on the LAST Ret in block
+        # order; the fault exit's zero outputs are not that Ret, so it sits
+        # directly after the entry block.
+        ordered = list(self.blocks.items())
+        entry_item, rest = ordered[0], [
+            item for item in ordered[1:] if item[1] is not fault_exit
+        ]
+        self.blocks.clear()
+        self.blocks[entry_item[0]] = entry_item[1]
+        self.blocks[fault_exit.name] = fault_exit
+        self.blocks.update(rest)
+        values = None if returned is None else list(returned)
+        if values is not None and all(
+            value is not None and str(value.dtype) in {
+                "int", "int8", "int16", "int32", "int64", "bool",
+                "float32", "float64",
+            }
+            for value in values
+        ):
+            self.current = fault_exit
+            self.emit(Handler.Ret, [
+                self.constant_value(0, dtype=str(value.dtype))
+                for value in values
+            ])
+            return
+        # Outputs that cannot be zeroed: continue as ``pop`` does.
+        self.current = fault_exit
+        for failing, continuing in self._index_fault_blocks:
+            terminator = failing.instrs.pop()
+            failing.successors.remove(fault_exit.name)
+            self.current = failing
+            self.branch(continuing)
+        self.current = fault_exit
+        self.emit(Handler.Ret, list(values or []))
 
     def _emit_sequence_row_load(
         self, result_id: int, sequence_id: int, index_id: int,
@@ -9586,6 +9706,72 @@ class _ControlSSABuilder(TiledObject):
 
             return _widest_element(*floats) or "float64"
         return "int64"
+
+    _INTEGER_WIDTH_BOUNDS = {
+        "bool": (0, 1),
+        "int32": (-(1 << 31), (1 << 31) - 1),
+        "int": (-(1 << 63), (1 << 63) - 1),
+        "int64": (-(1 << 63), (1 << 63) - 1),
+        "uint64": (0, (1 << 64) - 1),
+        "int128": (-(1 << 127), (1 << 127) - 1),
+    }
+
+    def _integer_width_join(self, values: Iterable[SSAValue]) -> str | None:
+        """The width a join of Python ``int`` arms of differing widths has.
+
+        Program: Token Orchard's ``_fingerprint_span`` (corpus c793): one
+        return is ``0, 0`` (int64 by class), the other the combines proven
+        ``[0, 2**64-1]`` (uint64).  Python returns an ``int`` from either, so
+        nothing can tell the arms apart; only the width must hold both.
+        Rule: the join's interval is the union of each arm's -- its
+        ``source_int_range_concordance`` row, else a constant's value, else
+        its width's bounds -- and its width is the narrowest that holds the
+        union (``python_int_range_dtype``).  ``None`` when the arms are not
+        all scalar ints of differing widths, at least one wider than int64,
+        or when no width holds the union.
+        """
+
+        present = tuple(
+            value for value in values
+            if value.dtype not in {None, "unknown", "none", "None"}
+        )
+        dtypes = {str(value.dtype) for value in present}
+        bounds = self._INTEGER_WIDTH_BOUNDS
+        if (
+            len(dtypes) < 2
+            or any(tuple(value.shape or ()) for value in present)
+            or not dtypes <= set(bounds)
+            or not dtypes & {"uint64", "int128"}
+        ):
+            return None
+        from .concordance_declarations import SOURCE_INT_RANGE
+        from .identity_concordance import current_identity_book
+        from ..transmogrifier.dtype_layout import python_int_range_dtype
+
+        range_page = current_identity_book().page(SOURCE_INT_RANGE)
+        constants = {
+            int(instruction.res.id): instruction.attributes.get("value")
+            for block in self.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Const" and instruction.res is not None
+        }
+        low = high = None
+        for value in present:
+            interval = None
+            if self.int_range_scope is not None:
+                interval = range_page.latest(
+                    (self.int_range_scope, int(value.id))
+                )
+            literal = constants.get(int(value.id))
+            if interval is None and type(literal) in {int, bool}:
+                interval = (int(literal), int(literal))
+            if interval is None:
+                interval = bounds[str(value.dtype)]
+            low = int(interval[0]) if low is None else min(low, int(interval[0]))
+            high = (
+                int(interval[1]) if high is None else max(high, int(interval[1]))
+            )
+        return python_int_range_dtype(low, high)
 
     def _numeric_join_arms(
         self,
@@ -22842,7 +23028,22 @@ class _ControlSSABuilder(TiledObject):
                     if value.dtype not in {None, "unknown", "none", "None"}
                 }
                 numeric_join_promoted = False
-                if len(merge_dtypes) > 1:
+                integer_width = (
+                    self._integer_width_join(incoming_values)
+                    if len(merge_dtypes) > 1 else None
+                )
+                if integer_width is not None:
+                    # Every arm is a Python int: the slot takes the width
+                    # holding their union, each arm converted on its edge.
+                    dtype = integer_width
+                    incoming_values = [
+                        self._cast_on_edge(block, value, integer_width)
+                        for (block, _values), value in zip(
+                            edges, incoming_values, strict=True,
+                        )
+                    ]
+                    self.current = exit_block
+                elif len(merge_dtypes) > 1:
                     promoted = self._numeric_join(incoming_values)
                     if promoted is not None:
                         dtype = promoted
@@ -22969,8 +23170,10 @@ class _ControlSSABuilder(TiledObject):
                     continue
                 self._revise_semantic_output(name, int(merged_id))
             self.emit(Handler.Ret, returned)
+            self._finish_fault_exits(returned)
         elif fallthrough_open:
             self.emit(Handler.Ret, returned)
+            self._finish_fault_exits(returned)
 
         # A returned union can be widened into a physical frame before the
         # function-exit join is built.  When that join has multiple incoming
@@ -23857,6 +24060,7 @@ def lower_control_program_to_ssa(
     native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
     native_value_type_abi: Mapping[int, Any] | None = None,
     native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+    int_range_scope: Any = None,
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
     builder = _ControlSSABuilder(
         program,
@@ -23922,6 +24126,7 @@ def lower_control_program_to_ssa(
         native_object_type_tests=native_object_type_tests,
         native_value_type_abi=native_value_type_abi,
         native_value_type_tests=native_value_type_tests,
+        int_range_scope=int_range_scope,
     )
     builder.lower(program.root)
     for kind, arguments in builder.table_epilogue_operations:
@@ -27604,6 +27809,7 @@ def lower_control_sections_to_ssa(
     native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
     native_value_type_abi: Mapping[int, Any] | None = None,
     native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+    int_range_scope: Any = None,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -30613,6 +30819,7 @@ def lower_control_sections_to_ssa(
         native_object_type_tests=native_object_type_tests,
         native_value_type_abi=native_value_type_abi,
         native_value_type_tests=native_value_type_tests,
+        int_range_scope=int_range_scope,
     )
     report(
         f"control lowering complete; blocks={len(control_function.blocks)} "

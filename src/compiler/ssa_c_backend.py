@@ -998,7 +998,12 @@ class CModuleExecution:
         self.artifact.entry()(self._pointers, self._extents)
         validation_error = self.artifact.take_validation_error()
         if validation_error:
-            raise RuntimeError(f"native tile runtime validation failed with code {validation_error}")
+            from .native_faults import validation_fault
+
+            raise validation_fault(
+                validation_error,
+                f"native tile runtime validation failed with code {validation_error}",
+            )
         if self.artifact.external_slots:
             from .external_functions import check_external_faults
 

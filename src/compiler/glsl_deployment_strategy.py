@@ -5512,11 +5512,6 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
-                        # A proven interval wider than int64 is the source's
-                        # width; the parents' int64 does not narrow it.
-                        proven = planned_scalar_dtypes().get(int(current))
-                        if proven in {"uint64", "int128"}:
-                            dtype = str(proven)
                 if operation in {"floor", "ceil", "trunc", "round"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so
@@ -5580,6 +5575,22 @@ def _build_shell_hierarchy_plan(
                             logical = (
                                 *batch_shape, left_shape[-2], right_shape[-1]
                             )
+                # A proven interval wider than int64 is the source's width;
+                # neither the parents' int64 nor a descriptor's class-only
+                # int64 narrows it, whatever the operation.  Program: corpus
+                # c790, ``high * (1 << 32) + low``: once ``shl`` had an
+                # elementwise descriptor its int64 reached the product and
+                # sum as ``tensor["dtype"]``, and a rule kept inside the
+                # no-descriptor branch never ran.  Corpus c793: a member of
+                # a call's returned tuple (``first, second = f(...)``) is no
+                # arithmetic operation at all, and kept int64.
+                proven = planned_scalar_dtypes().get(int(current))
+                if (
+                    proven in {"uint64", "int128"}
+                    and not tuple(logical or ())
+                    and dtype in {None, "int", "int64", "uint64", "int128"}
+                ):
+                    dtype = str(proven)
                 _shape_dtype_cache[current] = (logical, dtype)
                 states[current] = 2
             logical, dtype = _shape_dtype_cache.get(
@@ -10276,6 +10287,7 @@ def _retain_source_sequence_mutation_records(
         _RECEIVER_READING_METHODS,
         _receiver_collection_kind,
         _returned_formal_sequence_aliases,
+        _returned_tuple_member_kinds,
     )
 
     records = dict(
@@ -10286,6 +10298,7 @@ def _retain_source_sequence_mutation_records(
     forwarded_sequences = _returned_formal_sequence_aliases(
         graph_obj, function_table,
     )
+    tuple_member_kinds = _returned_tuple_member_kinds(graph_obj, function_table)
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
         # Program: ``xs = [5, n, 9, 8]; del xs[1]`` (fuzzer p3_13).  Wrong
@@ -10343,7 +10356,8 @@ def _retain_source_sequence_mutation_records(
         ):
             continue
         destination_data = graph_obj.nodes[destination]
-        destination_kind = _receiver_collection_kind(destination_data)
+        destination_kind = _receiver_collection_kind(destination_data) or tuple_member_kinds.get(
+            int(destination_data.get("value_id", destination)))
         mapping_default = destination_kind == "dict" and expression.func.attr == "setdefault"
         if destination_kind not in {"list", "set", "bytes", "bytearray", "array"} and not mapping_default:
             continue
@@ -27123,10 +27137,27 @@ def _fold_callsite_structural_values(
             if selected is None:
                 return unresolved
             fixed = known.get(selected, unresolved)
+            # Program: ``pick(a, 1)`` whose ``if n > 2: t = a else: t =
+            # [7, n, 2]`` folds on the constant argument (corpus c820, c821).
+            # Wrong record: the merge Phi took the selected display's literal
+            # VALUE, so it became a second Constant that kept the
+            # ``aggregate_phi`` producer with no arm to merge (a list "bound
+            # to lists of different shapes" / two heap owners for one list)
+            # while the display kept its own birth.  Rule: a merge selecting
+            # a mutable collection is that arm's storage, so it aliases the
+            # arm; only an immutable value is copied.
+            selected_attributes = (
+                graph.G.nodes[selected].get("attributes") or {}
+                if selected in graph.G else {}
+            )
+            selected_is_mutable_collection = str(
+                selected_attributes.get("aggregate_kind") or ""
+            ) in {"list", "set", "dict"} or isinstance(fixed, (list, set, dict))
             return (
                 _StructuralValueAlias(selected)
                 if fixed is unresolved
                 or isinstance(fixed, _ProgramABIValueFact)
+                or selected_is_mutable_collection
                 else fixed
             )
         if isinstance(expression, ast.UnaryOp):
@@ -28330,6 +28361,7 @@ def _fold_callsite_structural_values(
                     "add", "sub", "mult", "mul", "div", "truediv",
                     "floordiv", "mod", "pow", "maximum", "minimum", "emax", "emin",
                     "max", "min",
+                    "bitand", "bitor", "bitxor", "shl", "shr",
                 } | comparison_operations
                 or semantic_operation in comparison_operations
             ) and not (

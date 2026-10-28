@@ -2915,6 +2915,8 @@ class SSABlockKind(Enum):
     SEQUENCE_QUERY_MERGE = "sequence_query_merge"
     SEQUENCE_POP_SELECTED = "sequence_pop_selected"
     SEQUENCE_POP_EMPTY = "sequence_pop_empty"
+    SEQUENCE_INDEX_IN_RANGE = "sequence_index_in_range"
+    SEQUENCE_INDEX_OUT_OF_RANGE = "sequence_index_out_of_range"
     SEQUENCE_REMOVE_SCAN = "sequence_remove_scan"
     SEQUENCE_REMOVE_COMPARE = "sequence_remove_compare"
     SEQUENCE_REMOVE_NEXT = "sequence_remove_next"
