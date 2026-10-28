@@ -1057,7 +1057,19 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 specialization_book.post(
                     _SOURCE_VALUE_CLASS, (scope, value_id), proposed,
                     stage=_REDUCTION,
-                    provenance=_Derived(tuple(dict.fromkeys((*sources, specialization_cell)))),
+                    provenance=_Derived(tuple(dict.fromkeys((
+                        *sources,
+                        # The inherited class is about this copy's own
+                        # value: cite that value's identity cell, as the
+                        # callsite producer does, so a type ABI settled in
+                        # a fork of this copy derives from it.
+                        *((value_cell,) if (
+                            value_cell := node_identity_cell(
+                                target_wrapper, int(value_id),
+                            )
+                        ) is not None else ()),
+                        specialization_cell,
+                    )))),
                     mode=_Mode.CONCORD,
                 )
     # The parameters are what the call passed: concord them in this scope.
@@ -1990,7 +2002,13 @@ def _known_parameter_memory_contracts(
         value = bindings.get(name)
         if any(value is kind for kind in (list, set, dict, tuple)):
             storage_by_name[name] = ParameterStorage.TABLE
-        elif inspect.isclass(value):
+        elif inspect.isclass(value) and value not in (
+            int, float, bool, complex, str, bytes,
+        ):
+            # An annotation naming a scalar type declares the value's type,
+            # not a record: ``def step(acc: int, i: int)`` has no record
+            # parameter (a loop-index actual was linked as a record receiver
+            # and appended to the caller's arguments with no row).
             storage_by_name[name] = ParameterStorage.RECORD
         elif index == 0 and method_owner is not None:
             storage_by_name[name] = ParameterStorage.RECORD
@@ -2921,6 +2939,53 @@ class GraphTranslationShortfall:
 # materialized. A refused fold is not a failure: it falls through to the
 # ordinary path and reports itself there like anything else.
 _MAX_FOLDED_SEQUENCE_ELEMENTS = 1 << 20
+
+
+def _replication_name_needs_storage(graph: Any, node_id: Any, expression: Any) -> bool:
+    """Whether ``name = <expression>`` binds a list a later statement writes
+    through (``name[k] = v``, ``del name[k]``, ``name.append(v)`` ...) or
+    reads at a runtime index (``name[i]``): both need resident storage, which
+    a folded literal does not have."""
+
+    names = {
+        target.id
+        for successor in graph.G.successors(node_id)
+        for statement in (graph.G.nodes[successor].get("expr_obj"),)
+        if isinstance(statement, ast.Assign) and statement.value is expression
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
+    if not names:
+        return False
+    writers = {
+        "append", "extend", "insert", "pop", "remove", "clear", "sort",
+        "reverse",
+    }
+    for _node, data in graph.G.nodes(data=True):
+        other = data.get("expr_obj")
+        if (
+            isinstance(other, ast.Subscript)
+            and isinstance(other.ctx, (ast.Store, ast.Del))
+            and isinstance(other.value, ast.Name)
+            and other.value.id in names
+        ):
+            return True
+        if (
+            isinstance(other, ast.Subscript)
+            and isinstance(other.value, ast.Name)
+            and other.value.id in names
+            and not isinstance(other.slice, ast.Constant)
+        ):
+            return True
+        if (
+            isinstance(other, ast.Call)
+            and isinstance(other.func, ast.Attribute)
+            and other.func.attr in writers
+            and isinstance(other.func.value, ast.Name)
+            and other.func.value.id in names
+        ):
+            return True
+    return False
 
 
 def _static_sequence_literal(expression: Any) -> Any:
@@ -16145,7 +16210,11 @@ def _normalize_lexical_values(
                         mutation_fact = (
                             int(initial), operator_name,
                             str(sequence_policy), tuple(argument_ids),
-                            "mapping" if mapping_mutation else "sequence",
+                            # The class is the receiver's, as at every other
+                            # site that posts this fact: a dict's ``clear``
+                            # is a sequence operator on a mapping.
+                            "mapping" if aggregate_kind == "dict"
+                            else "sequence",
                         )
                         incumbent = mutation_page.latest(mutation_row)
                         if (
@@ -21695,7 +21764,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             source="authored call result declaration",
                             provenance=_Derived((result_cell,)),
                         )
-                if return_declaration_cell is not None:
+                # A width-carrying class (``-> 'Precision'``) names the
+                # class but not its limbs; the precision operation that
+                # produces the value states the width. Posting width 1 here
+                # contradicted ``x.exp()`` on a two-limb ``x``.
+                if return_declaration_cell is not None and not carries_width:
                     caller_scope = _source_numeric_scope(target_graph)
                     result_sources = tuple(dict.fromkeys(
                         cell for cell in (
@@ -22708,9 +22781,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "result_class_ref": str(receiver_class),
                     "precision_source_operation": source_operation,
                 })
+                # ``tensor_candidate`` is the AbstractTensor reading of the
+                # same method name (``x.exp()``); left on the node, lowering
+                # prefers it over the precision operator and emits a
+                # one-double tensor exp instead.
                 for field in (
                     "callee_ref", "method_ref", "constructor_ref",
-                    "class_ref",
+                    "class_ref", "tensor_candidate",
                 ):
                     attributes.pop(field, None)
                 accessor_id = id(expression.func)
@@ -23044,6 +23121,17 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             data.setdefault("attributes", {})["value"] = expression.value
         elif isinstance(expression, ast.BinOp):
             folded = _static_sequence_literal(expression)
+            # Program: ``a = [0] * 5; a[2] = n`` (corpus c718).  Wrong record:
+            # the fold makes a bare literal list, which has no storage
+            # identity a store can write, so the program was refused (shape
+            # (5,) recorded, () carried).  Rule: a replication whose bound
+            # name a later statement writes through, or reads at a runtime
+            # index, stays a replication, the fill into resident storage;
+            # only literals read at constant positions fold.
+            if folded is not None and _replication_name_needs_storage(
+                graph, node_id, expression,
+            ):
+                folded = None
             if folded is not None:
                 # Sequence replication is table allocation, not arithmetic.
                 data["type"] = "Constant"
@@ -23053,6 +23141,25 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 attributes["value"] = folded
                 attributes["source_type"] = "BinOp"
                 attributes["constant_folded"] = "sequence-replication"
+                # Program: ``xs = [4] * 3`` read at constant positions (corpus
+                # c249).  Wrong record: the folded node kept its operand
+                # edges, so the ``[4]`` display fed nothing but stayed live
+                # and was refused as a private sequence with no capacity.
+                # Rule: a folded literal reads nothing.
+                operand_ids = tuple(
+                    int(parent) for parent, _role in data.get("parents") or ()
+                )
+                _replace_inputs(graph, node_id, ())
+                for operand_id in operand_ids:
+                    if (
+                        operand_id in graph.G
+                        and graph.G.out_degree(operand_id) == 0
+                        and isinstance(
+                            graph.G.nodes[operand_id].get("expr_obj"),
+                            (ast.List, ast.Tuple),
+                        )
+                    ):
+                        _remove_node(graph, operand_id)
                 continue
             left_descriptor = _operand_numeric_descriptor(
                 graph, expression.left

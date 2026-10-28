@@ -529,6 +529,58 @@ def _concord_exact_region_feed_dtypes(
                                     target_structure.source,
                                     physical=_inherit,
                                 )
+
+                            # Program: ``while (lim - total).item() > 0.5:
+                            # total = total + 1.0`` (the region formal is
+                            # the loop variable's logical graph id, whose
+                            # row a scalar constant seed also posts).  Wrong
+                            # record: the formal's row posted
+                            # scalar/rank-0/``physical_dtype`` while the
+                            # feeding actual -- a loop Phi or an arithmetic
+                            # result of a region, whose operands carry no
+                            # contract row -- posted none of them, so the
+                            # transport refused (producer None, consumer
+                            # float64).  Rule: the same carried variable at
+                            # the same dtype and shape is one scalar
+                            # representation; the actual's UNPOSTED physical
+                            # fields are DERIVED from the formal's posted
+                            # row at this binding, through the same revise
+                            # writer, and a posted actual field is never
+                            # overwritten.
+                            _actual_inherit = {}
+
+                            if (
+                                target_structure.physical_dtype is not None
+                                and source_structure.physical_dtype is None
+                            ):
+                                _actual_inherit['physical_dtype'] = (
+                                    target_structure.physical_dtype
+                                )
+
+                            if (
+                                target_structure.declared_storage is not None
+                                and source_structure.declared_storage is None
+                            ):
+                                _actual_inherit['storage'] = (
+                                    target_structure.declared_storage
+                                )
+
+                            if (
+                                target_structure.rank is not None
+                                and source_structure.rank is None
+                            ):
+                                _actual_inherit['rank'] = target_structure.rank
+
+                            if _actual_inherit:
+                                revise_value_row(
+                                    caller,
+                                    int(actual.id),
+                                    actual.dtype,
+                                    actual.shape,
+                                    target_structure.source,
+                                    source_structure.source,
+                                    physical=_actual_inherit,
+                                )
                         # An actual that declares ``ssa_storage_view`` of its
                         # own id is the declared view, not the storage: its
                         # producer endpoint is the view's structural row

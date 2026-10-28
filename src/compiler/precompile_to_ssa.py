@@ -232,6 +232,18 @@ _REGION_MARKER = re.compile(r"^__scheduled_region_(\d+)__$")
 _CALLSITE_MARKER = re.compile(r"^__plan_callsite_(\d+)__$")
 
 
+def _region_value_dtype(value_id, value_dtypes, existing, control_name):
+    """The dtype the region's value record carries, or a named refusal."""
+    declared = (value_dtypes or {}).get(value_id)
+    if declared is not None:
+        return declared
+    if existing is not None and existing.dtype is not None:
+        return existing.dtype
+    raise ValueError(
+        f"region value %{value_id} in {control_name} has a shape record but "
+        "no dtype record (value_dtypes and region_value_meta both lack it)")
+
+
 def _region_table_operations(
     region_index: int,
     table_region_operations: Mapping[int, Any] | None,
@@ -1720,9 +1732,10 @@ def _runtime_rank_physical(
 
     from .identity_concordance import (
         SHAPE_STATE_PAGE, descriptor_from_shape_transformation_state,
+        shape_transformation_state,
     )
 
-    if shape_scope is None or tuple(value.shape or ()):
+    if shape_scope is None:
         return None
     row = (tuple(shape_scope), int(value.id))
     cell = book.latest_ref(SHAPE_STATE_PAGE, row)
@@ -1732,6 +1745,33 @@ def _runtime_rank_physical(
     if not (isinstance(fact, tuple) and fact and fact[0] == "resolved"):
         return None
     descriptor = descriptor_from_shape_transformation_state(fact[1])
+    # Program: ``acc = acc * 2 + i`` in a ``while`` (every int loop).  Wrong
+    # record: the computed update posted no storage/rank/physical dtype while
+    # the carried slot's literal initial posted them, so the loop-carry
+    # transport disagreed.  Rule: a result whose shape state is a resolved
+    # static numeric one of the value's own dtype and shape posts that
+    # state's physical view, DERIVED from the state cell (this producer
+    # owns it; the structural view no longer infers it).
+    state = shape_transformation_state(fact[1])
+    if state is not None and state[3] == "static":
+        from ..transmogrifier.dtype_layout import resolve
+
+        shape, dtype, rank, _metadata, _row_shape = state
+        layout = resolve(dtype)
+        if (
+            layout is not None
+            and layout.kind in {"bool", "int", "uint", "float"}
+            and str(dtype) == str(value.dtype)
+            and str(dtype) != "opaque_ref"
+            and rank == len(shape)
+            and tuple(shape) == tuple(value.shape or ())
+        ):
+            return {
+                "physical_dtype": str(dtype),
+                "storage": "span" if rank else "scalar", "rank": rank,
+            }, cell
+    if tuple(value.shape or ()):
+        return None
     if not (
         descriptor is not None
         and not tuple(descriptor.get("shape") or ())
@@ -19016,10 +19056,15 @@ class _ControlSSABuilder(TiledObject):
         # Program: ``d = {1: 10, 2: 20, 3: 30}; del d[2]; for k in d: ...``.
         # Wrong record: the loop ran over the physical rows, and a keyed
         # delete only clears the row's live flag, so the deleted key was
-        # still visited (57 for 37).  Nothing here skips a cleared row.
-        # Rule: iterating a table with a keyed delete is refused.  (A list
-        # formal a filtered loop reads also carries live flags, c359; those
-        # mark kept rows, not deletions, so they are not refused.)
+        # still visited (57 for 37).  Nothing here skipped a cleared row,
+        # and the loop was refused.  Rule: an iteration over a table with a
+        # keyed delete reads each row's live flag first and takes the
+        # latch for a cleared one, as a selected child table's does; the
+        # latch's carried values for that edge are the body-entry ones.
+        # (A list formal a filtered loop reads also carries live flags,
+        # c359; those mark kept rows, not deletions, so they are not
+        # skipped.)
+        table_live_block_names: set[str] = set()
         for iterable_id, _target_id, induction_name, *_projection in (
             *self.program.iterable_bindings,
             *self.program.projected_iterable_bindings,
@@ -19036,12 +19081,27 @@ class _ControlSSABuilder(TiledObject):
                 and descriptor.live_flags_value_id is not None
                 and sequence_id in self.keyed_deletion_sequence_ids
             ):
-                raise ValueError(
-                    f"{path}: loop {loop.induction} iterates table "
-                    f"{sequence_id}, whose deleted rows stay resident behind "
-                    "cleared live flags; iteration over a table with "
-                    "deletions is not lowered"
+                live_address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS, operands=(induction,),
                 )
+                live = self.fresh_value(
+                    dtype="bool", transform=LOAD, operands=(live_address,),
+                )
+                active = self.new_block("table_row_live")
+                self.emit(
+                    Handler.GetElementPtr,
+                    [self.external_value(descriptor.live_flags_value_id), induction],
+                    live_address,
+                    attributes={"binding": "table_row_live"},
+                )
+                self.emit(
+                    Handler.Load, [live_address], live,
+                    attributes={"binding": "table_row_live"},
+                )
+                self.conditional_branch(live, active, latch)
+                self.current = active
+                table_live_block_names.add(active.name)
+                break
         for iterable_id, target_id, induction_name in (
             self.program.iterable_bindings
         ):
@@ -19632,6 +19692,7 @@ class _ControlSSABuilder(TiledObject):
             candidate
             for candidate in self.blocks.values()
             if candidate.name not in blocks_before_body or candidate.name == body.name
+            or candidate.name in table_live_block_names
         ]
         # A nested retained loop may carry the same source state as this loop.
         # Its exit Phi is then the value produced by this iteration, but the
@@ -23579,7 +23640,7 @@ def _inject_field_slot_access(
     field_count: int,
     field_const_sources: Mapping[int, Any] | None = None,
     output_value_ids: tuple[int, ...] = (),
-    dtype: str = "float64",
+    dtype: str | None = None,
     field_dtypes: Mapping[int, str] | None = None,
     separate_field_storage: bool = False,
     field_accounting: Mapping[int, Mapping[str, Any]] | None = None,
@@ -23651,7 +23712,7 @@ def _inject_field_slot_access(
         SSA_VALUE, (_slot_scope, int(self_value_id)),
     )
 
-    def fresh(*causes: Any, value_dtype: str | None = None) -> int:
+    def fresh(*causes: Any, value_dtype: str) -> int:
         book = _slot_book()
         operand = (
             _receiver_cell if _receiver_cell is not None
@@ -23659,7 +23720,7 @@ def _inject_field_slot_access(
         )
         return _mint_ssa_id(
             book, _slot_scope, FIELD_SLOT_ACCESS, (operand, *causes),
-            dtype=dtype if value_dtype is None else value_dtype,
+            dtype=value_dtype,
             stage=CONTROL_SSA_FINISH,
         )
 
@@ -23738,7 +23799,7 @@ def _inject_field_slot_access(
                 raise ValueError("resident record field loads require exact separate slot locations")
             column_arrays[key] = resident_field_locations[int(key[1])][0]
             continue
-        arena_id = int(self_value_id) if index == 0 else fresh()
+        arena_id = int(self_value_id) if index == 0 else fresh(value_dtype=column_dtype)
         column_arrays[key] = SSAValue(
             arena_id, dtype=column_dtype,
             shape=(len(slots_by_column[key]),),
@@ -23812,7 +23873,7 @@ def _inject_field_slot_access(
         producer = producers[0]
         original = producer.res
         version = SSAValue(
-            fresh(),
+            fresh(value_dtype=original.dtype),
             dtype=original.dtype,
             shape=tuple(original.shape),
             device=original.device,
@@ -23850,7 +23911,7 @@ def _inject_field_slot_access(
         # it with the receiver dtype typed it ``bool`` on a bool-first
         # receiver, and Fortran refused ``logical + 1`` as an index.
         index = SSAValue(fresh(*causes, value_dtype="int64"), dtype="int64")
-        address = SSAValue(fresh(*causes))
+        address = SSAValue(fresh(*causes, value_dtype=slot_dtype))
         return (
             [
                 Instr("Const", [], index, attributes={"value": int(offset)}),
@@ -24050,7 +24111,7 @@ def _inject_field_slot_access(
             if literal is not None and flat[literal][1].op == "Const" and (
                 not flat[literal][1].args
             ):
-                source = SSAValue(fresh(*causes), dtype=slot_dtype)
+                source = SSAValue(fresh(*causes, value_dtype=slot_dtype), dtype=slot_dtype)
                 publish_row(source)
                 group.append(Instr(
                     "Const", [], source,
@@ -24099,6 +24160,37 @@ def _inject_field_slot_access(
                 position = return_position  # returned but otherwise unconsumed
             if position is None:
                 continue  # a read nothing consumes has no place and no effect
+            # Program: ``value = self.n; self.n += 1; return value`` (a
+            # counter's ``fresh``).  Wrong record: the read's only consumer is
+            # the ``return``, so its Load was placed right before it -- after
+            # the Store of the increment -- and the call returned the new
+            # value.  Rule: a read stays ahead of any LATER write to its own
+            # slot in the schedule: when that write's Store lands at or before
+            # the read's placement in the same block, the read is placed at
+            # that Store (it sorts first by schedule index).
+            for later_index in range(schedule_index + 1, len(field_ops)):
+                later_kind, later_value, later_slot = field_ops[later_index]
+                if later_kind != "write" or int(later_slot) != int(slot):
+                    continue
+                if later_index in arm_owned:
+                    store_position = arm_owned[later_index][0]
+                else:
+                    later_source = field_write_sources.get(
+                        int(later_value),
+                        produced_values.get(int(later_value)),
+                    )
+                    later_producer = (
+                        None if later_source is None
+                        else producer_position.get(int(later_source.id))
+                    )
+                    store_position = (
+                        later_producer + 1 if later_producer is not None else 0
+                    )
+                if (
+                    store_position < position
+                    and flat[store_position][0] == flat[position][0]
+                ):
+                    position = store_position
             _post_slot_read(int(value_id), int(slot), address)
         else:
             group = []
@@ -24243,6 +24335,12 @@ def _inject_field_slot_access(
     # and child-pool ABI arguments above retain their exact shapes and dtypes.
     for param_id in non_self_param_ids:
         if int(param_id) not in seen_argument_ids and int(param_id) not in field_read_ids:
+            if dtype is None:
+                raise ValueError(
+                    f"parameter value %{int(param_id)} is absent from the "
+                    f"lowered receiver method {control_function.name} and its "
+                    "dtype is not recorded"
+                )
             arguments.append(SSAValue(int(param_id), dtype=dtype))
             seen_argument_ids.add(int(param_id))
 
@@ -24324,54 +24422,6 @@ def _inject_field_slot_access(
             ))} if resident_field_locations is None else {}),
         },
     ), field_locations
-
-
-def _insert_before_region_holder(
-    block: Any, region_index: int, inserted: Any,
-) -> Any:
-    """``block`` with ``inserted`` placed just before the statement of a
-    top-level sequence that holds scheduled region ``region_index`` (the
-    region itself, or the branch/loop holding it), or None when no such
-    statement exists.  Only sequences are entered, so the placement runs
-    unconditionally, once."""
-
-    def holds(candidate: Any) -> bool:
-        if isinstance(candidate, StatementBlock):
-            return any(
-                (match := _REGION_MARKER.fullmatch(str(line))) is not None
-                and int(match.group(1)) == int(region_index)
-                for line in candidate.lines
-            )
-        for name in (
-            "blocks", "body", "orelse", "condition", "default", "callee",
-            "finalbody", "lanes",
-        ):
-            child = getattr(candidate, name, None)
-            children = child if isinstance(child, tuple) else (child,)
-            if any(
-                item is not None and not isinstance(item, (str, int))
-                and holds(item)
-                for item in children
-            ):
-                return True
-        return any(holds(item) for _label, item in getattr(candidate, "cases", ()) or ())
-
-    if not isinstance(block, SequenceBlock):
-        return None
-    for position, child in enumerate(block.blocks):
-        if not holds(child):
-            continue
-        if isinstance(child, SequenceBlock):
-            nested = _insert_before_region_holder(child, region_index, inserted)
-            if nested is None:
-                return None
-            return replace(block, blocks=(
-                *block.blocks[:position], nested, *block.blocks[position + 1:],
-            ))
-        return replace(block, blocks=(
-            *block.blocks[:position], inserted, *block.blocks[position:],
-        ))
-    return None
 
 
 def _schedule_loop_callsites(
@@ -26402,8 +26452,6 @@ def lower_control_sections_to_ssa(
     table_deletions: tuple[
         tuple[int, int | tuple[int, ...], int | None, str], ...
     ] = (),
-    table_deletion_bases: Mapping[int, int] | None = None,
-    table_deletion_held_ids: frozenset[int] = frozenset(),
     retained_sequence_ids: tuple[int, ...] = (),
     nested_sequence_ids: tuple[int, ...] = (),
     nested_tensor_sequence_ids: tuple[int, ...] = (),
@@ -28846,161 +28894,19 @@ def lower_control_sections_to_ssa(
             for position, (kind, arguments) in enumerate(operations):
                 if kind == "store":
                     store_placements[int(arguments[0])] = (operations, position)
-    # How many branch/loop arms hold each scheduled region.
-    region_arm_depth: dict[int, int] = {}
-
-    def survey_region_arms(block: Any, depth: int) -> None:
-        if isinstance(block, StatementBlock) and len(block.lines) == 1:
-            match = _REGION_MARKER.fullmatch(str(block.lines[0]))
-            if match is not None:
-                region_arm_depth[int(match.group(1))] = depth
-        if isinstance(block, SequenceBlock):
-            for child in block.blocks:
-                survey_region_arms(child, depth)
-            return
-        # Any other nested block (an arm, a loop or while body, a case) runs
-        # under a condition or repeatedly; counted as one arm deeper.
-        for name in (
-            "body", "orelse", "condition", "default", "callee", "finalbody",
-        ):
-            child = getattr(block, name, None)
-            if child is not None and not isinstance(child, (str, int)):
-                survey_region_arms(child, depth + 1)
-        for _label, child in getattr(block, "cases", ()) or ():
-            survey_region_arms(child, depth + 1)
-        for child in getattr(block, "lanes", ()) or ():
-            survey_region_arms(child, depth + 1)
-
-    survey_region_arms(control.root, 0)
-    # A held delete the shell installed in its arm as a table-delete
-    # mutation is placed already; the value-order rules below are for the
-    # deletes no control block carries.
     control_placed_delete_ids = _control_placed_table_delete_ids(control.root)
     for deletion in table_deletions:
         effect_id = int(deletion[0])
         if effect_id in control_placed_delete_ids:
             continue
-        base_store = store_placements.get(
-            int((table_deletion_bases or {}).get(effect_id, -1))
-        )
-        if base_store is not None:
-            operations, position = base_store
-            operations.insert(position + 1, ("delete", deletion))
-            for key, (placed, placed_position) in tuple(store_placements.items()):
-                if placed is operations and placed_position > position:
-                    store_placements[key] = (placed, placed_position + 1)
-            continue
-        preceding = [
-            (value_id, region_index)
-            for value_id, region_index in region_source_values
-            if value_id < effect_id
-        ]
-        following = [
-            (value_id, region_index)
-            for value_id, region_index in region_source_values
-            if value_id > effect_id
-        ]
-        if deletion[2] is None and preceding:
-            _value_id, region_index = max(preceding)
-            table_region_operations.setdefault(region_index, []).append(("delete", deletion))
-        elif preceding and max(preceding)[0] in iterable_source_ids:
-            _value_id, region_index = max(preceding)
-            table_region_operations.setdefault(region_index, []).append(("delete", deletion))
-        elif following:
-            _value_id, region_index = min(following)
-            # Program: ``o = maybe_pick(n + 1, 1); d = {1: 5, 2: n, 3: 8};
-            # del d[2]``, then ``(-3 if o is None else o + 1) + len(d) * 10``
-            # (fuzz p106_43).  Wrong record: the first region after the
-            # delete in value order is ``o + 1``, which runs only in the
-            # conditional's ``else`` arm, so the delete rode into that arm
-            # and ``len(d)`` was 3 whenever ``o`` was None (27 for 17; clean
-            # audit).  A later region outside every arm is no carrier
-            # either: there the delete followed the ``len`` that reads the
-            # table.  Rule: a delete no ``if``/loop holds, whose first
-            # region is held by an arm, is its own control effect: a
-            # table-delete mutation placed just before the statement that
-            # holds that arm, where it runs once and before every reader
-            # the scheduler orders after a write of the table.
-            if (
-                effect_id not in table_deletion_held_ids
-                and region_arm_depth.get(int(region_index), 0)
-            ):
-                if deletion[2] is not None:
-                    placed_root = _insert_before_region_holder(
-                        control.root, int(region_index),
-                        SequenceMutationBlock(ControlSequenceMutation(
-                            sequence_value_id=int(deletion[2]),
-                            operator="delete",
-                            argument_value_ids=(
-                                tuple(map(int, deletion[1]))
-                                if isinstance(deletion[1], tuple)
-                                else (int(deletion[1]),)
-                            ),
-                            effect_node_id=effect_id,
-                            argument_kind=(
-                                "table_delete_keys"
-                                if isinstance(deletion[1], tuple)
-                                else "table_delete_key"
-                            ),
-                        )),
-                    )
-                    if placed_root is not None:
-                        control = replace(control, root=placed_root)
-                        continue
-                shortfalls.append(SSALoweringShortfall(
-                    "ssa-table", "unconditional-delete-carrier",
-                    control_name,
-                    f"delete {effect_id} runs unconditionally, but the "
-                    f"region after it ({int(region_index)}) runs inside a "
-                    "branch or loop arm",
-                ))
-                continue
-            # Program: ``xs0 = [n, 3]; r0 = xs0[0]; swap(xs0); d1 = {1: 2, 2:
-            # n}; del d1[n % 3 + 1]`` (fuzz p122_35).  Wrong record: the
-            # carrier region also computes the delete's key (fused with
-            # ``r0``), and the delete ran as its pre-operation, reading the
-            # key before the region defined it (audit use-not-dominated; the
-            # helper then raised error 84 for a present key).  Rule: a delete
-            # whose key the carrier region produces is that region's
-            # post-operation.
-            key_ids = (
-                tuple(map(int, deletion[1]))
-                if isinstance(deletion[1], tuple) else (int(deletion[1]),)
-            )
-            produced_here = {
-                int(value_id)
-                for value_id, index in region_source_values
-                if int(index) == int(region_index)
-            }
-            if any(key_id in produced_here for key_id in key_ids):
-                table_reads = {
-                    int(value_id)
-                    for value_id, sequence_id in (
-                        sequence_length_values or {}
-                    ).items()
-                    if int(sequence_id) == int(deletion[2] or -1)
-                } | {
-                    int(result_id)
-                    for result_id, _query, sequence_id in table_lookups
-                    if int(sequence_id) == int(deletion[2] or -1)
-                }
-                if table_reads & set(map(int, region_signatures.get(
-                    int(region_index), ((), ()),
-                )[0])):
-                    shortfalls.append(SSALoweringShortfall(
-                        "ssa-table", "delete-key-carrier", control_name,
-                        f"delete {effect_id}'s key is computed by region "
-                        f"{int(region_index)}, which also reads the table "
-                        "the delete changes",
-                    ))
-                    continue
-                table_region_post_operations.setdefault(
-                    region_index, [],
-                ).insert(0, ("delete", deletion))
-                continue
-            table_region_operations.setdefault(region_index, []).insert(0, ("delete", deletion))
-        else:
-            table_epilogue_operations.append(("delete", deletion))
+        # Every keyed delete is an authored control effect the shell
+        # installs where its statement stands (``_install_lexical_sequence_
+        # mutations``); one that no control block carries has no record to
+        # place it by, and value order is not one.
+        shortfalls.append(SSALoweringShortfall(
+            "ssa-table", "unplaced-delete", control_name,
+            f"delete {effect_id} is carried by no control block",
+        ))
     table_epilogue_operations.extend(trailing_inplace_pack_operations)
     for destination_id, source_id, width_id, _consumed_ids in sequence_bit_packs:
         table_epilogue_operations.append((
@@ -29038,10 +28944,7 @@ def lower_control_sections_to_ssa(
                 value_id,
                 tuple(existing.shape or ()) if existing is not None else (),
             )),
-            str((value_dtypes or {}).get(
-                value_id,
-                existing.dtype if existing is not None else "float64",
-            )),
+            str(_region_value_dtype(value_id, value_dtypes, existing, control_name)),
             existing.device if existing is not None else None,
         )
     # Keep the hierarchy's pre-rewrite dataflow as scheduling authority.  A
@@ -29611,13 +29514,41 @@ def lower_control_sections_to_ssa(
             + ", ".join(undeclared_scalar_fields)
             + f"; declared={tuple(sorted(declared_field_dtypes))!r}"
         )
+    # A receiver with no authored record declaration (``record_identity`` is
+    # None) settles each scalar slot's dtype from the values its field
+    # operations move: the read result / written value carry the settled
+    # dtype in the function.  Disagreement or absence is a named refusal.
+    _function_value_dtypes: dict[int, set[str]] = {}
+    for _block in control_function.blocks.values():
+        for _instruction in _block.instrs:
+            for _value in (*_instruction.args, _instruction.res):
+                if _value is not None and _value.dtype is not None:
+                    _function_value_dtypes.setdefault(
+                        int(_value.id), set()
+                    ).add(str(_value.dtype))
+    for _name in undeclared_scalar_fields:
+        _slot = field_names.index(_name)
+        _seen = set()
+        for _kind, _value_id, _op_slot in field_ops:
+            if int(_op_slot) == _slot:
+                _seen |= _function_value_dtypes.get(int(_value_id), set())
+        if len(_seen) != 1:
+            raise ValueError(
+                f"record scalar slot ABI lacks dtype in {control_function.name} "
+                f"for record {record_identity!r}: field {_name!r}; its field "
+                f"operations carry dtypes {tuple(sorted(_seen))!r}"
+            )
+        declared_field_dtypes[_name] = next(iter(_seen))
+    scalar_dtypes = set(scalar_dtypes) | {
+        declared_field_dtypes[name] for name in undeclared_scalar_fields
+    }
     receiver_scalar_dtype = (
-        sorted(scalar_dtypes)[0] if scalar_dtypes else "float64"
+        sorted(scalar_dtypes)[0] if len(scalar_dtypes) == 1 else None
     )
     scalar_slot_dtypes = {
         compact_slot[old_slot]: (
             "opaque_ref" if old_slot in reference_slots
-            else declared_field_dtypes.get(name, receiver_scalar_dtype)
+            else declared_field_dtypes[name]
         )
         for old_slot, name in enumerate(field_names)
         if old_slot in compact_slot
