@@ -8161,6 +8161,40 @@ def _normalize_lexical_values(
         annotation_cell = iterator_attributes.get(
             "sequence_element_annotation_cell"
         )
+        if class_identity is None:
+            # Program: ``for k in d`` / ``for v in d.values()`` over ``d:
+            # dict[K, V]``.  Iterating a mapping yields its keys; ``.values()``
+            # yields its values; the annotation states each class.
+            iterator_data = graph.G.nodes[int(iterator_value)]
+            call = iterator_data.get("expr_obj")
+            mapping_attributes = iterator_attributes
+            mapping_id = int(iterator_value)
+            projected_attribute = "mapping_key_class_ref"
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "values"
+            ):
+                owners = [
+                    int(parent) for parent, role
+                    in iterator_data.get("parents") or ()
+                    if str(role) == "operand" and int(parent) in graph.G
+                ]
+                if len(owners) == 1:
+                    mapping_id = owners[0]
+                    mapping_attributes = (
+                        graph.G.nodes[mapping_id].get("attributes") or {}
+                    )
+                    projected_attribute = "mapping_value_class_ref"
+            if mapping_attributes.get("aggregate_kind") == "dict":
+                class_identity = mapping_attributes.get(projected_attribute)
+                annotation_cell = mapping_attributes.get(
+                    "mapping_value_annotation_cell"
+                )
+                if class_identity is not None and mapping_id != int(
+                    iterator_value
+                ):
+                    iterator_value = mapping_id
         if (
             class_identity is None
             and iterator_attributes.get("extraction_identity")
