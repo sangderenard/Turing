@@ -21701,10 +21701,17 @@ class _ControlSSABuilder(TiledObject):
             carried_updates,
             exit_context["continue_edges"],
         )
+        # Program: ``for i in range(2**63 - 5, 2**63 - 1, 3)``.  Wrong
+        # record: ``i + step`` wrapped past int64, the header compared the
+        # wrapped value against ``stop`` and the loop never ended.  Rule:
+        # the step saturates (``loop_induction_step``): a sum past int64 is
+        # past every int64 ``stop`` in the step's direction, so the header
+        # ends the loop exactly where Python's range does.
         self.emit(
             Handler.Add,
             [induction, step],
             next_induction,
+            attributes={"binding": "loop_induction_step"},
         )
         self.branch(header)
         if recursion_region_id is not None:

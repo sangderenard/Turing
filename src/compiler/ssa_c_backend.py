@@ -315,6 +315,20 @@ def _python_int_overflow_checked(instruction) -> bool:
     return python_int_overflow_checked(instruction)
 
 
+def _python_int_spelled(op: str, instruction) -> bool:
+    """Whether ``_python_int_statement`` spells this op (its LLVM rule).
+
+    ``<< >> // %`` keep Python's semantics proven or not; ``abs`` and unary
+    ``-`` only need it while no interval proves the result inside int64.
+    """
+
+    from .ssa_llvm_backend import python_int_operation
+
+    if op in {"Abs", "abs", "Neg"}:
+        return _python_int_overflow_checked(instruction)
+    return python_int_operation(instruction)
+
+
 def _python_int_statement(op: str, args, target: str) -> str:
     """C for Python's ``<< >> // %``, ``abs`` and unary ``-`` on an int64.
 
@@ -6493,7 +6507,7 @@ def emit_ssa_module_to_c(
                         is_integer(value) and not _is_unsigned_dtype(value.dtype)
                         for value in instruction.args
                     )
-                    and _python_int_overflow_checked(instruction)
+                    and _python_int_spelled(op, instruction)
                 ):
                     prototype = "void turing_validation_error(uint32_t error_code);"
                     if prototype not in prototypes:
@@ -6564,6 +6578,19 @@ def emit_ssa_module_to_c(
                     from .ssa_llvm_backend import python_int_overflow_checked
 
                     if (
+                        integral and op == "Add" and kind == "int64_t"
+                        and (instruction.attributes or {}).get("binding")
+                        == "loop_induction_step"
+                    ):
+                        # A range loop's induction step saturates, as the
+                        # LLVM lane's ``llvm.sadd.sat`` (precompile_to_ssa).
+                        declared = (
+                            f"int64_t t{result_id} = 0; if (__builtin_add_overflow("
+                            f"(int64_t)({args[0]}), (int64_t)({args[1]}), "
+                            f"&t{result_id})) t{result_id} = "
+                            f"((int64_t)({args[1]}) > 0) ? INT64_MAX : INT64_MIN;"
+                        )
+                    elif (
                         integral and op in {"Add", "Sub", "Mul"}
                         and kind == "int64_t"
                         and python_int_overflow_checked(instruction)

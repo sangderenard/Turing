@@ -91,7 +91,9 @@ def emit_ssa_function_to_wasm(
     Both are available deliberately -- a table costs memory and an interpolation,
     a series costs multiplies, and which is cheaper depends on the target.
     """
-    from .ssa_llvm_backend import python_int_unchecked_refusal
+    from .ssa_llvm_backend import (
+        DOUBLE_EXACT, INT32_EXACT, python_int_unchecked_refusal,
+    )
     from .work_contract import PRESETS, active_contract
 
     function: Function = module.functions[function_name]
@@ -200,7 +202,9 @@ def emit_ssa_function_to_wasm(
         if instruction.res is None:
             shortfalls.append(WasmEmissionShortfall(op, "instruction has no result"))
             continue
-        unchecked = python_int_unchecked_refusal(instruction, "direct scalar WASM")
+        unchecked = python_int_unchecked_refusal(
+            instruction, "direct scalar WASM f64", DOUBLE_EXACT,
+        )
         if unchecked is not None:
             shortfalls.append(WasmEmissionShortfall(op, unchecked))
             continue
@@ -570,7 +574,9 @@ def emit_ssa_module_to_wasm_core(
     """Emit ``function_name`` plus its inlined callees as one wasm function."""
 
     from .ir_identities import precision_backend_shortfalls
-    from .ssa_llvm_backend import python_int_unchecked_refusal
+    from .ssa_llvm_backend import (
+        DOUBLE_EXACT, INT32_EXACT, python_int_unchecked_refusal,
+    )
 
     name = str(entry_name or function_name)
     root: Function = module.functions[function_name]
@@ -701,7 +707,9 @@ def emit_ssa_module_to_wasm_core(
 
         nonlocal precision_present
         operation = str(instruction.op)
-        unchecked = python_int_unchecked_refusal(instruction, "core WASM i32")
+        unchecked = python_int_unchecked_refusal(
+            instruction, "core WASM i32", INT32_EXACT,
+        )
         if unchecked is not None:
             shortfalls.append(WasmEmissionShortfall(operation, unchecked))
             return

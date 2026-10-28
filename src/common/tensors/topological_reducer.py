@@ -5676,6 +5676,17 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
     posted: list = []
     for key, (class_cell, _identity) in class_cells.items():
         interval = state.get(find(key))
+        # The node's lowered instruction carries its proof
+        # (``python_int_range``): a native lane checks or refuses only
+        # Python int arithmetic no interval bounds.
+        for unit, node_id in members[key]:
+            node_attributes = unit.G.nodes[node_id].setdefault("attributes", {})
+            if interval is None or interval == _INT_RANGE_TOP:
+                node_attributes.pop("python_int_range", None)
+            else:
+                node_attributes["python_int_range"] = (
+                    int(interval[0]), int(interval[1]),
+                )
         if interval is None or interval == _INT_RANGE_TOP:
             continue
         incumbent = range_page.latest(key)

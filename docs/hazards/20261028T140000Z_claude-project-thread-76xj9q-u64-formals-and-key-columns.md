@@ -92,5 +92,14 @@ a negative shift count (87), NativeZeroDivisionError (88). JavaScript, WASM
 and GLSL (32-bit int or double storage) refuse such instructions by name;
 WGSL already refused int64. Test: tests/test_native_int_overflow_checked.py.
 
-Open: a `range(start, stop, step)` loop latch adds `i + step` unchecked, so a
-range ending near INT64_MAX wraps and does not terminate as Python does.
+A `range(start, stop, step)` loop latch added `i + step` unchecked, so a
+range ending near INT64_MAX wrapped and never terminated. The step now
+saturates (`loop_induction_step`: `llvm.sadd.sat.i64`, `__builtin_add_overflow`
+then INT64_MAX/INT64_MIN), which the header compare ends exactly where Python
+does, for either step sign.
+
+Checks and refusals are interval-aware: `_solve_int_ranges` stamps a proven
+interval on the source node (`python_int_range`), which the instruction
+carries. A result proven inside int64 is unchecked on C/LLVM; JS/WASM/GLSL
+refuse only results not proven inside their exact ints (2**53 for doubles,
+int32 for i32/GLSL int).

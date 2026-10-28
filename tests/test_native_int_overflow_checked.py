@@ -334,3 +334,104 @@ def test_wasm_refuses_unproven_int64_arithmetic():
     )
     direct = emit_ssa_function_to_wasm(module, region)
     assert any(shortfall.operation == "Mul" for shortfall in _refusals(direct.shortfalls))
+
+
+# --- a proven interval needs no check, and every target may lower it ----
+
+PROVEN_SOURCE = """
+def step(a: int, b: int) -> int:
+    x = 3
+    if a > b:
+        x = 7
+    return x * x + 1
+
+
+def root(a: int, b: int):
+    return step(a, b) + 2
+"""
+
+
+def _proven_module():
+    module, export, _parameters, _outputs = _lower(PROVEN_SOURCE)
+    return module, export
+
+
+def test_proven_int_arithmetic_carries_its_interval_and_is_not_checked():
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.ssa_llvm_backend import (
+        python_int_operation, python_int_overflow_checked,
+    )
+
+    module, export = _proven_module()
+    authored = [
+        instruction
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if python_int_operation(instruction)
+    ]
+    assert {instruction.op for instruction in authored} >= {"Add", "Mul"}
+    assert all(
+        instruction.attributes.get("python_int_range") is not None
+        and not python_int_overflow_checked(instruction)
+        for instruction in authored
+    )
+    source = emit_ssa_to_c(module, export).source
+    assert "_overflow(" not in source
+
+
+@LANES
+@pytest.mark.parametrize("a", [5, -1])
+def test_proven_int_arithmetic_matches_python(tmp_path, lane, a):
+    namespace = {}
+    exec(PROVEN_SOURCE, namespace)
+    assert lane(tmp_path, PROVEN_SOURCE, a, 0) == namespace["root"](a, 0)
+
+
+def test_javascript_lowers_proven_int_arithmetic():
+    from src.compiler.ssa_javascript_backend import emit_ssa_module_to_javascript
+
+    module, export = _proven_module()
+    artifact = emit_ssa_module_to_javascript(module, function_name=export)
+    assert artifact.complete, artifact.shortfalls
+
+
+def test_wasm_lowers_proven_int_arithmetic():
+    from src.compiler.ssa_wasm_backend import emit_ssa_function_to_wasm
+
+    module, _export = _proven_module()
+    regions = [
+        name for name in module.functions
+        if "__step__" in name and "planned_region" in name
+    ]
+    assert regions
+    for region in regions:
+        artifact = emit_ssa_function_to_wasm(module, region)
+        assert not _refusals(artifact.shortfalls), artifact.shortfalls
+
+
+# --- a range loop's step never wraps past its stop ----------------------
+
+RANGE_SOURCE = """
+def step(a: int, b: int) -> int:
+    count = 0
+    for _ in range(a, b, STEP):
+        count += 1
+    return count
+
+
+def root(a: int, b: int):
+    return step(a, b) + 0
+"""
+
+
+@LANES
+@pytest.mark.parametrize("step,a,b", [
+    (3, 2 ** 63 - 5, 2 ** 63 - 1),
+    (3, 0, 10),
+    (-3, INT64_MIN + 5, INT64_MIN),
+    (-3, 10, 0),
+])
+def test_range_step_near_int64_ends_where_python_does(tmp_path, lane, step, a, b):
+    source = RANGE_SOURCE.replace("STEP", str(step))
+    assert lane(tmp_path, source, a, b) == len(range(a, b, step))
