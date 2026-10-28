@@ -106,3 +106,27 @@ def test_out_of_range_read_still_raises(tmp_path, lane):
     assert _run(tmp_path, lane, OUT_OF_RANGE, 0) == 0
     with pytest.raises(NativeIndexError):
         _run(tmp_path, lane, OUT_OF_RANGE, 1)
+
+
+def test_fortran_emits_the_fault_exit_after_its_error_stop():
+    # The Fortran lane had no statement for the ``Trap`` and refused every
+    # program with a checked index (215 corpus programs, e.g. c137, c140).
+    # Its fault code is the ``error stop`` the validation call became; the
+    # ``Trap`` itself leaves without publishing, as C and LLVM do.
+    from src.compiler.ssa_fortran_backend import emit_module
+
+    module, export = _lowered(OUT_OF_RANGE)
+    emitted = emit_module(
+        module, extra_roots=(export,), progress=lambda _message: None,
+    )
+    assert emitted.complete, [item.format() for item in emitted.shortfalls]
+    lines = [line.strip() for line in emitted.source.splitlines()]
+    assert "error stop 71" in lines
+    exits = [
+        lines[index + 1:index + 3]
+        for index, line in enumerate(lines)
+        if line.startswith("! block sequence_index_out_of_range")
+    ]
+    # One block reports the code; the fault exit's block only returns.
+    assert any(body[-1] == "error stop 71" for body in exits), exits
+    assert any(body[-1] == "return" for body in exits), exits

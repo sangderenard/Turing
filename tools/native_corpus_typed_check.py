@@ -177,7 +177,14 @@ def run_fortran(module, export, params, outs, inputs, expects):
         FortranCoreNative, emit_module, fortran_compiler,
     )
     try:
-        fortran_module = emit_module(module, progress=lambda _: None)
+        # The export is the root, as in the C/LLVM lanes (which emit only
+        # ``export``) and the compilation product (``extra_roots=
+        # export_names``).  Without it every control function became an
+        # entry: c829/c855/c856's inlined ``same(a)`` helper was exported
+        # on its own and refused for returning its heap list.
+        fortran_module = emit_module(
+            module, extra_roots=(export,), progress=lambda _: None,
+        )
     except Exception as e:
         return f"EMIT-FAIL {type(e).__name__}: {str(e)[:300]}", None
     if not getattr(fortran_module, "complete", True):
