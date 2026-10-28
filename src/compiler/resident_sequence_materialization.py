@@ -777,6 +777,20 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
                  if str(role) == "base" and parent in graph_obj),
                 None,
             )
+            if base is not None and node_kind(base) == "indexed":
+                # ``g[i][1] = v`` writes a row of the list ``g``: its version
+                # is the outer list's storage, not the row view's.
+                outer = next(
+                    (parent for parent, role in graph_obj.nodes[base].get("parents") or ()
+                     if str(role) == "base" and parent in graph_obj
+                     and ((graph_obj.nodes[parent].get("attributes") or {}).get(
+                         "aggregate_kind") == "list"
+                         or (graph_obj.nodes[parent].get("attributes") or {}).get(
+                             "row_store_of_list"))),
+                    None,
+                )
+                if outer is not None:
+                    base = outer
             if base is not None:
                 aliases[value_id_of(node_id)] = value_id_of(base)
             continue
@@ -1112,20 +1126,36 @@ def _promote_conditional_sequence_aliases(
                 if true_resident is None or false_resident is None:
                     results.append(result)
                     continue
-                returned = {
-                    int(value_id)
-                    for name in tuple(graph_obj.graph.get("function_outputs") or ())
-                    for value_id in tuple(
-                        (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
-                    )
-                }
-                if merged_id in returned:
-                    raise ValueError(
-                        f"list {merged_id} is merged from branches and "
-                        "returned; a returned branch merge is a handle onto "
-                        "an arm's storage, which a call result cannot yet "
-                        "carry (refused by name)"
-                    )
+                # Program: ``a = [n, 1]; t = a if n > 2 else [7, n, 2];
+                # return t`` (c743).  The returned merge IS the function's
+                # result list, whose storage the caller passes in.  When
+                # every arm is a private display of this function, both die
+                # at the return, so the taken arm's rows copied into the
+                # result are Python's object exactly (the merge owns the
+                # result storage, as a divergent return's lists do).  An arm
+                # anything else holds (a parameter, a list changed or read
+                # after the merge) would have to be the caller's storage
+                # itself, which a call result cannot carry yet.
+                node_id = node_by_value.get(merged_id, -1)
+                if _returned_list_merge(graph_obj, node_id):
+                    if not _arms_private_displays(graph_obj, node_id):
+                        raise ValueError(
+                            f"list {merged_id} is merged from branches and "
+                            "returned with an arm that is not a private "
+                            "display of this function; the returned merge "
+                            "is a handle onto that arm's storage (a caller's "
+                            "list or a list this function still reads), "
+                            "which a call result cannot yet carry: a call "
+                            "result that IS an argument's list is not "
+                            "lowered at all (refused by name)"
+                        )
+                    destination = merged_id
+                    sequences.append((
+                        int(true_resident), int(false_resident),
+                        destination, merged_id,
+                    ))
+                    destination_ids.add(destination)
+                    continue
                 # Program: ``a = [n, 1]; if n > 2: t = a else: t = [7, n,
                 # 2]`` then ``a[0] = a[0] + 5; return t[0] + len(t)``
                 # (c737).  Wrong record: the merge was its own storage,
@@ -3137,6 +3167,57 @@ def _list_merged_from_unequal_displays(graph_obj: Any, node_id: int) -> bool:
     return None in lengths or lengths[0] != lengths[1]
 
 
+def _returned_list_merge(graph_obj: Any, node_id: int) -> bool:
+    """Whether the merge's value is one of the function's returned values."""
+
+    value_id = int((graph_obj.nodes.get(int(node_id)) or {}).get("value_id", node_id))
+    return value_id in {
+        int(returned)
+        for name in tuple(graph_obj.graph.get("function_outputs") or ())
+        for returned in tuple(
+            (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
+        )
+    }
+
+
+def _arms_private_displays(graph_obj: Any, node_id: int) -> bool:
+    """Whether every arm of a list merge is a display only the merge reads."""
+
+    data = graph_obj.nodes[int(node_id)]
+    arms = tuple(
+        int(parent) for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and int(parent) in graph_obj
+    )
+    for arm in arms:
+        attributes = graph_obj.nodes[arm].get("attributes") or {}
+        if (
+            attributes.get("producer_kind") != "aggregate"
+            or attributes.get("aggregate_leaf_value_ids") is None
+        ):
+            return False
+        for reader, reader_data in graph_obj.nodes(data=True):
+            if int(reader) != int(node_id) and any(
+                int(parent) == arm
+                for parent, _role in reader_data.get("parents") or ()
+            ):
+                return False
+    return True
+
+
+def _returned_copy_merge(graph_obj: Any, node_id: int) -> bool:
+    """A returned unequal-arm list merge whose arms are private displays.
+
+    It owns the result storage and each arm is copied into it; every other
+    unequal-arm merge is a handle onto the taken arm's storage.
+    """
+
+    return (
+        _list_merged_from_unequal_displays(graph_obj, int(node_id))
+        and _returned_list_merge(graph_obj, int(node_id))
+        and _arms_private_displays(graph_obj, int(node_id))
+    )
+
+
 def _handle_merge_storage_roots(graph_obj: Any) -> dict[int, int]:
     """One storage key for a list merged from branches and each of its arms.
 
@@ -3162,6 +3243,8 @@ def _handle_merge_storage_roots(graph_obj: Any) -> dict[int, int]:
 
     for node_id, data in graph_obj.nodes(data=True):
         if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+            continue
+        if _returned_copy_merge(graph_obj, int(node_id)):
             continue
         merged = int(data.get("value_id", node_id))
         for arm, role in data.get("parents") or ():
@@ -3413,7 +3496,9 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 rebound_on_one_branch = _list_rebound_on_one_branch(
                     graph_obj, int(node_id),
                 )
-                if _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+                if _list_merged_from_unequal_displays(
+                    graph_obj, int(node_id),
+                ) and not _returned_copy_merge(graph_obj, int(node_id)):
                     # No birth: the merge is a handle onto the taken arm's
                     # own storage (``_promote_conditional_sequence_aliases``,
                     # ``_lower_sequence_handle_merge``).
@@ -3676,6 +3761,17 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
     """
 
     outers = set(list_row_displays(graph_obj))
+    # ``g[i][1] = v`` is a new version of ``g`` (a loop may carry it): reads
+    # of any version are reads of the same list of lists.
+    aliases = _loop_carried_storage_aliases(graph_obj)
+    for version in tuple(aliases):
+        root = int(version)
+        for _ in range(len(aliases) + 1):
+            if root not in aliases:
+                break
+            root = int(aliases[root])
+        if root in outers:
+            outers.add(int(version))
     reads = []
     for node_id, data in graph_obj.nodes(data=True):
         if str(data.get("op") or data.get("type") or "").casefold() != "indexed":

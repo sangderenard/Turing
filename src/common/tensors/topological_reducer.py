@@ -1783,6 +1783,56 @@ def _resolved_source_value_class(
     return str(fact[0]), max(int(fact[1]), 1)
 
 
+def _concord_aggregate_merge_class(graph: Any, value_id: Any) -> None:
+    """Commit a returned branch merge's class from its arms' classes.
+
+    Program: ``a = [n, 1]; t = a if n > 2 else [7, n, 2]; return t`` then
+    ``t = make(n); t.append(5)`` (corpus c743).  Wrong record: a list merged
+    from branches (``aggregate_phi`` / ``aggregate_merge``) was born with its
+    aggregate kind but no class row, so the call result carried no class and
+    the caller's ``t.append(5)`` was not recognised as a change of a list: it
+    vanished (silent).  Rule: a merge of aggregates is the class its arms
+    agree on, derived from their class cells.
+    """
+
+    target = getattr(graph, "G", graph)
+    if not isinstance(value_id, int) or value_id not in target:
+        return
+    data = target.nodes[value_id]
+    attributes = data.get("attributes") or {}
+    if (
+        attributes.get("producer_kind") not in {"aggregate_phi", "aggregate_merge"}
+        or _resolved_source_value_class(graph, value_id)[0] is not None
+    ):
+        return
+    arms = tuple(
+        int(parent) for parent, role in data.get("parents") or ()
+        if str(role) in {"body", "orelse"} and int(parent) in target
+    )
+    for arm in arms:
+        _concord_aggregate_merge_class(graph, arm)
+    facts = {_resolved_source_value_class(graph, arm) for arm in arms}
+    if len(arms) != 2 or len(facts) != 1:
+        return
+    (class_identity, limbs), = facts
+    if class_identity is None:
+        return
+    book = current_identity_book()
+    scope = _source_numeric_scope(target)
+    _concord_source_value_class(
+        scope, int(value_id), str(class_identity),
+        precision_limbs=int(limbs),
+        source="branch merge of agreeing arms",
+        provenance=_Derived(tuple(
+            cell for cell in (
+                book.latest_ref(_SOURCE_VALUE_CLASS, (scope, arm))
+                for arm in arms
+            )
+            if cell is not None
+        )),
+    )
+
+
 def _indexed_store_source(graph: Any, value_id: Any) -> Any:
     """The sequence an ``IndexedStore`` chain writes, by its ``base`` edges."""
 
@@ -13815,6 +13865,32 @@ def _normalize_lexical_values(
                 )
             if isinstance(target.value, ast.Name):
                 bind_target(target.value, node_id)
+            elif (
+                isinstance(target.value, ast.Subscript)
+                and isinstance(target.value.value, ast.Name)
+                and graph.G.nodes[int(base)].get("type") == "Indexed"
+                and any(
+                    role == "base"
+                    and (
+                        (graph.G.nodes[parent].get("attributes") or {}).get(
+                            "aggregate_kind"
+                        ) == "list"
+                        or (graph.G.nodes[parent].get("attributes") or {}).get(
+                            "row_store_of_list"
+                        )
+                    )
+                    for parent, role in graph.G.nodes[int(base)].get("parents") or ()
+                )
+            ):
+                node_data["attributes"]["row_store_of_list"] = True
+                # Program: ``g = [[1, 2], [3, 4]]; g[i][1] = v; ... g[k]``
+                # (corpus c740).  Wrong record: a store into a row of a list
+                # of lists versioned nothing the outer list's name reads, so
+                # a later read of ``g`` had no edge from the store and
+                # region formation fused it with work before the store.
+                # Rule: the row write is a new version of the list that owns
+                # the row, as ``xs[i] = v`` is of ``xs``.
+                bind_target(target.value.value, node_id)
             elif isinstance(target.value, ast.Attribute) and isinstance(
                 target.value.value, ast.Name
             ):
@@ -24443,6 +24519,8 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     ),)
                     if history and int(history[-1]) in callee
                 )
+                for value_id in returned_value_ids:
+                    _concord_aggregate_merge_class(callee, value_id)
                 returned_facts = tuple(dict.fromkeys(
                     _resolved_source_value_class(callee, value_id)
                     for value_id in returned_value_ids
