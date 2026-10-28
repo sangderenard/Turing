@@ -43,6 +43,7 @@ def root(x, flag):
     ).with_execution_file('extraction_contracts/vehicle_full_native_execution.yaml')
     module, _, exports = lower_ast_source_to_ssa(
         source, 'root', name='none_predicate', extraction_contract=policy,
+        root_calls=[{'x': float, 'flag': float} if guard == 'sequential' else {'x': float}],
     )
     artifact = emit_ssa_to_c(module, exports[0])
     assert artifact.complete, artifact.shortfalls
