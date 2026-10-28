@@ -25087,11 +25087,25 @@ def _class_surface_ssa_program(
                 # as a true None-test).  Rule: a history that holds None
                 # joins its members only when the present ones hold two
                 # classes; beside one class it is an optional.
-                if len(set().union(*(
+                if (len(set().union(*(
                     returned_classes(other) for other in history
                     if not none_member(other)
                 )) - {"builtins.NoneType"}) >= 2
-                or not any(none_member(other) for other in history)
+                or not any(none_member(other) for other in history))
+                # Program: ``def pick(n): if n == 0: return [5, 6, 7];
+                # ...; return [n, n + 1, n + 2, n * 4]`` called twice
+                # (corpus c544).  Wrong record: each return site's list
+                # literal crossed as its own result edge, so its exact
+                # extent (3,) met the one result's unstated extent and the
+                # union arm refused.  Rule: every returned list is copied
+                # into the function's one result at its return site (A6);
+                # when all returns are lists that result's edge is the
+                # whole contract, and a site's own extent is not the
+                # call's.
+                and not all(
+                    returned_classes(other) == {"builtins.list"}
+                    for other in history
+                )
             )
     _settle_linked_dynamic_sequences(
         tuple(planned_graphs_by_shell.values()), tuple(linked_value_edges),

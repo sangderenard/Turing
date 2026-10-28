@@ -21273,6 +21273,15 @@ def _publish_conditional_call_aggregate_merges(
             and len(body.members) == len(orelse.members)
         ):
             return None
+        # Program: ``d = {1: n}; for i in range(4): if i == n: d[i + 5] =
+        # i`` (corpus c671).  Wrong record: the dict's ``if`` merge became
+        # an ``aggregate_phi`` of per-row member Phis on the source graph,
+        # so the table the loop carries was split into rows whose handle
+        # and column roles disagreed at the final concordance.  Rule: a
+        # dict's arms are versions of one table; its merge stays that
+        # table (``_loop_carried_storage_aliases``), never member Phis.
+        if body.aggregate_kind == "dict":
+            return None
         # The same merge may already be on the book, posted from the work
         # copy of this graph; this graph still needs its member Phis.
         incumbent, incumbent_cell = layout_of(merged_id)
