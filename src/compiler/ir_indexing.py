@@ -89,10 +89,13 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     # The energy audit's four raw GEP ids had no mint edge.
                     # This address is made from the exact indexing operands,
                     # not an unrelated global-counter identity.
+                    # An address is a ``ptr``, as every other minted
+                    # address is; left untyped, the backends now refuse it
+                    # (``y[0]`` in a planned region, c411/c412).
                     address = SSAValue(mint_ssa_value(
                         function, ADDRESS, (base, *indices, instruction.res),
-                        stage=CONTROL_SSA_FINISH,
-                    ))
+                        dtype="ptr", stage=CONTROL_SSA_FINISH,
+                    ), dtype="ptr")
                     lowered_attributes = {
                         **dict(instruction.attributes or {}),
                         "lowered_from": str(canonical_op),
@@ -113,8 +116,8 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     indices = instruction.args[1:-1]
                     address = SSAValue(mint_ssa_value(
                         function, ADDRESS, (base, *indices, instruction.res),
-                        stage=CONTROL_SSA_FINISH,
-                    ))
+                        dtype="ptr", stage=CONTROL_SSA_FINISH,
+                    ), dtype="ptr")
                     # The store has no result in address SSA, but the source
                     # IndexedStore result is the exact identity of this
                     # resident-memory effect.  Carry that identity across the
