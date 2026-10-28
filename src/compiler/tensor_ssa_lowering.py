@@ -376,6 +376,65 @@ _TENSOR_CONTRACT_KEYS = (
 )
 
 
+def _int64_lane_checked(instruction: Any, operation: str, result: Any) -> bool:
+    """An int64 tensor ``add``/``sub``/``mul`` whose lanes must not wrap
+    (``python_int_lane_overflow_checked``); ``binary_int64`` cannot check."""
+
+    from .ssa_llvm_backend import python_int_lane_overflow_checked
+
+    return (
+        str(operation) in {"add", "sub", "mul"}
+        and str(result.dtype or "").casefold() in {"int64", "i64", "long"}
+        and python_int_lane_overflow_checked(instruction, operation=operation)
+    )
+
+
+def _int64_lane_stays_elementwise(
+    instruction: Any, operation: str, result: Any, operands: Any,
+) -> bool:
+    """Whether an int64 tensor op stays the instruction itself.
+
+    Each backend's elementwise span loop then spells it on the integer path.
+    Program: ``-tokens`` / ``abs(tokens)`` on an int64 tensor.  Wrong record:
+    the only repository unary kernel is ``unary_double``; the lanes were cast
+    to float64 (2**53 + 1 came back 2**53) or, after an int64 producer, had
+    their bits negated as a double's sign.  And ``tokens * 1103515245``
+    through ``binary_int64`` wrapped every lane leaving int64.  Rule: int64
+    ``neg``/``abs`` always stay; int64 ``add``/``sub``/``mul`` stay when
+    ``python_int_lane_overflow_checked`` asks for per-lane checks and no
+    operand needs a broadcast kernel (each is the result's shape or rank 0).
+    """
+
+    operands = list(operands or ())
+    operation = str(operation)
+    int64 = {"int64", "i64", "long"}
+    if (
+        operation in {"neg", "abs"}
+        and len(operands) == 1
+        and all(
+            str(value.dtype or "").casefold() in int64
+            for value in (result, operands[0])
+        )
+    ):
+        return True
+    if not _int64_lane_checked(instruction, operation, result):
+        return False
+    shape = tuple(result.shape or ())
+    return bool(shape) and all(
+        str(value.dtype or "").casefold() in int64 | {"int", "int32", "i32"}
+        and (
+            tuple(value.shape or ()) == shape
+            or (
+                not tuple(value.shape or ())
+                and int((value.accounting or {}).get(
+                    "program_abi_rank", 0
+                ) or 0) == 0
+            )
+        )
+        for value in (getattr(instruction, "args", None) or operands)
+    )
+
+
 def _elementwise_result_physical(
     owner: Any, operands: Any, *, book: Any,
 ) -> dict[str, Any]:
@@ -5510,6 +5569,10 @@ def lower_tensor_calls_to_repository_ssa(
                 if (
                     source is not None
                     and opcode_contract is not None
+                    and not _int64_lane_stays_elementwise(
+                        instruction, operation, result, data_args,
+                    )
+                    and not _int64_lane_checked(instruction, operation, result)
                 ):
                     if str(result.dtype or "").casefold() not in {
                         "float32", "float16", "f32", "f16",
@@ -6844,6 +6907,21 @@ def lower_tensor_calls_to_repository_ssa(
                             instruction, output_argument=2,
                         ))
 
+                elif _int64_lane_stays_elementwise(
+                    instruction, operation, result, data_args,
+                ):
+                    # Program: ``-tokens`` / ``abs(tokens)`` on an int64
+                    # tensor.  Wrong record: the only repository unary kernel
+                    # is ``unary_double``, so the lanes were cast to float64
+                    # (2**53 + 1 came back 2**53, the result buffer float64)
+                    # or, after an int64 producer, their bits were negated as
+                    # a double's sign.  Rule: int64 Neg/Abs stay the
+                    # instruction itself, which each backend's elementwise
+                    # span loop spells on the integer path, wrapping at
+                    # INT64_MIN exactly as the NumPy reference does.
+                    rewritten.append(instruction)
+                    continue
+
                 else:
                     opcode = c_tensor_opcode(operation)
                     if opcode is not None and source is not None:
@@ -7158,10 +7236,23 @@ def lower_tensor_calls_to_repository_ssa(
                                             broadcasted, storage="temporary"
                                         )
                                         conformed_args.append(broadcasted)
-                                    emitted.append(call(
-                                        binary_kernel, [conformed_args[0], conformed_args[1], result, count, opcode_ssa],
-                                        result, instruction, output_argument=2,
-                                    ))
+                                    if _int64_lane_checked(
+                                        instruction, operation, result,
+                                    ):
+                                        # The operands are conformed by the
+                                        # int64 broadcast kernel; the
+                                        # arithmetic stays the instruction, so
+                                        # the backend's span loop checks each
+                                        # lane (``binary_int64`` would wrap).
+                                        emitted.append(dataclasses.replace(
+                                            instruction,
+                                            args=list(conformed_args),
+                                        ))
+                                    else:
+                                        emitted.append(call(
+                                            binary_kernel, [conformed_args[0], conformed_args[1], result, count, opcode_ssa],
+                                            result, instruction, output_argument=2,
+                                        ))
                             elif kind == "binary" and len(data_args) == 1:
                                 scalar_key = next((key for key in ("right_scalar", "left_scalar") if key in instruction.attributes), None)
                                 scalar_payload = instruction.attributes.get(scalar_key) if scalar_key else (metadata[-1] if metadata else None)
