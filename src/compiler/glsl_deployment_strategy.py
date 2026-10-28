@@ -3099,6 +3099,27 @@ def _build_shell_hierarchy_plan(
 
     _scalar_dtype_cache: list[dict[int, str]] = []
 
+    # The dtype a call's result carries: the callee's own settled record of
+    # the output value bound to it (``PlanCall.result_bindings``).
+    call_result_dtypes: dict[int, str] = {}
+
+    def note_call_result_dtypes(plan_call) -> None:
+        def settled(closure, value_id, seen=()):
+            for shape_row in closure.value_shapes:
+                if int(shape_row[0]) == int(value_id) and shape_row[2]:
+                    return str(shape_row[2])
+            for item in closure.items:
+                if isinstance(item, PlanClosure) and id(item) not in seen:
+                    found = settled(item, value_id, (*seen, id(closure)))
+                    if found is not None:
+                        return found
+            return None
+
+        for callee_id, caller_id in plan_call.result_bindings:
+            dtype = settled(plan_call.callee, callee_id)
+            if dtype is not None:
+                call_result_dtypes.setdefault(int(caller_id), dtype)
+
     def planned_scalar_dtypes() -> dict[int, str]:
         """``_planned_scalar_dtypes`` of this plan's graph, computed once."""
 
@@ -3775,6 +3796,7 @@ def _build_shell_hierarchy_plan(
                     )
                 ),
             ))
+            note_call_result_dtypes(items[-1])
             continue
         region_index = region_by_node.get(int(node_id))
         if (
@@ -4336,6 +4358,7 @@ def _build_shell_hierarchy_plan(
                     or node.get("dtype")
                     or described_dtype
                     or planned_scalar_dtypes().get(int(current))
+                    or call_result_dtypes.get(int(current))
                     or getattr(domain, "dtype", None)
                 )
                 # No record settles it: stay unsettled (None).  A value that
@@ -4746,6 +4769,20 @@ def _build_shell_hierarchy_plan(
             if (
                 str(node.get("op") or node.get("type") or "").casefold()
                 == "staticreference"
+            ):
+                return None
+            # A call whose callee body is not attached to this plan yet: its
+            # result type is the callee's, recorded by the callsite shell
+            # (``PlanCall.result_bindings``), which a later freeze attaches.
+            # No row is posted for it here.
+            # The same holds for whatever is computed from such a result.
+            if any(
+                str(graph.G.nodes[source].get("op") or "").casefold() == "call"
+                and source not in call_result_dtypes
+                and (_shape_dtype_cache.get(source) or (None, None))[1] is None
+                for source in (
+                    int(value_id), *nx.ancestors(graph.G, int(value_id)),
+                )
             ):
                 return None
             raise ValueError(
