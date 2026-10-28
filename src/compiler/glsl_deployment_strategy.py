@@ -3461,8 +3461,51 @@ def _post_region_value_obligation(graph: Any, value_id: int) -> None:
     )
 
 
+def _dtype_producer_cells(graph: Any, value_id: int, *extra: Any) -> tuple:
+    """The cells that proved a region value's type, as the book holds them.
+
+    The value's own identity cell, its source-value-class cell, its
+    VALUE_TYPE_ABI row (read through the canonical value row), and any
+    ``extra`` cells the deciding branch read (annotation, callsite class,
+    field declaration).  Only cells that exist are returned; nothing is
+    minted.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        CANONICAL_VALUE, SOURCE_VALUE_CLASS, VALUE_TYPE_ABI,
+    )
+    from .identity_concordance import Ref, current_identity_book
+
+    book = current_identity_book()
+    metadata = graph.G.graph
+    cells = []
+    try:
+        cells.append(node_identity_cell(graph, int(value_id)))
+    except ValueError:
+        pass
+    numeric_scope = metadata.get("source_numeric_scope")
+    if numeric_scope is None and metadata.get("authored_function_identity"):
+        numeric_scope = tuple(metadata["authored_function_identity"])
+    if numeric_scope is not None:
+        cells.append(book.latest_ref(
+            SOURCE_VALUE_CLASS, (numeric_scope, int(value_id)),
+        ))
+    read_scope = metadata.get("lexical_read_scope")
+    if read_scope is not None:
+        canonical = book.latest_ref(
+            CANONICAL_VALUE, (read_scope, int(value_id)),
+        )
+        if canonical is not None:
+            cells.append(book.latest_ref(VALUE_TYPE_ABI, canonical.row))
+    cells.extend(extra)
+    return tuple(dict.fromkeys(
+        cell for cell in cells if isinstance(cell, Ref)
+    ))
+
+
 def _settle_region_value_obligation(
-    graph: Any, value_id: int, dtype: str,
+    graph: Any, value_id: int, dtype: str, producer_cells: tuple = (),
 ) -> None:
     """Close an outstanding obligation with the dtype the strict freeze read."""
 
@@ -3484,7 +3527,9 @@ def _settle_region_value_obligation(
     book.post(
         PLAN_REGION_VALUE_DTYPE, row, str(dtype),
         stage=HIERARCHY_PLAN_FREEZE,
-        provenance=Derived((cell,) if cell is not None else ()),
+        provenance=Derived(tuple(dict.fromkeys((
+            *((cell,) if cell is not None else ()), *producer_cells,
+        )))),
         mode=Mode.REVISE,
     )
 
@@ -5296,7 +5341,7 @@ def _build_shell_hierarchy_plan(
             )
             return (root, logical, dtype)
 
-        def _typed_value_shape(value_id):
+        def _decide_value_shape(value_id):
             """A region value's record; a typed value with none refuses.
 
             A static symbol (``abs``) is not a value: it contributes no
@@ -5307,11 +5352,7 @@ def _build_shell_hierarchy_plan(
 
             record = _value_shape_dtype(value_id)
             if record[2] is not None:
-                if terminal:
-                    _settle_region_value_obligation(
-                        graph, int(value_id), record[2],
-                    )
-                return record
+                return record, _dtype_producer_cells(graph, int(value_id))
             node = graph.G.nodes.get(int(value_id), {})
             attributes = node.get("attributes") or {}
             # A collection the callsite specialization folded from its
@@ -5325,15 +5366,22 @@ def _build_shell_hierarchy_plan(
                 return (record[0], record[1], {
                     "int": "int64", "float": "float64", "bool": "bool",
                 }[str(attributes["sequence_element_class_ref"])
-                  .removeprefix("builtins.")])
+                  .removeprefix("builtins.")]), _dtype_producer_cells(
+                    graph, int(value_id),
+                    *(attributes.get("callsite_sequence_element_class_cells")
+                      or ()),
+                    attributes.get("sequence_element_annotation_cell"),
+                )
             if attributes.get("program_abi_record_identity"):
                 # A record value is a handle onto its fields' storage.
-                return (record[0], record[1], "opaque_ref")
+                return (record[0], record[1], "opaque_ref"), (
+                    _dtype_producer_cells(graph, int(value_id))
+                )
             if (
                 str(node.get("op") or node.get("type") or "").casefold()
                 == "staticreference"
             ):
-                return None
+                return None, ()
             if (
                 str(node.get("op") or node.get("type") or "").casefold()
                 == "slice"
@@ -5341,7 +5389,9 @@ def _build_shell_hierarchy_plan(
                 # ``xs[:k]``: the Slice is the index-metadata handle of
                 # the load it feeds (as a folded slice literal is, above);
                 # its bounds are the typed values.  It is not an element.
-                return (record[0], record[1], "opaque_ref")
+                return (record[0], record[1], "opaque_ref"), (
+                    _dtype_producer_cells(graph, int(value_id))
+                )
             # An external name read only as the receiver of tensor-namespace
             # calls (``AbstractTensor`` in ``AbstractTensor.get_tensor(x)``,
             # imported inside the method) is a static symbol, as a
@@ -5359,7 +5409,7 @@ def _build_shell_hierarchy_plan(
                     for child, role in receivers
                 )
             ):
-                return None
+                return None, ()
             # A limb of a Precision value: Precision is a numeric value, not
             # a record, and its ``_stack`` holds its limbs, whose element the
             # precision library states (``Precision.term`` reads
@@ -5383,11 +5433,13 @@ def _build_shell_hierarchy_plan(
                     )
                     return (record[0], record[1], limb_element_name(
                         attributes.get("precision_element")
-                    ))
+                    )), _dtype_producer_cells(graph, int(value_id), cell)
             if isinstance(attributes.get("value"), slice):
                 # A slice literal is index metadata for the load it feeds:
                 # a handle, as a record identity is, not an element type.
-                return (record[0], record[1], "opaque_ref")
+                return (record[0], record[1], "opaque_ref"), (
+                    _dtype_producer_cells(graph, int(value_id))
+                )
             # ``range(...)`` is an intrinsic whose extraction record names
             # its value: the arithmetic sequence of Python ints (no callee
             # body will ever attach to settle it).  Its elements are the
@@ -5399,7 +5451,9 @@ def _build_shell_hierarchy_plan(
                     attributes.get("python_identity_program") or {}
                 ).get("object_type") == "arithmetic_sequence"
             ):
-                return (record[0], record[1], "int64")
+                return (record[0], record[1], "int64"), (
+                    _dtype_producer_cells(graph, int(value_id))
+                )
             # A call whose callee body is not attached to this plan yet: its
             # result type is the callee's, recorded by the callsite shell
             # (``PlanCall.result_bindings``), which a later freeze attaches.
@@ -5434,7 +5488,7 @@ def _build_shell_hierarchy_plan(
                     int(value_id), *nx.ancestors(graph.G, int(value_id)),
                 )
             ):
-                return None
+                return None, ()
             # A collection handed to a call whose body is not attached yet
             # is written by that callee (``fill(xs, v)``); the element class
             # its writes settle arrives with the callee, so no row is posted
@@ -5452,10 +5506,10 @@ def _build_shell_hierarchy_plan(
                 )
                 for source in nx.ancestors(graph.G, int(value_id))
             ):
-                return None
+                return None, ()
             if not terminal:
                 _post_region_value_obligation(graph, int(value_id))
-                return None
+                return None, ()
             function_name = graph.G.graph.get("function_name")
             source = str(
                 node.get("op") or node.get("type") or "?"
@@ -5469,6 +5523,17 @@ def _build_shell_hierarchy_plan(
                 "in the tensor, specialization, node, descriptor, planned "
                 "scalar types, its operands, its call actuals or domain"
             )
+
+        def _typed_value_shape(value_id):
+            """Single exit: every typed record settles its open obligation
+            citing the producer cells its branch read."""
+
+            record, cells = _decide_value_shape(value_id)
+            if record is not None and record[2] is not None and terminal:
+                _settle_region_value_obligation(
+                    graph, int(value_id), record[2], cells,
+                )
+            return record
 
         value_shapes = tuple(
             record
