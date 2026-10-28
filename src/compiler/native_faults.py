@@ -25,6 +25,12 @@ NEGATIVE_SHIFT_COUNT = 87
 #: native divide would trap the host process instead.
 INT_ZERO_DIVISION = 88
 
+#: ``a / b`` on ints where ``a`` or ``b`` is not exactly a float64.  Python
+#: returns the correctly rounded quotient of the exact ints; ``float(a) /
+#: float(b)`` rounds twice and can differ in the last place.  Until that
+#: quotient is computed on Precision limbs, the native module reports it.
+INT_TRUE_DIVISION_INEXACT = 89
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -62,6 +68,11 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
         )
     if int(code) == NEGATIVE_SHIFT_COUNT:
         return NativeValueError(f"negative shift count ({runtime_message})")
+    if int(code) == INT_TRUE_DIVISION_INEXACT:
+        return NativeIntOverflow(
+            "int / int operand is not exact in float64; Python's correctly "
+            f"rounded quotient needs Precision limbs ({runtime_message})"
+        )
     if int(code) == INT_ZERO_DIVISION:
         return NativeZeroDivisionError(
             f"integer division or modulo by zero ({runtime_message})"

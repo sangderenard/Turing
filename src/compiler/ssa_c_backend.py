@@ -329,6 +329,36 @@ def _python_int_spelled(op: str, instruction) -> bool:
     return python_int_operation(instruction)
 
 
+def _python_int_true_division(instruction) -> bool:
+    from .ssa_llvm_backend import python_int_true_division
+
+    return python_int_true_division(instruction)
+
+
+def _python_int_true_division_statement(args, target: str) -> str:
+    """C for Python's ``int / int`` (the LLVM lane's
+    ``python_int_true_division_lines``): one IEEE division of operands that
+    are exactly float64, else ``INT_ZERO_DIVISION`` or
+    ``INT_TRUE_DIVISION_INEXACT``."""
+
+    from .native_faults import INT_TRUE_DIVISION_INEXACT, INT_ZERO_DIVISION
+
+    left, right = (f"((int64_t)({argument}))" for argument in args)
+
+    def exact(value: str) -> str:
+        return (
+            f"((double){value} < 9223372036854775808.0 "
+            f"&& (int64_t)(double){value} == {value})"
+        )
+
+    return (
+        f"double {target} = ((double){left} / (double){right}); "
+        f"if ({right} == 0) turing_validation_error({INT_ZERO_DIVISION}u); "
+        f"else if (!({exact(left)} && {exact(right)})) "
+        f"turing_validation_error({INT_TRUE_DIVISION_INEXACT}u);"
+    )
+
+
 def _python_int_statement(op: str, args, target: str) -> str:
     """C for Python's ``<< >> // %``, ``abs`` and unary ``-`` on an int64.
 
@@ -884,6 +914,29 @@ def supported_tensor_operations() -> frozenset[str]:
     # Keeping this derived from that shared basis prevents target selection
     # from accidentally auditing the older AbstractTensor C runtime instead.
     return llvm_tensor_ops()
+
+
+def integer_narrowing_c_check(*arguments):
+    from .ssa_llvm_backend import integer_narrowing_c_check as check
+
+    return check(*arguments)
+
+
+def _contract_integer_narrowing(instruction) -> bool:
+    from .ssa_llvm_backend import contract_integer_narrowing
+
+    return contract_integer_narrowing(instruction)
+
+
+def _c_storage_dtype(c_type: str) -> str | None:
+    """The integer dtype a C storage type spells (``uint8_t`` is uint8)."""
+
+    from ..transmogrifier.dtype_layout import DTYPES
+
+    for layout in DTYPES.values():
+        if layout.kind in {"int", "uint"} and layout.c_storage_type == c_type:
+            return layout.name
+    return None
 
 
 def _buffer_c_type(dtype) -> str:
@@ -6004,6 +6057,18 @@ def emit_ssa_module_to_c(
                                 int(addressed_value.id),
                                 carried_type(stored_value),
                             )
+                            source_type = carried_type(stored_value)
+                            narrowing = integer_narrowing_c_check(
+                                _c_storage_dtype(source_type),
+                                _c_storage_dtype(stored_type),
+                                source_type, value,
+                            )
+                            if narrowing is not None:
+                                prototype = "void turing_validation_error(uint32_t error_code);"
+                                if prototype not in prototypes:
+                                    prototypes.append(prototype)
+                                needs_validation_runtime = True
+                                body.append(f"        {narrowing}")
                             body.append(
                                 f"        *(({stored_type} *)({where})) = {value};"
                             )
@@ -6315,6 +6380,19 @@ def emit_ssa_module_to_c(
                         f"const {result_type} t{result_id} = "
                         f"({result_type})({cast_source});"
                     )
+                    narrowing = (
+                        integer_narrowing_c_check(
+                            instruction.args[0].dtype, instruction.res.dtype,
+                            _scalar_c_type(instruction.args[0].dtype), args[0],
+                        )
+                        if _contract_integer_narrowing(instruction) else None
+                    )
+                    if narrowing is not None:
+                        prototype = "void turing_validation_error(uint32_t error_code);"
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        declared = f"{narrowing} {declared}"
                 elif (
                     op.casefold() == "item"
                     and len(args) == 1
@@ -6499,12 +6577,24 @@ def emit_ssa_module_to_c(
                         )
                         + ";"
                     )
+                elif _python_int_true_division(instruction):
+                    prototype = "void turing_validation_error(uint32_t error_code);"
+                    if prototype not in prototypes:
+                        prototypes.append(prototype)
+                    needs_validation_runtime = True
+                    declared_storage_type = "double"
+                    declared = _python_int_true_division_statement(
+                        args, f"t{result_id}",
+                    )
                 elif (
                     op in _PYTHON_INT_OPERATIONS
                     and len(args) == _PYTHON_INT_OPERATIONS[op]
                     and _scalar_c_type(instruction.res.dtype) == "int64_t"
                     and all(
-                        is_integer(value) and not _is_unsigned_dtype(value.dtype)
+                        # The spelling computes on int64 operands; an int128
+                        # operand (a uint64 widened for ``%``) is not narrowed
+                        # through it but takes the int128 floored helper.
+                        is_integer(value) and str(value.dtype) == "int64"
                         for value in instruction.args
                     )
                     and _python_int_spelled(op, instruction)
