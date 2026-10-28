@@ -2442,6 +2442,7 @@ def _planned_scalar_dtypes_from(
     from ..transmogrifier.dtype_layout import (
         common_integer_dtype as _common_integer_dtype,
         python_int_range_dtype,
+        resolve as _resolve_layout,
     )
 
     range_page = _range_book().page(SOURCE_INT_RANGE)
@@ -2608,7 +2609,42 @@ def _planned_scalar_dtypes_from(
                 and attributes.get("method_return_declaration_cell")
                 is not None
             ):
-                settle(scalar, node_id, classes[next(iter(declared_returns))])
+                # Program: ``def probe(self, row) -> int: return
+                # self.count[row]`` over ``array("I")``, then ``1 +
+                # s.probe(0)`` (string core ``token_domain``).  Wrong record:
+                # the class-only ``-> int`` was stamped int64 on the call
+                # result while the callee's return settles uint32, so the
+                # caller's region and the callee's return disagreed.  Rule:
+                # ``-> int`` is a class, not a width.  The call result is
+                # what the callee's own return record settles (the method's
+                # ``function_table`` entry, as for a plain call below) when
+                # that is a layout of the declared class; the class's
+                # default width is only the fallback.
+                declared_class = next(iter(declared_returns))
+                method_reference = attributes.get(
+                    "callee_ref", attributes.get("method_ref")
+                )
+                settled_return = (
+                    None if method_reference is None
+                    else _callee_return_scalar_dtype(
+                        graph, int(method_reference),
+                    )
+                )
+                settled_layout = (
+                    None if settled_return is None
+                    or settled_return[0] != "scalar"
+                    else _resolve_layout(settled_return[1])
+                )
+                settled_kinds = {
+                    "int": {"int", "uint"}, "float": {"float"},
+                    "bool": {"bool"},
+                }[declared_class]
+                settle(scalar, node_id, (
+                    settled_return[1]
+                    if settled_layout is not None
+                    and settled_layout.kind in settled_kinds
+                    else classes[declared_class]
+                ))
             # Program: ``head(xs) * 10`` with ``def head(xs: list[int]) ->
             # int`` (corpus c385).  The same record on a plain function call:
             # its result is stamped with the callee's declared class.
