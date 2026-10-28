@@ -23125,6 +23125,25 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 attributes["value"] = folded
                 attributes["source_type"] = "BinOp"
                 attributes["constant_folded"] = "sequence-replication"
+                # Program: ``xs = [4] * 3`` read at constant positions (corpus
+                # c249).  Wrong record: the folded node kept its operand
+                # edges, so the ``[4]`` display fed nothing but stayed live
+                # and was refused as a private sequence with no capacity.
+                # Rule: a folded literal reads nothing.
+                operand_ids = tuple(
+                    int(parent) for parent, _role in data.get("parents") or ()
+                )
+                _replace_inputs(graph, node_id, ())
+                for operand_id in operand_ids:
+                    if (
+                        operand_id in graph.G
+                        and graph.G.out_degree(operand_id) == 0
+                        and isinstance(
+                            graph.G.nodes[operand_id].get("expr_obj"),
+                            (ast.List, ast.Tuple),
+                        )
+                    ):
+                        _remove_node(graph, operand_id)
                 continue
             left_descriptor = _operand_numeric_descriptor(
                 graph, expression.left
