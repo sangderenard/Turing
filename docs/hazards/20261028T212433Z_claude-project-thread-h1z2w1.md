@@ -12,6 +12,8 @@ program function (a catalog source reference keeps it). c812-c815 PASS (C and
 LLVM). Focused corpus subset (19 programs that define or call names matching
 the catalog) is identical to main otherwise. Pytest files touching
 ingestion/catalog give identical failure names on both trees.
-Still open, loud: a user `def max(a, b)` shadowing the builtin loops the
-callsite specialization guard on main and here (python_special_cases treats
-`max(...)` as the builtin by spelling).
+A module-level `def max`/`abs`/`min` that shadows a builtin was classified
+`builtins.max` (the builtin fallback bound the name before the program's own
+definition), so the planner looped the callsite specialization guard. Module
+definitions named like a builtin now bind first, as in Python. c816-c818 PASS;
+c816 and c817 refused on main.
