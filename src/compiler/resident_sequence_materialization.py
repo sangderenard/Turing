@@ -3237,6 +3237,11 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
     from .string_table import string_token
 
     accepted = set(map(int, sequence_ids))
+    # The rows of a list of lists are born at the outer display and own no
+    # declaration of their own (``list_row_displays``).
+    for outer_id, rows in list_row_displays(graph_obj).items():
+        if outer_id in accepted:
+            accepted.update(row for row, _node in rows)
     aggregate_scope = graph_obj.graph.get("source_aggregate_layout_scope")
 
     def layout_members_of(layout):
@@ -3515,22 +3520,28 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             parent, row = exact[0]
             value_id = int(row.get("value_id", parent))
             row_attributes = row.get("attributes") or {}
-            # Program: ``g = [[0, 0], [0, 0]]; g[1][0] = n`` (corpus c375,
-            # plan C6).  Wrong record: the inner display's member birth is
-            # owned by the inner display's node, which also owns that
-            # display's own ``clear``; the two facts met on one control
-            # block row and the program was refused with an uncaused
-            # revision naming neither.  A resident row is a scalar or a
-            # tuple's leaves; a list, set or dict row has no birth here.
-            # Rule: refuse it by name, as the comprehension birth does.
+            # Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  A
+            # list row is a child sequence of its own, born by its own
+            # display; the outer list stores the row's handle in the
+            # child-table pool and copies the row's members into it
+            # (``child_sequence`` append).  Set, dict and tuple rows have
+            # no pool row layout and stay refused by name.
+            if row_attributes.get("aggregate_kind") == "list" and not is_set:
+                rows.append(ControlSequenceMutation(
+                    sequence_value_id=sequence_id, operator="append",
+                    argument_value_ids=(value_id,), effect_node_id=parent,
+                    policy="duplicates", argument_kind="child_sequence",
+                    display_member=(int(node_id), int(ordinal)),
+                ))
+                continue
             if row_attributes.get("aggregate_kind") in {
-                "list", "set", "frozenset", "dict",
+                "set", "frozenset", "dict",
             }:
                 raise ValueError(
                     f"{'Set' if is_set else 'List'} {sequence_id} member "
                     f"{ordinal} is a {row_attributes['aggregate_kind']} "
-                    "display; a sequence whose rows are collections has no "
-                    "resident birth (nested collections are not lowered)"
+                    "display; only list rows have a resident birth "
+                    "(nested collections are not lowered)"
                 )
             leaves = tuple(map(int, row_attributes.get(
                 "aggregate_leaf_value_ids", ())))
@@ -3563,7 +3574,232 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
             policy="unique" if is_set else "duplicates",
         ))
         mutations.extend(rows)
-    return tuple(mutations)
+    return _list_rows_born_by_outer_display(graph_obj, tuple(mutations))
+
+
+def list_row_displays(graph_obj: Any) -> dict[int, tuple[tuple[int, int], ...]]:
+    """Each list display whose members are all list displays, by value id.
+
+    The value is its rows in member order as ``(row value id, row node)``.
+    Such a list is a nested table: its one column holds row handles and each
+    row is a slice of the child-table pool.  A display with any member that
+    is not a list display is not one (and is refused at birth if it mixes).
+    """
+
+    result: dict[int, tuple[tuple[int, int], ...]] = {}
+    for node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if attributes.get("aggregate_kind") != "list":
+            continue
+        members = tuple(
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role).startswith("elts") and parent in graph_obj
+        )
+        if not members:
+            # An all-constant list of lists folds to one constant that keeps
+            # its rows' value ids as its aggregate leaves.
+            members = tuple(
+                producer
+                for leaf in attributes.get("aggregate_leaf_value_ids") or ()
+                for producer in (next((
+                    int(candidate) for candidate, candidate_data
+                    in graph_obj.nodes(data=True)
+                    if int(candidate_data.get("value_id", candidate))
+                    == int(leaf)
+                ), None),)
+                if producer is not None
+            )
+            if len(members) != len(
+                attributes.get("aggregate_leaf_value_ids") or ()
+            ):
+                continue
+        if not members or not all(
+            (graph_obj.nodes[member].get("attributes") or {}).get(
+                "aggregate_kind"
+            ) == "list"
+            for member in members
+        ):
+            continue
+        result[int(data.get("value_id", node_id))] = tuple(
+            (int(graph_obj.nodes[member].get("value_id", member)), member)
+            for member in members
+        )
+    return result
+
+
+def list_row_pool_extents(graph_obj: Any) -> dict[int, tuple[int, int]]:
+    """``(rows, stride)`` of each list of lists' child-table pool.
+
+    The pool holds one fixed-stride slice per row: ``rows`` is the outer
+    display's member count and ``stride`` the longest row display.  A row
+    whose display length the source does not state is refused by name: its
+    slice would have no proven extent.
+    """
+
+    extents: dict[int, tuple[int, int]] = {}
+    for outer, rows in list_row_displays(graph_obj).items():
+        stride = 0
+        for row, node in rows:
+            data = graph_obj.nodes[node]
+            attributes = data.get("attributes") or {}
+            members = [
+                parent for parent, role in data.get("parents") or ()
+                if str(role).startswith("elts")
+            ]
+            count = (
+                len(members) if members
+                else len(attributes["aggregate_leaf_value_ids"])
+                if attributes.get("aggregate_leaf_value_ids")
+                else len(attributes["compile_time_sequence_items"])
+                if attributes.get("compile_time_sequence_items") is not None
+                else len(attributes["value"])
+                if isinstance(attributes.get("value"), (list, tuple))
+                else None
+            )
+            if count is None:
+                raise ValueError(
+                    f"list {row} is a row of list {outer} and its display "
+                    "length is not stated by the source; a row slice has "
+                    "no proven extent"
+                )
+            stride = max(stride, count)
+        extents[int(outer)] = (len(rows), max(1, stride))
+    return extents
+
+
+def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
+    """Value ids of ``g[i]`` for each list of lists ``g``: a row read.
+
+    A row read is a positional load of a row handle from the outer list's
+    one column and selects the row's pool slice; the element reads that
+    index it are positional loads from that slice.
+    """
+
+    outers = set(list_row_displays(graph_obj))
+    reads = []
+    for node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("op") or data.get("type") or "").casefold() != "indexed":
+            continue
+        base = next((
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role) == "base" and parent in graph_obj
+        ), None)
+        if base is not None and int(
+            graph_obj.nodes[base].get("value_id", base)
+        ) in outers:
+            reads.append(int(data.get("value_id", node_id)))
+    return tuple(sorted(reads))
+
+
+def _list_rows_born_by_outer_display(
+    graph_obj: Any, mutations: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    """Move each list row's birth to the list display that owns it.
+
+    Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  Wrong record:
+    the inner display's own ``clear`` and the outer's row append both belong
+    to the inner display's node, which holds one control block per kind, so
+    the two facts met on one block row and the program was refused with an
+    uncaused revision naming neither (corpus c375).  Rule: a list whose rows
+    are lists owns the whole birth.  At the outer display, in order: the
+    outer's ``clear``, then per row one ``child_row`` append (the row's
+    handle allocated in the child-table pool and appended to the outer),
+    then that row's member appends against the row's pool slice.  The inner
+    display keeps no birth of its own, so it is only ever consumed as a row:
+    a row that is read, changed, or listed twice elsewhere is a shared list
+    and is refused by name.
+    """
+
+    from dataclasses import replace
+    from .control_source import ControlSequenceMutation
+
+    births = [
+        item for item in mutations
+        if str(item.argument_kind) == "child_sequence"
+    ]
+    if not births:
+        return mutations
+    outer_nodes = {
+        int(item.display_member[0]): int(item.sequence_value_id)
+        for item in births
+    }
+    rows_of: dict[int, list[tuple[int, int, int]]] = {}
+    for item in births:
+        rows_of.setdefault(int(item.sequence_value_id), []).append((
+            int(item.display_member[1]), int(item.argument_value_ids[0]),
+            int(item.effect_node_id),
+        ))
+    row_slot: dict[int, tuple[int, int, int, int]] = {}
+    node_of_outer = {outer: node for node, outer in outer_nodes.items()}
+    outer_nodes_by_value = node_of_outer
+    for outer, members in rows_of.items():
+        members.sort()
+        for position, (_ordinal, inner, inner_node) in enumerate(members):
+            # A row is its pool slice: reads and stores through it
+            # (``g[1][i]`` folds to the row itself) address that slice, and
+            # nothing else may take the list as a value.
+            escapes = [
+                consumer for consumer in graph_obj.successors(inner_node)
+                if int(consumer) != outer_nodes_by_value[outer]
+                and str(
+                    graph_obj.nodes[consumer].get("op")
+                    or graph_obj.nodes[consumer].get("type") or ""
+                ).casefold() not in {"indexed", "indexedstore", "setitem"}
+            ]
+            if inner in row_slot or escapes:
+                raise ValueError(
+                    f"list {inner} is a row of list {outer} and is also "
+                    "listed twice or used as a whole list elsewhere; a "
+                    "shared row has one pool slice and is not lowered"
+                )
+            row_slot[inner] = (outer, position, inner_node, len(members))
+    mixed = [
+        item for item in mutations
+        if int(item.sequence_value_id) in rows_of
+        and str(item.operator) in {"append", "add"}
+        and str(item.argument_kind) != "child_sequence"
+    ]
+    if mixed:
+        raise ValueError(
+            f"list {int(mixed[0].sequence_value_id)} mixes list rows with "
+            "other members; a list of lists is lowered only when every row "
+            "is a list"
+        )
+    # Each row's member appends keep their producers as owners but execute
+    # at the outer display, right after that row's allocation: the display
+    # ordinal is (row position, 0 for the allocation, 1 + member ordinal).
+    row_appends: dict[int, list[Any]] = {}
+    for item in mutations:
+        sequence_id = int(item.sequence_value_id)
+        if sequence_id in row_slot and str(item.operator) != "clear":
+            outer, position, _node, _count = row_slot[sequence_id]
+            row_appends.setdefault(sequence_id, []).append(replace(
+                item, display_member=(
+                    node_of_outer[outer],
+                    (position << 16) | (1 + int(item.display_member[1])),
+                ),
+            ))
+    rewritten = []
+    for item in mutations:
+        sequence_id = int(item.sequence_value_id)
+        if str(item.argument_kind) == "child_sequence" or (
+            sequence_id in row_slot
+        ):
+            continue
+        rewritten.append(item)
+        if sequence_id in rows_of and str(item.operator) == "clear":
+            for _ordinal, inner, inner_node in rows_of[sequence_id]:
+                outer, position, _node, _count = row_slot[inner]
+                rewritten.append(ControlSequenceMutation(
+                    sequence_value_id=outer, operator="append",
+                    argument_value_ids=(), effect_node_id=inner_node,
+                    policy="duplicates", argument_kind="child_row",
+                    display_member=(
+                        node_of_outer[outer], position << 16,
+                    ),
+                ))
+                rewritten.extend(row_appends.get(inner, ()))
+    return tuple(rewritten)
 
 
 def _joined_list_literal_mutations(
