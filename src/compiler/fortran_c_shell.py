@@ -22421,6 +22421,17 @@ def _settle_linked_dynamic_sequences(
             # capacity (code 75).  Rule: a merged list is a local list
             # like a display; its leaf rows bound it when nothing grows it.
             if isinstance(data.get("expr_obj"), ast.List)
+            # A dict display with a runtime value.  An all-literal dict passed
+            # to a call binds as a static literal whose callee table differs
+            # from the caller's (``k in d`` answered False), so it keeps its
+            # refusal until that binding is one descriptor.
+            or (
+                isinstance(data.get("expr_obj"), ast.Dict)
+                and not all(
+                    isinstance(item, ast.Constant)
+                    for item in data["expr_obj"].values
+                )
+            )
             or (
                 (data.get("attributes") or {}).get("producer_kind")
                 == "aggregate_phi"

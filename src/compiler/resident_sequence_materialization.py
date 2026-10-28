@@ -1848,6 +1848,7 @@ def _static_mapping_capacity_bounds(
     graph_obj: Any,
     *,
     nonmutating_call_ids: Iterable[int] = (),
+    linked_bounded_ids: Iterable[int] = (),
 ) -> dict[int, int]:
     """Bound local keyed arenas by their complete constant-key universe.
 
@@ -1857,6 +1858,10 @@ def _static_mapping_capacity_bounds(
     """
     aliases = _loop_carried_storage_aliases(graph_obj)
     nonmutating_calls = set(map(int, nonmutating_call_ids))
+    # A dict display passed to callees that add no keys (``total({1: n})``):
+    # every escape is an exact argument binding into a component no function
+    # grows (``_settle_linked_dynamic_sequences``), so its keys bound it.
+    linked_bounded = set(map(int, linked_bounded_ids))
     keys, copies, unknown = {}, {}, set()
     set_universes: set[int] = set()
     for node_id, data in graph_obj.nodes(data=True):
@@ -2018,8 +2023,10 @@ def _static_mapping_capacity_bounds(
                   and _collection_call_identity(data)
                   in _NONESCAPING_COLLECTION_CALLS
               )):
-            for parent in roles.values():
+            for role, parent in roles.items():
                 destination = int(aliases.get(parent, parent))
+                if destination in linked_bounded and role.startswith("arg:"):
+                    continue
                 if destination in keys:
                     unknown.add(destination)
     # Program: ``d = {1: 5, 2: n}; del d[1]; d[1] = 4`` (scratch s42/t2).
@@ -2423,6 +2430,7 @@ def _static_sequence_capacity_survey(
     bounds = _static_mapping_capacity_bounds(
         graph_obj,
         nonmutating_call_ids=nonmutating_call_ids,
+        linked_bounded_ids=linked_bounded_ids,
     )
     local_lists = {int(node_id): len(data["expr_obj"].elts)
                    for node_id, data in graph_obj.nodes(data=True)

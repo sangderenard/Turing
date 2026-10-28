@@ -1173,6 +1173,16 @@ def _aggregate_binds_by_member(
         _call_escaped_argument_edges,
     )
 
+    # Program: ``def at(d): return d[2]`` called as ``at({1: n, 2: 5, 3: 7})``.
+    # Wrong record: the dict's leaf ledger (keys then values) was bound as
+    # positional members, so the callee's subscript read the third leaf, a
+    # key (3 for 5; silent).  Rule: a mapping or set is a keyed table, not a
+    # positional aggregate; it is bound whole, as its storage.
+    if (
+        (caller_graph.nodes.get(int(actual_id), {}).get("attributes") or {})
+        .get("aggregate_kind") in {"dict", "set", "frozenset"}
+    ):
+        return False
     escapes_elsewhere = any(
         int(argument) == int(actual_id)
         and (call_id is None or int(call) != int(call_id))
@@ -5814,6 +5824,25 @@ def _build_shell_hierarchy_plan(
                 and receivers
                 and all(
                     str(role) == "operand"
+                    and (
+                        graph.G.nodes.get(int(child), {}).get("attributes")
+                        or {}
+                    ).get("tensor_candidate") is not None
+                    for child, role in receivers
+                )
+            ):
+                return None, ()
+            # Lane D, D8.  Program: ``a = np.asarray(xs); a[0] + a[1]``.  The
+            # external name ``np.asarray`` (an Input bound ``tensor``) is read
+            # only as the callee of tensor-namespace calls; the call carries
+            # the typed result (its ``tensor`` record).  A callee is a static
+            # symbol, as a StaticReference is: not a value, so it posts no
+            # row and opens no dtype obligation.
+            if (
+                attributes.get("binding_kind") == "external"
+                and receivers
+                and all(
+                    str(role) == "callee"
                     and (
                         graph.G.nodes.get(int(child), {}).get("attributes")
                         or {}
