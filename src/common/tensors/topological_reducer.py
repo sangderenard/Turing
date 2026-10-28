@@ -1512,6 +1512,11 @@ def specialize_python_precision_widths(graph: Any) -> bool:
     while propagated:
         propagated = False
         for node_id, data in tuple(target.nodes(data=True)):
+            # A call or a comparison decides its own result class: a
+            # Precision-returning call was seeded above, and ``d.term(0)``
+            # or ``d > band`` reads a Precision without being one.
+            if isinstance(data.get("expr_obj"), (ast.Call, ast.Compare)):
+                continue
             parent_widths = tuple(
                 precision_flow_widths[int(parent)]
                 for parent, _role in data.get("parents", ())
