@@ -12525,41 +12525,13 @@ class _ControlSSABuilder(TiledObject):
             )
             for member in members:
                 span = int(member.id) in arena_ids or bool(member.shape)
-                _storage = "span" if span else "scalar"
-                # Program: ``for k in d`` over ``d: dict[int, int]`` and
-                # ``for a, b in ps`` over ``ps: list[tuple[int, int]]``.
-                # Wrong record: a member the ProgramABI binding already
-                # posted ``sequence`` (the sequence's own value) or
-                # ``reference`` (a tuple element's cell) was restated
-                # ``span``, and the physical view refused the two.  Rule: a
-                # member whose row already carries one of those kinds keeps
-                # it, with its rank.
-                _rank = 1 if span else 0
-                _prior_cell = self._book().latest_ref(
-                    SSA_VALUE, (self._scope(), int(member.id)),
-                )
-                _prior = (
-                    None if _prior_cell is None else
-                    self._book().page(SSA_VALUE).cell(
-                        _prior_cell.row, _prior_cell.column,
-                    )
-                )
-                _prior_storage = getattr(_prior, "storage", None)
-                if (
-                    _prior_storage == "reference"
-                    or (_prior_storage == "sequence"
-                        and int(member.id) == int(value_id))
-                ):
-                    _storage = _prior_storage
-                    if getattr(_prior, "rank", None) is not None:
-                        _rank = int(_prior.rank)
                 _member_cell = self._revise_value(
                     member,
                     self._sequence_contract_cell(value_id), _owner_kind,
                     stage=self._stage(),
                     physical={
-                        "storage": _storage,
-                        "rank": _rank,
+                        "storage": "span" if span else "scalar",
+                        "rank": 1 if span else 0,
                     },
                 )
                 _member_fact = self._book().page(SSA_VALUE).cell(
@@ -20449,30 +20421,9 @@ class _ControlSSABuilder(TiledObject):
                             descriptor.column_value_ids
                         )
                     ):
-                        # Program: ``for k, v in d.items()`` over a dict
-                        # parameter.  Wrong record: the column was asked of
-                        # ``external_value`` by id, which did not find the
-                        # descriptor's own column cell (it is an argument, not
-                        # a bound value) and appended a second formal with
-                        # the same id, so the callee's signature carried it
-                        # twice and its callers' receipt was refused.  Rule:
-                        # the column is the descriptor's own storage value.
-                        _column_id = int(
-                            descriptor.column_value_ids[int(column_projection)]
-                        )
-                        _column_cell = next((
-                            value for value in self.sequence_storage_values.get(
-                                resident_sequence_id, ()
-                            ) if int(value.id) == _column_id
-                        ), None)
-                        source = (
-                            _column_cell if _column_cell is not None else
-                            self.external_value(
-                                _column_id,
-                                dtype=str(descriptor.column_dtypes[
-                                    int(column_projection)
-                                ]),
-                            )
+                        source = self.external_value(
+                            int(descriptor.column_value_ids[int(column_projection)]),
+                            dtype=str(descriptor.column_dtypes[int(column_projection)]),
                         )
                     elif int(column_projection) == 0:
                         source = self.external_value(
