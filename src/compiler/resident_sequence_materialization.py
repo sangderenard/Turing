@@ -2115,6 +2115,9 @@ def _method_mutation_edges(graph_obj: Any) -> frozenset[tuple[int, int]]:
     """
 
     mutated: set[tuple[int, int]] = set()
+    # A call after a store in the same body names the store's version of
+    # its receiver: the same storage, by the storage aliases.
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
         if not (
@@ -2125,6 +2128,7 @@ def _method_mutation_edges(graph_obj: Any) -> frozenset[tuple[int, int]]:
         for parent, role in data.get("parents") or ():
             if str(role) != "operand" or parent not in graph_obj:
                 continue
+            parent = storage_aliases.get(parent, parent)
             if (
                 _receiver_collection_kind(graph_obj.nodes[parent])
                 in _MUTABLE_COLLECTION_KINDS
@@ -2656,13 +2660,14 @@ def _sequence_append_call_mutations(graph_obj: Any):
     recorded_effect_ids = {
         int(mutation.effect_node_id) for mutation in mutations
     }
+    storage_aliases = _loop_carried_storage_aliases(graph_obj)
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
         expression = data.get("expr_obj")
         if not (
             isinstance(expression, ast.Call)
             and isinstance(expression.func, ast.Attribute)
-            and expression.func.attr in {"append", "add", "clear"}
+            and expression.func.attr in {"append", "add", "clear", "pop"}
         ):
             continue
         if int(node_id) in recorded_effect_ids:
@@ -2678,10 +2683,51 @@ def _sequence_append_call_mutations(graph_obj: Any):
         )
         operation = str(expression.func.attr)
         arity = 0 if operation == "clear" else 1
+        # A statement after a store in the same body names the store's
+        # version of the dict: the same storage, by the storage aliases.
+        if operation == "pop" and destination_node is not None:
+            destination_node = int(
+                storage_aliases.get(destination_node, destination_node)
+            )
+        destination = (
+            graph_obj.nodes[destination_node]
+            if destination_node is not None else {}
+        )
+        attributes = destination.get("attributes") or {}
+        # Program: ``d = {1: 10, 2: 20}; d.pop(1, None); d[3] = n`` then
+        # ``len(d)`` (corpus c708).  Wrong record: a dict ``pop`` statement
+        # had no mutation record outside a retained loop's state effects, so
+        # it lowered to an empty region and the key stayed (3 for 2; clean
+        # audit).  Rule: a dict ``pop`` whose result nothing reads is a
+        # keyed delete of its key, as the loop lowering already states it:
+        # lookup-and-delete, absent keys tolerated only when a default is
+        # given.
+        pops_dict = (
+            operation == "pop"
+            and attributes.get("aggregate_kind") == "dict"
+            and len(arguments) in {1, 2}
+            and all(
+                # A statement's only consumer is the control construct that
+                # holds it as a ``body``/``orelse`` member.
+                str(graph_obj.nodes[successor].get("type") or "") in {
+                    "For", "While", "If"
+                }
+                and all(
+                    str(role) in {"body", "orelse"}
+                    for parent, role in (
+                        graph_obj.nodes[successor].get("parents") or ()
+                    )
+                    if int(parent) == int(node_id)
+                )
+                for successor in graph_obj.successors(node_id)
+            )
+        )
+        if operation == "pop" and not pops_dict:
+            continue
+        if pops_dict:
+            arity = len(arguments)
         if destination_node is None or len(arguments) != arity:
             continue
-        destination = graph_obj.nodes[destination_node]
-        attributes = destination.get("attributes") or {}
         # Program: ``cells = {1: 10, 2: 20}; if n: cells.clear();
         # return len(cells)``.  Wrong record: a dict's clear was not a
         # mutation at all (dicts were outside ``sequence_kinds``), so the
@@ -2690,9 +2736,17 @@ def _sequence_append_call_mutations(graph_obj: Any):
         clears_dict = (
             operation == "clear" and attributes.get("aggregate_kind") == "dict"
         )
-        if attributes.get("aggregate_kind") not in sequence_kinds and not clears_dict:
+        if (
+            attributes.get("aggregate_kind") not in sequence_kinds
+            and not clears_dict and not pops_dict
+        ):
             continue
         argument_kind = "value"
+        if pops_dict:
+            argument_kind = (
+                "mapping_pop_default_none" if len(arguments) == 2
+                else "mapping_pop"
+            )
         argument_ids = tuple(
             int(graph_obj.nodes[argument].get("value_id", argument))
             for argument in arguments
