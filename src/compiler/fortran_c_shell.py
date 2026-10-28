@@ -13532,52 +13532,6 @@ def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[i
     return result
 
 
-def _held_table_delete_ids(graph) -> frozenset[int]:
-    """Keyed deletes an ``if`` arm holds; every other delete runs
-    unconditionally.
-
-    A delete is held when it is an arm's ``body``/``orelse`` statement, or
-    when its branch compartment is an ``if`` arm.  ``for i in range(3): if
-    i == n: del d[2]`` records only the loop's ``body`` edge to the ``if``,
-    not the ``if``'s edge to the delete, so the edge alone missed it.
-    """
-
-    from .glsl_deployment_strategy import (
-        _branch_compartments,
-        _source_control_records,
-    )
-
-    graph_obj = graph.G
-    deletes = {
-        int(node_id): int(data.get("value_id", node_id))
-        for node_id, data in graph_obj.nodes(data=True)
-        if str(data.get("type") or "") == "DelItem"
-    }
-    if not deletes:
-        return frozenset()
-    memberships = _branch_compartments(graph)
-    records = _source_control_records(graph_obj)
-    held = {
-        deletes[int(parent)]
-        for _node_id, data in graph_obj.nodes(data=True)
-        for parent, role in data.get("parents") or ()
-        if str(role) in {"body", "orelse"} and int(parent) in deletes
-    }
-    held.update(
-        value_id
-        for node_id, value_id in deletes.items()
-        if any(
-            str(arm) in {"body", "orelse"}
-            and isinstance(
-                (records.get(int(owner)) or {}).get("expression"),
-                (ast.If, ast.IfExp),
-            )
-            for owner, arm in memberships.get(int(node_id), ())
-        )
-    )
-    return frozenset(held)
-
-
 def _sequence_mutation_owner_id(mutation) -> int:
     """The graph node whose authored position places this mutation.
 
@@ -15096,144 +15050,124 @@ def _install_lexical_sequence_mutations(
                 f"guarded={guarded}",
                 file=sys.stderr,
             )
-        inserted = False
-        # Innermost authored condition has the latest source position.
-        for owner_id, arm in sorted(
-            guarded, key=lambda item: node_position(item[0]), reverse=True,
-        ):
-            root, inserted = insert_in_conditional(
-                root, owner_id, arm, mutation_block
+        # The guards, innermost first.  An arm that owns no numerical region
+        # has no surviving ConditionalBlock; its authored branch is rebuilt
+        # from the retained pre-fold control record.  Every guard between the
+        # effect and the innermost one that survives is rebuilt and nested, so
+        # the effect runs under all of its conditions.
+        def synthesize(owner_id, arm, inner):
+            record = source_control_records.get(owner_id)
+            owner_node_id = (
+                int(owner_id) if int(owner_id) in graph.G else next((
+                    int(node_id)
+                    for node_id, data in graph.G.nodes(data=True)
+                    if int(data.get("value_id", node_id)) == int(owner_id)
+                ), None)
             )
+            owner_data = (
+                {} if owner_node_id is None
+                else graph.G.nodes[int(owner_node_id)]
+            )
+            expression = (
+                record.get("expression")
+                if record is not None
+                else owner_data.get("expr_obj")
+            )
+            recorded_predicate_id = (
+                None if record is None else record.get("predicate_id")
+            )
+            if recorded_predicate_id is None:
+                recorded_predicate_id = next((
+                    int(parent)
+                    for parent, role in owner_data.get("parents", ())
+                    if str(role) == "test"
+                ), None)
+            predicate_id = (
+                None if not isinstance(expression, (ast.If, ast.IfExp))
+                else _retained_control_value_id(
+                    graph.G,
+                    recorded_predicate_id,
+                    expression.test,
+                )
+            )
+            if predicate_id is None and isinstance(
+                expression, (ast.If, ast.IfExp)
+            ):
+                direct_test = next((
+                    int(parent)
+                    for parent, role in owner_data.get("parents", ())
+                    if str(role) == "test" and int(parent) in graph.G
+                ), None)
+                if direct_test is not None:
+                    predicate_id = int(
+                        graph.G.nodes[direct_test].get(
+                            "value_id", direct_test
+                        )
+                    )
+            if (
+                predicate_id is None
+                and recorded_predicate_id is not None
+                and isinstance(expression, (ast.If, ast.IfExp))
+            ):
+                # The conditional node may have been folded out after its
+                # immutable source-control record was published.  That
+                # record already speaks in the canonical value identity
+                # consumed by region/control SSA; retain it directly.
+                predicate_id = int(recorded_predicate_id)
+            if os.environ.get("TURING_DEBUG_SEQUENCE_MUTATION"):
+                print(
+                    "DEBUGMUTATION-GUARD "
+                    f"effect={int(mutation.effect_node_id)} "
+                    f"owner={owner_id} owner_node={owner_node_id} "
+                    f"recorded_predicate={recorded_predicate_id} "
+                    f"predicate={predicate_id} "
+                    f"expression={type(expression).__name__}",
+                    file=sys.stderr,
+                )
+            if predicate_id is None:
+                return None
+            empty = SequenceBlock(())
+            return ConditionalBlock(
+                int(predicate_id),
+                inner if arm == "body" else empty,
+                inner if arm == "orelse" else None,
+                predicate_expression=_graph_control_expression(
+                    graph.G, int(predicate_id),
+                    resident=_region_resident_value_ids(dispatch_subgraphs),
+                ),
+                source_node_id=int(owner_id),
+            )
+
+        inserted = False
+        item = mutation_block
+        for owner_id, arm in sorted(
+            guarded, key=lambda entry: node_position(entry[0]), reverse=True,
+        ):
+            root, inserted = insert_in_conditional(root, owner_id, arm, item)
             if inserted:
                 break
+            item = synthesize(owner_id, arm, item)
+            if item is None:
+                break
         if not inserted:
-            # A branch containing only structural storage effects owns no
-            # numerical region, so ordinary region overlay has no marker from
-            # which to materialize its ConditionalBlock.  Reconstruct that
-            # authored branch from the retained pre-fold control record, then
-            # place the complete wrapper inside its nearest surviving outer
-            # conditional (or at the lexical root).
-            synthesized = None
-            remaining_guards = guarded
-            if guarded:
-                owner_id, arm = sorted(
-                    guarded,
-                    key=lambda item: node_position(item[0]),
-                    reverse=True,
-                )[0]
-                record = source_control_records.get(owner_id)
-                owner_node_id = (
-                    int(owner_id) if int(owner_id) in graph.G else next((
-                        int(node_id)
-                        for node_id, data in graph.G.nodes(data=True)
-                        if int(data.get("value_id", node_id)) == int(owner_id)
-                    ), None)
-                )
-                owner_data = (
-                    {} if owner_node_id is None
-                    else graph.G.nodes[int(owner_node_id)]
-                )
-                expression = (
-                    record.get("expression")
-                    if record is not None
-                    else owner_data.get("expr_obj")
-                )
-                recorded_predicate_id = (
-                    None if record is None else record.get("predicate_id")
-                )
-                if recorded_predicate_id is None:
-                    recorded_predicate_id = next((
-                        int(parent)
-                        for parent, role in owner_data.get("parents", ())
-                        if str(role) == "test"
-                    ), None)
-                predicate_id = (
-                    None if not isinstance(expression, (ast.If, ast.IfExp))
-                    else _retained_control_value_id(
-                        graph.G,
-                        recorded_predicate_id,
-                        expression.test,
-                    )
-                )
-                if predicate_id is None and isinstance(
-                    expression, (ast.If, ast.IfExp)
-                ):
-                    direct_test = next((
-                        int(parent)
-                        for parent, role in owner_data.get("parents", ())
-                        if str(role) == "test" and int(parent) in graph.G
-                    ), None)
-                    if direct_test is not None:
-                        predicate_id = int(
-                            graph.G.nodes[direct_test].get(
-                                "value_id", direct_test
-                            )
-                        )
-                if (
-                    predicate_id is None
-                    and recorded_predicate_id is not None
-                    and isinstance(expression, (ast.If, ast.IfExp))
-                ):
-                    # The conditional node may have been folded out after its
-                    # immutable source-control record was published.  That
-                    # record already speaks in the canonical value identity
-                    # consumed by region/control SSA; retain it directly.
-                    predicate_id = int(recorded_predicate_id)
-                if os.environ.get("TURING_DEBUG_SEQUENCE_MUTATION"):
-                    print(
-                        "DEBUGMUTATION-GUARD "
-                        f"effect={int(mutation.effect_node_id)} "
-                        f"owner={owner_id} owner_node={owner_node_id} "
-                        f"recorded_predicate={recorded_predicate_id} "
-                        f"predicate={predicate_id} "
-                        f"expression={type(expression).__name__}",
-                        file=sys.stderr,
-                    )
-                if predicate_id is not None:
-                    empty = SequenceBlock(())
-                    synthesized = ConditionalBlock(
-                        int(predicate_id),
-                        mutation_block if arm == "body" else empty,
-                        mutation_block if arm == "orelse" else None,
-                        predicate_expression=_graph_control_expression(
-                            graph.G, int(predicate_id),
-                            resident=_region_resident_value_ids(
-                                dispatch_subgraphs
-                            ),
-                        ),
-                        source_node_id=int(owner_id),
-                    )
-                    remaining_guards = tuple(
-                        item for item in guarded if item != (owner_id, arm)
-                    )
-            if synthesized is not None:
-                for owner_id, arm in sorted(
-                    remaining_guards,
-                    key=lambda item: node_position(item[0]),
-                    reverse=True,
-                ):
-                    root, inserted = insert_in_conditional(
-                        root, owner_id, arm, synthesized
-                    )
-                    if inserted:
-                        break
-                if not inserted:
+            if item is not None:
+                if guarded:
                     root = insert_in_enclosing_loop(
-                        root, synthesized, int(mutation.effect_node_id)
+                        root, item, int(mutation.effect_node_id)
                     )
-            elif guarded:
-                unplaced.append(int(mutation.effect_node_id))
+                else:
+                    # A display member's append is placed by its display
+                    # (``_sequence_mutation_owner_id``), in its loop too: the
+                    # member of a list merged from branches is a Phi with no
+                    # coordinate, which put the birth after the loop (c969).
+                    root = insert_in_enclosing_loop(
+                        root, item,
+                        int(mutation.effect_node_id)
+                        if isinstance(mutation, ScalarFieldWriteBlock)
+                        else _sequence_mutation_owner_id(mutation),
+                    )
             else:
-                # A display member's append is placed by its display
-                # (``_sequence_mutation_owner_id``), in its loop too: the
-                # member of a list merged from branches is a Phi with no
-                # coordinate, which put the birth after the loop (c969).
-                root = insert_in_enclosing_loop(
-                    root, mutation_block,
-                    int(mutation.effect_node_id)
-                    if isinstance(mutation, ScalarFieldWriteBlock)
-                    else _sequence_mutation_owner_id(mutation),
-                )
+                unplaced.append(int(mutation.effect_node_id))
     # A source effect now owned by lexical control must not also leave a
     # numerical-region marker. Copier stores40/85/92 were removed from their
     # numerical bodies, but their markers emitted undefined numerical_region
@@ -28547,12 +28481,11 @@ def _class_surface_ssa_program(
         # delete an ``if`` holds owns no numerical region, so its arm was
         # projected away and the delete rode the nearest region in value
         # order -- after the loop, unconditionally -- and ``len(d)`` was 1
-        # for 2 (clean audit).  Rule: a held keyed delete is an authored
-        # control effect like a held append: a table-delete mutation placed
+        # for 2 (clean audit).  Rule: a keyed delete is an authored
+        # control effect like an append: a table-delete mutation placed
         # in its arm (synthesized from the retained conditional when the arm
         # has no region), so it runs exactly when and where its ``if`` does.
         from .control_source import ControlSequenceMutation
-        held_table_delete_ids = _held_table_delete_ids(graph)
         held_table_deletes = tuple(
             ControlSequenceMutation(
                 sequence_value_id=int(sequence_id),
@@ -28568,8 +28501,7 @@ def _class_surface_ssa_program(
                 ),
             )
             for effect_id, key, sequence_id, _storage in table_deletions
-            if int(effect_id) in held_table_delete_ids
-            and int(effect_id) in graph_obj
+            if int(effect_id) in graph_obj
             and sequence_id is not None
             and key != ()
         )
@@ -29648,21 +29580,6 @@ def _class_surface_ssa_program(
                 ),
                 table_stores=table_stores,
                 table_deletions=table_deletions,
-                # The table version each keyed delete reads (its ``base``).
-                table_deletion_bases={
-                    int(data.get("value_id", node_id)): int(
-                        graph_obj.nodes[base].get("value_id", base)
-                    )
-                    for node_id, data in graph_obj.nodes(data=True)
-                    if str(data.get("type") or "") == "DelItem"
-                    for base in (next((
-                        int(parent)
-                        for parent, role in data.get("parents") or ()
-                        if str(role) == "base" and int(parent) in graph_obj
-                    ), None),)
-                    if base is not None
-                },
-                table_deletion_held_ids=_held_table_delete_ids(graph),
                 retained_sequence_ids=retained_sequence_ids,
                 nested_sequence_ids=nested_sequence_ids,
                 nested_tensor_sequence_ids=nested_tensor_sequence_ids,
@@ -46903,16 +46820,29 @@ def _class_surface_ssa_program(
     def frame_fixed_point_digest() -> str:
         """Fingerprint every mutable ledger governed by the frame pass."""
 
+        import io
         import pickle
+        import types
         payload = (
             all_functions,
             all_record_tables,
             all_sequence_tables,
             call_records,
         )
-        return hashlib.sha256(
-            pickle.dumps(payload, protocol=5)
-        ).hexdigest()
+
+        class _LedgerPickler(pickle.Pickler):
+            # A retained source class keeps its defining module's lexical
+            # bindings (``math`` for ``Precision``) on the ClassDef the
+            # record-class page holds. A module is immutable here and is
+            # named by its import path, so the digest records the name.
+            def persistent_id(self, value):
+                if isinstance(value, types.ModuleType):
+                    return ("module", value.__name__)
+                return None
+
+        buffer = io.BytesIO()
+        _LedgerPickler(buffer, protocol=5).dump(payload)
+        return hashlib.sha256(buffer.getvalue()).hexdigest()
 
     frame_states = {frame_fixed_point_digest(): 0}
     frame_guard = BoundedFixedPoint(
