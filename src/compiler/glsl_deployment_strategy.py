@@ -31170,6 +31170,51 @@ def _callsite_return_shape_sources(caller, original, specialized, call_id, retur
     return tuple(dict.fromkeys((node_identity_cell(caller, int(call_id)), binding, *cells)))
 
 
+def _callsite_actual_int_range(caller: Any, call_id: int, actual_id: int):
+    """``((low, high), cell)`` proving a call actual's interval, else ``None``.
+
+    A raising guard dominating the call narrows the actual there
+    (``guarded_call_actual_range``); otherwise the actual's own row.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _int_range_cell, _source_numeric_scope,
+    )
+    from .concordance_declarations import GUARDED_CALL_ACTUAL_RANGE
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    data = caller.G.nodes.get(int(actual_id), {})
+    value_id = int(data.get("value_id", actual_id))
+    guarded_row = (_source_numeric_scope(caller.G), int(call_id), value_id)
+    cell = book.latest_ref(GUARDED_CALL_ACTUAL_RANGE, guarded_row)
+    if cell is None:
+        cell = _int_range_cell(caller, value_id)
+    if cell is None:
+        return None
+    interval = book.page(cell.page).cell(cell.row, cell.column)
+    return (int(interval[0]), int(interval[1])), cell
+
+
+def _authored_formal_int_range(original: Any, formal: str):
+    """The authored formal's own proven interval, else ``None``."""
+
+    from ..common.tensors.topological_reducer import _int_range_cell
+    from .identity_concordance import current_identity_book
+
+    for node_id, data in original.G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if data.get("type") == "Input" and attributes.get("binding_name") == formal:
+            cell = _int_range_cell(original, int(data.get("value_id", node_id)))
+            if cell is None:
+                return None
+            interval = current_identity_book().page(cell.page).cell(
+                cell.row, cell.column,
+            )
+            return (int(interval[0]), int(interval[1]))
+    return None
+
+
 def _callsite_specialized_shell_type(
     owner: Any,
     node_id: int,
@@ -31217,6 +31262,11 @@ def _callsite_specialized_shell_type(
     #: Per literal parameter: the caller argument cells that proved it; the
     #: copy's ``planner_specialization`` rows derive from them.
     specialization_cells: dict[str, tuple] = {}
+    #: Per int parameter: the interval this callsite's actual is proven in,
+    #: when it is narrower than the authored formal's (the join over every
+    #: caller), and the cell proving it.  The copy is minted for it.
+    parameter_int_ranges: dict[str, tuple[int, int]] = {}
+    parameter_int_range_cells: dict[str, Any] = {}
     from ..common.tensors.topological_reducer import _source_numeric_scope
     from .identity_concordance import current_identity_book
 
@@ -31370,6 +31420,14 @@ def _callsite_specialized_shell_type(
                 str(caller.G.graph.get("function_name")),
                 _argument_identity_cells(caller, int(parent)),
             )
+            actual_range = _callsite_actual_int_range(
+                caller, int(node_id), int(parent),
+            )
+            if actual_range is not None and actual_range[0] != (
+                _authored_formal_int_range(original, parameter)
+            ):
+                parameter_int_ranges[parameter] = actual_range[0]
+                parameter_int_range_cells[parameter] = actual_range[1]
         proven_descriptor = tensor_descriptors.get(parameter)
         if proven_descriptor is not None and descriptor_states_a_shape(
             proven_descriptor
@@ -31445,8 +31503,20 @@ def _callsite_specialized_shell_type(
     if not (
         specializations or tensor_descriptors
         or aggregate_descriptors or record_descriptors
+        or parameter_int_ranges
     ):
         return fallback
+    # The called inventory records each proven actual interval as a call
+    # record; the copy minted for these intervals reads them.
+    from .called_inventory import post_call_edge_range
+
+    int_range_edges = {
+        parameter: post_call_edge_range(
+            current_identity_book(), parameter, caller_scope, int(node_id),
+            interval, parameter_int_range_cells[parameter],
+        )
+        for parameter, interval in parameter_int_ranges.items()
+    }
 
     def stable(value: Any) -> object:
         return _stable_signature_value(value)
@@ -31475,6 +31545,7 @@ def _callsite_specialized_shell_type(
         )),
         tuple(sorted(parameter_classes.items())),
         tuple(sorted(parameter_element_classes.items())),
+        tuple(sorted(parameter_int_ranges.items())),
     )
     key = (
         tuple(policy.items()), generation,
@@ -31596,6 +31667,12 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_parameter_class_cells"] = dict(
         parameter_class_cells
+    )
+    specialized.G.graph["called_formal_int_range_edges"] = dict(
+        int_range_edges
+    )
+    specialized.G.graph["planner_parameter_int_ranges"] = dict(
+        sorted(parameter_int_ranges.items())
     )
     specialized.G.graph["planner_tensor_descriptors"] = copy.deepcopy(
         tensor_descriptors

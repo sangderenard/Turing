@@ -661,8 +661,33 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         )
     }
 
+    # Program: ``def _trim(out): while len(out) > 1: out.pop()`` called
+    # with ``[1, n, 0, 0]`` (``out`` unannotated).  Wrong record: the
+    # reducer classified the loop's ``pop`` before the call actual gave the
+    # formal its class, so the effect stayed OPAQUE and the loop refused
+    # ("receiver's class is unresolved").  Rule: as for any receiver, a
+    # state whose class is now a builtin list is that list, and its
+    # in-place method is the list's own sequence mutation.
+    def resolved_list(state_id: int) -> bool:
+        data = graph.G.nodes.get(int(state_id), {})
+        return (
+            _receiver_collection_kind(data) == "list"
+            and (data.get("attributes") or {}).get("sequence_writable", True)
+        )
+
     def forwarded_effect(effect):
         actual = returned_actuals.get(int(effect["state_input_id"]))
+        if (
+            actual is None
+            and effect.get("effect_mode", "opaque") == "opaque"
+            and str(effect["operator"]) in SEQUENCE_MUTATION_OPERATORS
+            and resolved_list(int(effect["state_input_id"]))
+        ):
+            return {
+                **effect,
+                "effect_mode": "sequence_mutation",
+                "sequence_policy": "duplicates",
+            }
         if (
             actual is None
             or effect.get("effect_mode", "opaque") != "opaque"
