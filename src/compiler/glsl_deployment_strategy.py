@@ -28188,6 +28188,7 @@ def _fold_callsite_structural_values(
                     "add", "sub", "mult", "mul", "div", "truediv",
                     "floordiv", "mod", "pow", "maximum", "minimum", "emax", "emin",
                     "max", "min",
+                    "bitand", "bitor", "bitxor", "shl", "shr",
                 } | comparison_operations
                 or semantic_operation in comparison_operations
             ) and not (
