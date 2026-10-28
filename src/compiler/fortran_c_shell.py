@@ -7957,6 +7957,26 @@ def _authored_dataclass_record_views(
                 if isinstance(node, ast.AnnAssign):
                     target = node.target
                     receipt = field_receipt(node.annotation)
+                    # Program: ``self._d: dict[int, int] = {}`` then
+                    # ``self._d[k] = v`` in a method.  Wrong record: the
+                    # annotation alone chose the caller-supplied keyed view
+                    # (keys, values, length; exactly full), so the method
+                    # growing the class's own mapping was refused for want of
+                    # a capacity part.  Rule: a scalar mapping the initializer
+                    # births empty is the class's own growable mapping, the
+                    # same receipt as the unannotated ``self._d = {}``.
+                    if (
+                        receipt is not None
+                        and receipt.get("storage") == "keyed"
+                        and receipt.get("dtype") in {
+                            "int64", "float64", "bool",
+                        }
+                        and not receipt.get("value_record")
+                        and not receipt.get("value_tensor")
+                        and isinstance(node.value, ast.Dict)
+                        and not node.value.keys
+                    ):
+                        receipt = initialized_field_receipt(node.value)
                 elif isinstance(node, ast.Assign) and len(node.targets) == 1:
                     target = node.targets[0]
                     receipt = (
