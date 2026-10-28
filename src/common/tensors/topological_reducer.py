@@ -1512,6 +1512,11 @@ def specialize_python_precision_widths(graph: Any) -> bool:
     while propagated:
         propagated = False
         for node_id, data in tuple(target.nodes(data=True)):
+            # A call or a comparison decides its own result class: a
+            # Precision-returning call was seeded above, and ``d.term(0)``
+            # or ``d > band`` reads a Precision without being one.
+            if isinstance(data.get("expr_obj"), (ast.Call, ast.Compare)):
+                continue
             parent_widths = tuple(
                 precision_flow_widths[int(parent)]
                 for parent, _role in data.get("parents", ())
@@ -9810,7 +9815,14 @@ def _normalize_lexical_values(
                             )
                         ) or operation_name in _MAPPING_MUTATION_OPERATORS
                         mutation_operation = (
-                            operation_name if known_mutation
+                            # A set's one-iterable ``update`` is ``extend``
+                            # under its unique policy.
+                            "extend"
+                            if aggregate_kind == "set"
+                            and operation_name == "update"
+                            and len(expression.args) == 1
+                            and not expression.keywords
+                            else operation_name if known_mutation
                             else f"unclassified_call:{operation_name}"
                         )
                         mutation_fact = (
@@ -16164,9 +16176,18 @@ def _normalize_lexical_values(
                             else None
                         )
                     )
+                    # ``s.update(xs)`` inserts each element of one iterable
+                    # under the set's unique policy: the sequence ``extend``.
+                    operator_name = (
+                        "extend"
+                        if aggregate_kind == "set"
+                        and call.func.attr == "update"
+                        and len(call.args) == 1 and not call.keywords
+                        else str(call.func.attr)
+                    )
                     sequence_mutation = (
                         sequence_policy is not None
-                        and call.func.attr in _SEQUENCE_MUTATION_OPERATORS
+                        and operator_name in _SEQUENCE_MUTATION_OPERATORS
                         and not (
                             aggregate_kind == "dict"
                             and call.func.attr == "pop"
@@ -16192,7 +16213,7 @@ def _normalize_lexical_values(
                         )
                         mutation_row = (value_class_scope, int(call_id))
                         mutation_fact = (
-                            int(initial), str(call.func.attr),
+                            int(initial), operator_name,
                             str(sequence_policy), tuple(argument_ids),
                             # The class is the receiver's, as at every other
                             # site that posts this fact: a dict's ``clear``
@@ -16232,7 +16253,7 @@ def _normalize_lexical_values(
                             )
                     state_effects.append({
                         "state_name": name,
-                        "operator": call.func.attr,
+                        "operator": operator_name,
                         "effect_mode": (
                             "sequence_mutation"
                             if sequence_mutation
@@ -24765,7 +24786,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             layout_row = key_attrs.get("source_aggregate_layout_row")
             layout_cell = None if layout_row is None else current_identity_book().latest_ref(_SOURCE_AGGREGATE_LAYOUT, tuple(layout_row))
             if layout_cell is None:
-                unproved_mapping_fields.add(field_cell)
+                # Program: ``self.table.setdefault(key, []).append(v)`` with
+                # ``key: int``.  Wrong record: only a tuple key's layout was
+                # read, so a scalar key left the field unproved and its heap
+                # table had no key column dtype.  Rule: a scalar key whose
+                # source class is a Python scalar is one key column.
+                key_value = int(target.nodes[key_id].get("value_id", key_id))
+                key_class_cell = current_identity_book().latest_ref(_SOURCE_VALUE_CLASS, (scope, key_value))
+                key_class = None if key_class_cell is None else current_identity_book().page(_SOURCE_VALUE_CLASS).cell(key_class_cell.row, key_class_cell.column)
+                if key_class is None or int(key_class[1]) != 1 or str(key_class[0]) not in {"builtins.int", "builtins.float", "builtins.bool"}:
+                    unproved_mapping_fields.add(field_cell)
+                    continue
+                key_dtypes = ({"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}[str(key_class[0])],)
+                proposed = {"mapping_child_column_dtypes": (str(dtype),), "mapping_value_aggregate_kind": "list", "mapping_key_column_count": 1, "mapping_key_column_dtypes": key_dtypes, "mapping_value_dtype": "int64"}
+                incumbent = mapping_contract_views.setdefault(field_cell, proposed)
+                if incumbent != proposed:
+                    raise ValueError(f"mapping child writers disagree for declaration {field_cell!r}")
+                mapping_contract_evidence.append({"field_cell": field_cell, "class_cell": class_cell, "key_layout_cell": None, "dtype": str(dtype), "key_width": 1, "key_class_cells": (key_class_cell,), "key_dtypes": key_dtypes})
                 continue
             layout = current_identity_book().page(_SOURCE_AGGREGATE_LAYOUT).cell(layout_cell.row, layout_cell.column)
             if layout.aggregate_kind != "tuple" or not layout.members:

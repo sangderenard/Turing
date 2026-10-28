@@ -253,6 +253,15 @@ _FLOORED_HELPERS = (
     "static double turing_ffloordiv(double a, double b) {",
     "    return floor(a / b);",
     "}",
+    # Python's int.bit_length: the bits of |v| (0 for 0, 64 for INT64_MIN),
+    # the C spelling of the Fortran lane's turing_python_bit_length.
+    "static long long turing_bit_length(long long v) {",
+    "    unsigned long long m = v < 0 ? 0ULL - (unsigned long long)v",
+    "                                 : (unsigned long long)v;",
+    "    long long n = 0;",
+    "    while (m != 0) { n += 1; m >>= 1; }",
+    "    return n;",
+    "}",
 )
 #: Owned heap arenas (``ssa_heap_allocation``): every block is
 #: ``[previous block][elements...]`` linked into its owner cell, so one
@@ -6327,6 +6336,18 @@ def emit_ssa_module_to_c(
                         f"({args[0]})) : ({args[0]}));"
                     )
                 elif (
+                    op == "BitLength" and len(args) == 1
+                    and is_integer(instruction.args[0])
+                    and _is_integer_dtype(instruction.res.dtype)
+                ):
+                    kind = _scalar_c_type(instruction.res.dtype)
+                    declared_storage_type = kind
+                    integer_ids.add(result_id)
+                    declared = (
+                        f"const {kind} t{result_id} = "
+                        f"({kind})turing_bit_length((long long)({args[0]}));"
+                    )
+                elif (
                     op.casefold() in _INTEGER_VALUED_UNARY and len(args) == 1
                     and _is_integer_dtype(instruction.res.dtype)
                 ):
@@ -6831,6 +6852,28 @@ def emit_ssa_module_to_c(
                 entry_span.take(
                     UnitKind.STATEMENT,
                     args=(int(sequence.capacity_value_id),), spelling=capacity,
+                )
+    # A root-owned list of lists keeps its row slices in a child-table pool:
+    # publish the pool's proven capacity and stride, as the outer capacity
+    # cell above is, before any row is allocated.
+    if root_sequences is not None:
+        for outer_id, rows, stride in tuple(
+            root.metadata.get("child_pool_static_extents", ())
+        ):
+            outer = root_sequences.sequences.get(int(outer_id))
+            pool = None if outer is None else outer.child_table_pool
+            if pool is None:
+                continue
+            for member_id, value in (
+                (pool.capacity_value_id, int(rows) * int(stride)),
+                (pool.row_stride_value_id, int(stride)),
+            ):
+                cell = owned_storage_names.get(int(member_id))
+                if cell is None:
+                    continue
+                entry_lines.append(f"    ((int64_t *){cell})[0] = {value};")
+                entry_span.take(
+                    UnitKind.STATEMENT, args=(int(member_id),), spelling=cell,
                 )
     # -- record-parameter relocation prologue -------------------------------
     # Record parameters are runtime cell arenas (the program mutates scalar

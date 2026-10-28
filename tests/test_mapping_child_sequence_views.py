@@ -33,8 +33,10 @@ def test_setdefault_append_uses_the_selected_child_row_storage():
     pool = parent.child_table_pool
     assert pool.key_columns == ()
     assert len(pool.column_value_ids) == 1
-    assert child.capacity_value_id == pool.row_stride_value_id
     definitions = {i.res.id: i for i in instructions if i.res is not None}
+    capacity = definitions[child.capacity_value_id]
+    assert capacity.op == "Cast"
+    assert capacity.args[0].id == pool.row_stride_value_id
     view = definitions[child.column_value_ids[0]]
     assert view.op == "GetElementPtr"
     assert view.args[0].id == pool.column_value_ids[0]

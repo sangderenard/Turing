@@ -2284,6 +2284,9 @@ def _planned_scalar_dtypes_from(
 
     scalar: dict[int, str] = {}
     element: dict[int, str] = dict(assumed_elements or {})
+    # A list of lists holds one element class per row: ``row_element`` is
+    # the class every row of a collection-of-collections shares.
+    row_element: dict[int, str] = {}
 
     def join(dtypes):
         known = {dtype for dtype in dtypes if dtype is not None}
@@ -2312,6 +2315,14 @@ def _planned_scalar_dtypes_from(
 
     collection_kinds = {"list", "tuple", "set", "dict"}
 
+    # ``def put(xs, t): xs.append(t)``: an unannotated parameter that a
+    # retained append grows is a collection; its rows are what it appends.
+    grown_receivers = {
+        int(record.get("sequence_value_id", -1))
+        for record in (G.graph.get("source_sequence_mutation_records") or {}).values()
+        if str(record.get("operator")) in {"append", "add", "insert"}
+    }
+
     def is_collection(node_id):
         data = G.nodes.get(int(node_id), {})
         return (
@@ -2320,6 +2331,10 @@ def _planned_scalar_dtypes_from(
             ))
             or (data.get("attributes") or {}).get("aggregate_kind")
             in collection_kinds
+            or (
+                operation(data) == "input"
+                and int(data.get("value_id", node_id)) in grown_receivers
+            )
         )
 
     records = G.graph.get("source_sequence_mutation_records") or {}
@@ -2431,6 +2446,18 @@ def _planned_scalar_dtypes_from(
                     settle(element, node_id, join([
                         literal_dtype(member) for member in literal
                     ]))
+                    # A folded list of lists (corpus c733) holds the one
+                    # class its member rows share.
+                    if all(
+                        isinstance(member, (list, tuple)) and member
+                        for member in literal
+                    ):
+                        settle(row_element, node_id, join([
+                            join([literal_dtype(item) for item in member])
+                            for member in literal
+                        ]))
+                        # Its own column holds the rows' handles.
+                        settle(element, node_id, "int64")
                 # Program: ``sum(i * k for i in range(6))`` (corpus c27).
                 # Lane D, D2.  A folded ``range`` is a constant whose rows
                 # are Python ints by construction; nobody read that, so the
@@ -2531,15 +2558,53 @@ def _planned_scalar_dtypes_from(
                             or linked_class or ""
                         ).removeprefix("builtins.")
                     ))
+                    # Program: ``span_total(atoms, ...)`` with ``atoms``
+                    # unannotated, called as ``span_total([n + 1, 4], 0,
+                    # 2)`` (corpus c690).  Wrong record: the callsite
+                    # specialization splits the literal actual into member
+                    # formals (``atoms[1]``) that carry no class of their
+                    # own, so the row read from them had no dtype.  Rule: a
+                    # member formal has the element class the call edge
+                    # settled on the aggregate it belongs to
+                    # (``sequence_element_class_ref``).
+                    if (
+                        attributes.get("aggregate_parent_binding") is not None
+                        and node_id not in scalar
+                    ):
+                        member_classes = {
+                            str((G.nodes[owner].get("attributes") or {}).get(
+                                "sequence_element_class_ref"
+                            ) or "").removeprefix("builtins.")
+                            for owner in G.successors(node_id)
+                            if (G.nodes[owner].get("attributes") or {}).get(
+                                "binding_name"
+                            ) == attributes["aggregate_parent_binding"]
+                        }
+                        if len(member_classes) == 1:
+                            settle(scalar, node_id, classes.get(
+                                next(iter(member_classes))
+                            ))
                     # An annotated collection parameter (``xs: list[int]``)
                     # is a collection: its element class joins its
                     # annotation with its writers, in the collection rule.
+                    # An unannotated one takes its class from its call edge
+                    # (c690): the same ``sequence_element_class_ref``, on a
+                    # parameter whose settled class is the collection's.
+                    # So is an unannotated one a retained append grows:
+                    # its element class is its writers' join.
                     if (
-                        attributes.get("aggregate_kind") in collection_kinds
+                        (
+                            attributes.get("aggregate_kind") in collection_kinds
+                            or str(attributes.get("result_class_ref") or "")
+                            .removeprefix("builtins.") in collection_kinds
+                        )
                         and (
                             attributes.get("sequence_element_class_ref")
                             or attributes.get("mapping_value_class_ref")
                         )
+                    ) or (
+                        attributes.get("aggregate_kind") is None
+                        and int(data.get("value_id", node_id)) in grown_receivers
                     ):
                         pass
                     else:
@@ -2876,6 +2941,26 @@ def _planned_scalar_dtypes_from(
                     if attributes.get("producer_kind") == "sequence_materialization"
                     else parents(data, "elts")
                 )
+                # Program: ``g = [[1, 2], [3, n]]; g[i][1] * 10`` (corpus
+                # c732).  Wrong record: a member that is itself a list has no
+                # scalar class, so the outer list joined nothing, the row
+                # ``g[i]`` had no element class, and the planner stopped at
+                # "has no settled dtype".  Rule: when every member is a
+                # collection the outer list's rows are lists, and it holds
+                # the one element class its member rows share.
+                row_members = members or [
+                    int(leaf) for leaf in
+                    attributes.get("aggregate_leaf_value_ids") or ()
+                    if int(leaf) in G
+                ]
+                if row_members and all(
+                    is_collection(member) for member in row_members
+                ):
+                    settle(row_element, node_id, join(
+                        [element.get(member) for member in row_members]
+                    ))
+                    # Its own column holds the rows' handles.
+                    settle(element, node_id, "int64")
                 writers = [scalar.get(member) for member in members]
                 # Lane D, D2 step 4.  Program: ``ys = sorted(xs); ys[0]``
                 # (corpus c127, c129).  ``sorted`` returns a new list of its
@@ -2993,6 +3078,21 @@ def _planned_scalar_dtypes_from(
                     writers.append(classes.get(str(
                         attributes["sequence_element_class_ref"]
                     ).removeprefix("builtins.")))
+                # Program: ``self._c = []`` in ``__init__``, then ``for v in
+                # self._c`` in a method that appends ints.  Wrong record:
+                # the unannotated field states no element class, so ``v``
+                # had no row though the class field contract the reducer
+                # stamps on the field's GetAttr (``sequence_column_dtypes``)
+                # holds int64 rows.  Rule: a positional record field's one
+                # column dtype is its element class.
+                elif (
+                    attributes.get("producer_kind") == "record_field"
+                    and attributes.get("aggregate_kind") in {"list", "tuple", "set"}
+                    and len(tuple(attributes.get("sequence_column_dtypes") or ())) == 1
+                    and str(attributes["sequence_column_dtypes"][0])
+                    in {"int64", "float64", "bool"}
+                ):
+                    writers.append(str(attributes["sequence_column_dtypes"][0]))
                 for record in records.values():
                     if int(record.get("sequence_value_id", -1)) == int(
                         data.get("value_id", node_id)
@@ -3037,7 +3137,10 @@ def _planned_scalar_dtypes_from(
                 continue
             if op in {"indexed", "getitem", "subscript"}:
                 base = parents(data, "base", "value", "object")
-                if base:
+                if base and base[0] in row_element:
+                    # A row of a list of lists is a list of the shared class.
+                    settle(element, node_id, row_element[base[0]])
+                elif base:
                     settle(scalar, node_id, element.get(base[0]))
                 continue
             # Program: ``d = {}; for i in range(n): d[i % 2] = d.get(i % 2,
@@ -3307,11 +3410,121 @@ def _planned_scalar_dtypes_from(
     return {**element, **scalar}
 
 
+def _region_value_dtype_row(graph: Any, value_id: int, *, mint: bool):
+    """The ``region_value_dtype`` row of a value, under its graph's scope."""
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    if scope is None:
+        scope = graph.G.graph.get("hierarchy_settlement_scope")
+        if scope is None and mint:
+            from .concordance_declarations import PLANNER_SCOPE
+            from .identity_concordance import current_identity_book
+
+            scope = current_identity_book().mint_scope(
+                "hierarchy_settlement", PLANNER_SCOPE,
+            )
+            graph.G.graph["hierarchy_settlement_scope"] = scope
+    return None if scope is None else (tuple(scope), int(value_id))
+
+
+def _post_region_value_obligation(graph: Any, value_id: int) -> None:
+    """Record that a non-terminal freeze left this value's dtype to settle."""
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import (
+        HIERARCHY_PLAN_FREEZE, PLAN_REGION_VALUE_DTYPE,
+        REGION_VALUE_DTYPE_AWAITS_SETTLEMENT,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unresolved, current_identity_book,
+    )
+
+    row = _region_value_dtype_row(graph, value_id, mint=True)
+    try:
+        cells = (node_identity_cell(graph, int(value_id)),)
+    except ValueError:
+        cells = ()
+    book = current_identity_book()
+    incumbent = book.page(PLAN_REGION_VALUE_DTYPE).latest(row)
+    if incumbent is not None:
+        return  # already owed (or settled): one row per value
+    book.post(
+        PLAN_REGION_VALUE_DTYPE, row,
+        Unresolved(
+            REGION_VALUE_DTYPE_AWAITS_SETTLEMENT,
+            read=tuple(cell for cell in cells if cell is not None),
+        ),
+        stage=HIERARCHY_PLAN_FREEZE,
+        provenance=Derived(tuple(cell for cell in cells if cell is not None)),
+        mode=Mode.REVISE,
+    )
+
+
+def _settle_region_value_obligation(
+    graph: Any, value_id: int, dtype: str,
+) -> None:
+    """Close an outstanding obligation with the dtype the strict freeze read."""
+
+    from .concordance_declarations import (
+        HIERARCHY_PLAN_FREEZE, PLAN_REGION_VALUE_DTYPE,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Unresolved, current_identity_book,
+    )
+
+    row = _region_value_dtype_row(graph, value_id, mint=False)
+    if row is None:
+        return
+    book = current_identity_book()
+    page = book.page(PLAN_REGION_VALUE_DTYPE)
+    if not isinstance(page.latest(row), Unresolved):
+        return
+    cell = book.latest_ref(PLAN_REGION_VALUE_DTYPE, row)
+    book.post(
+        PLAN_REGION_VALUE_DTYPE, row, str(dtype),
+        stage=HIERARCHY_PLAN_FREEZE,
+        provenance=Derived((cell,) if cell is not None else ()),
+        mode=Mode.REVISE,
+    )
+
+
+def outstanding_region_value_obligations(graph: Any) -> tuple[int, ...]:
+    """Region values of ``graph`` whose dtype is still an open obligation."""
+
+    from .concordance_declarations import PLAN_REGION_VALUE_DTYPE
+    from .identity_concordance import Unresolved, current_identity_book
+
+    scope = graph.G.graph.get("lexical_read_scope")
+    scopes = [
+        item for item in (
+            scope, graph.G.graph.get("hierarchy_settlement_scope"),
+        ) if item is not None
+    ]
+    page = current_identity_book().page(PLAN_REGION_VALUE_DTYPE)
+    return tuple(
+        int(row[1]) for item in scopes
+        for row in page.scope_rows(tuple(item))
+        if isinstance(page.latest(row), Unresolved)
+    )
+
+
 def _build_shell_hierarchy_plan(
     shell: Any,
     _memo: dict[int, PlanClosure] | None = None,
+    *,
+    terminal: bool = False,
 ) -> PlanClosure:
-    """Freeze call/region ownership before backend source composition."""
+    """Freeze call/region ownership before backend source composition.
+
+    ``terminal`` is the phase.  A freeze made while callsite planning,
+    actual-to-formal binding and linked-ABI settlement are still ahead
+    (``terminal=False``, the default: shell construction) freezes STRUCTURE
+    only: a region value no record has typed yet is posted as an outstanding
+    obligation (``region_value_dtype`` row, ``Unresolved``) and gets no
+    ``value_shapes`` row and no invented dtype.  The post-settlement freeze
+    (``refresh_hierarchy_plan``: ``terminal=True``) reads the settled
+    sources and refuses by name what is still unsettled.
+    """
 
     memo = {} if _memo is None else _memo
     incumbent_plan = memo.get(id(shell))
@@ -4026,7 +4239,7 @@ def _build_shell_hierarchy_plan(
                     name=str(child_graph.graph.get("function_name")),
                     captures=tuple(dict.fromkeys(callee for _caller, callee in argument_bindings)),
                     items=(),
-                ) if recursive_target is not None else _build_shell_hierarchy_plan(child, memo)),
+                ) if recursive_target is not None else _build_shell_hierarchy_plan(child, memo, terminal=terminal)),
                 parents,
                 tuple(caller for _callee, caller in result_bindings),
                 tuple(argument_bindings),
@@ -5093,9 +5306,25 @@ def _build_shell_hierarchy_plan(
 
             record = _value_shape_dtype(value_id)
             if record[2] is not None:
+                if terminal:
+                    _settle_region_value_obligation(
+                        graph, int(value_id), record[2],
+                    )
                 return record
             node = graph.G.nodes.get(int(value_id), {})
             attributes = node.get("attributes") or {}
+            # A collection the callsite specialization folded from its
+            # actual (an unannotated ``atoms`` bound to ``[a, b]``) keeps
+            # the element class the call edge settled
+            # (``sequence_element_class_ref``): its row is that class.
+            if attributes.get("aggregate_kind") in {"list", "tuple"} and (
+                str(attributes.get("sequence_element_class_ref") or "")
+                .removeprefix("builtins.") in {"int", "float", "bool"}
+            ):
+                return (record[0], record[1], {
+                    "int": "int64", "float": "float64", "bool": "bool",
+                }[str(attributes["sequence_element_class_ref"])
+                  .removeprefix("builtins.")])
             if attributes.get("program_abi_record_identity"):
                 # A record value is a handle onto its fields' storage.
                 return (record[0], record[1], "opaque_ref")
@@ -5104,6 +5333,14 @@ def _build_shell_hierarchy_plan(
                 == "staticreference"
             ):
                 return None
+            if (
+                str(node.get("op") or node.get("type") or "").casefold()
+                == "slice"
+            ):
+                # ``xs[:k]``: the Slice is the index-metadata handle of
+                # the load it feeds (as a folded slice literal is, above);
+                # its bounds are the typed values.  It is not an element.
+                return (record[0], record[1], "opaque_ref")
             # An external name read only as the receiver of tensor-namespace
             # calls (``AbstractTensor`` in ``AbstractTensor.get_tensor(x)``,
             # imported inside the method) is a static symbol, as a
@@ -5215,10 +5452,21 @@ def _build_shell_hierarchy_plan(
                 for source in nx.ancestors(graph.G, int(value_id))
             ):
                 return None
+            if not terminal:
+                _post_region_value_obligation(graph, int(value_id))
+                return None
+            function_name = graph.G.graph.get("function_name")
+            source = str(
+                node.get("op") or node.get("type") or "?"
+            )
+            binding = attributes.get("binding_name")
             raise ValueError(
-                f"region value {int(value_id)} has no settled dtype in the "
-                "tensor, specialization, node, descriptor, planned scalar "
-                "types, its operands or domain"
+                f"region value {int(value_id)} "
+                f"({source}"
+                + (f" {binding!r}" if binding is not None else "")
+                + f" in function {function_name!r}) has no settled dtype "
+                "in the tensor, specialization, node, descriptor, planned "
+                "scalar types, its operands, its call actuals or domain"
             )
 
         value_shapes = tuple(
@@ -5250,6 +5498,25 @@ def _build_shell_hierarchy_plan(
                 and int(descriptor.get("rank", -1)) == 0
                 and descriptor.get("metadata_state", "static") == "static"
             ))
+        )
+        # Program: ``g = [[1, 2], [3, 4]]; g[i][j]`` (corpus c733).  Wrong
+        # record: a folded list of lists has no tensor extent (its rows are
+        # lists), so its ``Const`` line got no value record and the region
+        # refused it.  Rule: such a constant is a list of row handles: one
+        # int64 per row.
+        value_shapes += tuple(
+            (int(value_id), (len(literal),), "int64")
+            for value_id in sorted(materialised)
+            if int(value_id) not in produced
+            and int(value_id) not in captured
+            and int(value_id) not in {record[0] for record in value_shapes}
+            for literal in ((
+                (graph.G.nodes.get(int(value_id)) or {}).get("attributes")
+                or {}
+            ).get("value"),)
+            if isinstance(literal, list) and literal and all(
+                isinstance(member, (list, tuple)) for member in literal
+            )
         )
         value_ranks = tuple(
             (
@@ -5657,6 +5924,19 @@ def _build_hierarchical_glsl_artifact(shell: Any):
         fields={},
     )
     shell.hierarchical_compose_failure = None
+    # A region is lowered only from a strict (post-settlement) freeze: a
+    # value still owed its dtype by a non-terminal freeze is refused by name.
+    for planned in _walk_planned_shells(shell):
+        owed = outstanding_region_value_obligations(planned.process_graph)
+        if owed:
+            raise ValueError(
+                "hierarchy plan of function "
+                f"{planned.process_graph.G.graph.get('function_name')!r} "
+                f"was frozen before settlement and region value(s) "
+                f"{sorted(owed)} still await a dtype; "
+                "refresh_hierarchy_plan() was not run after linked-ABI "
+                "settlement"
+            )
     hierarchy = shell.hierarchy_plan
     value_table = shell.hierarchy_value_table
 
@@ -9775,7 +10055,15 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
                 "value_id", destination
             )),
             "argument_value_ids": mutation_arguments,
-            "operator": str(expression.func.attr),
+            # ``s.update(xs)`` on a set inserts each element of one
+            # iterable under the set's unique policy: the sequence
+            # ``extend``, which inherits that policy.
+            "operator": (
+                "extend"
+                if destination_kind == "set" and expression.func.attr == "update"
+                and len(arguments) == 1 and not expression.keywords
+                else str(expression.func.attr)
+            ),
             "argument_kind": "mapping_setdefault" if mapping_default else "value",
             "policy": (
                 "unique"
@@ -12302,8 +12590,14 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                 int(graph.G.nodes[receivers[0]].get("value_id", receivers[0])), declaration,
             )
 
+    from .resident_sequence_materialization import _handle_merge_storage_roots
+
+    handle_roots = _handle_merge_storage_roots(graph.G)
+
     def storage_key(value_id):
-        return field_storage_keys.get(int(value_id), int(value_id))
+        return field_storage_keys.get(
+            int(value_id), handle_roots.get(int(value_id), int(value_id)),
+        )
 
     readers_by_sequence: dict[Any, list[tuple[tuple[int, int], int]]] = {}
     reader_ends: dict[int, tuple[int, int]] = {}
@@ -20064,7 +20358,9 @@ def _publish_conditional_call_aggregate_merges(
     def arm_layout(value_id: int):
         """The arm's layout row; a call arm's is posted from its ledger."""
         layout, cell = layout_of(value_id)
-        if layout is not None:
+        if layout is not None and all(
+            int(member.value_id) in graph.G for member in layout.members
+        ):
             return layout, cell
         data = graph.G.nodes[int(value_id)]
         attributes = data.get("attributes") or {}
@@ -20116,9 +20412,9 @@ def _publish_conditional_call_aggregate_merges(
             and len(body.members) == len(orelse.members)
         ):
             return None
+        # The same merge may already be on the book, posted from the work
+        # copy of this graph; this graph still needs its member Phis.
         incumbent, incumbent_cell = layout_of(merged_id)
-        if incumbent is not None:
-            return incumbent_cell
         members = []
         for index, (left, right) in enumerate(zip(body.members, orelse.members)):
             member_sources = tuple(dict.fromkeys(filter(None, (
@@ -20169,6 +20465,11 @@ def _publish_conditional_call_aggregate_merges(
             ),
         })
         graph.G.nodes[int(merged_id)].pop("tensor", None)
+        if incumbent is not None:
+            graph.G.nodes[int(merged_id)].setdefault("attributes", {})[
+                "source_aggregate_layout_row"
+            ] = (scope, int(merged_id))
+            return incumbent_cell
         return post_layout(
             int(merged_id), body.aggregate_kind, members,
             conditional_cell, (body_cell, else_cell),
@@ -20709,6 +21010,12 @@ def _propagate_callsite_tensor_specializations(
             isolated_callers.get(id(caller.G), caller)
             for caller in graphs
         ]
+    #: (source graph, call node) -> the return members published on the
+    #: isolated copy, replayed on the source graph once the rounds settle.
+    isolated_return_members: dict[tuple[int, int], tuple] = {}
+    isolated_origin = {
+        id(clean.G): key for key, clean in isolated_callers.items()
+    }
     #: (caller graph, call node) -> per-slot callee return value cells of
     #: the latest ``call_result_descriptor`` answer for that call.
     return_cells_by_call: dict[tuple[int, int], tuple] = {}
@@ -21305,6 +21612,10 @@ def _propagate_callsite_tensor_specializations(
             conditional_changed |= _publish_conditional_call_aggregate_merges(
                 caller, function_table,
             )
+            if conditional_changed:
+                # A merge published just now gives its unpack projections a
+                # member ledger the earlier fold could not read.
+                _fold_callsite_structural_values(caller)
             changed |= conditional_changed
             mutation_counts["conditional_members"] += int(conditional_changed)
             for _node_id, data in tuple(caller.G.nodes(data=True)):
@@ -21517,6 +21828,15 @@ def _propagate_callsite_tensor_specializations(
                                 (id(caller.G), int(_node_id)), (),
                             ),
                         )
+                        if id(caller.G) in isolated_origin:
+                            isolated_return_members[(
+                                isolated_origin[id(caller.G)], int(_node_id),
+                            )] = (
+                                result_descriptors, next(iter(return_kinds)),
+                                return_cells_by_call.get(
+                                    (id(caller.G), int(_node_id)), (),
+                                ),
+                            )
                         changed |= return_members_changed
                         mutation_counts["return_members"] += int(
                             return_members_changed
@@ -21967,6 +22287,16 @@ def _propagate_callsite_tensor_specializations(
                 else _callee_optional_aggregate_members(callee)
             )
             if arms_members is None:
+                replay = isolated_return_members.get(
+                    (id(source.G), int(_node_id))
+                )
+                if replay is not None and not attributes.get(
+                    "aggregate_leaf_value_ids"
+                ):
+                    _publish_callsite_return_members(
+                        source, int(_node_id), *replay[:2],
+                        return_cells=replay[2],
+                    )
                 continue
             _publish_callsite_return_members(
                 source, int(_node_id),
@@ -21981,7 +22311,8 @@ def _propagate_callsite_tensor_specializations(
                 ),
             )
         _publish_conditional_tuple_members(source, function_table)
-        _publish_conditional_call_aggregate_merges(source, function_table)
+        if _publish_conditional_call_aggregate_merges(source, function_table):
+            _fold_callsite_structural_values(source)
 
 
 def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
@@ -25387,6 +25718,14 @@ def _mutated_sequence_node_ids(
         literal = (data.get("attributes") or {}).get("value")
         if isinstance(literal, (list, set, dict, bytearray)):
             return True
+        # A list merged from branches is the taken arm's own mutable list
+        # (``grow(t, k)`` then ``len(a)``, c739), not an immutable value.
+        if (
+            (data.get("attributes") or {}).get("producer_kind")
+            in {"aggregate_phi", "aggregate_merge"}
+            and (data.get("attributes") or {}).get("aggregate_kind") == "list"
+        ):
+            return True
         return str((data.get("attributes") or {}).get(
             "extraction_identity"
         ) or "") in {
@@ -25466,7 +25805,9 @@ def _mutated_sequence_node_ids(
         ]
         while pending:
             merged = graph_obj.nodes[pending.pop()]
-            if (merged.get("attributes") or {}).get("producer_kind") != "aggregate_phi":
+            if (merged.get("attributes") or {}).get("producer_kind") not in {
+                "aggregate_phi", "aggregate_merge",
+            }:
                 continue
             for parent, role in merged.get("parents") or ():
                 if (
@@ -26828,6 +27169,34 @@ def _fold_callsite_structural_values(
                     expression.args[1]
                     if len(expression.args) > 1 else None
                 )
+                # A numeric value (``Precision[2]``) is physically a float64
+                # scalar, so its ABI fact reads ``builtins.float``; its
+                # source class is the one its numeric descriptor names.
+                numeric = argument_attributes.get(
+                    "numeric_feature_descriptor"
+                )
+                if isinstance(numeric, Mapping):
+                    from ..common.tensors import extended_precision
+
+                    numeric_class = getattr(
+                        extended_precision, str(numeric.get("type_name")),
+                        None,
+                    )
+                    numeric_identities = type_identities(
+                        expression.args[1]
+                        if len(expression.args) > 1 else None
+                    )
+                    if isinstance(numeric_class, type) and numeric_identities:
+                        held = {
+                            f"{base.__module__}.{base.__qualname__}"
+                            for base in numeric_class.__mro__
+                        }
+                        return any(
+                            name == identity
+                            or name.endswith("." + identity)
+                            for name in held
+                            for identity in numeric_identities
+                        )
                 # ``list[int]`` does not prove an exact Python ``int`` for
                 # a loop item: bool is an int subclass and is accepted by
                 # the annotation. Without a callsite's exact homogeneous
@@ -29601,6 +29970,42 @@ def _post_callsite_loop_element_classes(
         cells = tuple(cell for cell in cells if cell is not None)
         return (element_class, cells) if cells else None
 
+    def declared_actual_element_class(
+        actual_id: int, formal_id: int,
+    ) -> tuple[str, tuple[Any, ...]] | None:
+        """Read the element class an annotated actual declares.
+
+        Program: ``def span_total(atoms, ...)`` (no annotation) called as
+        ``span_total(xs, ...)`` from ``def forward(xs: list[int], ...)``
+        (corpus c690).  Wrong record: the formal states no element class
+        and the actual's ``list[int]`` annotation, the one place the
+        class is written, was not read at this call edge, so the rows read
+        from ``atoms`` had no dtype.  Rule: a formal with no element class
+        of its own takes the one its actual's annotation records, with
+        that annotation's cell as the source.
+        """
+
+        formal = (specialized.G.nodes[formal_id].get("attributes") or {})
+        if (
+            formal.get("sequence_element_class_ref")
+            or formal.get("sequence_element_annotation_cell") is not None
+        ):
+            return None
+        actual = (caller.G.nodes.get(int(actual_id)) or {}).get(
+            "attributes"
+        ) or {}
+        annotation_cell = actual.get("sequence_element_annotation_cell")
+        element_class = str(actual.get("sequence_element_class_ref") or "")
+        if (
+            actual.get("binding_kind") != "parameter"
+            or element_class not in {
+                "builtins.int", "builtins.float", "builtins.bool",
+            }
+            or annotation_cell is None
+        ):
+            return None
+        return element_class, (annotation_cell,)
+
     receiver, positional, _all = _method_parameter_layout(specialized.G)
     formal_ids = {
         str(name): tuple(map(int, history or ()))
@@ -29633,6 +30038,10 @@ def _post_callsite_loop_element_classes(
         if len(formal_candidates) != 1:
             continue
         formal_id = int(formal_candidates[0])
+        if abi_element_class is None:
+            abi_element_class = declared_actual_element_class(
+                int(actual_id), formal_id,
+            )
         leaves = _authored_aggregate_leaves(caller, int(actual_id))
         if leaves and not _aggregate_binds_by_member(
             caller.G, int(actual_id), specialized.G, parameter, int(call_id),
@@ -29742,6 +30151,26 @@ def _post_callsite_loop_element_classes(
             # shell key and its exact member/ProgramABI cells are the source
             # of this derived formal view.
             formal_attributes["sequence_element_class_ref"] = exact_class
+            # An unannotated formal is an aggregate only through its
+            # actual (c690): when the actual is itself an aggregate
+            # parameter, the formal is bound to that storage and has its
+            # aggregate record, so a read of it is a load from that
+            # storage and not a scalar read.
+            actual_record = caller.G.nodes[int(actual_id)].get(
+                "attributes"
+            ) or {}
+            if (
+                formal_attributes.get("aggregate_kind") is None
+                and actual_record.get("producer_kind")
+                == "aggregate_parameter"
+                and actual_record.get("aggregate_kind") in {"list", "tuple"}
+            ):
+                for record_key in (
+                    "producer_kind", "aggregate_kind",
+                    "sequence_key_columns", "sequence_column_count",
+                    "sequence_writable",
+                ):
+                    formal_attributes[record_key] = actual_record[record_key]
             formal_attributes[
                 "callsite_sequence_element_class_fact"
             ] = class_fact
@@ -30557,8 +30986,13 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 # "call".  AST nodes keep the AST rule because an AST graph
                 # also holds op "call" nodes that are not activations
                 # (short-circuited boolop operands).
+                # A class operator (``x / y`` on a record class) is an
+                # activation of its dunder: the reducer records that dispatch
+                # on the BinOp/UnaryOp node itself.
                 expression = data.get("expr_obj")
-                if expression is None:
+                if attributes.get("class_operator_dispatch"):
+                    pass
+                elif expression is None:
                     if str(
                         data.get("op") or data.get("type") or ""
                     ).casefold() != "call":
@@ -31122,13 +31556,19 @@ class ProcessGraphGLSLDeployment(TiledObject):
             capture=True,
         )
 
-    def refresh_hierarchy_plan(self):
+    def refresh_hierarchy_plan(self, terminal: bool = True):
         # Freeze hierarchy only after all callsite shells are attached.
+        # ``terminal`` is False for the structural precompile that runs
+        # BEFORE linked-ABI settlement: it freezes structure and leaves
+        # unsettled region dtypes as outstanding obligations; the
+        # post-settlement refresh is terminal and refuses what is left.
 
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
-        ) = assign_hierarchy_ids(_build_shell_hierarchy_plan(self), shell=self)
+        ) = assign_hierarchy_ids(
+            _build_shell_hierarchy_plan(self, terminal=terminal), shell=self,
+        )
         return self.hierarchy_plan
 
     def prepare_graph_precompile(
@@ -31154,7 +31594,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
         _note(
             "aot: refreshing root hierarchy before structural precompile"
         )
-        self.refresh_hierarchy_plan()
+        self.refresh_hierarchy_plan(terminal=not structural_ssa_only)
         _note(
             "aot: refreshed root hierarchy before structural precompile "
             f"in {time.perf_counter() - hierarchy_started:.3f}s"
@@ -31202,7 +31642,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
             # Match hierarchy freezing, which folds only function graphs.
             if target.process_graph.G.graph.get("function_name"):
                 _fold_callsite_structural_values(target.process_graph)
-            target.refresh_hierarchy_plan()
+            target.refresh_hierarchy_plan(terminal=not structural_ssa_only)
             _note(
                 f"aot: shell {shell_index}/{len(planned_shells)} "
                 f"{shell_name} hierarchy ready in "

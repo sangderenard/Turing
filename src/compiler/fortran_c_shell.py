@@ -115,6 +115,7 @@ from .native_shell_abi import (
 from .authored_parameter_abi import (
     _authored_sequence_annotation_contract as _authored_sequence_annotation_contract,
     _authored_parameter_sequence_contracts as _authored_parameter_sequence_contracts,
+    _linked_list_parameter_contracts as _linked_list_parameter_contracts,
     _authored_tensor_parameter_value_abi as _authored_tensor_parameter_value_abi,
     _authored_text_parameter_transforms as _authored_text_parameter_transforms,
     _current_authored_parameter_annotations as _current_authored_parameter_annotations,
@@ -159,6 +160,9 @@ from .resident_sequence_materialization import (
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
+    list_row_displays as list_row_displays,
+    list_row_reads as list_row_reads,
+    list_row_pool_extents as list_row_pool_extents,
     _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
     _list_rebound_on_one_branch as _list_rebound_on_one_branch,
     _loop_carried_initial_ids as _loop_carried_initial_ids,
@@ -7974,6 +7978,99 @@ def _authored_dataclass_record_views(
                 elif dict(previous) != dict(receipt):
                     # Conflicting physical declarations are not a proven ABI.
                     fields.pop(target.attr, None)
+        # ``self._c = []`` states a list and nothing about its rows; the
+        # rows' class is what every method appends.  Join the appended
+        # values each method proves (an annotated parameter of that method,
+        # or a literal); any unproven or disagreeing writer proves nothing
+        # and the field stays undeclared, as before.
+        if initializer is not None:
+            scalar_classes = {"int": "int64", "float": "float64", "bool": "bool"}
+
+            def literal_class(value: Any) -> str | None:
+                if isinstance(value, bool):
+                    return "bool"
+                if isinstance(value, int):
+                    return "int64"
+                if isinstance(value, float):
+                    return "float64"
+                return None
+
+            empty_list_fields = {
+                node.targets[0].attr
+                for node in ast.walk(initializer)
+                if isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Attribute)
+                and isinstance(node.targets[0].value, ast.Name)
+                and node.targets[0].value.id == "self"
+                and (
+                    (isinstance(node.value, ast.List) and not node.value.elts)
+                    or (
+                        isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name)
+                        and node.value.func.id == "list"
+                        and not node.value.args and not node.value.keywords
+                    )
+                )
+                and node.targets[0].attr not in fields
+            }
+            appended: dict[str, list[str | None]] = {}
+            for method in methods.values():
+                parameter_classes = {
+                    argument.arg: scalar_classes.get(
+                        argument.annotation.id
+                        if isinstance(argument.annotation, ast.Name) else ""
+                    )
+                    for argument in (
+                        *method.args.posonlyargs, *method.args.args,
+                        *method.args.kwonlyargs,
+                    )
+                    if argument.annotation is not None
+                }
+                rebound = {
+                    name.id
+                    for node in ast.walk(method)
+                    for target in (
+                        node.targets if isinstance(node, ast.Assign)
+                        else (node.target,) if isinstance(node, (
+                            ast.AugAssign, ast.AnnAssign, ast.For,
+                            ast.AsyncFor, ast.NamedExpr,
+                        )) else ()
+                    )
+                    for name in ast.walk(target)
+                    if isinstance(name, ast.Name)
+                }
+                for node in ast.walk(method):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in {"append", "insert"}
+                        and isinstance(node.func.value, ast.Attribute)
+                        and isinstance(node.func.value.value, ast.Name)
+                        and node.func.value.value.id == "self"
+                        and node.func.value.attr in empty_list_fields
+                        and node.args
+                    ):
+                        continue
+                    value = node.args[-1]
+                    appended.setdefault(node.func.value.attr, []).append(
+                        literal_class(value.value)
+                        if isinstance(value, ast.Constant)
+                        else parameter_classes.get(value.id)
+                        if isinstance(value, ast.Name)
+                        and value.id not in rebound
+                        else None
+                    )
+            for field_name, classes_seen in appended.items():
+                known = set(classes_seen)
+                if None in known:
+                    continue
+                if known <= {"int64", "bool"} and len(known) > 1:
+                    known = {"int64"}
+                if len(known) == 1:
+                    fields[field_name] = {
+                        "storage": "span", "dtype": next(iter(known)),
+                        "rank": 1, "mutable": True, "aggregate_kind": "list",
+                    }
         class_fields[class_name] = fields
         class_methods[class_name] = methods
 
@@ -10803,6 +10900,7 @@ def _field_slot_ops(
         for sequence_id, _policy, _columns, _writable
         in sequence_declarations
     }
+    linked_list_parameters = _linked_list_parameter_contracts(graph_obj)
     for parameter_name, contract in _authored_parameter_sequence_contracts(graph_obj).items():
         history = tuple(map(int, identity.get(str(parameter_name), ())))
         if not history:
@@ -10818,7 +10916,8 @@ def _field_slot_ops(
             sequence_id, policy, int(column_count), bool(writable),
         ))
         declared_sequence_ids.add(sequence_id)
-        retained_sequence_ids.add(sequence_id)
+        if str(parameter_name) not in linked_list_parameters:
+            retained_sequence_ids.add(sequence_id)
 
     # Source-derived ``Sequence[Record]`` metadata survives graph extraction
     # independently of any one Input wrapper. Declare its caller-owned
@@ -20932,6 +21031,21 @@ def _prune_dead_local_sequences(
     return removed
 
 
+_CHILD_POOL_MEMBER_ROLES = (
+    "length_value_id", "capacity_value_id", "row_stride_value_id",
+    "shape_value_id", "rank_value_id", "shape_stride_value_id",
+    "status_value_id", "live_flags_value_id",
+)
+
+
+def _child_pool_identity_fields(pool) -> dict[str, Any]:
+    """A child-table pool's member cells, by role."""
+    return {
+        "column_value_ids": tuple(pool.column_value_ids),
+        **{role: getattr(pool, role) for role in _CHILD_POOL_MEMBER_ROLES},
+    }
+
+
 def _retire_concordant_sequence_aliases(
     all_functions: Mapping[str, Any],
     all_sequence_tables: Mapping[str, Any],
@@ -20988,6 +21102,27 @@ def _retire_concordant_sequence_aliases(
         def resident(value_id: int) -> int:
             return int(aliases.get(int(value_id), int(value_id)))
 
+        def pool_members(pool) -> tuple[int, ...]:
+            if pool is None:
+                return ()
+            return (
+                *map(int, pool.column_value_ids),
+                *(int(getattr(pool, role)) for role in _CHILD_POOL_MEMBER_ROLES
+                  if getattr(pool, role) is not None),
+            )
+
+        def bind_pool_members(bindings, stale, incumbent) -> None:
+            # A setdefault receiver re-read in one method carries a second
+            # view of the same child-table pool.  Its pool cells are the
+            # resident pool's, role by role, exactly as the outer columns.
+            if stale.child_table_pool is None or incumbent.child_table_pool is None:
+                return
+            for alias, target in zip(
+                pool_members(stale.child_table_pool),
+                pool_members(incumbent.child_table_pool),
+            ):
+                bindings.setdefault(int(alias), int(target))
+
         for sequence_id, descriptor in tuple(sequence_table.sequences.items()):
             sequence_id = int(sequence_id)
             resident_id = resident(sequence_id)
@@ -21011,6 +21146,26 @@ def _retire_concordant_sequence_aliases(
                 capacity_value_id=int(incumbent.capacity_value_id),
                 status_address_id=incumbent.status_address_id,
                 live_flags_value_id=incumbent.live_flags_value_id,
+                # The pool's member cells are the same frame bookkeeping:
+                # equal contracts with every role present on both sides
+                # are one pool.
+                child_table_pool=(
+                    incumbent.child_table_pool
+                    if descriptor.child_table_pool is not None
+                    and incumbent.child_table_pool is not None
+                    and len(descriptor.child_table_pool.column_value_ids)
+                    == len(incumbent.child_table_pool.column_value_ids)
+                    and all(
+                        (getattr(descriptor.child_table_pool, role) is None)
+                        == (getattr(incumbent.child_table_pool, role) is None)
+                        for role in _CHILD_POOL_MEMBER_ROLES
+                    )
+                    and replace(
+                        descriptor.child_table_pool,
+                        **_child_pool_identity_fields(incumbent.child_table_pool),
+                    ) == incumbent.child_table_pool
+                    else descriptor.child_table_pool
+                ),
             )
             if resolved != incumbent or sequence_id in physical_ids:
                 continue
@@ -21022,6 +21177,7 @@ def _retire_concordant_sequence_aliases(
                   if descriptor.status_address_id is not None else ()),
                 *((int(descriptor.live_flags_value_id),)
                   if descriptor.live_flags_value_id is not None else ()),
+                *pool_members(descriptor.child_table_pool),
             }
             # Prove the stale cells are only removable bookkeeping before
             # mutating the real function.  A call/return use means this is
@@ -21036,6 +21192,7 @@ def _retire_concordant_sequence_aliases(
             # removable initialization stores above must not reset the owner.
             member_bindings: dict[int, int] = {}
             _bind_sequence_storage_members(member_bindings, descriptor, incumbent)
+            bind_pool_members(member_bindings, descriptor, incumbent)
             rebind_member_reads(trial, member_bindings)
             if any(
                 int(argument.id) in stale_private
@@ -21092,6 +21249,11 @@ def _retire_concordant_sequence_aliases(
         for stale_id, resident_id in sorted(replacements.items()):
             member_bindings: dict[int, int] = {}
             _bind_sequence_storage_members(
+                member_bindings,
+                sequence_table.by_id(int(stale_id)),
+                sequence_table.by_id(int(resident_id)),
+            )
+            bind_pool_members(
                 member_bindings,
                 sequence_table.by_id(int(stale_id)),
                 sequence_table.by_id(int(resident_id)),
@@ -21738,6 +21900,32 @@ def _settle_linked_dynamic_sequences(
             left, right = find(views[0]), find(view)
             if left != right:
                 parent[left] = right
+    # Program: ``t = a if n > 2 else [3, 4, 5]`` (if/else form) then
+    # ``t.append(9)``, ``len(a)`` (c736).  Wrong record: the merge was a copy
+    # of the taken arm, so the growth through ``t`` never reached ``a``.
+    # Rule: a list merged from arms is a handle onto the taken arm's own
+    # storage (``_lower_sequence_handle_merge``), so merge and arms are ONE
+    # component here, as an argument and its formal are: a component that
+    # grows anywhere is DYNAMIC in every view (rule 4).
+    from .resident_sequence_materialization import (
+        _list_merged_from_unequal_displays,
+    )
+
+    for graph_obj in graphs:
+        for node_id, data in graph_obj.nodes(data=True):
+            if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+                continue
+            merged_key = (id(graph_obj), int(data.get("value_id", node_id)))
+            for arm, role in data.get("parents") or ():
+                if str(role) not in {"body", "orelse"} or arm not in graph_obj:
+                    continue
+                arm_key = (
+                    id(graph_obj),
+                    int(graph_obj.nodes[arm].get("value_id", arm)),
+                )
+                left, right = find(arm_key), find(merged_key)
+                if left != right:
+                    parent[left] = right
     linked = set(parent)
     seeds: set[tuple[int, int]] = set()
     for graph_obj in graphs:
@@ -21843,11 +22031,59 @@ def _settle_linked_dynamic_sequences(
     dynamic_roots = {find(seed) for seed in seeds if seed in linked}
     from .resident_sequence_materialization import _call_escaped_argument_edges
 
+    # Program: ``def __init__(self): self._c = []`` with ``self._c.append(t)``
+    # in a method.  Wrong record: the birth's element type is the join of its
+    # writers (``_planned_scalar_dtypes``), and the writers are in another
+    # function, so the empty display stayed unknown, never became a heap
+    # sequence, and its DYNAMIC views disagreed.  Rule: the views of one
+    # storage hold one element type; the join of what each function proves
+    # for its own view is the component's, published per graph as
+    # ``linked_sequence_element_dtypes``.
+    from types import SimpleNamespace as _GraphView
+    from .glsl_deployment_strategy import _planned_scalar_dtypes
+
+    planned_by_graph = {}
+    for graph_obj in graphs:
+        planned = dict(_planned_scalar_dtypes(_GraphView(G=graph_obj)))
+        # The retained mutation records may not exist yet; a view's appended
+        # values are its writers here as there.
+        appended: dict[int, set] = {}
+        for mutation in _sequence_append_call_mutations(graph_obj):
+            if mutation.operator in {"append", "add", "insert"} and (
+                mutation.argument_value_ids
+            ):
+                appended.setdefault(int(mutation.sequence_value_id), set()).add(
+                    planned.get(int(mutation.argument_value_ids[-1]))
+                )
+        for sequence_id, dtypes in appended.items():
+            if sequence_id not in planned and len(dtypes) == 1 and None not in dtypes:
+                planned[sequence_id] = next(iter(dtypes))
+        planned_by_graph[id(graph_obj)] = planned
+    component_elements: dict[tuple[int, int], set] = {}
+    for graph_id, value_id in linked:
+        if find((graph_id, value_id)) not in dynamic_roots:
+            continue
+        component_elements.setdefault(find((graph_id, value_id)), set()).add(
+            planned_by_graph.get(graph_id, {}).get(int(value_id))
+        )
+    component_element = {}
+    for root, dtypes in component_elements.items():
+        known = {dtype for dtype in dtypes if dtype in {"int64", "float64", "bool"}}
+        if known <= {"int64", "bool"} and len(known) > 1:
+            known = {"int64"}
+        if len(known) == 1:
+            component_element[root] = next(iter(known))
     for graph_obj in graphs:
         graph_obj.graph["linked_dynamic_sequence_ids"] = tuple(sorted(
             value_id for graph_id, value_id in linked
             if graph_id == id(graph_obj) and find((graph_id, value_id)) in dynamic_roots
         ))
+        graph_obj.graph["linked_sequence_element_dtypes"] = {
+            int(value_id): component_element[find((graph_id, value_id))]
+            for graph_id, value_id in linked
+            if graph_id == id(graph_obj)
+            and find((graph_id, value_id)) in component_element
+        }
         # Program: ``xs = [n, 4]; setfirst(xs, 9); len(xs)`` (scratch c_g2).
         # Wrong record: an escaped local list had no row bound, so its arena
         # became entry-ABI storage the wrapper sized at one row; the second
@@ -24193,9 +24429,21 @@ def _class_surface_ssa_program(
             if callee_graph is None:
                 continue
             for caller_id, callee_id in planned_call.argument_bindings:
-                linked_value_edges.append((
-                    caller_graph, int(caller_id), callee_graph, int(callee_id),
-                ))
+                # Program: ``intern_batch(1, [65], [1, 1])`` (Token Orchard
+                # acceptance).  Wrong record: the callsite fold folds
+                # ``validate_batch_envelope``'s body to a constant and drops
+                # the unread formal ``values``; the plan keeps the authored
+                # actual-to-formal binding from the declaration graph as
+                # provenance.  Settling a value ABI over that edge posted
+                # VALUE_TYPE_ABI for a value absent from the specialized copy,
+                # derived from no class of that copy's scope.  Rule: a value
+                # ABI crosses only to a formal the callee graph holds; the
+                # binding stays an exact site and a call-edge row.
+                if int(callee_id) in callee_graph:
+                    linked_value_edges.append((
+                        caller_graph, int(caller_id), callee_graph,
+                        int(callee_id),
+                    ))
                 linked_argument_sites.add((
                     id(caller_graph), int(planned_call.callsite_id),
                     int(caller_id),
@@ -27302,6 +27550,24 @@ def _class_surface_ssa_program(
                 declaration for declaration in sequence_declarations
                 if int(declaration[0]) not in promoted_loop_ports
             )
+        # Program: ``g = [[1, 2], [3, n]]; g[i][1]`` (corpus c732).  Wrong
+        # record: each row display kept a declaration of its own, so the
+        # outer list's rows were separate arenas that nothing indexed.  Rule:
+        # a list whose members are all list displays is a nested table (its
+        # column holds row handles, ``nested_sequence_ids``); each row is a
+        # slice of its child-table pool and names no storage of its own.
+        local_list_rows = list_row_displays(graph_obj)
+        local_row_ids = {
+            row for rows in local_list_rows.values() for row, _node in rows
+        }
+        if local_list_rows:
+            sequence_declarations = tuple(
+                declaration for declaration in sequence_declarations
+                if int(declaration[0]) not in local_row_ids
+            )
+            nested_sequence_ids = tuple(sorted({
+                *map(int, nested_sequence_ids), *local_list_rows,
+            }))
         if conditional_sequence_destinations:
             sequence_declarations = tuple(
                 (
@@ -28266,6 +28532,9 @@ def _class_surface_ssa_program(
                 nested_descriptor_sequence_dtypes[destination_id] = (
                     "int64",
                 )
+
+        for outer_id in local_list_rows:
+            nested_descriptor_sequence_dtypes[int(outer_id)] = ("int64",)
 
         self_record_fields = dict(
             (declared_parameter_records.get("self") or {}).get("fields") or {}
@@ -29592,7 +29861,10 @@ def _class_surface_ssa_program(
                         if int(column_count) == 1
                         and int(sequence_id) in dynamic_sequence_ids
                         for planned in (
-                            planned_sequence_elements.get(int(sequence_id)),
+                            planned_sequence_elements.get(int(sequence_id))
+                            or dict(graph_obj.graph.get(
+                                "linked_sequence_element_dtypes"
+                            ) or {}).get(int(sequence_id)),
                         )
                         if planned in {"int64", "float64", "bool"}
                     },
@@ -29606,11 +29878,25 @@ def _class_surface_ssa_program(
                         graph_obj, sequence_declarations
                     )
                 ),
-                sequence_child_table_layouts=(
-                    _sequence_child_table_layout_contracts(
+                sequence_child_table_layouts={
+                    **_sequence_child_table_layout_contracts(
                         graph_obj, sequence_declarations
-                    )
-                ),
+                    ),
+                    # The handle is column 0 of a list's one column; a row
+                    # holds the class its member rows share.
+                    **{
+                        int(outer_id): (
+                            0,
+                            (str(
+                                planned_sequence_elements.get(
+                                    int(rows[0][0])
+                                ) or "unknown"
+                            ),),
+                            (), True,
+                        )
+                        for outer_id, rows in local_list_rows.items()
+                    },
+                },
                 sequence_row_record_slots=_sequence_row_record_slots(
                     graph_obj, sequence_declarations
                 ),
@@ -29653,7 +29939,13 @@ def _class_surface_ssa_program(
                     _sequence_inplace_bit_pack_call_ops(graph)
                 ),
                 sequence_row_operations=_sequence_row_operations(
-                    graph_obj, sequence_declarations,
+                    graph_obj,
+                    (*sequence_declarations, *(
+                        (int(row), "duplicates", 1, True)
+                        for row in sorted({
+                            *local_row_ids, *list_row_reads(graph_obj),
+                        })
+                    )),
                     {
                         int(value_id): int(resident_id)
                         for value_id, (resident_id, _kind)
@@ -30313,6 +30605,14 @@ def _class_surface_ssa_program(
             module_ir.functions[symbol].metadata["static_mapping_capacity_bounds"] = (
                 dict(sequence_capacity_bounds)
             )
+            if local_list_rows:
+                module_ir.functions[symbol].metadata[
+                    "child_pool_static_extents"
+                ] = tuple(
+                    (int(outer), int(rows), int(stride))
+                    for outer, (rows, stride)
+                    in sorted(list_row_pool_extents(graph_obj).items())
+                )
             module_ir.functions[symbol].metadata[
                 "sequence_capacity_sources"
             ] = tuple(dict.fromkeys((
@@ -30375,7 +30675,13 @@ def _class_surface_ssa_program(
                     if str(role).startswith("arg:") and parent in graph_obj
                 )
             for operation in _sequence_row_operations(
-                graph_obj, sequence_declarations
+                graph_obj,
+                (*sequence_declarations, *(
+                    (int(row), "duplicates", 1, True)
+                    for row in sorted({
+                        *local_row_ids, *list_row_reads(graph_obj),
+                    })
+                )),
             ):
                 lowered_source_value_ids.add(int(operation[1]))
                 lowered_source_value_ids.add(int(operation[-1]))
@@ -43820,6 +44126,13 @@ def _class_surface_ssa_program(
                             *((canonical.heap_owner_value_id,)
                               if canonical.heap_owner_value_id is not None else ()),
                         )
+                        # A frame member the constructor's own body never
+                        # touched (the heap owner of a field born empty and
+                        # grown only by methods) is still caller-owned
+                        # storage of this field: allocate it like the rest.
+                        for value_id in canonical_ids:
+                            if int(value_id) not in remap:
+                                remap[int(value_id)] = remap_mint(int(value_id))
                         resident_ids = tuple(remap[int(value_id)]
                                              for value_id in canonical_ids)
                         for local in constructor_sequences.sequences.values():
@@ -49858,6 +50171,40 @@ def _class_surface_ssa_program(
                             if receipt not in receipts:
                                 receipts.append(receipt)
 
+                # ``def relay(): return pair(...)`` linked into ``return
+                # relay(...)``: relay's one authored output is its own
+                # forwarded call, whose members are already relay's Ret.  The
+                # caller forwards that same aggregate, so it binds no single
+                # value; it takes every member, as a direct forward does.
+                if (
+                    len(record.result_bindings) == 1
+                    and int(record.result_bindings[0][1])
+                    == int(record.callsite_id)
+                    and int(record.callsite_id) in set(map(
+                        int,
+                        caller.metadata.get("source_output_value_ids", ()),
+                    ))
+                    and len(callee_outputs) > 1
+                    and int(record.result_bindings[0][0]) not in {
+                        int(output.id) for output in callee_outputs
+                    }
+                    and any(
+                        instruction.op in {"Call", "call"}
+                        and (instruction.attributes or {}).get(
+                            "result_convention"
+                        ) == "ssa.aggregate"
+                        and int((instruction.attributes or {}).get(
+                            "plan_callsite_id", -1
+                        )) == int(record.result_bindings[0][0])
+                        and tuple(map(int, (instruction.attributes or {}).get(
+                            "output_ids", ()
+                        ))) == tuple(int(output.id) for output in callee_outputs)
+                        for callee_block in callee.blocks.values()
+                        for instruction in callee_block.instrs
+                    )
+                ):
+                    record = replace(record, result_bindings=())
+
                 def physical_caller_storage(value_id: int) -> int:
                     current = int(value_id)
                     seen: set[int] = set()
@@ -50280,6 +50627,29 @@ def _class_surface_ssa_program(
                         caller.metadata.get("source_output_value_ids", ()),
                     ))
                 )
+                if forwarded_aggregate and not physical_result_bindings:
+                    # ``return callee(...)`` publishes the callee's whole
+                    # aggregate as the caller's outputs.  Bind every member
+                    # positionally, exactly as an unpacking caller would, so
+                    # the ordinary aggregate unpack projects each one and Ret
+                    # returns the members rather than the abstract tuple.
+                    from .concordance_declarations import REGION_CALL_RESULT
+
+                    physical_result_bindings = tuple(
+                        (
+                            int(output.id),
+                            int(mint_compiler_value_id(
+                                caller, REGION_CALL_RESULT, (
+                                    _frame_value_cell(callee, int(output.id)),
+                                ),
+                            )),
+                        )
+                        for output in callee_outputs
+                    )
+                    physical_result_positions = tuple(range(len(callee_outputs)))
+                    physical_result_slots = tuple(range(len(callee_outputs)))
+                    selected_callee_outputs = tuple(callee_outputs)
+                    has_exact_partial_aggregate = True
                 bound_aggregate_outputs = ()
                 if (
                     len(record.result_bindings) == 1
@@ -52212,6 +52582,13 @@ def _class_surface_ssa_program(
                         or forwarded_aggregate
                     ) and caller_result_id is not None and result is not None:
                         produced_results[int(caller_result_id)] = result
+                        if forwarded_aggregate:
+                            # A forwarded aggregate answers its call site's
+                            # authored output even when its result took a
+                            # fresh id.
+                            produced_results.setdefault(
+                                int(record.callsite_id), result,
+                            )
                     authored_results = {
                         value_id: produced_results[value_id]
                         for value_id in source_output_ids
@@ -52261,6 +52638,21 @@ def _class_surface_ssa_program(
                                         for _role, slot in role_slots
                                     )
                                 }
+                                if (
+                                    forwarded_aggregate and aggregate_unpack
+                                    and caller_result_id is not None
+                                ):
+                                    # The forwarded aggregate's members, in
+                                    # the callee's Ret order, stand in its
+                                    # one authored output slot: the call
+                                    # site, whatever id its result took.
+                                    members = tuple(
+                                        values[int(caller_id)]
+                                        for _callee_id, caller_id
+                                        in physical_result_bindings
+                                    )
+                                    union_outputs[int(caller_result_id)] = members
+                                    union_outputs[int(record.callsite_id)] = members
                                 selected_outputs = []
                                 for value_id in source_output_ids:
                                     union_frame = union_outputs.get(
