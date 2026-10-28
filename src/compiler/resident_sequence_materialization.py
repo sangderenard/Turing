@@ -3400,6 +3400,24 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                         else row.get("expr_obj") is element
                     )
                 )
+            # Program: ``a = [n, 7, n, 7]; a[1] = n + 1`` (corpus c725).
+            # Wrong record: one value used for two members has one producer
+            # node and two ``elts`` edges, so both edges matched the second
+            # occurrence's ordinal and the list was refused as lacking one
+            # exact producer.  Rule: the k-th member that names a value is
+            # that value's k-th edge, in source order; a value with fewer
+            # edges than members is still refused.
+            if (
+                member_id is not None and element is not None
+                and len(exact) > 1
+                and not isinstance(element, ast.Starred)
+            ):
+                earlier = sum(
+                    1 for position in range(ordinal)
+                    if int(layout_members[position]) == int(member_id)
+                )
+                if earlier < len(exact):
+                    exact = (exact[earlier],)
             if len(exact) != 1 or isinstance(element, ast.Starred):
                 raise ValueError(
                     f"{'Set' if is_set else 'List'} {sequence_id} lacks one "

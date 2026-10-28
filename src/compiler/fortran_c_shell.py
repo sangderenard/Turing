@@ -89,6 +89,7 @@ from .ast_control_normalization import (
     _normalize_loop_else as _normalize_loop_else,
     _normalize_chained_comparisons as _normalize_chained_comparisons,
     _normalize_constant_membership as _normalize_constant_membership,
+    _normalize_sequence_replication_display as _normalize_sequence_replication_display,
     _normalize_builtin_divmod as _normalize_builtin_divmod,
     _normalize_mapping_get as _normalize_mapping_get,
     _normalize_set_constructor as _normalize_set_constructor,
@@ -61402,6 +61403,9 @@ def _lower_ast_source_to_ssa_impl(
     # Membership in an inline numeric literal becomes a disjunction before
     # the short-circuit normalization nests it.
     chained_comparison_receipts.extend(_normalize_constant_membership(tree))
+    chained_comparison_receipts.extend(
+        _normalize_sequence_replication_display(tree)
+    )
     chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
     chained_comparison_receipts.extend(_normalize_mapping_get(tree))
     chained_comparison_receipts.extend(_normalize_set_constructor(tree))
@@ -61830,6 +61834,9 @@ def _lower_ast_source_to_ssa_impl(
         )
         chained_comparison_receipts.extend(
             _normalize_constant_membership(discovered_tree)
+        )
+        chained_comparison_receipts.extend(
+            _normalize_sequence_replication_display(discovered_tree)
         )
         chained_comparison_receipts.extend(
             _normalize_builtin_divmod(discovered_tree)
