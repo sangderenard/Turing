@@ -20063,7 +20063,9 @@ def _publish_conditional_call_aggregate_merges(
     def arm_layout(value_id: int):
         """The arm's layout row; a call arm's is posted from its ledger."""
         layout, cell = layout_of(value_id)
-        if layout is not None:
+        if layout is not None and all(
+            int(member.value_id) in graph.G for member in layout.members
+        ):
             return layout, cell
         data = graph.G.nodes[int(value_id)]
         attributes = data.get("attributes") or {}
@@ -20115,9 +20117,9 @@ def _publish_conditional_call_aggregate_merges(
             and len(body.members) == len(orelse.members)
         ):
             return None
+        # The same merge may already be on the book, posted from the work
+        # copy of this graph; this graph still needs its member Phis.
         incumbent, incumbent_cell = layout_of(merged_id)
-        if incumbent is not None:
-            return incumbent_cell
         members = []
         for index, (left, right) in enumerate(zip(body.members, orelse.members)):
             member_sources = tuple(dict.fromkeys(filter(None, (
@@ -20168,6 +20170,11 @@ def _publish_conditional_call_aggregate_merges(
             ),
         })
         graph.G.nodes[int(merged_id)].pop("tensor", None)
+        if incumbent is not None:
+            graph.G.nodes[int(merged_id)].setdefault("attributes", {})[
+                "source_aggregate_layout_row"
+            ] = (scope, int(merged_id))
+            return incumbent_cell
         return post_layout(
             int(merged_id), body.aggregate_kind, members,
             conditional_cell, (body_cell, else_cell),
@@ -20708,6 +20715,12 @@ def _propagate_callsite_tensor_specializations(
             isolated_callers.get(id(caller.G), caller)
             for caller in graphs
         ]
+    #: (source graph, call node) -> the return members published on the
+    #: isolated copy, replayed on the source graph once the rounds settle.
+    isolated_return_members: dict[tuple[int, int], tuple] = {}
+    isolated_origin = {
+        id(clean.G): key for key, clean in isolated_callers.items()
+    }
     #: (caller graph, call node) -> per-slot callee return value cells of
     #: the latest ``call_result_descriptor`` answer for that call.
     return_cells_by_call: dict[tuple[int, int], tuple] = {}
@@ -21304,6 +21317,10 @@ def _propagate_callsite_tensor_specializations(
             conditional_changed |= _publish_conditional_call_aggregate_merges(
                 caller, function_table,
             )
+            if conditional_changed:
+                # A merge published just now gives its unpack projections a
+                # member ledger the earlier fold could not read.
+                _fold_callsite_structural_values(caller)
             changed |= conditional_changed
             mutation_counts["conditional_members"] += int(conditional_changed)
             for _node_id, data in tuple(caller.G.nodes(data=True)):
@@ -21516,6 +21533,15 @@ def _propagate_callsite_tensor_specializations(
                                 (id(caller.G), int(_node_id)), (),
                             ),
                         )
+                        if id(caller.G) in isolated_origin:
+                            isolated_return_members[(
+                                isolated_origin[id(caller.G)], int(_node_id),
+                            )] = (
+                                result_descriptors, next(iter(return_kinds)),
+                                return_cells_by_call.get(
+                                    (id(caller.G), int(_node_id)), (),
+                                ),
+                            )
                         changed |= return_members_changed
                         mutation_counts["return_members"] += int(
                             return_members_changed
@@ -21966,6 +21992,16 @@ def _propagate_callsite_tensor_specializations(
                 else _callee_optional_aggregate_members(callee)
             )
             if arms_members is None:
+                replay = isolated_return_members.get(
+                    (id(source.G), int(_node_id))
+                )
+                if replay is not None and not attributes.get(
+                    "aggregate_leaf_value_ids"
+                ):
+                    _publish_callsite_return_members(
+                        source, int(_node_id), *replay[:2],
+                        return_cells=replay[2],
+                    )
                 continue
             _publish_callsite_return_members(
                 source, int(_node_id),
@@ -21980,7 +22016,8 @@ def _propagate_callsite_tensor_specializations(
                 ),
             )
         _publish_conditional_tuple_members(source, function_table)
-        _publish_conditional_call_aggregate_merges(source, function_table)
+        if _publish_conditional_call_aggregate_merges(source, function_table):
+            _fold_callsite_structural_values(source)
 
 
 def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
