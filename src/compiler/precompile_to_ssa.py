@@ -9451,6 +9451,121 @@ class _ControlSSABuilder(TiledObject):
             self._function_exit = self.new_block("function_exit")
         return self._function_exit
 
+    def _cast_on_edge(
+        self, block: BasicBlock, value: SSAValue, dtype: str,
+    ) -> SSAValue:
+        """``value`` converted to ``dtype`` at the end of ``block``.
+
+        The conversion is emitted before ``block``'s terminator, so it is
+        the merge's incoming value on that edge.  A value already of
+        ``dtype``, or one with no class (an absent arm), is returned as is.
+        """
+
+        if (
+            value.dtype in {None, "unknown", "none"}
+            or str(value.dtype) == str(dtype)
+        ):
+            return value
+        widened = self.fresh_value(
+            dtype=str(dtype), transform=CONTROL_CAST, operands=(value,),
+        )
+        self.current = block
+        terminator = block.instrs.pop()
+        self.emit(
+            Handler.Cast, [value], widened,
+            attributes={"target_dtype": str(dtype)},
+        )
+        block.instrs.append(terminator)
+        return widened
+
+    _NUMERIC_CLASS = {
+        "bool": "bool", "int": "int", "int32": "int", "int64": "int",
+        "float": "float", "float16": "float", "float32": "float",
+        "float64": "float", "double": "float",
+    }
+
+    def _numeric_join(self, values: Iterable[SSAValue]) -> str | None:
+        """The class a scalar numeric join of ``values`` has, or ``None``.
+
+        The planner's branch-join rule (``_value_shape_dtype``, ``phi``):
+        the widest float when any arm is float, int64 when the arms are
+        ints and bools.  Absent arms (``None``) state nothing.  Shaped or
+        non-numeric arms, or arms that already agree, answer ``None``.
+        """
+
+        present = tuple(
+            value for value in values
+            if value.dtype not in {None, "unknown", "none"}
+        )
+        dtypes = {str(value.dtype) for value in present}
+        if (
+            len(dtypes) < 2
+            or any(tuple(value.shape or ()) for value in present)
+            or not dtypes <= set(self._NUMERIC_CLASS)
+        ):
+            return None
+        floats = tuple(
+            {"float": "float64", "double": "float64"}.get(dtype, dtype)
+            for dtype in dtypes if self._NUMERIC_CLASS[dtype] == "float"
+        )
+        if floats:
+            from ..common.tensors.topological_reducer import _widest_element
+
+            return _widest_element(*floats) or "float64"
+        return "int64"
+
+    def _numeric_join_arms(
+        self,
+        dtype: str | None,
+        arms: tuple[tuple[BasicBlock, SSAValue], ...],
+    ) -> tuple[SSAValue, ...]:
+        """A scalar numeric join's arms, each in the join's class ``dtype``.
+
+        Program: ``if c == 2: s = n else: s = n * 0.5; return s + 0.25``
+        (corpus c770).  The join's class is the planner's (the widest float
+        when an arm is float), and an int arm entered the Phi as an int:
+        C converted it implicitly, LLVM refused the Phi.  Rule: an arm of
+        a narrower numeric class converts on its own edge; an arm of a
+        wider class than the join is refused, never narrowed.  Anything
+        but scalar int/bool/float arms is left as it is.
+        """
+
+        numeric_class = self._NUMERIC_CLASS
+        absent = {"None", "unknown", "none"}
+        values = tuple(value for _block, value in arms)
+        merged_class = numeric_class.get(str(dtype))
+        if (
+            merged_class is None
+            or any(tuple(value.shape or ()) for value in values)
+            or not all(
+                str(value.dtype) in numeric_class or str(value.dtype) in absent
+                for value in values
+            )
+        ):
+            return values
+        rank = {"bool": 0, "int": 1, "float": 2}
+        narrowed = tuple(
+            str(value.dtype) for value in values
+            if str(value.dtype) in numeric_class
+            and rank[numeric_class[str(value.dtype)]] > rank[merged_class]
+        )
+        if narrowed:
+            # A conversion here would drop what Python keeps (3.5 -> 3).
+            raise ValueError(
+                f"{self.function_name}: a scalar join of class {dtype!r} "
+                f"has arms of a wider class {narrowed!r}; no record "
+                "settles the join's class to hold them"
+            )
+        current = self.current
+        converted = tuple(
+            self._cast_on_edge(block, value, str(dtype))
+            if numeric_class.get(str(value.dtype), merged_class)
+            != merged_class else value
+            for block, value in arms
+        )
+        self.current = current
+        return converted
+
     def _value_dominates_block(
         self, value: SSAValue, current_name: str,
     ) -> bool:
@@ -18343,7 +18458,17 @@ class _ControlSSABuilder(TiledObject):
                 cause=(true_value, false_value, predicate),
             )
             if merged.dtype in {None, "unknown"}:
-                merged.dtype = true_value.dtype or false_value.dtype
+                # Program: ``if c == 2: s = n else: s = n * 0.5`` (corpus
+                # c770).  Wrong record: the merge took its TRUE arm's class,
+                # so a float arm could be narrowed to int64.
+                # Rule: a scalar numeric join promotes (``_numeric_join``).
+                merged.dtype = self._numeric_join(
+                    (true_value, false_value),
+                ) or true_value.dtype or false_value.dtype
+            true_value, false_value = self._numeric_join_arms(
+                merged.dtype if not tuple(merged.shape or ()) else None,
+                ((true_exit, true_value), (false_exit, false_value)),
+            )
             if (
                 int(result_id) not in self.region_value_meta
                 and tuple(true_value.shape) == tuple(false_value.shape)
@@ -22477,6 +22602,41 @@ class _ControlSSABuilder(TiledObject):
                      if value.dtype not in {None, "unknown", "none"}),
                     str(incoming_values[0].dtype or "unknown"),
                 )
+                # Program: ``def pick(n, c): if c == 2: return n; return n *
+                # 0.5`` read as ``pick(n, c) + 0.25`` (corpus c772, c773).
+                # Wrong record: the exit merge took its FIRST return's
+                # dtype, so the float arm was stored into an int64 slot (3.5
+                # became 3); with a ``None`` arm too, the mismatched
+                # payloads left the optional unlowered and its presence was
+                # lost.  Rule:
+                # scalar returns of differing numeric class merge as a
+                # branch join does (``_value_shape_dtype``'s ``phi`` rule):
+                # the widest float when any arm is float, int64 when the
+                # arms are ints and bools.  Any other disagreement is named.
+                merge_dtypes = {
+                    str(value.dtype) for value in incoming_values
+                    if value.dtype not in {None, "unknown", "none"}
+                }
+                if len(merge_dtypes) > 1:
+                    promoted = self._numeric_join(incoming_values)
+                    if promoted is not None:
+                        dtype = promoted
+                        incoming_values = list(self._numeric_join_arms(
+                            dtype, tuple(
+                                (block, value)
+                                for (block, _values), value in zip(
+                                    edges, incoming_values, strict=True,
+                                )
+                            ),
+                        ))
+                        self.current = exit_block
+                    else:
+                        self.shortfalls.append(SSALoweringShortfall(
+                            "control", "return_arms_dtype_disagree",
+                            f"{self.function_name}.return_slot[{slot}]",
+                            "return statements disagree on the slot's "
+                            f"physical class: {tuple(sorted(merge_dtypes))!r}",
+                        ))
                 member_phi = (
                     record_kind is ReturnArmsKind.OPTIONAL_AGGREGATE
                     and len(edges) > 1
