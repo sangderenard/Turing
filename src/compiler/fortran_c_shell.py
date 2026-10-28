@@ -27452,6 +27452,19 @@ def _class_surface_ssa_program(
             specialization_contract = (
                 *specialization_contract, aggregate_specialization,
             )
+        # Program: ``head_sum(xs)`` called with ``list[int]`` and with
+        # ``list[float]`` (corpus c832).  Wrong record: both copies carried
+        # the same empty contract, so both lowered under one symbol and the
+        # int caller bound a float64 frame.  Rule: the element class every
+        # call record names for a list formal is part of the callsite
+        # contract.
+        element_specialization = (
+            graph_obj.graph.get("planner_parameter_element_classes") or {}
+        )
+        if element_specialization:
+            specialization_contract = (
+                *specialization_contract, element_specialization,
+            )
         # A record-only callsite variant IS a different executable contract.
         # root(Actual)->relay(Declared)->leaf(Declared) used to overwrite both
         # variants under one symbol because only literals/tensors were keyed.
