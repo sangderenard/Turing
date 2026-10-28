@@ -374,6 +374,9 @@ def test_region_sequence_arena_formal_posts_span_rank():
 
 
 def test_keyed_tensor_lookup_posts_span_rank_derived_from_its_contract():
+    from src.compiler.called_inventory import (
+            MappingClass, RecordClass, TensorClass,
+        )
     from tests.test_sequence_contract_concordance import (
         c_backend_repository_ssa_reference,
     )
@@ -392,6 +395,12 @@ def test_keyed_tensor_lookup_posts_span_rank_derived_from_its_contract():
         "    return selected.real.sum()\n",
         "sample",
         name="keyed_tensor_rows",
+        root_calls=[{
+            "reading": RecordClass(
+                "Reading", voltage_v=MappingClass(str, TensorClass("float64")),
+            ),
+            "key": str,
+        }],
         extraction_contract=ExtractionContract(CONTRACT),
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         progress=lambda _message: None,

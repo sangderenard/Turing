@@ -18,6 +18,28 @@ MAPPING_KEY_ABSENT = 84
 #: limbs, the native module reports it rather than return a wrapped value.
 INT_OVERFLOW = 86
 
+#: ``a << b`` or ``a >> b`` with ``b < 0``: Python raises ``ValueError``.
+NEGATIVE_SHIFT_COUNT = 87
+
+#: ``a // 0`` or ``a % 0`` on ints: Python raises ``ZeroDivisionError``; the
+#: native divide would trap the host process instead.
+INT_ZERO_DIVISION = 88
+
+#: ``a ** b`` / ``pow(a, b, m)`` typed int reached ``b < 0``.  Python's
+#: result is a float (``2 ** -1 == 0.5``) or, with a modulus, a modular
+#: inverse; the int-typed native power reports it instead of returning an
+#: int Python never computes.
+INT_POWER_NEGATIVE_EXPONENT = 89
+
+#: ``pow(a, b, 0)``: Python raises ``ValueError``.
+POW_MODULUS_ZERO = 90
+
+#: ``a / b`` on ints where ``a`` or ``b`` is not exactly a float64.  Python
+#: returns the correctly rounded quotient of the exact ints; ``float(a) /
+#: float(b)`` rounds twice and can differ in the last place.  Until that
+#: quotient is computed on Precision limbs, the native module reports it.
+INT_TRUE_DIVISION_INEXACT = 91
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -25,6 +47,22 @@ class NativeIndexError(RuntimeError, IndexError):
 
 class NativeIntOverflow(RuntimeError, OverflowError):
     """An int64 result past int64 that Python would have kept exact."""
+
+
+class NativeValueError(RuntimeError, ValueError):
+    """``ValueError`` raised from a native validation code."""
+
+
+class NativeZeroDivisionError(RuntimeError, ZeroDivisionError):
+    """``ZeroDivisionError`` raised from a native validation code."""
+
+
+class NativeIntPowerNegativeExponent(RuntimeError):
+    """An int-typed ``a ** b`` whose exponent was negative at run time.
+
+    Python returns a float there (or a modular inverse for three-argument
+    ``pow``); the program's int type cannot carry it.
+    """
 
 
 class NativeKeyError(RuntimeError, KeyError):
@@ -44,5 +82,25 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
     if int(code) == INT_OVERFLOW:
         return NativeIntOverflow(
             f"int result left int64; no interval proves it ({runtime_message})"
+        )
+    if int(code) == NEGATIVE_SHIFT_COUNT:
+        return NativeValueError(f"negative shift count ({runtime_message})")
+    if int(code) == INT_TRUE_DIVISION_INEXACT:
+        return NativeIntOverflow(
+            "int / int operand is not exact in float64; Python's correctly "
+            f"rounded quotient needs Precision limbs ({runtime_message})"
+        )
+    if int(code) == INT_ZERO_DIVISION:
+        return NativeZeroDivisionError(
+            f"integer division or modulo by zero ({runtime_message})"
+        )
+    if int(code) == INT_POWER_NEGATIVE_EXPONENT:
+        return NativeIntPowerNegativeExponent(
+            "int ** negative int is not an int in Python "
+            f"({runtime_message})"
+        )
+    if int(code) == POW_MODULUS_ZERO:
+        return NativeValueError(
+            f"pow() 3rd argument cannot be 0 ({runtime_message})"
         )
     return RuntimeError(runtime_message)

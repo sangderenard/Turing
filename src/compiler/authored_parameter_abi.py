@@ -266,9 +266,22 @@ def _linked_list_parameter_contracts(graph_obj: Any) -> dict[str, tuple]:
         name = attributes.get("binding_name")
         value_id = int(data.get("value_id", node_id))
         receipt = linked.get(value_id) or {}
+        # Program: ``def _trim(out): if out[-1] == 0: out.pop()`` called
+        # with ``[1, n, 0, 0]``.  Wrong record: the call edge gives a
+        # non-empty list argument its element type as a ``span`` receipt
+        # (``aggregate_kind`` list), and only a list with no storage
+        # receipt got this row contract, so ``out[-1]`` read a raw span
+        # while ``pop`` made ``out`` a heap sequence: two views of one
+        # storage that disagree.  Rule: a list's span receipt is that list,
+        # and takes the list row contract as an empty list's does.
+        storage = receipt.get("storage")
         if (
             name is None or str(name) in annotated
-            or receipt.get("storage") is not None
+            or not (
+                storage is None
+                or (storage == "span"
+                    and receipt.get("aggregate_kind") == "list")
+            )
             or receipt.get("python_type") != "builtins.list"
             or value_id not in linked_elements
         ):

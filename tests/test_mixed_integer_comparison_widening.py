@@ -448,7 +448,7 @@ def test_canonical_uint64_int64_comparison_uses_exact_internal_domain(
 
 @pytest.mark.parametrize("backend", ["c", "llvm", "fortran"])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_int64_uint32_add_uses_exact_int64_inputs_and_existing_wrap_law(
+def test_int64_uint32_add_uses_exact_int64_inputs_and_python_int_law(
     backend, reverse, tmp_path,
 ):
     module, outputs, exports = _lower_integer_add(
@@ -476,11 +476,25 @@ def test_int64_uint32_add_uses_exact_int64_inputs_and_existing_wrap_law(
     root = module.functions[entry]
     parameters = dict(root.metadata["parameter_names"])
     result = outputs[entry][0]
+    # Python ints are exact: an unproven sum past int64 (no interval bounds
+    # ``left``) raises NativeIntOverflow on the checked C and LLVM lanes,
+    # never wraps to -2**63.  The Fortran lane still wraps (not checked).
+    from src.compiler.native_faults import NativeIntOverflow
+
+    past_int64 = NativeIntOverflow if backend in {"c", "llvm"} else -(2**63)
     cases = (
-        (2**63 - 1, 1, -(2**63)),
+        (2**63 - 1, 1, past_int64),
         (-(2**63), 2**32 - 1, -(2**63) + 2**32 - 1),
         (-(2**63), 1, -(2**63) + 1),
     )
+
+    def check(run, expected):
+        if expected is NativeIntOverflow:
+            with pytest.raises(NativeIntOverflow):
+                run()
+        else:
+            assert run().buffers[result.id].item() == expected
+
     def feed(left_value, right_value):
         values = {"left": left_value, "right": right_value}
         return {
@@ -498,8 +512,12 @@ def test_int64_uint32_add_uses_exact_int64_inputs_and_existing_wrap_law(
         assert artifact.complete, artifact.shortfalls
         artifact.compile(tmp_path / "c")
         for left_value, right_value, expected in cases:
-            execution = artifact.prepare_execution(feed(left_value, right_value)).run()
-            assert execution.buffers[result.id].item() == expected
+            check(
+                lambda: artifact.prepare_execution(
+                    feed(left_value, right_value),
+                ).run(),
+                expected,
+            )
     elif backend == "llvm":
         from src.compiler.ssa_llvm_backend import (
             compile_artifact,
@@ -511,10 +529,12 @@ def test_int64_uint32_add_uses_exact_int64_inputs_and_existing_wrap_law(
         assert emitted.complete, emitted.shortfalls
         artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
         for left_value, right_value, expected in cases:
-            execution = prepare_artifact_execution(
-                artifact, feed(left_value, right_value),
-            ).run()
-            assert execution.buffers[result.id].item() == expected
+            check(
+                lambda: prepare_artifact_execution(
+                    artifact, feed(left_value, right_value),
+                ).run(),
+                expected,
+            )
     else:
         from src.compiler.fortran_toolchain import (
             aggressive_fortran_flags,

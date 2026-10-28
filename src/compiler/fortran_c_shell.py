@@ -5823,6 +5823,23 @@ def _lower_optional_record_presence_catalogue(graph: Any) -> int:
     return lowered
 
 
+def _prove_tensor_value_dtypes(contracts: dict) -> None:
+    """A keyed-tensor field whose annotation names no element dtype takes the
+    element dtype the root-call records prove (called inventory), posted on
+    the identity book; with no record it stays ``unknown``."""
+
+    from .called_inventory import called_field_tensor_dtype
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    for (owner, field), receipt in list(contracts.items()):
+        if not (receipt.get("value_tensor") and receipt.get("dtype") == "unknown"):
+            continue
+        proven = called_field_tensor_dtype(book, str(owner), str(field))
+        if proven is not None:
+            contracts[(owner, field)] = {**receipt, "dtype": proven[0]}
+
+
 def _authored_annotation_field_receipt(
     annotation: ast.AST,
     python_bindings: Mapping[str, Any] | None = None,
@@ -10853,6 +10870,24 @@ def _field_slot_ops(
                 # tensor identity otherwise disappears before SSA lowering.
                 nested_sequence_ids.add(int(sequence_id))
                 nested_tensor_sequence_ids.add(int(sequence_id))
+                # The element dtype of those tensor spans is the class the
+                # root-call records prove for this record field (called
+                # inventory), consumed here as the child column's dtype;
+                # with no record it stays unknown.
+                if receiver_record is not None:
+                    from .called_inventory import called_field_tensor_dtype
+                    from .identity_concordance import (
+                        current_identity_book as _called_book,
+                    )
+
+                    proven = called_field_tensor_dtype(
+                        _called_book(),
+                        str(receiver_record.get("identity") or ""), attribute,
+                    )
+                    if proven is not None:
+                        graph_obj.graph.setdefault(
+                            "nested_tensor_value_dtypes", {}
+                        )[int(sequence_id)] = proven[0]
     # Runtime aggregates captured from a lexical/module binding are resident
     # storage exactly like aggregate fields, but they have no record slot.
     # Correlate all normalized occurrences by their authored binding identity;
@@ -27654,6 +27689,18 @@ def _class_surface_ssa_program(
             specialization_contract = (
                 *specialization_contract, element_specialization,
             )
+        # Program: ``step(x % 2**32, y % 256)`` and ``step(x, y)``.  Wrong
+        # record: the copy minted for the proven intervals and the unproven
+        # one lowered under one symbol, so one caller ran the other's
+        # checks (or lack of them).  Rule: each formal's proven callsite
+        # interval is part of the callsite contract.
+        int_range_specialization = (
+            graph_obj.graph.get("planner_parameter_int_ranges") or {}
+        )
+        if int_range_specialization:
+            specialization_contract = (
+                *specialization_contract, int_range_specialization,
+            )
         # A record-only callsite variant IS a different executable contract.
         # root(Actual)->relay(Declared)->leaf(Declared) used to overwrite both
         # variants under one symbol because only literals/tensors were keyed.
@@ -30682,6 +30729,9 @@ def _class_surface_ssa_program(
                 retained_sequence_ids=retained_sequence_ids,
                 nested_sequence_ids=nested_sequence_ids,
                 nested_tensor_sequence_ids=nested_tensor_sequence_ids,
+                nested_tensor_value_dtypes=dict(
+                    graph_obj.graph.get("nested_tensor_value_dtypes") or {}
+                ),
                 joined_sequence_ids=joined_sequence_ids,
                 joined_singleton_values=sequence_singleton_values,
                 nested_record_fields=nested_record_fields,
@@ -44128,10 +44178,6 @@ def _class_surface_ssa_program(
         for block in function.blocks.values():
             for instruction in block.instrs:
                 if instruction.op not in {"Ret", "ret", "Return", "return"}:
-                    continue
-                if instruction.attributes.get("fault_exit"):
-                    # The zero outputs of a checked index's fault exit are
-                    # not the source outputs; there is nothing to settle.
                     continue
                 by_id = {
                     int(argument.id): argument
@@ -59723,6 +59769,7 @@ def _class_surface_ssa_program(
         drop_dead_pure_structural_instructions,
         drop_dead_pure_region_calls,
         reduce_constant_exponent_pow,
+        reduce_integer_pow,
     )
 
     compile_substage("reduce constant powers and dead pure work")
@@ -59732,6 +59779,10 @@ def _class_surface_ssa_program(
     # results nothing reads (the materialized comprehension ``range``) must
     # not force a backend to spell code nothing runs.
     drop_dead_pure_region_calls(all_functions)
+    # Python ``int`` powers become checked square-and-multiply SSA after
+    # the dead sweeps: its guards call the validation runtime, which a
+    # pure-region sweep must not see as removable work.
+    reduce_integer_pow(all_functions)
 
     # Sequence descriptors are the canonical physical ABI.  A source value
     # may have been captured provisionally by a numerical region before its
@@ -63505,6 +63556,7 @@ def _lower_ast_source_to_ssa_impl(
                 declared_class_field_contracts[
                     (str(class_definition.name), str(field_name))
                 ] = receipt
+    _prove_tensor_value_dtypes(declared_class_field_contracts)
     if declared_class_field_contracts:
         graph.G.graph["declared_class_field_contracts"] = (
             declared_class_field_contracts
@@ -63605,6 +63657,7 @@ def _lower_ast_source_to_ssa_impl(
                 declared_class_field_contracts.setdefault(
                     (str(class_definition.name), str(field_name)), receipt,
                 )
+        _prove_tensor_value_dtypes(declared_class_field_contracts)
         if declared_class_field_contracts:
             graph.G.graph["declared_class_field_contracts"] = (
                 declared_class_field_contracts

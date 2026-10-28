@@ -172,9 +172,13 @@ def test_integer_span_scalar_arithmetic_matches_c_and_llvm(
         artifact, execution = _run(backend, module, entry, feeds, tmp_path)
         assert np.asarray(execution.buffers[result.id]).reshape(-1).tolist() == expected
         if backend == "llvm":
-            spelling = {"x * n": "mul i64", "x - n": "sub i64",
-                        "x % n": "srem i64"}[expression]
-            assert spelling in artifact.llvm_ir
+            # Integer domain, never ``fmul double``.  Python ``int`` lanes
+            # (``python_int_lane_overflow_checked``) spell * and - with the
+            # signed overflow intrinsics.
+            spellings = {"x * n": ("mul i64", "smul.with.overflow.i64"),
+                         "x - n": ("sub i64", "ssub.with.overflow.i64"),
+                         "x % n": ("srem i64",)}[expression]
+            assert any(spelling in artifact.llvm_ir for spelling in spellings)
         abi = artifact.runtime_abi()
         assert abi["schema"] == "turing-runtime-abi-v1"
         buffers = {item["value_id"]: item for item in abi["buffers"]}

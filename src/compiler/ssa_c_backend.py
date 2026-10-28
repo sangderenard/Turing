@@ -301,6 +301,122 @@ _FLOORED_INT128 = {
 }
 
 
+#: Python ``int`` operations spelled by ``_python_int_statement`` when
+#: ``python_int_overflow_checked`` holds, with their operand counts.
+_PYTHON_INT_OPERATIONS = {
+    "Shl": 2, "Shr": 2, "FloorDiv": 2, "Mod": 2, "Abs": 1, "abs": 1, "Neg": 1,
+}
+_C_INT64_MIN = "(-9223372036854775807LL - 1)"
+
+
+def _python_int_overflow_checked(instruction) -> bool:
+    from .ssa_llvm_backend import python_int_overflow_checked
+
+    return python_int_overflow_checked(instruction)
+
+
+def _python_int_spelled(op: str, instruction) -> bool:
+    """Whether ``_python_int_statement`` spells this op (its LLVM rule).
+
+    ``<< >> // %`` keep Python's semantics proven or not; ``abs`` and unary
+    ``-`` only need it while no interval proves the result inside int64.
+    """
+
+    from .ssa_llvm_backend import python_int_operation
+
+    if op in {"Abs", "abs", "Neg"}:
+        return _python_int_overflow_checked(instruction)
+    return python_int_operation(instruction)
+
+
+def _python_int_true_division(instruction) -> bool:
+    from .ssa_llvm_backend import python_int_true_division
+
+    return python_int_true_division(instruction)
+
+
+def _python_int_true_division_statement(args, target: str) -> str:
+    """C for Python's ``int / int`` (the LLVM lane's
+    ``python_int_true_division_lines``): one IEEE division of operands that
+    are exactly float64, else ``INT_ZERO_DIVISION`` or
+    ``INT_TRUE_DIVISION_INEXACT``."""
+
+    from .native_faults import INT_TRUE_DIVISION_INEXACT, INT_ZERO_DIVISION
+
+    left, right = (f"((int64_t)({argument}))" for argument in args)
+
+    def exact(value: str) -> str:
+        return (
+            f"((double){value} < 9223372036854775808.0 "
+            f"&& (int64_t)(double){value} == {value})"
+        )
+
+    return (
+        f"double {target} = ((double){left} / (double){right}); "
+        f"if ({right} == 0) turing_validation_error({INT_ZERO_DIVISION}u); "
+        f"else if (!({exact(left)} && {exact(right)})) "
+        f"turing_validation_error({INT_TRUE_DIVISION_INEXACT}u);"
+    )
+
+
+def _python_int_statement(op: str, args, target: str) -> str:
+    """C for Python's ``<< >> // %``, ``abs`` and unary ``-`` on an int64.
+
+    The LLVM lane's ``_python_int_lines``: Python's value or a named fault
+    (``NEGATIVE_SHIFT_COUNT``, ``INT_ZERO_DIVISION``, ``INT_OVERFLOW``),
+    computed on a safe operand so no C operation is undefined.  The
+    statement opens ``int64_t <target> = <value>;`` so a loop's later
+    definition can assign the incumbent local instead.
+    """
+
+    from .native_faults import INT_ZERO_DIVISION, NEGATIVE_SHIFT_COUNT
+
+    def fault(code: int) -> str:
+        return f"turing_validation_error({int(code)}u);"
+
+    overflow = fault(_INT_OVERFLOW_CODE)
+    if op == "Neg":
+        (value,) = args
+        return (
+            f"int64_t {target} = 0; if (__builtin_sub_overflow("
+            f"(int64_t)0, (int64_t)({value}), &{target})) {overflow}"
+        )
+    if op in {"Abs", "abs"}:
+        (value,) = args
+        return (
+            f"int64_t {target} = (({value}) < 0 ? (int64_t)(0 - "
+            f"(uint64_t)({value})) : ({value})); "
+            f"if (({value}) == {_C_INT64_MIN}) {overflow}"
+        )
+    left, right = (f"((int64_t)({argument}))" for argument in args)
+    if op in {"Shl", "Shr"}:
+        inrange = f"({right} >= 0 && {right} < 64)"
+        negative = f"if ({right} < 0) {fault(NEGATIVE_SHIFT_COUNT)}"
+        if op == "Shr":
+            # Python ``>>`` floors: arithmetic, and 0 / -1 past 63 bits.
+            return (
+                f"int64_t {target} = ({left} >> ({inrange} ? {right} : 63)); "
+                f"{negative}"
+            )
+        return (
+            f"int64_t {target} = (int64_t)((uint64_t){left} << "
+            f"({inrange} ? {right} : 0)); {negative} "
+            f"else if ({right} < 64 ? (({target} >> {right}) != {left}) "
+            f": ({left} != 0)) {overflow}"
+        )
+    wide = f"({left} == {_C_INT64_MIN} && {right} == -1)"
+    helper = "turing_ifloordiv" if op == "FloorDiv" else "turing_imod"
+    statement = (
+        f"int64_t {target} = {helper}({left}, "
+        f"({right} == 0 || {wide}) ? 1 : {right}); "
+        f"if ({right} == 0) {fault(INT_ZERO_DIVISION)}"
+    )
+    if op == "FloorDiv":
+        # -2**63 // -1 == 2**63; -2**63 % -1 == 0 is the safe divisor's.
+        statement += f" else if {wide} {overflow}"
+    return statement
+
+
 def _floored_integer_helper(op: str, operands) -> str:
     """The floored integer helper whose domain holds every operand."""
 
@@ -739,6 +855,54 @@ def _settled_dtype(dtype, value_id, record):
     return dtype
 
 
+def _blocks_in_definition_order(function) -> list[str]:
+    """Block names in reverse post-order from the entry block.
+
+    C binds an SSA result to its local when the defining statement is
+    emitted, so a block must be emitted after every block that dominates it.
+    The block dict is insertion ordered, and a lowering may append a block
+    (for example a sequence-index in-range arm) after the loop latch it
+    branches to; emitting in dict order then reaches the latch before the
+    definition it consumes.  Labels and ``goto`` make the textual order free,
+    so emit in reverse post-order (every dominator precedes the blocks it
+    dominates), the order the SSA's dominance already guarantees.  Blocks
+    unreachable from the entry keep their dict order at the end.
+    """
+
+    names = list(function.blocks)
+    if not names:
+        return names
+    start = "entry" if "entry" in function.blocks else names[0]
+
+    def successors(name: str) -> list[str]:
+        block = function.blocks[name]
+        targets: list[str] = []
+        for instruction in block.instrs:
+            attributes = instruction.attributes or {}
+            for key in ("target", "true_target", "false_target"):
+                target = attributes.get(key)
+                if target is not None and str(target) in function.blocks:
+                    targets.append(str(target))
+        return targets
+
+    visited: set[str] = {start}
+    post: list[str] = []
+    stack: list[tuple[str, iter]] = [(start, iter(successors(start)))]
+    while stack:
+        name, pending = stack[-1]
+        for successor in pending:
+            if successor not in visited:
+                visited.add(successor)
+                stack.append((successor, iter(successors(successor))))
+                break
+        else:
+            stack.pop()
+            post.append(name)
+    ordered = post[::-1]
+    ordered.extend(name for name in names if name not in visited)
+    return ordered
+
+
 def _scalar_c_type(dtype) -> str:
     name = str(_settled_dtype(dtype, "?", "dtype passed to C type lookup")).casefold()
     if name == "ptr":
@@ -798,6 +962,29 @@ def supported_tensor_operations() -> frozenset[str]:
     # Keeping this derived from that shared basis prevents target selection
     # from accidentally auditing the older AbstractTensor C runtime instead.
     return llvm_tensor_ops()
+
+
+def integer_narrowing_c_check(*arguments):
+    from .ssa_llvm_backend import integer_narrowing_c_check as check
+
+    return check(*arguments)
+
+
+def _contract_integer_narrowing(instruction) -> bool:
+    from .ssa_llvm_backend import contract_integer_narrowing
+
+    return contract_integer_narrowing(instruction)
+
+
+def _c_storage_dtype(c_type: str) -> str | None:
+    """The integer dtype a C storage type spells (``uint8_t`` is uint8)."""
+
+    from ..transmogrifier.dtype_layout import DTYPES
+
+    for layout in DTYPES.values():
+        if layout.kind in {"int", "uint"} and layout.c_storage_type == c_type:
+            return layout.name
+    return None
 
 
 def _buffer_c_type(dtype) -> str:
@@ -3367,7 +3554,48 @@ def emit_ssa_module_to_c(
                 )
                 for key in table if key.casefold() == op.casefold()
             ), op)
-            if op in _BINARY and len(elements) == 2:
+            from .ssa_llvm_backend import python_int_lane_overflow_checked
+
+            lane_checked = (
+                integral and result_type == "int64_t"
+                and python_int_lane_overflow_checked(instruction)
+            )
+            # A checked lane is a statement: the overflow builtin reports
+            # code 86 (NativeIntOverflow) for the lane Python's ``int``
+            # would carry past int64.
+            lane_statement = None
+            if lane_checked and op in {"Add", "Sub", "Mul", "Neg", "Abs"}:
+                prototype = "void turing_validation_error(uint32_t error_code);"
+                if prototype not in prototypes:
+                    prototypes.append(prototype)
+                needs_validation_runtime = True
+                lane = f"ew_v_{result_id}"
+                report = f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                if op in {"Add", "Sub", "Mul"} and len(elements) == 2:
+                    builtin = {
+                        "Add": "__builtin_add_overflow",
+                        "Sub": "__builtin_sub_overflow",
+                        "Mul": "__builtin_mul_overflow",
+                    }[op]
+                    lane_statement = (
+                        f"int64_t {lane}; if ({builtin}((int64_t)({elements[0]}), "
+                        f"(int64_t)({elements[1]}), &{lane})) {report}"
+                    )
+                elif op in {"Neg", "Abs"} and len(elements) == 1:
+                    lane_statement = (
+                        f"int64_t {lane}; if (__builtin_sub_overflow((int64_t)0, "
+                        f"(int64_t)({elements[0]}), &{lane})) {report}"
+                    )
+                    if op == "Abs":
+                        # |x| leaves int64 only at INT64_MIN, the one lane
+                        # whose checked negation reports.
+                        lane_statement += (
+                            f" if (({elements[0]}) >= 0) {lane} = "
+                            f"(int64_t)({elements[0]});"
+                        )
+            if lane_statement is not None:
+                expression = f"ew_v_{result_id}"
+            elif op in _BINARY and len(elements) == 2:
                 if op == "Div" and not _is_integer_dtype(result.dtype):
                     expression = (
                         f"((double){elements[0]} / (double){elements[1]})"
@@ -3414,8 +3642,28 @@ def emit_ssa_module_to_c(
                 )
             elif op == "Pow" and len(elements) == 2 and not integral:
                 expression = f"pow({elements[0]}, {elements[1]})"
+            elif op == "Neg" and len(elements) == 1 and integral:
+                # Negation through the unsigned type, as Add/Sub/Mul above:
+                # INT64_MIN wraps to itself instead of being undefined.
+                layout = dtype_layout(result.dtype)
+                unsigned = dtype_layout(
+                    f"uint{max(32, 8 * layout.byte_size)}"
+                ).c_storage_type
+                expression = f"({result_type})(0 - ({unsigned}){elements[0]})"
             elif op == "Neg" and len(elements) == 1:
                 expression = f"(-{elements[0]})"
+            elif (
+                op == "Abs" and len(elements) == 1 and integral
+                and _is_integer_dtype(result.dtype)
+            ):
+                layout = dtype_layout(result.dtype)
+                unsigned = dtype_layout(
+                    f"uint{max(32, 8 * layout.byte_size)}"
+                ).c_storage_type
+                expression = (
+                    f"(({elements[0]}) < 0 ? ({result_type})(0 - "
+                    f"({unsigned})({elements[0]})) : ({elements[0]}))"
+                )
             elif (
                 op in _UNARY and _UNARY[op] is not None
                 and len(elements) == 1 and not integral
@@ -3433,10 +3681,15 @@ def emit_ssa_module_to_c(
                     activation_array(result_type, int(count)) if static
                     else runtime_activation_array(result_type, count)
                 )
+            store = (
+                f"(({result_type} *)({destination}))[{index}] = "
+                f"({result_type})({expression});"
+            )
+            if lane_statement is not None:
+                store = f"{{ {lane_statement} {store} }}"
             loop = (
                 f"for (ptrdiff_t {index} = 0; {index} < (ptrdiff_t)({count}); "
-                f"++{index}) (({result_type} *)({destination}))[{index}] = "
-                f"({result_type})({expression});"
+                f"++{index}) {store}"
             )
             if checks:
                 prototype = "void turing_validation_error(uint32_t error_code);"
@@ -3938,7 +4191,7 @@ def emit_ssa_module_to_c(
             )
         }
 
-        block_names = list(function.blocks)
+        block_names = _blocks_in_definition_order(function)
         emitted_scalar_locals: set[int] = set()
         effect_guarded_blocks = set(
             function.metadata.get("pool_effect_guarded_blocks") or ()
@@ -4366,6 +4619,13 @@ def emit_ssa_module_to_c(
                     body.append(f"            goto {_c_label(on_false)};")
                     body.append("        }")
                     continue
+                if op == "Trap" and instruction.attributes.get("fault_exit"):
+                    # A checked fault already recorded its validation code;
+                    # the exit publishes no outputs and leaves through the
+                    # activation-storage cleanup.
+                    span.take_pending()
+                    body.append(f"        goto cleanup_{_c_symbol(fn)};")
+                    continue
                 if op in {"Ret", "ret", "Return", "return"}:
                     if trace_this_function:
                         pending_trace.clear()
@@ -4506,7 +4766,29 @@ def emit_ssa_module_to_c(
                         sum_start = scalar_operand(instruction.args[1])
                         if sum_start is None:
                             continue
-                    if count == 1:
+                    # ``sum(xs)`` of Python ints: each step is int ``+``.
+                    checked_sum = (
+                        op == "sum" and result_type == "int64_t"
+                        and _python_int_overflow_checked(instruction)
+                    )
+                    if checked_sum:
+                        prototype = (
+                            "void turing_validation_error(uint32_t error_code);"
+                        )
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                    if count == 1 and checked_sum:
+                        scalar = scalar_operand(source)
+                        if scalar is None:
+                            continue
+                        body.append(
+                            f"        int64_t t{result_id} = 0; "
+                            f"if (__builtin_add_overflow((int64_t)({sum_start}), "
+                            f"(int64_t)({scalar}), &t{result_id})) "
+                            f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                        )
+                    elif count == 1:
                         scalar = scalar_operand(source)
                         if scalar is None:
                             continue
@@ -4555,6 +4837,12 @@ def emit_ssa_module_to_c(
                         elif op == "sum":
                             # Left to right from ``start``, as Python adds.
                             step = (
+                                f"if (__builtin_add_overflow("
+                                f"turing_red_{result_id}, "
+                                f"(int64_t)turing_red_{result_id}_v, "
+                                f"&turing_red_{result_id})) "
+                                f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                                if checked_sum else
                                 f"turing_red_{result_id} += "
                                 f"({result_type})turing_red_{result_id}_v;"
                             )
@@ -5824,6 +6112,18 @@ def emit_ssa_module_to_c(
                                 int(addressed_value.id),
                                 carried_type(stored_value),
                             )
+                            source_type = carried_type(stored_value)
+                            narrowing = integer_narrowing_c_check(
+                                _c_storage_dtype(source_type),
+                                _c_storage_dtype(stored_type),
+                                source_type, value,
+                            )
+                            if narrowing is not None:
+                                prototype = "void turing_validation_error(uint32_t error_code);"
+                                if prototype not in prototypes:
+                                    prototypes.append(prototype)
+                                needs_validation_runtime = True
+                                body.append(f"        {narrowing}")
                             body.append(
                                 f"        *(({stored_type} *)({where})) = {value};"
                             )
@@ -6135,6 +6435,19 @@ def emit_ssa_module_to_c(
                         f"const {result_type} t{result_id} = "
                         f"({result_type})({cast_source});"
                     )
+                    narrowing = (
+                        integer_narrowing_c_check(
+                            instruction.args[0].dtype, instruction.res.dtype,
+                            _scalar_c_type(instruction.args[0].dtype), args[0],
+                        )
+                        if _contract_integer_narrowing(instruction) else None
+                    )
+                    if narrowing is not None:
+                        prototype = "void turing_validation_error(uint32_t error_code);"
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                        declared = f"{narrowing} {declared}"
                 elif (
                     op.casefold() == "item"
                     and len(args) == 1
@@ -6319,6 +6632,35 @@ def emit_ssa_module_to_c(
                         )
                         + ";"
                     )
+                elif _python_int_true_division(instruction):
+                    prototype = "void turing_validation_error(uint32_t error_code);"
+                    if prototype not in prototypes:
+                        prototypes.append(prototype)
+                    needs_validation_runtime = True
+                    declared_storage_type = "double"
+                    declared = _python_int_true_division_statement(
+                        args, f"t{result_id}",
+                    )
+                elif (
+                    op in _PYTHON_INT_OPERATIONS
+                    and len(args) == _PYTHON_INT_OPERATIONS[op]
+                    and _scalar_c_type(instruction.res.dtype) == "int64_t"
+                    and all(
+                        # The spelling computes on int64 operands; an int128
+                        # operand (a uint64 widened for ``%``) is not narrowed
+                        # through it but takes the int128 floored helper.
+                        is_integer(value) and str(value.dtype) == "int64"
+                        for value in instruction.args
+                    )
+                    and _python_int_spelled(op, instruction)
+                ):
+                    prototype = "void turing_validation_error(uint32_t error_code);"
+                    if prototype not in prototypes:
+                        prototypes.append(prototype)
+                    needs_validation_runtime = True
+                    integer_ids.add(result_id)
+                    declared_storage_type = "int64_t"
+                    declared = _python_int_statement(op, args, f"t{result_id}")
                 elif op == "Pow" and len(args) == 2:
                     if _is_integer_dtype(instruction.res.dtype):
                         shortfalls.append(CEmissionShortfall(
@@ -6381,6 +6723,19 @@ def emit_ssa_module_to_c(
                     from .ssa_llvm_backend import python_int_overflow_checked
 
                     if (
+                        integral and op == "Add" and kind == "int64_t"
+                        and (instruction.attributes or {}).get("binding")
+                        == "loop_induction_step"
+                    ):
+                        # A range loop's induction step saturates, as the
+                        # LLVM lane's ``llvm.sadd.sat`` (precompile_to_ssa).
+                        declared = (
+                            f"int64_t t{result_id} = 0; if (__builtin_add_overflow("
+                            f"(int64_t)({args[0]}), (int64_t)({args[1]}), "
+                            f"&t{result_id})) t{result_id} = "
+                            f"((int64_t)({args[1]}) > 0) ? INT64_MAX : INT64_MIN;"
+                        )
+                    elif (
                         integral and op in {"Add", "Sub", "Mul"}
                         and kind == "int64_t"
                         and python_int_overflow_checked(instruction)
@@ -6527,7 +6882,14 @@ def emit_ssa_module_to_c(
                     kind = (
                         _scalar_c_type(instruction.res.dtype)
                     )
-                    declared = f"const {kind} t{result_id} = (-{args[0]});"
+                    # Program: ``return -n`` declared int128 (the int
+                    # overflow union's exact arm).  Wrong record: ``-n`` ran
+                    # in n's int64 and -(-2**63) wrapped before widening.
+                    # Rule: negate in the declared domain (an exact widening
+                    # of the operand), as the binary ops do.
+                    declared = (
+                        f"const {kind} t{result_id} = (-({kind})({args[0]}));"
+                    )
                 elif (
                     op.casefold() in _UNARY_PREDICATES
                     and len(args) == 1

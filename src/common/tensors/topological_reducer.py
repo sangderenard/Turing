@@ -4848,7 +4848,8 @@ def _builtin_scalar_operator_class(expression: Any, operand_classes: tuple) -> s
     if any(item not in {"builtins.int", "builtins.bool", "builtins.float"}
            for item in classes):
         return None
-    if isinstance(expression, ast.BinOp) and len(classes) == 2:
+    # ``index += 1`` is the same operator as ``index + 1``.
+    if isinstance(expression, (ast.BinOp, ast.AugAssign)) and len(classes) == 2:
         if "builtins.float" in classes:
             return (
                 "builtins.float"
@@ -4913,7 +4914,44 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
         conditional_phi = (
             str(data.get("type") or data.get("op") or "").casefold() == "phi"
             and (data.get("attributes") or {}).get("source_conditional_id") is not None
+        ) or (
+            # ``7 if a > 0 else 3``: a conditional expression is the same
+            # merge of its two arms as an if-statement's phi.
+            isinstance(expression, ast.IfExp)
+            and str(data.get("type") or "") == "IfExp"
         )
+        loop_attributes = data.get("attributes") or {}
+        if (
+            isinstance(expression, ast.For)
+            and loop_attributes.get("iterator_kind") == "arithmetic_sequence"
+        ):
+            # Program: ``for i in range(10): total += i * 3``.  Wrong
+            # record: the counter had no class row, so no interval proof
+            # reached ``i * 3``.  Rule: ``range`` yields only ``int``; the
+            # body's target binding (one the body does not rebind) has that
+            # class, DERIVED from the loop node's cell.
+            rebound = {
+                *dict(loop_attributes.get("loop_carried_bindings") or {}),
+                *dict(loop_attributes.get("loop_break_bindings") or {}),
+            }
+            loop_cell = node_identity_cell(graph, int(node_id))
+            for name, target_id in dict(
+                loop_attributes.get("loop_target_bindings") or {}
+            ).items():
+                if name in rebound or target_id not in target or loop_cell is None:
+                    continue
+                target_value = int(
+                    target.nodes[target_id].get("value_id", target_id)
+                )
+                if page.latest((scope, target_value)) is not None:
+                    continue
+                _concord_source_value_class(
+                    scope, target_value, "builtins.int",
+                    source="range loop counter",
+                    provenance=_Derived((loop_cell,)),
+                )
+                changed = True
+            continue
         field_state = (data.get("attributes") or {}).get("record_field_state")
         initial_id = (data.get("attributes") or {}).get("initial_value_id")
         if (
@@ -5026,7 +5064,7 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             continue
         if conditional_phi:
             roles = ("body", "orelse")
-        elif isinstance(expression, (ast.BinOp, ast.Compare)):
+        elif isinstance(expression, (ast.BinOp, ast.AugAssign, ast.Compare)):
             roles = ("lhs", "rhs")
         elif isinstance(expression, ast.UnaryOp):
             roles = ("operand",)
@@ -5301,6 +5339,46 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             if isinstance(data.get("expr_obj"), ast.AST)
         }
         guards = []
+        # The values each loop carries (its bindings' pre-loop and updated
+        # values), by the loop statement.
+        loop_carried = {}
+        for _loop_id, loop_data in unit.G.nodes(data=True):
+            loop_statement = loop_data.get("expr_obj")
+            if not isinstance(loop_statement, (ast.For, ast.While)):
+                continue
+            loop_attributes = loop_data.get("attributes") or {}
+            loop_carried[id(loop_statement)] = frozenset(
+                unit.key(int(member))
+                for pairs in (
+                    loop_attributes.get("loop_carried_bindings") or {},
+                    loop_attributes.get("loop_break_bindings") or {},
+                )
+                for pair in dict(pairs).values()
+                for member in pair
+            )
+
+        def region(statements):
+            """Each AST node of ``statements``: the values a guard on entry
+            no longer bounds there.  A loop nested in the region rebinds the
+            values it carries on every iteration (one value id names them
+            all), so a guard read before the loop bounds none of them inside
+            it; a loop with no graph node bounds nothing inside it."""
+
+            covered = {}
+
+            def visit(node, excluded):
+                if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                    carried = loop_carried.get(id(node))
+                    if carried is None:
+                        return
+                    excluded = excluded | carried
+                covered[id(node)] = excluded
+                for child in ast.iter_child_nodes(node):
+                    visit(child, excluded)
+
+            for statement in statements:
+                visit(statement, frozenset())
+            return covered
 
         def leaves(node_id):
             data = unit.G.nodes.get(node_id, {})
@@ -5321,8 +5399,47 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 return []
             return [(kind, roles["lhs"], roles["rhs"])]
 
+        negated = {
+            "less": "greater_equal", "less_equal": "greater",
+            "greater": "less_equal", "greater_equal": "less",
+        }
+
+        def conjuncts(node_id):
+            """A ``while`` test's comparisons, each TRUE in the body, as
+            the disjunct (its negation) that is false there."""
+
+            data = unit.G.nodes.get(node_id, {})
+            expression = data.get("expr_obj")
+            if isinstance(expression, ast.BoolOp):
+                if not isinstance(expression.op, ast.And):
+                    return []
+                found = []
+                for parent, role in data.get("parents") or ():
+                    if str(role).startswith("value:"):
+                        found.extend(conjuncts(int(parent)))
+                return found
+            return [
+                (negated[kind], lhs, rhs)
+                for kind, lhs, rhs in leaves(node_id)
+            ]
+
         def walk(statements):
             for index, statement in enumerate(statements):
+                if (
+                    isinstance(statement, ast.While)
+                    and id(statement.test) in nodes_by_expression
+                ):
+                    # Program: ``index = 0; while index < 4: ...; index +=
+                    # 1`` (String Core's ``fingerprint_atom_step``).  Wrong
+                    # record: the carried ``index`` widened to unbounded, so
+                    # ``index + 1`` stayed overflow-checked.  Rule: the test
+                    # held when this iteration began, so a body read of the
+                    # SAME value the test compared (a rebinding is a new
+                    # value id) lies where every ``and``-ed comparison with
+                    # a constant holds.  The ``else`` arm is not the body.
+                    held = conjuncts(nodes_by_expression[id(statement.test)])
+                    if held:
+                        guards.append((region(statement.body), tuple(held)))
                 if (
                     isinstance(statement, ast.If)
                     and not statement.orelse
@@ -5332,12 +5449,9 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 ):
                     disjuncts = leaves(nodes_by_expression[id(statement.test)])
                     if disjuncts:
-                        dominated = {
-                            id(node)
-                            for later in statements[index + 1:]
-                            for node in ast.walk(later)
-                        }
-                        guards.append((dominated, tuple(disjuncts)))
+                        guards.append((
+                            region(statements[index + 1:]), tuple(disjuncts),
+                        ))
                 for field in ("body", "orelse", "finalbody", "handlers"):
                     nested = getattr(statement, field, None)
                     if isinstance(nested, list):
@@ -5361,7 +5475,7 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         low = high = None
         read = []
         for dominated, disjuncts in guards_of(unit):
-            if id(site) not in dominated:
+            if id(site) not in dominated or value_key in dominated[id(site)]:
                 continue
             for kind, lhs, rhs in disjuncts:
                 for value, constant, flipped in ((lhs, rhs, False), (rhs, lhs, True)):
@@ -5583,7 +5697,11 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         parents = {
             str(role): int(parent) for parent, role in data.get("parents") or ()
         }
-        if kind == "phi" and attributes.get("source_conditional_id") is not None:
+        if (
+            kind == "phi" and attributes.get("source_conditional_id") is not None
+        ) or (kind == "ifexp" and isinstance(expression, ast.IfExp)):
+            # An if-statement merge or a conditional expression
+            # (``7 if a > 0 else 3``) holds one of its arms: their join.
             if not {"body", "orelse"} <= set(parents):
                 return _INT_RANGE_TOP, ()
             arms = tuple(unit.key(parents[role]) for role in ("body", "orelse"))
@@ -5591,15 +5709,24 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             for arm in arms:
                 joined = _join_int_range(joined, current(arm))
             return joined, arms
-        if isinstance(expression, (ast.BinOp, ast.UnaryOp)):
+        if isinstance(expression, (ast.BinOp, ast.AugAssign, ast.UnaryOp)):
             roles = (
-                ("lhs", "rhs") if isinstance(expression, ast.BinOp)
+                ("lhs", "rhs")
+                if isinstance(expression, (ast.BinOp, ast.AugAssign))
                 else ("operand",)
             )
             if any(role not in parents for role in roles):
                 return _INT_RANGE_TOP, ()
             operand_keys = tuple(unit.key(parents[role]) for role in roles)
-            operands = tuple(current(operand) for operand in operand_keys)
+            # A guard dominating the operator narrows its operands there.
+            narrowed = tuple(
+                guarded(unit, node_id, operand, current(operand))
+                for operand in operand_keys
+            )
+            operands = tuple(interval for interval, _used in narrowed)
+            guard_reads = tuple(
+                read for _interval, used in narrowed for read in used
+            )
             if any(operand is None for operand in operands):
                 return None, ()
             interval, used = _builtin_int_operator_range(
@@ -5611,7 +5738,9 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             )
             if interval is None:
                 return _INT_RANGE_TOP, ()
-            return interval, tuple(operand_keys[position] for position in used)
+            return interval, (
+                *(operand_keys[position] for position in used), *guard_reads,
+            )
         if kind in {"indexed", "getitem", "subscript"} and {"base", "index"} <= set(parents):
             base, index = parents["base"], parents["index"]
             callee = callee_of(unit, base) if base in unit.G else None
@@ -5658,8 +5787,18 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             if returned is not None and len(returned) == 1:
                 return current(returned[0]), (returned[0],)
             return inherited(unit.key(node_id))
+        if data.get("type") == "Input" and attributes.get("binding_kind") == "loop":
+            loop = loop_targets.get((id(unit), int(node_id)))
+            if loop is None:
+                return inherited(unit.key(node_id))
+            return range_counter(unit, *loop)
         if data.get("type") == "Input" and attributes.get("binding_name") is not None:
             key = unit.key(node_id)
+            edge = called_formal_range(
+                unit, node_id, str(attributes["binding_name"]),
+            )
+            if edge is not None:
+                return edge
             actuals = formal_actuals.get(key)
             if actuals and key not in formal_incomplete:
                 joined, read = None, []
@@ -5672,6 +5811,99 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 return joined, tuple(read)
             return inherited(key)
         return inherited(unit.key(node_id))
+
+    # ``for i in range(a, b, s)`` loop targets: the Input each target binds
+    # in the body, its loop node and its zero-trip initial value (``None``:
+    # unbound before the loop).  A target the body rebinds is a carried
+    # binding, not the counter, and stays unproven here.
+    loop_targets: dict = {}
+    for unit in units:
+        for loop_id, data in unit.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            if attributes.get("iterator_kind") != "arithmetic_sequence":
+                continue
+            rebound = {
+                *dict(attributes.get("loop_carried_bindings") or {}),
+                *dict(attributes.get("loop_break_bindings") or {}),
+            }
+            initials = dict(attributes.get("loop_target_initials") or {})
+            for name, target in dict(
+                attributes.get("loop_target_bindings") or {}
+            ).items():
+                if name in rebound or target is None:
+                    continue
+                loop_targets[(id(unit), int(target))] = (
+                    int(loop_id), initials.get(name),
+                )
+
+    def settled(key):
+        """``current`` for a value the solver tracks; any other value (no
+        int class row) is unbounded, never an empty join."""
+
+        return current(key) if find(key) in classes else _INT_RANGE_TOP
+
+    def range_counter(unit, loop_id, initial):
+        """The interval of ``range(start, stop, step)``'s counter.
+
+        Every value the counter takes satisfies ``start <= i < stop`` for a
+        positive step and ``stop < i <= start`` for a negative one; with the
+        step's sign unknown it lies between the bounds.  A target bound
+        before the loop keeps that value when the range is empty.
+        """
+
+        loop = unit.G.nodes[loop_id]
+        loop_attributes = loop.get("attributes") or {}
+        roles = {
+            str(role): int(parent) for parent, role in loop.get("parents") or ()
+        }
+        bounds, read = {}, []
+        for role in ("start", "stop", "step"):
+            if role in roles:
+                key = unit.key(roles[role])
+                bounds[role] = settled(key)
+                read.append(key)
+            elif type(loop_attributes.get(role)) is int:
+                bounds[role] = (loop_attributes[role],) * 2
+            else:
+                return _INT_RANGE_TOP, ()
+        if any(bound is None for bound in bounds.values()):
+            return None, ()
+        if any(bound == _INT_RANGE_TOP for bound in bounds.values()):
+            return _INT_RANGE_TOP, ()
+        start, stop, step = bounds["start"], bounds["stop"], bounds["step"]
+        if step[0] > 0:
+            interval = (start[0], stop[1] - 1)
+        elif step[1] < 0:
+            interval = (stop[0] + 1, start[1])
+        else:
+            interval = (min(start[0], stop[0]), max(start[1], stop[1]))
+        # An interval with low > high: the body never runs, no value.
+        counter = interval if interval[0] <= interval[1] else None
+        if initial is not None:
+            initial_key = unit.key(int(initial))
+            counter = _join_int_range(counter, settled(initial_key))
+            read.append(initial_key)
+        return counter, tuple(read)
+
+    # A callsite-specialized copy's formal: the interval the called
+    # inventory recorded for the actuals of the callsites the copy was
+    # minted for (``called_inventory.post_call_edge_range``).
+    edge_cells: dict = {}
+
+    def called_formal_range(unit, node_id, name):
+        from ...compiler.concordance_declarations import CALL_EDGE_INT_RANGE
+
+        edge_row = dict(
+            unit.G.graph.get("called_formal_int_range_edges") or {}
+        ).get(name)
+        if edge_row is None:
+            return None
+        interval = book.page(CALL_EDGE_INT_RANGE).latest(tuple(edge_row))
+        cell = book.latest_ref(CALL_EDGE_INT_RANGE, tuple(edge_row))
+        if interval is None or cell is None:
+            return None
+        edge_cells.setdefault(unit.key(node_id), cell)
+        return (int(interval[0]), int(interval[1])), ()
 
     for _round in range(64 * max(1, len(classes))):
         round_changed = False
@@ -5698,6 +5930,17 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
     posted: list = []
     for key, (class_cell, _identity) in class_cells.items():
         interval = state.get(find(key))
+        # The node's lowered instruction carries its proof
+        # (``python_int_range``): a native lane checks or refuses only
+        # Python int arithmetic no interval bounds.
+        for unit, node_id in members[key]:
+            node_attributes = unit.G.nodes[node_id].setdefault("attributes", {})
+            if interval is None or interval == _INT_RANGE_TOP:
+                node_attributes.pop("python_int_range", None)
+            else:
+                node_attributes["python_int_range"] = (
+                    int(interval[0]), int(interval[1]),
+                )
         if interval is None or interval == _INT_RANGE_TOP:
             continue
         incumbent = range_page.latest(key)
@@ -5709,7 +5952,8 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             SOURCE_INT_RANGE, key, (int(interval[0]), int(interval[1])),
             stage=_REDUCTION,
             provenance=_Derived(tuple(
-                cell for cell in (class_cell, node_cell) if cell is not None
+                cell for cell in (class_cell, node_cell, edge_cells.get(key))
+                if cell is not None
             )),
             mode=_Mode.CONCORD,
         )

@@ -79,3 +79,27 @@ Python never computes. Both native lanes now check these ops
 `native_faults.INT_OVERFLOW` (NativeIntOverflow) instead. Stage 2 replaces the
 report with continuation as Precision limbs. Test:
 tests/test_native_int_overflow_checked.py.
+
+## The rest of unproven int64 arithmetic (Precision adaptor stage 1, cont.)
+
+On an unproven int64 both native lanes lowered `a << b` unchecked (and as
+poison/UB past 63), `a >> b` as a LOGICAL shift (`-8 >> 1` gave 2**63 - 4),
+`a // b` and `a % b` as raw `sdiv`/`srem` (division by zero and
+`-2**63 // -1` trapped the host process), `abs(-2**63)` and C's unary `-`
+wrapped, and `sum(xs)` / `pow(n, 2)` reductions added unchecked. They now give
+Python's value or a named fault: NativeIntOverflow (86), NativeValueError for
+a negative shift count (87), NativeZeroDivisionError (88). JavaScript, WASM
+and GLSL (32-bit int or double storage) refuse such instructions by name;
+WGSL already refused int64. Test: tests/test_native_int_overflow_checked.py.
+
+A `range(start, stop, step)` loop latch added `i + step` unchecked, so a
+range ending near INT64_MAX wrapped and never terminated. The step now
+saturates (`loop_induction_step`: `llvm.sadd.sat.i64`, `__builtin_add_overflow`
+then INT64_MAX/INT64_MIN), which the header compare ends exactly where Python
+does, for either step sign.
+
+Checks and refusals are interval-aware: `_solve_int_ranges` stamps a proven
+interval on the source node (`python_int_range`), which the instruction
+carries. A result proven inside int64 is unchecked on C/LLVM; JS/WASM/GLSL
+refuse only results not proven inside their exact ints (2**53 for doubles,
+int32 for i32/GLSL int).
