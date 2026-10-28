@@ -51085,6 +51085,33 @@ def _class_surface_ssa_program(
                             result = call_arguments[
                                 int(aliased_return_argument_index)
                             ]
+                            # Program: ``def keep(m): m.v = 0.5; return m``
+                            # called as ``keep(metrics)``.  Wrong record: the
+                            # call record's result binding named the semantic
+                            # record handle (callee 0 -> caller 1) while the
+                            # call's result is the returned formal's caller
+                            # storage (formal 1 -> caller 3), a pair no record
+                            # held, so the frame-aliased projection refused.
+                            # Rule: when the live Ret value is a formal, the
+                            # record carries that exact pair beside the
+                            # handle pair.
+                            aliased_result_pair = (
+                                int(callee.args[
+                                    int(aliased_return_argument_index)
+                                ].id),
+                                int(caller_result_id),
+                            )
+                            if aliased_result_pair not in tuple(
+                                (int(a), int(b))
+                                for a, b in record.result_bindings
+                            ):
+                                record = replace(
+                                    record,
+                                    result_bindings=(
+                                        *record.result_bindings,
+                                        aliased_result_pair,
+                                    ),
+                                )
                             callee_sequence_table = all_sequence_tables.get(
                                 str(record.callee_symbol)
                             )
