@@ -25,6 +25,33 @@ if unknown_backends:
 FORTRAN_STANDALONE = os.environ.get("TYPED_CHECK_FORTRAN_STANDALONE", "1") != "0"
 
 
+def _scalar_list(v):
+    return isinstance(v, list) and bool(v) and all(
+        isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+
+
+def _feeds(module, export, params, feeds):
+    """The root's input buffers.  A scalar parameter is a one-element array.
+    A list parameter is its ABI: the column storage holds the rows, and the
+    descriptor's length and capacity cells (caller inputs, not compile-time
+    sizes) hold len(list); nothing is fed that the descriptor does not name."""
+
+    out = {}
+    table = module.sequence_tables.get(export)
+    for name, v in feeds.items():
+        if not _scalar_list(v):
+            out[params[name]] = np.array([v])
+            continue
+        descriptor = next(
+            d for d in table.sequences.values()
+            if int(d.column_value_ids[0]) == int(params[name])
+        )
+        out[params[name]] = np.array(v)
+        out[int(descriptor.length_address_id)] = np.array([len(v)])
+        out[int(descriptor.capacity_value_id)] = np.array([len(v)])
+    return out
+
+
 def judge(feeds, expect, flat, kinds):
     exp = list(expect) if isinstance(expect, tuple) else [expect]
     # An integer answer is exact: a float64 round trip of 6 * (2**55 + 1)
@@ -52,7 +79,7 @@ def run_llvm(module, export, params, outs, inputs, expects):
     results, values = [], []
     for feeds, expect in zip(inputs, expects):
         try:
-            ex = prepare_artifact_execution(art, {params[k]: np.array([v]) for k, v in feeds.items()}).run()
+            ex = prepare_artifact_execution(art, _feeds(module, export, params, feeds)).run()
             arrays = [np.asarray(ex.buffers[v.id]) for v in outs]
             flat = [x for a in arrays for x in a.reshape(-1).tolist()]
             values.append(flat)
@@ -121,7 +148,7 @@ def run_fortran(module, export, params, outs, inputs, expects):
     results, values = [], []
     for feeds, expect in zip(inputs, expects):
         try:
-            ex = native.prepare_execution({params[k]: np.array([v]) for k, v in feeds.items()}).run()
+            ex = native.prepare_execution(_feeds(module, export, params, feeds)).run()
             arrays = [np.asarray(ex.buffers[v.id]) for v in outs]
             flat = [x for a in arrays for x in a.reshape(-1).tolist()]
             values.append(flat)
@@ -184,8 +211,19 @@ def main():
 def check_group(path, src, inputs, expects, inventory, label=None):
     if True:
         label = label or path.stem
+        # The harness feeds each root parameter as a one-element array.  A
+        # container has no such form (its storage, length and capacity are
+        # its own ABI), so running it reported a false WRONG for a program
+        # nothing had judged.  Say what is true: it was not run.
+        containers = sorted({
+            k for feeds in inputs for k, v in feeds.items()
+            if isinstance(v, (list, tuple, dict, set, frozenset)) and not _scalar_list(v)
+        })
+        if containers:
+            print(f"{label}: CANNOT-FEED container root parameter(s) {containers}; not run (only lists of numbers are fed)")
+            return
         try:
-            module, _, exports = lower_ast_source_to_ssa(src, "root", name="corpus_" + path.stem + ("" if inventory is None else "__" + "_".join(inventory[1].values())), extraction_contract=ROOT + "/extraction_contracts/program_extraction.yaml", progress=lambda _: None, **({} if inventory is None else dict(root_calls=inventory[0], root_signature=inventory[1])))
+            module, _, exports = lower_ast_source_to_ssa(src, "root", name="corpus_" + path.stem + ("" if inventory is None else "__" + "_".join(v.replace("[", "_").replace("]", "") for v in inventory[1].values())), extraction_contract=ROOT + "/extraction_contracts/program_extraction.yaml", progress=lambda _: None, **({} if inventory is None else dict(root_calls=inventory[0], root_signature=inventory[1])))
         except Exception as e:
             print(f"{label}: LOWER-FAIL {type(e).__name__}: {str(e)[:300]}"); return
         rep = " ".join(l.strip() for l in concordance_report(module, limit=3).splitlines()[:1] + [l for l in concordance_report(module, limit=3).splitlines() if l.startswith("     ")][:2])
@@ -206,7 +244,7 @@ def check_group(path, src, inputs, expects, inventory, label=None):
         c_values = []
         for feeds, expect in zip(inputs, expects):
             try:
-                ex = art.prepare_execution({params[k]: np.array([v]) for k, v in feeds.items()}).run()
+                ex = art.prepare_execution(_feeds(module, exports[0], params, feeds)).run()
                 got = [ex.buffers[v.id].reshape(-1).tolist() for v in outs]
                 kinds = [ex.buffers[v.id].dtype.kind for v in outs]
                 flat = [x for g in got for x in g]

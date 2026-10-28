@@ -162,6 +162,7 @@ from .resident_sequence_materialization import (
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
     list_row_displays as list_row_displays,
+    dict_row_displays as dict_row_displays,
     list_row_reads as list_row_reads,
     list_row_pool_extents as list_row_pool_extents,
     _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
@@ -11080,6 +11081,10 @@ def _field_slot_ops(
             continue
         if aggregate_kind == "array" and attributes.get("producer_kind") != "sequence_materialization":
             continue
+        if attributes.get("mapping_display_child"):
+            # A list value of a dict display is a row of the mapping's child
+            # pool, born by the display; it is not a second allocation.
+            continue
         if attributes.get("producer_kind") in {"mapping_default_result", "mapping_lookup_result"}:
             # A setdefault result selects the mapping's child pool. It is
             # not another list allocation; its mutation uses that row view.
@@ -11541,11 +11546,19 @@ def _field_slot_ops(
                         source_data.setdefault("attributes", {})[
                             "sequence_column_dtypes"
                         ] = (str(declared_dtype),)
-                sequence_initializations.append((
-                    int(source_id),
-                    "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
-                    int(constructor_mapping_contracts.get(int(source_id), {}).get("mapping_key_column_count", 1)) + _mapping_value_column_count(constructor_mapping_contracts.get(int(source_id), {})) if aggregate_kind == "dict" else 1,
-                ))
+                # A field written from a constructor PARAMETER is the
+                # caller's own list (rule 8: one owner, the actual's
+                # storage).  Its descriptor is the formal's, born by the
+                # caller; initializing it here would reset the caller's
+                # length to zero (``Bag(a)`` read back an empty ``a``).
+                if (source_data.get("attributes") or {}).get(
+                    "binding_kind"
+                ) != "parameter":
+                    sequence_initializations.append((
+                        int(source_id),
+                        "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
+                        int(constructor_mapping_contracts.get(int(source_id), {}).get("mapping_key_column_count", 1)) + _mapping_value_column_count(constructor_mapping_contracts.get(int(source_id), {})) if aggregate_kind == "dict" else 1,
+                    ))
                 storage_identity = f"{owner}.{canonical_field(str(attribute))}"
                 if storage_identity in retained_storage_identities:
                     retained_sequence_ids.add(int(source_id))
@@ -16210,7 +16223,7 @@ def _install_lexical_sequence_queries(
         # born list of lists is a resident row sequence of its own, so its
         # length is the resident length query, as ``len(xs)`` is.
         list_row_query = (
-            expression.func.id in {"bool", "len"}
+            expression.func.id in {"bool", "len", "sum"}
             and len(arguments) == 1
             and int(sequence_data.get("value_id", sequence_id))
                 in set(map(int, list_row_reads(graph_obj)))
@@ -28012,6 +28025,20 @@ def _class_surface_ssa_program(
             nested_sequence_ids = tuple(sorted({
                 *map(int, nested_sequence_ids), *local_list_rows,
             }))
+        local_dict_rows = dict_row_displays(graph_obj)
+        if local_dict_rows:
+            # The rows of a mapping of lists are pool slices born at the dict
+            # display, with no arena of their own.
+            dict_row_ids = {
+                row for rows in local_dict_rows.values() for row, _node in rows
+            }
+            sequence_declarations = tuple(
+                declaration for declaration in sequence_declarations
+                if int(declaration[0]) not in dict_row_ids
+            )
+            nested_sequence_ids = tuple(sorted({
+                *map(int, nested_sequence_ids), *local_dict_rows,
+            }))
         if conditional_sequence_destinations:
             sequence_declarations = tuple(
                 (
@@ -28286,7 +28313,13 @@ def _class_surface_ssa_program(
             graph_obj, joined_sequence_ids
         )
         literal_mutations = (*joined_literal_mutations, *_list_literal_mutations(
-            graph_obj, declared_sequence_ids - set(joined_sequence_ids) - native_handle_ids,
+            graph_obj,
+            declared_sequence_ids - set(joined_sequence_ids) - native_handle_ids
+            # A mapping of lists births its rows at the dict display.
+            - {
+                row for rows in dict_row_displays(graph_obj).values()
+                for row, _node in rows
+            },
         ))
         if glyph_sequence_mutations or token_glyph_mutations or literal_mutations:
             control, joined_literal_shortfalls = (
@@ -28981,6 +29014,25 @@ def _class_surface_ssa_program(
 
         for outer_id in local_list_rows:
             nested_descriptor_sequence_dtypes[int(outer_id)] = ("int64",)
+        # A dict display of lists: key column(s), then the row-handle column.
+        for outer_id in local_dict_rows:
+            outer_data = next((
+                data for node, data in graph_obj.nodes(data=True)
+                if int(data.get("value_id", node)) == int(outer_id)
+            ), {})
+            key_values = [
+                graph_obj.nodes[parent].get("attributes") or {}
+                for parent, role in outer_data.get("parents") or ()
+                if str(role).startswith("keys") and parent in graph_obj
+            ]
+            if key_values and all(
+                isinstance(item.get("value"), int)
+                and not isinstance(item.get("value"), bool)
+                for item in key_values
+            ):
+                nested_descriptor_sequence_dtypes[int(outer_id)] = (
+                    "int64", "int64",
+                )
 
         self_record_fields = dict(
             (declared_parameter_records.get("self") or {}).get("fields") or {}
@@ -30358,6 +30410,20 @@ def _class_surface_ssa_program(
                         )
                         for outer_id, rows in local_list_rows.items()
                     },
+                    # A dict display of lists: the handle follows the key
+                    # column; a row holds the class its lists share.
+                    **{
+                        int(outer_id): (
+                            1,
+                            (str(next((
+                                planned_sequence_elements[int(row)]
+                                for row, _node in rows
+                                if planned_sequence_elements.get(int(row))
+                            ), "int64")),),
+                            (), True,
+                        )
+                        for outer_id, rows in local_dict_rows.items()
+                    },
                 },
                 sequence_row_record_slots=_sequence_row_record_slots(
                     graph_obj, sequence_declarations
@@ -31067,7 +31133,7 @@ def _class_surface_ssa_program(
             module_ir.functions[symbol].metadata["static_mapping_capacity_bounds"] = (
                 dict(sequence_capacity_bounds)
             )
-            if local_list_rows:
+            if local_list_rows or local_dict_rows:
                 module_ir.functions[symbol].metadata[
                     "child_pool_static_extents"
                 ] = tuple(
@@ -44520,6 +44586,22 @@ def _class_surface_ssa_program(
                     caller_aliases = _concordant_function_aliases(caller)
                     for parameter_id in constructor_parameter_ids:
                         actual_id = int(remap[parameter_id])
+                        # Rule 8: an actual that is a forwarded call result
+                        # (``Bag(same(a))``) is the argument's own list.  The
+                        # constructor's list field is that ONE sequence, so
+                        # the formal binds the resident root's descriptor, not
+                        # a second sequence naming the same members.
+                        resident_actual = int(caller_aliases.get(actual_id, actual_id))
+                        if (
+                            resident_actual != actual_id
+                            and caller_sequences.by_id(actual_id) is None
+                            and caller_sequences.by_id(resident_actual) is not None
+                            and constructor_sequences.by_id(int(constructor_aliases.get(
+                                parameter_id, parameter_id,
+                            ))) is not None
+                        ):
+                            actual_id = resident_actual
+                            remap[parameter_id] = actual_id
                         _bind_sequence_storage_members(
                             remap,
                             constructor_sequences.by_id(int(constructor_aliases.get(

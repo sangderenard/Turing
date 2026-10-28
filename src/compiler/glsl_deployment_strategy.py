@@ -3760,6 +3760,83 @@ def _post_region_value_obligation(graph: Any, value_id: int) -> None:
     )
 
 
+def _owe_host_scalar_class(graph: Any, value_id: int) -> bool:
+    """Record that a host-scalar operand has no settled class yet.
+
+    The descriptor query found neither a ``source_value_class`` cell nor a
+    planned scalar dtype for ``value_id``: it posts the same open obligation
+    a non-terminal freeze posts for a region value (``region_value_dtype``,
+    ``Unresolved``), to be settled when the class arrives or refused by name
+    by the terminal freeze.  A graph that has not been canonically relabelled
+    is the pre-lowering root graph: its value ids are object addresses
+    (``id()``), reduction-local and unique only within that reduction, and a
+    lowering pass has not run on it, so it has no class to owe and posts
+    nothing.  Returns whether an obligation was posted.
+    """
+
+    if not graph.G.graph.get("canonical_value_ids"):
+        return False
+    if int(value_id) not in graph.G:
+        return False
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    try:
+        node_identity_cell(graph, int(value_id))
+    except ValueError:
+        # An obligation is DERIVED from the value's identity cell; a node
+        # that never entered the book has nothing to be owed against.
+        return False
+    _post_region_value_obligation(graph, int(value_id))
+    return True
+
+
+def _refuse_unsettled_host_scalars(graph: Any, planned_dtypes: Any) -> None:
+    """The terminal freeze: settle each owed host-scalar class or refuse it.
+
+    Reads, in order, the value's ``source_value_class`` cell and the planner's
+    settled scalar dtype; a value with neither is refused naming its
+    function, op and binding.
+    """
+
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from .concordance_declarations import SOURCE_VALUE_CLASS
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    scope = _source_numeric_scope(graph.G)
+    for value_id in outstanding_region_value_obligations(graph):
+        if int(value_id) not in graph.G:
+            continue
+        class_fact = book.page(SOURCE_VALUE_CLASS).latest((scope, int(value_id)))
+        class_cell = book.latest_ref(SOURCE_VALUE_CLASS, (scope, int(value_id)))
+        dtype = {
+            "builtins.int": "int64", "builtins.bool": "bool",
+            "builtins.float": "float64",
+        }.get(
+            str(class_fact[0])
+            if isinstance(class_fact, tuple) and class_fact else ""
+        ) or planned_dtypes.get(int(value_id))
+        if dtype is None and isinstance(class_fact, tuple) and class_fact:
+            # A recorded class with no element dtype (``None``, a record,
+            # a string) is a settled non-scalar: the obligation closes on it.
+            dtype = str(class_fact[0])
+        if dtype is not None:
+            _settle_region_value_obligation(
+                graph, int(value_id), dtype,
+                () if class_cell is None else (class_cell,),
+            )
+            continue
+        node = graph.G.nodes[int(value_id)]
+        binding = (node.get("attributes") or {}).get("binding_name")
+        raise ValueError(
+            f"value {int(value_id)} ({node.get('op') or node.get('type')}"
+            + (f" {binding!r}" if binding is not None else "")
+            + f" in function {graph.G.graph.get('function_name')!r}) was "
+            "consumed as a host scalar but has no source_value_class cell "
+            "and no planned scalar dtype"
+        )
+
+
 def _dtype_producer_cells(graph: Any, value_id: int, *extra: Any) -> tuple:
     """The cells that proved a region value's type, as the book holds them.
 
@@ -6004,6 +6081,9 @@ def _build_shell_hierarchy_plan(
         )
         if int(value_id) in graph.G
     }
+
+    if terminal:
+        _refuse_unsettled_host_scalars(graph, planned_scalar_dtypes())
 
     planned = PlanClosure(
         name=str(
@@ -25174,7 +25254,10 @@ def _tensor_descriptor_rule(
                         if isinstance(host_class, tuple) and host_class
                         else ""
                     )
-                    if host_dtype is None:
+                    class_cell = _host_book().latest_ref(_HOST_CLASS, (
+                        _host_scope(graph.G), int(operand),
+                    ))
+                    if host_dtype is None and host_class is None:
                         # Next record: the planner's proven scalar dtype
                         # for this value (literals, range targets, region
                         # operator rules, collection element joins).
@@ -25187,6 +25270,22 @@ def _tensor_descriptor_rule(
                             memo = (stamp, _planned_scalar_dtypes(graph))
                             graph.G.graph["_host_scalar_planned"] = memo
                         host_dtype = memo[1].get(int(operand))
+                    if host_dtype is not None:
+                        # The class is settled: close the value's open
+                        # obligation (if the query owed one) citing it.
+                        _settle_region_value_obligation(
+                            graph, int(operand), host_dtype,
+                            () if class_cell is None else (class_cell,),
+                        )
+                    elif host_class is None:
+                        # No class cell, no planned dtype: the value is
+                        # unsettled.  The query records that as an open
+                        # obligation (``refresh_hierarchy_plan(terminal=True)``
+                        # settles or refuses it by name) rather than raising
+                        # mid-fixpoint.  A value whose class IS recorded but
+                        # has no element dtype (``None``, a record, a
+                        # string) is settled as a non-scalar, not owed.
+                        _owe_host_scalar_class(graph, int(operand))
                     if host_dtype is None:
                         continue
                     sides[index] = {
@@ -25911,8 +26010,11 @@ def _tensor_descriptor_rule(
                         break
                     path.insert(0, int(top_index))
                     top = top_base
+                # A dict's subscript is a key lookup: its leaves are keys and
+                # values in display order, not positional members.
                 if (
                     leaves
+                    and base_attributes.get("aggregate_kind") != "dict"
                     and isinstance(index, int)
                     and not isinstance(index, bool)
                     and -len(leaves) <= index < len(leaves)
