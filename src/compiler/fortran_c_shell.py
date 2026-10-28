@@ -210,20 +210,17 @@ def _loop_rebound_value_ids(function: Any) -> frozenset:
     case and costs one page lookup.
     """
 
-    try:
-        from .identity_concordance import (
-            current_identity_book, loop_scope_declarations,
-        )
+    from .identity_concordance import (
+        current_identity_book, loop_scope_declarations,
+    )
 
-        return frozenset(
-            int(rebind["outer"])
-            for declaration in loop_scope_declarations(
-                current_identity_book(), str(function.name),
-            )
-            for rebind in declaration["rebinds"]
+    return frozenset(
+        int(rebind["outer"])
+        for declaration in loop_scope_declarations(
+            current_identity_book(), str(function.name),
         )
-    except Exception:
-        return frozenset()
+        for rebind in declaration["rebinds"]
+    )
 
 
 def _concordant_function_aliases(

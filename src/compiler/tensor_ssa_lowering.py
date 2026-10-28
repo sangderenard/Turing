@@ -559,10 +559,7 @@ def _settle_operand_shapes(
     known rather than on what was cached.
     """
 
-    try:
-        from .identity_concordance import proven_shape_of, shape_scope_of
-    except Exception:
-        return
+    from .identity_concordance import proven_shape_of, shape_scope_of
     # The shapes proven for the COPY this function was lowered from; a
     # sibling specialization's proofs live in its own scope.
     scope = shape_scope_of(function)
@@ -578,10 +575,7 @@ def _settle_operand_shapes(
         # that it speaks for itself.
         if (value.accounting or {}).get("ssa_storage_view"):
             continue
-        try:
-            settled = proven_shape_of(scope, int(value.id))
-        except Exception:
-            continue
+        settled = proven_shape_of(scope, int(value.id))
         if settled and tuple(value.shape or ()) != settled:
             # The call-edge concordance has already proved that this helper
             # has no single formal shape.  A nonempty shape on its exact
@@ -953,16 +947,13 @@ def _record_ssa_shape(function: Any, value: Any) -> None:
     ``function`` was lowered from -- the key every other shape store uses, so
     a value whose stores disagree is one row."""
 
-    try:
-        from .identity_concordance import current_identity_book, shape_scope_of
+    from .identity_concordance import current_identity_book, shape_scope_of
 
-        extents = tuple(int(e) for e in (value.shape or ()))
-        if not extents:
-            return
-        page = current_identity_book().page("shape.ssa")
-        page.set((shape_scope_of(function), int(value.id)), 0, extents)
-    except Exception:
-        pass
+    extents = tuple(int(e) for e in (value.shape or ()))
+    if not extents:
+        return
+    page = current_identity_book().page("shape.ssa")
+    page.set((shape_scope_of(function), int(value.id)), 0, extents)
 
 
 def _used_value_ids(module: IRModule) -> set[int]:
@@ -1424,22 +1415,19 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
                         ),
                         "shape_settlement_tie_policy": "unanimous",
                     }
-                    try:
-                        from .identity_concordance import (
-                            record_proven_shape,
-                            shape_scope_of,
-                        )
+                    from .identity_concordance import (
+                        record_proven_shape,
+                        shape_scope_of,
+                    )
 
-                        record_proven_shape(
-                            shape_scope_of(function), int(result.id), shape,
-                            result.dtype or next((
-                                source.dtype for source in sources
-                                if source.dtype is not None
-                            ), None),
-                            None,
-                        )
-                    except Exception:
-                        pass
+                    record_proven_shape(
+                        shape_scope_of(function), int(result.id), shape,
+                        result.dtype or next((
+                            source.dtype for source in sources
+                            if source.dtype is not None
+                        ), None),
+                        None,
+                    )
                     table = getattr(module, "tensor_tables", {}).get(
                         function_name
                     )
@@ -5974,19 +5962,16 @@ def lower_tensor_calls_to_repository_ssa(
                         source.shape or ()
                     ):
                         result.shape = tuple(source.shape)
-                        try:
-                            from .identity_concordance import (
-                                record_proven_shape,
-                                shape_scope_of,
-                            )
+                        from .identity_concordance import (
+                            record_proven_shape,
+                            shape_scope_of,
+                        )
 
-                            record_proven_shape(
-                                shape_scope_of(function), int(result.id),
-                                tuple(source.shape),
-                                result.dtype or source.dtype,
-                            )
-                        except Exception:
-                            pass
+                        record_proven_shape(
+                            shape_scope_of(function), int(result.id),
+                            tuple(source.shape),
+                            result.dtype or source.dtype,
+                        )
                     callee = _CAST_OPERATIONS[operation]
                     dtype_hint = str(
                         _attribute(instruction.attributes, "dtype", "target_dtype")
@@ -6346,19 +6331,16 @@ def lower_tensor_calls_to_repository_ssa(
                     # holds a different SSAValue carrying the same id, so the
                     # fact belongs to the identity, not to the occurrence --
                     # record it where every occurrence can read it.
-                    try:
-                        from .identity_concordance import (
-                            record_proven_shape,
-                            shape_scope_of,
-                        )
+                    from .identity_concordance import (
+                        record_proven_shape,
+                        shape_scope_of,
+                    )
 
-                        record_proven_shape(
-                            shape_scope_of(function), int(result.id),
-                            tuple(source.shape),
-                            result.dtype or source.dtype,
-                        )
-                    except Exception:
-                        pass
+                    record_proven_shape(
+                        shape_scope_of(function), int(result.id),
+                        tuple(source.shape),
+                        result.dtype or source.dtype,
+                    )
                     axis = _attribute(instruction.attributes, "axis", "dim")
                     if axis is None:
                         axis = next((item for item in metadata if isinstance(item, (int, float))), 0)
