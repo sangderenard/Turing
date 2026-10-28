@@ -31032,6 +31032,7 @@ def _callsite_specialized_shell_type(
     # What each argument is, as the caller's concordance states it.  The
     # specialization's parameters are exactly these values.
     parameter_classes: dict[str, tuple[str, int]] = {}
+    parameter_element_classes: dict[str, str] = {}
     # Keep the exact cells which proved those classes.  A specialized copy
     # must not turn an accepted caller fact back into an unsourced callee
     # fact merely because the compact metadata receipt stores the spelling
@@ -31086,6 +31087,13 @@ def _callsite_specialized_shell_type(
         parameter = str(parameter)
         bound_parameters.add(parameter)
         class_fact = caller_class_page.latest((caller_scope, int(parent)))
+        # The actual's element class (``list[int]`` against ``list[float]``)
+        # is part of the signature the copy is built for: the called
+        # inventory's classes for the formal are exact.
+        element_class = ((caller.G.nodes[int(parent)].get("attributes") or {})
+                         .get("sequence_element_class_ref"))
+        if element_class is not None:
+            parameter_element_classes[parameter] = str(element_class)
         if isinstance(class_fact, tuple) and len(class_fact) >= 2:
             parameter_classes[parameter] = (
                 str(class_fact[0]), max(int(class_fact[1]), 1),
@@ -31290,6 +31298,7 @@ def _callsite_specialized_shell_type(
             for name, value in record_descriptors.items()
         )),
         tuple(sorted(parameter_classes.items())),
+        tuple(sorted(parameter_element_classes.items())),
     )
     key = (
         tuple(policy.items()), generation,
@@ -31405,6 +31414,9 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_parameter_classes"] = dict(
         parameter_classes
+    )
+    specialized.G.graph["planner_parameter_element_classes"] = dict(
+        parameter_element_classes
     )
     specialized.G.graph["planner_parameter_class_cells"] = dict(
         parameter_class_cells
