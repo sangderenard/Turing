@@ -5952,15 +5952,52 @@ class _ControlSSABuilder(TiledObject):
             del self.consumer_row_loads[value_id]
             self._emit_sequence_row_load(*consumer_row_load)
         sequence_id = self.sequence_length_values.get(value_id)
-        if sequence_id is not None and value_id not in self.external_values:
+        # Program: ``while len(out) > 1 and out[len(out) - 1] == 0:
+        # out.pop()``.  Wrong record: a ``len`` is loaded where its value is
+        # first consumed and then stays bound, so the latch's re-evaluation
+        # of the test reused the ENTRY test's loads: ``len(out) > 1`` tested
+        # the length before any pop, and the ``len`` under the ``and`` read
+        # a load defined only in the entry test's short-circuit arm (a value
+        # that does not dominate the latch).  Rule: a length the loop test
+        # reads is read again by each re-evaluation of that test -- the
+        # latch's load is the length's next generation.
+        latch_rereads = self.__dict__.get("_latch_length_rereads")
+        reread = (
+            latch_rereads is not None
+            and value_id in latch_rereads
+            and value_id in self.external_values
+            and sequence_id is not None
+            and int(sequence_id) not in self.native_object_source_ids
+            and int(sequence_id) in self.sequence_descriptors
+        )
+        if sequence_id is not None and (
+            value_id not in self.external_values or reread
+        ):
             if int(sequence_id) in self.native_object_source_ids:
                 self._emit_native_object_operation('length', int(sequence_id), (), value_id)
             descriptor = self.sequence_descriptors.get(int(sequence_id))
+            condition_lengths = self.__dict__.get("_condition_length_reads")
+            if condition_lengths and descriptor is not None:
+                condition_lengths[-1].add(value_id)
             if descriptor is not None:
                 length_cell = self.sequence_storage_values[int(sequence_id)][
                     len(descriptor.column_value_ids)
                 ]
-                value = SSAValue(value_id, dtype="int64")
+                if reread:
+                    previous = self.external_values[value_id]
+                    latch_rereads.discard(value_id)
+                    self._latch_length_previous[value_id] = previous
+                    value = self.fresh_value(
+                        dtype="int64",
+                        transform=VERSIONED_WRITE,
+                        operands=(self._binding_cell(value_id), previous),
+                    )
+                    value.accounting.update({
+                        **dict(previous.accounting or {}),
+                        "source_value_id": value_id,
+                    })
+                else:
+                    value = SSAValue(value_id, dtype="int64")
                 if descriptor.live_flags_value_id is not None:
                     # Program: ``d = {1: n, 2: 3}; del d[1]; len(d)``.
                     # Wrong record: ``len`` loaded the length cell, which
@@ -21796,13 +21833,22 @@ class _ControlSSABuilder(TiledObject):
             )
             else None
         )
-        self.lower(loop.condition, path=f"{path}.condition.initial")
-        preheader = self.current
-        initial_predicate = (
-            self.lower_control_expression(loop.predicate_expression)
-            if loop.predicate_expression is not None
-            else self.external_value(loop.predicate_value_id, dtype="bool")
+        # The lengths the entry test loads: the latch's test loads them
+        # again (``external_value``'s ``_latch_length_rereads``).
+        condition_length_reads = self.__dict__.setdefault(
+            "_condition_length_reads", [],
         )
+        condition_length_reads.append(set())
+        try:
+            self.lower(loop.condition, path=f"{path}.condition.initial")
+            preheader = self.current
+            initial_predicate = (
+                self.lower_control_expression(loop.predicate_expression)
+                if loop.predicate_expression is not None
+                else self.external_value(loop.predicate_value_id, dtype="bool")
+            )
+        finally:
+            test_length_ids = condition_length_reads.pop()
         next_predicate = self.fresh_value(
             dtype="bool", transform=CONTROL_PREDICATE,
             operands=(initial_predicate, loop_cell),
@@ -22242,6 +22288,11 @@ class _ControlSSABuilder(TiledObject):
             latch_frame["latch"] = True
         latch_generation = self.__dict__.get("_latch_test_generation", False)
         self._latch_test_generation = True
+        outer_length_rereads = self.__dict__.get("_latch_length_rereads")
+        outer_length_previous = self.__dict__.get("_latch_length_previous")
+        self._latch_length_rereads = set(test_length_ids)
+        self._latch_length_previous = {}
+        latch_length_previous = self._latch_length_previous
         try:
             if not carried_test:
                 # A carried test (``while go:``) has no latch computation:
@@ -22264,6 +22315,8 @@ class _ControlSSABuilder(TiledObject):
                     latch_leaf = latch_predicate
         finally:
             self._latch_test_generation = latch_generation
+            self._latch_length_rereads = outer_length_rereads
+            self._latch_length_previous = outer_length_previous
             if latch_frame is not None:
                 latch_frame["latch"] = False
             self.enclosing_loop_states.pop()
@@ -22273,6 +22326,10 @@ class _ControlSSABuilder(TiledObject):
         for initial_id, previous in latch_restore:
             # RESTORED: post-loop consumers read the header Phi again.
             self._withdraw(initial_id, previous, loop_cell)
+        # The latch's length loads do not dominate the exit; the entry
+        # test's do.
+        for length_id, previous in latch_length_previous.items():
+            self._withdraw(length_id, previous, loop_cell)
         if latch_leaf is None and not any(
             instruction.res is next_predicate
             for instruction in self.current.instrs
@@ -27449,7 +27506,54 @@ def _schedule_loop_callsites(
                 reads_since_write: dict[int, list[int]] = {}
                 last_terminal = None
                 terminal_guard_candidates: list[tuple[int, int]] = []
-                for position, child in enumerate(run):
+                # Program: ``while len(out) > 1 and out[len(out) - 1] == 0:
+                # out.pop()`` then ``if len(out) == 1: out[0] = 0`` (and
+                # ``if out[-1] == 0: out.pop()``).  Wrong record: the regions
+                # producing a conditional's predicate stay in the flat
+                # schedule and sat AFTER the ``ConditionalBlock`` in this
+                # run, so the walk below met the arm's write of ``out``
+                # before the predicate's read of it and ordered that read
+                # after the write (RAW), while the predicate value orders it
+                # before: a cycle.  Rule: a statement's accesses follow those
+                # of every statement whose value it consumes, wherever the
+                # run places that producer -- the walk visits a statement's
+                # value producers (transitively) before it.
+                value_prerequisites: dict[int, set[int]] = {}
+                for (prerequisite, current), reasons in dependency_reasons.items():
+                    if any(
+                        isinstance(reason, tuple) and reason
+                        and reason[0] in {"value", "birth"}
+                        for reason in reasons
+                    ):
+                        value_prerequisites.setdefault(
+                            int(current), set()
+                        ).add(int(prerequisite))
+                access_order: list[int] = []
+                access_visited: set[int] = set()
+                for start in range(len(run)):
+                    if start in access_visited:
+                        continue
+                    access_visited.add(start)
+                    stack = [(start, iter(sorted(
+                        value_prerequisites.get(start, ())
+                    )))]
+                    while stack:
+                        position, pending = stack[-1]
+                        prerequisite = next(
+                            (candidate for candidate in pending
+                             if candidate not in access_visited),
+                            None,
+                        )
+                        if prerequisite is None:
+                            stack.pop()
+                            access_order.append(position)
+                            continue
+                        access_visited.add(prerequisite)
+                        stack.append((prerequisite, iter(sorted(
+                            value_prerequisites.get(prerequisite, ())
+                        ))))
+                for position in access_order:
+                    child = run[position]
                     reads, writes = sequence_accesses(child)
                     # Program: ``xs = [n, 4]; ys = [0]; grow(ys, 2)``, then
                     # ``head(xs) + width(ys) * 10 + ys[-1]`` (c193).  A call
@@ -32671,7 +32775,15 @@ def lower_control_sections_to_ssa(
                                 previous_signature = region_signatures.get(
                                     int(region_index)
                                 )
-                                if previous_signature is not None:
+                                # A region called more than once (a while
+                                # test, evaluated on entry and again at the
+                                # latch) gains its length feeds at the first
+                                # call; the later calls append the same
+                                # arguments and revise nothing.
+                                if previous_signature is not None and any(
+                                    int(value.id) not in previous_signature[0]
+                                    for value in appended
+                                ):
                                     revised_feeds = (
                                         *tuple(previous_signature[0]),
                                         *(
