@@ -58,7 +58,12 @@ def frame_aliased_result_binding(instruction, callee, *, book=None, record=None,
     result_id = instruction.attributes.get("semantic_result_id")
     if result_id is None and instruction.res is not None:
         result_id = int(instruction.res.id)
-    outputs = tuple(int(formal) for formal, result in record.result_bindings if int(result) == result_id)
+    # A result binding may also name the semantic record handle (a callee
+    # id that is not a formal); only a pair naming a callee formal can be
+    # the frame alias.
+    callee_formal_ids = {int(formal.id) for formal in callee.args}
+    outputs = tuple(int(formal) for formal, result in record.result_bindings
+                    if int(result) == result_id and int(formal) in callee_formal_ids)
     if len(outputs) != 1:
         raise ConcordanceRefusal("frame-aliased result has no unique recorded result binding")
     formal_id = outputs[0]

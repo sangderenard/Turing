@@ -47976,7 +47976,17 @@ def _class_surface_ssa_program(
                                 # A scalar native call publishes through its
                                 # own result value; rebind the call itself.
                                 for spliced in reversed(sequence):
-                                    if spliced.op == "Call" and spliced.res is not None:
+                                    # A frame-aliased call's result IS its
+                                    # caller operand (the returned formal's
+                                    # storage); the marker's handle id is not
+                                    # a second definition of it.
+                                    if (
+                                        spliced.op == "Call"
+                                        and spliced.res is not None
+                                        and not spliced.attributes.get(
+                                            "result_aliases_frame"
+                                        )
+                                    ):
                                         spliced.res = retain_result(marker_result, spliced.res)
                                         values[int(marker_result.id)] = (
                                             marker_result
