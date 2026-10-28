@@ -2285,6 +2285,7 @@ class _ControlSSABuilder(TiledObject):
         native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
         native_value_type_abi: Mapping[int, Any] | None = None,
         native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+        int_range_scope: Any = None,
     ):
         TiledObject.__post_init__(self)
         from .evolution_metagraph import (
@@ -2293,6 +2294,9 @@ class _ControlSSABuilder(TiledObject):
         )
 
         self.program = program
+        #: The ``source_int_range_concordance`` scope of this function's
+        #: values (``_source_numeric_scope``), or ``None`` when unknown.
+        self.int_range_scope = int_range_scope
         #: ssa id -> the SSAValue object the book's ``ssa_value`` row names
         #: (plan 80 B2.1): the one private structure the builder keeps,
         #: because emitted instructions hold the objects and mutate them.
@@ -9702,6 +9706,72 @@ class _ControlSSABuilder(TiledObject):
 
             return _widest_element(*floats) or "float64"
         return "int64"
+
+    _INTEGER_WIDTH_BOUNDS = {
+        "bool": (0, 1),
+        "int32": (-(1 << 31), (1 << 31) - 1),
+        "int": (-(1 << 63), (1 << 63) - 1),
+        "int64": (-(1 << 63), (1 << 63) - 1),
+        "uint64": (0, (1 << 64) - 1),
+        "int128": (-(1 << 127), (1 << 127) - 1),
+    }
+
+    def _integer_width_join(self, values: Iterable[SSAValue]) -> str | None:
+        """The width a join of Python ``int`` arms of differing widths has.
+
+        Program: Token Orchard's ``_fingerprint_span`` (corpus c793): one
+        return is ``0, 0`` (int64 by class), the other the combines proven
+        ``[0, 2**64-1]`` (uint64).  Python returns an ``int`` from either, so
+        nothing can tell the arms apart; only the width must hold both.
+        Rule: the join's interval is the union of each arm's -- its
+        ``source_int_range_concordance`` row, else a constant's value, else
+        its width's bounds -- and its width is the narrowest that holds the
+        union (``python_int_range_dtype``).  ``None`` when the arms are not
+        all scalar ints of differing widths, at least one wider than int64,
+        or when no width holds the union.
+        """
+
+        present = tuple(
+            value for value in values
+            if value.dtype not in {None, "unknown", "none", "None"}
+        )
+        dtypes = {str(value.dtype) for value in present}
+        bounds = self._INTEGER_WIDTH_BOUNDS
+        if (
+            len(dtypes) < 2
+            or any(tuple(value.shape or ()) for value in present)
+            or not dtypes <= set(bounds)
+            or not dtypes & {"uint64", "int128"}
+        ):
+            return None
+        from .concordance_declarations import SOURCE_INT_RANGE
+        from .identity_concordance import current_identity_book
+        from ..transmogrifier.dtype_layout import python_int_range_dtype
+
+        range_page = current_identity_book().page(SOURCE_INT_RANGE)
+        constants = {
+            int(instruction.res.id): instruction.attributes.get("value")
+            for block in self.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Const" and instruction.res is not None
+        }
+        low = high = None
+        for value in present:
+            interval = None
+            if self.int_range_scope is not None:
+                interval = range_page.latest(
+                    (self.int_range_scope, int(value.id))
+                )
+            literal = constants.get(int(value.id))
+            if interval is None and type(literal) in {int, bool}:
+                interval = (int(literal), int(literal))
+            if interval is None:
+                interval = bounds[str(value.dtype)]
+            low = int(interval[0]) if low is None else min(low, int(interval[0]))
+            high = (
+                int(interval[1]) if high is None else max(high, int(interval[1]))
+            )
+        return python_int_range_dtype(low, high)
 
     def _numeric_join_arms(
         self,
@@ -22961,7 +23031,22 @@ class _ControlSSABuilder(TiledObject):
                     if value.dtype not in {None, "unknown", "none", "None"}
                 }
                 numeric_join_promoted = False
-                if len(merge_dtypes) > 1:
+                integer_width = (
+                    self._integer_width_join(incoming_values)
+                    if len(merge_dtypes) > 1 else None
+                )
+                if integer_width is not None:
+                    # Every arm is a Python int: the slot takes the width
+                    # holding their union, each arm converted on its edge.
+                    dtype = integer_width
+                    incoming_values = [
+                        self._cast_on_edge(block, value, integer_width)
+                        for (block, _values), value in zip(
+                            edges, incoming_values, strict=True,
+                        )
+                    ]
+                    self.current = exit_block
+                elif len(merge_dtypes) > 1:
                     promoted = self._numeric_join(incoming_values)
                     if promoted is not None:
                         dtype = promoted
@@ -23978,6 +24063,7 @@ def lower_control_program_to_ssa(
     native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
     native_value_type_abi: Mapping[int, Any] | None = None,
     native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+    int_range_scope: Any = None,
 ) -> tuple[Function, tuple[SSALoweringShortfall, ...]]:
     builder = _ControlSSABuilder(
         program,
@@ -24043,6 +24129,7 @@ def lower_control_program_to_ssa(
         native_object_type_tests=native_object_type_tests,
         native_value_type_abi=native_value_type_abi,
         native_value_type_tests=native_value_type_tests,
+        int_range_scope=int_range_scope,
     )
     builder.lower(program.root)
     for kind, arguments in builder.table_epilogue_operations:
@@ -27725,6 +27812,7 @@ def lower_control_sections_to_ssa(
     native_object_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
     native_value_type_abi: Mapping[int, Any] | None = None,
     native_value_type_tests: Mapping[int, Mapping[str, Any]] | None = None,
+    int_range_scope: Any = None,
 ) -> tuple[
     IRModule,
     tuple[SSALoweringShortfall, ...],
@@ -30734,6 +30822,7 @@ def lower_control_sections_to_ssa(
         native_object_type_tests=native_object_type_tests,
         native_value_type_abi=native_value_type_abi,
         native_value_type_tests=native_value_type_tests,
+        int_range_scope=int_range_scope,
     )
     report(
         f"control lowering complete; blocks={len(control_function.blocks)} "

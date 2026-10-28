@@ -30081,6 +30081,10 @@ def _class_surface_ssa_program(
             _GraphView(G=graph_obj)
         )
 
+        from ..common.tensors.topological_reducer import (
+            _source_numeric_scope as _int_range_scope,
+        )
+
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -30094,6 +30098,7 @@ def _class_surface_ssa_program(
                 native_object_type_tests=native_type_tests,
                 native_value_type_abi=native_value_type_abi,
                 native_value_type_tests=native_value_type_tests,
+                int_range_scope=_int_range_scope(graph_obj),
                 callsite_stored_argument_ids=callsite_stored_argument_ids,
                 identity_table=dict(graph_obj.graph.get("identity_table") or {}),
                 function_outputs=tuple(
