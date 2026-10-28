@@ -2002,7 +2002,13 @@ def _known_parameter_memory_contracts(
         value = bindings.get(name)
         if any(value is kind for kind in (list, set, dict, tuple)):
             storage_by_name[name] = ParameterStorage.TABLE
-        elif inspect.isclass(value):
+        elif inspect.isclass(value) and value not in (
+            int, float, bool, complex, str, bytes,
+        ):
+            # An annotation naming a scalar type declares the value's type,
+            # not a record: ``def step(acc: int, i: int)`` has no record
+            # parameter (a loop-index actual was linked as a record receiver
+            # and appended to the caller's arguments with no row).
             storage_by_name[name] = ParameterStorage.RECORD
         elif index == 0 and method_owner is not None:
             storage_by_name[name] = ParameterStorage.RECORD
