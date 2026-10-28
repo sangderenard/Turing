@@ -24357,54 +24357,6 @@ def _inject_field_slot_access(
     ), field_locations
 
 
-def _insert_before_region_holder(
-    block: Any, region_index: int, inserted: Any,
-) -> Any:
-    """``block`` with ``inserted`` placed just before the statement of a
-    top-level sequence that holds scheduled region ``region_index`` (the
-    region itself, or the branch/loop holding it), or None when no such
-    statement exists.  Only sequences are entered, so the placement runs
-    unconditionally, once."""
-
-    def holds(candidate: Any) -> bool:
-        if isinstance(candidate, StatementBlock):
-            return any(
-                (match := _REGION_MARKER.fullmatch(str(line))) is not None
-                and int(match.group(1)) == int(region_index)
-                for line in candidate.lines
-            )
-        for name in (
-            "blocks", "body", "orelse", "condition", "default", "callee",
-            "finalbody", "lanes",
-        ):
-            child = getattr(candidate, name, None)
-            children = child if isinstance(child, tuple) else (child,)
-            if any(
-                item is not None and not isinstance(item, (str, int))
-                and holds(item)
-                for item in children
-            ):
-                return True
-        return any(holds(item) for _label, item in getattr(candidate, "cases", ()) or ())
-
-    if not isinstance(block, SequenceBlock):
-        return None
-    for position, child in enumerate(block.blocks):
-        if not holds(child):
-            continue
-        if isinstance(child, SequenceBlock):
-            nested = _insert_before_region_holder(child, region_index, inserted)
-            if nested is None:
-                return None
-            return replace(block, blocks=(
-                *block.blocks[:position], nested, *block.blocks[position + 1:],
-            ))
-        return replace(block, blocks=(
-            *block.blocks[:position], inserted, *block.blocks[position:],
-        ))
-    return None
-
-
 def _schedule_loop_callsites(
     control: ControlProgram,
     hierarchy_plan: "PlanClosure | None",
@@ -26433,8 +26385,6 @@ def lower_control_sections_to_ssa(
     table_deletions: tuple[
         tuple[int, int | tuple[int, ...], int | None, str], ...
     ] = (),
-    table_deletion_bases: Mapping[int, int] | None = None,
-    table_deletion_held_ids: frozenset[int] = frozenset(),
     retained_sequence_ids: tuple[int, ...] = (),
     nested_sequence_ids: tuple[int, ...] = (),
     nested_tensor_sequence_ids: tuple[int, ...] = (),
@@ -28877,161 +28827,19 @@ def lower_control_sections_to_ssa(
             for position, (kind, arguments) in enumerate(operations):
                 if kind == "store":
                     store_placements[int(arguments[0])] = (operations, position)
-    # How many branch/loop arms hold each scheduled region.
-    region_arm_depth: dict[int, int] = {}
-
-    def survey_region_arms(block: Any, depth: int) -> None:
-        if isinstance(block, StatementBlock) and len(block.lines) == 1:
-            match = _REGION_MARKER.fullmatch(str(block.lines[0]))
-            if match is not None:
-                region_arm_depth[int(match.group(1))] = depth
-        if isinstance(block, SequenceBlock):
-            for child in block.blocks:
-                survey_region_arms(child, depth)
-            return
-        # Any other nested block (an arm, a loop or while body, a case) runs
-        # under a condition or repeatedly; counted as one arm deeper.
-        for name in (
-            "body", "orelse", "condition", "default", "callee", "finalbody",
-        ):
-            child = getattr(block, name, None)
-            if child is not None and not isinstance(child, (str, int)):
-                survey_region_arms(child, depth + 1)
-        for _label, child in getattr(block, "cases", ()) or ():
-            survey_region_arms(child, depth + 1)
-        for child in getattr(block, "lanes", ()) or ():
-            survey_region_arms(child, depth + 1)
-
-    survey_region_arms(control.root, 0)
-    # A held delete the shell installed in its arm as a table-delete
-    # mutation is placed already; the value-order rules below are for the
-    # deletes no control block carries.
     control_placed_delete_ids = _control_placed_table_delete_ids(control.root)
     for deletion in table_deletions:
         effect_id = int(deletion[0])
         if effect_id in control_placed_delete_ids:
             continue
-        base_store = store_placements.get(
-            int((table_deletion_bases or {}).get(effect_id, -1))
-        )
-        if base_store is not None:
-            operations, position = base_store
-            operations.insert(position + 1, ("delete", deletion))
-            for key, (placed, placed_position) in tuple(store_placements.items()):
-                if placed is operations and placed_position > position:
-                    store_placements[key] = (placed, placed_position + 1)
-            continue
-        preceding = [
-            (value_id, region_index)
-            for value_id, region_index in region_source_values
-            if value_id < effect_id
-        ]
-        following = [
-            (value_id, region_index)
-            for value_id, region_index in region_source_values
-            if value_id > effect_id
-        ]
-        if deletion[2] is None and preceding:
-            _value_id, region_index = max(preceding)
-            table_region_operations.setdefault(region_index, []).append(("delete", deletion))
-        elif preceding and max(preceding)[0] in iterable_source_ids:
-            _value_id, region_index = max(preceding)
-            table_region_operations.setdefault(region_index, []).append(("delete", deletion))
-        elif following:
-            _value_id, region_index = min(following)
-            # Program: ``o = maybe_pick(n + 1, 1); d = {1: 5, 2: n, 3: 8};
-            # del d[2]``, then ``(-3 if o is None else o + 1) + len(d) * 10``
-            # (fuzz p106_43).  Wrong record: the first region after the
-            # delete in value order is ``o + 1``, which runs only in the
-            # conditional's ``else`` arm, so the delete rode into that arm
-            # and ``len(d)`` was 3 whenever ``o`` was None (27 for 17; clean
-            # audit).  A later region outside every arm is no carrier
-            # either: there the delete followed the ``len`` that reads the
-            # table.  Rule: a delete no ``if``/loop holds, whose first
-            # region is held by an arm, is its own control effect: a
-            # table-delete mutation placed just before the statement that
-            # holds that arm, where it runs once and before every reader
-            # the scheduler orders after a write of the table.
-            if (
-                effect_id not in table_deletion_held_ids
-                and region_arm_depth.get(int(region_index), 0)
-            ):
-                if deletion[2] is not None:
-                    placed_root = _insert_before_region_holder(
-                        control.root, int(region_index),
-                        SequenceMutationBlock(ControlSequenceMutation(
-                            sequence_value_id=int(deletion[2]),
-                            operator="delete",
-                            argument_value_ids=(
-                                tuple(map(int, deletion[1]))
-                                if isinstance(deletion[1], tuple)
-                                else (int(deletion[1]),)
-                            ),
-                            effect_node_id=effect_id,
-                            argument_kind=(
-                                "table_delete_keys"
-                                if isinstance(deletion[1], tuple)
-                                else "table_delete_key"
-                            ),
-                        )),
-                    )
-                    if placed_root is not None:
-                        control = replace(control, root=placed_root)
-                        continue
-                shortfalls.append(SSALoweringShortfall(
-                    "ssa-table", "unconditional-delete-carrier",
-                    control_name,
-                    f"delete {effect_id} runs unconditionally, but the "
-                    f"region after it ({int(region_index)}) runs inside a "
-                    "branch or loop arm",
-                ))
-                continue
-            # Program: ``xs0 = [n, 3]; r0 = xs0[0]; swap(xs0); d1 = {1: 2, 2:
-            # n}; del d1[n % 3 + 1]`` (fuzz p122_35).  Wrong record: the
-            # carrier region also computes the delete's key (fused with
-            # ``r0``), and the delete ran as its pre-operation, reading the
-            # key before the region defined it (audit use-not-dominated; the
-            # helper then raised error 84 for a present key).  Rule: a delete
-            # whose key the carrier region produces is that region's
-            # post-operation.
-            key_ids = (
-                tuple(map(int, deletion[1]))
-                if isinstance(deletion[1], tuple) else (int(deletion[1]),)
-            )
-            produced_here = {
-                int(value_id)
-                for value_id, index in region_source_values
-                if int(index) == int(region_index)
-            }
-            if any(key_id in produced_here for key_id in key_ids):
-                table_reads = {
-                    int(value_id)
-                    for value_id, sequence_id in (
-                        sequence_length_values or {}
-                    ).items()
-                    if int(sequence_id) == int(deletion[2] or -1)
-                } | {
-                    int(result_id)
-                    for result_id, _query, sequence_id in table_lookups
-                    if int(sequence_id) == int(deletion[2] or -1)
-                }
-                if table_reads & set(map(int, region_signatures.get(
-                    int(region_index), ((), ()),
-                )[0])):
-                    shortfalls.append(SSALoweringShortfall(
-                        "ssa-table", "delete-key-carrier", control_name,
-                        f"delete {effect_id}'s key is computed by region "
-                        f"{int(region_index)}, which also reads the table "
-                        "the delete changes",
-                    ))
-                    continue
-                table_region_post_operations.setdefault(
-                    region_index, [],
-                ).insert(0, ("delete", deletion))
-                continue
-            table_region_operations.setdefault(region_index, []).insert(0, ("delete", deletion))
-        else:
-            table_epilogue_operations.append(("delete", deletion))
+        # Every keyed delete is an authored control effect the shell
+        # installs where its statement stands (``_install_lexical_sequence_
+        # mutations``); one that no control block carries has no record to
+        # place it by, and value order is not one.
+        shortfalls.append(SSALoweringShortfall(
+            "ssa-table", "unplaced-delete", control_name,
+            f"delete {effect_id} is carried by no control block",
+        ))
     table_epilogue_operations.extend(trailing_inplace_pack_operations)
     for destination_id, source_id, width_id, _consumed_ids in sequence_bit_packs:
         table_epilogue_operations.append((

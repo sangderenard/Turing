@@ -378,3 +378,52 @@ def test_var_that_reads_its_hoisted_undefined_stays_a_loud_refusal(body):
     assert any(
         item.code == "unsupported-binding-kind" for item in lowered.shortfalls
     ), lowered.shortfall_report()
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    "let x = n; if (p) { if (n > 1) return 1; x = 2; } return x;",
+    "let x = n; if (p) { x = 1; } else { if (n > 2) return 5; x = 2; } return x * 2;",
+    "let x = n; { if (n > 1) return 1; x = 2; } return x;",
+])
+def test_a_nested_early_return_leaves_the_other_paths_the_rest(body):
+    source = (
+        f"/** @param {{number}} n @param {{boolean}} p */ "
+        f"function root(n, p) {{ {body} }}"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(
+        source, "[[0, true], [3, true], [0, false], [3, false], [NaN, true]]",
+    ) == "PASS"
+
+
+@needs_node
+def test_a_nested_early_return_with_no_return_after_it_stays_refused():
+    source = (
+        "/** @param {number} n @param {boolean} p */ "
+        "function root(n, p) { if (p) { if (n > 1) return 1; } }"
+    )
+    assert not lower_javascript_source_to_ssa(source).complete
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    "let s = 0; let i = 0; do { s += n; i++; if (s > 9) break; } while (i < 3); return s;",
+    "let s = 0; switch (n) { case 1: s = 1; case 2: s += 2; break; default: s = 7; case 3: s += 3; } return s;",
+])
+def test_do_and_switch_become_the_loops_and_ifs_they_mean(body):
+    source = f"/** @param {{number}} n */ function root(n) {{ {body} }}"
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(source, "[[0], [1], [2], [3], [5], [NaN], [-0]]") == "PASS"
+
+
+@needs_node
+def test_a_switch_whose_cases_declare_a_let_stays_refused():
+    # Every case shares one scope; per-case blocks would split it.
+    source = (
+        "/** @param {number} n */ function root(n) { switch (n) "
+        "{ case 1: let t = 2; return t; default: return 0; } }"
+    )
+    assert not lower_javascript_source_to_ssa(source).complete

@@ -1173,6 +1173,14 @@ def _value_llvm_type(value: _Any) -> str:
     # names. Resolve them before consulting the scalar layout catalogue.
     if str(getattr(value, "dtype", "")) in {"ssa.aggregate", "ptrptr_float64"}:
         return "ptr"
+    if (
+        str(getattr(value, "dtype", "")).casefold() == "none"
+        and not accounting.get("physical_dtype")
+    ):
+        # Structural absence is not a numeric dtype: it is the inert scalar
+        # carrier cell the C emitter spells ``double`` for ``none`` (see
+        # ``_scalar_c_type``), holding the zero sentinel.
+        return "double"
     if accounting.get("heap_owner") or accounting.get("heap_element_dtype") is not None:
         # These are declared native pointer CELLS, not a typed address whose
         # dtype names the pointee. Raw ptr spelling alone historically means

@@ -155,17 +155,61 @@ PINNED_MATH = frozenset({
 })
 
 
-def _libm():
-    import ctypes
-    import ctypes.util
+_PINNED_LIBRARY: dict | None = None
 
-    library = ctypes.CDLL(ctypes.util.find_library("m") or "libm.so.6")
+
+def _libm():
+    """The pinned functions as the native code resolves them.
+
+    Not a guessed system libm (``libm.so.6`` exists only on glibc): a
+    one-line shim per function, ``double pin_exp(double x) { return
+    exp(x); }``, built by the same toolchain, command and contract flags
+    as the C lane's artifacts, so each call binds to whatever ``exp`` the
+    compiled programs bind to on this platform.  The argument is a
+    runtime value, so the compiler cannot fold the call away (a folded
+    literal call is a separate hazard, docs/hazards/20261027T230236Z_*).
+    A toolchain that cannot build the shim refuses by name.
+    """
+
+    global _PINNED_LIBRARY
+    if _PINNED_LIBRARY is not None:
+        return _PINNED_LIBRARY
+    import ctypes
+
+    from src.compiler.work_contract import active_contract
+
+    directory = pathlib.Path(tempfile.mkdtemp())
+    source = directory / "turing_pinned_math.c"
+    library = directory / "turing_pinned_math.dll"
+    source.write_text(
+        "#include <math.h>\n"
+        "#if defined(_WIN32)\n#define PIN __declspec(dllexport)\n"
+        "#else\n#define PIN __attribute__((visibility(\"default\")))\n#endif\n"
+        + "".join(
+            f"PIN double pin_{name}(double x) {{ return {name}(x); }}\n"
+            for name in sorted(PINNED_MATH)
+        ),
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable, "-m", "ziglang", "cc", "-shared", "-O3",
+        *map(str, active_contract().compiler_flags),
+        "-o", str(library), str(source),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode != 0 or not library.is_file():
+        raise RuntimeError(
+            "pinned-math shim did not build with the C lane's toolchain: "
+            + (completed.stderr or completed.stdout).strip()[:300]
+        )
+    loaded = ctypes.CDLL(str(library))
     functions = {}
     for name in PINNED_MATH:
-        function = getattr(library, name)
+        function = getattr(loaded, f"pin_{name}")
         function.restype = ctypes.c_double
         function.argtypes = (ctypes.c_double,)
         functions[name] = function
+    _PINNED_LIBRARY = functions
     return functions
 
 
