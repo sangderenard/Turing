@@ -1,5 +1,5 @@
 # A list of constant lists is read by runtime row and column.
-def root(n: int) -> int:
+def root(n):
     g = [[1, 2], [3, 4]]
     i = n % 2
     j = (n + 1) % 2

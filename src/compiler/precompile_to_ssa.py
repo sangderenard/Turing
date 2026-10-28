@@ -5010,7 +5010,7 @@ class _ControlSSABuilder(TiledObject):
             self.emit(Handler.Ret, [
                 self.constant_value(0, dtype=str(value.dtype))
                 for value in values
-            ])
+            ], attributes={"fault_exit": True})
             return
         # Outputs that cannot be zeroed: continue as ``pop`` does.
         self.current = fault_exit
@@ -19715,6 +19715,9 @@ class _ControlSSABuilder(TiledObject):
             loop.step,
             location=f"{path}.step",
         )
+        # An extent that loads a row of a list of lists checks its index,
+        # which leaves the preheader in a later block (corpus c777).
+        preheader = self.current
         # A resident sequence extent is int64. The old header hard-coded
         # int (i32), while its latch's indexed use settled to i64, producing
         # an invalid Phi even for a two-member native table iteration.

@@ -1,5 +1,5 @@
 # The list of lists is born again on every pass of the loop.
-def root(n: int) -> int:
+def root(n):
     total = 0
     for k in range(n):
         g = [[k, 1], [2, k + 1]]
