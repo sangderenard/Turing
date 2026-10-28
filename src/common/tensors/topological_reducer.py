@@ -21683,7 +21683,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                             source="authored call result declaration",
                             provenance=_Derived((result_cell,)),
                         )
-                if return_declaration_cell is not None:
+                # A width-carrying class (``-> 'Precision'``) names the
+                # class but not its limbs; the precision operation that
+                # produces the value states the width. Posting width 1 here
+                # contradicted ``x.exp()`` on a two-limb ``x``.
+                if return_declaration_cell is not None and not carries_width:
                     caller_scope = _source_numeric_scope(target_graph)
                     result_sources = tuple(dict.fromkeys(
                         cell for cell in (
@@ -22696,9 +22700,13 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     "result_class_ref": str(receiver_class),
                     "precision_source_operation": source_operation,
                 })
+                # ``tensor_candidate`` is the AbstractTensor reading of the
+                # same method name (``x.exp()``); left on the node, lowering
+                # prefers it over the precision operator and emits a
+                # one-double tensor exp instead.
                 for field in (
                     "callee_ref", "method_ref", "constructor_ref",
-                    "class_ref",
+                    "class_ref", "tensor_candidate",
                 ):
                     attributes.pop(field, None)
                 accessor_id = id(expression.func)
