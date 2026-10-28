@@ -25008,6 +25008,8 @@ def _tensor_descriptor_rule(
                             graph.G.graph["_host_scalar_planned"] = memo
                         host_dtype = memo[1].get(int(operand))
                     if host_dtype is None:
+                        if os.environ.get("TRAPPROG"):
+                            open("/tmp/trap2.log", "a").write(repr((os.environ["TRAPPROG"], str(graph.G.graph.get("authored_function_identity"))[-30:], operand, node.get("type"), ast.unparse(node["expr_obj"])[:40] if node.get("expr_obj") is not None else None, (node.get("attributes") or {}).get("binding_kind"))) + "\n")
                         continue
                     sides[index] = {
                         "shape": (), "dtype": host_dtype, "rank": 0,
