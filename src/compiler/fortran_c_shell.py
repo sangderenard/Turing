@@ -27729,6 +27729,9 @@ def _class_surface_ssa_program(
             sequence_declarations = tuple(
                 declaration for declaration in sequence_declarations
                 if int(declaration[0]) not in local_row_ids
+                and int(declaration[0]) not in set(
+                    map(int, list_row_reads(graph_obj))
+                )
             )
             nested_sequence_ids = tuple(sorted({
                 *map(int, nested_sequence_ids), *local_list_rows,
@@ -29952,9 +29955,19 @@ def _class_surface_ssa_program(
                         ).get("fields") or {}
                     ).items()
                 },
-                sequence_initializations=sequence_initializations,
+                sequence_initializations=tuple(
+                    initialization for initialization in sequence_initializations
+                    if int(initialization[0]) not in set(
+                        map(int, list_row_reads(graph_obj))
+                    )
+                ),
                 field_aliases=field_aliases,
-                sequence_declarations=sequence_declarations,
+                sequence_declarations=tuple(
+                    declaration for declaration in sequence_declarations
+                    if int(declaration[0]) not in set(
+                        map(int, list_row_reads(graph_obj))
+                    )
+                ),
                 sequence_capacity_sources=sequence_capacity_sources,
                 dynamic_sequence_ids=dynamic_sequence_ids,
                 sequence_column_dtypes={
