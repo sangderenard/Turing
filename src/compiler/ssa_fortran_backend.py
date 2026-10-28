@@ -4948,6 +4948,23 @@ class _FunctionEmitter:
         return None
 
     # -- statement emission ------------------------------------------------
+    def _entry_heap_release_lines(self) -> list[str]:
+        """Release the entry frame's heap arenas on every exit.
+
+        The entry owns its frame's heap, as the C and LLVM wrappers do:
+        every arena is released once the results are written (or, on a
+        fault exit, without writing them), and the owner cell is reset to
+        null.
+        """
+
+        if not self.release_heap_owners:
+            return []
+        return [
+            f"    call turing_heap_release({_name(argument)})"
+            for argument in self.function.args
+            if int(argument.id) in self._frame_heap_owner_ids
+        ]
+
     def _emit_block(self, block: BasicBlock, body: list[str]) -> None:
         body.append(f"    ! block {block.name}")
         # Only emit a statement label where something actually branches to it;
@@ -5029,6 +5046,20 @@ class _FunctionEmitter:
                 body.append(f"      goto {self._label(false_target)}")
                 body.append("    end if")
                 continue
+            if instr.op == "Trap" and instr.attributes.get("fault_exit"):
+                # Program: ``xs.remove(v)`` / any checked ``xs[i]`` (c137,
+                # c140; 215 corpus programs).  Wrong record: the checked
+                # index's failing branch ends in a non-returning ``Trap``
+                # marked ``fault_exit`` that C (``goto cleanup``) and LLVM
+                # (``ret void``) emit, but Fortran had no statement for it
+                # and refused the whole program.  Rule: the validation
+                # code is already reported by the ``error stop <code>`` the
+                # preceding ``turing_validation_error`` call became; the
+                # exit publishes no outputs and leaves through the same
+                # heap release the entry's ``Ret`` runs.
+                body.extend(self._entry_heap_release_lines())
+                body.append("    return")
+                continue
             if instr.op in ("Ret", "ret", "Return", "return"):
                 return_value = self.function.metadata.get("return_value")
                 if return_value is not None and instr.args:
@@ -5052,15 +5083,7 @@ class _FunctionEmitter:
                                     output, returned, self._operand(returned)
                                 )
                             )
-                if self.release_heap_owners:
-                    # The entry owns its frame's heap, as the C and LLVM
-                    # wrappers do: every arena is released once the results
-                    # are written, and the owner cell is reset to null.
-                    body.extend(
-                        f"    call turing_heap_release({_name(argument)})"
-                        for argument in self.function.args
-                        if int(argument.id) in self._frame_heap_owner_ids
-                    )
+                body.extend(self._entry_heap_release_lines())
                 body.append("    return")
                 continue
 
@@ -6177,6 +6200,12 @@ def emit_module(
             for instruction in block.instrs
             if instruction.res is not None
         )
+        read_value_ids = {
+            int(operand.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for operand in instruction.args
+        }
         for descriptor in table.sequences.values():
             pool = descriptor.child_table_pool
             if pool is None:
@@ -6195,7 +6224,17 @@ def emit_module(
                 *((int(pool.status_value_id),) if pool.status_value_id is not None else ()),
                 *((int(pool.live_flags_value_id),) if pool.live_flags_value_id is not None else ()),
             }
-            missing_values = pool_value_ids - available_value_ids
+            # Program: ``d = {1: [1, 2, 3], 2: [4, n]}; return d[2][1]``
+            # (c860-c865).  Wrong record: the pool's rows are addressed by
+            # slot * row stride and grow against the stride, so nothing in
+            # ``root`` reads the pool capacity cell and the lowering gave it
+            # no formal; Fortran refused "child-table pool names absent SSA
+            # values" where C seeds a pool member only when the function
+            # owns its cell (``owned_storage_names``) and ran the program.
+            # Rule: a pool member the function neither defines nor reads
+            # has no storage here to name; an absent member that an
+            # instruction reads still refuses.
+            missing_values = (pool_value_ids - available_value_ids) & read_value_ids
             if missing_values:
                 raise FortranEmissionError(
                     f"sequence {descriptor.sequence_id} child-table pool names "
@@ -6319,6 +6358,36 @@ def emit_module(
             # (gfortran: REAL(8) to INTEGER(8)).  Rule: when the function's
             # one ``Ret`` returns its declared outputs beside other values,
             # the ``Ret`` operands are its outputs.
+            named_outputs[function_name] = next(iter(own_returns.values()))
+            continue
+        # Program: ``s = n if c == 2 else n * 0.5; return s`` (c804, c805,
+        # c806, c809).  Wrong record: ``named_outputs`` names the joined
+        # source value ``s`` (t7), but the value union leaves as its frame
+        # (tag + one payload per arm), which the published
+        # ``aggregate_return_layouts`` read view expands ``s`` into and the
+        # one ``Ret`` returns.  Fortran declared the lone t7 (a double) as
+        # its output, so the frame cells C and LLVM publish were absent
+        # (harness: ``KeyError`` on the tag id).  Rule: a declared output
+        # with an aggregate return layout is its layout's members; when
+        # those expand to exactly the one ``Ret``'s operands, the ``Ret``
+        # operands are the outputs, as in C and LLVM.
+        return_layouts = {
+            int(output_id): tuple(map(int, members))
+            for output_id, members in (
+                function.metadata.get("aggregate_return_layouts") or ()
+            )
+        }
+        expanded_ids = tuple(
+            member
+            for value_id in declared_ids
+            for member in return_layouts.get(int(value_id), (int(value_id),))
+        )
+        if (
+            function_name not in named_outputs
+            and expanded_ids != declared_ids
+            and len(own_returns) == 1
+            and expanded_ids == next(iter(own_returns))
+        ):
             named_outputs[function_name] = next(iter(own_returns.values()))
             continue
         if isinstance(return_value, SSAValue):
@@ -8190,25 +8259,28 @@ def _conceptual_record(descriptor: Any, available_value_ids: set[int]) -> bool:
     ``0`` is overwritten on both arms and never emitted).  The C backend reads
     record tables only for record parameters; Fortran refused the module with
     "record 'S' field 'n' names absent SSA values [2]".  Rule: a descriptor
-    is checked (and exported) only when the record or one of its field values
-    is resident; a resident record with an absent field still refuses, and so
-    does any record with a field naming storage (a span, sequence, nested
-    record or reference): those name arenas the function must hold.
+    is checked (and exported) only when the record itself is resident; a
+    resident record with an absent field still refuses, and so does any
+    record with a field naming storage (a span, sequence, nested record or
+    reference): those name arenas the function must hold.
+
+    Program: ``s = S(a, 0); for ...: s.m += 1`` (c532, c535-c538, c550).
+    Wrong record: field ``n`` holds the formal ``a`` (resident), so the
+    record counted as physical, while field ``m``'s constructor ``0`` was
+    re-materialized as the loop phi's own constant and its descriptor id
+    is no SSA value of ``root``; Fortran refused with "record 'S' field
+    'm' names absent SSA values [4]" where C (which reads record tables
+    only for resident record formals) ran it.  A resident field VALUE is
+    an ordinary SSA value, not the record's presence.
     """
 
     if int(descriptor.record_id) in available_value_ids:
         return False
-    if any(
+    return not any(
         str(getattr(field.storage, "value", field.storage)) != "scalar"
         or field.sequence_id is not None
         or field.record_id is not None
         for field in descriptor.fields
-    ):
-        return False
-    return not any(
-        int(value_id) in available_value_ids
-        for field in descriptor.fields
-        for value_id in field.value_ids
     )
 
 
