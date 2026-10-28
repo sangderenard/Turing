@@ -47,6 +47,60 @@ def root(n: int) -> int:
 '''
 
 
+# The token-orchard store shape: typed array fields grown by one method and
+# read by another (a uint64 begin offset plus an int index, a uint32 count
+# compared with a list length).
+STORE = '''
+from array import array
+
+
+class Store:
+    def __init__(self):
+        self.epoch = 0
+        self.domain = array("B")
+        self.begin = array("Q")
+        self.count = array("I")
+        self.atoms = array("I")
+
+    def add(self, domain: int, values: list[int], b: int, e: int) -> int:
+        row = len(self.domain)
+        self.epoch += 1
+        self.domain.append(domain)
+        self.begin.append(len(self.atoms))
+        self.count.append(e - b)
+        i = b
+        while i < e:
+            self.atoms.append(values[i])
+            i += 1
+        return row
+
+    def matches(self, row: int, values: list[int]) -> bool:
+        count = self.count[row]
+        if count != len(values):
+            return False
+        source = self.begin[row]
+        i = 0
+        while i < count:
+            if self.atoms[source + i] != values[i]:
+                return False
+            i += 1
+        return True
+
+
+def root(n: int) -> int:
+    s = Store()
+    i = 0
+    total = 0
+    while i < n:
+        row = s.add(1, [65 + i, 128578, 7], 0, 3)
+        if s.matches(row, [65 + i, 128578, 7]):
+            total += 1
+        total += row
+        i += 1
+    return total + s.epoch
+'''
+
+
 def _lowered(source, name):
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
@@ -105,3 +159,13 @@ def test_array_field_element_read_in_method(tmp_path, code, dtype):
     assert len(outputs) == 1
     for lane in ("c", "llvm"):
         assert _run(module, export, parameters, outputs, lane, tmp_path / lane, 7) == 7
+
+
+def test_array_store_fields_read_across_methods(tmp_path):
+    module, export, parameters, outputs = _lowered(STORE, "array_store_reads")
+    assert len(outputs) == 1
+    for lane in ("c", "llvm"):
+        for n, expected in ((0, 0), (1, 2), (17, 170)):
+            assert _run(
+                module, export, parameters, outputs, lane, tmp_path / f"{lane}{n}", n,
+            ) == expected
