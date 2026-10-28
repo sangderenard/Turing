@@ -69,3 +69,13 @@ two callers, the catalogue fold with one), the loop unrolled over the
 authored four elements, and the pop was ignored.  A literal is now a value
 of the callee only while the callee never mutates that formal
 (`_formal_is_mutated_in_place`).
+
+## Unproven int64 arithmetic wrapped silently (Precision adaptor stage 1)
+
+Python `int` `+ - *` (and unary `-`) on scalars no interval bounds lowered to
+plain int64 arithmetic, so `mul(n, n)` past 2**63 returned a wrapped value
+Python never computes. Both native lanes now check these ops
+(`llvm.s*.with.overflow.i64`, `__builtin_*_overflow`) and report
+`native_faults.INT_OVERFLOW` (NativeIntOverflow) instead. Stage 2 replaces the
+report with continuation as Precision limbs. Test:
+tests/test_native_int_overflow_checked.py.

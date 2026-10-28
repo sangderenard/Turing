@@ -20135,12 +20135,25 @@ def _propagate_native_type_tag_results(
                                         f"payload={int(prior_id)}"
                                     )
                                 claimed[id(prior_payload)] = linked_payload
+                            claimed_ids = {
+                                int(prior_tag.id): int(tag.id),
+                                **linked_payloads,
+                            }
                             for rewrite_block in caller.blocks.values():
                                 for consumer in rewrite_block.instrs:
                                     consumer.args = [
                                         claimed.get(id(argument), argument)
                                         for argument in consumer.args
                                     ]
+                                    # A per-arm region call feeds the arm's
+                                    # payload under its own id.
+                                    if "feed_ids" in consumer.attributes:
+                                        consumer.attributes["feed_ids"] = tuple(
+                                            claimed_ids.get(int(value), int(value))
+                                            for value in consumer.attributes[
+                                                "feed_ids"
+                                            ]
+                                        )
                                     # Program: ``if v is not None: t = v * 3``
                                     # on a value-union call result.  Wrong
                                     # record: the region feed's view of ``v``
@@ -24979,10 +24992,19 @@ def _class_surface_ssa_program(
                     if int(member) in callee_graph
                 ),)
                 for member in history[:-1]
-                if not none_member(member) or len(set().union(*(
+                # Program: ``def leaf(f): if f: return 0.5; return None``.
+                # Wrong record: the present member joined beside a ``None``
+                # one with a single class, so the call result became a
+                # NoneType|float tagged union and the optional's own
+                # presence lowering was bypassed (a forwarded optional read
+                # as a true None-test).  Rule: a history that holds None
+                # joins its members only when the present ones hold two
+                # classes; beside one class it is an optional.
+                if len(set().union(*(
                     returned_classes(other) for other in history
                     if not none_member(other)
                 )) - {"builtins.NoneType"}) >= 2
+                or not any(none_member(other) for other in history)
             )
     _settle_linked_dynamic_sequences(
         tuple(planned_graphs_by_shell.values()), tuple(linked_value_edges),

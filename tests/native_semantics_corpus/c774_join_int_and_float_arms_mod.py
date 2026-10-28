@@ -3,5 +3,5 @@ def root(n: int, c: int) -> float:
         s = n
     else:
         s = n * 0.5
-    return (s * 3.0) % 5 + 0.0
+    return (s * 3) % 5 + 0.0
 # INPUTS [{'n':7,'c':2},{'n':7,'c':3}]
