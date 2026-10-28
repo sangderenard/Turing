@@ -1609,6 +1609,12 @@ def post_control_program(
             block_cell = post_block(block)
             if block_cell is None:
                 continue
+            # Program: ``xs.extend([a, b, b])``.  A repeated display member
+            # births twice from one producer: the same block fact on the
+            # same row, so the same cell.  A cell has one placement; its
+            # first occurrence in this arm holds it.
+            if any(block_cell.key == item.key for item in placed):
+                continue
             posted_block_cells.add(block_cell.key)
             predecessors = tuple(placed)
             placed.append(block_cell)
