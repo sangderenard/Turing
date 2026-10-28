@@ -295,7 +295,9 @@ def test_reassigned_let_binding_is_a_new_version_of_the_same_name():
 
 
 @pytest.mark.parametrize("source", [
-    "function f(x) { var y = x; return y; }",
+    # A var read before its declaration runs reads undefined (Lane J12
+    # admits only the vars that read like a let).
+    "function f(x) { let z = y; var y = x; return z; }",
     "function f(x) { const y = x; y = 1; return y; }",
     "function f(x) { let y = x; y &&= 1; return y; }",
 ])

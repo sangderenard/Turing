@@ -4954,8 +4954,11 @@ def lower_sequence_aggregate_constants(
     frame; the retained stores populate it on every invocation.
     """
 
-    arena_dtypes: dict[int, str | None] = {}
-    for table in sequence_tables.values():
+    # Value ids are numbered per function, so an arena's declared dtype is
+    # keyed by (function, id); two descriptors of one function that declare
+    # different dtypes for one arena are a disagreement, never first-wins.
+    arena_dtypes: dict[tuple[str, int], str | None] = {}
+    for table_name, table in sequence_tables.items():
         for descriptor in table.sequences.values():
             if not descriptor.column_value_ids:
                 continue
@@ -4965,15 +4968,27 @@ def lower_sequence_aggregate_constants(
                 and str(descriptor.column_dtypes[0]) not in {"", "unknown"}
                 else None
             )
-            arena_dtypes.setdefault(int(descriptor.column_value_ids[0]), declared)
-    arena_ids = set(arena_dtypes)
-    if not arena_ids:
+            key = (str(table_name), int(descriptor.column_value_ids[0]))
+            earlier = arena_dtypes.get(key)
+            if key in arena_dtypes and None not in (earlier, declared) and earlier != declared:
+                raise ValueError(
+                    f"lower_sequence_aggregate_constants: sequence arena "
+                    f"%t{key[1]} of {key[0]} is declared {earlier!r} and "
+                    f"{declared!r} by two sequence descriptors"
+                )
+            arena_dtypes[key] = declared if declared is not None else earlier
+    if not arena_dtypes:
         return
 
-    def arena_dtype(value: SSAValue) -> str:
+    def arena_dtype(function_name: str, value: SSAValue) -> str:
         # The arena's element type is proven by the Const's own annotation or
         # by the sequence descriptor's declared first column; nothing else.
-        proven = value.dtype or arena_dtypes.get(int(value.id))
+        # 'unknown' is the absence of a dtype, not a dtype.
+        own = str(value.dtype or "")
+        proven = (
+            own if own not in {"", "unknown"}
+            else arena_dtypes.get((function_name, int(value.id)))
+        )
         if not proven:
             raise ValueError(
                 f"lower_sequence_aggregate_constants: sequence arena value "
@@ -4983,6 +4998,10 @@ def lower_sequence_aggregate_constants(
         return str(proven)
 
     for function in functions.values():
+        arena_ids = {
+            value_id for name, value_id in arena_dtypes
+            if name == function.name
+        }
         locally_initialized_arena_ids = {
             int(instruction.args[0].id)
             for block in function.blocks.values()
@@ -5013,7 +5032,7 @@ def lower_sequence_aggregate_constants(
                         # backend to print a Python container as one literal.
                         promoted[value_id] = SSAValue(
                             value_id,
-                            dtype=arena_dtype(instruction.res),
+                            dtype=arena_dtype(function.name, instruction.res),
                             accounting={
                                 "sequence_arena": True,
                                 "compile_time_initialized": True,
@@ -5025,7 +5044,7 @@ def lower_sequence_aggregate_constants(
                         continue
                     promoted[int(instruction.res.id)] = SSAValue(
                         int(instruction.res.id),
-                        dtype=arena_dtype(instruction.res),
+                        dtype=arena_dtype(function.name, instruction.res),
                         accounting={"sequence_arena": True},
                     )
                     continue
