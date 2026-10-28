@@ -28579,54 +28579,54 @@ def _class_surface_ssa_program(
                 extra_mutations=held_table_deletes,
             )
             lexical_sequence_shortfalls = (*lexical_sequence_shortfalls, *held_delete_shortfalls)
-            # Numerical region order alone does not represent reads of mutable
-            # fields. Restore authored sibling order before the dependency
-            # scheduler: an early bool(field) must precede the conditional
-            # that updates the field and publishes its continuation version.
-            from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock
-            # A dispatch region is atomic and may contain early input casts
-            # together with a later authored update.  Place it where the
-            # whole region becomes complete.  Using the earliest member here
-            # undid the dependency-safe atomic region order: pi_update's
-            # final self.acc region also contains line-5 casts, so it
-            # overtook the line-7 normalization and read stale resident state.
-            region_positions = _dispatch_region_completion_positions(
-                graph_obj, getattr(shell, "dispatch_subgraphs", ()),
-            )
-            def source_position(block):
-                if isinstance(block, StatementBlock) and len(block.lines) == 1:
-                    line = block.lines[0]
-                    if line.startswith("__scheduled_region_") and line.endswith("__"):
-                        return region_positions.get(int(line[len("__scheduled_region_"):-2]), (1 << 30, 0, 0))
-                node_id = (block.effect_node_id if isinstance(block, ScalarFieldWriteBlock)
-                           else getattr(block, "source_node_id", None))
-                if node_id is None:
-                    node_id = getattr(block, "source_loop_node_id", None)
-                if node_id is not None:
-                    return _authored_node_position(graph_obj, int(node_id))
-                return (1 << 30, 0, 0)
-            def order_field_effects(block):
-                if isinstance(block, SequenceBlock):
-                    children = [order_field_effects(child) for child in block.blocks]
-                    # Unknown statements remain barriers; do not move calls
-                    # whose source ownership is supplied by the linker.
-                    result, run = [], []
-                    for child in children:
-                        if source_position(child)[0] >= (1 << 30):
-                            result.extend(sorted(run, key=source_position)); run = []
-                            result.append(child)
-                        else:
-                            run.append(child)
-                    result.extend(sorted(run, key=source_position))
-                    return replace(block, blocks=tuple(result))
-                if isinstance(block, ConditionalBlock):
-                    return replace(block, body=order_field_effects(block.body),
-                                   orelse=None if block.orelse is None else order_field_effects(block.orelse))
-                if isinstance(block, (LoopBlock, WhileBlock)):
-                    return replace(block, body=order_field_effects(block.body))
-                return block
-            control = replace(control, root=order_field_effects(control.root))
-            from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
+        # Numerical region order alone does not represent reads of mutable
+        # fields. Restore authored sibling order before the dependency
+        # scheduler: an early bool(field) must precede the conditional
+        # that updates the field and publishes its continuation version.
+        from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock
+        # A dispatch region is atomic and may contain early input casts
+        # together with a later authored update.  Place it where the
+        # whole region becomes complete.  Using the earliest member here
+        # undid the dependency-safe atomic region order: pi_update's
+        # final self.acc region also contains line-5 casts, so it
+        # overtook the line-7 normalization and read stale resident state.
+        region_positions = _dispatch_region_completion_positions(
+            graph_obj, getattr(shell, "dispatch_subgraphs", ()),
+        )
+        def source_position(block):
+            if isinstance(block, StatementBlock) and len(block.lines) == 1:
+                line = block.lines[0]
+                if line.startswith("__scheduled_region_") and line.endswith("__"):
+                    return region_positions.get(int(line[len("__scheduled_region_"):-2]), (1 << 30, 0, 0))
+            node_id = (block.effect_node_id if isinstance(block, ScalarFieldWriteBlock)
+                       else getattr(block, "source_node_id", None))
+            if node_id is None:
+                node_id = getattr(block, "source_loop_node_id", None)
+            if node_id is not None:
+                return _authored_node_position(graph_obj, int(node_id))
+            return (1 << 30, 0, 0)
+        def order_field_effects(block):
+            if isinstance(block, SequenceBlock):
+                children = [order_field_effects(child) for child in block.blocks]
+                # Unknown statements remain barriers; do not move calls
+                # whose source ownership is supplied by the linker.
+                result, run = [], []
+                for child in children:
+                    if source_position(child)[0] >= (1 << 30):
+                        result.extend(sorted(run, key=source_position)); run = []
+                        result.append(child)
+                    else:
+                        run.append(child)
+                result.extend(sorted(run, key=source_position))
+                return replace(block, blocks=tuple(result))
+            if isinstance(block, ConditionalBlock):
+                return replace(block, body=order_field_effects(block.body),
+                               orelse=None if block.orelse is None else order_field_effects(block.orelse))
+            if isinstance(block, (LoopBlock, WhileBlock)):
+                return replace(block, body=order_field_effects(block.body))
+            return block
+        control = replace(control, root=order_field_effects(control.root))
+        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
         # Keyed values consumed directly by control have no numerical region
         # to schedule their reads.  This includes direct return operands, but
         # also branch predicates and resident sequence mutations (notably the
