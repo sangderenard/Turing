@@ -12328,13 +12328,41 @@ class _ControlSSABuilder(TiledObject):
             )
             for member in members:
                 span = int(member.id) in arena_ids or bool(member.shape)
+                _storage = "span" if span else "scalar"
+                # Program: ``for k in d`` over ``d: dict[int, int]`` and
+                # ``for a, b in ps`` over ``ps: list[tuple[int, int]]``.
+                # Wrong record: a member the ProgramABI binding already
+                # posted ``sequence`` (the sequence's own value) or
+                # ``reference`` (a tuple element's cell) was restated
+                # ``span``, and the physical view refused the two.  Rule: a
+                # member whose row already carries one of those kinds keeps
+                # it, with its rank.
+                _rank = 1 if span else 0
+                _prior_cell = self._book().latest_ref(
+                    SSA_VALUE, (self._scope(), int(member.id)),
+                )
+                _prior = (
+                    None if _prior_cell is None else
+                    self._book().page(SSA_VALUE).cell(
+                        _prior_cell.row, _prior_cell.column,
+                    )
+                )
+                _prior_storage = getattr(_prior, "storage", None)
+                if (
+                    _prior_storage == "reference"
+                    or (_prior_storage == "sequence"
+                        and int(member.id) == int(value_id))
+                ):
+                    _storage = _prior_storage
+                    if getattr(_prior, "rank", None) is not None:
+                        _rank = int(_prior.rank)
                 _member_cell = self._revise_value(
                     member,
                     self._sequence_contract_cell(value_id), _owner_kind,
                     stage=self._stage(),
                     physical={
-                        "storage": "span" if span else "scalar",
-                        "rank": 1 if span else 0,
+                        "storage": _storage,
+                        "rank": _rank,
                     },
                 )
                 _member_fact = self._book().page(SSA_VALUE).cell(
