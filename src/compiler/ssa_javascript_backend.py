@@ -43,6 +43,17 @@ from .javascript_runtime_utilities import (
 from .oop_schema import ClassSchema
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 @dataclass(frozen=True, slots=True)
 class JavaScriptEmissionShortfall:
     operation: str
@@ -845,7 +856,7 @@ def emit_ssa_module_to_javascript(
                     if result is None or not args:
                         refuse(operation, "cast needs an operand and result", function_label, block_name)
                     else:
-                        dtype = str(attributes.get("target_dtype") or instruction.res.dtype or "float64")
+                        dtype = str(attributes.get("target_dtype") or _settled_dtype(instruction.res.dtype, instruction.res.id, "Cast target_dtype attribute or result dtype"))
                         lines.append(f"        {result} = turingCast({args[0]}, {_literal(dtype)});")
                     continue
                 if operation in {"Select", "select", "where"}:
@@ -1109,7 +1120,7 @@ def emit_ssa_module_to_javascript(
         Parameter(
             name=f"t{value.id}",
             role="inout" if int(value.id) in root_pointers else "input",
-            dtype=str(value.dtype or "float64"),
+            dtype=str(_settled_dtype(value.dtype, value.id, "SSAValue.dtype")),
             c_type="JavaScript value",
             ctypes_name="n/a",
             passing="reference" if int(value.id) in root_pointers else "value",

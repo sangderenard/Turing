@@ -112,6 +112,17 @@ _I64_BITWISE_OPCODE = {
 }
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 class WasmEmissionError(ValueError):
     """The program cannot be expressed in WebAssembly."""
 
@@ -1039,7 +1050,7 @@ def _value_type(program: FusedProgram, dtype: str | None) -> tuple[str, int, str
             if entry is not None and entry.dtype:
                 dtype = str(entry.dtype)
                 break
-    resolved = _TYPES.get(str(dtype or "float64"))
+    resolved = _TYPES.get(str(_settled_dtype(dtype, "?", "fused program dtype")))
     if resolved is None:
         raise WasmEmissionError(
             f"no WebAssembly value type for dtype {dtype!r}; "
