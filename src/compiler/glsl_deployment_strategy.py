@@ -25911,8 +25911,11 @@ def _tensor_descriptor_rule(
                         break
                     path.insert(0, int(top_index))
                     top = top_base
+                # A dict's subscript is a key lookup: its leaves are keys and
+                # values in display order, not positional members.
                 if (
                     leaves
+                    and base_attributes.get("aggregate_kind") != "dict"
                     and isinstance(index, int)
                     and not isinstance(index, bool)
                     and -len(leaves) <= index < len(leaves)
