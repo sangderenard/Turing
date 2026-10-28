@@ -18632,8 +18632,23 @@ class _ControlSSABuilder(TiledObject):
                 snapshot_cells.get(int(initial_value_id)),
                 true_value, false_value, predicate,
             )
+            # Program: ``s = 0; for v in xs: if v > 3.0: s += v``
+            # (``test_ssa_numeric_joins``).  Wrong record: the carried merge took the entered
+            # version's class (int64) while the arm that rebinds ``s`` is a
+            # float, so the native Phi truncated 4.5 to 4.  Rule: a scalar
+            # numeric join promotes (``_numeric_join``) and converts the
+            # narrower arm on its own edge; ``ssa_numeric_joins`` refuses
+            # the join where Python could tell the classes apart.
+            join_dtype = self._numeric_join((true_value, false_value))
+            join_arms = (true_value, false_value)
+            if join_dtype is not None:
+                true_value, false_value = self._numeric_join_arms(
+                    join_dtype,
+                    ((true_exit, true_value), (false_exit, false_value)),
+                )
+            carried_dtype = initial.dtype if join_dtype is None else join_dtype
             if int(merged_value_id) in {
-                int(true_value.id), int(false_value.id),
+                int(join_arms[0].id), int(join_arms[1].id),
             }:
                 # Graph identities may reuse the selected arm's SetAttr id as
                 # the enclosing join id.  They are the same source version,
@@ -18641,7 +18656,7 @@ class _ControlSSABuilder(TiledObject):
                 # definition separately and retain the graph id as provenance
                 # instead of emitting a self-referential Phi.
                 merged = self.fresh_value(
-                    dtype=initial.dtype, shape=initial.shape,
+                    dtype=carried_dtype, shape=initial.shape,
                     transform=PHI_CONDITIONAL, operands=phi_operands,
                 )
                 merged.accounting.update({
@@ -18651,7 +18666,7 @@ class _ControlSSABuilder(TiledObject):
             else:
                 merged = SSAValue(
                     int(merged_value_id),
-                    dtype=initial.dtype,
+                    dtype=carried_dtype,
                     shape=initial.shape,
                 )
                 # The join adopts the graph's merge id; its row derives from
@@ -18669,8 +18684,8 @@ class _ControlSSABuilder(TiledObject):
             if self._is_stand_in(initial_value_id):
                 candidates = [
                     arm_value for arm_id, arm_value in (
-                        (true_value_id, true_value),
-                        (false_value_id, false_value),
+                        (true_value_id, join_arms[0]),
+                        (false_value_id, join_arms[1]),
                     )
                     if values_before_body.get(int(arm_id)) is arm_value
                 ]
@@ -18686,6 +18701,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_carried",
+                    **({"numeric_join_promoted": True}
+                       if (true_value, false_value) != join_arms else {}),
                     "initial_value_id": self._phi_initial_binding(
                         initial_value_id, entered, merged,
                         stage=CONTROL_SSA_CONDITIONAL,
