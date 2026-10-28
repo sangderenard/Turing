@@ -9462,7 +9462,7 @@ class _ControlSSABuilder(TiledObject):
         """
 
         if (
-            value.dtype in {None, "unknown", "none"}
+            value.dtype in {None, "unknown", "none", "None"}
             or str(value.dtype) == str(dtype)
         ):
             return value
@@ -9495,7 +9495,7 @@ class _ControlSSABuilder(TiledObject):
 
         present = tuple(
             value for value in values
-            if value.dtype not in {None, "unknown", "none"}
+            if value.dtype not in {None, "unknown", "none", "None"}
         )
         dtypes = {str(value.dtype) for value in present}
         if (
@@ -22615,7 +22615,7 @@ class _ControlSSABuilder(TiledObject):
                 # arms are ints and bools.  Any other disagreement is named.
                 merge_dtypes = {
                     str(value.dtype) for value in incoming_values
-                    if value.dtype not in {None, "unknown", "none"}
+                    if value.dtype not in {None, "unknown", "none", "None"}
                 }
                 if len(merge_dtypes) > 1:
                     promoted = self._numeric_join(incoming_values)
