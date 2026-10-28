@@ -24826,6 +24826,56 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             mapping_contract_evidence.append({"field_cell": field_cell, "class_cell": class_cell, "key_layout_cell": layout_cell, "dtype": str(dtype), "key_width": len(layout.members), "key_class_cells": key_class_cells, "key_dtypes": key_dtypes})
     if unproved_mapping_fields.intersection(mapping_contract_views):
         raise ValueError("mapping child writers include an unproved payload or key layout for the same field declaration")
+    # Program: ``self._d = {}`` in ``__init__`` and ``self._d[k] = v`` in a
+    # method.  Wrong record: the field's heap table had no key or value
+    # dtype (no annotation, an empty display), so its constructor birth had
+    # no owner.  Rule: as for child writers above, the scalar stores into
+    # an unannotated mapping field settle its key and value columns when
+    # every store's key and value have one Python scalar class each.
+    scalar_store_views: dict[Any, set] = {}
+    for entry in function_table:
+        wrapper = getattr(entry, "graph", None)
+        if wrapper is None:
+            continue
+        target = wrapper.G
+        scope = _source_numeric_scope(wrapper)
+        for _store_id, store_data in target.nodes(data=True):
+            if str(store_data.get("type") or store_data.get("op")).casefold() != "indexedstore":
+                continue
+            roles = [(str(role), int(parent)) for parent, role in store_data.get("parents") or ()]
+            bases = [parent for role, parent in roles if role == "base"]
+            indices = [parent for role, parent in roles if role == "index"]
+            values = [parent for role, parent in roles if role == "value"]
+            if len(bases) != 1 or bases[0] not in target:
+                continue
+            base_attrs = target.nodes[bases[0]].get("attributes") or {}
+            field_cell = base_attrs.get("field_declaration_cell")
+            if (
+                not isinstance(field_cell, _Ref) or field_cell.page != _CLASS_FIELD_DECLARATION
+                or base_attrs.get("aggregate_kind") != "dict"
+                or field_cell in mapping_contract_views or field_cell in unproved_mapping_fields
+            ):
+                continue
+            classes = []
+            for operand in (*indices, *values):
+                cell = current_identity_book().latest_ref(
+                    _SOURCE_VALUE_CLASS, (scope, int(target.nodes[operand].get("value_id", operand))),
+                ) if operand in target else None
+                fact = None if cell is None else current_identity_book().page(_SOURCE_VALUE_CLASS).cell(cell.row, cell.column)
+                classes.append(
+                    {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(fact[0]))
+                    if fact is not None and int(fact[1]) == 1 else None
+                )
+            scalar_store_views.setdefault(field_cell, set()).add(
+                tuple(classes) if len(indices) == 1 and len(values) == 1 else None
+            )
+    for field_cell, writes in scalar_store_views.items():
+        if len(writes) != 1 or None in writes or None in next(iter(writes)):
+            continue
+        key_dtype, value_dtype = next(iter(writes))
+        mapping_contract_views[field_cell] = {
+            "mapping_key_dtype": key_dtype, "mapping_value_dtype": value_dtype,
+        }
     for entry in function_table:
         wrapper = getattr(entry, "graph", None)
         if wrapper is None:
@@ -24852,7 +24902,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if field_id not in target:
                 continue
             contract = mapping_contract_views.get((target.nodes[field_id].get("attributes") or {}).get("field_declaration_cell"))
-            if contract is not None:
+            if contract is not None and "mapping_child_column_dtypes" in contract:
                 data.setdefault("attributes", {}).update({"producer_kind": "mapping_lookup_result" if operation == "get" else "mapping_default_result", "aggregate_kind": "list", "sequence_column_count": 1, "sequence_column_dtypes": contract["mapping_child_column_dtypes"], "sequence_element_class_ref": {"int64": "builtins.int", "float64": "builtins.float", "bool": "builtins.bool"}[contract["mapping_child_column_dtypes"][0]]})
     graph.G.graph["mapping_child_contract_evidence"] = tuple(mapping_contract_evidence)
 

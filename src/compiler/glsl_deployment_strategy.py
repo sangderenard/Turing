@@ -3065,6 +3065,15 @@ def _planned_scalar_dtypes_from(
                     writers.append(classes.get(str(
                         attributes["mapping_value_class_ref"]
                     ).removeprefix("builtins.")))
+                # An unannotated mapping field's rows: the class field
+                # contract its methods' scalar stores settled.
+                elif (
+                    attributes.get("aggregate_kind") == "dict"
+                    and attributes.get("producer_kind") == "record_field"
+                    and str(attributes.get("mapping_value_dtype"))
+                    in {"int64", "float64", "bool"}
+                ):
+                    writers.append(str(attributes["mapping_value_dtype"]))
                 elif attributes.get("sequence_element_class_ref"):
                     writers.append(classes.get(str(
                         attributes["sequence_element_class_ref"]
@@ -3362,8 +3371,9 @@ def _planned_scalar_dtypes_from(
                     ))
                     continue
                 # Program: ``v = d.get(n); a = -1 if v is None else v``
-                # (corpus c434).  Wrong record: ``d.get(n)`` is the IfExp
-                # ``d[n] if n in d else None``; its ``None`` arm is a
+                # (corpus c434; also ``s = None if c else i`` then ``t =
+                # None if s is None else -s``, corpus c367).  Wrong record:
+                # ``d.get(n)`` is the IfExp ``d[n] if n in d else None``; its ``None`` arm is a
                 # constant with no scalar class, so the join never closed
                 # and the consumer's region had no row.  Rule: an optional
                 # join's payload (the only value a region reads, its

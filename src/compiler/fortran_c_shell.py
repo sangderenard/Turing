@@ -18282,6 +18282,27 @@ def _sequence_column_dtype_contracts(
     for destination, writes in row_writes.items():
         if all(None not in row for row in writes) and len(set(writes)) == 1:
             contracts[destination] = writes[0]
+    # An empty display a constructor assigns to a mapping field is written
+    # by that field's methods; the class field contract settled from those
+    # stores (``class_field_mapping_contracts``) is its row constraint.
+    field_mapping_contracts = dict(graph_obj.graph.get("class_field_mapping_contracts") or {})
+    for _node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("type") or data.get("op") or "").casefold() != "setattr":
+            continue
+        field_contract = field_mapping_contracts.get(
+            str((data.get("attributes") or {}).get("attribute"))
+        ) or {}
+        if not (field_contract.get("mapping_key_dtype") and field_contract.get("mapping_value_dtype")):
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) != "value" or parent not in graph_obj:
+                continue
+            destination = int(graph_obj.nodes[parent].get("value_id", parent))
+            if declared.get(destination) == 2 and destination not in contracts:
+                contracts[destination] = (
+                    str(field_contract["mapping_key_dtype"]),
+                    str(field_contract["mapping_value_dtype"]),
+                )
 
     for node_id, data in graph_obj.nodes(data=True):
         value_id = int(data.get("value_id", node_id))
@@ -24408,9 +24429,21 @@ def _class_surface_ssa_program(
             if callee_graph is None:
                 continue
             for caller_id, callee_id in planned_call.argument_bindings:
-                linked_value_edges.append((
-                    caller_graph, int(caller_id), callee_graph, int(callee_id),
-                ))
+                # Program: ``intern_batch(1, [65], [1, 1])`` (Token Orchard
+                # acceptance).  Wrong record: the callsite fold folds
+                # ``validate_batch_envelope``'s body to a constant and drops
+                # the unread formal ``values``; the plan keeps the authored
+                # actual-to-formal binding from the declaration graph as
+                # provenance.  Settling a value ABI over that edge posted
+                # VALUE_TYPE_ABI for a value absent from the specialized copy,
+                # derived from no class of that copy's scope.  Rule: a value
+                # ABI crosses only to a formal the callee graph holds; the
+                # binding stays an exact site and a call-edge row.
+                if int(callee_id) in callee_graph:
+                    linked_value_edges.append((
+                        caller_graph, int(caller_id), callee_graph,
+                        int(callee_id),
+                    ))
                 linked_argument_sites.add((
                     id(caller_graph), int(planned_call.callsite_id),
                     int(caller_id),
