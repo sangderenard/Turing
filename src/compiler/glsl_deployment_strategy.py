@@ -5889,25 +5889,6 @@ def _build_shell_hierarchy_plan(
                 )
             ):
                 return None, ()
-            # Lane D, D8.  Program: ``a = np.asarray(xs); a[0] + a[1]``.  The
-            # external name ``np.asarray`` (an Input bound ``tensor``) is read
-            # only as the callee of tensor-namespace calls; the call carries
-            # the typed result (its ``tensor`` record).  A callee is a static
-            # symbol, as a StaticReference is: not a value, so it posts no
-            # row and opens no dtype obligation.
-            if (
-                attributes.get("binding_kind") == "external"
-                and receivers
-                and all(
-                    str(role) == "callee"
-                    and (
-                        graph.G.nodes.get(int(child), {}).get("attributes")
-                        or {}
-                    ).get("tensor_candidate") is not None
-                    for child, role in receivers
-                )
-            ):
-                return None, ()
             # A limb of a Precision value: Precision is a numeric value, not
             # a record, and its ``_stack`` holds its limbs, whose element the
             # precision library states (``Precision.term`` reads
