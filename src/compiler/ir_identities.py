@@ -209,6 +209,291 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
     return counts
 
 
+def _python_int_dtype(dtype) -> bool:
+    return str(dtype) == "int64"
+
+
+def _integer_constant(instruction) -> int | None:
+    """The exact int payload of an integer ``Const``, else ``None``."""
+
+    for key in ("constant", "values", "value"):
+        payload = instruction.attributes.get(key)
+        if payload is not None:
+            break
+    if isinstance(payload, bool) or not isinstance(payload, int):
+        return None
+    return int(payload)
+
+
+def _integer_pow_site(instruction) -> str | None:
+    """Which exact power reduction an instruction takes, else ``None``.
+
+    ``"int"``: ``a ** b`` / ``pow(a, b)`` on int64 with an int64 result.
+    ``"modular"``: ``pow(a, b, m)`` on int64.
+    """
+
+    canonical = str(
+        instruction.attributes.get("tensor_operation")
+        or instruction.attributes.get("tensor")
+        or instruction.op
+    )
+    result = instruction.res
+    if (
+        canonical not in _POW or result is None
+        or tuple(getattr(result, "shape", None) or ())
+        or len(instruction.args) not in (2, 3)
+        or not all(_python_int_dtype(value.dtype) for value in instruction.args)
+        or any(tuple(value.shape or ()) for value in instruction.args)
+        or not _python_int_dtype(result.dtype)
+    ):
+        return None
+    return "int" if len(instruction.args) == 2 else "modular"
+
+
+def reduce_integer_pow(functions) -> dict:
+    """The shared exact power reduction: Python ``int`` powers, in place.
+
+    Program: ``a ** b``, ``pow(a, b)``, ``pow(a, b, m)`` on ints.  Wrong
+    record: C and LLVM refused every int power but ``x ** 2``, and a float
+    ``pow`` of an int is not Python's exact int.  Rule: square-and-multiply
+    in ordinary repository SSA, so every backend inherits it -- each
+    multiply is Python ``int`` arithmetic (``source_type`` ``BinOp``),
+    which C and LLVM overflow-check (``native_faults.INT_OVERFLOW``).
+    A constant exponent unrolls straight-line; a variable one becomes a
+    loop over its bits (at most 63 trips).  ``pow(a, b, m)`` reduces each
+    product by Python's floored ``%``, so intermediates stay below ``m**2``.
+
+    Python's other outcomes are named faults: ``0 ** -n`` raises
+    ``ZeroDivisionError`` (``INT_ZERO_DIVISION``), ``pow(a, b, 0)``
+    ``ValueError`` (``POW_MODULUS_ZERO``).  ``a ** -n`` is a float in
+    Python and ``pow(a, -n, m)`` a modular inverse; an int-typed power
+    reaching a negative exponent reports ``INT_POWER_NEGATIVE_EXPONENT``
+    rather than return an int Python never computes: the frontend types
+    every int ** int as int (``a ** -2`` too), and a float arm would need
+    an int | float result.
+    """
+
+    from .concordance_declarations import (
+        PRECISION_IDENTITIES, PRECISION_IDENTITY_VALUE, SSA_BLOCK,
+        SSABlockKind,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import function_scope_of, identity_cells
+    from .native_faults import (
+        INT_POWER_NEGATIVE_EXPONENT, INT_ZERO_DIVISION, POW_MODULUS_ZERO,
+    )
+    from .ssa_record_return_state import mint_ssa_value
+    from ..transmogrifier.ssa import BasicBlock
+
+    counts = {"int_pow_unrolled": 0, "int_pow_loop": 0, "int_pow_modular": 0}
+
+    def rewrite(function, block_name: str, index: int) -> None:
+        block = function.blocks[block_name]
+        power = block.instrs[index]
+        site = _integer_pow_site(power)
+        post = block.instrs[index + 1:]
+        old_successors = list(block.successors)
+        block.instrs = block.instrs[:index]
+        anchor = power.args[0]
+        constants = {
+            int(instruction.res.id): _integer_constant(instruction)
+            for candidate in function.blocks.values()
+            for instruction in candidate.instrs
+            if instruction.op == "Const" and instruction.res is not None
+        }
+        added: list[BasicBlock] = []
+        taken = set(function.blocks)
+        state = {"current": block}
+
+        def new_block(stem: str, kind) -> BasicBlock:
+            serial = 0
+            name = f"{block_name}.{stem}"
+            while name in taken:
+                serial += 1
+                name = f"{block_name}.{stem}.{serial}"
+            taken.add(name)
+            created = BasicBlock(name)
+            added.append(created)
+            # The block's ``ssa_block`` row, from the power it spells.
+            owners = identity_cells(function, power.res, *power.args)
+            book = current_identity_book()
+            row = (function_scope_of(function), str(function.name), name)
+            if owners and book.latest_ref(SSA_BLOCK, row) is None:
+                book.post(
+                    SSA_BLOCK, row, kind, stage=PRECISION_IDENTITIES,
+                    provenance=Derived(owners), mode=Mode.CONCORD,
+                )
+            return created
+
+        def mint(dtype: str) -> SSAValue:
+            return SSAValue(mint_ssa_value(
+                function, PRECISION_IDENTITY_VALUE, (anchor,),
+                dtype=dtype, shape=(), stage=PRECISION_IDENTITIES,
+            ), dtype=dtype)
+
+        def put(op, args, dtype="int64", attributes=None, res=None) -> SSAValue:
+            res = mint(dtype) if res is None else res
+            state["current"].instrs.append(
+                Instr(op, list(args), res, attributes=dict(attributes or {}))
+            )
+            return res
+
+        def arithmetic(op, args, res=None) -> SSAValue:
+            # Python ``int`` arithmetic: the backends' checked spelling.
+            return put(op, args, attributes={
+                "source_type": "BinOp", "integer_power": True,
+            }, res=res)
+
+        def const(value: int) -> SSAValue:
+            return put("Const", [], attributes={"value": int(value)})
+
+        def jump(target: BasicBlock) -> None:
+            current = state["current"]
+            current.instrs.append(
+                Instr("Br", [], None, attributes={"target": target.name})
+            )
+            current.successors = [target.name]
+
+        def guard(condition: SSAValue, code: int, failure: str) -> None:
+            fault = new_block("pow_fault", SSABlockKind.VALIDATION_FAIL)
+            passing = new_block("pow_checked", SSABlockKind.VALIDATION_PASS)
+            current = state["current"]
+            current.instrs.append(Instr("CondBr", [condition], None, attributes={
+                "true_target": fault.name, "false_target": passing.name,
+            }))
+            current.successors = [fault.name, passing.name]
+            fault.instrs.append(Instr("Call", [], None, attributes={
+                "callee": "turing_validation_error", "error_code": int(code),
+                "failure": failure,
+            }))
+            state["current"] = fault
+            jump(passing)
+            state["current"] = passing
+
+        base, exponent = power.args[0], power.args[1]
+        literal = constants.get(int(exponent.id))
+        zero, one = const(0), const(1)
+        unrolled = site == "int" and literal is not None and literal >= 0
+        negative = None if unrolled else put("Lt", [exponent, zero], "bool")
+        modulus = None
+        if site == "modular":
+            modulus = power.args[2]
+            modulus_zero = put("Eq", [modulus, zero], "bool")
+            guard(modulus_zero, POW_MODULUS_ZERO, "pow_modulus_zero")
+            guard(negative, INT_POWER_NEGATIVE_EXPONENT,
+                  "pow_negative_exponent")
+            modulus = put("Select", [modulus_zero, one, modulus])
+        elif not unrolled:
+            zero_base = put("Eq", [base, zero], "bool")
+            guard(put("And", [negative, zero_base], "bool"),
+                  INT_ZERO_DIVISION, "zero_to_negative_power")
+            guard(negative, INT_POWER_NEGATIVE_EXPONENT,
+                  "pow_negative_exponent")
+        if unrolled:
+            # Straight-line square-and-multiply over the literal's bits.
+            square, result, bits = base, None, int(literal)
+            if bits == 0:
+                put("Const", [], attributes={"value": 1}, res=power.res)
+            while bits:
+                last_bit = bits == 1
+                if bits & 1:
+                    result = square if result is None else arithmetic(
+                        "Mul", [result, square],
+                        res=power.res if last_bit else None,
+                    )
+                    if result is square and last_bit:
+                        arithmetic("Mul", [square, one], res=power.res)
+                bits >>= 1
+                if bits:
+                    square = arithmetic("Mul", [square, square])
+            counts["int_pow_unrolled"] += 1
+        else:
+            count = put("Select", [negative, zero, exponent])
+            if modulus is not None:
+                start = arithmetic("Mod", [base, modulus])
+                first = arithmetic("Mod", [one, modulus])
+            else:
+                start, first = base, one
+            entry = state["current"]
+            header = new_block("pow_loop", SSABlockKind.LOOP_HEADER)
+            step = new_block("pow_step", SSABlockKind.LOOP_BODY)
+            done = new_block("pow_done", SSABlockKind.LOOP_EXIT)
+            jump(header)
+            result, square, remaining = power.res, mint("int64"), mint("int64")
+            next_result, next_square, next_remaining = (
+                mint("int64"), mint("int64"), mint("int64"),
+            )
+            incoming = {"incoming_blocks": (entry.name, step.name)}
+            state["current"] = header
+            put("Phi", [first, next_result], attributes=incoming, res=result)
+            put("Phi", [start, next_square], attributes=incoming, res=square)
+            put("Phi", [count, next_remaining], attributes=incoming,
+                res=remaining)
+            going = put("Gt", [remaining, zero], "bool")
+            header.instrs.append(Instr("CondBr", [going], None, attributes={
+                "true_target": step.name, "false_target": done.name,
+            }))
+            header.successors = [step.name, done.name]
+            state["current"] = step
+            odd = put("Ne", [put("BitAnd", [remaining, one]), zero], "bool")
+            factor = put("Select", [odd, square, one])
+            put("Shr", [remaining, one], res=next_remaining)
+            more = put("Gt", [next_remaining, zero], "bool")
+            # The square is taken only while bits remain, so it
+            # overflows only where the power itself does.
+            kept = put("Select", [more, square, one])
+            if modulus is None:
+                arithmetic("Mul", [result, factor], res=next_result)
+                arithmetic("Mul", [kept, kept], res=next_square)
+            else:
+                arithmetic("Mod", [arithmetic("Mul", [result, factor]),
+                                   modulus], res=next_result)
+                arithmetic("Mod", [arithmetic("Mul", [kept, kept]),
+                                   modulus], res=next_square)
+            jump(header)
+            state["current"] = done
+            counts["int_pow_modular" if modulus is not None
+                   else "int_pow_loop"] += 1
+
+        tail = state["current"]
+        tail.instrs.extend(post)
+        tail.successors = old_successors
+        if tail is not block:
+            # Successor Phis now enter from the block holding the tail.
+            for successor in old_successors:
+                target = function.blocks.get(successor)
+                for instruction in (target.instrs if target else ()):
+                    blocks = instruction.attributes.get("incoming_blocks")
+                    if str(instruction.op) == "Phi" and blocks:
+                        instruction.attributes["incoming_blocks"] = tuple(
+                            tail.name if str(origin) == block_name else origin
+                            for origin in blocks
+                        )
+        ordered = []
+        for name, existing in function.blocks.items():
+            ordered.append((name, existing))
+            if name == block_name:
+                ordered.extend((created.name, created) for created in added)
+        function.blocks.clear()
+        function.blocks.update(ordered)
+
+    for function in functions.values():
+        while True:
+            site = next(
+                (
+                    (name, position)
+                    for name, candidate in function.blocks.items()
+                    for position, instruction in enumerate(candidate.instrs)
+                    if _integer_pow_site(instruction) is not None
+                ),
+                None,
+            )
+            if site is None:
+                break
+            rewrite(function, *site)
+    return counts
+
+
 # Operations a region may contain and still be removable when nothing reads
 # its results: value construction and arithmetic only -- no stores, no
 # calls, no table traffic.  ``LNot``, ``Select`` and ``isfinite`` are the
