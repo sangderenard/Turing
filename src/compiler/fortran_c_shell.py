@@ -44937,11 +44937,22 @@ def _class_surface_ssa_program(
                             mapped_sequence_id = remap[
                                 int(source_sequence.sequence_id)
                             ]
-                            _frame_register_sequence(caller, caller_sequences, map_sequence_descriptor(source_sequence, remap, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(source_sequence.child_table_pool, remap)), _frame_table_cell(
-                                constructor_sequences,
-                                source_sequence.sequence_id,
-                                SEQUENCE_DESCRIPTOR,
-                            ))
+                            mapped_descriptor = map_sequence_descriptor(source_sequence, remap, sequence_id=mapped_sequence_id, child_table_pool=map_child_pool(source_sequence.child_table_pool, remap))
+                            # One owner per list: a field bound to a
+                            # constructor parameter IS the actual's resident
+                            # sequence, whose descriptor and column claim its
+                            # owner already posted.  Every further
+                            # constructor over the same actual (``Bag(a)``
+                            # twice) maps to that identical descriptor;
+                            # re-posting it is a second writer of one claim.
+                            # A DIFFERING descriptor still registers, and
+                            # table.register refuses the disagreement.
+                            if caller_sequences.by_id(mapped_sequence_id) != mapped_descriptor:
+                                _frame_register_sequence(caller, caller_sequences, mapped_descriptor, _frame_table_cell(
+                                    constructor_sequences,
+                                    source_sequence.sequence_id,
+                                    SEQUENCE_DESCRIPTOR,
+                                ))
                             # The constructor's list display proved its row
                             # bound before remapping. Carry that same bound
                             # with its descriptor, as ordinary call frames do.
