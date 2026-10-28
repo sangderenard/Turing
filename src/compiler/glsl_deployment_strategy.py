@@ -26819,6 +26819,34 @@ def _fold_callsite_structural_values(
                     expression.args[1]
                     if len(expression.args) > 1 else None
                 )
+                # A numeric value (``Precision[2]``) is physically a float64
+                # scalar, so its ABI fact reads ``builtins.float``; its
+                # source class is the one its numeric descriptor names.
+                numeric = argument_attributes.get(
+                    "numeric_feature_descriptor"
+                )
+                if isinstance(numeric, Mapping):
+                    from ..common.tensors import extended_precision
+
+                    numeric_class = getattr(
+                        extended_precision, str(numeric.get("type_name")),
+                        None,
+                    )
+                    numeric_identities = type_identities(
+                        expression.args[1]
+                        if len(expression.args) > 1 else None
+                    )
+                    if isinstance(numeric_class, type) and numeric_identities:
+                        held = {
+                            f"{base.__module__}.{base.__qualname__}"
+                            for base in numeric_class.__mro__
+                        }
+                        return any(
+                            name == identity
+                            or name.endswith("." + identity)
+                            for name in held
+                            for identity in numeric_identities
+                        )
                 # ``list[int]`` does not prove an exact Python ``int`` for
                 # a loop item: bool is an int subclass and is accepted by
                 # the annotation. Without a callsite's exact homogeneous
@@ -30548,8 +30576,13 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 # "call".  AST nodes keep the AST rule because an AST graph
                 # also holds op "call" nodes that are not activations
                 # (short-circuited boolop operands).
+                # A class operator (``x / y`` on a record class) is an
+                # activation of its dunder: the reducer records that dispatch
+                # on the BinOp/UnaryOp node itself.
                 expression = data.get("expr_obj")
-                if expression is None:
+                if attributes.get("class_operator_dispatch"):
+                    pass
+                elif expression is None:
                     if str(
                         data.get("op") or data.get("type") or ""
                     ).casefold() != "call":
