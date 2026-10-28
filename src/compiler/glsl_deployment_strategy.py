@@ -1061,6 +1061,8 @@ def _callsite_argument_is_initializer(
     argument_id = int(argument_id)
     if loop_carried_initial_at_call(caller.G, call_id, argument_id):
         return False
+    if _call_returns_argument(caller, call_id, argument_id):
+        return False
     if argument_id not in _mutated_sequence_node_ids(caller.G):
         return True
     from .resident_sequence_materialization import _call_escaped_argument_edges
@@ -1182,6 +1184,82 @@ def _aggregate_binds_by_member(
             caller_graph, include_call_escapes=False,
         )
         or _formal_storage_is_mutated(callee_graph, parameter)
+        or _formal_is_returned(callee_graph, parameter)
+    )
+
+
+def _returned_parameter_names(callee_graph: Any) -> frozenset[str]:
+    """Names of the formals a callee's return slots can hand back as ITSELF.
+
+    A return slot is a formal directly (``return a``) or a branch merge one
+    of whose arms is (``return a if k else [9]``): rule 8 identity
+    forwarding, read from the callee's own graph.
+    """
+
+    names: set[str] = set()
+    seen: set[int] = set()
+    pending = [
+        int(slot)
+        for site in (callee_graph.graph.get("return_slot_values") or {}).values()
+        for slot in site if slot is not None
+    ]
+    while pending:
+        node_id = pending.pop()
+        if node_id in seen or node_id not in callee_graph:
+            continue
+        seen.add(node_id)
+        data = callee_graph.nodes[node_id]
+        attributes = data.get("attributes") or {}
+        if attributes.get("binding_kind") == "parameter":
+            names.add(str(attributes.get("binding_name")))
+        if attributes.get("producer_kind") in {"aggregate_phi", "aggregate_merge"}:
+            pending.extend(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) in {"body", "orelse"}
+            )
+    return frozenset(names)
+
+
+def _formal_is_returned(callee_graph: Any, parameter: str) -> bool:
+    """Whether the callee's return slots hand back ``parameter`` itself.
+
+    Program: ``def same(a): return a; t = same(xs); t.append(5)``.  Wrong
+    record: ``xs`` was split into display members for the callee, so the
+    returned formal named an aggregate rebuilt from leaves and the caller's
+    result had no storage behind it.  Rule 8: a returned formal is the
+    caller's own storage (identity forwarding), so the argument is bound
+    whole -- one owner, the actual's arena -- never by member.
+    """
+
+    return str(parameter) in _returned_parameter_names(callee_graph)
+
+
+def _call_returns_argument(caller: Any, call_id: int, argument_id: int) -> bool:
+    """Whether the call's callee can return the storage ``argument_id`` names.
+
+    Program: ``a = [1, 2, 3]; t = pick(a, k); t.append(5)`` with ``pick``
+    returning ``a`` on one branch.  Wrong record: ``a`` was only the
+    caller's initializer here (nothing in the caller mutated it), so the
+    callee was specialized on its literal rows while its result was ``a``'s
+    own list, grown through ``t``.  Rule 8: the result IS the argument's
+    storage, so the initializer is not its contents after the call.
+    """
+
+    function_table = getattr(caller, "function_table", None)
+    data = caller.G.nodes.get(int(call_id), {})
+    attributes = data.get("attributes") or {}
+    reference = attributes.get("callee_ref", attributes.get("method_ref"))
+    if function_table is None or reference is None:
+        return False
+    callee = getattr(function_table.entry(int(reference)).graph, "G", None)
+    if callee is None:
+        return False
+    receiver, positional, _all = _method_parameter_layout(callee)
+    returned = _returned_parameter_names(callee)
+    return any(
+        int(parent) == int(argument_id)
+        and _callsite_parameter_name(str(role), receiver, positional) in returned
+        for parent, role in data.get("parents") or ()
     )
 
 

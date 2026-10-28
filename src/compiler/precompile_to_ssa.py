@@ -29941,6 +29941,29 @@ def lower_control_sections_to_ssa(
                         else argument
                         for argument in instruction.args
                     ]
+                # The typed views above were keyed by the alias spelling.  The
+                # region now names the resident root, which is the SAME
+                # storage (rule 8): the root takes the alias's typed view
+                # unless it already has its own, so the formal is typed once.
+                for alias_id, root_id in capture_rebindings.items():
+                    if alias_id in region_value_meta:
+                        region_value_meta.setdefault(
+                            root_id, region_value_meta[alias_id],
+                        )
+                    if alias_id in region_values:
+                        view = region_values[alias_id]
+                        region_values.setdefault(root_id, SSAValue(
+                            root_id, dtype=view.dtype,
+                            shape=tuple(view.shape or ()),
+                        ))
+                    if alias_id in instruction_values:
+                        view = instruction_values[alias_id]
+                        instruction_values.setdefault(root_id, SSAValue(
+                            root_id, dtype=view.dtype,
+                            shape=tuple(view.shape or ()),
+                            device=view.device,
+                            accounting=dict(view.accounting or {}),
+                        ))
                 effective_captures = tuple(dict.fromkeys(
                     resident_root(int(value_id))
                     for value_id in effective_captures
