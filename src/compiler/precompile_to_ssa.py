@@ -4994,24 +4994,18 @@ class _ControlSSABuilder(TiledObject):
     def _finish_fault_exits(self, returned: Any) -> None:
         """Close the out-of-range exits of checked indices.
 
-        The validation code is already recorded when control gets here; the
-        exit returns zero outputs so nothing reads a row that is not there.
+        The validation code is already recorded when control gets here, so
+        the exit publishes nothing: it is a non-returning ``Trap`` marked
+        ``fault_exit``, not a second ``Ret``.  The function keeps exactly one
+        ``Ret``, and every backend names its output buffers from that one
+        (a zero-valued fault ``Ret`` used to win the buffer naming in the
+        lanes that read the first ``Ret``).
         """
 
         if self._fault_exit is None:
             return
         fault_exit = self._fault_exit
-        # Later passes publish the function's outputs on the LAST Ret in block
-        # order; the fault exit's zero outputs are not that Ret, so it sits
-        # directly after the entry block.
-        ordered = list(self.blocks.items())
-        entry_item, rest = ordered[0], [
-            item for item in ordered[1:] if item[1] is not fault_exit
-        ]
-        self.blocks.clear()
-        self.blocks[entry_item[0]] = entry_item[1]
-        self.blocks[fault_exit.name] = fault_exit
-        self.blocks.update(rest)
+        returning = self.current
         values = None if returned is None else list(returned)
         if values is not None and all(
             value is not None and str(value.dtype) in {
@@ -5021,20 +5015,18 @@ class _ControlSSABuilder(TiledObject):
             for value in values
         ):
             self.current = fault_exit
-            self.emit(Handler.Ret, [
-                self.constant_value(0, dtype=str(value.dtype))
-                for value in values
-            ], attributes={"fault_exit": True})
+            self.emit(Handler.Trap, [], attributes={"fault_exit": True})
             return
-        # Outputs that cannot be zeroed: continue as ``pop`` does.
-        self.current = fault_exit
+        # Outputs outside the scalar classes: continue as ``pop`` does.  The
+        # exit block then has no predecessor; drop it rather than leave a
+        # second, unreachable ``Ret`` behind.
         for failing, continuing in self._index_fault_blocks:
-            terminator = failing.instrs.pop()
+            failing.instrs.pop()
             failing.successors.remove(fault_exit.name)
             self.current = failing
             self.branch(continuing)
-        self.current = fault_exit
-        self.emit(Handler.Ret, list(values or []))
+        self.blocks.pop(fault_exit.name, None)
+        self.current = returning
 
     def _emit_sequence_row_load(
         self, result_id: int, sequence_id: int, index_id: int,

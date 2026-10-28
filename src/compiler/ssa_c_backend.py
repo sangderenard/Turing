@@ -4518,6 +4518,13 @@ def emit_ssa_module_to_c(
                     body.append(f"            goto {_c_label(on_false)};")
                     body.append("        }")
                     continue
+                if op == "Trap" and instruction.attributes.get("fault_exit"):
+                    # A checked fault already recorded its validation code;
+                    # the exit publishes no outputs and leaves through the
+                    # activation-storage cleanup.
+                    span.take_pending()
+                    body.append(f"        goto cleanup_{_c_symbol(fn)};")
+                    continue
                 if op in {"Ret", "ret", "Return", "return"}:
                     if trace_this_function:
                         pending_trace.clear()

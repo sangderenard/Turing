@@ -3649,6 +3649,13 @@ def _emit_repository_call_module(
                     )
                 continue
 
+            if operation == "Trap" and instruction.attributes.get("fault_exit"):
+                # A checked fault already recorded its validation code; the
+                # exit publishes no outputs.
+                span.take_pending()
+                body.append("  ret void")
+                continue
+
             if operation in {"Ret", "ret", "Return", "return"}:
                 span.take_pending()
                 emit_return_values(tuple(instruction.args))
