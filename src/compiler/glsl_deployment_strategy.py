@@ -2980,6 +2980,15 @@ def _planned_scalar_dtypes_from(
                     writers.append(classes.get(str(
                         attributes["mapping_value_class_ref"]
                     ).removeprefix("builtins.")))
+                # An unannotated mapping field's rows: the class field
+                # contract its methods' scalar stores settled.
+                elif (
+                    attributes.get("aggregate_kind") == "dict"
+                    and attributes.get("producer_kind") == "record_field"
+                    and str(attributes.get("mapping_value_dtype"))
+                    in {"int64", "float64", "bool"}
+                ):
+                    writers.append(str(attributes["mapping_value_dtype"]))
                 elif attributes.get("sequence_element_class_ref"):
                     writers.append(classes.get(str(
                         attributes["sequence_element_class_ref"]

@@ -18183,6 +18183,27 @@ def _sequence_column_dtype_contracts(
     for destination, writes in row_writes.items():
         if all(None not in row for row in writes) and len(set(writes)) == 1:
             contracts[destination] = writes[0]
+    # An empty display a constructor assigns to a mapping field is written
+    # by that field's methods; the class field contract settled from those
+    # stores (``class_field_mapping_contracts``) is its row constraint.
+    field_mapping_contracts = dict(graph_obj.graph.get("class_field_mapping_contracts") or {})
+    for _node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("type") or data.get("op") or "").casefold() != "setattr":
+            continue
+        field_contract = field_mapping_contracts.get(
+            str((data.get("attributes") or {}).get("attribute"))
+        ) or {}
+        if not (field_contract.get("mapping_key_dtype") and field_contract.get("mapping_value_dtype")):
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) != "value" or parent not in graph_obj:
+                continue
+            destination = int(graph_obj.nodes[parent].get("value_id", parent))
+            if declared.get(destination) == 2 and destination not in contracts:
+                contracts[destination] = (
+                    str(field_contract["mapping_key_dtype"]),
+                    str(field_contract["mapping_value_dtype"]),
+                )
 
     for node_id, data in graph_obj.nodes(data=True):
         value_id = int(data.get("value_id", node_id))
