@@ -2866,42 +2866,47 @@ def _planned_scalar_dtypes_from(
                 defaults = parents(data, "arg:1")
                 # The receiver is the table, a store's version of it, or a
                 # loop's carried version of it.
-                # Program: ``cells = {1: 10}; if n > 1: cells[n] = ..;
-                # cells.get(5, big)`` (corpus c302).  A branch join of two
-                # versions of a table is that table when every arm is one.
-                def is_dict_table(table, seen=()):
-                    while table is not None and (
-                        operation(G.nodes[table]) in {"indexedstore", "setitem"}
-                        or (
-                            operation(G.nodes[table]) == "loopresult"
-                            and (G.nodes[table].get("attributes") or {}).get(
-                                "result_kind"
-                            ) == "carried"
-                        )
+                table = receiver[0] if len(receiver) == 1 else None
+                # Program: ``d = {1: n, 7: 4}; for i in range(4): if i ==
+                # n: d[1] = i`` then ``d.get(7, -1) + d.get(1, 0)`` (corpus
+                # c673).  Wrong record: the loop's carried value is the
+                # body's ``if`` merge, a phi of the store and the entering
+                # table, which this walk did not cross, so the read had no
+                # table and its class fell to the float64 default.  Rule:
+                # a merge whose arms all reach one table is that table.
+                def reaching_table(node, depth=0):
+                    if node is None or depth > 16:
+                        return None
+                    kind = operation(G.nodes[node])
+                    if kind == "phi":
+                        reached = {
+                            reaching_table(arm, depth + 1)
+                            for arm in parents(G.nodes[node], "body", "orelse")
+                        }
+                        return next(iter(reached)) if len(reached) == 1 else None
+                    if kind in {"indexedstore", "setitem"} or (
+                        kind == "loopresult"
+                        and (G.nodes[node].get("attributes") or {}).get(
+                            "result_kind"
+                        ) == "carried"
                     ):
                         base = parents(
-                            G.nodes[table],
-                            "value" if operation(G.nodes[table]) == "loopresult"
-                            else "base",
+                            G.nodes[node],
+                            "value" if kind == "loopresult" else "base",
                         )
-                        table = base[0] if len(base) == 1 else None
-                    if table is None or table in seen:
-                        return False
-                    if operation(G.nodes[table]) == "phi":
-                        arms = parents(G.nodes[table], "body", "orelse")
-                        return bool(arms) and all(
-                            is_dict_table(arm, (*seen, table)) for arm in arms
+                        return reaching_table(
+                            base[0] if len(base) == 1 else None, depth + 1
                         )
-                    return bool(
-                        is_collection(table)
-                        and (G.nodes[table].get("attributes") or {}).get(
-                            "aggregate_kind"
-                        ) == "dict"
-                    )
+                    return node
 
+                table = reaching_table(table)
+                table = reaching_table(table)
                 if (
-                    len(receiver) == 1 and len(defaults) == 1
-                    and is_dict_table(receiver[0])
+                    table is not None and len(defaults) == 1
+                    and is_collection(table)
+                    and (G.nodes[table].get("attributes") or {}).get(
+                        "aggregate_kind"
+                    ) == "dict"
                 ):
                     held = element.get(receiver[0])
                     default_dtype = scalar.get(defaults[0])

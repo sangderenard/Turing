@@ -164,11 +164,15 @@ def test_loop_lowers_to_header_body_exit_blocks_with_phis():
 
 @needs_node
 @pytest.mark.parametrize("source", [
-    # break/continue/return leave a loop other than through its condition.
+    # A label on a block is not a loop's: its exit has no flag.
     "/** @param {number} n */ function root(n) { let s = 0; "
-    "for (let i = 0; i < n; i++) { if (i > 2) { break; } s += i; } return s; }",
+    "blk: { if (n > 1) { break blk; } s = 1; } return s; }",
+    # A returned value whose kind is not known before the loop.
+    "/** @param {number} n */ function root(n) { "
+    "for (let i = 0; i < n; i++) { if (i > 2) return f(i); } return 1; }",
+    # A loop with neither a condition nor a break never leaves.
     "/** @param {number} n */ function root(n) { let s = 0; "
-    "while (s < n) { return s; } return 1; }",
+    "for (;;) { s += n; } return s; }",
     # A carried value that changes kind has no single dtype.
     "/** @param {number} n */ function root(n) { let x = 0; "
     "for (let i = 0; i < n; i++) { x = x > 0; } return x; }",
@@ -269,3 +273,57 @@ def test_lowering_inside_an_open_compile_posts_to_that_book():
     finally:
         end_identity_book(token)
     assert lowered.module.metadata["identity_book"] is book
+
+
+@needs_node
+def test_break_and_continue_are_flags_on_the_loop():
+    source = (
+        "/** @param {number} n */ function root(n) { let s = 0; "
+        "for (let i = 0; i < n && i < 40; i++) "
+        "{ if (i % 2 === 0) continue; if (s > 20) break; s += i; } return s; }"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    phis = [
+        instruction.attributes["binding_name"]
+        for instruction in lowered.module.functions["root"].blocks["loop0_header"].instrs
+        if instruction.op == "Phi"
+    ]
+    # The break flag is carried; the continue flag is per iteration.
+    assert sorted(name.split("@")[0] for name in phis) == ["%break", "i", "s"]
+    assert check_program(source, "[[0], [3], [9], [100], [NaN], [Infinity]]") == "PASS"
+
+
+@needs_node
+def test_return_inside_a_loop_is_a_carried_flag_and_result():
+    source = (
+        "/** @param {number} n */ function root(n) { let s = 0; "
+        "for (let i = 0; i < n && i < 40; i++) { s += i; if (s > 10) return i; } "
+        "return -s; }"
+    )
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    phis = sorted(
+        instruction.attributes["binding_name"]
+        for instruction in lowered.module.functions["root"].blocks["loop0_header"].instrs
+        if instruction.op == "Phi"
+    )
+    assert [name.split("@")[0] for name in phis] == ["%result", "%return", "i", "s"]
+    assert check_program(source, "[[0], [3], [9], [100], [NaN], [Infinity]]") == "PASS"
+
+
+@needs_node
+@pytest.mark.parametrize("body", [
+    # break/continue to an enclosing loop from a nested one.
+    "let s = 0; outer: for (let i = 0; i < 5; i++) { for (let j = 0; j < 5; j++) "
+    "{ if (i * j > n) break outer; if (j > i) continue outer; s += j; } s += 100; } return s;",
+    # Three levels, each exit to a different loop, beside a return.
+    "let s = 0; a: for (let i = 0; i < 4; i++) { b: for (let j = 0; j < 4; j++) "
+    "{ for (let k = 0; k < 4; k++) { if (k > j) continue b; if (i + j + k > n) break a; "
+    "if (s > 40) return -s; s += 1; } s += 10; } s += 100; } return s;",
+])
+def test_labeled_exits_set_the_target_loops_flags(body):
+    source = f"/** @param {{number}} n */ function root(n) {{ {body} }}"
+    lowered = lower_javascript_source_to_ssa(source)
+    assert lowered.complete, lowered.shortfall_report()
+    assert check_program(source, "[[0], [2], [5], [9], [NaN], [Infinity]]") == "PASS"
