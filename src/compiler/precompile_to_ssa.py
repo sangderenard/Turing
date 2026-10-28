@@ -27623,6 +27623,60 @@ def _schedule_loop_callsites(
                         value_prerequisites.setdefault(
                             int(current), set()
                         ).add(int(prerequisite))
+                # Program: ``ys = [y * n for y in [3, 9, 0]]`` beside
+                # ``xs.sort()`` (c244), ``xs[i % 4] += i + n`` (c373).  Wrong
+                # record: the walk pulled a value producer ahead with only
+                # its value prerequisites, so a read of a list (and the
+                # list's last member append it consumes) came before the
+                # list's birth and earlier appends, still later in the walk:
+                # the read ordered before them and indexed a short list
+                # (fault 71).  Rule: a statement's accesses follow the
+                # run's earlier writes of every arena it touches, so a
+                # producer pulled ahead brings those writes with it -- save
+                # a write that consumes the statement's own value (a store
+                # at an index the statement computes), which follows it.
+                value_consumers: dict[int, set[int]] = {}
+                for current, prerequisites in value_prerequisites.items():
+                    for prerequisite in prerequisites:
+                        value_consumers.setdefault(
+                            prerequisite, set()
+                        ).add(current)
+
+                def value_downstream(position: int) -> set[int]:
+                    reached: set[int] = set()
+                    pending = [position]
+                    while pending:
+                        for consumer in value_consumers.get(pending.pop(), ()):
+                            if consumer not in reached:
+                                reached.add(consumer)
+                                pending.append(consumer)
+                    return reached
+
+                run_writes: dict[int, list[int]] = {}
+                written_prerequisites: dict[int, set[int]] = {}
+                for position, child in enumerate(run):
+                    reads, writes = sequence_accesses(child)
+                    downstream = None
+                    for arena in reads | writes:
+                        writers = run_writes.get(arena)
+                        if not writers:
+                            continue
+                        if downstream is None:
+                            downstream = value_downstream(position)
+                        writer = next((
+                            candidate for candidate in reversed(writers)
+                            if candidate not in downstream
+                        ), None)
+                        if writer is not None:
+                            written_prerequisites.setdefault(
+                                position, set()
+                            ).add(writer)
+                    for arena in writes:
+                        run_writes.setdefault(arena, []).append(position)
+                for position, writers in written_prerequisites.items():
+                    value_prerequisites.setdefault(position, set()).update(
+                        writers
+                    )
                 access_order: list[int] = []
                 access_visited: set[int] = set()
                 for start in range(len(run)):
