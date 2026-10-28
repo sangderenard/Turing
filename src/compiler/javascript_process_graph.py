@@ -392,6 +392,13 @@ class _JavaScriptProcessInterpreter:
         self.loop_count = 0
         # Labeled loops being interpreted: label -> their exit flags.
         self.loop_labels: dict[str, dict[Any, str]] = {}
+        # What runs after the statement being interpreted, innermost first:
+        # each enclosing list's remaining statements and the names visible
+        # there.  A loop body starts a fresh stack (its rest is the next
+        # iteration, and its returns are already flags).
+        self.continuations: list[
+            tuple[Sequence[Mapping[str, Any]], frozenset[str]]
+        ] = []
         self.shortfalls: list[JavaScriptExpressionShortfall] = []
         self.bindings: dict[str, dict[str, Any]] = {}
         self.binding_records: list[dict[str, Any]] = []
@@ -1680,6 +1687,21 @@ class _JavaScriptProcessInterpreter:
             return
         outer = dict(self.bindings)
         self.bindings = dict(outer)
+        enclosing, self.continuations = self.continuations, []
+        try:
+            self._loop(statement, label, kind, own, outward, outer)
+        finally:
+            self.continuations = enclosing
+
+    def _loop(
+        self,
+        statement: Mapping[str, Any],
+        label: str | None,
+        kind: Any,
+        own: set[Any],
+        outward: Mapping[Any, Any],
+        outer: dict[str, dict[str, Any]],
+    ) -> None:
         initializer = statement.get("init")
         if initializer is not None:
             self.sequence([
@@ -1908,9 +1930,15 @@ class _JavaScriptProcessInterpreter:
                 return self.expression(argument), True
             if kind == "BlockStatement":
                 outer = dict(self.bindings)
-                value, returned, visible = self._branch(
-                    list(statement.get("body", ())), outer,
+                self.continuations.append(
+                    (statements[index + 1:], frozenset(outer)),
                 )
+                try:
+                    value, returned, visible = self._branch(
+                        list(statement.get("body", ())), outer,
+                    )
+                finally:
+                    self.continuations.pop()
                 self.bindings = visible
                 if returned:
                     return value, True
@@ -1924,19 +1952,29 @@ class _JavaScriptProcessInterpreter:
                 outer = dict(self.bindings)
                 condition_value = self.expression(statement["test"])
                 condition = self.truthy(condition_value, statement["test"])
-                yes, yes_returns, yes_bindings = self._branch(
-                    self._statement_body(statement.get("consequent")), outer,
+                self.continuations.append(
+                    (statements[index + 1:], frozenset(outer)),
                 )
-                no, no_returns, no_bindings = self._branch(
-                    self._statement_body(statement.get("alternate")), outer,
-                )
+                try:
+                    yes, yes_returns, yes_bindings = self._branch(
+                        self._statement_body(statement.get("consequent")), outer,
+                    )
+                    no, no_returns, no_bindings = self._branch(
+                        self._statement_body(statement.get("alternate")), outer,
+                    )
+                finally:
+                    self.continuations.pop()
                 rest = list(statements[index + 1:])
                 if yes_returns and not no_returns:
                     self.bindings = no_bindings
                     no, no_returns = self.sequence(rest)
+                    if not no_returns:
+                        no, no_returns = self._continue()
                 elif no_returns and not yes_returns:
                     self.bindings = yes_bindings
                     yes, yes_returns = self.sequence(rest)
+                    if not yes_returns:
+                        yes, yes_returns = self._continue()
                 if yes_returns and no_returns:
                     self.bindings = outer
                     if yes is None or no is None:
@@ -2025,6 +2063,32 @@ class _JavaScriptProcessInterpreter:
             )
             index += 1
         return None, False
+
+    def _continue(self) -> tuple[int | None, bool]:
+        """Run what follows the enclosing lists, on this path alone.
+
+        A path that returned early in a nested arm leaves the others to fall
+        out of that arm into the rest of the function; this interprets that
+        rest for them, so the arm returns on every path.  Each enclosing
+        list's rest runs with the names visible there (an arm's own
+        declarations end with it) and with the continuation outside it.
+        """
+
+        saved = self.continuations
+        try:
+            while self.continuations:
+                rest, visible = self.continuations[-1]
+                self.continuations = self.continuations[:-1]
+                self.bindings = {
+                    name: record for name, record in self.bindings.items()
+                    if name in visible
+                }
+                value, returned = self.sequence(rest)
+                if returned:
+                    return value, True
+            return None, False
+        finally:
+            self.continuations = saved
 
     def function(
         self,

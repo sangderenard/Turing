@@ -175,6 +175,12 @@ class Generator:
                 if rng.random() < 0.3:
                     exit_ = f"return {self.result(1)}"
                 lines.append(f"{indent}if ({self.condition(1)}) {{ {exit_}; }}")
+            elif not self.loops and choice < 0.1:
+                # An early return in an arm; the other paths fall through
+                # into the rest of the function.
+                lines.append(
+                    f"{indent}if ({self.condition(1)}) {{ return {self.result(1)}; }}"
+                )
             elif depth > 0 and choice < 0.25:
                 lines.extend(self.loop_statement(depth - 1, indent))
             elif depth > 0 and choice < 0.5:
