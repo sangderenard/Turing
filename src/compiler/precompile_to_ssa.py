@@ -3282,6 +3282,42 @@ class _ControlSSABuilder(TiledObject):
             return tuple(found)
 
         control_mutations = authored_sequence_mutations(program.root)
+        # Program: ``d.setdefault(k, []).append(100 + i)`` with no loop over
+        # a looked-up row (string_core core.py).  Wrong record: only a loop
+        # target reading a row named the child element, so a write-only
+        # mapping of lists was born with an ``unknown`` pool column, no heap
+        # contract could be stated, and both backends had no layout for it.
+        # Rule: a row the mapping's ``setdefault`` selects is written by its
+        # appends; their values name the child element exactly as a reader's
+        # target does, and readers and writers must agree.
+        setdefault_parents = {
+            int(mutation.effect_node_id): int(mutation.sequence_value_id)
+            for mutation in control_mutations
+            if str(mutation.operator) == "setdefault"
+            and mutation.effect_node_id is not None
+        }
+        for mutation in control_mutations:
+            parent_id = setdefault_parents.get(int(mutation.sequence_value_id))
+            if (
+                parent_id is None
+                or str(mutation.operator) != "append"
+                or len(tuple(mutation.argument_value_ids)) != 1
+            ):
+                continue
+            value_meta = self.region_value_meta.get(
+                int(mutation.argument_value_ids[0])
+            )
+            incoming_dtype = str(getattr(value_meta, "dtype", None) or "unknown")
+            if incoming_dtype in {"", "None", "unknown"}:
+                continue
+            incumbent_dtype = nested_value_dtypes.get(parent_id)
+            if incumbent_dtype is not None and incumbent_dtype != incoming_dtype:
+                raise ValueError(
+                    "nested sequence element writers and readers disagree "
+                    f"on their physical dtype: sequence={parent_id}, "
+                    f"first={incumbent_dtype!r}, incoming={incoming_dtype!r}"
+                )
+            nested_value_dtypes[parent_id] = incoming_dtype
         self.native_object_source_ids = set(map(int, native_object_value_ids)) | {
             int(mutation.sequence_value_id) for mutation in control_mutations
             if mutation.operator in {'object_construct', 'object_materialize'}}
@@ -3354,11 +3390,22 @@ class _ControlSSABuilder(TiledObject):
 
         collect_handle_merges(program.root)
 
+        # So is a keyed read of a mapping of lists (``len(d[k])``): its
+        # lookup selects the pool row where it runs; a private arena
+        # declared for the read would be storage nothing writes.
+        selected_mapping_rows = {
+            int(result_id)
+            for result_id, sequence_id in lookup_sequence_by_result.items()
+            if int(sequence_id) in self.sequence_child_table_layouts
+            and int(self.sequence_child_table_layouts[int(sequence_id)][0]) > 0
+        }
         for sequence_id, policy, column_count, writable in sequence_declarations:
             # A row of a list of lists is selected by its row load, which
             # builds its descriptor where it runs (``len(g[i])``, corpus
             # c800); declared here it would load before its index exists.
             if int(sequence_id) in (consumer_row_loads or {}):
+                continue
+            if int(sequence_id) in selected_mapping_rows:
                 continue
             committed = commit_sequence_contract(
                 function_name,
@@ -3459,6 +3506,28 @@ class _ControlSSABuilder(TiledObject):
                 value_meta = self.region_value_meta.get(int(value_id))
                 if value_meta is not None and column_dtypes and column_dtypes[-1] in {None, "unknown"}:
                     column_dtypes[-1] = str(value_meta.dtype)
+            # ``d.setdefault(k, [])`` writes its key row exactly as a keyed
+            # store does: its key value names the key column, so a mapping
+            # only ``setdefault`` grows is born with a known key layout (and
+            # can take the dynamic heap contract at birth).
+            for mutation in control_mutations:
+                if (
+                    int(mutation.sequence_value_id) != int(sequence_id)
+                    or str(mutation.operator) != "setdefault"
+                    or len(tuple(mutation.argument_value_ids)) < 2
+                ):
+                    continue
+                key_meta = self.region_value_meta.get(
+                    int(mutation.argument_value_ids[0])
+                )
+                if (
+                    key_meta is not None and column_dtypes
+                    and column_dtypes[0] in {None, "unknown"}
+                    and str(key_meta.dtype or "unknown")
+                    not in {"", "None", "unknown"}
+                    and not tuple(getattr(key_meta, "shape", ()) or ())
+                ):
+                    column_dtypes[0] = str(key_meta.dtype)
             self._sequence_descriptor(
                 int(sequence_id),
                 policy=committed.policy,
@@ -3596,6 +3665,8 @@ class _ControlSSABuilder(TiledObject):
             )
         for sequence_id, policy, column_count in sequence_initializations:
             if int(sequence_id) in (consumer_row_loads or {}):
+                continue
+            if int(sequence_id) in selected_mapping_rows:
                 continue
             literal_table_rows = None
             descriptor_policy = (
@@ -12767,6 +12838,16 @@ class _ControlSSABuilder(TiledObject):
                     handle_column, child_column_dtypes,
                     child_key_columns, child_writable,
                 ) = declared_child_layout
+                # A mapping-of-lists layout names its row kind, not always
+                # its element: the element its writers/readers settled
+                # (``nested_value_dtype``) fills an ``unknown`` one-column row.
+                if (
+                    nested_value_dtype
+                    and len(tuple(child_column_dtypes)) == 1
+                    and str(tuple(child_column_dtypes)[0])
+                    in {"", "None", "unknown"}
+                ):
+                    child_column_dtypes = (str(nested_value_dtype),)
             child_columns = tuple(
                 storage_cell(dtype) for dtype in child_column_dtypes
             )
@@ -13577,6 +13658,24 @@ class _ControlSSABuilder(TiledObject):
             self._bind(int(query.result_value_id), result, BindingKind.SEQUENCE_RESULT, selected_extent)
             return
         nested_selection = self.nested_row_selections.get(sequence_id)
+        # Program: ``d.setdefault(k, []).append(x); len(d[k])``.  Wrong
+        # record: the keyed read selected a child row of the mapping's pool,
+        # but the query read the length cell of a private descriptor the
+        # declaration pass had minted for the read (never written: 0).
+        # Rule: the length of a selected child row is the pool's length
+        # cell at the row's handle, as for a nested row.
+        child_selection = self.child_table_selections.get(sequence_id)
+        if (
+            nested_selection is None
+            and child_selection is not None
+            and child_selection[0].shape_value_id is None
+            and sequence_id not in self.child_selection_validity
+            and query.operation in {"length", "truth"}
+        ):
+            nested_selection = (
+                self.external_value(child_selection[0].length_value_id),
+                child_selection[1],
+            )
         if (
             nested_selection is not None
             and query.operation in {"length", "truth"}

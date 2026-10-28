@@ -16271,11 +16271,33 @@ def _install_lexical_sequence_queries(
             and (data.get("attributes") or {}).get("extraction_identity")
                 == f"builtins.{expression.func.id}"
         )
+        # Program: ``d.setdefault(k, []).append(x)`` then ``len(d[k])``
+        # (string_core core.py).  Wrong record: a row of a mapping of lists
+        # that ``setdefault`` grows (no display) was no row read, so its
+        # ``len`` stayed an unlowered call and became a formal no caller
+        # can supply.  Rule: a keyed read of a mapping whose rows are lists
+        # selects a child row; its length is that row's resident length
+        # query, as ``len(g[i])`` is.
+        mapping_row_query = (
+            expression.func.id in {"bool", "len"}
+            and len(arguments) == 1
+            and str(sequence_data.get("op") or sequence_data.get("type") or "").casefold() == "indexed"
+            and any(
+                str(role) == "base" and int(parent) in graph_obj
+                and (graph_obj.nodes[int(parent)].get("attributes") or {}).get(
+                    "mapping_value_aggregate_kind"
+                ) == "list"
+                for parent, role in sequence_data.get("parents") or ()
+            )
+            and (data.get("attributes") or {}).get("extraction_identity")
+                == f"builtins.{expression.func.id}"
+        )
         if (
             producer_loop_node_id is None
             and not local_list_truth
             and not loop_row_query
             and not list_row_query
+            and not mapping_row_query
         ):
             continue
         if os.environ.get("TURING_DEBUG_BUILTIN_SELECTION"):
