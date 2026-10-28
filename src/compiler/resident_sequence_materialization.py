@@ -1669,6 +1669,8 @@ def _identity_return_aliases(
     copy while the shared callee's slot is a merge; the call's own copy is
     the callee it runs, so it is the one read here.
     """
+    from ..common.tensors.topological_reducer import _indexed_store_source
+
     if function_table is None:
         return {}
     callsite_graphs = {} if callsite_graphs is None else callsite_graphs
@@ -1704,6 +1706,12 @@ def _identity_return_aliases(
             for pair in (loop_attrs.get("loop_break_bindings") or {}).values():
                 loop_rebound.update(int(item) for item in pair)
         for index, slots in enumerate(zip(*sites)):
+            # ``a[0] = x; return a`` returns the store version of ``a``: the
+            # list it writes (its ``base`` chain) is the returned object.
+            slots = tuple(
+                None if slot is None else _indexed_store_source(child, int(slot))
+                for slot in slots
+            )
             if len(set(slots)) != 1 or slots[0] is None:
                 continue
             if int(slots[0]) in loop_rebound:
