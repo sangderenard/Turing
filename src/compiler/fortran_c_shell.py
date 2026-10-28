@@ -42573,7 +42573,7 @@ def _class_surface_ssa_program(
                     value_dtype = str(parts["values"].dtype or "unknown")
                     keyed_helper_dtypes = (
                         ("int64", None), (value_dtype, None),
-                        ("int64", (1,)), ("int64", None),
+                        ("int64", None), ("int64", None),
                         ("int", (1,)), ("int64", None),
                     )
                     if sequence_operation == "contains":
@@ -54543,13 +54543,23 @@ def _class_surface_ssa_program(
                     if formal.dtype in {None, "unknown"} and fed.dtype:
                         formal.dtype = fed.dtype
                     if isinstance(formal_physical, dict):
+                        # Rule: a formal whose posted physical view is the
+                        # caller actual's scalar slot has that actual's
+                        # shape; the planner's graph extent (1,) would
+                        # contradict the storage this row now posts.
+                        formal_shape = tuple(formal.shape or ())
+                        if (formal_physical.get("storage") == "scalar"
+                                and formal_physical.get("rank") == 0
+                                and not tuple(fed.shape or ())):
+                            formal_shape = ()
                         _revise_ssa_value(
                             callee, formal.id, dtype=formal.dtype,
-                            shape=tuple(formal.shape or ()),
+                            shape=formal_shape,
                             stage=FRAME_BINDING,
                             sources=(_frame_value_cell(caller, fed.id),),
                             physical=formal_physical,
                         )
+                        formal.shape = formal_shape
 
     # Exact writable ProgramABI outputs use an in/out calling convention: the
     # caller-owned formal is also the storage defined by the region's producer.
