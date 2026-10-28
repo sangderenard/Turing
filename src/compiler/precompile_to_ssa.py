@@ -8024,6 +8024,29 @@ class _ControlSSABuilder(TiledObject):
             self._book().latest_ref(INGESTION_VALUE, row)
         )
 
+    def _return_site_unreachable(self, site_cell: Any) -> bool:
+        """Whether every slot row of ``site_cell`` reads RETURN_SITE_UNREACHABLE."""
+
+        if site_cell is None or self.lexical_read_scope is None:
+            return False
+        from .concordance_declarations import (
+            RETURN_SITE_SLOT, RETURN_SITE_UNREACHABLE,
+        )
+        from .identity_concordance import Unresolved, current_identity_book
+
+        page = current_identity_book().pages.get(RETURN_SITE_SLOT.name)
+        if page is None:
+            return False
+        rows = tuple(
+            row for row in page.scope_rows(self.lexical_read_scope)
+            if row[1] == site_cell
+        )
+        return bool(rows) and all(
+            isinstance(fact := page.latest(row), Unresolved)
+            and fact.reason == RETURN_SITE_UNREACHABLE
+            for row in rows
+        )
+
     def _structural_return_members(self, value_id: int) -> tuple[int, ...] | None:
         """Read recursive tuple positions from their live concordance view."""
         from .concordance_declarations import SOURCE_AGGREGATE_LAYOUT
@@ -11283,6 +11306,18 @@ class _ControlSSABuilder(TiledObject):
                 self.lower(operation, path=f"{path}.resource_cleanup[{index}]")
             return
         if isinstance(block, LoopControlBlock) and block.action == "return":
+            # Program: ``validate_batch_envelope``'s ``if not
+            # isinstance(offset, int) or isinstance(offset, bool): return 1,
+            # 0`` in its offsets loop, specialized for a literal int list.
+            # Wrong record: the loop's blocks were composed before the
+            # hierarchy plan's structural fold disproved that return, removed
+            # its ``1, 0`` literals and revised the site to
+            # RETURN_SITE_UNREACHABLE; this edge still read the removed
+            # literals and minted them as untyped caller storage ("declared
+            # call storage ... has no recorded dtype").  Rule: a return edge
+            # whose site the record calls unreachable is not emitted.
+            if self._return_site_unreachable(block.return_site_cell):
+                return
             # A source ``return`` below the function's top level: capture
             # this return's own slot values on the edge and branch to the
             # function exit, where every return edge is merged per slot
