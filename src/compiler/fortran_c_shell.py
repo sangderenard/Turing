@@ -52637,6 +52637,33 @@ def _class_surface_ssa_program(
                             output_physical = _frame_physical_fields(
                                 callee, int(callee_output.id),
                             )
+                            # Program: ``e, statuses, tokens = intern(...)`` then
+                            # ``tokens[0]`` / appends in the caller (string-core
+                            # ``repeated_manager`` value 148).  Wrong record: the
+                            # callee return's ``span`` was posted over a caller
+                            # value whose SEQUENCE_CONTRACT (and so its settled
+                            # ABI arm) says ``sequence``; the physical view then
+                            # refused the two.  Rule: a caller value with a
+                            # sequence contract is a resident sequence; the
+                            # callee's span is the view it was returned through.
+                            if (
+                                isinstance(output_physical, dict)
+                                and output_physical.get("storage") == "span"
+                            ):
+                                from .concordance_declarations import (
+                                    SEQUENCE_CONTRACT_CONCORDANCE as _FRAME_SEQUENCE_CONTRACT,
+                                )
+                                from .identity_concordance import (
+                                    current_identity_book as _frame_contract_book,
+                                )
+
+                                if _frame_contract_book().latest_ref(
+                                    _FRAME_SEQUENCE_CONTRACT,
+                                    (str(caller_symbol), caller_id),
+                                ) is not None:
+                                    output_physical = {
+                                        **output_physical, "storage": "sequence",
+                                    }
                             publish_ssa_value_type(
                                 caller, output, dtype=structure.dtype, shape=structure.shape,
                                 sources=_frame_cells(
