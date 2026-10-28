@@ -751,6 +751,60 @@ def check_loop_carried_class_widening(module: Any) -> list[Finding]:
     return findings
 
 
+def check_phi_narrower_than_arm(module: Any) -> list[Finding]:
+    """A scalar Phi of a narrower class than one of its incoming values.
+
+    Program: ``s = 0; for v in xs: if v < 3.0: continue; s += v``
+    (``test_ssa_numeric_joins``).  Wrong record: the latch Phi joining the edge past the
+    ``continue`` (the header, int) with the edge after ``s += v`` was
+    minted with the reserved update's class (int64) before late call-result
+    settlement made that update a float; C converted 4.5 to 4 and LLVM
+    refused the Phi.  Python's ``s`` is an int on one path and a float on
+    the other, a runtime-varying class that needs the tagged union.  Rule:
+    run after the last writer of physical scalar dtypes; a scalar Phi whose
+    class (bool < int < float) is narrower than an incoming value's is a
+    finding naming both.  The loop header against its update is
+    ``check_loop_carried_class_widening``'s.
+    """
+
+    findings: list[Finding] = []
+    for name, function in _functions(module):
+        for block in (getattr(function, "blocks", {}) or {}).values():
+            for instruction in block.instrs:
+                result = instruction.res
+                if (
+                    str(instruction.op).casefold() != "phi"
+                    or result is None
+                    or (instruction.attributes or {}).get("binding")
+                    == "loop_carried"
+                    or tuple(result.shape or ())
+                ):
+                    continue
+                result_class = _SCALAR_CLASS.get(str(result.dtype))
+                if result_class is None:
+                    continue
+                for incoming in instruction.args:
+                    incoming_class = _SCALAR_CLASS.get(str(incoming.dtype))
+                    if (
+                        incoming_class is None
+                        or tuple(incoming.shape or ())
+                        or _CLASS_RANK[incoming_class]
+                        <= _CLASS_RANK[result_class]
+                    ):
+                        continue
+                    findings.append(Finding(
+                        "phi_narrower_than_arm", str(name),
+                        f"a join of {result_class} and {incoming_class} "
+                        f"arms (Phi value={int(result.id)} is "
+                        f"{result.dtype!r}, incoming value="
+                        f"{int(incoming.id)} is {incoming.dtype!r}); Python "
+                        "keeps each arm's class, and the int-or-float union "
+                        "lowering is not built",
+                    ))
+                    break
+    return findings
+
+
 def run_all(module: Any) -> list[Finding]:
     """Every decisive check; the candidate reporter is separate on purpose.
 

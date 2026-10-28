@@ -2652,6 +2652,18 @@ def _planned_scalar_dtypes_from(
                         pass
                     else:
                         continue
+                elif kind == "loop":
+                    # Program: ``for a, b in ps`` over ``ps:
+                    # list[tuple[int, int]]``, ``for k, v in d.items()``.
+                    # A destructured target has no single element class to
+                    # read off its iterable; the reducer concorded each
+                    # name's class from the annotation's position and
+                    # stamped it as ``result_class_ref``.  That declared
+                    # class is the target's dtype.
+                    settle(scalar, node_id, classes.get(str(
+                        attributes.get("result_class_ref") or ""
+                    ).removeprefix("builtins.")))
+                    continue
                 else:
                     continue
             if op == "for":
@@ -2690,6 +2702,18 @@ def _planned_scalar_dtypes_from(
                                 settle(scalar, int(target_id), "int64")
                 elif iterable and target_names:
                     held = element.get(iterable[0])
+                    if (
+                        (G.nodes[iterable[0]].get("attributes") or {}).get(
+                            "aggregate_kind"
+                        ) == "dict"
+                        and (G.nodes[iterable[0]].get("attributes") or {}).get(
+                            "mapping_key_class_ref"
+                        )
+                    ):
+                        # Iterating a mapping yields its keys: the
+                        # annotation's key class, concorded on the target,
+                        # is the dtype, not the value rows' class.
+                        held = None
                     for name in target_names:
                         for target_id, target in G.nodes(data=True):
                             if (
@@ -2702,6 +2726,11 @@ def _planned_scalar_dtypes_from(
                                 ) == "loop"
                             ):
                                 settle(scalar, int(target_id), held)
+                                if iterable[0] in row_element:
+                                    # ``for r in g`` over a list of lists:
+                                    # ``r`` is a row of the shared class.
+                                    settle(element, int(target_id),
+                                           row_element[iterable[0]])
                 # Program: ``for p, q in zip(xs, ys): t += p * q`` (c171,
                 # c172).  Wrong record: a tuple target has no single name, so
                 # ``p`` and ``q`` were never typed and fell to the float64
@@ -2739,6 +2768,55 @@ def _planned_scalar_dtypes_from(
                                 ):
                                     settle(scalar, int(target_id),
                                            element.get(argument))
+                # Program: ``ps = [(n, 2), (3, 4)]`` then ``for a, b in ps``.
+                # Wrong record: the tuple target's names had no rule over a
+                # list of tuple displays, so ``a * b`` had no dtype.  Rule:
+                # the i-th name is the join of the i-th member of every
+                # tuple the list displays (a member whose class is unknown
+                # leaves the name unknown, as any join does).
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and iterable
+                    and isinstance(
+                        G.nodes[iterable[0]].get("expr_obj"),
+                        (ast.List, ast.Tuple),
+                    )
+                ):
+                    rows = parents(G.nodes[iterable[0]], "elts")
+                    width = len(loop_expression.target.elts)
+                    row_leaves = [
+                        tuple(int(leaf) for leaf in (
+                            G.nodes[row].get("attributes") or {}
+                        ).get("aggregate_leaf_value_ids") or ())
+                        for row in rows
+                    ]
+                    if rows and all(
+                        len(leaves) == width and all(
+                            leaf in G for leaf in leaves
+                        )
+                        for leaves in row_leaves
+                    ):
+                        for position, item in enumerate(
+                            loop_expression.target.elts
+                        ):
+                            held = join([
+                                scalar.get(leaves[position])
+                                for leaves in row_leaves
+                            ])
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 # Program: ``for k, x in enumerate(xs): t += k * x`` (c351).
                 # Wrong record: as with ``zip``, the tuple target's names were
                 # never typed, so ``x`` fell to the float64 default; C
@@ -5346,11 +5424,19 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
-                        # A proven interval wider than int64 is the source's
-                        # width; the parents' int64 does not narrow it.
-                        proven = planned_scalar_dtypes().get(int(current))
-                        if proven in {"uint64", "int128"}:
-                            dtype = str(proven)
+                    # A proven interval wider than int64 is the source's
+                    # width; neither the parents' int64 nor a descriptor's
+                    # class-only int64 narrows it.  Program: corpus c790,
+                    # ``high * (1 << 32) + low``.  Once ``shl`` had an
+                    # elementwise descriptor, its int64 reached the product
+                    # and sum as ``tensor["dtype"]``, this rule (then inside
+                    # the no-descriptor branch) never ran, and the combine
+                    # wrapped negative with no finding.
+                    proven = planned_scalar_dtypes().get(int(current))
+                    if proven in {"uint64", "int128"} and dtype in {
+                        None, "int", "int64", "uint64", "int128",
+                    }:
+                        dtype = str(proven)
                 if operation in {"floor", "ceil", "trunc", "round"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so
@@ -10110,6 +10196,7 @@ def _retain_source_sequence_mutation_records(
         _RECEIVER_READING_METHODS,
         _receiver_collection_kind,
         _returned_formal_sequence_aliases,
+        _returned_tuple_member_kinds,
     )
 
     records = dict(
@@ -10120,6 +10207,7 @@ def _retain_source_sequence_mutation_records(
     forwarded_sequences = _returned_formal_sequence_aliases(
         graph_obj, function_table,
     )
+    tuple_member_kinds = _returned_tuple_member_kinds(graph_obj, function_table)
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
         # Program: ``xs = [5, n, 9, 8]; del xs[1]`` (fuzzer p3_13).  Wrong
@@ -10177,7 +10265,8 @@ def _retain_source_sequence_mutation_records(
         ):
             continue
         destination_data = graph_obj.nodes[destination]
-        destination_kind = _receiver_collection_kind(destination_data)
+        destination_kind = _receiver_collection_kind(destination_data) or tuple_member_kinds.get(
+            int(destination_data.get("value_id", destination)))
         mapping_default = destination_kind == "dict" and expression.func.attr == "setdefault"
         if destination_kind not in {"list", "set", "bytes", "bytearray", "array"} and not mapping_default:
             continue
@@ -23057,6 +23146,12 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "maximum", "minimum", "emax", "emin", "clamp_min", "clamp_max",
     "logical_and", "logical_or", "logical_xor",
     "bitwise_and", "bitwise_or", "bitwise_xor",
+    # The process graph spells Python's bit operators ``bitand``/``bitor``/
+    # ``bitxor``/``shl``/``shr`` (ast_process_graph).  Only the catalogue
+    # spellings above were listed, so ``low ^ byte`` of two integers had no
+    # descriptor, and the consumer that finds a descriptor-less scalar operand
+    # (``(low ^ byte) % m``) typed that operand float64.
+    "bitand", "bitor", "bitxor", "shl", "shr",
 })
 
 #: The elementwise binary operations whose result is a truth value.
@@ -26897,10 +26992,27 @@ def _fold_callsite_structural_values(
             if selected is None:
                 return unresolved
             fixed = known.get(selected, unresolved)
+            # Program: ``pick(a, 1)`` whose ``if n > 2: t = a else: t =
+            # [7, n, 2]`` folds on the constant argument (corpus c820, c821).
+            # Wrong record: the merge Phi took the selected display's literal
+            # VALUE, so it became a second Constant that kept the
+            # ``aggregate_phi`` producer with no arm to merge (a list "bound
+            # to lists of different shapes" / two heap owners for one list)
+            # while the display kept its own birth.  Rule: a merge selecting
+            # a mutable collection is that arm's storage, so it aliases the
+            # arm; only an immutable value is copied.
+            selected_attributes = (
+                graph.G.nodes[selected].get("attributes") or {}
+                if selected in graph.G else {}
+            )
+            selected_is_mutable_collection = str(
+                selected_attributes.get("aggregate_kind") or ""
+            ) in {"list", "set", "dict"} or isinstance(fixed, (list, set, dict))
             return (
                 _StructuralValueAlias(selected)
                 if fixed is unresolved
                 or isinstance(fixed, _ProgramABIValueFact)
+                or selected_is_mutable_collection
                 else fixed
             )
         if isinstance(expression, ast.UnaryOp):
@@ -28104,6 +28216,7 @@ def _fold_callsite_structural_values(
                     "add", "sub", "mult", "mul", "div", "truediv",
                     "floordiv", "mod", "pow", "maximum", "minimum", "emax", "emin",
                     "max", "min",
+                    "bitand", "bitor", "bitxor", "shl", "shr",
                 } | comparison_operations
                 or semantic_operation in comparison_operations
             ) and not (

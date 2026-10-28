@@ -119,6 +119,7 @@ from .concordance_declarations import (
     TENSOR_SHAPE_CONCORDANCE,
     VERSIONED_WRITE,
     VALUE_TYPE_ABI,
+    LOOP_UPDATE_MINIMUM_TRIPS,
     VALUE_TYPE_TAG,
     WHILE_CARRIED_TEST,
     WHILE_TEST_NO_READ_EXPRESSION,
@@ -2584,6 +2585,8 @@ class _ControlSSABuilder(TiledObject):
         # payload storage remains in the incumbent sequence descriptor.
         # Entries are installed only from SOURCE_OPTIONAL_GLYPH_CARRY cells.
         self.optional_glyph_presence_by_value: dict[int, SSAValue] = {}
+        self.sequence_handle_merge_ids: set[int] = set()
+        self.sequence_handle_predicates: dict[int, tuple] = {}
         # ProgramABI optional scalar fields are a typed payload plus one
         # Boolean presence cell.  Control IR carries their exact relation so
         # a later union join can construct its semantic tag without treating
@@ -3126,6 +3129,20 @@ class _ControlSSABuilder(TiledObject):
         for iterable_id, target_id, _induction in program.iterable_bindings:
             target = self._value_from_meta(int(target_id))
             if target.dtype in {None, "", "unknown"}:
+                continue
+            # A row of a list of lists is selected by its row load where the
+            # loop runs, not before any descriptor exists (corpus c777).
+            if int(iterable_id) in self.consumer_row_loads:
+                continue
+            # ... and so is a loop target iterating such a list's rows:
+            # its value is the row handle the loop loads (corpus c779).
+            if any(
+                int(outer_id) in self.sequence_child_table_layouts
+                and self.sequence_child_table_layouts[int(outer_id)][0] == 0
+                for outer_id, row_target_id, _row_induction
+                in program.iterable_bindings
+                if int(row_target_id) == int(iterable_id)
+            ):
                 continue
             iterable = self.external_value(int(iterable_id))
             iterable.dtype = target.dtype
@@ -9594,6 +9611,35 @@ class _ControlSSABuilder(TiledObject):
             self._function_exit = self.new_block("function_exit")
         return self._function_exit
 
+    def _carried_run_class(
+        self, initial: SSAValue, updated_id: int, carried_dtype: Any,
+    ) -> tuple[SSAValue, str | None]:
+        """The header class of a ``For`` that provably runs, and its seed.
+
+        See ``_carried_run_dtype``.  When it answers, the seed is converted
+        to that class in the preheader (the current block).  Inside the body
+        the header still holds the seed on the first trip, so the Phi is
+        marked ``numeric_join_promoted`` and ``ssa_numeric_joins`` checks
+        every body read.  Returns ``(initial, None)`` otherwise.
+        """
+
+        meta = self.region_value_meta.get(int(updated_id))
+        if meta is None or tuple(initial.shape or ()) or tuple(meta.shape or ()):
+            return initial, None
+        run_dtype = _carried_run_dtype(
+            self.lexical_read_scope, updated_id, carried_dtype, meta.dtype,
+        )
+        if run_dtype is None:
+            return initial, None
+        seed = self.fresh_value(
+            dtype=run_dtype, transform=CONTROL_CAST, operands=(initial,),
+        )
+        self.emit(
+            Handler.Cast, [initial], seed,
+            attributes={"target_dtype": run_dtype},
+        )
+        return seed, run_dtype
+
     def _cast_on_edge(
         self, block: BasicBlock, value: SSAValue, dtype: str,
     ) -> SSAValue:
@@ -10286,6 +10332,12 @@ class _ControlSSABuilder(TiledObject):
             selected_extent = self.selected_child_extent_values.get(iterable_id)
             if selected_extent is not None:
                 return selected_extent
+            # An iterated row of a list of lists is selected by its row
+            # load, which runs where the row is first asked for (corpus
+            # c777).
+            row_load = self.consumer_row_loads.pop(iterable_id, None)
+            if row_load is not None and iterable_id not in self.external_values:
+                self._emit_sequence_row_load(*row_load)
             resident_id = iterable_id
             seen_aliases: set[int] = set()
             while (
@@ -18669,6 +18721,7 @@ class _ControlSSABuilder(TiledObject):
                 self._lower_sequence_handle_merge(
                     int(_true_id), int(_false_id), merged,
                     incoming_blocks=(true_exit.name, false_exit.name),
+                    predicate=predicate,
                 )
             # An optional keyed lookup changes whether its child handle is
             # present; it does not create another child arena.  Preserve the
@@ -18698,8 +18751,23 @@ class _ControlSSABuilder(TiledObject):
                 snapshot_cells.get(int(initial_value_id)),
                 true_value, false_value, predicate,
             )
+            # Program: ``s = 0; for v in xs: if v > 3.0: s += v``
+            # (``test_ssa_numeric_joins``).  Wrong record: the carried merge took the entered
+            # version's class (int64) while the arm that rebinds ``s`` is a
+            # float, so the native Phi truncated 4.5 to 4.  Rule: a scalar
+            # numeric join promotes (``_numeric_join``) and converts the
+            # narrower arm on its own edge; ``ssa_numeric_joins`` refuses
+            # the join where Python could tell the classes apart.
+            join_dtype = self._numeric_join((true_value, false_value))
+            join_arms = (true_value, false_value)
+            if join_dtype is not None:
+                true_value, false_value = self._numeric_join_arms(
+                    join_dtype,
+                    ((true_exit, true_value), (false_exit, false_value)),
+                )
+            carried_dtype = initial.dtype if join_dtype is None else join_dtype
             if int(merged_value_id) in {
-                int(true_value.id), int(false_value.id),
+                int(join_arms[0].id), int(join_arms[1].id),
             }:
                 # Graph identities may reuse the selected arm's SetAttr id as
                 # the enclosing join id.  They are the same source version,
@@ -18707,7 +18775,7 @@ class _ControlSSABuilder(TiledObject):
                 # definition separately and retain the graph id as provenance
                 # instead of emitting a self-referential Phi.
                 merged = self.fresh_value(
-                    dtype=initial.dtype, shape=initial.shape,
+                    dtype=carried_dtype, shape=initial.shape,
                     transform=PHI_CONDITIONAL, operands=phi_operands,
                 )
                 merged.accounting.update({
@@ -18717,7 +18785,7 @@ class _ControlSSABuilder(TiledObject):
             else:
                 merged = SSAValue(
                     int(merged_value_id),
-                    dtype=initial.dtype,
+                    dtype=carried_dtype,
                     shape=initial.shape,
                 )
                 # The join adopts the graph's merge id; its row derives from
@@ -18735,8 +18803,8 @@ class _ControlSSABuilder(TiledObject):
             if self._is_stand_in(initial_value_id):
                 candidates = [
                     arm_value for arm_id, arm_value in (
-                        (true_value_id, true_value),
-                        (false_value_id, false_value),
+                        (true_value_id, join_arms[0]),
+                        (false_value_id, join_arms[1]),
                     )
                     if values_before_body.get(int(arm_id)) is arm_value
                 ]
@@ -18752,6 +18820,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_carried",
+                    **({"numeric_join_promoted": True}
+                       if (true_value, false_value) != join_arms else {}),
                     "initial_value_id": self._phi_initial_binding(
                         initial_value_id, entered, merged,
                         stage=CONTROL_SSA_CONDITIONAL,
@@ -18867,9 +18937,30 @@ class _ControlSSABuilder(TiledObject):
             )
         self.active_stage = stage_before
 
+    def _sequence_member_roles(self, sequence_id: int) -> dict:
+        """The storage cells of one sequence keyed by their descriptor role."""
+
+        descriptor = self.sequence_descriptors[int(sequence_id)]
+        by_id = {
+            int(cell.id): cell
+            for cell in self.sequence_storage_values[int(sequence_id)]
+        }
+        roles = {
+            ("column", position): by_id[int(member_id)]
+            for position, member_id in enumerate(descriptor.column_value_ids)
+        }
+        roles[("length",)] = by_id[int(descriptor.length_address_id)]
+        roles[("capacity",)] = by_id[int(descriptor.capacity_value_id)]
+        if descriptor.heap_owner_value_id is not None:
+            roles[("heap_owner",)] = by_id[int(descriptor.heap_owner_value_id)]
+        status = self.sequence_status_values.get(int(sequence_id))
+        if status is not None:
+            roles[("status",)] = status
+        return roles
+
     def _lower_sequence_handle_merge(
         self, true_id: int, false_id: int, merged: SSAValue, *,
-        incoming_blocks: tuple[str, str],
+        incoming_blocks: tuple[str, str], predicate: SSAValue,
     ) -> None:
         """A list merged from two arms is a handle onto the taken arm's storage.
 
@@ -19083,6 +19174,10 @@ class _ControlSSABuilder(TiledObject):
         self.sequence_storage_values[merged_id] = members
         if status is not None:
             self.sequence_status_values[merged_id] = status
+        self.sequence_handle_merge_ids.add(merged_id)
+        self.sequence_handle_predicates[merged_id] = (
+            predicate, int(true_id), int(false_id),
+        )
 
     def _publish_loop_result_ports(
         self,
@@ -19603,6 +19698,7 @@ class _ControlSSABuilder(TiledObject):
             )
         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]] = []
         own_result_ports = {int(port_id) for port_id, *_ in loop.result_ports}
+        carried_seed_casts: dict[int, SSAValue] = {}
         reserved_updates: set[int] = set()
         for updated_id, initial_id in loop.carried_aliases:
             updated_id = int(updated_id)
@@ -19658,6 +19754,12 @@ class _ControlSSABuilder(TiledObject):
             carried_dtype, carried_physical = self._posted_carried_type(
                 initial_value, updated_value,
             )
+            seed_value, run_class = self._carried_run_class(
+                initial_value, updated_id, carried_dtype,
+            )
+            if run_class is not None:
+                carried_dtype, carried_physical = run_class, None
+                carried_seed_casts[updated_id] = seed_value
             current_value = self.fresh_value(
                 dtype=carried_dtype,
                 shape=initial_value.shape,
@@ -19725,13 +19827,15 @@ class _ControlSSABuilder(TiledObject):
             updated_value,
             current_value,
         ) in enumerate(carried):
+            seed_cast = carried_seed_casts.get(updated_id)
             self.emit(
                 Handler.Phi,
-                [initial_value, updated_value],
+                [seed_cast or initial_value, updated_value],
                 current_value,
                 attributes={
                     "incoming_blocks": (preheader.name, latch.name),
                     "binding": "loop_carried",
+                    **({"numeric_join_promoted": True} if seed_cast else {}),
                     "initial_value_id": self._phi_initial_binding(
                         initial_id, initial_value, current_value,
                         stage=CONTROL_SSA_LOOP,
@@ -19961,7 +20065,15 @@ class _ControlSSABuilder(TiledObject):
                     attributes={"iteration_semantics": "values"},
                 )
                 continue
-            if int(target_id) in self.nested_row_target_ids:
+            # The rows of a born list of lists are pool rows: the outer's
+            # column holds their handles (corpus c779), whatever queries
+            # the loop target.
+            outer_descriptor = self.sequence_descriptors.get(int(iterable_id))
+            if int(target_id) in self.nested_row_target_ids and not (
+                outer_descriptor is not None
+                and outer_descriptor.child_table_pool is not None
+                and len(outer_descriptor.column_value_ids) == 1
+            ):
                 self.bind_nested_row(
                     self.external_value(iterable_id, dtype="int"),
                     induction,
@@ -19970,7 +20082,7 @@ class _ControlSSABuilder(TiledObject):
                     attributes={"induction": loop.induction},
                 )
                 continue
-            self.indexed_load(
+            handle_value = self.indexed_load(
                 self.external_value(iterable_id),
                 induction,
                 target_id,
@@ -19979,6 +20091,18 @@ class _ControlSSABuilder(TiledObject):
                     "induction": loop.induction,
                 },
             )
+            # Program: ``for r in g: for x in r`` over a list of lists
+            # (corpus c778).  The outer's column holds row handles, so the
+            # loop target is the handle of a pool row: the inner loop and
+            # its queries read that row as any selected child.
+            outer = self.sequence_descriptors.get(int(iterable_id))
+            outer_pool = None if outer is None else outer.child_table_pool
+            if outer_pool is not None and outer_pool.key_columns == () and (
+                len(outer.column_value_ids) == 1
+            ):
+                self.child_table_selections[int(target_id)] = (
+                    outer_pool, handle_value,
+                )
         for iterable_id, target_id, induction_name, projection in (
             self.program.projected_iterable_bindings
         ):
@@ -22171,6 +22295,56 @@ class _ControlSSABuilder(TiledObject):
                 continue
             returned.append(value)
             returned_ids.add(value.id)
+        # Program: ``if n > 2: t = a else: t = [7, n, 2]`` then ``return t``
+        # (c787).  A returned list merged from arms the caller owns (a
+        # parameter, or a result lease) is a handle: its storage is
+        # whichever arm was taken, so the result cannot be a cell this call
+        # was handed.  Rule: the call returns WHICH ARM it took (the
+        # conditional's own predicate, a bool) and the caller selects its
+        # result's members from its own actuals of the two arms
+        # (``sequence_handle_returns``, read by the frame linker).
+        sequence_handle_returns = []
+        for position, value in enumerate(tuple(returned)):
+            for merged_id in sorted(self.sequence_handle_merge_ids):
+                members = self.sequence_storage_values[merged_id]
+                if int(members[0].id) != int(value.id):
+                    continue
+                if len(self.function_return_edges or ()):
+                    raise ValueError(
+                        f"list {merged_id} is a merged handle returned "
+                        "through several return edges; the returned arm "
+                        "predicate is one conditional's, so only a single "
+                        "return of the merge is lowered"
+                    )
+                predicate, true_id, false_id = (
+                    self.sequence_handle_predicates[merged_id]
+                )
+                roles = []
+                for arm_pair in (
+                    (true_id, false_id, merged_id),
+                ):
+                    arms = [
+                        self._sequence_member_roles(arm_id)
+                        for arm_id in arm_pair
+                    ]
+                    for role in arms[0]:
+                        roles.append((
+                            role, int(arms[0][role].id),
+                            int(arms[1][role].id), int(arms[2][role].id),
+                        ))
+                for index, (name, named_id) in enumerate(named_returns):
+                    if int(named_id) == int(value.id):
+                        named_returns[index] = (name, int(predicate.id))
+                        self._revise_semantic_output(
+                            name, int(predicate.id), self._value_cell(predicate),
+                        )
+                returned[position] = predicate
+                returned_ids.discard(value.id)
+                returned_ids.add(predicate.id)
+                sequence_handle_returns.append((
+                    int(predicate.id), int(merged_id), int(true_id),
+                    int(false_id), tuple(roles),
+                ))
         value_names = []
         for name, history in self.value_name_histories.items():
             value = next((
@@ -23141,6 +23315,9 @@ class _ControlSSABuilder(TiledObject):
                     ),
                     "native_value_union_return_layouts": tuple(
                         native_value_union_return_layouts
+                    ),
+                    "sequence_handle_returns": tuple(
+                        sequence_handle_returns
                     ),
                     "control_identity_receipts": tuple(dict.fromkeys(
                         self.control_identity_receipts
@@ -25873,6 +26050,16 @@ def _schedule_loop_callsites(
                     int(start_id)
                     for target_id, start_id in control.induction_offsets
                     if int(target_id) in targets
+                } | {
+                    # Program: ``for x in g[n % 3]`` over a list of lists
+                    # (corpus c777).  The iterated row is selected by a row
+                    # load no region owns, so the loop reads that load's
+                    # sequence and index.
+                    int(read_id)
+                    for iterable_id, _target_id, induction
+                    in control.iterable_bindings
+                    if induction == loop.induction
+                    for read_id in (row_load_reads or {}).get(int(iterable_id), ())
                 }
 
             consumed.update(loop_offset_starts(block))
@@ -27104,7 +27291,11 @@ def _concord_region_feed_consumers(
             ):
                 if cell is not None and cell not in sources:
                     sources.append(cell)
-        feed_cell = book.latest_ref(CANONICAL_VALUE, (scope, int(feed)))
+        # A formal split off a captured value (``region_capture_binding``)
+        # has no canonical cell; its minted ``ssa_value`` cell is its own.
+        feed_cell = book.latest_ref(
+            CANONICAL_VALUE, (scope, int(feed)),
+        ) or book.latest_ref(SSA_VALUE, (str(control_scope), int(feed)))
         if feed_cell is not None and feed_cell not in sources:
             sources.append(feed_cell)
         _post_derived_or_raw(
@@ -27113,6 +27304,176 @@ def _concord_region_feed_consumers(
             tuple(dict.fromkeys(nodes)), tuple(sources),
             stage=CONTROL_SSA_REGION, mode=Mode.CONCORD,
         )
+
+
+_RUN_CLASS = {
+    "bool": 0, "int32": 1, "int64": 1, "int": 1,
+    "float16": 2, "float32": 2, "float64": 2, "float": 2, "double": 2,
+}
+
+
+def _carried_run_dtype(
+    lexical_read_scope: Any, updated_id: int, seed_dtype: Any,
+    update_dtype: Any,
+) -> str | None:
+    """The class a scalar ``For``-carried name has once the loop has run.
+
+    Program: ``xs = [2.5, t * 1.5]; s = 0; for v in xs: s += v``.  Python's
+    ``s`` is the seed's class (int) only after zero trips and the update's
+    class (float) after any other number.  When the book proves the update
+    runs at least once (``loop_update_minimum_trips``), the loop's exit
+    value is exactly ``update_dtype``; that is the answer when it is a
+    wider class (bool < int < float) than ``seed_dtype``.  ``None`` when
+    there is no proof or no widening: the header keeps the seed's class
+    and ``check_loop_carried_class_widening`` refuses a widening by name.
+    """
+
+    if lexical_read_scope is None:
+        return None
+    from .identity_concordance import current_identity_book
+
+    trips = current_identity_book().page(LOOP_UPDATE_MINIMUM_TRIPS).latest(
+        (tuple(lexical_read_scope), int(updated_id))
+    )
+    seed_rank = _RUN_CLASS.get(str(seed_dtype))
+    update_rank = _RUN_CLASS.get(str(update_dtype))
+    if (
+        not isinstance(trips, int) or trips < 1
+        or seed_rank is None or update_rank is None
+        or seed_rank >= update_rank
+    ):
+        return None
+    return str(update_dtype)
+
+
+def _type_carried_reads_by_run_class(
+    lexical_read_scope: Any,
+    control_scope: Any,
+    region_index: int,
+    enclosing_loops: Iterable[Any],
+    instructions: Any,
+    region_value_meta: Mapping[int, Any],
+    captures: tuple[int, ...],
+) -> tuple[tuple[int, ...], dict[int, SSAValue]]:
+    """Give a loop body region's read of a carried name the header's class.
+
+    Program: ``s = 0; for v in xs: s += v`` with ``xs`` a non-empty display.
+    The graph reads ``s`` in the body through its seed's id, so the body
+    region's formal took the seed's class (int) while the header Phi carries
+    the run class (float, ``_carried_run_dtype``); the call then rounded the
+    float into the int formal.  The seed's id is also the seed (a parameter
+    ``acc = n`` keeps its own class), so the read cannot be retyped in place.
+    Rule: in a region inside loop L, when every operand slot reading a seed
+    L carries is attributed by the book (``lexical_read_binding``) to a
+    carried name (``loop_carried_binding``), those slots read a fresh formal
+    of the run class, minted and recorded as ``_split_region_captures_by_
+    binding`` does (``region_capture_binding``: fed by that binding, the
+    header).  A seed with any other read is left alone: the call input
+    adapter converts it and ``ssa_numeric_joins`` refuses by name.  Uses
+    whose result class would differ between the arms are refused there too.
+    Returns the captures (the formal replacing its seed) and the new
+    formals.
+    """
+
+    formals: dict[int, SSAValue] = {}
+    if lexical_read_scope is None:
+        return captures, formals
+    from ..common.tensors.topological_reducer import _operand_positions
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    scope = tuple(lexical_read_scope)
+    read_page = book.page("lexical_read_binding")
+    carried_page = book.page("loop_carried_binding")
+    produced = {
+        int(instruction.res.id): instruction.res
+        for instruction in instructions if instruction.res is not None
+    }
+    captures = tuple(captures)
+    for loop in enclosing_loops:
+        if loop.source_loop_node_id is None:
+            continue
+        for updated_id, initial_id in loop.carried_aliases:
+            updated_id, initial_id = int(updated_id), int(initial_id)
+            if initial_id in produced or initial_id not in captures:
+                continue
+            names = set(map(str, carried_page.latest((
+                scope, int(loop.source_loop_node_id), updated_id, initial_id,
+            )) or ()))
+            update = produced.get(updated_id) or region_value_meta.get(
+                updated_id
+            )
+            if not names or update is None or tuple(update.shape or ()):
+                continue
+            slots = []
+            for instruction in instructions:
+                if not any(int(arg.id) == initial_id for arg in instruction.args):
+                    continue
+                roles = list(getattr(instruction, "arg_roles", ()) or ())
+                if instruction.res is None or len(roles) != len(instruction.args):
+                    slots.append(None)
+                    continue
+                for index, (role, ordinal, argument) in enumerate(
+                    _operand_positions(zip(instruction.args, roles))
+                ):
+                    if int(argument.id) != initial_id:
+                        continue
+                    binding = read_page.latest((
+                        scope, int(instruction.res.id), role, ordinal,
+                    ))
+                    slots.append(
+                        (instruction, index, argument, role, ordinal, binding)
+                        if binding is not None and str(binding) in names
+                        and not tuple(argument.shape or ()) else None
+                    )
+            if not slots or None in slots or len({
+                str(slot[5]) for slot in slots
+            }) != 1:
+                continue
+            run_dtype = _carried_run_dtype(
+                scope, updated_id, slots[0][2].dtype, update.dtype,
+            )
+            if run_dtype is None:
+                continue
+            binding = str(slots[0][5])
+            read_cells = tuple(dict.fromkeys(
+                cell for cell in (
+                    book.latest_ref(
+                        LEXICAL_READ_BINDING,
+                        (scope, int(instruction.res.id), role, ordinal),
+                    )
+                    for instruction, _i, _a, role, ordinal, _b in slots
+                ) if cell is not None
+            ))
+            source_cell = book.latest_ref(CANONICAL_VALUE, (scope, initial_id))
+            # NOVEL REGION_FORMAL_SPLIT from the carried read cells and the
+            # seed's canonical cell, as a binding split is.
+            formal_id = _mint_ssa_id(
+                book, str(control_scope), REGION_FORMAL_SPLIT,
+                (*read_cells, source_cell),
+                dtype=run_dtype, shape=(), stage=CONTROL_SSA_REGION,
+            )
+            for instruction, index, argument, *_rest in slots:
+                instruction.args[index] = SSAValue(
+                    formal_id, dtype=run_dtype, shape=argument.shape,
+                    device=getattr(argument, "device", None),
+                )
+            _post_derived_or_raw(
+                book, REGION_CAPTURE_BINDING,
+                (str(control_scope), int(region_index), formal_id),
+                (initial_id, binding),
+                (
+                    *read_cells, source_cell,
+                    book.latest_ref(SSA_VALUE, (str(control_scope), formal_id)),
+                ),
+                stage=CONTROL_SSA_REGION, mode=Mode.CONCORD,
+            )
+            formals[formal_id] = SSAValue(formal_id, dtype=run_dtype)
+            captures = tuple(
+                formal_id if value_id == initial_id else value_id
+                for value_id in captures
+            )
+    return captures, formals
 
 
 def _split_region_captures_by_binding(
@@ -28443,6 +28804,37 @@ def lower_control_sections_to_ssa(
             planned_region_instructions[planned_index] = planned_instructions
 
     captured_row_loads: set[int] = set()
+    # The ``For`` loops whose body schedules each region (innermost last):
+    # a region's read of a name such a loop carries reads its header.
+    region_enclosing_loops: dict[int, tuple[LoopBlock, ...]] = {}
+
+    def enclose_regions(block: Any, loops: tuple[LoopBlock, ...]) -> None:
+        if isinstance(block, StatementBlock):
+            for line in block.lines:
+                match = _REGION_MARKER.fullmatch(str(line))
+                if match is not None:
+                    region_enclosing_loops[int(match.group(1))] = loops
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                enclose_regions(child, loops)
+        elif isinstance(block, ConditionalBlock):
+            enclose_regions(block.body, loops)
+            if block.orelse is not None:
+                enclose_regions(block.orelse, loops)
+        elif isinstance(block, LoopBlock):
+            enclose_regions(block.body, (*loops, block))
+        elif isinstance(block, WhileBlock):
+            enclose_regions(block.condition, loops)
+            enclose_regions(block.body, loops)
+        elif isinstance(block, CallBlock):
+            enclose_regions(block.callee, loops)
+        elif isinstance(block, StateMachineTick):
+            for _value, body in block.cases:
+                enclose_regions(body, loops)
+            if block.default is not None:
+                enclose_regions(block.default, loops)
+
+    enclose_regions(control.root, ())
     compile_substage(f"SSA section {control_name}: lower planned regions")
     planned_result_ids = {
         int(instruction.res.id)
@@ -29661,6 +30053,12 @@ def lower_control_sections_to_ssa(
                         ),),
                         stage=CONTROL_SSA_REGION, mode=Mode.REVISE,
                     )
+            effective_captures, run_formals = _type_carried_reads_by_run_class(
+                lexical_read_scope, tensor_shape_concordance_scope,
+                region_index, region_enclosing_loops.get(region_index, ()),
+                instructions, region_value_meta, effective_captures,
+            )
+            region_values.update(run_formals)
             effective_captures = _split_region_captures_by_binding(
                 lexical_read_scope, tensor_shape_concordance_scope,
                 region_index, instructions, effective_captures,
@@ -30053,7 +30451,7 @@ def lower_control_sections_to_ssa(
         sequence_length_values=sequence_length_values,
         row_load_reads={
             int(result): tuple(
-                int(read) for read in (operation[0], operation[1])
+                int(read) for read in (operation[1], operation[2])
                 if read is not None
             )
             for result, operation in row_load_by_result.items()

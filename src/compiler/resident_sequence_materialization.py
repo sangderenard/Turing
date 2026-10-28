@@ -1131,24 +1131,15 @@ def _promote_conditional_sequence_aliases(
                 # result list, whose storage the caller passes in.  When
                 # every arm is a private display of this function, both die
                 # at the return, so the taken arm's rows copied into the
-                # result are Python's object exactly (the merge owns the
-                # result storage, as a divergent return's lists do).  An arm
-                # anything else holds (a parameter, a list changed or read
-                # after the merge) would have to be the caller's storage
-                # itself, which a call result cannot carry yet.
+                # result are Python's object exactly.  Any other arm
+                # (c787-c789: a parameter list) is the caller's object, so
+                # the merge stays a handle merge and the function returns
+                # its arm predicate; the caller selects among its actuals.
                 node_id = node_by_value.get(merged_id, -1)
-                if _returned_list_merge(graph_obj, node_id):
-                    if not _arms_private_displays(graph_obj, node_id):
-                        raise ValueError(
-                            f"list {merged_id} is merged from branches and "
-                            "returned with an arm that is not a private "
-                            "display of this function; the returned merge "
-                            "is a handle onto that arm's storage (a caller's "
-                            "list or a list this function still reads), "
-                            "which a call result cannot yet carry: a call "
-                            "result that IS an argument's list is not "
-                            "lowered at all (refused by name)"
-                        )
+                if (
+                    _returned_list_merge(graph_obj, node_id)
+                    and _arms_private_displays(graph_obj, node_id)
+                ):
                     destination = merged_id
                     sequences.append((
                         int(true_resident), int(false_resident),
@@ -1674,6 +1665,67 @@ def _identity_return_aliases(graph_obj: Any, function_table: Any) -> dict[int, i
     return result
 
 
+def _returned_tuple_member_kinds(
+    graph_obj: Any, function_table: Any,
+) -> dict[int, str]:
+    """Collection kind of each unpacked member of a tuple-returning call.
+
+    Program: ``def mk(n): xs = [n, 1]; return xs, n + 1`` then
+    ``xs, k = mk(n); xs.append(5); return len(xs)`` (c822).  Wrong record:
+    the member projection ``call[0]`` carries no ``aggregate_kind`` (only the
+    callee's return slot knows it is a list), so the in-place method on it
+    was no mutation record and the append vanished (silent wrong value).
+    Rule: a constant-index projection of a call result is the collection the
+    callee returns at that position, whenever every return site agrees.
+    """
+
+    if function_table is None:
+        return {}
+    kinds = {}
+    for call_id, data in graph_obj.nodes(data=True):
+        reference = (data.get("attributes") or {}).get("callee_ref")
+        if reference is None:
+            continue
+        child = getattr(
+            getattr(function_table.entry(reference), "graph", None), "G", None,
+        )
+        if child is None:
+            continue
+        sites = tuple((child.graph.get("return_slot_values") or {}).values())
+        if not sites or len({len(site) for site in sites}) != 1:
+            continue
+        member_kinds = []
+        for slots in zip(*sites):
+            site_kinds = {
+                None if slot is None else _receiver_collection_kind(
+                    child.nodes.get(int(slot), {})
+                )
+                for slot in slots
+            }
+            member_kinds.append(
+                site_kinds.pop() if len(site_kinds) == 1 else None
+            )
+        for node_id, projection in graph_obj.nodes(data=True):
+            if str(projection.get("type") or projection.get("op") or "").casefold() in {
+                "indexedstore", "subscriptstore", "setitem",
+            }:
+                continue
+            roles = {
+                str(role): int(parent)
+                for parent, role in projection.get("parents") or ()
+            }
+            if roles.get("base") != int(call_id) or "index" not in roles:
+                continue
+            key = (graph_obj.nodes.get(roles["index"], {}).get("attributes") or {}).get("value")
+            if (
+                isinstance(key, int) and not isinstance(key, bool)
+                and 0 <= key < len(member_kinds)
+                and member_kinds[key] in {"list", "bytes", "bytearray"}
+            ):
+                kinds[int(projection.get("value_id", node_id))] = member_kinds[key]
+    return kinds
+
+
 def _returned_formal_sequence_aliases(
     graph_obj: Any, function_table: Any, *,
     call_result_kinds: Mapping[int, str] | None = None,
@@ -1691,7 +1743,15 @@ def _returned_formal_sequence_aliases(
         graph_obj, function_table,
     ).items():
         call_data = graph_obj.nodes.get(int(call_id), {})
-        if (call_data.get("attributes") or {}).get("callee_ref") is None:
+        # A tuple member ``b`` of ``b, k = f(a, n)`` (``return a, n``) is the
+        # call's authored projection: it names the actual's storage as the
+        # whole-result call does.
+        if (
+            (call_data.get("attributes") or {}).get("callee_ref") is None
+            and not (call_data.get("attributes") or {}).get(
+                "authored_call_result_projection"
+            )
+        ):
             continue
         actual_data = graph_obj.nodes.get(int(actual_id), {})
         value_id = int(actual_data.get("value_id", actual_id))
@@ -3814,7 +3874,29 @@ def list_row_reads(graph_obj: Any) -> tuple[int, ...]:
             graph_obj.nodes[base].get("value_id", base)
         ) in outers:
             reads.append(int(data.get("value_id", node_id)))
-    return tuple(sorted(reads))
+    # ``for r in g``: the loop target is a row of the list of lists.
+    for node_id, data in graph_obj.nodes(data=True):
+        if str(data.get("op") or data.get("type") or "").casefold() != "for":
+            continue
+        iterable = next((
+            int(parent) for parent, role in data.get("parents") or ()
+            if str(role) == "iterable" and parent in graph_obj
+        ), None)
+        if iterable is None or int(
+            graph_obj.nodes[iterable].get("value_id", iterable)
+        ) not in outers:
+            continue
+        loop = data.get("expr_obj")
+        if not (isinstance(loop, ast.For) and isinstance(loop.target, ast.Name)):
+            continue
+        reads.extend(
+            int(child_data.get("value_id", child))
+            for child, child_data in graph_obj.nodes(data=True)
+            if str(child_data.get("op") or child_data.get("type") or "").casefold() == "input"
+            and (child_data.get("attributes") or {}).get("binding_kind") == "loop"
+            and (child_data.get("attributes") or {}).get("binding_name") == loop.target.id
+        )
+    return tuple(sorted(set(reads)))
 
 
 def _list_rows_born_by_outer_display(
