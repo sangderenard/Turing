@@ -12492,8 +12492,14 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
                 int(graph.G.nodes[receivers[0]].get("value_id", receivers[0])), declaration,
             )
 
+    from .resident_sequence_materialization import _handle_merge_storage_roots
+
+    handle_roots = _handle_merge_storage_roots(graph.G)
+
     def storage_key(value_id):
-        return field_storage_keys.get(int(value_id), int(value_id))
+        return field_storage_keys.get(
+            int(value_id), handle_roots.get(int(value_id), int(value_id)),
+        )
 
     readers_by_sequence: dict[Any, list[tuple[tuple[int, int], int]]] = {}
     reader_ends: dict[int, tuple[int, int]] = {}
@@ -25577,6 +25583,14 @@ def _mutated_sequence_node_ids(
         literal = (data.get("attributes") or {}).get("value")
         if isinstance(literal, (list, set, dict, bytearray)):
             return True
+        # A list merged from branches is the taken arm's own mutable list
+        # (``grow(t, k)`` then ``len(a)``, c739), not an immutable value.
+        if (
+            (data.get("attributes") or {}).get("producer_kind")
+            in {"aggregate_phi", "aggregate_merge"}
+            and (data.get("attributes") or {}).get("aggregate_kind") == "list"
+        ):
+            return True
         return str((data.get("attributes") or {}).get(
             "extraction_identity"
         ) or "") in {
@@ -25656,7 +25670,9 @@ def _mutated_sequence_node_ids(
         ]
         while pending:
             merged = graph_obj.nodes[pending.pop()]
-            if (merged.get("attributes") or {}).get("producer_kind") != "aggregate_phi":
+            if (merged.get("attributes") or {}).get("producer_kind") not in {
+                "aggregate_phi", "aggregate_merge",
+            }:
                 continue
             for parent, role in merged.get("parents") or ():
                 if (

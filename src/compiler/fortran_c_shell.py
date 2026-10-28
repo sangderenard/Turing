@@ -21717,6 +21717,32 @@ def _settle_linked_dynamic_sequences(
             left, right = find(views[0]), find(view)
             if left != right:
                 parent[left] = right
+    # Program: ``t = a if n > 2 else [3, 4, 5]`` (if/else form) then
+    # ``t.append(9)``, ``len(a)`` (c736).  Wrong record: the merge was a copy
+    # of the taken arm, so the growth through ``t`` never reached ``a``.
+    # Rule: a list merged from arms is a handle onto the taken arm's own
+    # storage (``_lower_sequence_handle_merge``), so merge and arms are ONE
+    # component here, as an argument and its formal are: a component that
+    # grows anywhere is DYNAMIC in every view (rule 4).
+    from .resident_sequence_materialization import (
+        _list_merged_from_unequal_displays,
+    )
+
+    for graph_obj in graphs:
+        for node_id, data in graph_obj.nodes(data=True):
+            if not _list_merged_from_unequal_displays(graph_obj, int(node_id)):
+                continue
+            merged_key = (id(graph_obj), int(data.get("value_id", node_id)))
+            for arm, role in data.get("parents") or ():
+                if str(role) not in {"body", "orelse"} or arm not in graph_obj:
+                    continue
+                arm_key = (
+                    id(graph_obj),
+                    int(graph_obj.nodes[arm].get("value_id", arm)),
+                )
+                left, right = find(arm_key), find(merged_key)
+                if left != right:
+                    parent[left] = right
     linked = set(parent)
     seeds: set[tuple[int, int]] = set()
     for graph_obj in graphs:
