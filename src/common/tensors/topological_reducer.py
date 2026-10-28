@@ -1057,7 +1057,19 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 specialization_book.post(
                     _SOURCE_VALUE_CLASS, (scope, value_id), proposed,
                     stage=_REDUCTION,
-                    provenance=_Derived(tuple(dict.fromkeys((*sources, specialization_cell)))),
+                    provenance=_Derived(tuple(dict.fromkeys((
+                        *sources,
+                        # The inherited class is about this copy's own
+                        # value: cite that value's identity cell, as the
+                        # callsite producer does, so a type ABI settled in
+                        # a fork of this copy derives from it.
+                        *((value_cell,) if (
+                            value_cell := node_identity_cell(
+                                target_wrapper, int(value_id),
+                            )
+                        ) is not None else ()),
+                        specialization_cell,
+                    )))),
                     mode=_Mode.CONCORD,
                 )
     # The parameters are what the call passed: concord them in this scope.
