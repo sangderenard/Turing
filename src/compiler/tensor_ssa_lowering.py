@@ -5640,6 +5640,23 @@ def lower_tensor_calls_to_repository_ssa(
                             },
                         )
                         continue
+                if (
+                    operation not in _VIEW_OPERATIONS
+                    and operation not in _CAST_OPERATIONS
+                    and operation != "cbrt"
+                    and reference.operation(operation) is None
+                    and c_tensor_opcode(operation) is None
+                ):
+                    # The repository reference defines no operation for this
+                    # one (``.real``): nothing below can lower it to a
+                    # kernel call.  Registering descriptors for its operands
+                    # would freeze a physical layout (byte width) for tensors
+                    # whose element dtype nothing has proven -- a bare
+                    # ``Tensor`` annotation states none.  Leave the
+                    # instruction as authored; the descriptor is registered
+                    # by the consumer that actually lowers the value.
+                    rewritten.append(instruction)
+                    continue
                 source_descriptor = None
                 if source is not None:
                     source_descriptor = register_tensor(
