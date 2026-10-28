@@ -25183,7 +25183,18 @@ def _tensor_descriptor_rule(
             and str(attributes.get("extraction_identity") or "")
             in {f"builtins.{operation}", operation}
         )
-        if operation in _ELEMENTWISE_BINARY_OPERATIONS or variadic_builtin_selector:
+        # A method call resolved to a source class's method (``bag.add(x)``)
+        # is a call whose name happens to be a canonical op; its resolved
+        # ``method_ref`` says whose it is, and its receiver is an object, not
+        # an elementwise operand.
+        resolved_method_call = bool(
+            attributes.get("source_type") == "Call"
+            and attributes.get("method_ref") is not None
+        )
+        if (
+            operation in _ELEMENTWISE_BINARY_OPERATIONS
+            and not resolved_method_call
+        ) or variadic_builtin_selector:
             operands = tuple(
                 int(parent)
                 for parent, role in data.get("parents") or ()
