@@ -116,3 +116,50 @@ def test_every_typed_return_settles_its_obligation(monkeypatch):
     assert posted, "the probe must exercise a non-terminal obligation"
     assert posted <= set(settled)
     assert all(settled[key] for key in posted)
+
+
+def _owed_host_scalar_graph(value_id):
+    graph = _graph_with_identity(value_id)
+    graph.G.graph["source_numeric_scope"] = ("module", "reader")
+    graph.G.nodes[value_id]["attributes"] = {"binding_name": "acc"}
+    assert strategy._owe_host_scalar_class(graph, value_id)
+    assert strategy.outstanding_region_value_obligations(graph) == (value_id,)
+    return graph
+
+
+def test_terminal_freeze_settles_owed_host_scalar_from_class_or_planned_dtype():
+    _book, token = begin_identity_book()
+    try:
+        by_class = _owed_host_scalar_graph(5)
+        current_identity_book().post(
+            SOURCE_VALUE_CLASS, (("module", "reader"), 5),
+            ("builtins.float", 1, "test producer"),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        strategy._refuse_unsettled_host_scalars(by_class, {})
+        row = strategy._region_value_dtype_row(by_class, 5, mint=False)
+        assert current_identity_book().page(
+            PLAN_REGION_VALUE_DTYPE).latest(row) == "float64"
+        assert strategy.outstanding_region_value_obligations(by_class) == ()
+
+        by_plan = _owed_host_scalar_graph(6)
+        strategy._refuse_unsettled_host_scalars(by_plan, {6: "int64"})
+        row = strategy._region_value_dtype_row(by_plan, 6, mint=False)
+        assert current_identity_book().page(
+            PLAN_REGION_VALUE_DTYPE).latest(row) == "int64"
+    finally:
+        end_identity_book(token)
+
+
+def test_terminal_freeze_refuses_unsettled_host_scalar_by_name():
+    _book, token = begin_identity_book()
+    try:
+        graph = _owed_host_scalar_graph(7)
+        with pytest.raises(ValueError) as refusal:
+            strategy._refuse_unsettled_host_scalars(graph, {})
+        message = str(refusal.value)
+        assert "'reader'" in message and "Indexed" in message
+        assert "'acc'" in message and "value 7" in message
+    finally:
+        end_identity_book(token)
