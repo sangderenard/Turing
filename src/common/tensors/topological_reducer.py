@@ -15882,9 +15882,37 @@ def _normalize_lexical_values(
                             and name not in static_environment
                         ):
                             initial = input_value(name, binding_kind="parameter")
+                        # Program: ``while True: (if v <= 0: r = v; break);
+                        # v = v - 1`` then ``return r`` (the form a direct tail
+                        # call normalizes to).  Wrong record: ``r`` has no
+                        # pre-loop binding, so it was dropped from the break
+                        # bindings, and its value -- an alias of the carried
+                        # ``v`` -- left the post-loop read naming ``v``'s seed
+                        # node: the call returned its argument.  Rule: a
+                        # break-only name bound to a carried value takes that
+                        # carried seed as its (never observable) no-break
+                        # value, so the loop result port records the break
+                        # edge's current value.
+                        seeded_from_carried = False
                         if (
                             initial is None
-                            or (int(initial) == int(value) and name not in loop_carried_bindings)
+                            and is_break
+                            and name not in loop_carried_bindings
+                            and value is not None
+                            and int(value) in {
+                                int(pair[0])
+                                for pair in loop_carried_bindings.values()
+                            }
+                        ):
+                            initial = value
+                            seeded_from_carried = True
+                        if (
+                            initial is None
+                            or (
+                                int(initial) == int(value)
+                                and name not in loop_carried_bindings
+                                and not seeded_from_carried
+                            )
                             or int(initial) not in graph.G
                             or int(value) not in graph.G
                         ):
