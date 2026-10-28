@@ -6624,11 +6624,24 @@ class ProcessGraph(TiledObject):
                                 node.id for node in ast.walk(parameter.annotation)
                                 if isinstance(node, ast.Name)
                             }
-                            if inventory[0] not in admitted and not (
-                                (inventory[0] == "bool" and "int" in admitted)
-                                or (inventory[0] in ("bool", "int")
-                                    and "float" in admitted)
-                            ):
+                            # ``list[int]`` is admitted by an annotation that
+                            # names the container and admits the element class.
+                            head, _, element = inventory[0].partition("[")
+                            element = element.rstrip("]")
+                            if element:
+                                spelled_ok = head in admitted and (
+                                    element in admitted
+                                    or (element == "bool" and "int" in admitted)
+                                    or (element in ("bool", "int")
+                                        and "float" in admitted)
+                                )
+                            else:
+                                spelled_ok = inventory[0] in admitted or (
+                                    (inventory[0] == "bool" and "int" in admitted)
+                                    or (inventory[0] in ("bool", "int")
+                                        and "float" in admitted)
+                                )
+                            if not spelled_ok:
                                 raise ValueError(
                                     f"formal {parameter.arg} of {identity} is "
                                     f"annotated {ast.unparse(parameter.annotation)} "
