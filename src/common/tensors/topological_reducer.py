@@ -16129,7 +16129,11 @@ def _normalize_lexical_values(
                         mutation_fact = (
                             int(initial), str(call.func.attr),
                             str(sequence_policy), tuple(argument_ids),
-                            "mapping" if mapping_mutation else "sequence",
+                            # The class is the receiver's, as at every other
+                            # site that posts this fact: a dict's ``clear``
+                            # is a sequence operator on a mapping.
+                            "mapping" if aggregate_kind == "dict"
+                            else "sequence",
                         )
                         incumbent = mutation_page.latest(mutation_row)
                         if (
