@@ -4,13 +4,12 @@
 # high * (1 << 32) + low, a full u64 in Python. The interval has to cross
 # the call returns, the formals and the loop-carried values, or the combine
 # stays int64 and wraps negative natively whenever high >= 2**31 (n=0, n=5).
-# The return annotations are not what this case tests: without them the
-# unpacked members have no class and the program refuses earlier ("a join
-# of int and float arms"), an open reader gap of its own.
+# The callees' tuple returns are unannotated: each unpacked member takes its
+# class from the callee's returned value.
 U32 = 4294967296
 
 
-def limb_step(high: int, low: int, byte: int) -> tuple[int, int]:
+def limb_step(high: int, low: int, byte: int):
     mixed = low ^ byte
     product = mixed * 435
     next_low = product % U32
@@ -19,7 +18,7 @@ def limb_step(high: int, low: int, byte: int) -> tuple[int, int]:
     return next_high, next_low
 
 
-def atom_step(high: int, low: int, atom: int) -> tuple[int, int]:
+def atom_step(high: int, low: int, atom: int):
     remaining = atom
     index = 0
     while index < 4:
