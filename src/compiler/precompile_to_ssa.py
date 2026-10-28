@@ -6169,6 +6169,21 @@ class _ControlSSABuilder(TiledObject):
             physical = _contract_physical(
                 self._book(), result, canonical, dtype=dtype,
             )
+            if (
+                physical is None
+                and self._book().current_ref(
+                    VALUE_TYPE_ABI, canonical.row,
+                ) is None
+                and not tuple(result.shape or ())
+            ):
+                # Program: ``for x in [1, 5, 9]: ...`` in a root (c156).  A
+                # target of a LOCAL literal list has no ProgramABI contract
+                # row to disagree with; the exact descriptor column is the
+                # whole proof, so the element is a scalar of its dtype.  A
+                # contract row that exists and does not match still refuses.
+                physical = (
+                    {"storage": "scalar", "rank": 0}, element_dtype_cell,
+                )
             if physical is None:
                 raise ValueError(
                     "descriptor-typed static iterable Load has no matching "
