@@ -5024,6 +5024,48 @@ def _build_shell_hierarchy_plan(
                 == "staticreference"
             ):
                 return None
+            # An external name read only as the receiver of tensor-namespace
+            # calls (``AbstractTensor`` in ``AbstractTensor.get_tensor(x)``,
+            # imported inside the method) is a static symbol, as a
+            # StaticReference is: not a value.
+            receivers = tuple(node.get("children") or ())
+            if (
+                attributes.get("binding_kind") == "external"
+                and receivers
+                and all(
+                    str(role) == "operand"
+                    and (
+                        graph.G.nodes.get(int(child), {}).get("attributes")
+                        or {}
+                    ).get("tensor_candidate") is not None
+                    for child, role in receivers
+                )
+            ):
+                return None
+            # A limb of a Precision value: Precision is a numeric value, not
+            # a record, and its ``_stack`` holds its limbs, whose element the
+            # precision library states (``Precision.term`` reads
+            # ``self._stack[k]``).
+            limb_stack = int(value_id)
+            if str(node.get("type")) == "Indexed":
+                limb_stack = next((
+                    int(parent) for parent, role in (node.get("parents") or ())
+                    if str(role) == "base"
+                ), None)
+            if limb_stack is not None:
+                cell = (
+                    graph.G.nodes.get(limb_stack, {}).get("attributes") or {}
+                ).get("field_declaration_cell")
+                if getattr(cell, "row", None) == (
+                    "src.common.tensors.extended_precision", "Precision",
+                    "_stack",
+                ):
+                    from ..common.tensors.extended_precision import (
+                        limb_element_name,
+                    )
+                    return (record[0], record[1], limb_element_name(
+                        attributes.get("precision_element")
+                    ))
             if isinstance(attributes.get("value"), slice):
                 # A slice literal is index metadata for the load it feeds:
                 # a handle, as a record identity is, not an element type.
@@ -5057,6 +5099,15 @@ def _build_shell_hierarchy_plan(
                         ) == "Call"
                         and (graph.G.nodes[source].get("attributes") or {})
                         .get("method_ref") is not None
+                    )
+                    # So is a call named by its static reference
+                    # (``Precision.width_of(x)``): an unlinked callee.
+                    or (
+                        (graph.G.nodes[source].get("attributes") or {}).get(
+                            "source_type"
+                        ) == "Call"
+                        and (graph.G.nodes[source].get("attributes") or {})
+                        .get("static_python_reference") is not None
                     )
                 )
                 and source not in call_result_dtypes
@@ -20565,12 +20616,14 @@ def _propagate_callsite_tensor_specializations(
         if function_source is not None and function_source.G is not graph.G:
             table_graph_ids.add(id(graph.G))
     isolated_callers = {}
+    isolated_sources = {}
     for caller in graphs:
         if id(caller.G) in table_graph_ids:
             isolated_callers.setdefault(
                 id(caller.G),
                 extract_clean_process_subgraph(caller, caller.G),
             )
+            isolated_sources.setdefault(id(caller.G), caller)
     if isolated_callers:
         graphs = [
             isolated_callers.get(id(caller.G), caller)
@@ -21815,6 +21868,41 @@ def _propagate_callsite_tensor_specializations(
             })
         specialization_guard.round(changed, state=state_digest)
 
+    for source in isolated_sources.values():
+        from .frame_identity_book import _frame_call_cells
+
+        for _node_id, data in tuple(source.G.nodes(data=True)):
+            attributes = data.get("attributes") or {}
+            reference = attributes.get("callee_ref")
+            if reference is None:
+                reference = attributes.get("method_ref")
+            if reference is None:
+                continue
+            try:
+                callee = function_table.entry(int(reference)).graph
+            except (KeyError, TypeError, ValueError):
+                continue
+            arms_members = (
+                None if callee is None
+                else _callee_optional_aggregate_members(callee)
+            )
+            if arms_members is None:
+                continue
+            _publish_callsite_return_members(
+                source, int(_node_id),
+                tuple(
+                    _tensor_descriptor(callee, int(member))
+                    for member in arms_members
+                ),
+                "tuple",
+                return_cells=tuple(
+                    _frame_call_cells(source.G, int(_node_id))
+                    for _ in arms_members
+                ),
+            )
+        _publish_conditional_tuple_members(source, function_table)
+        _publish_conditional_call_aggregate_merges(source, function_table)
+
 
 def _repair_missing_aggregate_leaf_projections(graph: Any) -> int:
     """Restore only aggregate leaves removed by structural branch folding.
@@ -22723,6 +22811,16 @@ class _DescriptorQuery(set):
         self.cut_counter[0] += 1
 
 
+def _recorded_dtype(value: Any, record: str, value_id: Any) -> str:
+    """Return the dtype a record carries, or refuse by name."""
+    if value is None or str(value) == "":
+        raise ValueError(
+            f"value {value_id}: {record} carries no dtype; the pipeline "
+            "recorded no element type for it and none is assumed"
+        )
+    return str(value)
+
+
 def _tensor_descriptor(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -23315,7 +23413,10 @@ def _tensor_descriptor_rule(
             **tensor,
             "shape": linked_shape,
             "dtype": str(
-                linked.get("dtype") or tensor.get("dtype") or "float64"
+                _recorded_dtype(
+                    linked.get("dtype") or tensor.get("dtype"),
+                    "linked_value_abi", data.get("value_id", node_id),
+                )
             ),
             "rank": len(linked_shape),
         }
@@ -23422,7 +23523,10 @@ def _tensor_descriptor_rule(
         if isinstance(linked, Mapping) and linked.get("shape") is not None:
             tensor = {
                 "shape": tuple(map(int, linked["shape"])),
-                "dtype": str(linked.get("dtype") or "float64"),
+                "dtype": _recorded_dtype(
+                    linked.get("dtype"), "linked_value_abi",
+                    data.get("value_id", node_id),
+                ),
             }
     if "shape" not in tensor and str(
         data.get("op") or data.get("type") or ""
@@ -23485,7 +23589,10 @@ def _tensor_descriptor_rule(
             field_shape = tuple(map(int, field.get("shape") or ()))
             tensor = {
                 "shape": field_shape,
-                "dtype": str(field.get("dtype") or "float64"),
+                "dtype": _recorded_dtype(
+                    field.get("dtype"), f"record field {field_name!r}",
+                    data.get("value_id", node_id),
+                ),
                 "rank": len(field_shape),
             }
         elif field_name in {"real", "imag"} and receiver is not None:
@@ -23758,7 +23865,10 @@ def _tensor_descriptor_rule(
                 "shape": tuple(
                     int(extent) for extent in (boundary.get("shape") or ())
                 ),
-                "dtype": str(boundary.get("dtype") or "float64"),
+                "dtype": _recorded_dtype(
+                    boundary.get("dtype"), "ProgramABI boundary",
+                    data.get("value_id", node_id),
+                ),
             }
             # The declared Python type travels with the descriptor.  A
             # callee re-deriving the type from the dtype alone turned a
@@ -23935,7 +24045,10 @@ def _tensor_descriptor_rule(
                 ):
                     return {
                         "shape": (int(iterable_shape[0]), *element_shape),
-                        "dtype": str(element.get("dtype") or "float64"),
+                        "dtype": _recorded_dtype(
+                        element.get("dtype"), "comprehension element",
+                        data.get("value_id", node_id),
+                    ),
                         "rank": 1 + element_rank,
                     }
                 # The resident sequence's length cell owns the leading
@@ -23945,7 +24058,10 @@ def _tensor_descriptor_rule(
                 # leading extent to the sequence descriptor.
                 return {
                     "shape": (),
-                    "dtype": str(element.get("dtype") or "float64"),
+                    "dtype": _recorded_dtype(
+                        element.get("dtype"), "comprehension element",
+                        data.get("value_id", node_id),
+                    ),
                     "rank": 1 + element_rank,
                     "metadata_state": "dynamic",
                     "sequence_row_shape": element_shape,
@@ -24057,7 +24173,10 @@ def _tensor_descriptor_rule(
                 base = _tensor_descriptor(graph, source_id, seen)
                 if base is not None and descriptor_states_a_shape(base):
                     extents = tuple(int(e) for e in (base.get("shape") or ()))
-                    dtype = str(base.get("dtype") or "float64")
+                    dtype = _recorded_dtype(
+                        base.get("dtype"), f"{operation} source tensor",
+                        source_id,
+                    )
                     settled = None
                     first = arguments[0] if arguments else None
                     if operation == "unsqueeze" and isinstance(first, int):
@@ -24588,7 +24707,10 @@ def _tensor_descriptor_rule(
                     else:
                         reduced = None
                 if reduced is not None:
-                    dtype = str(source.get("dtype") or "float64")
+                    dtype = _recorded_dtype(
+                        source.get("dtype"), f"{operation} source tensor",
+                        data.get("value_id", node_id),
+                    )
                     if operation in {"any", "all"}:
                         dtype = "bool"
                     elif operation in {"argmin", "argmax"}:
@@ -24665,6 +24787,21 @@ def _tensor_descriptor_rule(
                 inherited = _tensor_descriptor(graph, sources[0], seen)
                 if inherited is not None:
                     return inherited
+                # An authored Python scalar literal carries its own type
+                # (float -> float64, int -> int64, bool -> bool).
+                literal = graph.G.nodes[sources[0]].get("constant")
+                if literal is None:
+                    literal = (
+                        graph.G.nodes[sources[0]].get("attributes") or {}
+                    ).get("value")
+                literal_dtype = (
+                    "bool" if isinstance(literal, bool)
+                    else "int64" if isinstance(literal, int)
+                    else "float64" if isinstance(literal, float)
+                    else None
+                )
+                if literal_dtype is not None:
+                    return {"shape": (), "dtype": literal_dtype, "rank": 0}
         if operation in {
             "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
             "tanh", "clone", "copy", "identity", "real", "imag", "conj",
@@ -24813,9 +24950,9 @@ def _tensor_descriptor_rule(
                         sliced = len(range(start, stop, step))
                         return {
                             "shape": (int(sliced), *base_shape[1:]),
-                            "dtype": str(
-                                (base_descriptor or {}).get("dtype")
-                                or "float64"
+                            "dtype": _recorded_dtype(
+                                (base_descriptor or {}).get("dtype"),
+                                "slice base tensor", base,
                             ),
                             "rank": len(base_shape),
                         }
@@ -24911,9 +25048,14 @@ def _tensor_descriptor_rule(
         else:
             return None
     static_shape = tuple(tensor.get("shape") or ())
+    if not tensor.get("dtype"):
+        # No element type was recorded for this value (a Phi/LoopResult whose
+        # sources publish none).  The query then states nothing about it,
+        # rather than inventing a scalar float64 descriptor.
+        return None
     return {
         "shape": static_shape,
-        "dtype": str(tensor.get("dtype") or "float64"),
+        "dtype": str(tensor["dtype"]),
         "rank": int(tensor.get("rank", len(static_shape))),
         **(
             {"metadata_state": str(tensor["metadata_state"])}
@@ -25532,7 +25674,9 @@ def _fold_callsite_structural_values(
             return None
         return {
             "shape": tuple(map(int, field["shape"])),
-            "dtype": str(field.get("dtype") or "float64"),
+            "dtype": _recorded_dtype(
+                field.get("dtype"), f"record field {field_name!r}", receiver,
+            ),
         }
 
     def descriptor_attribute(parent: int, attribute: str) -> Any:
@@ -27628,7 +27772,18 @@ def _fold_callsite_structural_values(
                         ), None)
                         data["tensor"] = {
                             "shape": (count,),
-                            "dtype": named_dtype or "float64",
+                            "dtype": named_dtype or (
+                                "float64" if any(
+                                    isinstance(v, float)
+                                    for v in positional_values
+                                ) else "int64" if all(
+                                    isinstance(v, int)
+                                    for v in positional_values
+                                ) else _recorded_dtype(
+                                    None, "arange bounds",
+                                    data.get("value_id", node_id),
+                                )
+                            ),
                         }
                         normalized = dict(data.get("attributes") or {})
                         normalized.update({
@@ -29234,7 +29389,10 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
             extra_args=dict(attributes),
             tensor={
                 "shape": tuple(shape),
-                "dtype": str(source_descriptor.get("dtype") or "float64"),
+                "dtype": _recorded_dtype(
+                    source_descriptor.get("dtype"), "unbroadcast source",
+                    current,
+                ),
             },
             control={}, constant=None, expr_obj=None, store_id=None,
         )
@@ -33830,6 +33988,23 @@ class ProcessGraphGLSLDeployment(TiledObject):
         return False
 
 
+def _plan_with_current_iterable(graph: Any, plan: Any) -> Any:
+    """The plan, its loop's iterable node re-read from the loop's own edges
+    when the discovered one has since left the graph."""
+
+    iterable = plan.loop.iterable_node
+    if iterable is None or int(iterable) in graph.G:
+        return plan
+    current = next((
+        int(parent)
+        for parent, role in graph.G.nodes[int(plan.loop.node_id)].get("parents") or ()
+        if str(role) in {"iterable", "iter"} and int(parent) in graph.G
+    ), None)
+    if current is None:
+        return plan
+    return replace(plan, loop=replace(plan.loop, iterable_node=current))
+
+
 def strategize_shell_deployment(
     graph: Any,
     *,
@@ -34242,6 +34417,15 @@ def strategize_shell_deployment(
         for plan in discovered_loop_plans
         if int(plan.loop.node_id) not in evaporated_loop_ids
         and int(plan.loop.node_id) in graph.G
+    )
+    # Program: ``for i in range(3): d[1] = i + n`` then ``for k in d: ...``
+    # (corpus c714).  Wrong record: the first loop unrolls and its result
+    # node is removed, the second loop's iterable is re-pointed at the value
+    # that replaced it, but the second loop's discovered plan still named
+    # the removed node, so lowering raised KeyError.  Rule: a retained loop
+    # plan names the iterable its node holds now.
+    retained_loop_plans = tuple(
+        _plan_with_current_iterable(graph, plan) for plan in retained_loop_plans
     )
     semantic_loop_plans = selection_phase(
         "materialize-loop-semantic-ir",

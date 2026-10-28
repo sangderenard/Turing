@@ -6559,6 +6559,12 @@ def _canonical_program_abi_type_identity(
     # resolve through the record table.
     if canonical in _BUILTIN_PRIMITIVE_TYPE_IDENTITIES:
         return canonical
+    # ``Precision`` is a numeric value type with no ProgramABI record, so
+    # the record table cannot join its two spellings: an annotation names
+    # it ``Precision`` and a contract ``src.common.tensors.
+    # extended_precision.Precision``. Both are one type, never a union.
+    if canonical == "src.common.tensors.extended_precision.Precision":
+        return "Precision"
     return _program_abi_record_for_type_identity(
         canonical, program_abi,
     ) or canonical
@@ -28970,8 +28976,15 @@ def _class_surface_ssa_program(
                         getattr(cell.page, "name", cell.page) == "parameter_annotation"
                         for cell in settled_arms[0].source_cells
                     ) or any(
-                        (data.get("attributes") or {}).get("binding_kind") == "parameter"
-                        and int(data.get("value_id", node_id)) == sequence_id
+                        # A value with no producing edge (an input, or the
+                        # literal a callsite specialization bound to the
+                        # formal: in the specialized copy a ``const`` with
+                        # in_degree 0 and no binding_kind) is the
+                        # parameter's own value, whose kind belongs to
+                        # parameter_abi_kind; a resident derived inside the
+                        # function is the one SEQUENCE_CONTRACT restates.
+                        int(data.get("value_id", node_id)) == sequence_id
+                        and graph_obj.in_degree(node_id) == 0
                         for node_id, data in graph_obj.nodes(data=True)
                     ):
                         continue
@@ -51019,6 +51032,18 @@ def _class_surface_ssa_program(
                                         ),
                                     },
                                 )
+                                # Program: ``t = [n, 1] if n > 2 else [5, 6]``
+                                # passed to a callee.  Wrong record: this
+                                # restored occurrence took the callee formal's
+                                # provisional shape () while the lease's
+                                # ``ssa_value`` row already published (2,).
+                                # Rule: an occurrence is a view of its row.
+                                _posted = _posted_ssa_value_fact(
+                                    caller, int(source),
+                                )
+                                if _posted is not None:
+                                    value.dtype = _posted.dtype
+                                    value.shape = tuple(_posted.shape or ())
                                 caller.args.append(value)
                                 values[int(source)] = value
                             if value is None:
@@ -61433,6 +61458,13 @@ def _lower_ast_source_to_ssa_impl(
             return None
 
         def _numeric_descriptor_element(descriptor: Any) -> str:
+            # A precision numeral's coefficients are limbs, and the limb
+            # element is stated by the precision library itself.
+            if "precision" in set(map(str, descriptor.features)):
+                from ..common.tensors.extended_precision import (
+                    limb_element_name,
+                )
+                return limb_element_name(descriptor.element_type)
             if not descriptor.element_type:
                 raise ValueError(
                     f"numeric descriptor {descriptor.type_name!r} records no "

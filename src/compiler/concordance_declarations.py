@@ -2819,6 +2819,7 @@ class SSABlockKind(Enum):
     STATE_NEXT = "state_next"
     STATE_MERGE = "state_merge"
     CHILD_TABLE_LIVE = "child_table_live"
+    TABLE_ROW_LIVE = "table_row_live"
     MAPPING_SETDEFAULT_FOUND = "mapping_setdefault_found"
     MAPPING_SETDEFAULT_MISSING = "mapping_setdefault_missing"
     MAPPING_SETDEFAULT_MERGE = "mapping_setdefault_merge"
