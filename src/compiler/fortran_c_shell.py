@@ -24172,9 +24172,21 @@ def _class_surface_ssa_program(
             if callee_graph is None:
                 continue
             for caller_id, callee_id in planned_call.argument_bindings:
-                linked_value_edges.append((
-                    caller_graph, int(caller_id), callee_graph, int(callee_id),
-                ))
+                # Program: ``intern_batch(1, [65], [1, 1])`` (Token Orchard
+                # acceptance).  Wrong record: the callsite fold folds
+                # ``validate_batch_envelope``'s body to a constant and drops
+                # the unread formal ``values``; the plan keeps the authored
+                # actual-to-formal binding from the declaration graph as
+                # provenance.  Settling a value ABI over that edge posted
+                # VALUE_TYPE_ABI for a value absent from the specialized copy,
+                # derived from no class of that copy's scope.  Rule: a value
+                # ABI crosses only to a formal the callee graph holds; the
+                # binding stays an exact site and a call-edge row.
+                if int(callee_id) in callee_graph:
+                    linked_value_edges.append((
+                        caller_graph, int(caller_id), callee_graph,
+                        int(callee_id),
+                    ))
                 linked_argument_sites.add((
                     id(caller_graph), int(planned_call.callsite_id),
                     int(caller_id),
