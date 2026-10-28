@@ -43790,6 +43790,10 @@ def _class_surface_ssa_program(
             for instruction in block.instrs:
                 if instruction.op not in {"Ret", "ret", "Return", "return"}:
                     continue
+                if instruction.attributes.get("fault_exit"):
+                    # The zero outputs of a checked index's fault exit are
+                    # not the source outputs; there is nothing to settle.
+                    continue
                 by_id = {
                     int(argument.id): argument
                     for argument in instruction.args
