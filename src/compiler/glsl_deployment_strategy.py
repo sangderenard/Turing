@@ -23550,13 +23550,13 @@ def _tensor_descriptor(
             and not polymorphic_specialization
             and not collection_result
         ):
-            return {
-                "shape": settled,
-                "dtype": str(
-                    (_deepest_fact(page, row) or ("", (), "float64"))[2]
-                ),
-                "rank": len(settled),
-            }
+            deepest = _deepest_fact(page, row)
+            if deepest is not None:
+                return {
+                    "shape": settled,
+                    "dtype": str(deepest[2]),
+                    "rank": len(settled),
+                }
     except Exception as error:
         if os.environ.get("TURING_DEBUG_SEQUENCE_ROW_LAYOUT"):
             print(
@@ -24192,7 +24192,16 @@ def _tensor_descriptor_rule(
                 tensor = dict(inherited)
                 # Both projections expose real-valued elements while
                 # preserving the source tensor's storage/rank contract.
-                tensor["dtype"] = "float64"
+                # The projection's element is the complex width's real
+                # half; a source that is not complex keeps its own dtype.
+                tensor["dtype"] = {
+                    "complex64": "float32", "complex128": "float64",
+                }.get(str(inherited.get("dtype")), inherited.get("dtype"))
+                if tensor["dtype"] is None:
+                    raise ValueError(
+                        f"{field_name!r} of value {receiver}: the receiver "
+                        "descriptor records no dtype"
+                    )
     if (
         "shape" not in tensor
         and data.get("type") == "Input"
@@ -24898,7 +24907,50 @@ def _tensor_descriptor_rule(
                         _ELEMENTWISE_BINARY_OPERATIONS
                     ):
                         continue
-                    sides[index] = {"shape": (), "dtype": "float64"}
+                    # The host scalar's dtype is its recorded class (the
+                    # concordance's source-value-class cell, posted by the
+                    # pass that made the value).  With no class cell the
+                    # side stays undescribed: unsettled, never float64.
+                    from ..common.tensors.topological_reducer import (
+                        _source_numeric_scope as _host_scope,
+                    )
+                    from .concordance_declarations import (
+                        SOURCE_VALUE_CLASS as _HOST_CLASS,
+                    )
+                    from .identity_concordance import (
+                        current_identity_book as _host_book,
+                    )
+
+                    host_class = _host_book().page(_HOST_CLASS).latest((
+                        _host_scope(graph.G), int(operand),
+                    ))
+                    host_dtype = {
+                        "builtins.int": "int64",
+                        "builtins.bool": "bool",
+                        "builtins.float": "float64",
+                    }.get(
+                        str(host_class[0])
+                        if isinstance(host_class, tuple) and host_class
+                        else ""
+                    )
+                    if host_dtype is None:
+                        # Next record: the planner's proven scalar dtype
+                        # for this value (literals, range targets, region
+                        # operator rules, collection element joins).
+                        stamp = (
+                            graph.G.number_of_nodes(),
+                            graph.G.number_of_edges(),
+                        )
+                        memo = graph.G.graph.get("_host_scalar_planned")
+                        if memo is None or memo[0] != stamp:
+                            memo = (stamp, _planned_scalar_dtypes(graph))
+                            graph.G.graph["_host_scalar_planned"] = memo
+                        host_dtype = memo[1].get(int(operand))
+                    if host_dtype is None:
+                        continue
+                    sides[index] = {
+                        "shape": (), "dtype": host_dtype, "rank": 0,
+                    }
                 # An empty shape is a rank-0 scalar only when the node
                 # produces a scalar.  For a tensor-producing node it is what
                 # the query returns while its extents are still unsettled,
@@ -25132,12 +25184,13 @@ def _tensor_descriptor_rule(
                                 for side in sides
                                 if str(side.get("dtype") or "unknown")
                                 != "unknown"
-                            ), "float64")
-                            return {
-                                "shape": tuple(result),
-                                "dtype": dtype,
-                                "rank": len(result),
-                            }
+                            ), None)
+                            if dtype is not None:
+                                return {
+                                    "shape": tuple(result),
+                                    "dtype": dtype,
+                                    "rank": len(result),
+                                }
                     elif left and right:
                         left_vector = len(left) == 1
                         right_vector = len(right) == 1
@@ -25166,12 +25219,13 @@ def _tensor_descriptor_rule(
                                     if str(
                                         side.get("dtype") or "unknown"
                                     ) != "unknown"
-                                ), "float64")
-                                return {
-                                    "shape": tuple(result),
-                                    "dtype": dtype,
-                                    "rank": len(result),
-                                }
+                                ), None)
+                                if dtype is not None:
+                                    return {
+                                        "shape": tuple(result),
+                                        "dtype": dtype,
+                                        "rank": len(result),
+                                    }
         if operation in {
             "sum", "mean", "prod", "min", "max", "any", "all",
             "argmin", "argmax",
