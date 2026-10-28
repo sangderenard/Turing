@@ -2277,10 +2277,40 @@ def _planned_scalar_dtypes_from(
         if isinstance(value, bool):
             return "bool"
         if isinstance(value, int):
-            return "int64"
+            from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+            try:
+                return python_int_literal_dtype(value)
+            except OverflowError:
+                return None
         if isinstance(value, float):
             return "float64"
         return None
+
+    # A builtin ``int`` value's native width is the narrowest layout holding
+    # its proven interval (``source_int_range_concordance``), the same law a
+    # literal's width follows.  An unproven value keeps the int64 rule.
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope as _range_scope,
+    )
+    from .concordance_declarations import SOURCE_INT_RANGE
+    from .identity_concordance import current_identity_book as _range_book
+    from ..transmogrifier.dtype_layout import (
+        common_integer_dtype as _common_integer_dtype,
+        python_int_range_dtype,
+    )
+
+    range_scope = _range_scope(G)
+    range_page = _range_book().page(SOURCE_INT_RANGE)
+
+    def range_dtype(node_id):
+        data = G.nodes.get(int(node_id), {})
+        interval = range_page.latest(
+            (range_scope, int(data.get("value_id", node_id)))
+        )
+        if interval is None:
+            return None
+        return python_int_range_dtype(int(interval[0]), int(interval[1]))
 
     scalar: dict[int, str] = {}
     element: dict[int, str] = dict(assumed_elements or {})
@@ -2303,6 +2333,9 @@ def _planned_scalar_dtypes_from(
             return "float64"
         if all(dtype in {"int64", "bool"} for dtype in dtypes):
             return "int64"
+        if all(dtype in {"int64", "uint64", "int128", "bool"} for dtype in dtypes):
+            # A proven-wide operand: the exact common integer domain.
+            return _common_integer_dtype(tuple(dtypes))
         return None
 
     def parents(data, *roles):
@@ -2399,6 +2432,16 @@ def _planned_scalar_dtypes_from(
             op = operation(data)
             attributes = data.get("attributes") or {}
             expression = data.get("expr_obj")
+            proven_width = range_dtype(node_id)
+            if (
+                proven_width not in {None, "int64"}
+                and scalar.get(node_id) in {None, "int64", "int"}
+                and scalar.get(node_id) != proven_width
+            ):
+                # The interval is the stronger proof: an int64 seed from a
+                # class-only contract does not narrow it.
+                scalar[node_id] = proven_width
+                changed = True
             # Program: ``k.mul(x) + k.scale`` with ``def mul(self, x: int) ->
             # int`` (corpus c426).  Wrong record: a method call is named by
             # its method (``mul``), so no operator rule typed it and its
@@ -5226,6 +5269,11 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
+                        # A proven interval wider than int64 is the source's
+                        # width; the parents' int64 does not narrow it.
+                        proven = planned_scalar_dtypes().get(int(current))
+                        if proven in {"uint64", "int128"}:
+                            dtype = str(proven)
                 if operation in {"floor", "ceil", "trunc", "round"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so

@@ -1763,6 +1763,9 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             cells=_node_identity_cells(target_wrapper, node_id, operand_id),
         )
         changed = changed or prior != int(width)
+    # The specialization is its own numeric scope: its literal-folded inputs
+    # and inherited classes prove its own intervals.
+    _propagate_builtin_int_ranges(target_wrapper)
     return changed
 
 
@@ -4890,6 +4893,212 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             ))),
         )
         changed = True
+    return changed
+
+
+def _builtin_int_operator_range(
+    operator: ast.AST,
+    operands: tuple[tuple[int, int] | None, ...],
+) -> tuple[tuple[int, int] | None, tuple[int, ...]]:
+    """The interval Python's own operator semantics prove, and what it read.
+
+    Returns ``(interval, positions)``: ``positions`` are the operands whose
+    intervals the proof used (a floor modulus by a positive divisor proves
+    ``[0, divisor - 1]`` whatever its dividend is).  ``(None, ())`` when the
+    operands do not decide an interval.
+    """
+
+    def known(*positions: int) -> bool:
+        return all(operands[position] is not None for position in positions)
+
+    if isinstance(operator, (ast.UAdd, ast.USub, ast.Invert)):
+        if not known(0):
+            return None, ()
+        low, high = operands[0]
+        if isinstance(operator, ast.UAdd):
+            return (low, high), (0,)
+        if isinstance(operator, ast.USub):
+            return (-high, -low), (0,)
+        return (~high, ~low), (0,)
+    if len(operands) != 2:
+        return None, ()
+    lhs, rhs = operands
+    if isinstance(operator, ast.Mod):
+        if rhs is not None and rhs[0] > 0:
+            if lhs is not None and lhs[0] >= 0 and lhs[1] < rhs[0]:
+                return lhs, (0, 1)
+            return (0, rhs[1] - 1), (1,)
+        if rhs is not None and rhs[1] < 0:
+            return (rhs[0] + 1, 0), (1,)
+        return None, ()
+    if isinstance(operator, ast.BitAnd):
+        nonnegative = tuple(
+            position for position, interval in enumerate(operands)
+            if interval is not None and interval[0] >= 0
+        )
+        if not nonnegative:
+            return None, ()
+        return (0, min(operands[position][1] for position in nonnegative)), nonnegative
+    if not known(0, 1):
+        return None, ()
+    (a, b), (c, d) = lhs, rhs
+    if isinstance(operator, ast.Add):
+        return (a + c, b + d), (0, 1)
+    if isinstance(operator, ast.Sub):
+        return (a - d, b - c), (0, 1)
+    if isinstance(operator, ast.Mult):
+        products = (a * c, a * d, b * c, b * d)
+        return (min(products), max(products)), (0, 1)
+    if isinstance(operator, ast.FloorDiv) and c > 0:
+        quotients = (a // c, a // d, b // c, b // d)
+        return (min(quotients), max(quotients)), (0, 1)
+    if isinstance(operator, (ast.LShift, ast.RShift)) and c >= 0:
+        if isinstance(operator, ast.LShift):
+            if d > 512:
+                return None, ()
+            shifted = (a << c, a << d, b << c, b << d)
+        else:
+            shifted = (a >> c, a >> d, b >> c, b >> d)
+        return (min(shifted), max(shifted)), (0, 1)
+    if isinstance(operator, (ast.BitOr, ast.BitXor)) and a >= 0 and c >= 0:
+        return (0, (1 << max(b, d).bit_length()) - 1), (0, 1)
+    return None, ()
+
+
+def _propagate_builtin_int_ranges(graph: Any) -> bool:
+    """Publish the interval every builtin ``int`` value is proven to lie in.
+
+    Program: Token Orchard's ``_fingerprint_span``: ``high`` and ``low`` are
+    ``... % U32_MODULUS``, then ``first = high * (1 << 32) + low``.  Wrong
+    record: every Python ``int`` operator result was int64 by class alone,
+    so ``first`` wrapped negative on C and LLVM whenever ``high >= 2**31``
+    with no finding (Python's ``first`` is a full u64).  Rule: a literal is
+    its own interval; a builtin operator over ranged operands has the
+    interval Python's arithmetic proves (``_builtin_int_operator_range``); a
+    conditional merge joins its arms.  Each row is DERIVED from the value's
+    class cell, its node cell and the operand range cells the rule read.  A
+    value the source does not bound gets no row.  Returns whether a row was
+    added.
+    """
+
+    from ...compiler.concordance_declarations import (
+        SOURCE_INT_RANGE, SOURCE_VALUE_CLASS,
+    )
+
+    book = current_identity_book()
+    target = getattr(graph, "G", graph)
+    scope = _source_numeric_scope(graph)
+    class_page = book.page(SOURCE_VALUE_CLASS)
+    range_page = book.page(SOURCE_INT_RANGE)
+
+    def value_of(node_id: int) -> int:
+        if node_id in target:
+            return int(target.nodes[node_id].get("value_id", node_id))
+        return int(node_id)
+
+    def integer_class_cell(value_id: int):
+        cell = book.latest_ref(SOURCE_VALUE_CLASS, (scope, int(value_id)))
+        if cell is None:
+            return None, None
+        identity = _canonical_source_class_identity(
+            class_page.cell(cell.row, cell.column)[0]
+        )
+        if identity not in {"builtins.int", "builtins.bool"}:
+            return None, None
+        return cell, identity
+
+    # Operands before results: an acyclic graph settles in one pass, and the
+    # repeat only serves a cyclic one.
+    try:
+        order = tuple(nx.topological_sort(target))
+    except nx.NetworkXUnfeasible:
+        order = tuple(target.nodes)
+    changed = False
+    for _round in range(max(1, target.number_of_nodes())):
+        round_changed = False
+        for node_id in order:
+            data = target.nodes[node_id]
+            value_id = value_of(int(node_id))
+            if range_page.latest((scope, value_id)) is not None:
+                continue
+            class_cell, identity = integer_class_cell(value_id)
+            if class_cell is None:
+                continue
+            node_cell = node_identity_cell(graph, int(node_id))
+            expression = data.get("expr_obj")
+            attributes = data.get("attributes") or {}
+            interval = None
+            read_cells: tuple = ()
+            literal = (
+                expression.value if isinstance(expression, ast.Constant)
+                else attributes.get("value")
+                if str(data.get("type") or data.get("op") or "").casefold()
+                in {"constant", "const"}
+                else None
+            )
+            if type(literal) in {int, bool}:
+                interval = (int(literal), int(literal))
+            elif identity == "builtins.bool":
+                interval = (0, 1)
+            else:
+                parents = {
+                    str(role): int(parent)
+                    for parent, role in data.get("parents") or ()
+                }
+                conditional_phi = (
+                    str(data.get("type") or data.get("op") or "").casefold() == "phi"
+                    and attributes.get("source_conditional_id") is not None
+                )
+                if conditional_phi:
+                    roles = ("body", "orelse")
+                elif isinstance(expression, ast.BinOp):
+                    roles = ("lhs", "rhs")
+                elif isinstance(expression, ast.UnaryOp):
+                    roles = ("operand",)
+                else:
+                    continue
+                if any(role not in parents for role in roles):
+                    continue
+                operand_cells = tuple(
+                    book.latest_ref(
+                        SOURCE_INT_RANGE, (scope, value_of(parents[role])),
+                    )
+                    for role in roles
+                )
+                operands = tuple(
+                    None if cell is None
+                    else tuple(map(int, range_page.cell(cell.row, cell.column)))
+                    for cell in operand_cells
+                )
+                if conditional_phi:
+                    if any(operand is None for operand in operands):
+                        continue
+                    interval = (
+                        min(low for low, _high in operands),
+                        max(high for _low, high in operands),
+                    )
+                    used = (0, 1)
+                else:
+                    interval, used = _builtin_int_operator_range(
+                        expression.op, operands,
+                    )
+                if interval is None:
+                    continue
+                read_cells = tuple(operand_cells[position] for position in used)
+            book.post(
+                SOURCE_INT_RANGE, (scope, value_id),
+                (int(interval[0]), int(interval[1])),
+                stage=_REDUCTION,
+                provenance=_Derived(tuple(dict.fromkeys(
+                    cell for cell in (class_cell, node_cell, *read_cells)
+                    if cell is not None
+                ))),
+                mode=_Mode.CONCORD,
+            )
+            round_changed = True
+        changed = changed or round_changed
+        if not round_changed:
+            break
     return changed
 
 
@@ -24732,6 +24941,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 lower_class_operator_calls(entry_wrapper)
                 if _propagate_builtin_scalar_operator_classes(entry_wrapper):
                     operator_classes_changed = True
+                _propagate_builtin_int_ranges(entry_wrapper)
         if not propagate_call_formal_numeric_types() and not operator_classes_changed:
             break
     # String Core computes token = AGGREGATE_BASE + len(self.domain), then

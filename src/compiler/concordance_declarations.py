@@ -501,6 +501,16 @@ CALLABLE_IDENTITY = declare_page("callable_identity_concordance", (
 SOURCE_VALUE_CLASS = declare_page("source_value_class_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), tuple)
+#: ``_propagate_builtin_int_ranges``: the closed interval a builtin ``int``
+#: value is proven to lie in, ``(numeric scope, value id)`` -> ``(low,
+#: high)``, CONCORD, DERIVED from the value's ``source_value_class`` cell, its
+#: node identity, and the operand range cells the operator rule read.  A
+#: value with no proof has no row.  The native width of a Python ``int`` is
+#: the narrowest declared layout holding this interval
+#: (``dtype_layout.python_int_range_dtype``), exactly as a literal's is.
+SOURCE_INT_RANGE = declare_page("source_int_range_concordance", (
+    RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), tuple)
 
 # ============================================================================
 # Step 3: reducer field state and return sites (plan 70, sections 1-3, 6)
