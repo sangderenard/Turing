@@ -115,6 +115,7 @@ from .native_shell_abi import (
 from .authored_parameter_abi import (
     _authored_sequence_annotation_contract as _authored_sequence_annotation_contract,
     _authored_parameter_sequence_contracts as _authored_parameter_sequence_contracts,
+    _linked_list_parameter_contracts as _linked_list_parameter_contracts,
     _authored_tensor_parameter_value_abi as _authored_tensor_parameter_value_abi,
     _authored_text_parameter_transforms as _authored_text_parameter_transforms,
     _current_authored_parameter_annotations as _current_authored_parameter_annotations,
@@ -7974,6 +7975,99 @@ def _authored_dataclass_record_views(
                 elif dict(previous) != dict(receipt):
                     # Conflicting physical declarations are not a proven ABI.
                     fields.pop(target.attr, None)
+        # ``self._c = []`` states a list and nothing about its rows; the
+        # rows' class is what every method appends.  Join the appended
+        # values each method proves (an annotated parameter of that method,
+        # or a literal); any unproven or disagreeing writer proves nothing
+        # and the field stays undeclared, as before.
+        if initializer is not None:
+            scalar_classes = {"int": "int64", "float": "float64", "bool": "bool"}
+
+            def literal_class(value: Any) -> str | None:
+                if isinstance(value, bool):
+                    return "bool"
+                if isinstance(value, int):
+                    return "int64"
+                if isinstance(value, float):
+                    return "float64"
+                return None
+
+            empty_list_fields = {
+                node.targets[0].attr
+                for node in ast.walk(initializer)
+                if isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Attribute)
+                and isinstance(node.targets[0].value, ast.Name)
+                and node.targets[0].value.id == "self"
+                and (
+                    (isinstance(node.value, ast.List) and not node.value.elts)
+                    or (
+                        isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name)
+                        and node.value.func.id == "list"
+                        and not node.value.args and not node.value.keywords
+                    )
+                )
+                and node.targets[0].attr not in fields
+            }
+            appended: dict[str, list[str | None]] = {}
+            for method in methods.values():
+                parameter_classes = {
+                    argument.arg: scalar_classes.get(
+                        argument.annotation.id
+                        if isinstance(argument.annotation, ast.Name) else ""
+                    )
+                    for argument in (
+                        *method.args.posonlyargs, *method.args.args,
+                        *method.args.kwonlyargs,
+                    )
+                    if argument.annotation is not None
+                }
+                rebound = {
+                    name.id
+                    for node in ast.walk(method)
+                    for target in (
+                        node.targets if isinstance(node, ast.Assign)
+                        else (node.target,) if isinstance(node, (
+                            ast.AugAssign, ast.AnnAssign, ast.For,
+                            ast.AsyncFor, ast.NamedExpr,
+                        )) else ()
+                    )
+                    for name in ast.walk(target)
+                    if isinstance(name, ast.Name)
+                }
+                for node in ast.walk(method):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in {"append", "insert"}
+                        and isinstance(node.func.value, ast.Attribute)
+                        and isinstance(node.func.value.value, ast.Name)
+                        and node.func.value.value.id == "self"
+                        and node.func.value.attr in empty_list_fields
+                        and node.args
+                    ):
+                        continue
+                    value = node.args[-1]
+                    appended.setdefault(node.func.value.attr, []).append(
+                        literal_class(value.value)
+                        if isinstance(value, ast.Constant)
+                        else parameter_classes.get(value.id)
+                        if isinstance(value, ast.Name)
+                        and value.id not in rebound
+                        else None
+                    )
+            for field_name, classes_seen in appended.items():
+                known = set(classes_seen)
+                if None in known:
+                    continue
+                if known <= {"int64", "bool"} and len(known) > 1:
+                    known = {"int64"}
+                if len(known) == 1:
+                    fields[field_name] = {
+                        "storage": "span", "dtype": next(iter(known)),
+                        "rank": 1, "mutable": True, "aggregate_kind": "list",
+                    }
         class_fields[class_name] = fields
         class_methods[class_name] = methods
 
@@ -10803,6 +10897,7 @@ def _field_slot_ops(
         for sequence_id, _policy, _columns, _writable
         in sequence_declarations
     }
+    linked_list_parameters = _linked_list_parameter_contracts(graph_obj)
     for parameter_name, contract in _authored_parameter_sequence_contracts(graph_obj).items():
         history = tuple(map(int, identity.get(str(parameter_name), ())))
         if not history:
@@ -10818,7 +10913,8 @@ def _field_slot_ops(
             sequence_id, policy, int(column_count), bool(writable),
         ))
         declared_sequence_ids.add(sequence_id)
-        retained_sequence_ids.add(sequence_id)
+        if str(parameter_name) not in linked_list_parameters:
+            retained_sequence_ids.add(sequence_id)
 
     # Source-derived ``Sequence[Record]`` metadata survives graph extraction
     # independently of any one Input wrapper. Declare its caller-owned
@@ -21822,11 +21918,59 @@ def _settle_linked_dynamic_sequences(
     dynamic_roots = {find(seed) for seed in seeds if seed in linked}
     from .resident_sequence_materialization import _call_escaped_argument_edges
 
+    # Program: ``def __init__(self): self._c = []`` with ``self._c.append(t)``
+    # in a method.  Wrong record: the birth's element type is the join of its
+    # writers (``_planned_scalar_dtypes``), and the writers are in another
+    # function, so the empty display stayed unknown, never became a heap
+    # sequence, and its DYNAMIC views disagreed.  Rule: the views of one
+    # storage hold one element type; the join of what each function proves
+    # for its own view is the component's, published per graph as
+    # ``linked_sequence_element_dtypes``.
+    from types import SimpleNamespace as _GraphView
+    from .glsl_deployment_strategy import _planned_scalar_dtypes
+
+    planned_by_graph = {}
+    for graph_obj in graphs:
+        planned = dict(_planned_scalar_dtypes(_GraphView(G=graph_obj)))
+        # The retained mutation records may not exist yet; a view's appended
+        # values are its writers here as there.
+        appended: dict[int, set] = {}
+        for mutation in _sequence_append_call_mutations(graph_obj):
+            if mutation.operator in {"append", "add", "insert"} and (
+                mutation.argument_value_ids
+            ):
+                appended.setdefault(int(mutation.sequence_value_id), set()).add(
+                    planned.get(int(mutation.argument_value_ids[-1]))
+                )
+        for sequence_id, dtypes in appended.items():
+            if sequence_id not in planned and len(dtypes) == 1 and None not in dtypes:
+                planned[sequence_id] = next(iter(dtypes))
+        planned_by_graph[id(graph_obj)] = planned
+    component_elements: dict[tuple[int, int], set] = {}
+    for graph_id, value_id in linked:
+        if find((graph_id, value_id)) not in dynamic_roots:
+            continue
+        component_elements.setdefault(find((graph_id, value_id)), set()).add(
+            planned_by_graph.get(graph_id, {}).get(int(value_id))
+        )
+    component_element = {}
+    for root, dtypes in component_elements.items():
+        known = {dtype for dtype in dtypes if dtype in {"int64", "float64", "bool"}}
+        if known <= {"int64", "bool"} and len(known) > 1:
+            known = {"int64"}
+        if len(known) == 1:
+            component_element[root] = next(iter(known))
     for graph_obj in graphs:
         graph_obj.graph["linked_dynamic_sequence_ids"] = tuple(sorted(
             value_id for graph_id, value_id in linked
             if graph_id == id(graph_obj) and find((graph_id, value_id)) in dynamic_roots
         ))
+        graph_obj.graph["linked_sequence_element_dtypes"] = {
+            int(value_id): component_element[find((graph_id, value_id))]
+            for graph_id, value_id in linked
+            if graph_id == id(graph_obj)
+            and find((graph_id, value_id)) in component_element
+        }
         # Program: ``xs = [n, 4]; setfirst(xs, 9); len(xs)`` (scratch c_g2).
         # Wrong record: an escaped local list had no row bound, so its arena
         # became entry-ABI storage the wrapper sized at one row; the second
@@ -29571,7 +29715,10 @@ def _class_surface_ssa_program(
                         if int(column_count) == 1
                         and int(sequence_id) in dynamic_sequence_ids
                         for planned in (
-                            planned_sequence_elements.get(int(sequence_id)),
+                            planned_sequence_elements.get(int(sequence_id))
+                            or dict(graph_obj.graph.get(
+                                "linked_sequence_element_dtypes"
+                            ) or {}).get(int(sequence_id)),
                         )
                         if planned in {"int64", "float64", "bool"}
                     },
@@ -43799,6 +43946,13 @@ def _class_surface_ssa_program(
                             *((canonical.heap_owner_value_id,)
                               if canonical.heap_owner_value_id is not None else ()),
                         )
+                        # A frame member the constructor's own body never
+                        # touched (the heap owner of a field born empty and
+                        # grown only by methods) is still caller-owned
+                        # storage of this field: allocate it like the rest.
+                        for value_id in canonical_ids:
+                            if int(value_id) not in remap:
+                                remap[int(value_id)] = remap_mint(int(value_id))
                         resident_ids = tuple(remap[int(value_id)]
                                              for value_id in canonical_ids)
                         for local in constructor_sequences.sequences.values():

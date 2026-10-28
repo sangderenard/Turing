@@ -2312,6 +2312,14 @@ def _planned_scalar_dtypes_from(
 
     collection_kinds = {"list", "tuple", "set", "dict"}
 
+    # ``def put(xs, t): xs.append(t)``: an unannotated parameter that a
+    # retained append grows is a collection; its rows are what it appends.
+    grown_receivers = {
+        int(record.get("sequence_value_id", -1))
+        for record in (G.graph.get("source_sequence_mutation_records") or {}).values()
+        if str(record.get("operator")) in {"append", "add", "insert"}
+    }
+
     def is_collection(node_id):
         data = G.nodes.get(int(node_id), {})
         return (
@@ -2320,6 +2328,10 @@ def _planned_scalar_dtypes_from(
             ))
             or (data.get("attributes") or {}).get("aggregate_kind")
             in collection_kinds
+            or (
+                operation(data) == "input"
+                and int(data.get("value_id", node_id)) in grown_receivers
+            )
         )
 
     records = G.graph.get("source_sequence_mutation_records") or {}
@@ -2534,12 +2546,17 @@ def _planned_scalar_dtypes_from(
                     # An annotated collection parameter (``xs: list[int]``)
                     # is a collection: its element class joins its
                     # annotation with its writers, in the collection rule.
+                    # So is an unannotated one a retained append grows:
+                    # its element class is its writers' join.
                     if (
                         attributes.get("aggregate_kind") in collection_kinds
                         and (
                             attributes.get("sequence_element_class_ref")
                             or attributes.get("mapping_value_class_ref")
                         )
+                    ) or (
+                        attributes.get("aggregate_kind") is None
+                        and int(data.get("value_id", node_id)) in grown_receivers
                     ):
                         pass
                     else:
