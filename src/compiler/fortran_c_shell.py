@@ -51025,6 +51025,18 @@ def _class_surface_ssa_program(
                                         ),
                                     },
                                 )
+                                # Program: ``t = [n, 1] if n > 2 else [5, 6]``
+                                # passed to a callee.  Wrong record: this
+                                # restored occurrence took the callee formal's
+                                # provisional shape () while the lease's
+                                # ``ssa_value`` row already published (2,).
+                                # Rule: an occurrence is a view of its row.
+                                _posted = _posted_ssa_value_fact(
+                                    caller, int(source),
+                                )
+                                if _posted is not None:
+                                    value.dtype = _posted.dtype
+                                    value.shape = tuple(_posted.shape or ())
                                 caller.args.append(value)
                                 values[int(source)] = value
                             if value is None:

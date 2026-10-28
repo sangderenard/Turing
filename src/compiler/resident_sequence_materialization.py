@@ -2235,6 +2235,29 @@ def _static_sequence_capacity_survey(
                 and not any(isinstance(element, ast.Starred)
                             for element in expression.elts)):
             bounds.setdefault(int(node_id), len(expression.elts))
+    # Program: ``a = [1, 2]; t = a if n > 2 else [3, 4]`` then ``len(a)``
+    # (corpus c271).  Wrong record: the merge (an ``aggregate_phi``) was
+    # bounded, but each folded literal arm is a resident arena of its own
+    # (it is the phi's member), and no arm had a bound, so C refused it as
+    # a private sequence with no capacity.  Rule: an arm of a list merge
+    # that is a folded literal and that nothing grows is bounded by its
+    # literal length.
+    grown_arms = {
+        int(mutation.sequence_value_id)
+        for mutation in _sequence_append_call_mutations(graph_obj)
+    }
+    for _node_id, data in graph_obj.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if (attributes.get("producer_kind") != "aggregate_phi"
+                or attributes.get("aggregate_kind") != "list"):
+            continue
+        for parent, role in data.get("parents") or ():
+            if str(role) not in {"body", "orelse"} or int(parent) in grown_arms:
+                continue
+            arm = graph_obj.nodes.get(int(parent), {}).get("attributes") or {}
+            if (arm.get("aggregate_kind") == "list"
+                    and isinstance(arm.get("value"), (list, tuple))):
+                bounds.setdefault(int(parent), len(arm["value"]))
     if control is not None:
         bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
             control, local_lists,
