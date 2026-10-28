@@ -25,9 +25,49 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 
+class TensorClass:
+    """The class of a tensor argument: the neutral AbstractTensor class with
+    its element dtype.  A class record, never a sampled tensor; the dtype is
+    a neutral dtype-layout name (no backend tensor class is spelled)."""
+
+    def __init__(self, dtype: str) -> None:
+        from ..transmogrifier.dtype_layout import resolve
+
+        if resolve(str(dtype)) is None:
+            raise ValueError(f"no dtype layout declared for {dtype!r}")
+        self.dtype = str(dtype)
+
+    def __str__(self) -> str:
+        return f"AbstractTensor[{self.dtype}]"
+
+
+class MappingClass:
+    """``Mapping[key, value]`` where the value class is a class record."""
+
+    def __init__(self, key: type, value: Any) -> None:
+        self.key, self.value = key, value
+
+    def __str__(self) -> str:
+        return f"Mapping[{class_spelling(self.key)}, {class_spelling(self.value)}]"
+
+
+class RecordClass:
+    """A record argument: its class name and the class record of each field
+    whose class the caller states (``field -> TensorClass/MappingClass/...``)."""
+
+    def __init__(self, record: type | str, **fields: Any) -> None:
+        self.name = record if isinstance(record, str) else record.__name__
+        self.fields = fields
+
+    def __str__(self) -> str:
+        return self.name
+
+
 def class_spelling(value: Any) -> str:
     """The exact Python class of a call argument (a value or a class)."""
 
+    if isinstance(value, (TensorClass, MappingClass, RecordClass)):
+        return str(value)
     cls = value if isinstance(value, type) else type(value)
     # A list call record names its element class: ``list[int]`` types the
     # formal's rows, where the bare ``list`` left every row dtype unsettled.
@@ -52,9 +92,17 @@ def post_root_calls(
     cells: dict[str, list] = {}
     classes: dict[str, set] = {}
     for ordinal, call in enumerate(root_calls):
-        record = tuple(sorted(
+        flat = [
             (str(name), class_spelling(value)) for name, value in call.items()
-        ))
+        ]
+        # A record argument's stated field classes are rows of the same
+        # record, addressed ``formal.field``.
+        flat += [
+            (f"{name}.{field}", class_spelling(field_class))
+            for name, value in call.items() if isinstance(value, RecordClass)
+            for field, field_class in value.fields.items()
+        ]
+        record = tuple(sorted(flat))
         row = (function_identity, ordinal)
         ref = book.post(
             ROOT_CALL_RECORD, row, record, stage=INGESTION,
@@ -86,7 +134,12 @@ def distinct_signatures(root_calls: Iterable[Mapping[str, Any]]) -> list[dict[st
 
     seen: dict[tuple, dict[str, str]] = {}
     for call in root_calls:
-        sig = tuple(sorted((str(k), class_spelling(v)) for k, v in call.items()))
+        sig = tuple(sorted(
+            [(str(k), class_spelling(v)) for k, v in call.items()]
+            + [(f"{k}.{f}", class_spelling(c))
+               for k, v in call.items() if isinstance(v, RecordClass)
+               for f, c in v.fields.items()]
+        ))
         seen.setdefault(sig, dict(sig))
     return list(seen.values())
 
@@ -122,6 +175,45 @@ def called_class(book: Any, function_identity: str, formal: str):
             "signature (lower_ast_source_by_signature)"
         )
     return fact.selected, book.latest_ref(CALLED_INVENTORY, row)
+
+
+def called_field_tensor_dtype(book: Any, owner_class: str, field: str):
+    """The element dtype the root-call records prove for tensor values held
+    by ``owner_class.field`` (a tensor, or a mapping of tensors), as
+    ``(dtype, ref)``; ``None`` when no record states that field's class.
+    Records that disagree form a union the lowering cannot type: a named
+    refusal, never a pick."""
+
+    import re
+
+    from .concordance_declarations import CALLED_INVENTORY
+
+    page = book.page(CALLED_INVENTORY)
+    dtypes: set[str] = set()
+    refs: list = []
+    for row in page.rows():
+        _identity, formal = row
+        base, dot, attribute = str(formal).partition(".")
+        if not dot or attribute != field:
+            continue
+        holder = page.latest((row[0], base))
+        if holder is None or owner_class not in holder.classes:
+            continue
+        fact = page.latest(row)
+        for spelling in fact.classes:
+            match = re.fullmatch(r"(?:Mapping\[[^,\]]+, )?AbstractTensor\[(\w+)\]\]?", spelling)
+            if match is not None:
+                dtypes.add(match.group(1))
+        refs.append(book.latest_ref(CALLED_INVENTORY, row))
+    if not dtypes:
+        return None
+    if len(dtypes) > 1:
+        raise ValueError(
+            f"{owner_class}.{field} is called with tensor element classes "
+            f"{sorted(dtypes)}: an exact union the lowering has no single "
+            "dtype for"
+        )
+    return next(iter(dtypes)), refs[0]
 
 
 def annotate_from_inventory(tree: Any, function_identity: str, book: Any) -> None:
