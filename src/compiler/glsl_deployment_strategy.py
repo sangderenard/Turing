@@ -2652,6 +2652,18 @@ def _planned_scalar_dtypes_from(
                         pass
                     else:
                         continue
+                elif kind == "loop":
+                    # Program: ``for a, b in ps`` over ``ps:
+                    # list[tuple[int, int]]``, ``for k, v in d.items()``.
+                    # A destructured target has no single element class to
+                    # read off its iterable; the reducer concorded each
+                    # name's class from the annotation's position and
+                    # stamped it as ``result_class_ref``.  That declared
+                    # class is the target's dtype.
+                    settle(scalar, node_id, classes.get(str(
+                        attributes.get("result_class_ref") or ""
+                    ).removeprefix("builtins.")))
+                    continue
                 else:
                     continue
             if op == "for":
@@ -23062,6 +23074,12 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "maximum", "minimum", "emax", "emin", "clamp_min", "clamp_max",
     "logical_and", "logical_or", "logical_xor",
     "bitwise_and", "bitwise_or", "bitwise_xor",
+    # The process graph spells Python's bit operators ``bitand``/``bitor``/
+    # ``bitxor``/``shl``/``shr`` (ast_process_graph).  Only the catalogue
+    # spellings above were listed, so ``low ^ byte`` of two integers had no
+    # descriptor, and the consumer that finds a descriptor-less scalar operand
+    # (``(low ^ byte) % m``) typed that operand float64.
+    "bitand", "bitor", "bitxor", "shl", "shr",
 })
 
 #: The elementwise binary operations whose result is a truth value.

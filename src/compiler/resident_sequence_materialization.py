@@ -1131,24 +1131,15 @@ def _promote_conditional_sequence_aliases(
                 # result list, whose storage the caller passes in.  When
                 # every arm is a private display of this function, both die
                 # at the return, so the taken arm's rows copied into the
-                # result are Python's object exactly (the merge owns the
-                # result storage, as a divergent return's lists do).  An arm
-                # anything else holds (a parameter, a list changed or read
-                # after the merge) would have to be the caller's storage
-                # itself, which a call result cannot carry yet.
+                # result are Python's object exactly.  Any other arm
+                # (c787-c789: a parameter list) is the caller's object, so
+                # the merge stays a handle merge and the function returns
+                # its arm predicate; the caller selects among its actuals.
                 node_id = node_by_value.get(merged_id, -1)
-                if _returned_list_merge(graph_obj, node_id):
-                    if not _arms_private_displays(graph_obj, node_id):
-                        raise ValueError(
-                            f"list {merged_id} is merged from branches and "
-                            "returned with an arm that is not a private "
-                            "display of this function; the returned merge "
-                            "is a handle onto that arm's storage (a caller's "
-                            "list or a list this function still reads), "
-                            "which a call result cannot yet carry: a call "
-                            "result that IS an argument's list is not "
-                            "lowered at all (refused by name)"
-                        )
+                if (
+                    _returned_list_merge(graph_obj, node_id)
+                    and _arms_private_displays(graph_obj, node_id)
+                ):
                     destination = merged_id
                     sequences.append((
                         int(true_resident), int(false_resident),

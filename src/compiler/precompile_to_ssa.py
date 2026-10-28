@@ -2581,6 +2581,8 @@ class _ControlSSABuilder(TiledObject):
         # payload storage remains in the incumbent sequence descriptor.
         # Entries are installed only from SOURCE_OPTIONAL_GLYPH_CARRY cells.
         self.optional_glyph_presence_by_value: dict[int, SSAValue] = {}
+        self.sequence_handle_merge_ids: set[int] = set()
+        self.sequence_handle_predicates: dict[int, tuple] = {}
         # ProgramABI optional scalar fields are a typed payload plus one
         # Boolean presence cell.  Control IR carries their exact relation so
         # a later union join can construct its semantic tag without treating
@@ -18603,6 +18605,7 @@ class _ControlSSABuilder(TiledObject):
                 self._lower_sequence_handle_merge(
                     int(_true_id), int(_false_id), merged,
                     incoming_blocks=(true_exit.name, false_exit.name),
+                    predicate=predicate,
                 )
             # An optional keyed lookup changes whether its child handle is
             # present; it does not create another child arena.  Preserve the
@@ -18632,8 +18635,23 @@ class _ControlSSABuilder(TiledObject):
                 snapshot_cells.get(int(initial_value_id)),
                 true_value, false_value, predicate,
             )
+            # Program: ``s = 0; for v in xs: if v > 3.0: s += v``
+            # (``test_ssa_numeric_joins``).  Wrong record: the carried merge took the entered
+            # version's class (int64) while the arm that rebinds ``s`` is a
+            # float, so the native Phi truncated 4.5 to 4.  Rule: a scalar
+            # numeric join promotes (``_numeric_join``) and converts the
+            # narrower arm on its own edge; ``ssa_numeric_joins`` refuses
+            # the join where Python could tell the classes apart.
+            join_dtype = self._numeric_join((true_value, false_value))
+            join_arms = (true_value, false_value)
+            if join_dtype is not None:
+                true_value, false_value = self._numeric_join_arms(
+                    join_dtype,
+                    ((true_exit, true_value), (false_exit, false_value)),
+                )
+            carried_dtype = initial.dtype if join_dtype is None else join_dtype
             if int(merged_value_id) in {
-                int(true_value.id), int(false_value.id),
+                int(join_arms[0].id), int(join_arms[1].id),
             }:
                 # Graph identities may reuse the selected arm's SetAttr id as
                 # the enclosing join id.  They are the same source version,
@@ -18641,7 +18659,7 @@ class _ControlSSABuilder(TiledObject):
                 # definition separately and retain the graph id as provenance
                 # instead of emitting a self-referential Phi.
                 merged = self.fresh_value(
-                    dtype=initial.dtype, shape=initial.shape,
+                    dtype=carried_dtype, shape=initial.shape,
                     transform=PHI_CONDITIONAL, operands=phi_operands,
                 )
                 merged.accounting.update({
@@ -18651,7 +18669,7 @@ class _ControlSSABuilder(TiledObject):
             else:
                 merged = SSAValue(
                     int(merged_value_id),
-                    dtype=initial.dtype,
+                    dtype=carried_dtype,
                     shape=initial.shape,
                 )
                 # The join adopts the graph's merge id; its row derives from
@@ -18669,8 +18687,8 @@ class _ControlSSABuilder(TiledObject):
             if self._is_stand_in(initial_value_id):
                 candidates = [
                     arm_value for arm_id, arm_value in (
-                        (true_value_id, true_value),
-                        (false_value_id, false_value),
+                        (true_value_id, join_arms[0]),
+                        (false_value_id, join_arms[1]),
                     )
                     if values_before_body.get(int(arm_id)) is arm_value
                 ]
@@ -18686,6 +18704,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_carried",
+                    **({"numeric_join_promoted": True}
+                       if (true_value, false_value) != join_arms else {}),
                     "initial_value_id": self._phi_initial_binding(
                         initial_value_id, entered, merged,
                         stage=CONTROL_SSA_CONDITIONAL,
@@ -18801,9 +18821,30 @@ class _ControlSSABuilder(TiledObject):
             )
         self.active_stage = stage_before
 
+    def _sequence_member_roles(self, sequence_id: int) -> dict:
+        """The storage cells of one sequence keyed by their descriptor role."""
+
+        descriptor = self.sequence_descriptors[int(sequence_id)]
+        by_id = {
+            int(cell.id): cell
+            for cell in self.sequence_storage_values[int(sequence_id)]
+        }
+        roles = {
+            ("column", position): by_id[int(member_id)]
+            for position, member_id in enumerate(descriptor.column_value_ids)
+        }
+        roles[("length",)] = by_id[int(descriptor.length_address_id)]
+        roles[("capacity",)] = by_id[int(descriptor.capacity_value_id)]
+        if descriptor.heap_owner_value_id is not None:
+            roles[("heap_owner",)] = by_id[int(descriptor.heap_owner_value_id)]
+        status = self.sequence_status_values.get(int(sequence_id))
+        if status is not None:
+            roles[("status",)] = status
+        return roles
+
     def _lower_sequence_handle_merge(
         self, true_id: int, false_id: int, merged: SSAValue, *,
-        incoming_blocks: tuple[str, str],
+        incoming_blocks: tuple[str, str], predicate: SSAValue,
     ) -> None:
         """A list merged from two arms is a handle onto the taken arm's storage.
 
@@ -19017,6 +19058,10 @@ class _ControlSSABuilder(TiledObject):
         self.sequence_storage_values[merged_id] = members
         if status is not None:
             self.sequence_status_values[merged_id] = status
+        self.sequence_handle_merge_ids.add(merged_id)
+        self.sequence_handle_predicates[merged_id] = (
+            predicate, int(true_id), int(false_id),
+        )
 
     def _publish_loop_result_ports(
         self,
@@ -22134,6 +22179,56 @@ class _ControlSSABuilder(TiledObject):
                 continue
             returned.append(value)
             returned_ids.add(value.id)
+        # Program: ``if n > 2: t = a else: t = [7, n, 2]`` then ``return t``
+        # (c787).  A returned list merged from arms the caller owns (a
+        # parameter, or a result lease) is a handle: its storage is
+        # whichever arm was taken, so the result cannot be a cell this call
+        # was handed.  Rule: the call returns WHICH ARM it took (the
+        # conditional's own predicate, a bool) and the caller selects its
+        # result's members from its own actuals of the two arms
+        # (``sequence_handle_returns``, read by the frame linker).
+        sequence_handle_returns = []
+        for position, value in enumerate(tuple(returned)):
+            for merged_id in sorted(self.sequence_handle_merge_ids):
+                members = self.sequence_storage_values[merged_id]
+                if int(members[0].id) != int(value.id):
+                    continue
+                if len(self.function_return_edges or ()):
+                    raise ValueError(
+                        f"list {merged_id} is a merged handle returned "
+                        "through several return edges; the returned arm "
+                        "predicate is one conditional's, so only a single "
+                        "return of the merge is lowered"
+                    )
+                predicate, true_id, false_id = (
+                    self.sequence_handle_predicates[merged_id]
+                )
+                roles = []
+                for arm_pair in (
+                    (true_id, false_id, merged_id),
+                ):
+                    arms = [
+                        self._sequence_member_roles(arm_id)
+                        for arm_id in arm_pair
+                    ]
+                    for role in arms[0]:
+                        roles.append((
+                            role, int(arms[0][role].id),
+                            int(arms[1][role].id), int(arms[2][role].id),
+                        ))
+                for index, (name, named_id) in enumerate(named_returns):
+                    if int(named_id) == int(value.id):
+                        named_returns[index] = (name, int(predicate.id))
+                        self._revise_semantic_output(
+                            name, int(predicate.id), self._value_cell(predicate),
+                        )
+                returned[position] = predicate
+                returned_ids.discard(value.id)
+                returned_ids.add(predicate.id)
+                sequence_handle_returns.append((
+                    int(predicate.id), int(merged_id), int(true_id),
+                    int(false_id), tuple(roles),
+                ))
         value_names = []
         for name, history in self.value_name_histories.items():
             value = next((
@@ -23102,6 +23197,9 @@ class _ControlSSABuilder(TiledObject):
                     ),
                     "native_value_union_return_layouts": tuple(
                         native_value_union_return_layouts
+                    ),
+                    "sequence_handle_returns": tuple(
+                        sequence_handle_returns
                     ),
                     "control_identity_receipts": tuple(dict.fromkeys(
                         self.control_identity_receipts

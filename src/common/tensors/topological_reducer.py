@@ -6416,6 +6416,8 @@ def _normalize_lexical_values(
     parameter_sequence_record_widths: dict[str, int] = {}
     parameter_sequence_element_classes: dict[str, str] = {}
     parameter_mapping_value_classes: dict[str, str] = {}
+    parameter_sequence_member_classes: dict[str, tuple[str, ...]] = {}
+    parameter_mapping_key_classes: dict[str, str] = {}
     known_class_identities = {
         record.identity for record in navigation_table.classes
     }
@@ -6589,6 +6591,10 @@ def _normalize_lexical_values(
             "bytearray",
         }:
             return annotation.id
+        if isinstance(annotation, ast.Name) and annotation.id in {
+            "Mapping", "MutableMapping",
+        }:
+            return "dict"
         if isinstance(annotation, ast.Subscript):
             return annotation_aggregate_kind(annotation.value)
         if isinstance(annotation, ast.BinOp) and isinstance(
@@ -6666,6 +6672,40 @@ def _normalize_lexical_values(
             parameter_mapping_value_classes[argument.arg] = (
                 primitive_class_identities[aggregate_annotation.slice.elts[1].id]
             )
+        # Program: ``def root(ps: list[tuple[int, int]])`` then ``for a, b in
+        # ps``.  A mapping annotation also names its key class first.
+        if (
+            isinstance(aggregate_annotation, ast.Subscript) and aggregate_kind == "dict"
+            and isinstance(aggregate_annotation.slice, ast.Tuple)
+            and len(aggregate_annotation.slice.elts) == 2
+            and isinstance(aggregate_annotation.slice.elts[0], ast.Name)
+            and aggregate_annotation.slice.elts[0].id in primitive_class_identities
+        ):
+            parameter_mapping_key_classes[argument.arg] = (
+                primitive_class_identities[aggregate_annotation.slice.elts[0].id]
+            )
+        # A sequence whose annotated element is a fixed-width tuple of
+        # primitives (``list[tuple[int, float]]``) declares one class per
+        # tuple position; a destructuring loop target takes its position's.
+        if isinstance(aggregate_annotation, ast.Subscript) and aggregate_kind in {
+            "list", "set", "frozenset",
+        }:
+            row = aggregate_annotation.slice
+            if (
+                isinstance(row, ast.Subscript)
+                and annotation_aggregate_kind(row) == "tuple"
+                and isinstance(row.slice, ast.Tuple)
+                and row.slice.elts
+                and all(
+                    isinstance(item, ast.Name)
+                    and item.id in primitive_class_identities
+                    for item in row.slice.elts
+                )
+            ):
+                parameter_sequence_member_classes[argument.arg] = tuple(
+                    primitive_class_identities[item.id]
+                    for item in row.slice.elts
+                )
         if isinstance(aggregate_annotation, ast.Subscript) and aggregate_kind in {
             "list", "set", "frozenset", "tuple",
         }:
@@ -7389,6 +7429,18 @@ def _normalize_lexical_values(
                     "sequence_element_class_ref": str(element_class),
                     "sequence_element_annotation_cell": annotation_cell,
                 })
+            member_classes = parameter_sequence_member_classes.get(name)
+            if member_classes is not None and annotation_cell is not None:
+                attributes.update({
+                    "sequence_member_class_refs": tuple(member_classes),
+                    "sequence_element_annotation_cell": annotation_cell,
+                })
+            key_class = parameter_mapping_key_classes.get(name)
+            if key_class is not None and annotation_cell is not None:
+                attributes.update({
+                    "mapping_key_class_ref": str(key_class),
+                    "mapping_value_annotation_cell": annotation_cell,
+                })
             value_class = parameter_mapping_value_classes.get(name)
             if value_class is not None and annotation_cell is not None:
                 attributes.update({
@@ -8031,6 +8083,69 @@ def _normalize_lexical_values(
     ) -> None:
         """Project one declared sequence element class to its loop binding."""
 
+        if (
+            isinstance(iterator_value, int)
+            and iterator_value in graph.G
+            and isinstance(target, (ast.Tuple, ast.List))
+        ):
+            # Program: ``for a, b in ps`` over ``ps: list[tuple[int, int]]``
+            # and ``for k, v in d.items()`` over ``d: dict[int, int]``.  The
+            # annotation states one class per position (tuple members) or the
+            # key and value classes (mapping); each unpacked name takes its
+            # position's class from the same annotation cell.
+            iterator_data = graph.G.nodes[int(iterator_value)]
+            carrier = iterator_data
+            carrier_id = int(iterator_value)
+            member_attribute = "sequence_member_class_refs"
+            if (
+                isinstance(iterator_data.get("expr_obj"), ast.Call)
+                and isinstance(iterator_data["expr_obj"].func, ast.Attribute)
+                and iterator_data["expr_obj"].func.attr == "items"
+            ):
+                owners = [
+                    int(parent) for parent, role
+                    in iterator_data.get("parents") or ()
+                    if str(role) == "operand" and int(parent) in graph.G
+                ]
+                if len(owners) != 1:
+                    return
+                carrier_id = owners[0]
+                carrier = graph.G.nodes[carrier_id]
+            carrier_attributes = carrier.get("attributes") or {}
+            if member_attribute in carrier_attributes:
+                member_classes = tuple(carrier_attributes[member_attribute])
+                cell = carrier_attributes.get("sequence_element_annotation_cell")
+            elif carrier_id != int(iterator_value):
+                member_classes = (
+                    carrier_attributes.get("mapping_key_class_ref"),
+                    carrier_attributes.get("mapping_value_class_ref"),
+                )
+                cell = carrier_attributes.get("mapping_value_annotation_cell")
+            else:
+                return
+            if cell is None or len(member_classes) != len(target.elts):
+                return
+            for member_target, member_class in zip(target.elts, member_classes):
+                if member_class is None or not isinstance(member_target, ast.Name):
+                    continue
+                member_value = loop_target_bindings_by_ast.get(id(member_target))
+                if member_value is None or int(member_value) not in graph.G:
+                    continue
+                graph.G.nodes[int(member_value)].setdefault(
+                    "attributes", {}
+                )["result_class_ref"] = str(member_class)
+                _concord_source_value_class(
+                    value_class_scope,
+                    int(member_value),
+                    str(member_class),
+                    source="declared sequence tuple-member projection",
+                    provenance=_Derived(tuple(dict.fromkeys(filter(None, (
+                        cell,
+                        node_identity_cell(graph, carrier_id),
+                        node_identity_cell(graph, int(member_value)),
+                    ))))),
+                )
+            return
         if (
             not isinstance(iterator_value, int)
             or iterator_value not in graph.G
@@ -11491,6 +11606,7 @@ def _normalize_lexical_values(
                     "sequence_element_dtypes",
                     "sequence_column_dtypes",
                     "sequence_element_class_ref",
+                    "sequence_member_class_refs",
                     "sequence_element_annotation_cell",
                     "sequence_element_record",
                 ):
@@ -16256,11 +16372,20 @@ def _normalize_lexical_values(
                     parents = list(
                         graph.G.nodes[member_id].get("parents") or ()
                     )
+                    # Program: ``for alias, resident in pairs: alias =
+                    # int(alias); ...; owners.setdefault(alias, source)``
+                    # (``identity_concordance.concordant_alias_bindings``).
+                    # Wrong record: the body's own rebinding ``int(alias)``
+                    # is a binding of the same spelling, so it was rewritten
+                    # back to the loop target; the setdefault's key became
+                    # the raw target and disagreed with its posted mutation.
+                    # Rule: only a binding from outside this body is stale.
                     replacements = {
                         old: current_loop_bindings[name]
                         for name in current_loop_bindings
                         for old in identity_bindings.get(name, ())
                         if old != current_loop_bindings[name]
+                        and old not in body_member_ids
                     }
                     rewritten = [
                         (replacements.get(parent, parent), role)

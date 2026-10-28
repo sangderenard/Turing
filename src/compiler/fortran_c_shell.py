@@ -20852,6 +20852,204 @@ def _drop_formals_and_call_operands(
                     _refresh_frame_aliased_result(instruction, function)
 
 
+def _select_handle_result(
+    caller: Any, callee: Any, native_call: Any, native_sequence: Any,
+    record: Any, selection: Any, data_placeholder: Any, *,
+    actual_by_formal: Mapping[int, Any],
+    all_sequence_tables: Mapping[str, Any],
+    callee_values: Mapping[int, Any],
+) -> None:
+    """Make the caller's list the arm the callee took, after the call.
+
+    Program: ``t = pick(a, n)`` where ``pick`` returns ``a`` when ``n > 2``
+    and a display of its own otherwise, then ``t.append(5)`` and
+    ``len(a)`` (c787).  Python's ``t`` IS ``a`` on one path, so the result
+    list is no storage this call was handed: its members (data arena,
+    length, capacity, owner, status) are the CALLER's own cells of the arm
+    taken.  The callee returns which arm that was (the conditional's
+    predicate, ``selection``'s tag); the caller joins its actual of each
+    arm's cell with one Phi per member, exactly as a list merged from
+    branches inside one function does (``_lower_sequence_handle_merge``):
+    a block split after the call, two empty arms, and the merge.  The arm
+    the callee built is the result lease the linker already minted for the
+    callee's own formals; the arm that is a parameter is the caller's actual.
+    """
+
+    from ..transmogrifier.ssa import BasicBlock, Instr, SSAValue
+
+    (
+        _predicate_id, tag_id, list_id, _true_id, _false_id, roles,
+    ) = selection
+    tag = native_call.res
+    if tag is None or int(tag.id) != int(tag_id):
+        raise FortranEmissionError(
+            "a call that returns which list arm it took has no tag result: "
+            f"callee={record.callee_symbol!r} callsite="
+            f"{int(record.callsite_id)}"
+        )
+    sequence = all_sequence_tables[str(record.caller)].by_id(int(list_id))
+    if sequence is None:
+        raise FortranEmissionError(
+            "a call result that is a handle onto a list has no caller "
+            f"descriptor: callee={record.callee_symbol!r} "
+            f"callsite={int(record.callsite_id)} result={int(list_id)}"
+        )
+    member_ids = {
+        ("column", position): int(value_id)
+        for position, value_id in enumerate(sequence.column_value_ids)
+    }
+    member_ids[("length",)] = int(sequence.length_address_id)
+    member_ids[("capacity",)] = int(sequence.capacity_value_id)
+    if sequence.status_address_id is not None:
+        member_ids[("status",)] = int(sequence.status_address_id)
+    if sequence.heap_owner_value_id is not None:
+        member_ids[("heap_owner",)] = int(sequence.heap_owner_value_id)
+    # The list's birth initialised its length to empty.  The call defines it
+    # now; that store would run over whichever arm was taken.
+    _strip_dead_cell_bookkeeping(caller, {int(sequence.length_address_id)})
+
+    def occurrence(value_id: int) -> Any:
+        if int(value_id) == int(data_placeholder.id):
+            return data_placeholder
+        for argument in caller.args:
+            if int(argument.id) == int(value_id):
+                return argument
+        for block in caller.blocks.values():
+            for instruction in block.instrs:
+                for argument in instruction.args:
+                    if int(argument.id) == int(value_id):
+                        return argument
+        return SSAValue(int(value_id))
+
+    block = next(
+        candidate for candidate in caller.blocks.values()
+        if any(item is native_sequence[-1] for item in candidate.instrs)
+    )
+    position = next(
+        index for index, item in enumerate(block.instrs)
+        if item is native_sequence[-1]
+    )
+    tail = block.instrs[position + 1:]
+    stem = f"sequence_handle_{int(record.callsite_id)}"
+    taken = BasicBlock(f"{stem}_true")
+    other = BasicBlock(f"{stem}_false")
+    merge = BasicBlock(f"{stem}_merge")
+    merged_members = []
+    for role, true_member, false_member, merged_member in roles:
+        role = tuple(role)
+        if role not in member_ids:
+            raise FortranEmissionError(
+                f"a handle result member has no caller cell: role={role!r} "
+                f"callee={record.callee_symbol!r}"
+            )
+        arms = []
+        for callee_formal in (true_member, false_member):
+            actual = actual_by_formal.get(int(callee_formal))
+            if actual is None:
+                raise FortranEmissionError(
+                    "a list arm returned by a call is not storage the "
+                    "caller passed: callee formal "
+                    f"{int(callee_formal)} of {record.callee_symbol!r} has "
+                    "no actual (an arm that lives in the callee's own frame "
+                    "dies at its return)"
+                )
+            arms.append(actual)
+        result = occurrence(member_ids[role])
+        source = callee_values[int(merged_member)]
+        result.dtype = source.dtype
+        result.shape = tuple(source.shape or ())
+        result.device = source.device
+        # The member names its sequence and position, as a formal member
+        # does (the merged member in the callee names the same position).
+        result.accounting = {
+            **dict(result.accounting or {}),
+            **{
+                key: value for key, value in dict(source.accounting or {}).items()
+                if key in {
+                    "heap_element_dtype", "sequence_row_shape",
+                    "compiler_frame_member",
+                }
+            },
+            "compiler_frame_storage": str(caller.name),
+            "compiler_frame_sequence_id": int(list_id),
+        }
+        merged_members.append(Instr(
+            "Phi", arms, result,
+            attributes={
+                "incoming_blocks": (taken.name, other.name),
+                "binding": "sequence_handle_member",
+                "sequence_value_id": int(list_id),
+            },
+        ))
+    placeholders = {int(instruction.res.id): instruction.res for instruction in merged_members}
+    caller.args = [
+        argument for argument in caller.args
+        if int(argument.id) not in placeholders
+    ]
+    # One member is one object: every reader holds the defining Phi's result,
+    # not a spelling of its id that carries no sequence/member identity.
+    for candidate_block in (*caller.blocks.values(), block, merge):
+        for instruction in candidate_block.instrs:
+            if instruction.op == "Phi" and instruction.res is not None and (
+                int(instruction.res.id) in placeholders
+            ):
+                continue
+            instruction.args = [
+                placeholders.get(int(argument.id), argument)
+                for argument in instruction.args
+            ]
+    block.instrs[position + 1:] = [Instr(
+        "CondBr", [tag], None,
+        attributes={
+            "true_target": taken.name, "false_target": other.name,
+        },
+    )]
+    for arm in (taken, other):
+        arm.instrs.append(Instr("Br", [], None, attributes={"target": merge.name}))
+        arm.successors.append(merge.name)
+    merge.instrs = [*merged_members, *tail]
+    merge.successors = list(block.successors)
+    block.successors = [taken.name, other.name]
+    # Successors that merge on this block's edge now merge on the join's.
+    for successor in merge.successors:
+        for instruction in caller.blocks[successor].instrs:
+            incoming = instruction.attributes.get("incoming_blocks")
+            if instruction.op == "Phi" and incoming:
+                instruction.attributes["incoming_blocks"] = tuple(
+                    merge.name if str(name) == block.name else name
+                    for name in incoming
+                )
+    # Each new block is a row of its own, derived from the block it was
+    # split from: the arms and the join of one ``if`` on the tag.
+    from .concordance_declarations import FRAME_LINK, SSA_BLOCK, SSABlockKind
+    from .identity_concordance import current_identity_book
+
+    split_cell = current_identity_book().latest_ref(
+        SSA_BLOCK, (
+            _frame_book_scope(caller), str(caller.name), str(block.name),
+        ),
+    )
+    for new_block, kind in (
+        (taken, SSABlockKind.IF_TRUE), (other, SSABlockKind.IF_FALSE),
+        (merge, SSABlockKind.IF_MERGE),
+    ):
+        _frame_post(
+            SSA_BLOCK, (
+                _frame_book_scope(caller), str(caller.name),
+                str(new_block.name),
+            ), kind, stage=FRAME_LINK, cells=(split_cell,),
+        )
+    rebuilt = {}
+    for name, candidate in caller.blocks.items():
+        rebuilt[name] = candidate
+        if candidate is block:
+            rebuilt[taken.name] = taken
+            rebuilt[other.name] = other
+            rebuilt[merge.name] = merge
+    caller.blocks.clear()
+    caller.blocks.update(rebuilt)
+
+
 def _strip_dead_cell_bookkeeping(function: Any, members: set[int]) -> set[int]:
     """Remove the bookkeeping of storage cells nothing reads anymore.
 
@@ -49224,6 +49422,49 @@ def _class_surface_ssa_program(
                     () if callee is None
                     else emit_outputs(record.callee_symbol, callee)
                 )
+                # Program: ``pick(a, n)`` returning ``a`` on one path and a
+                # local display on the other (c787).  The callee returns the
+                # conditional's predicate (which arm it took); the caller's
+                # result list is not this call's output but a selection
+                # between its own actuals of the two arms, made after the
+                # call (``handle_selections`` below).  The call's one output
+                # is that predicate, bound to a caller value of its own.
+                handle_returns = (
+                    () if callee is None else tuple(
+                        callee.metadata.get("sequence_handle_returns") or ()
+                    )
+                )
+                handle_selection = None
+                if handle_returns:
+                    for (
+                        predicate_id, merged_id, true_id, false_id, roles,
+                    ) in handle_returns:
+                        pair = next((
+                            (callee_id, caller_id)
+                            for callee_id, caller_id in record.result_bindings
+                            if int(callee_id) in {
+                                int(predicate_id), int(merged_id),
+                            }
+                        ), None)
+                        if pair is None:
+                            continue
+                        tag_id = mint_compiler_value_id(
+                            caller, FRAME_SCAFFOLD,
+                            (_frame_value_cell(callee, int(predicate_id)),),
+                            dtype="bool",
+                        )
+                        handle_selection = (
+                            int(predicate_id), int(tag_id), int(pair[1]),
+                            int(true_id), int(false_id), tuple(roles),
+                        )
+                        record = replace(record, result_bindings=tuple(
+                            (int(predicate_id), int(tag_id))
+                            if int(callee_id) == int(pair[0])
+                            and int(caller_id) == int(pair[1])
+                            else (int(callee_id), int(caller_id))
+                            for callee_id, caller_id in record.result_bindings
+                        ))
+                        break
                 callee_aggregate_outputs = (
                     tuple((callee_outputs[0].accounting or {}).get(
                         "ssa_aggregate_outputs", ()
@@ -52515,6 +52756,27 @@ def _class_surface_ssa_program(
                             "plan_callsite_id", -1
                         )) == int(record.callsite_id)
                     )
+                    handle_result_placeholder = None
+                    if handle_selection is not None:
+                        # The marker's result is the caller's list (its data
+                        # arena placeholder), which the selection below
+                        # defines; the call itself yields only the tag.
+                        for marker_block in caller.blocks.values():
+                            for marker_instruction in marker_block.instrs:
+                                marker_attributes = (
+                                    marker_instruction.attributes or {}
+                                )
+                                if (
+                                    marker_attributes.get("plan_callsite_marker")
+                                    and int(marker_attributes.get(
+                                        "plan_callsite_id", -1
+                                    )) == int(record.callsite_id)
+                                    and marker_instruction.res is not None
+                                ):
+                                    handle_result_placeholder = (
+                                        marker_instruction.res
+                                    )
+                                    marker_instruction.res = None
                     inserted = False
                     if instance_pool is not None and not returns_physical_result:
                         # The exact source edge is constructor-result ->
@@ -52585,6 +52847,15 @@ def _class_surface_ssa_program(
                     inserted = inserted or insert_at_loop_anchor(
                         record, native_sequence
                     )
+                    if handle_selection is not None and inserted:
+                        _select_handle_result(
+                            caller, callee, native_call, native_sequence,
+                            record, handle_selection,
+                            handle_result_placeholder,
+                            actual_by_formal=actual_by_formal,
+                            all_sequence_tables=all_sequence_tables,
+                            callee_values=function_values(callee),
+                        )
                     if (
                         returns_aggregate
                         and result is not None
@@ -60201,9 +60472,16 @@ def _class_surface_ssa_program(
 
     # The last writer of physical scalar dtypes has run: a carried Phi of a
     # narrower class than its update is a trip-count-dependent result class.
-    from .ssa_self_check import check_loop_carried_class_widening
+    # Any other scalar Phi narrower than an arm is the same wrong record.
+    from .ssa_self_check import (
+        check_loop_carried_class_widening,
+        check_phi_narrower_than_arm,
+    )
 
-    carried_widening = check_loop_carried_class_widening(lowered_module)
+    carried_widening = [
+        *check_loop_carried_class_widening(lowered_module),
+        *check_phi_narrower_than_arm(lowered_module),
+    ]
     if carried_widening:
         raise ValueError(
             "; ".join(
