@@ -19996,6 +19996,26 @@ def _propagate_native_type_tag_results(
                         provisional_tag_id = dict(caller.metadata.get(
                             "native_value_type_tags", ()
                         )).get(int(first_payload.id))
+                        # Side-by-side arms past the first were reserved
+                        # the same way (``reserve_pending_call_native_union``)
+                        # and are claimed by arm name.
+                        pending_payloads = dict(dict(caller.metadata.get(
+                            "native_value_union_pending_payloads", ()
+                        )).get(int(first_payload.id), ()))
+                        linked_payloads = {
+                            int(pending_payloads[arm.name]): int(
+                                arm.value_ids[0]
+                            )
+                            for arm in alternatives
+                            if arm.name in pending_payloads
+                            and len(arm.value_ids) == 1
+                        }
+                        if len(linked_payloads) != len(pending_payloads):
+                            raise ValueError(
+                                "native union result left a reserved arm "
+                                f"unclaimed at {callee.name}->{caller.name}: "
+                                f"{sorted(pending_payloads)!r}"
+                            )
                         if (
                             incumbent is not None
                             and provisional_tag_id is not None
@@ -20003,7 +20023,16 @@ def _propagate_native_type_tag_results(
                             == int(provisional_tag_id)
                             and int(provisional_tag_id) != int(tag.id)
                             and replace(
-                                incumbent, tag_value_id=int(tag.id)
+                                incumbent, tag_value_id=int(tag.id),
+                                alternatives=tuple(
+                                    replace(arm, value_ids=tuple(
+                                        linked_payloads.get(
+                                            int(value_id), int(value_id),
+                                        )
+                                        for value_id in arm.value_ids
+                                    ))
+                                    for arm in incumbent.alternatives
+                                ),
                             ) == result_descriptor
                         ):
                             caller_unions.unions.assign(
@@ -20054,10 +20083,21 @@ def _propagate_native_type_tag_results(
                                     f"value={int(first_payload.id)}, "
                                     f"tag={int(prior_tag_id)}"
                                 )
+                            claimed = {id(prior_tag): tag}
+                            for prior_id, linked_id in linked_payloads.items():
+                                prior_payload = values.get(int(prior_id))
+                                linked_payload = values.get(int(linked_id))
+                                if prior_payload is None or linked_payload is None:
+                                    raise ValueError(
+                                        "native union result lost a reserved "
+                                        f"arm payload: caller={caller.name!r}, "
+                                        f"payload={int(prior_id)}"
+                                    )
+                                claimed[id(prior_payload)] = linked_payload
                             for rewrite_block in caller.blocks.values():
                                 for consumer in rewrite_block.instrs:
                                     consumer.args = [
-                                        tag if argument is prior_tag else argument
+                                        claimed.get(id(argument), argument)
                                         for argument in consumer.args
                                     ]
                                     # Program: ``if v is not None: t = v * 3``
@@ -20084,7 +20124,7 @@ def _propagate_native_type_tag_results(
                                             }
                             caller.args = [
                                 argument for argument in caller.args
-                                if argument is not prior_tag
+                                if id(argument) not in claimed
                             ]
                             # Program: ``def wrap(r, f): return maybe(r, f)``.
                             # Wrong record: the wrapper's published return
@@ -20105,18 +20145,20 @@ def _propagate_native_type_tag_results(
                             from .identity_concordance import (
                                 current_identity_book,
                             )
+                            renamed = {
+                                int(prior_tag_id): int(tag.id),
+                                **linked_payloads,
+                            }
                             for output_id, members in tuple(
                                 aggregate_return_layouts(caller).items()
                             ):
-                                if int(prior_tag_id) not in members:
+                                if not set(map(int, members)) & set(renamed):
                                     continue
                                 book = current_identity_book()
                                 publish_aggregate_return_layout(
                                     caller, int(output_id),
                                     tuple(
-                                        int(tag.id)
-                                        if int(member) == int(prior_tag_id)
-                                        else int(member)
+                                        renamed.get(int(member), int(member))
                                         for member in members
                                     ),
                                     sources=(
@@ -20134,7 +20176,6 @@ def _propagate_native_type_tag_results(
                             # The same wrong record seen from the wrapper's
                             # callers: their linked calls name the wrapper's
                             # outputs by id, the provisional tag among them.
-                            renamed = {int(prior_tag_id): int(tag.id)}
                             for outer in all_functions.values():
                                 for outer_block in outer.blocks.values():
                                     for outer_call in outer_block.instrs:
@@ -24843,6 +24884,65 @@ def _class_surface_ssa_program(
                 (callee_graph, int(callee_id), caller_graph, int(caller_id))
                 for callee_id, caller_id in planned_call.result_bindings
             )
+            # Program: ``def pick(n, c): if c == 2: return n; return n *
+            # 0.5``.  Wrong record: the result edge bound only the output's
+            # last return (``n * 0.5``), so the caller's call result claimed
+            # float though one return is an int.  A positional output's
+            # history in the callee's identity table names every returned
+            # value (one per return site); each
+            # is a result edge, and the contract settlement below joins
+            # their classes into the union the call carries.  A ``return
+            # None`` member joins only when the other returns hold two
+            # classes, as the callee's return frame does
+            # (``_return_edges_scalar_union``); beside one class it is an
+            # optional whose presence is lowered on its own
+            # (``ssa_optional_values``).
+            callee_contracts = linked_value_abi_by_graph.get(
+                id(callee_graph), {}
+            )
+
+            def returned_classes(member: int) -> set:
+                contract = callee_contracts.get(int(member)) or {}
+                return {
+                    str(identity) for identity in (
+                        *(contract.get("python_types") or ()),
+                        contract.get("python_type"),
+                    )
+                    if identity is not None
+                }
+
+            def none_member(member: int) -> bool:
+                node = callee_graph.nodes[int(member)]
+                return (
+                    isinstance(node.get("expr_obj"), ast.Constant)
+                    and node["expr_obj"].value is None
+                )
+
+            output_histories = {
+                int(history[-1]): tuple(map(int, history))
+                for name, history in (
+                    callee_graph.graph.get("identity_table") or {}
+                ).items()
+                # Only a positional slot's history is its return values; a
+                # returned name's history is its rebinding chain.
+                if history and str(name) in set(map(str, (
+                    callee_graph.graph.get("positional_output_names") or ()
+                )))
+            }
+            linked_value_edges.extend(
+                (callee_graph, int(member), caller_graph, int(caller_id))
+                for callee_id, caller_id in planned_call.result_bindings
+                for history in (tuple(
+                    member
+                    for member in output_histories.get(int(callee_id), ())
+                    if int(member) in callee_graph
+                ),)
+                for member in history[:-1]
+                if not none_member(member) or len(set().union(*(
+                    returned_classes(other) for other in history
+                    if not none_member(other)
+                )) - {"builtins.NoneType"}) >= 2
+            )
     _settle_linked_dynamic_sequences(
         tuple(planned_graphs_by_shell.values()), tuple(linked_value_edges),
         frozenset(linked_argument_sites),
@@ -25244,12 +25344,25 @@ def _class_surface_ssa_program(
                                 next(iter(payload_classes))
                             )
                             conditional_changed = True
-                        continue
+                        # Program: ``if c == 2: s = n else: s = n * 0.5;
+                        # return s`` (corpus c775).  A name merge whose arms
+                        # are two present classes is the same join an IfExp
+                        # is: Python keeps each arm's class, so it settles
+                        # into a tagged union below, not into either class.
+                        if not (
+                            len(arm_classes) == 2
+                            and None not in arm_classes
+                            and "builtins.NoneType" not in arm_classes
+                            and len(payload_classes) == 2
+                        ):
+                            continue
                     member_merge = (
                         str(data.get("type") or "") == "Phi"
                         and (
                             member_attributes.get("conditional_result_of") is not None
                             or member_attributes.get("aggregate_parent_value_id")
+                            is not None
+                            or member_attributes.get("source_conditional_id")
                             is not None
                         )
                     )

@@ -2624,6 +2624,12 @@ class _ControlSSABuilder(TiledObject):
         self.native_value_union_payloads: dict[
             int, dict[str, tuple[SSAValue, ...]]
         ] = {}
+        # call result id -> ((arm, provisional payload id), ...) reserved
+        # before frame linking (``reserve_pending_call_native_union``).
+        self.pending_call_union_payloads: dict[int, tuple] = {}
+        # promoted read view id -> the union call result it reads
+        # (``_promote_union_call_result``).
+        self.numeric_union_read_views: dict[int, SSAValue] = {}
         self.native_value_union_sequence_ids: dict[
             int, dict[str, int]
         ] = {}
@@ -7871,6 +7877,7 @@ class _ControlSSABuilder(TiledObject):
                 self.reserve_pending_call_native_union(
                     int(output_id), result,
                 )
+                self._promote_union_call_result(int(output_id), result)
             self.emitted_plan_callsites.add(int(callsite_id))
             return
         result = None
@@ -7890,7 +7897,76 @@ class _ControlSSABuilder(TiledObject):
             result,
             attributes=marker_attributes,
         )
+        if result is not None:
+            self._promote_union_call_result(primary, result)
         self.emitted_plan_callsites.add(int(callsite_id))
+
+    _NUMERIC_RANK = {"builtins.bool": 0, "builtins.int": 1, "builtins.float": 2}
+
+    def _promote_union_call_result(
+        self, value_id: int, value: SSAValue,
+    ) -> None:
+        """Read a numeric union call result as its widest arm's class.
+
+        Program: ``s = pick(n, c); return s + 0.25`` where ``pick`` returns
+        ``n`` or ``n * 0.5``.  Wrong record: the call result's id named only
+        its first arm's payload, so ``s + 0.25`` read the float slot, which
+        is empty when ``pick`` returned the int (0.25, not 7.25).  Rule: the
+        id's reads see one value of the widest arm's class, chosen by the
+        tag from each arm's own payload converted on its own; it is marked
+        ``numeric_join_promoted`` like a join's Phi, so ``ssa_numeric_joins``
+        refuses every read that could tell the classes apart.  The frame
+        (each arm's payload and the tag) is unchanged for the call result's
+        own return.
+        """
+
+        reserved = self.pending_call_union_payloads.get(int(value_id))
+        tag = self.native_value_type_tags.get(int(value_id))
+        if not reserved or tag is None:
+            return
+        payloads = self.native_value_union_payloads.get(int(value_id), {})
+        fact = self.native_value_type_abi.get(int(value_id))
+        tags = dict(getattr(fact, "tags", ()) or ())
+        if not payloads or any(
+            identity not in self._NUMERIC_RANK or identity not in tags
+            for identity in payloads
+        ):
+            return
+        widest = max(payloads, key=self._NUMERIC_RANK.__getitem__)
+        promoted = payloads[widest][0]
+        target = str(promoted.dtype)
+        for identity, (payload,) in payloads.items():
+            if identity == widest:
+                continue
+            converted = self.fresh_value(
+                dtype=target, transform=CONTROL_CAST, operands=(payload,),
+            )
+            self.emit(
+                Handler.Cast, [payload], converted,
+                attributes={"target_dtype": target},
+            )
+            chosen = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE, operands=(tag,),
+            )
+            self.emit(
+                Handler.Eq,
+                [tag, self.constant_value(int(tags[identity]), tag)], chosen,
+            )
+            selected = self.fresh_value(
+                dtype=target, transform=CONTROL_EXPRESSION,
+                operands=(chosen, converted, promoted),
+            )
+            self.emit(
+                Handler.Select, [chosen, converted, promoted], selected,
+                attributes={
+                    "binding": "numeric_union_call_result",
+                    "source_value_id": int(value_id),
+                    "numeric_join_promoted": True,
+                },
+            )
+            promoted = selected
+        self.numeric_union_read_views[int(promoted.id)] = value
+        self._bind(int(value_id), promoted, BindingKind.REFINED, value, tag)
 
     def reserve_pending_call_native_union(
         self, value_id: int, value: SSAValue,
@@ -7938,6 +8014,53 @@ class _ControlSSABuilder(TiledObject):
             "native_type_alternatives": alternatives,
         }
         self.post_native_type_tag(value_id, tag, fact, value)
+        # Program: ``def pick(n, c): return n if c == 2 else n * 0.5`` called
+        # as ``return pick(n, c)``.  Wrong record: an int|float result has a
+        # side-by-side frame (one payload per arm), but only the call result
+        # and its tag were reserved, so the caller's return frame filled the
+        # other arm with an inactive constant and the linked payload never
+        # reached it.  Rule: every scalar arm past the first is reserved like
+        # the tag, and linking claims each reservation by arm name.
+        physical = tuple(
+            fact.get("physical_alternatives", ())
+            if isinstance(fact, Mapping)
+            else getattr(fact, "physical_alternatives", ())
+        )
+        material = tuple(
+            arm for arm in physical if str(arm.storage) != "none"
+        )
+        if len({
+            (str(arm.storage), str(arm.dtype), tuple(arm.shape or ()))
+            for arm in material
+        }) <= 1 or any(str(arm.storage) != "scalar" for arm in material):
+            return
+        if str(value.dtype or "unknown") != str(material[0].dtype):
+            # The linked call binds this id to the frame's first payload,
+            # which holds the first arm (``bool`` of ``bool | int``), not the
+            # widest class its readers see (``_promote_union_call_result``).
+            value.dtype = str(material[0].dtype)
+            self._revise_value(value, self._book().current_ref(
+                VALUE_TYPE_ABI, (self.lexical_read_scope, value_id),
+            ))
+        payloads = {str(material[0].identity): (value,)}
+        for arm in material[1:]:
+            payload = self.fresh_value(
+                dtype=str(arm.dtype), shape=tuple(arm.shape or ()),
+                transform=REGION_FORMAL_SPLIT,
+                operands=(self._canonical_cell(value_id), value),
+            )
+            payload.accounting.update({
+                "native_union_payload_pending_for_value_id": value_id,
+                "native_union_payload_pending_arm": str(arm.identity),
+            })
+            self.arguments.append(payload)
+            payloads[str(arm.identity)] = (payload,)
+        self.native_value_union_payloads[value_id] = payloads
+        self.pending_call_union_payloads[value_id] = tuple(
+            (identity, int(arm_values[0].id))
+            for identity, arm_values in payloads.items()
+            if arm_values[0] is not value
+        )
 
     # -- reads resolved through the identity book --------------------------
     #
@@ -14769,6 +14892,117 @@ class _ControlSSABuilder(TiledObject):
                     ),
                 )
         return descriptor
+
+    def _return_edges_scalar_union(
+        self, physical_slot: int, epilogue: tuple,
+    ) -> ValueTypeABIFact | None:
+        """The union a scalar output carries when its returns disagree.
+
+        Program: ``def pick(n, c): if c == 2: return n; return n * 0.5``.
+        Python's result is an int on one path and a float on the other; the
+        output has no single graph value whose ``VALUE_TYPE_ABI`` states
+        that (the exit merge is not a graph node), while each returned
+        value's own row is exact.  Rule: when every return edge's value at
+        this slot has one exact scalar alternative (bool, int or float, no
+        shape) and they differ, the output is their union, tags ordered by
+        identity as every union's are.  Each edge is then framed with its
+        own tag and payload, and the caller reads the frame.  The lexical
+        epilogue (``epilogue``, the values computed above an open fall-
+        through) is one more edge.  ``None`` otherwise.
+        """
+
+        edges = [values for _block, values in self.function_return_edges or ()]
+        if not edges:
+            return None
+        if not self.current.instrs or self.current.instrs[-1].op not in {
+            Handler.Br.value, Handler.CondBr.value, Handler.Ret.value,
+        }:
+            edges.append(tuple(epilogue))
+        arms: dict[str, Any] = {}
+        for values in edges:
+            if physical_slot >= len(values) or values[physical_slot] is None:
+                return None
+            fact = self.native_value_type_abi.get(
+                int(values[physical_slot].id)
+            )
+            physical = tuple(getattr(fact, "physical_alternatives", ()) or ())
+            if len(physical) != 1:
+                return None
+            arm = physical[0]
+            if str(arm.identity) == "builtins.NoneType":
+                # ``return None`` beside numeric returns: a storage-free arm.
+                if str(arm.storage) != "none":
+                    return None
+                arms.setdefault(str(arm.identity), arm)
+                continue
+            if (
+                str(arm.identity) not in {
+                    "builtins.bool", "builtins.int", "builtins.float",
+                }
+                or str(arm.storage) != "scalar"
+                or tuple(arm.shape or ())
+            ):
+                return None
+            arms.setdefault(str(arm.identity), arm)
+        if len(set(arms) - {"builtins.NoneType"}) < 2:
+            return None
+        alternatives = tuple(sorted(arms))
+        return ValueTypeABIFact(
+            alternatives,
+            tuple(
+                (identity, ordinal)
+                for ordinal, identity in enumerate(alternatives)
+            ),
+            tuple(arms[identity] for identity in alternatives),
+        ), tuple(
+            int(values[physical_slot].id) for values in edges
+        )
+
+    def _post_output_union(
+        self, declared_id: int, fact: ValueTypeABIFact, edge_ids: tuple,
+    ) -> None:
+        """Record the output's union on the row its callers read.
+
+        The output's id names the last member of its return history; its
+        callers' contracts and the frame's tag read this row.  The union
+        stands on every return edge's own row.
+        """
+
+        if self.lexical_read_scope is None:
+            return
+        book = self._book()
+        cells = tuple(
+            cell for cell in (
+                book.latest_ref(
+                    VALUE_TYPE_ABI, (self.lexical_read_scope, int(value_id)),
+                )
+                for value_id in dict.fromkeys(edge_ids)
+            )
+            if cell is not None
+        )
+        if len(cells) != len(set(edge_ids)):
+            raise ValueError(
+                "output union has a return edge without its type ABI: "
+                f"{self.function_name} value {int(declared_id)}"
+            )
+        identity = self._canonical_cell(int(declared_id))
+        if identity is None:
+            raise ValueError(
+                "output union has no value identity: "
+                f"{self.function_name} value {int(declared_id)}"
+            )
+        book.post(
+            VALUE_TYPE_ABI, (self.lexical_read_scope, int(declared_id)),
+            fact, stage=self._stage(),
+            provenance=Derived(self._cells(
+                identity, *cells,
+                *(
+                    cell for arm in fact.physical_alternatives
+                    for cell in arm.source_cells
+                ),
+            )),
+            mode=Mode.REVISE,
+        )
 
     def merge_native_type_tags(
         self,
@@ -22059,6 +22293,7 @@ class _ControlSSABuilder(TiledObject):
         named_returns: tuple,
         parameter_value_names: tuple,
         returned: tuple,
+        union_return_layouts: Mapping[int, tuple[int, ...]] | None = None,
     ) -> dict[str, Any]:
         """Post ``function_parameter`` / ``function_output`` and materialize
         the metadata tuples from the pages (plan 80 B2.6).
@@ -22094,27 +22329,47 @@ class _ControlSSABuilder(TiledObject):
             parameter_names = tuple(parameter_value_names)
         # -- function_output: slot -> (name or None, ssa id), DERIVED(the
         #    slot value's cell (the merge Phi or the single edge's value)).
+        # Program: ``s = as_int(n) if c == 2 else as_float(n); return s``.
+        # A named union output leaves as its frame (tag and one payload per
+        # arm), so no slot is the authored value itself.  Its name belongs
+        # to the frame's first slot; the comparison below reads that slot
+        # back as the authored value.
+        union_owner = {
+            int(physical_id): int(output_id)
+            for output_id, physical_ids in dict(
+                union_return_layouts or {}
+            ).items()
+            for physical_id in physical_ids[:1]
+        }
+        # A union built at the exit merge (``_return_edges_scalar_union``)
+        # is named by its frame's first slot itself.
         pending_names = list(named_returns)
         for slot, value in enumerate(returned):
+            authored_ids = {
+                union_owner.get(int(value.id), int(value.id)), int(value.id),
+            }
             name = next(
                 (
                     candidate for candidate, value_id in pending_names
-                    if int(value_id) == int(value.id)
+                    if int(value_id) in authored_ids
                 ),
                 None,
             )
             if name is not None:
                 pending_names.remove((name, next(
                     value_id for candidate, value_id in pending_names
-                    if candidate == name and int(value_id) == int(value.id)
+                    if candidate == name and int(value_id) in authored_ids
                 )))
             self._post_concord(
                 FUNCTION_OUTPUT, (scope, int(slot)), (name, int(value.id)),
                 value, self._binding_cell(value.id), stage=CONTROL_SSA_FINISH,
             )
         page = book.pages.get(FUNCTION_OUTPUT.name)
+        named_ids = {(str(name), int(value_id)) for name, value_id in named_returns}
         named_outputs = tuple(
             (str(fact[0]), int(fact[1]))
+            if (str(fact[0]), int(fact[1])) in named_ids else
+            (str(fact[0]), union_owner.get(int(fact[1]), int(fact[1])))
             for row in (() if page is None else page.scope_rows(scope))
             for fact in (page.latest(row),)
             if fact is not None and fact[0] is not None
@@ -22506,6 +22761,9 @@ class _ControlSSABuilder(TiledObject):
             # the carried phi -- the port id doubles as a written field slot
             # whose cell nothing stores.
             value = carried_port_values.get(int(value.id), value)
+            # A returned numeric union call result leaves as its frame (each
+            # arm's payload and the tag), not as its promoted read view.
+            value = self.numeric_union_read_views.get(int(value.id), value)
             named_returns.append((name, int(value.id)))
             self._revise_semantic_output(name, int(value.id))
             superseded.update(map(int, history))
@@ -22774,6 +23032,9 @@ class _ControlSSABuilder(TiledObject):
         native_type_return_slots = []
         native_value_union_return_layouts = []
         typed_logical_returns = []
+        # Output unions composed from their returns' exact classes; the
+        # declared id's own row stays the last return's.
+        composed_return_unions: dict[int, ValueTypeABIFact] = {}
         for logical_slot, physical_slot in sorted(
             logical_to_physical_return_slot.items()
         ):
@@ -22790,6 +23051,18 @@ class _ControlSSABuilder(TiledObject):
                 if isinstance(type_fact, Mapping)
                 else getattr(type_fact, "alternatives", ())
             )
+            if len(alternatives) <= 1:
+                returns_union = self._return_edges_scalar_union(
+                    physical_slot, returned,
+                )
+                if returns_union is not None:
+                    returns_union, edge_ids = returns_union
+                    self._post_output_union(
+                        int(declared_id), returns_union, edge_ids,
+                    )
+                    type_fact = returns_union
+                    alternatives = returns_union.alternatives
+                    composed_return_unions[declared_id] = returns_union
             if len(alternatives) > 1:
                 typed_logical_returns.append((
                     int(logical_slot), int(physical_slot),
@@ -23360,7 +23633,9 @@ class _ControlSSABuilder(TiledObject):
         # physical receipt, and the declared VALUE_TYPE_ABI cell remains its
         # source of truth.
         for declared_id, role_slots in native_value_union_return_layouts:
-            type_fact = self.native_value_type_abi.get(int(declared_id))
+            type_fact = composed_return_unions.get(
+                int(declared_id),
+            ) or self.native_value_type_abi.get(int(declared_id))
             physical = tuple(
                 type_fact.get("physical_alternatives", ())
                 if isinstance(type_fact, Mapping)
@@ -23500,6 +23775,13 @@ class _ControlSSABuilder(TiledObject):
             )
         page_metadata = self._finish_pages(
             tuple(named_returns), tuple(parameter_value_names), tuple(returned),
+            {
+                int(output_id): tuple(
+                    int(returned[int(slot)].id) for _role, slot in role_slots
+                )
+                for output_id, role_slots
+                in native_value_union_return_layouts
+            },
         )
         sequence_table = SSASequenceTable(owner=self.function_name)
 
@@ -23567,6 +23849,9 @@ class _ControlSSABuilder(TiledObject):
                     ),
                     "native_value_type_tests": tuple(
                         self.native_value_type_tests.values()
+                    ),
+                    "native_value_union_pending_payloads": tuple(
+                        sorted(self.pending_call_union_payloads.items())
                     ),
                     "native_type_return_layouts": tuple(
                         native_type_return_slots

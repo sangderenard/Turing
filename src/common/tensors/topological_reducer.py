@@ -4807,6 +4807,9 @@ _BUILTIN_SCALAR_INTEGER_OPERATORS = (
 _BUILTIN_SCALAR_FLOAT_OPERATORS = (
     ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod,
 )
+_BUILTIN_SCALAR_COMPARISONS = (
+    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+)
 
 
 def _builtin_scalar_operator_class(expression: Any, operand_classes: tuple) -> str | None:
@@ -4840,6 +4843,14 @@ def _builtin_scalar_operator_class(expression: Any, operand_classes: tuple) -> s
         if isinstance(expression.op, _BUILTIN_SCALAR_INTEGER_OPERATORS):
             return "builtins.int"
         return None
+    if (
+        isinstance(expression, ast.Compare)
+        and len(classes) == 2
+        and len(expression.ops) == 1
+        and isinstance(expression.ops[0], _BUILTIN_SCALAR_COMPARISONS)
+    ):
+        # ``n > 3``: a comparison of builtin numbers is a ``bool``.
+        return "builtins.bool"
     if isinstance(expression, ast.UnaryOp) and len(classes) == 1:
         if isinstance(expression.op, ast.Not):
             return "builtins.bool"
@@ -4993,7 +5004,7 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             continue
         if conditional_phi:
             roles = ("body", "orelse")
-        elif isinstance(expression, ast.BinOp):
+        elif isinstance(expression, (ast.BinOp, ast.Compare)):
             roles = ("lhs", "rhs")
         elif isinstance(expression, ast.UnaryOp):
             roles = ("operand",)

@@ -57,12 +57,62 @@ def judge(feeds, expect, flat, kinds):
     # An integer answer is exact: a float64 round trip of 6 * (2**55 + 1)
     # passed under the relative tolerance (a comprehension row typed float64).
     ok = len(flat) == len(exp) and all(
-        (float(a).is_integer() and int(a) == b) if isinstance(b, int) and not isinstance(b, bool)
+        (a is None) if b is None
+        else False if a is None
+        else (float(a).is_integer() and int(a) == b) if isinstance(b, int) and not isinstance(b, bool)
         else abs(float(a) - float(b)) <= 1e-12 * max(1.0, abs(float(b)))
         for a, b in zip(flat, exp))
     want_kinds = ["b" if isinstance(e, bool) else "i" if isinstance(e, int) else "f" if isinstance(e, float) else "?" for e in exp]
     type_ok = all(w == "?" or k == w or (w == "i" and k in "iu") or (w == "b" and k in "biu") for k, w in zip(kinds, want_kinds))
     return ("ok" if type_ok else f"TYPE {feeds} got kinds {kinds} want {want_kinds}") if ok else f"WRONG {feeds} got {flat} want {exp}"
+
+
+_UNION_KINDS = {
+    "builtins.int": ("i", int), "builtins.float": ("f", float),
+    "builtins.bool": ("b", bool), "builtins.NoneType": ("?", lambda _v: None),
+}
+
+
+def output_values(module, export, outs, buffer_of):
+    """The root's outputs as Python sees them: ``(values, kinds)``.
+
+    A value union leaves the program as its frame (an int64 tag and one
+    payload cell per arm, ``module.value_union_tables``).  The tag names
+    the live arm; only that arm's payload is the value, with that arm's
+    class.  Every other output is read as it is.
+    """
+
+    table = getattr(module, "value_union_tables", {}).get(export)
+    unions = [] if table is None else list(dict(table.unions).values())
+    ids = [int(v.id) for v in outs]
+    frames = {}
+    for union in unions:
+        members = {int(union.tag_value_id)} | {
+            int(value_id) for arm in union.alternatives for value_id in arm.value_ids
+        }
+        if members <= set(ids):
+            frames[min(ids.index(m) for m in members)] = (union, members)
+    covered = {m for _union, members in frames.values() for m in members}
+    values, kinds = [], []
+    for position, v in enumerate(outs):
+        if position in frames:
+            union, _members = frames[position]
+            tag = int(np.asarray(buffer_of(int(union.tag_value_id))).reshape(-1)[0])
+            arm = union.alternatives[tag]
+            kind, convert = _UNION_KINDS.get(str(arm.name), ("?", lambda value: value))
+            payload = (
+                None if not arm.value_ids else
+                np.asarray(buffer_of(int(arm.value_ids[0]))).reshape(-1)[0].item()
+            )
+            values.append(convert(payload) if payload is not None else None)
+            kinds.append(kind)
+            continue
+        if int(v.id) in covered:
+            continue
+        array = np.asarray(buffer_of(int(v.id)))
+        values.extend(array.reshape(-1).tolist())
+        kinds.extend([array.dtype.kind] * array.size)
+    return values, kinds
 
 
 def run_llvm(module, export, params, outs, inputs, expects):
@@ -80,10 +130,9 @@ def run_llvm(module, export, params, outs, inputs, expects):
     for feeds, expect in zip(inputs, expects):
         try:
             ex = prepare_artifact_execution(art, _feeds(module, export, params, feeds)).run()
-            arrays = [np.asarray(ex.buffers[v.id]) for v in outs]
-            flat = [x for a in arrays for x in a.reshape(-1).tolist()]
+            flat, kinds = output_values(module, export, outs, lambda i: ex.buffers[i])
             values.append(flat)
-            results.append(judge(feeds, expect, flat, [a.dtype.kind for a in arrays]))
+            results.append(judge(feeds, expect, flat, kinds))
         except Exception as e:
             values.append(None)
             results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
@@ -149,10 +198,9 @@ def run_fortran(module, export, params, outs, inputs, expects):
     for feeds, expect in zip(inputs, expects):
         try:
             ex = native.prepare_execution(_feeds(module, export, params, feeds)).run()
-            arrays = [np.asarray(ex.buffers[v.id]) for v in outs]
-            flat = [x for a in arrays for x in a.reshape(-1).tolist()]
+            flat, kinds = output_values(module, export, outs, lambda i: ex.buffers[i])
             values.append(flat)
-            results.append(judge(feeds, expect, flat, [a.dtype.kind for a in arrays]))
+            results.append(judge(feeds, expect, flat, kinds))
         except Exception as e:
             values.append(None)
             results.append(f"RUN-FAIL {type(e).__name__}: {str(e)[:150]}")
@@ -166,7 +214,12 @@ def disagreements(inputs, c_values, other_values):
         for feeds, c, o in zip(inputs, c_values, other_values)
         if c is not None and o is not None and (
             len(c) != len(o)
-            or any(abs(float(a) - float(b)) > 1e-12 * max(1.0, abs(float(a))) for a, b in zip(c, o))
+            or any(
+                (a is None) != (b is None)
+                or type(a) is not type(b)
+                or (a is not None and abs(float(a) - float(b)) > 1e-12 * max(1.0, abs(float(a))))
+                for a, b in zip(c, o)
+            )
         )
     ]
 
@@ -245,9 +298,7 @@ def check_group(path, src, inputs, expects, inventory, label=None):
         for feeds, expect in zip(inputs, expects):
             try:
                 ex = art.prepare_execution(_feeds(module, exports[0], params, feeds)).run()
-                got = [ex.buffers[v.id].reshape(-1).tolist() for v in outs]
-                kinds = [ex.buffers[v.id].dtype.kind for v in outs]
-                flat = [x for g in got for x in g]
+                flat, kinds = output_values(module, exports[0], outs, lambda i: ex.buffers[i])
                 c_values.append(flat)
                 results.append(judge(feeds, expect, flat, kinds))
             except Exception as e:

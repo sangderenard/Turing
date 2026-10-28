@@ -3,7 +3,8 @@
 The join is carried as one physical class (``ssa_numeric_joins``).  That
 is exact only where the joined value meets an operand of that class in
 arithmetic (corpus c770-c774).  Each program here reads it where an int
-and a float differ, and must be refused by name, never answered.
+and a float differ, and must be refused by name, never answered.  A join
+that leaves as its value-union frame keeps each class (corpus c804-c809).
 """
 
 import pytest
@@ -14,23 +15,6 @@ from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 REFUSED = "int-or-float union lowering is not built"
 
 PROGRAMS = {
-    "returned_from_the_program": """
-def root(n: int, c: int):
-    if c == 2:
-        s = n
-    else:
-        s = n * 0.5
-    return s
-""",
-    "callee_result_returned": """
-def pick(n, c):
-    if c == 2:
-        return n
-    return n * 0.5
-
-def root(n: int, c: int):
-    return pick(n, c)
-""",
     "compared": """
 def root(n: int, c: int):
     if c == 2:
