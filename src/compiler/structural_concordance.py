@@ -12,7 +12,7 @@ from .concordance_declarations import (
     STRUCTURAL_CONCORDANCE, STRUCTURAL_VALUE, OPTIONAL_VALUE_STRUCTURE, BoundaryTransport,
     SourceAggregateLayout, StructuralValue, RETURN_SITE_SLOT, RETURN_OUTPUT_ARMS, CALL_EDGE,
     AGGREGATE_RETURN_LAYOUT, RECORD_SCALAR_SHAPE, SSAValueFact,
-    VALUE_TYPE_ABI, CELL_SET, SSA_VALUE_PHYSICAL_FIELDS, INGESTION_VALUE,
+    VALUE_TYPE_ABI, CELL_SET, SSA_VALUE_PHYSICAL_FIELDS, POLICY_PHYSICAL_KIND, INGESTION_VALUE,
 )
 from .identity_concordance import ConcordanceRefusal, Ref, current_identity_book
 
@@ -124,6 +124,12 @@ def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=())
                     storage, dtype, shape, rank = next(iter(views))
                     if (storage != "none" and str(dtype) == str(fact.dtype)
                             and tuple(shape) == tuple(fact.shape or ())):
+                        # The row's declared keyed/table policy IS this physical
+                        # kind (POLICY_PHYSICAL_KIND); the arm adds no second
+                        # storage claim to it.
+                        row_storage = fields.get("storage")
+                        if POLICY_PHYSICAL_KIND.get(row_storage) == storage:
+                            storage = row_storage
                         merge({"physical_dtype": str(dtype), "storage": storage, "rank": rank})
             continue
         # Revisions retain historical origin edges. Follow those exact refs,
@@ -134,24 +140,6 @@ def _ssa_physical_view(read, scope, value_id, fact, shape_scope=None, active=())
         elif source.page == CELL_SET:
             read(CELL_SET, source.row)
             pending.extend(read.sources(source))
-    if shape_scope is not None:
-        state = read(SHAPE_STATE_PAGE, (tuple(shape_scope), int(value_id)))
-        state = (shape_transformation_state(state[1]) if isinstance(state, tuple)
-                 and state and state[0] == "resolved" else None)
-        if state is not None:
-            shape, dtype, rank, metadata, _row_shape = state
-            layout = resolve(dtype)
-            if (str(dtype) == str(fact.dtype) and layout is not None
-                    and layout.kind in {"bool", "int", "uint", "float"}
-                    and str(dtype) != "opaque_ref"
-                    and fields.get("storage") in (None, "scalar", "span")):
-                if (metadata == "static" and rank == len(shape)
-                        and (tuple(shape) == tuple(fact.shape or ()) or not fact.shape)
-                        and not (rank == 0 and fields.get("arena"))):
-                    merge({"physical_dtype": str(dtype), "storage": "span" if rank else "scalar",
-                           "rank": rank})
-                elif metadata == "dynamic" and not shape and rank > 0 and not fact.shape:
-                    merge({"physical_dtype": str(dtype), "storage": "span", "rank": rank})
     for origin in origins:
         mint = read(MINT_PAGE, (origin.key, int(value_id)))
         if not (isinstance(mint, tuple) and len(mint) == 2):
