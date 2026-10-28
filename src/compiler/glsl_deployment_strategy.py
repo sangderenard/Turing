@@ -24704,6 +24704,21 @@ def _tensor_descriptor_rule(
                 inherited = _tensor_descriptor(graph, sources[0], seen)
                 if inherited is not None:
                     return inherited
+                # An authored Python scalar literal carries its own type
+                # (float -> float64, int -> int64, bool -> bool).
+                literal = graph.G.nodes[sources[0]].get("constant")
+                if literal is None:
+                    literal = (
+                        graph.G.nodes[sources[0]].get("attributes") or {}
+                    ).get("value")
+                literal_dtype = (
+                    "bool" if isinstance(literal, bool)
+                    else "int64" if isinstance(literal, int)
+                    else "float64" if isinstance(literal, float)
+                    else None
+                )
+                if literal_dtype is not None:
+                    return {"shape": (), "dtype": literal_dtype, "rank": 0}
         if operation in {
             "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
             "tanh", "clone", "copy", "identity", "real", "imag", "conj",
