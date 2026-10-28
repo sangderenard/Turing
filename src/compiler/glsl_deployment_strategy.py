@@ -4526,11 +4526,49 @@ def _build_shell_hierarchy_plan(
                         and not tuple(described.get("shape") or ())
                     ):
                         described_dtype = str(described["dtype"])
+                # A ``Precision[k]`` value (``x: Precision[2]``) is k limbs
+                # of its element type, binary64 unless the descriptor names
+                # one: the numeric descriptor IS its type record. Complex and
+                # rational descriptors are records and are settled as such.
+                numeric = attributes.get("numeric_feature_descriptor")
+                if numeric is None and str(node.get("type")) in {
+                    "Indexed", "IndexedStore",
+                }:
+                    # An element of a ``Precision[k]`` array, and the array
+                    # an element store yields, have the array's limbs and
+                    # element type.
+                    base = next((
+                        int(parent)
+                        for parent, role in (node.get("parents") or ())
+                        if str(role) == "base"
+                    ), None)
+                    numeric = (
+                        (graph.G.nodes.get(base, {}).get("attributes") or {})
+                        .get("numeric_feature_descriptor")
+                        if base is not None else None
+                    )
+                precision_dtype = (
+                    str(numeric.get("element_type") or "float64")
+                    if isinstance(numeric, Mapping)
+                    and set(map(str, numeric.get("features") or ()))
+                    == {"precision"}
+                    else None
+                )
+                if (
+                    precision_dtype is None
+                    and int(attributes.get("precision_limbs") or 1) > 1
+                ):
+                    # A precision operation's result: limbs of the element
+                    # the reducer recorded for it.
+                    precision_dtype = str(
+                        attributes.get("precision_element") or "float64"
+                    )
                 dtype = (
                     tensor.get("dtype")
                     or getattr(specialization, "dtype", None)
                     or node.get("dtype")
                     or described_dtype
+                    or precision_dtype
                     or planned_scalar_dtypes().get(int(current))
                     or call_result_dtypes.get(int(current))
                     or getattr(domain, "dtype", None)
