@@ -188,6 +188,17 @@ _FUSED_UNARY: dict[str, str] = {
 }
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 def _fused_opcode_name(opcode: int) -> str | None:
     from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         C_TENSOR_OPCODE_ORDER,
@@ -1929,7 +1940,9 @@ def _emit_repository_call_module(
             ring_id, count_id = history_ids(raw_id)
             appended_history.append(_SSAValue(
                 ring_id,
-                dtype=getattr(value, "dtype", None) or "float64",
+                dtype=_settled_dtype(
+                    getattr(value, "dtype", None), raw_id,
+                    "watched history value dtype"),
                 shape=(depth,),
             ))
             appended_history.append(_SSAValue(count_id, dtype="int64"))

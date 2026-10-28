@@ -2199,9 +2199,13 @@ def _recover_late_source_pure_expressions(
                         return None
                     runtime_leaves.append((block_name, index, operand))
                     source_roots.add(initial_id)
-                    result = result_value(
-                        value_id, str(operand.dtype or "float64"),
-                    )
+                    if not operand.dtype:
+                        raise ValueError(
+                            f"scalar loop-carry cast %t{value_id}: source "
+                            f"operand %t{int(operand.id)} has no recorded "
+                            "dtype"
+                        )
+                    result = result_value(value_id, str(operand.dtype))
                     result.dtype = operand.dtype
                     result.shape = ()
                     planned.append((
@@ -4876,12 +4880,19 @@ def _lower_planned_region_record_projection_captures(
                 for block in region.blocks.values():
                     block.instrs[:] = [item for item in block.instrs if item is not instruction]
             else:
+                if not (instruction.res.dtype or capture.dtype):
+                    raise ValueError(
+                        f"record field projection %t{int(instruction.res.id)}"
+                        f" ({attribute!r} of receiver {receiver_id}): neither"
+                        " the projection nor its resident capture "
+                        f"%t{int(capture.id)} has a recorded dtype"
+                    )
                 instruction.op = "Cast"
                 instruction.args = [capture]
                 instruction.arg_roles = []
                 instruction.attributes = {
                     "target_dtype": str(
-                        instruction.res.dtype or capture.dtype or "float64"
+                        instruction.res.dtype or capture.dtype
                     ),
                     "resolved_record_field_projection": True,
                     "record_receiver_id": receiver_id,
@@ -5094,6 +5105,18 @@ def _exact_structural_value_origin(graph_obj: Any, value_id: int) -> int:
 
 
 from .runtime_abi import HOST_CALLBACK_SCHEMA
+
+
+def _recorded_field_dtype(field: Any, what: str) -> str:
+    """The element dtype a record field declaration recorded; refuse absence."""
+
+    dtype = field.get("dtype") if hasattr(field, "get") else None
+    if not dtype:
+        raise ValueError(
+            f"{what}: the field declaration {dict(field or {})!r} records no "
+            "dtype, so its storage type was never settled"
+        )
+    return str(dtype)
 
 _HOST_CALLBACK_DTYPES = {
     "int": "int64", "float": "float64", "bool": "bool",
@@ -32876,8 +32899,13 @@ def _class_surface_ssa_program(
                         f"operand:{reduction_operands[0]}",
                     ))
                     return None
+                if not operand.dtype:
+                    raise ValueError(
+                        f"structural {operation} %t{value_id}: operand "
+                        f"%t{int(operand.id)} has no recorded dtype"
+                    )
                 result = SSAValue(
-                    value_id, dtype=operand.dtype or "float64", shape=(),
+                    value_id, dtype=operand.dtype, shape=(),
                 )
                 insertions.append(Instr(
                     operation, [operand], result,
@@ -36609,8 +36637,9 @@ def _class_surface_ssa_program(
                                 (
                                     "int64"
                                     if nested_field.get("value_tensor")
-                                    else str(
-                                        nested_field.get("dtype") or "float64"
+                                    else _recorded_field_dtype(
+                                        nested_field,
+                                        "nested mapping field values column",
                                     )
                                 ),
                                 1,
@@ -37687,7 +37716,9 @@ def _class_surface_ssa_program(
                         leaf_path, leaf_storage, leaf_declaration_cell,
                     ))
                     continue
-                leaf_dtype = str(leaf_field.get("dtype") or "float64")
+                leaf_dtype = _recorded_field_dtype(
+                    leaf_field, f"record leaf {leaf_name!r}",
+                )
                 leaf_mutable = bool(leaf_field.get("mutable", False))
                 column_shape = (
                     () if row_count is None
@@ -38728,7 +38759,9 @@ def _class_surface_ssa_program(
                                 (
                                     "int64"
                                     if field.get("value_tensor")
-                                    else str(field.get("dtype") or "float64")
+                                    else _recorded_field_dtype(
+                                        field, "mapping field values column",
+                                    )
                                 ),
                                 1,
                             ),
@@ -40553,7 +40586,9 @@ def _class_surface_ssa_program(
                         (
                             "values", SSARecordFieldStorage.SPAN,
                             int(sequence.column_value_ids[value_columns[0]]),
-                            str(field.get("dtype") or "float64"), 1,
+                            _recorded_field_dtype(
+                                field, "mapping field values column",
+                            ), 1,
                         ),
                     )
                     for part_name, part_storage, part_id, part_dtype, rank in (
@@ -58227,9 +58262,14 @@ def _class_surface_ssa_program(
                 int(extent) for extent in (argument.shape or ())
                 if isinstance(extent, int) or str(extent).isdigit()
             )
+            if not argument.dtype:
+                raise ValueError(
+                    f"declared call storage for %t{int(argument.id)} "
+                    f"(callee {owner!r}) has no recorded dtype"
+                )
             declared_storage.append({
                 "value_id": int(argument.id),
-                "dtype": str(argument.dtype or "float64"),
+                "dtype": str(argument.dtype),
                 "shape": shape,
                 "callee": str(owner),
                 "callsite_id": accounting.get("callsite_id"),
@@ -61335,6 +61375,14 @@ def _lower_ast_source_to_ssa_impl(
         features = frozenset(map(str, descriptor.features))
         if features == frozenset({"precision"}):
             return None
+
+        def _numeric_descriptor_element(descriptor: Any) -> str:
+            if not descriptor.element_type:
+                raise ValueError(
+                    f"numeric descriptor {descriptor.type_name!r} records no "
+                    "element_type for its coefficient fields"
+                )
+            return str(descriptor.element_type)
         # A precision numeral's coefficient leaves are Precision values of
         # the numeral's width: each leaf carries that many limbs.
         leaf_width = (
@@ -61365,7 +61413,7 @@ def _lower_ast_source_to_ssa_impl(
                 fields = {
                     name: {
                         "storage": "scalar",
-                        "dtype": str(descriptor.element_type or "float64"),
+                        "dtype": _numeric_descriptor_element(descriptor),
                         "rank": 0,
                         "mutable": False,
                         **leaf_width,
@@ -61387,7 +61435,7 @@ def _lower_ast_source_to_ssa_impl(
             fields = {
                 name: {
                     "storage": "scalar",
-                    "dtype": str(descriptor.element_type or "float64"),
+                    "dtype": _numeric_descriptor_element(descriptor),
                     "rank": 0,
                     "mutable": False,
                     **leaf_width,
