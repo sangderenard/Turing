@@ -18529,10 +18529,14 @@ class _ControlSSABuilder(TiledObject):
                 merged.dtype = self._numeric_join(
                     (true_value, false_value),
                 ) or true_value.dtype or false_value.dtype
+            join_arms = (true_value, false_value)
             true_value, false_value = self._numeric_join_arms(
                 merged.dtype if not tuple(merged.shape or ()) else None,
                 ((true_exit, true_value), (false_exit, false_value)),
             )
+            # An arm converted to the join's class: where Python could tell
+            # the classes apart, ``ssa_numeric_joins`` refuses the join.
+            numeric_join_promoted = (true_value, false_value) != join_arms
             if (
                 int(result_id) not in self.region_value_meta
                 and tuple(true_value.shape) == tuple(false_value.shape)
@@ -18546,6 +18550,8 @@ class _ControlSSABuilder(TiledObject):
                 attributes={
                     "incoming_blocks": (true_exit.name, false_exit.name),
                     "binding": "conditional_result",
+                    **({"numeric_join_promoted": True}
+                       if numeric_join_promoted else {}),
                     # The merge of a short-circuit operator IS the operator.
                     **({
                         "structural_operation": "boolop",
@@ -22701,10 +22707,12 @@ class _ControlSSABuilder(TiledObject):
                     str(value.dtype) for value in incoming_values
                     if value.dtype not in {None, "unknown", "none", "None"}
                 }
+                numeric_join_promoted = False
                 if len(merge_dtypes) > 1:
                     promoted = self._numeric_join(incoming_values)
                     if promoted is not None:
                         dtype = promoted
+                        numeric_join_promoted = True
                         incoming_values = list(self._numeric_join_arms(
                             dtype, tuple(
                                 (block, value)
@@ -22766,6 +22774,8 @@ class _ControlSSABuilder(TiledObject):
                             "incoming_blocks": tuple(incoming_blocks),
                             "binding": "return_merge",
                             "return_slot_index": slot,
+                            **({"numeric_join_promoted": True}
+                               if numeric_join_promoted else {}),
                             **(
                                 {"return_arm_absent": tuple(incoming_absent)}
                                 if member_phi else {}
@@ -29507,7 +29517,11 @@ def lower_control_sections_to_ssa(
             # generic guess is an integer, decided here, once, before the
             # control caller and later regions read it (``n + k`` indexing
             # an array; its caller once loaded the int result as a double).
-            integer_dtypes = {"int", "int64", "int32", "int16", "int8"}
+            # uint64/int128 are settled integers too: the width of a proven
+            # interval (``source_int_range_concordance``), never a guess.
+            integer_dtypes = {
+                "int", "int64", "int32", "int16", "int8", "uint64", "int128",
+            }
             integer_ops = {
                 "add", "sub", "mul", "floordiv", "mod", "neg",
                 "min", "max", "abs",
@@ -29797,6 +29811,39 @@ def lower_control_sections_to_ssa(
         from .identity_concordance import current_identity_book
 
         item_operand_page = current_identity_book().page("item_operand")
+    def retained_lookup_ids(block):
+        if isinstance(block, SequenceQueryBlock) and block.operation == "lookup":
+            yield int(block.result_value_id)
+        for child in getattr(block, "blocks", ()):
+            yield from retained_lookup_ids(child)
+        for name in ("condition", "body", "orelse", "callee"):
+            child = getattr(block, name, None)
+            if child is not None:
+                yield from retained_lookup_ids(child)
+
+    retained_table_lookup_ids = set(retained_lookup_ids(control.root))
+    scheduled_lookup_ids = {
+        int(operation[0])
+        for operations in (
+            *table_region_operations.values(),
+            *table_region_post_operations.values(),
+        )
+        for kind, operation in operations
+        if str(kind) in {"lookup", "lookup_capture"}
+    }
+    # Lookups the control tree retains or a loop owns are placed there.
+    unplaced_lookup_ids = {
+        int(result_id)
+        for result_id, query_ids, _sequence_id in table_lookups
+        if int(result_id) not in scheduled_lookup_ids
+        and int(result_id) not in retained_table_lookup_ids
+        and not any(
+            int(key) in (table_lookup_loop_owners or {})
+            for key in (
+                query_ids if isinstance(query_ids, tuple) else (query_ids,)
+            )
+        )
+    }
     for region_index, instructions in planned_region_instructions.items():
         # Program: ``xs1 = [4, n]; xs1[0] += n; return xs1[0]`` (fuzzer
         # p25_25; corpus c273).  Wrong record: the store's region spelled
@@ -29855,19 +29902,46 @@ def lower_control_sections_to_ssa(
                 if read_id is not None
             ),
         )))
+        # An unscheduled captured lookup likewise reads its key: ``self._d.get(k +
+        # 7, -1)`` needs the region producing ``k + 7`` first.
+        consumed = tuple(dict.fromkeys((
+            *consumed,
+            *(
+                int(query)
+                for value_id in consumed
+                if int(value_id) in unplaced_lookup_ids
+                for lookup in (lookup_by_result.get(int(value_id)),)
+                if lookup is not None
+                for query in (
+                    lookup[1] if isinstance(lookup[1], (tuple, list))
+                    else (lookup[1],)
+                )
+                if isinstance(query, int)
+            ),
+        )))
         region_dependency_signatures[int(region_index)] = (consumed, produced)
 
-    def retained_lookup_ids(block):
-        if isinstance(block, SequenceQueryBlock) and block.operation == "lookup":
-            yield int(block.result_value_id)
-        for child in getattr(block, "blocks", ()):
-            yield from retained_lookup_ids(child)
-        for name in ("condition", "body", "orelse", "callee"):
-            child = getattr(block, name, None)
-            if child is not None:
-                yield from retained_lookup_ids(child)
+    # Program: ``self._d[k] = v`` then ``return self._d.get(k + 7, -1) +
+    # len(self._d)`` in a method.  Wrong record: no region scheduled the
+    # lookup (its receiver is a record field, not a region value), so the
+    # prologue emitted it at entry, before its key's region and before the
+    # store it must observe; the final audit refused the read before the
+    # definition.  Rule: an unscheduled lookup a region captures is emitted
+    # with the first such region, as that region's captured lookup.
+    for result_id, lookup in sorted(lookup_by_result.items()):
+        if result_id not in unplaced_lookup_ids:
+            continue
+        consumers = sorted(
+            int(region_index)
+            for region_index, (consumed, _produced)
+            in region_dependency_signatures.items()
+            if int(result_id) in consumed
+        )
+        if consumers:
+            table_region_operations.setdefault(consumers[0], []).append((
+                "lookup_capture", lookup,
+            ))
 
-    retained_table_lookup_ids = set(retained_lookup_ids(control.root))
     region_scheduled_lookup_ids = {
         int(operation[0])
         for operations in (

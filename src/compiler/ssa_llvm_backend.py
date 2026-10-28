@@ -2055,7 +2055,25 @@ def _emit_repository_call_module(
 
         seen: set[tuple[str, int]] = set()
         current = (str(name), int(value_id))
-        while current[0] != function_name:
+        root_formals = {
+            int(value.id) for value in module.functions[function_name].args
+        }
+        while True:
+            if current[0] == function_name:
+                if current[1] in root_formals:
+                    return current[1]
+                # Program: ``(x * y).sum()`` over runtime-sized spans.  The
+                # product is a region's result that the root projects under
+                # the same id and feeds to the reducing region: its extents
+                # are its producer's, so follow the producing region's edge.
+                produced = next((
+                    key for key in elementwise_runtime_results
+                    if key[1] == current[1] and key[0] != function_name
+                    and key in shape_extent_origin
+                ), None)
+                if produced is None:
+                    return current[1]
+                current = produced
             if current in seen:
                 return None
             seen.add(current)
@@ -2065,7 +2083,6 @@ def _emit_repository_call_module(
             if origin is None:
                 return None
             current = origin
-        return current[1]
 
     # Functions that address a span across more than one axis need the extents
     # vector, and so does every function that calls one.
@@ -2081,6 +2098,13 @@ def _emit_repository_call_module(
     # extents vector. Such a function needs %extents even when it never
     # addresses an element itself -- region_4 does exactly this: four
     # whole-array assignments and not one GetElementPtr.
+    # A reduction of a runtime-sized span counts it from the extents vector.
+    extent_users.update(
+        name for name in reachable
+        for block in module.functions[name].blocks.values()
+        for instruction in block.instrs
+        if instruction.args and _runtime_sized_span(instruction.args[0])
+    )
     extent_users.update(
         name for name in reachable
         for block in module.functions[name].blocks.values()
@@ -2260,6 +2284,12 @@ def _emit_repository_call_module(
                     count = max(count, int(requirement.element_count))
             if value_id not in allocated and (
                 (str(name), value_id) in elementwise_runtime_results
+                # A region's runtime-sized span result, projected here and
+                # fed on to its consumer (``(x * y).sum()``).
+                or (_runtime_sized_span(value) and any(
+                    key[1] == value_id and key[0] != str(name)
+                    for key in elementwise_runtime_results
+                ))
             ):
                 # Program: ``x + y * 2.0`` over runtime-sized rank-2 spans.
                 # Wrong record: the intermediate ``y * 2.0`` is a local span
@@ -4559,6 +4589,188 @@ def _emit_repository_call_module(
                 )
                 continue
 
+            axis = (instruction.attributes or {}).get("axis")
+            if axis is None:
+                axis = (instruction.attributes or {}).get("dim")
+            if (
+                str(operation).casefold() in {"sum", "prod", "mean", "max", "min"}
+                and axis is not None
+                and result is not None
+                and instruction.args
+                # builtin ``min(n, 3)`` carries its second operand as
+                # ``dim``; a scalar has no axis to reduce.
+                and (
+                    tuple(instruction.args[0].shape or ())
+                    or int((instruction.args[0].accounting or {}).get(
+                        "program_abi_rank"
+                    ) or 0)
+                )
+            ):
+                # Program: ``def f(y): return y.max(axis=0)`` with y (2, 3).
+                # Rule (as in C): one result per lane of the kept axes,
+                # row-major, folded along the axis in index order; max/min
+                # take numpy's rule, so a NaN in the lane is its result.
+                reduced_op = str(operation).casefold()
+                source = instruction.args[0]
+                shape = tuple(source.shape or ())
+                if (
+                    not isinstance(axis, int) or not shape
+                    or not all(isinstance(item, int) for item in shape)
+                    or not -len(shape) <= axis < len(shape)
+                ):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"{operation} over axis {axis!r} of shape {shape!r} "
+                        "needs one in-range integer axis of a static shape",
+                    ))
+                    continue
+                axis %= len(shape)
+                length = shape[axis]
+                inner = _math.prod(shape[axis + 1:])
+                lanes = _math.prod(shape[:axis]) * inner
+                if _math.prod(tuple(result.shape or ())) != lanes or (
+                    length == 0 and reduced_op in {"max", "min"}
+                ):
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"{operation} over axis {axis} of {shape!r} into "
+                        f"{tuple(result.shape or ())!r} (an empty max/min "
+                        "axis raises in numpy)",
+                    ))
+                    continue
+                source_type = _value_llvm_type(source)
+                result_type = _value_llvm_type(result)
+                accumulator_type = "double" if (
+                    result_type == "double" or reduced_op == "mean"
+                ) else result_type
+                if accumulator_type not in {"i32", "i64", "double"}:
+                    shortfalls.append(LLVMEmissionShortfall(
+                        name, operation,
+                        f"{operation} over an axis into {accumulator_type}",
+                    ))
+                    continue
+                floating = accumulator_type == "double"
+                entry_label = block_exit_label.get(
+                    active_block or "", active_block or "entry",
+                )
+                lane, lane_next = f"%ax.l.{tag}", f"%ax.l.next.{tag}"
+                step, step_next = f"%ax.k.{tag}", f"%ax.k.next.{tag}"
+                acc, acc_next = f"%ax.acc.{tag}", f"%ax.acc.next.{tag}"
+                outer_head, outer_body = f"ax.oh.{tag}", f"ax.ob.{tag}"
+                inner_head, inner_body = f"ax.ih.{tag}", f"ax.ib.{tag}"
+                inner_done, done = f"ax.id.{tag}", f"ax.done.{tag}"
+
+                def lane_element(at: str, label: str) -> str:
+                    body.append(
+                        f"  %ax.addr.{label}.{tag} = getelementptr "
+                        f"{source_type}, ptr {pointer(source)}, i64 {at}"
+                    )
+                    body.append(
+                        f"  %ax.v.{label}.{tag} = load {source_type}, ptr "
+                        f"%ax.addr.{label}.{tag}, align {_align(source_type)}"
+                    )
+                    return convert_loaded(
+                        f"%ax.v.{label}.{tag}", source_type, accumulator_type,
+                        f"ax.{label}.{tag}",
+                    )
+
+                ordered = reduced_op in {"max", "min"}
+                body.append(f"  br label %{outer_head}")
+                body.append(f"{outer_head}:")
+                body.append(
+                    f"  {lane} = phi i64 [ 0, %{entry_label} ], "
+                    f"[ {lane_next}, %{inner_done} ]"
+                )
+                body.append(f"  %ax.omore.{tag} = icmp slt i64 {lane}, {lanes}")
+                body.append(
+                    f"  br i1 %ax.omore.{tag}, label %{outer_body}, label %{done}"
+                )
+                body.append(f"{outer_body}:")
+                body.append(f"  %ax.lo.{tag} = udiv i64 {lane}, {inner}")
+                body.append(f"  %ax.li.{tag} = urem i64 {lane}, {inner}")
+                body.append(
+                    f"  %ax.lb.{tag} = mul i64 %ax.lo.{tag}, {length * inner}"
+                )
+                body.append(f"  %ax.base.{tag} = add i64 %ax.lb.{tag}, %ax.li.{tag}")
+                if ordered:
+                    initial = lane_element(f"%ax.base.{tag}", "first")
+                    first = "1"
+                else:
+                    initial = literal(1 if reduced_op == "prod" else 0, accumulator_type)
+                    first = "0"
+                body.append(f"  br label %{inner_head}")
+                body.append(f"{inner_head}:")
+                body.append(
+                    f"  {step} = phi i64 [ {first}, %{outer_body} ], "
+                    f"[ {step_next}, %{inner_body} ]"
+                )
+                body.append(
+                    f"  {acc} = phi {accumulator_type} [ {initial}, %{outer_body} ], "
+                    f"[ {acc_next}, %{inner_body} ]"
+                )
+                body.append(f"  %ax.imore.{tag} = icmp slt i64 {step}, {length}")
+                body.append(
+                    f"  br i1 %ax.imore.{tag}, label %{inner_body}, label %{inner_done}"
+                )
+                body.append(f"{inner_body}:")
+                body.append(f"  %ax.ko.{tag} = mul i64 {step}, {inner}")
+                body.append(f"  %ax.at.{tag} = add i64 %ax.base.{tag}, %ax.ko.{tag}")
+                item = lane_element(f"%ax.at.{tag}", "row")
+                if reduced_op in {"sum", "mean"}:
+                    body.append(
+                        f"  {acc_next} = {'fadd' if floating else 'add'} "
+                        f"{accumulator_type} {acc}, {item}"
+                    )
+                elif reduced_op == "prod":
+                    body.append(
+                        f"  {acc_next} = {'fmul' if floating else 'mul'} "
+                        f"{accumulator_type} {acc}, {item}"
+                    )
+                else:
+                    greatest = reduced_op == "max"
+                    if floating:
+                        for rendered_line in _max_template(
+                            max_step_rule(instruction) or NUMPY, greatest,
+                        ).format(acc, item, out=acc_next).splitlines():
+                            body.append(f"  {rendered_line}")
+                    else:
+                        body.append(
+                            f"  %ax.keep.{tag} = icmp {'sgt' if greatest else 'slt'} "
+                            f"{accumulator_type} {item}, {acc}"
+                        )
+                        body.append(
+                            f"  {acc_next} = select i1 %ax.keep.{tag}, "
+                            f"{accumulator_type} {item}, {accumulator_type} {acc}"
+                        )
+                body.append(f"  {step_next} = add i64 {step}, 1")
+                body.append(f"  br label %{inner_head}")
+                body.append(f"{inner_done}:")
+                value = acc
+                if reduced_op == "mean":
+                    body.append(
+                        f"  %ax.mean.{tag} = fdiv double {acc}, "
+                        f"{literal(float(length), 'double')}"
+                    )
+                    value = f"%ax.mean.{tag}"
+                stored = convert_loaded(
+                    value, accumulator_type, result_type, f"ax.store.{tag}",
+                )
+                body.append(
+                    f"  %ax.dst.{tag} = getelementptr {result_type}, "
+                    f"ptr {pointer(result)}, i64 {lane}"
+                )
+                body.append(
+                    f"  store {result_type} {stored}, ptr %ax.dst.{tag}, "
+                    f"align {_align(result_type)}"
+                )
+                body.append(f"  {lane_next} = add i64 {lane}, 1")
+                body.append(f"  br label %{outer_head}")
+                body.append(f"{done}:")
+                if active_block is not None:
+                    block_exit_label[active_block] = done
+                register_cache.clear()
+                continue
+
             selector = _reduction_read_as_selector(operation, instruction)
             if selector is not None:
                 shortfalls.append(LLVMEmissionShortfall(name, operation, selector))
@@ -4896,6 +5108,17 @@ def _emit_repository_call_module(
                         ) or lengths
                     if len(lengths) == 1:
                         count = load_as(lengths[0], "i64", f"red.n.{tag}")
+                if count is None and _runtime_sized_span(source):
+                    # ``(x * y).sum()`` over runtime-sized spans: the span
+                    # reduces over its element count, read from the extents
+                    # vector as its elementwise producer is sized.
+                    measured = _span_element_count(
+                        name, source, f"red.{tag}", body,
+                        public_span_value, module_extent_slot,
+                    )
+                    if measured is not None:
+                        body.append(f"  %red.n64.{tag} = sext i32 {measured} to i64")
+                        count = f"%red.n64.{tag}"
                 if count is None:
                     shortfalls.append(LLVMEmissionShortfall(
                         name, operation,
