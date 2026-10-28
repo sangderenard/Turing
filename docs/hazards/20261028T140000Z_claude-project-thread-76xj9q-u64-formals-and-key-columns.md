@@ -50,3 +50,13 @@ history after the post-loop version, so the returned name resolved to the
 loop's exit value and the add was dropped with no error.  The port is now
 inserted right after the loop's last version of the name; its
 `name_binding` row still takes the next free row.
+
+## A list formal with an all-literal caller (corpus c799)
+
+`width(values: list[int])` called with `[65 + r, 66]` and with
+`[65, 67, 68]`.  The literal call's specialization declared the formal in
+`_field_slot_ops` as a retained arena (live flags).  The schema survey joins
+every variant of `width`, so the generic variant counted live flags that its
+runtime caller never wrote, and `len(values)` read 0 with no error.  An
+authored list formal is the caller's storage viewed as a list: it keeps
+deleted rows only when its function deletes from it.
