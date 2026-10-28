@@ -158,6 +158,7 @@ from .resident_sequence_materialization import (
     _joined_byte_sequence_ids as _joined_byte_sequence_ids,
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
+    _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
     _list_rebound_on_one_branch as _list_rebound_on_one_branch,
     _loop_carried_initial_ids as _loop_carried_initial_ids,
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
@@ -21855,6 +21856,10 @@ def _settle_linked_dynamic_sequences(
                 == "list"
                 and (data.get("attributes") or {}).get("aggregate_leaf_value_ids")
             )
+            # Program: the same merge from displays of different lengths
+            # (c654).  Born by the arms' copies, it is bounded by the
+            # longest arm (the survey's copy bound) when nothing grows it.
+            or _list_merged_from_unequal_displays(graph_obj, int(node_id))
             for value_id in (int(node_id),)
             if value_id in escapes
             and (
