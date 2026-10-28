@@ -28101,19 +28101,65 @@ def _fold_callsite_structural_values(
                     except ValueError:
                         shape = None
                     if shape is not None:
+                        result_dtype = (
+                            "bool" if (
+                                operation in comparison_operations
+                                or semantic_operation
+                                in comparison_operations
+                            ) else next((
+                                descriptor["dtype"]
+                                for descriptor in parent_descriptors
+                                if tuple(descriptor["shape"])
+                            ), parent_descriptors[0]["dtype"])
+                        )
+                        # Program: ``if c == 2: s = n else: s = n * 0.5;
+                        # return s + 0.25`` (corpus c770, c771).  Wrong
+                        # record: with no shaped operand the result took its
+                        # FIRST operand's dtype, so ``n * 0.5`` was int64;
+                        # the join read that, and C stored 3.5 into an int64
+                        # and returned 3.25 for 3.75.  Rule: Python arithmetic
+                        # on scalars is float when any operand is float, and
+                        # true division always is (the widest float width
+                        # the operands declare, ``_widest_element``).
+                        # ``max``/``min`` return an operand, not a promotion,
+                        # and keep their rule.
+                        scalar_float_operands = tuple(
+                            str(descriptor["dtype"])
+                            for descriptor in parent_descriptors
+                            if str(descriptor.get("dtype") or "") in {
+                                "float", "float16", "float32", "float64",
+                                "double", "f16", "f32", "f64",
+                            }
+                        )
+                        if (
+                            shape == ()
+                            and not any(
+                                int(descriptor.get("rank") or 0)
+                                for descriptor in parent_descriptors
+                            )
+                            and semantic_operation
+                            not in comparison_operations
+                            and operation in {
+                                "add", "sub", "mult", "mul", "floordiv",
+                                "mod", "pow", "div", "truediv",
+                            }
+                            and (
+                                scalar_float_operands
+                                or operation in {"div", "truediv"}
+                            )
+                        ):
+                            from ..common.tensors.topological_reducer import (
+                                _widest_element,
+                            )
+
+                            result_dtype = _widest_element(*(
+                                {"float": "float64", "double": "float64"}
+                                .get(dtype, dtype)
+                                for dtype in scalar_float_operands
+                            )) or "float64"
                         data["tensor"] = {
                             "shape": shape,
-                            "dtype": (
-                                "bool" if (
-                                    operation in comparison_operations
-                                    or semantic_operation
-                                    in comparison_operations
-                                ) else next((
-                                    descriptor["dtype"]
-                                    for descriptor in parent_descriptors
-                                    if tuple(descriptor["shape"])
-                                ), parent_descriptors[0]["dtype"])
-                            ),
+                            "dtype": result_dtype,
                         }
                         # Program: ``def f(a: bool, b: bool): return a + b``.
                         # Wrong record: both bool operands made the scalar
