@@ -10299,7 +10299,8 @@ class _ControlSSABuilder(TiledObject):
         if floats:
             from ..common.tensors.topological_reducer import _widest_element
 
-            return _widest_element(*floats) or "float64"
+            # Every spelling in ``floats`` is a ranked element type.
+            return _widest_element(*floats)
         return "int64"
 
     _INTEGER_WIDTH_BOUNDS = {
