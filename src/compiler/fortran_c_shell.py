@@ -20094,12 +20094,25 @@ def _propagate_native_type_tag_results(
                                         f"payload={int(prior_id)}"
                                     )
                                 claimed[id(prior_payload)] = linked_payload
+                            claimed_ids = {
+                                int(prior_tag.id): int(tag.id),
+                                **linked_payloads,
+                            }
                             for rewrite_block in caller.blocks.values():
                                 for consumer in rewrite_block.instrs:
                                     consumer.args = [
                                         claimed.get(id(argument), argument)
                                         for argument in consumer.args
                                     ]
+                                    # A per-arm region call feeds the arm's
+                                    # payload under its own id.
+                                    if "feed_ids" in consumer.attributes:
+                                        consumer.attributes["feed_ids"] = tuple(
+                                            claimed_ids.get(int(value), int(value))
+                                            for value in consumer.attributes[
+                                                "feed_ids"
+                                            ]
+                                        )
                                     # Program: ``if v is not None: t = v * 3``
                                     # on a value-union call result.  Wrong
                                     # record: the region feed's view of ``v``
