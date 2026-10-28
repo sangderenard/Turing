@@ -18,8 +18,10 @@ over each arm's own payload), which is followed like a Phi.  Anything else --
 the value leaving the program, a comparison, ``//`` or ``%`` with an int,
 a store, ``type()`` -- can tell the classes apart, so it is refused by
 name.  A join or call result that leaves the program, or a function, as
-its value-union frame keeps each arm's exact class; its other readers are
-not built yet.
+its value-union frame keeps each arm's exact class, and so does a region
+the tag dispatches per arm (``_emit_region_call_by_arm``: each copy reads
+its own arm's payload); the readers left here are the ones no per-arm copy
+covers.
 """
 
 from __future__ import annotations
@@ -143,8 +145,10 @@ def refuse_type_visible_numeric_joins(module: Any) -> int:
                         continue
                     if (
                         op in _PASS_THROUGH_OPS
-                        or instruction.attributes.get("binding")
-                        == "numeric_union_call_result"
+                        or instruction.attributes.get("binding") in {
+                            "numeric_union_call_result",
+                            "numeric_union_arm_result",
+                        }
                     ) and instruction.res is not None:
                         pending.append((function_name, int(instruction.res.id)))
                     elif op in _ARITHMETIC_OPS:
@@ -163,6 +167,12 @@ def refuse_type_visible_numeric_joins(module: Any) -> int:
                                 f"is an operand of {op} with an operand not "
                                 f"of its class {join_dtype!r}",
                             )
+                    elif op == "Call" and instruction.attributes.get(
+                        "union_arm_dispatch"
+                    ):
+                        # Called only where the tag names this payload's
+                        # arm: the payload is that arm's exact value there.
+                        continue
                     elif op == "Call":
                         callee = str(instruction.attributes.get("callee"))
                         if callee not in functions:

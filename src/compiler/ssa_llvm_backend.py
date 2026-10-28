@@ -799,15 +799,61 @@ def _unsigned_value(value: _Any) -> bool:
     return layout is not None and layout.kind in {"uint", "bool"}
 
 
+_PYTHON_INT_BUILTINS = frozenset({"builtins.abs", "builtins.sum", "builtins.pow"})
+
+
+_INT64_BOUNDS = (-(1 << 63), (1 << 63) - 1)
+
+
+def python_int_proven_range(instruction: _Any) -> tuple[int, int] | None:
+    """The interval the solver proved for this op's result, else ``None``.
+
+    ``_solve_int_ranges`` stamps it on the source node
+    (``python_int_range``), which the lowered instruction carries.
+    """
+
+    attributes = getattr(instruction, "attributes", None) or {}
+    interval = attributes.get("python_int_range")
+    if interval is None or len(tuple(interval)) != 2:
+        return None
+    low, high = (int(bound) for bound in interval)
+    return (low, high) if low <= high else None
+
+
+def python_int_proven_within(instruction: _Any, bounds: tuple[int, int]) -> bool:
+    """Whether the proven result interval lies inside ``bounds``."""
+
+    interval = python_int_proven_range(instruction)
+    return (
+        interval is not None
+        and bounds[0] <= interval[0] and interval[1] <= bounds[1]
+    )
+
+
 def python_int_overflow_checked(instruction: _Any) -> bool:
     """Whether a scalar op is Python ``int`` arithmetic that must not wrap.
 
     Program: ``a * b`` on ints the interval solver does not bound.  Wrong
     record: the native op wrapped at int64 and returned a value Python never
-    computes.  Rule: authored scalar int64 arithmetic (``source_type`` of a
-    Python expression) is overflow-checked; a proven interval inside int64
-    makes the check unreachable, a proven wider one picks a wider dtype.
-    Compiler-made index and extent arithmetic carries no ``source_type``.
+    computes.  Rule: authored scalar int64 arithmetic with no proven int64
+    interval (``python_int_proven_range``) is overflow-checked; a proven
+    interval inside int64 needs no check, a proven wider one picks a wider
+    dtype.  Compiler-made index and extent arithmetic carries no
+    ``source_type``.
+    """
+
+    return (
+        python_int_operation(instruction)
+        and _python_int_exact()
+        and not python_int_proven_within(instruction, _INT64_BOUNDS)
+    )
+
+
+def python_int_operation(instruction: _Any) -> bool:
+    """Whether a scalar int64 op is authored Python ``int`` arithmetic.
+
+    Proven or not, it keeps Python's semantics: ``>>`` floors, ``//`` and
+    ``%`` by zero raise, a negative shift count raises.
     """
 
     result = getattr(instruction, "res", None)
@@ -816,8 +862,175 @@ def python_int_overflow_checked(instruction: _Any) -> bool:
         result is not None
         and str(getattr(result, "dtype", "")) == "int64"
         and not tuple(getattr(result, "shape", None) or ())
-        and str(attributes.get("source_type") or "")
-        in {"BinOp", "AugAssign", "UnaryOp"}
+        and (
+            str(attributes.get("source_type") or "")
+            in {"BinOp", "AugAssign", "UnaryOp"}
+            # Authored builtins whose int result is Python arithmetic:
+            # ``abs(-2**63)``, ``sum(xs)`` and ``pow(n, 2)`` leave int64.
+            or attributes.get("extraction_identity") in _PYTHON_INT_BUILTINS
+        )
+    )
+
+
+_INT64_MIN = "-9223372036854775808"
+
+
+def _python_int_lines(
+    operation: str, operands: list[str], register: str,
+) -> list[str] | None:
+    """Python's ``<< >> // %`` and ``abs`` on a checked i64, else ``None``.
+
+    Program: ``a << b``, ``a >> b``, ``a // b``, ``a % b``, ``abs(a)`` on
+    ints no interval bounds.  Wrong records: ``shl`` wrapped (and is poison
+    past 63), ``>>`` was ``lshr`` (``-8 >> 1`` gave 2**63 - 4), ``sdiv`` by
+    zero or of ``-2**63 // -1`` trapped the host, ``abs(-2**63)`` wrapped.
+    Rule: Python's value or a named fault -- ``NEGATIVE_SHIFT_COUNT``,
+    ``INT_ZERO_DIVISION``, ``INT_OVERFLOW``; the faulting lanes compute on
+    a safe operand so no instruction is undefined.
+    """
+
+    from .native_faults import INT_ZERO_DIVISION, NEGATIVE_SHIFT_COUNT
+
+    r = register
+    if operation in {"Shl", "Shr"} and len(operands) == 2:
+        value, count = operands
+        lines = [
+            f"{r}.negative = icmp slt i64 {count}, 0",
+            f"call void @turing_int_fault(i1 {r}.negative, "
+            f"i32 {NEGATIVE_SHIFT_COUNT})",
+            f"{r}.inrange = icmp ult i64 {count}, 64",
+        ]
+        if operation == "Shr":
+            # Python ``>>`` floors: arithmetic, and 0 / -1 past 63 bits.
+            return lines + [
+                f"{r}.amount = select i1 {r}.inrange, i64 {count}, i64 63",
+                f"{r} = ashr i64 {value}, {r}.amount",
+            ]
+        return lines + [
+            f"{r}.amount = select i1 {r}.inrange, i64 {count}, i64 0",
+            f"{r} = shl i64 {value}, {r}.amount",
+            f"{r}.back = ashr i64 {r}, {r}.amount",
+            f"{r}.lost = icmp ne i64 {r}.back, {value}",
+            f"{r}.nonzero = icmp ne i64 {value}, 0",
+            f"{r}.far = select i1 {r}.inrange, i1 {r}.lost, i1 {r}.nonzero",
+            f"{r}.counted = xor i1 {r}.negative, true",
+            f"{r}.overflow = and i1 {r}.far, {r}.counted",
+            f"call void @turing_int_overflow(i1 {r}.overflow)",
+        ]
+    if operation in {"FloorDiv", "Mod"} and len(operands) == 2:
+        dividend, divisor = operands
+        lines = [
+            f"{r}.zero = icmp eq i64 {divisor}, 0",
+            f"call void @turing_int_fault(i1 {r}.zero, "
+            f"i32 {INT_ZERO_DIVISION})",
+            f"{r}.minimum = icmp eq i64 {dividend}, {_INT64_MIN}",
+            f"{r}.minus_one = icmp eq i64 {divisor}, -1",
+            f"{r}.wide = and i1 {r}.minimum, {r}.minus_one",
+        ]
+        if operation == "FloorDiv":
+            # -2**63 // -1 == 2**63.  (-2**63 % -1 == 0 needs no report:
+            # the safe divisor 1 below gives exactly that remainder.)
+            lines.append(f"call void @turing_int_overflow(i1 {r}.wide)")
+        lines += [
+            f"{r}.unsafe = or i1 {r}.zero, {r}.wide",
+            f"{r}.divisor = select i1 {r}.unsafe, i64 1, i64 {divisor}",
+        ]
+        floored = integer_scalar_lines(
+            operation, "i64", [dividend, f"{r}.divisor"], r,
+        )
+        assert floored is not None
+        return lines + floored[0]
+    if operation in {"Abs", "abs"} and len(operands) == 1:
+        magnitude = integer_scalar_lines(operation, "i64", operands, r)
+        assert magnitude is not None
+        return magnitude[0] + [
+            f"{r}.overflow = icmp eq i64 {operands[0]}, {_INT64_MIN}",
+            f"call void @turing_int_overflow(i1 {r}.overflow)",
+        ]
+    return None
+
+
+#: The ints a target's integer storage holds exactly.
+INT32_EXACT = (-(1 << 31), (1 << 31) - 1)
+DOUBLE_EXACT = (-(1 << 53), 1 << 53)
+
+
+def python_int_unchecked_refusal(
+    instruction: _Any, target: str, exact: tuple[int, int],
+) -> str | None:
+    """Why ``target`` refuses ``instruction``: Python int arithmetic it can't hold.
+
+    A target whose int storage is 32-bit ``int`` or a double holds exactly
+    the ints in ``exact``.  Python int arithmetic whose result no interval
+    proves inside ``exact`` would return a value Python never computes, so
+    it refuses by name; a proven one lowers as before.
+    """
+
+    if not python_int_operation(instruction) or python_int_proven_within(
+        instruction, exact,
+    ):
+        return None
+    return (
+        f"Python int arithmetic with no interval proven inside {target}'s "
+        f"exact ints [{exact[0]}, {exact[1]}] must not wrap, and {target} has "
+        "no checked int64 spelling (python_int_overflow_checked)"
+    )
+
+
+def _python_int_exact() -> bool:
+    """The numeric contract asks int64 results to stay Python ``int``.
+
+    ``integer_arithmetic`` in the numeric contract
+    (``ssa_call_input_adapters._NUMERIC_CONVERSION_MODES``) is the one switch:
+    ``python_exact`` checks, ``wrap`` computes NumPy's two's-complement lane.
+    """
+
+    from .ssa_call_input_adapters import integer_arithmetic_policy
+
+    return integer_arithmetic_policy() == "python_exact"
+
+
+_LANE_CHECKED_OPERATIONS = frozenset({"add", "sub", "mul", "neg", "abs"})
+
+
+def python_int_lane_overflow_checked(
+    instruction: _Any, *, operation: str | None = None,
+) -> bool:
+    """Whether an elementwise int64 tensor op must fault instead of wrapping.
+
+    Program: ``token * 1103515245 + 12345`` on an int64 AbstractTensor.
+    Wrong record: every lane wrapped at int64 on C and LLVM, so a lane
+    leaving int64 returned a value Python's ``int`` never computes.  Rule:
+    under the numeric contract's ``integer_arithmetic: python_exact``, authored (``source_type``)
+    signed int64 Add/Sub/Mul/Neg/Abs over a span checks every lane and
+    reports code 86.  No interval proves a lane's range, so every such lane
+    is checked.  The scalar rule is ``python_int_overflow_checked``.
+    """
+
+    result = getattr(instruction, "res", None)
+    attributes = getattr(instruction, "attributes", None) or {}
+    from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+
+    operation = str(operation or getattr(instruction, "op", "") or "")
+    operation = TENSOR_OPERATION_SCALAR_SPELLING.get(
+        operation.casefold(), operation,
+    )
+    return (
+        result is not None
+        and operation.casefold() in _LANE_CHECKED_OPERATIONS
+        and str(getattr(result, "dtype", "")).casefold() == "int64"
+        and not _unsigned_value(result)
+        and bool(
+            tuple(getattr(result, "shape", None) or ())
+            or _declared_span_rank(result) > 0
+        )
+        and (
+            str(attributes.get("source_type") or "")
+            in {"BinOp", "AugAssign", "UnaryOp", "Call"}
+            # ``abs(tokens)`` is the authored builtin, ingested as such.
+            or attributes.get("extraction_identity") == "builtins.abs"
+        )
+        and _python_int_exact()
     )
 
 
@@ -826,19 +1039,37 @@ def integer_scalar_lines(
     operand_type: str,
     operands: list[str],
     register: str,
-    *, unsigned: bool = False, checked: bool = False,
+    *, unsigned: bool = False, checked: bool = False, proven: bool = False,
+    saturating: bool = False,
 ) -> tuple[list[str], str] | None:
     """(lines, result type) for an integer-domain scalar op, else ``None``.
 
     ``None`` means this opcode has no exact integer spelling; the caller
     decides whether that is a shortfall or a documented double-domain
     evaluation converted back to the declared integer type.  ``checked``
-    (``python_int_overflow_checked``) spells signed i64 ``Add``/``Sub``/
-    ``Mul``/``Neg`` with the overflow intrinsics and reports an overflow.
+    (``python_int_operation``) spells Python's ``<< >> // %`` on a signed
+    i64, and -- unless ``proven`` (an interval inside int64) -- signed
+    ``Add``/``Sub``/``Mul``/``Neg``/``Abs`` with the overflow intrinsics,
+    reporting an overflow.
     """
 
     if (
-        checked and not unsigned and operand_type == "i64"
+        saturating and not unsigned and operand_type == "i64"
+        and operation == "Add" and len(operands) == 2
+    ):
+        # A range loop's induction step (``loop_induction_step``).
+        return ([
+            f"{register} = call i64 @llvm.sadd.sat.i64"
+            f"(i64 {operands[0]}, i64 {operands[1]})",
+        ], operand_type)
+    if checked and not unsigned and operand_type == "i64" and not (
+        proven and operation in {"Abs", "abs"}
+    ):
+        python_lines = _python_int_lines(operation, operands, register)
+        if python_lines is not None:
+            return python_lines, operand_type
+    if (
+        checked and not proven and not unsigned and operand_type == "i64"
         and (
             (operation in _CHECKED_INTEGER_INTRINSICS and len(operands) == 2)
             or (operation == "Neg" and len(operands) == 1)
@@ -1073,6 +1304,8 @@ exit:
     "turing_validation_error": (
         "declare void @turing_validation_error(i32)"
     ),
+    # A range loop's induction step saturates (``loop_induction_step``).
+    "llvm.sadd.sat.i64": "declare i64 @llvm.sadd.sat.i64(i64, i64)",
     **{
         f"llvm.{name}.with.overflow.i64": (
             f"declare {{i64, i1}} @llvm.{name}.with.overflow.i64(i64, i64)"
@@ -1081,6 +1314,17 @@ exit:
     },
     # Python ``int`` never wraps.  An unproven int64 result that left int64
     # is reported (native_faults.INT_OVERFLOW) instead of returned wrapped.
+    # Python's other int exceptions (native_faults NEGATIVE_SHIFT_COUNT,
+    # INT_ZERO_DIVISION): report ``code`` when ``fault`` holds.
+    "turing_int_fault": """define internal void @turing_int_fault(i1 %fault, i32 %code) {
+entry:
+  br i1 %fault, label %report, label %exit
+report:
+  call void @turing_validation_error(i32 %code)
+  br label %exit
+exit:
+  ret void
+}""",
     "turing_int_overflow": f"""define internal void @turing_int_overflow(i1 %overflow) {{
 entry:
   br i1 %overflow, label %report, label %exit
@@ -5087,10 +5331,30 @@ def _emit_repository_call_module(
                     # times a scalar reached ``fmul double`` with i64
                     # operands. The scalar emitter already owns the integer
                     # law; span rank changes the sweep, not the declared dtype.
-                    integer = integer_scalar_lines(
-                        operation, compute_type, operands, computed,
-                        unsigned=_unsigned_value(instruction.args[0]),
+                    lane_checked = (
+                        compute_type == "i64"
+                        and python_int_lane_overflow_checked(instruction)
                     )
+                    if lane_checked and operation in {"Abs", "abs"}:
+                        # |x| leaves int64 only at INT64_MIN, the one lane
+                        # whose checked negation reports.
+                        negated = integer_scalar_lines(
+                            "Neg", compute_type, operands,
+                            f"{computed}.neg", checked=True,
+                        )
+                        integer = None if negated is None else ([
+                            *negated[0],
+                            f"{computed}.below = icmp slt i64 "
+                            f"{operands[0]}, 0",
+                            f"{computed} = select i1 {computed}.below, "
+                            f"i64 {computed}.neg, i64 {operands[0]}",
+                        ], compute_type)
+                    else:
+                        integer = integer_scalar_lines(
+                            operation, compute_type, operands, computed,
+                            unsigned=_unsigned_value(instruction.args[0]),
+                            checked=lane_checked,
+                        )
                     if integer is None:
                         shortfalls.append(LLVMEmissionShortfall(
                             name, operation,
@@ -5313,7 +5577,18 @@ def _emit_repository_call_module(
                 )
                 body.append(f"{loop_body}:")
                 item = element(index, "row")
-                if operation == "sum":
+                if (
+                    operation == "sum" and accumulator_type == "i64"
+                    and not _unsigned_value(result)
+                    and python_int_overflow_checked(instruction)
+                ):
+                    # ``sum(xs)`` of Python ints: each step is int ``+``.
+                    body.extend(
+                        f"  {line}" for line in integer_scalar_lines(
+                            "Add", "i64", [acc, item], acc_next, checked=True,
+                        )[0]
+                    )
+                elif operation == "sum":
                     body.append(
                         f"  {acc_next} = {'fadd' if floating else 'add'} "
                         f"{accumulator_type} {acc}, {item}"
@@ -5472,7 +5747,10 @@ def _emit_repository_call_module(
                     integer = integer_scalar_lines(
                         operation, operand_type, operands, register,
                         unsigned=compute_unsigned,
-                        checked=python_int_overflow_checked(instruction),
+                        checked=python_int_operation(instruction),
+                        proven=not python_int_overflow_checked(instruction),
+                        saturating=(instruction.attributes or {}).get("binding")
+                        == "loop_induction_step",
                     )
                     if integer is None:
                         shortfalls.append(LLVMEmissionShortfall(
@@ -8037,7 +8315,10 @@ def emit_ssa_function_to_llvm(
                     None if domain == "double"
                     else integer_scalar_lines(
                         str(operation), domain, operands, register,
-                        checked=python_int_overflow_checked(instruction),
+                        checked=python_int_operation(instruction),
+                        proven=not python_int_overflow_checked(instruction),
+                        saturating=(instruction.attributes or {}).get("binding")
+                        == "loop_induction_step",
                     )
                 )
                 if integer is not None:

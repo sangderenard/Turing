@@ -5676,6 +5676,17 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
     posted: list = []
     for key, (class_cell, _identity) in class_cells.items():
         interval = state.get(find(key))
+        # The node's lowered instruction carries its proof
+        # (``python_int_range``): a native lane checks or refuses only
+        # Python int arithmetic no interval bounds.
+        for unit, node_id in members[key]:
+            node_attributes = unit.G.nodes[node_id].setdefault("attributes", {})
+            if interval is None or interval == _INT_RANGE_TOP:
+                node_attributes.pop("python_int_range", None)
+            else:
+                node_attributes["python_int_range"] = (
+                    int(interval[0]), int(interval[1]),
+                )
         if interval is None or interval == _INT_RANGE_TOP:
             continue
         incumbent = range_page.latest(key)
@@ -10928,7 +10939,19 @@ def _normalize_lexical_values(
                                 ))),
                                 mode=_Mode.CONCORD,
                             )
-            callee = resolved_call_argument(expression.func)
+            # ``np.asarray(xs)``: ingestion rewrote the frontend-qualified
+            # callee to the neutral AbstractTensor operation's bare name
+            # (``tensor``) and the call carries that operation.  The name is
+            # the operation's spelling, not a binding: reading it would mint
+            # a free external Input that no program bound.
+            callee = (
+                None
+                if isinstance(expression.func, ast.Name)
+                and getattr(
+                    expression, "_abstract_tensor_frontend_reference", None,
+                ) == expression.func.id
+                else resolved_call_argument(expression.func)
+            )
             if isinstance(callee, _StaticPythonReference) and node_id in graph.G:
                 identity_target = (
                     callee.value.__func__

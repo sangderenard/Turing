@@ -851,8 +851,16 @@ def emit_ssa_module_to_glsl_compute(
             ))
         return held
 
+    from .ssa_llvm_backend import INT32_EXACT, python_int_unchecked_refusal
+
     for instruction in region.blocks["entry"].instrs:
         op = str(instruction.op)
+        unchecked = python_int_unchecked_refusal(
+            instruction, "GLSL int", INT32_EXACT,
+        )
+        if unchecked is not None:
+            shortfalls.append(GLSLComputeShortfall(op, unchecked))
+            continue
         section = bool(instruction.attributes.get("precision_section"))
         if section:
             precision_present = True
