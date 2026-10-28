@@ -1,4 +1,4 @@
-def root(n: int) -> int:
+def root(n):
     g = [[0, 0, 0], [0, 0, 0]]
     for k in range(n):
         g[k % 2][k % 3] = g[k % 2][k % 3] + k + 1

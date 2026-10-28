@@ -170,6 +170,7 @@ from .resident_sequence_materialization import (
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
     _loop_carried_storage_aliases as _loop_carried_storage_aliases,
     _promote_conditional_sequence_aliases as _promote_conditional_sequence_aliases,
+    _retarget_forwarded_sequence_effects as _retarget_forwarded_sequence_effects,
     _sequence_append_call_mutations as _sequence_append_call_mutations,
     _source_mapping_mutations as _source_mapping_mutations,
     _source_glyph_sequence_materializations as _source_glyph_sequence_materializations,
@@ -17783,6 +17784,16 @@ def _sequence_row_operations(
             else None
         )
 
+    # Program: ``xs[k] if k < 2 else 0`` specialized at ``k = 5`` (corpus
+    # c824).  Wrong record: the fold kept the dead arm's ``Indexed`` node, and
+    # its row load, now checked, raised IndexError for a read Python never
+    # makes.  Rule: a read nothing consumes and no return publishes is not a
+    # row load.
+    returned_ids = {
+        int(slot)
+        for slots in (graph_obj.graph.get("return_slot_values") or {}).values()
+        for slot in slots if slot is not None
+    }
     operations: list[tuple[Any, ...]] = []
     for node_id, data in sorted(graph_obj.nodes(data=True)):
         kind = str(data.get("op") or data.get("type") or "").casefold()
@@ -17791,6 +17802,12 @@ def _sequence_row_operations(
             outer_id = node_roles.get("base")
             column_node = node_roles.get("index")
             if outer_id is None or column_node is None:
+                continue
+            if (
+                not any(True for _ in graph_obj.successors(node_id))
+                and value_id(node_id) not in returned_ids
+                and int(node_id) not in returned_ids
+            ):
                 continue
             # Program: ``ys = xs[1:n]; sum(ys)`` (scratch c204).  Wrong
             # record: the slice was collected as a one-row load at index
@@ -17855,6 +17872,24 @@ def _sequence_row_operations(
                 sequence_id in positional_sequences
                 and widths[sequence_id] == 1
                 and value_id(base_node) in nested_row_reads
+            ):
+                operations.append((
+                    "store", value_id(node_id), int(sequence_id),
+                    value_id(row_index_node), integer_literal(row_index_node),
+                    (value_id(row_value_node),), value_id(base_node),
+                ))
+                continue
+            # Program: ``xs = [1, 2, 3]; xs[n] = 9`` with ``n`` out of range.
+            # Wrong record: the scalar store fell through to the region, a
+            # bare pointer write past the list (heap corruption).  Rule: a
+            # store into a one-column list is a row store, checked as a read
+            # is (``IndexError``, validation code 71).
+            if (
+                sequence_id in positional_sequences
+                and widths[sequence_id] == 1
+                and value_id(base_node) == sequence_id
+                and (graph_obj.nodes[row_value_node].get("attributes") or {})
+                .get("aggregate_kind") is None
             ):
                 operations.append((
                     "store", value_id(node_id), int(sequence_id),
@@ -27655,6 +27690,16 @@ def _class_surface_ssa_program(
                         int(entry.reference.address)
                     ] = candidates[0]
         callsite_shells = getattr(shell, "callsite_function_shells", {})
+        # The callee each call actually runs is its callsite's specialized
+        # copy; identity forwarding reads that copy, not the shared callee.
+        callsite_callee_graphs = {
+            int(callsite_id): child_graph
+            for callsite_id, child_shell in callsite_shells.items()
+            for child_graph in (getattr(
+                getattr(child_shell, "process_graph", None), "G", None,
+            ),)
+            if child_graph is not None
+        }
         transformed_call_source_ids: set[int] = set()
         transformed_parameters_by_reference: dict[int, set[int]] = {}
         for planned_call in local_plan_calls:
@@ -27796,6 +27841,7 @@ def _class_surface_ssa_program(
         returned_formal_sequence_aliases = _returned_formal_sequence_aliases(
             graph_obj, source_function_table,
             call_result_kinds=sequence_call_result_kinds,
+            callsite_graphs=callsite_callee_graphs,
         )
         (
             control,
@@ -27815,6 +27861,9 @@ def _class_surface_ssa_program(
             **returned_formal_sequence_aliases,
             **conditional_sequence_aliases,
         }
+        control = _retarget_forwarded_sequence_effects(
+            control, returned_formal_sequence_aliases,
+        )
         (
             sequence_concats,
             sequence_concat_aliases,
@@ -28806,7 +28855,7 @@ def _class_surface_ssa_program(
             graph_obj.graph.get("parameter_record_abi") or {}
         )
         descriptor_element_dtypes: dict[int, str] = {}
-        parameter_result_aliases = _identity_return_aliases(graph_obj, source_function_table)
+        parameter_result_aliases = _identity_return_aliases(graph_obj, source_function_table, callsite_callee_graphs)
         for record_parameter, record in declared_parameter_records.items():
             owner_ids = set(map(
                 int, identities.get(str(record_parameter), ())
@@ -28990,7 +29039,7 @@ def _class_surface_ssa_program(
         scalar_writes = []
         scalar_write_sources = set()
         scalar_write_effect_ids = set()
-        returned_parameter_aliases = _identity_return_aliases(graph_obj, source_function_table)
+        returned_parameter_aliases = _identity_return_aliases(graph_obj, source_function_table, callsite_callee_graphs)
         for parameter, record in declared_parameter_records.items():
             receivers = set(map(int, identities.get(str(parameter), ())))
             receivers.update(alias for alias, original in returned_parameter_aliases.items()
@@ -29512,6 +29561,7 @@ def _class_surface_ssa_program(
             (_loop_carried_storage_aliases(graph_obj), None),
             (_identity_return_aliases(
                 graph_obj, getattr(graph, "function_table", None),
+                callsite_callee_graphs,
             ), None),
             # Enum.value changes semantic class to the declaration's value
             # type while retaining the Enum receiver's fixed-width resident
@@ -30063,6 +30113,10 @@ def _class_surface_ssa_program(
             _GraphView(G=graph_obj)
         )
 
+        from ..common.tensors.topological_reducer import (
+            _source_numeric_scope as _int_range_scope,
+        )
+
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -30076,6 +30130,7 @@ def _class_surface_ssa_program(
                 native_object_type_tests=native_type_tests,
                 native_value_type_abi=native_value_type_abi,
                 native_value_type_tests=native_value_type_tests,
+                int_range_scope=_int_range_scope(graph_obj),
                 callsite_stored_argument_ids=callsite_stored_argument_ids,
                 identity_table=dict(graph_obj.graph.get("identity_table") or {}),
                 function_outputs=tuple(
@@ -43771,6 +43826,10 @@ def _class_surface_ssa_program(
         for block in function.blocks.values():
             for instruction in block.instrs:
                 if instruction.op not in {"Ret", "ret", "Return", "return"}:
+                    continue
+                if instruction.attributes.get("fault_exit"):
+                    # The zero outputs of a checked index's fault exit are
+                    # not the source outputs; there is nothing to settle.
                     continue
                 by_id = {
                     int(argument.id): argument
