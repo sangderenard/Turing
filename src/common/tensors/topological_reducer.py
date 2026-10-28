@@ -7131,6 +7131,10 @@ def _normalize_lexical_values(
     }
 
     local_class_declarations: dict[str, tuple[str, Any]] = {}
+    # Locals whose declaration is ``C | None``: ``local_class_declarations``
+    # holds the present arm ``C`` (what a presence refinement proves), never
+    # the class of every value the local binds.
+    local_optional_class_declarations: set[str] = set()
     local_sequence_element_declarations: dict[str, tuple[str, Any]] = {}
     source_identity = getattr(statement, "_python_source_identity", None)
     function_identity = (
@@ -7204,6 +7208,7 @@ def _normalize_lexical_values(
             annotation_members = [annotation_expression]
             class_identities = []
             valid_class_annotation = True
+            admits_none = False
             while annotation_members:
                 member = annotation_members.pop()
                 if isinstance(member, ast.BinOp) and isinstance(
@@ -7215,6 +7220,7 @@ def _normalize_lexical_values(
                 ) or (
                     isinstance(member, ast.Name) and member.id == "None"
                 ):
+                    admits_none = True
                     continue
                 elif (
                     isinstance(member, ast.Name)
@@ -7249,6 +7255,43 @@ def _normalize_lexical_values(
                 annotation,
                 annotation_cell,
             )
+            if admits_none:
+                local_optional_class_declarations.add(name)
+
+    def concord_local_class_declaration(name: str, value_id: int) -> None:
+        class_identity, annotation_cell = local_class_declarations[name]
+        class_sources = tuple(filter(None, (
+            node_identity_cell(graph, int(value_id)),
+            annotation_cell,
+        )))
+        if name in local_optional_class_declarations:
+            # Program: ``minted: int | None = None`` (c930, and
+            # ``IdentityBook._post`` in the bootstrap).  Wrong record: the
+            # declaration posted the present arm ``int`` as the class of
+            # the bound ``None`` literal.  Rule: a ``C | None`` declaration
+            # names two classes; it concords with the class the value's own
+            # producer posted when that is one of them, and claims nothing
+            # for a value whose class is not yet recorded.
+            from ...compiler.concordance_declarations import (
+                SOURCE_VALUE_CLASS,
+            )
+
+            incumbent = current_identity_book().page(
+                SOURCE_VALUE_CLASS
+            ).latest((value_class_scope, int(value_id)))
+            if incumbent is None:
+                return
+            if _canonical_source_class_identity(
+                incumbent[0]
+            ) == "builtins.NoneType":
+                class_identity = "builtins.NoneType"
+        _concord_source_value_class(
+            value_class_scope,
+            int(value_id),
+            class_identity,
+            source=f"authored local annotation {name}",
+            provenance=_Derived(class_sources) if class_sources else None,
+        )
 
     def annotation_aggregate_kind(annotation: ast.AST | None) -> str | None:
         if isinstance(annotation, ast.Name) and annotation.id in {
@@ -8691,7 +8734,9 @@ def _normalize_lexical_values(
                             {"result_class_ref": local_class_declarations[
                                 target.id
                             ][0]}
-                            if target.id in local_class_declarations else {}
+                            if target.id in local_class_declarations
+                            and target.id
+                            not in local_optional_class_declarations else {}
                         ),
                         **(
                             {
@@ -8719,20 +8764,7 @@ def _normalize_lexical_values(
                     target.id
                 )
                 if local_class_declaration is not None:
-                    class_identity, annotation_cell = local_class_declaration
-                    class_sources = tuple(filter(None, (
-                        node_identity_cell(graph, int(value)),
-                        annotation_cell,
-                    )))
-                    _concord_source_value_class(
-                        value_class_scope,
-                        int(value),
-                        class_identity,
-                        source=f"authored local annotation {target.id}",
-                        provenance=(
-                            _Derived(class_sources) if class_sources else None
-                        ),
-                    )
+                    concord_local_class_declaration(target.id, int(value))
                 loop_target_bindings_by_ast[target_identity] = value
                 identity_bindings.setdefault(target.id, []).append(value)
                 # The loop target's ``name_binding`` row: DERIVED from the
@@ -14793,23 +14825,11 @@ def _normalize_lexical_values(
                     })
             local_class_declaration = local_class_declarations.get(target.id)
             if local_class_declaration is not None and int(value) in graph.G:
-                class_identity, annotation_cell = local_class_declaration
-                graph.G.nodes[int(value)].setdefault(
-                    "attributes", {}
-                )["result_class_ref"] = class_identity
-                class_sources = tuple(filter(None, (
-                    node_identity_cell(graph, int(value)),
-                    annotation_cell,
-                )))
-                _concord_source_value_class(
-                    value_class_scope,
-                    int(value),
-                    class_identity,
-                    source=f"authored local annotation {target.id}",
-                    provenance=(
-                        _Derived(class_sources) if class_sources else None
-                    ),
-                )
+                if target.id not in local_optional_class_declarations:
+                    graph.G.nodes[int(value)].setdefault(
+                        "attributes", {}
+                    )["result_class_ref"] = local_class_declaration[0]
+                concord_local_class_declaration(target.id, int(value))
             source_binding = None
             source_version = None
             if isinstance(value_occurrence, ast.Name):
