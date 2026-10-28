@@ -36,6 +36,18 @@ SCHEMA = "turing-compiled-program-api-v1"
 _C_TYPES: dict[str, tuple[str, str]] = c_abi_type_table()
 
 
+def is_frame_workspace(value: SSAValue, source_name: str | None = None) -> bool:
+    """Whether the existing ABI assigns this storage to one entry frame."""
+    accounting = dict(value.accounting or {})
+    return (
+        source_name is None
+        and not accounting.get("program_abi_parameter")
+        and any(accounting.get(key) is not None for key in (
+            "linked_call_frame_storage", "returned_record_storage", "compiler_frame_storage",
+        ))
+    )
+
+
 @dataclass(frozen=True)
 class Parameter:
     """One dummy argument, in declaration order."""
@@ -63,6 +75,10 @@ class Parameter:
     # projection is part of the public ABI contract; wrappers must not infer
     # it from an anonymous SSA spelling or silently supply a placeholder.
     source_transform: str | None = None
+    # Physical element order at the ABI boundary.  Ordinary shaped Fortran
+    # dummies are column-major.  Repository SSA tensor arenas retain their
+    # declared dense row-major layout even when passed through such a dummy.
+    layout: str | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         mapping: dict[str, Any] = {
@@ -83,6 +99,8 @@ class Parameter:
             mapping["source_name"] = self.source_name
         if self.source_transform is not None:
             mapping["source_transform"] = self.source_transform
+        if self.layout is not None:
+            mapping["layout"] = self.layout
         return mapping
 
 
@@ -157,6 +175,18 @@ def _c_type_for(dtype: str | None) -> tuple[str, str]:
     return c_abi_type(dtype)
 
 
+def _recorded_dtype(value: SSAValue) -> str:
+    """The dtype the pipeline settled for ``value``; refuse a missing one."""
+
+    if not value.dtype:
+        raise ValueError(
+            f"compiled program ABI: parameter value %t{int(value.id)} has "
+            "no recorded dtype; the pipeline never settled its type, so the "
+            "ABI refuses to invent one"
+        )
+    return str(value.dtype)
+
+
 def describe_fortran_function(
     name: str,
     function: Function,
@@ -173,6 +203,7 @@ def describe_fortran_function(
     reference_argument_ids: Iterable[int] = (),
     value_dtypes: Mapping[int, str] | None = None,
     value_shapes: Mapping[int, Sequence[int]] | None = None,
+    value_layouts: Mapping[int, str] | None = None,
 ) -> EntryPoint:
     """Describe one emitted Fortran subroutine's calling contract.
 
@@ -218,7 +249,7 @@ def describe_fortran_function(
     output_ids = {value.id for value in outputs}
     for occurrence in function.args:
         value = declared(occurrence)
-        c_type, ctypes_name = _c_type_for(value.dtype)
+        c_type, ctypes_name = _c_type_for(_recorded_dtype(value))
         dynamic_extent = dynamic_array_extents.get(int(value.id))
         array = (
             bool(value.shape)
@@ -231,15 +262,7 @@ def describe_fortran_function(
             authored_source_name = str(accounting["program_abi_parameter"])
             if accounting.get("program_abi_field"):
                 authored_source_name += "." + str(accounting["program_abi_field"])
-        workspace = (
-            authored_source_name is None
-            and not accounting.get("program_abi_parameter")
-            and (
-                accounting.get("linked_call_frame_storage") is not None
-                or accounting.get("returned_record_storage") is not None
-                or accounting.get("compiler_frame_storage") is not None
-            )
-        )
+        workspace = is_frame_workspace(value, authored_source_name)
         if str(value.dtype) == "ptr" and (
             accounting.get("heap_owner")
             or accounting.get("heap_element_dtype") is not None
@@ -273,7 +296,7 @@ def describe_fortran_function(
                     if workspace
                     else "inout" if int(value.id) in output_ids else "input"
                 ),
-                dtype=str(value.dtype or "float64"),
+                dtype=_recorded_dtype(value),
                 c_type=c_type,
                 ctypes_name=ctypes_name,
                 # A scalar dummy is declared `value` by the emitter; an array
@@ -300,19 +323,20 @@ def describe_fortran_function(
                 extents=dimensions,
                 source_name=authored_source_name,
                 source_transform=source_transforms.get(int(value.id)),
+                layout=(value_layouts or {}).get(int(value.id)),
             )
         )
     for value in outputs:
         if value.id in {argument.id for argument in function.args}:
             continue
-        c_type, ctypes_name = _c_type_for(value.dtype)
+        c_type, ctypes_name = _c_type_for(_recorded_dtype(value))
         dimensions = dynamic_array_dimensions.get(int(value.id), ()) or tuple(
             f"extent_{int(size)}" for size in value.shape)
         parameters.append(
             Parameter(
                 name=f"t{value.id}",
                 role="output",
-                dtype=str(value.dtype or "float64"),
+                dtype=_recorded_dtype(value),
                 c_type=c_type,
                 ctypes_name=ctypes_name,
                 passing="reference",
@@ -330,6 +354,7 @@ def describe_fortran_function(
                 extents=dimensions,
                 source_name=source_names.get(int(value.id)),
                 source_transform=source_transforms.get(int(value.id)),
+                layout=(value_layouts or {}).get(int(value.id)),
             )
         )
     return EntryPoint(

@@ -120,6 +120,530 @@ def _callee_spelling(callee: Mapping[str, Any] | None) -> str:
     return ".".join(_callee_parts(callee))
 
 
+#: Nodes whose ``break``/``continue`` do not leave an enclosing loop.
+_OPAQUE_TO_LOOP_EXITS = frozenset({
+    "ForStatement", "WhileStatement", "DoWhileStatement", "ForInStatement",
+    "ForOfStatement", "SwitchStatement", "FunctionDeclaration",
+    "FunctionExpression", "ArrowFunctionExpression",
+})
+
+
+_FUNCTION_NODES = frozenset({
+    "FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression",
+})
+
+
+def _loop_of(statement: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The ``for``/``while`` loop ``statement`` is, or labels; else None."""
+
+    kind = statement.get("type")
+    if kind in {"ForStatement", "WhileStatement"}:
+        return statement
+    if kind == "LabeledStatement":
+        body = statement.get("body") or {}
+        if body.get("type") in {"ForStatement", "WhileStatement"}:
+            return body
+    return None
+
+
+def _return_names(loop: Mapping[str, Any]) -> tuple[str, str]:
+    """The hidden return flag and result of the loop at ``loop``."""
+
+    position = f"{loop.get('start')}:{loop.get('end')}"
+    return f"%return@{position}", f"%result@{position}"
+
+
+def _return_check(loop: Mapping[str, Any]) -> dict[str, Any]:
+    """``if (returned) { return result; }`` following a loop that returns."""
+
+    flag, result = _return_names(loop)
+    at = {"start": loop.get("end"), "end": loop.get("end")}
+    return {
+        "type": "IfStatement", **at,
+        "test": {"type": "Identifier", "name": flag, **at},
+        "consequent": {
+            "type": "BlockStatement", **at,
+            "body": [{
+                "type": "ReturnStatement", **at,
+                "argument": {"type": "Identifier", "name": result, **at},
+            }],
+        },
+        "alternate": None,
+    }
+
+
+def _at(source: Mapping[str, Any]) -> dict[str, Any]:
+    return {"start": source.get("start"), "end": source.get("end")}
+
+
+def _flag_assignment(
+    name: str,
+    source: Mapping[str, Any],
+    value: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """``name = true;`` standing for an exit (or ``name = value;``)."""
+
+    right = value if value is not None else {
+        "type": "Literal", "value": True, **_at(source),
+    }
+    return {
+        "type": "ExpressionStatement", **_at(source),
+        "expression": {
+            "type": "AssignmentExpression", "operator": "=", **_at(source),
+            "left": {"type": "Identifier", "name": name, **_at(source)},
+            "right": right,
+        },
+    }
+
+
+def _flag_declaration(name: str, source: Mapping[str, Any]) -> dict[str, Any]:
+    """``let name = false;`` opening each iteration's body."""
+
+    return {
+        "type": "VariableDeclaration", "kind": "let", **_at(source),
+        "declarations": [{
+            "type": "VariableDeclarator", **_at(source),
+            "id": {"type": "Identifier", "name": name, **_at(source)},
+            "init": {"type": "Literal", "value": False, **_at(source)},
+        }],
+    }
+
+
+def _flags_clear(names: Any, source: Mapping[str, Any]) -> dict[str, Any]:
+    """``!a && !b ...`` over the hidden exit flags."""
+
+    test: dict[str, Any] | None = None
+    for name in names:
+        clear = {
+            "type": "UnaryExpression", "operator": "!", "prefix": True,
+            **_at(source),
+            "argument": {"type": "Identifier", "name": name, **_at(source)},
+        }
+        test = clear if test is None else {
+            "type": "LogicalExpression", "operator": "&&", **_at(source),
+            "left": test, "right": clear,
+        }
+    assert test is not None
+    return test
+
+
+#: Identifier fields that name no binding: labels and dotted property names.
+_NOT_REFERENCES = frozenset({"label", "property", "key"})
+
+
+def _var_as_let(
+    statements: Sequence[Mapping[str, Any]],
+    parameters: frozenset[str],
+) -> list[Mapping[str, Any]]:
+    """``var`` declarations rewritten into ``let`` where the two agree.
+
+    A ``var`` is function scoped and hoisted (undefined until its
+    declaration runs); a ``let`` is block scoped.  Without closures the two
+    read alike when the first declaration of a name has an initializer and
+    every read and later declaration of the name lies after it, inside the
+    statement list that holds it.  That first declaration becomes a
+    ``let`` (a ``for (var ...)`` initializer is hoisted to a ``let`` just
+    before its loop, which still holds every read), later declarations
+    become assignments (``var x;`` alone is dropped), and a declaration of
+    a parameter is an assignment.  Any other ``var`` is left alone, and the
+    interpreter refuses it.
+    """
+
+    declarations: dict[str, list[tuple[int, int, tuple[int, ...], bool]]] = {}
+    references: dict[str, list[tuple[int, tuple[int, ...]]]] = {}
+    lexical: set[str] = set()
+
+    def visit(item: Any, lists: tuple[int, ...], field: str | None) -> None:
+        if isinstance(item, list):
+            if field in {"body", "consequent"} and all(
+                isinstance(child, Mapping) for child in item
+            ):
+                lists = (*lists, id(item))
+            for child in item:
+                visit(child, lists, None)
+            return
+        if not isinstance(item, Mapping):
+            return
+        kind = item.get("type")
+        if kind in _FUNCTION_NODES:
+            return
+        if kind == "Identifier":
+            if field not in _NOT_REFERENCES:
+                references.setdefault(str(item.get("name")), []).append(
+                    (int(item.get("start") or 0), lists),
+                )
+            return
+        if kind == "MemberExpression" and not item.get("computed"):
+            visit(item.get("object"), lists, "object")
+            return
+        if kind == "VariableDeclaration":
+            for declarator in item.get("declarations", ()):
+                target = declarator.get("id") or {}
+                if target.get("type") != "Identifier":
+                    continue
+                name = str(target.get("name"))
+                if item.get("kind") != "var":
+                    lexical.add(name)
+                    continue
+                declarations.setdefault(name, []).append((
+                    int(target.get("start") or 0),
+                    int(declarator.get("end") or 0), lists,
+                    declarator.get("init") is not None,
+                ))
+            for declarator in item.get("declarations", ()):
+                visit(declarator.get("init"), lists, "init")
+            return
+        for key, child in item.items():
+            if key not in {"type", "start", "end"}:
+                visit(child, lists, key)
+
+    root = list(statements)
+    visit(root, (), "body")
+    lets: set[str] = set()
+    for name, found in declarations.items():
+        if name in parameters or name in lexical:
+            continue
+        start, end, lists, initialized = min(found, key=lambda entry: entry[0])
+        scope = lists[-1] if lists else None
+        if initialized and scope is not None and all(
+            scope in where and position >= end
+            for position, where in (
+                *references.get(name, ()),
+                *((entry[0], entry[2]) for entry in found if entry[0] != start),
+            )
+        ):
+            lets.add(name)
+    if not declarations:
+        return root
+    first: dict[str, int] = {
+        name: min(entry[0] for entry in declarations[name]) for name in lets
+    }
+
+    def rewrite(declaration: Mapping[str, Any]) -> list[Mapping[str, Any]] | None:
+        """The statements a ``var`` becomes, or None to leave it."""
+
+        out: list[Mapping[str, Any]] = []
+        for declarator in declaration.get("declarations", ()):
+            target = declarator.get("id") or {}
+            name = str(target.get("name"))
+            initializer = declarator.get("init")
+            if name in lets and int(target.get("start") or 0) == first[name]:
+                out.append({
+                    **declaration, "kind": "let", "declarations": [declarator],
+                })
+            elif name in lets or name in parameters:
+                if initializer is not None:
+                    out.append(_flag_assignment(name, declarator, initializer))
+            else:
+                return None
+        return out
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, list):
+            result: list[Any] = []
+            for child in item:
+                if isinstance(child, Mapping) and child.get("type") == "VariableDeclaration" and child.get("kind") == "var":
+                    replaced = rewrite(child)
+                    result.extend([child] if replaced is None else replaced)
+                    continue
+                loop = _loop_of(child) if isinstance(child, Mapping) else None
+                initializer = (loop or {}).get("init") or {}
+                if (
+                    initializer.get("type") == "VariableDeclaration"
+                    and initializer.get("kind") == "var"
+                ):
+                    replaced = rewrite(initializer)
+                    if replaced is not None and all(
+                        statement.get("type") == "VariableDeclaration"
+                        for statement in replaced
+                    ):
+                        result.extend(replaced)
+                        child = _without_init(child)
+                result.append(walk(child))
+            return result
+        if isinstance(item, Mapping):
+            if item.get("type") in _FUNCTION_NODES:
+                return item
+            return {key: walk(child) for key, child in item.items()}
+        return item
+
+    return walk(root)
+
+
+def _without_init(statement: Mapping[str, Any]) -> dict[str, Any]:
+    """``statement`` (a ``for`` loop or a label on one) with no initializer."""
+
+    if statement.get("type") == "LabeledStatement":
+        return {**statement, "body": _without_init(statement["body"])}
+    return {**statement, "init": None}
+
+
+def _do_as_while(statements: Sequence[Mapping[str, Any]]) -> list[Any]:
+    """Every ``do body while (test)`` rewritten into a ``while`` loop.
+
+    ``let %first = true; while (%first || !!test) { %first = false; body }``
+    runs the body once before the first test, and a ``continue`` in the
+    body (a flag the loop rewrite guards the rest of the body with) still
+    reaches the test.  Positions are the do loop's, so its hidden flags
+    keep their keys.  Functions are left alone.
+    """
+
+    def loop(statement: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """``[declaration, while]`` for a (labeled) do loop."""
+
+        if statement.get("type") == "LabeledStatement":
+            declaration, inner = loop(statement["body"])
+            return [declaration, {**statement, "body": inner}]
+        first = f"%first@{statement.get('start')}:{statement.get('end')}"
+        at = _at(statement)
+        test = statement.get("test") or {}
+        body = walk(statement.get("body"))
+        return [
+            {**_flag_declaration(first, statement), "declarations": [{
+                "type": "VariableDeclarator", **at,
+                "id": {"type": "Identifier", "name": first, **at},
+                "init": {"type": "Literal", "value": True, **at},
+            }]},
+            {
+                "type": "WhileStatement", **at,
+                "test": {
+                    "type": "LogicalExpression", "operator": "||", **_at(test),
+                    "left": {"type": "Identifier", "name": first, **at},
+                    "right": {
+                        "type": "UnaryExpression", "operator": "!",
+                        "prefix": True, **_at(test),
+                        "argument": {
+                            "type": "UnaryExpression", "operator": "!",
+                            "prefix": True, **_at(test), "argument": walk(test),
+                        },
+                    },
+                },
+                "body": {
+                    "type": "BlockStatement", **_at(body or statement),
+                    "body": [
+                        _flag_assignment(first, statement, {
+                            "type": "Literal", "value": False, **at,
+                        }),
+                        *(
+                            body.get("body", ())
+                            if (body or {}).get("type") == "BlockStatement"
+                            else [body]
+                        ),
+                    ],
+                },
+            },
+        ]
+
+    def is_do(item: Any) -> bool:
+        while isinstance(item, Mapping) and item.get("type") == "LabeledStatement":
+            item = item.get("body")
+        return isinstance(item, Mapping) and item.get("type") == "DoWhileStatement"
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, list):
+            out: list[Any] = []
+            for child in item:
+                out.extend(loop(child) if is_do(child) else [walk(child)])
+            return out
+        if isinstance(item, Mapping):
+            if item.get("type") in _FUNCTION_NODES:
+                return item
+            if is_do(item):
+                return {"type": "BlockStatement", **_at(item), "body": loop(item)}
+            return {key: walk(child) for key, child in item.items()}
+        return item
+
+    return walk(list(statements))
+
+
+def _switch_as_ifs(statements: Sequence[Mapping[str, Any]]) -> list[Any]:
+    """Every ``switch`` rewritten into a run of guarded ``if`` statements.
+
+    ``let %switch = d; let %any = d === t1 || ...; let %matched = false;
+    let %switchbreak = false;`` then, per case in source order,
+    ``if (!%switchbreak && (%matched || %switch === t)) { %matched = true;
+    body }`` with ``!%any`` as the default's test, so a default anywhere
+    is entered only when no case matches and falls through to the cases
+    after it.  The switch's own ``break`` sets ``%switchbreak`` and the rest
+    of its statement list runs under ``if (!%switchbreak)``.  Case tests are
+    pure here, so evaluating them all up front agrees with JavaScript's
+    lazy order.  A switch whose cases declare a ``let``/``const`` (one
+    scope across every case) or label a statement is left alone, and the
+    interpreter refuses it.
+    """
+
+    def identifier(name: str, source: Mapping[str, Any]) -> dict[str, Any]:
+        return {"type": "Identifier", "name": name, **_at(source)}
+
+    def declare(name: str, init: Mapping[str, Any], source: Mapping[str, Any]):
+        return {
+            "type": "VariableDeclaration", "kind": "let", **_at(source),
+            "declarations": [{
+                "type": "VariableDeclarator", **_at(source),
+                "id": identifier(name, source), "init": init,
+            }],
+        }
+
+    def literal(value: bool, source: Mapping[str, Any]) -> dict[str, Any]:
+        return {"type": "Literal", "value": value, **_at(source)}
+
+    def binary(operator: str, left: Any, right: Any, source: Mapping[str, Any]):
+        return {
+            "type": "LogicalExpression" if operator in {"&&", "||"}
+            else "BinaryExpression",
+            "operator": operator, "left": left, "right": right, **_at(source),
+        }
+
+    def negate(argument: Any, source: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "type": "UnaryExpression", "operator": "!", "prefix": True,
+            "argument": argument, **_at(source),
+        }
+
+    def owns_break(item: Any) -> bool:
+        if isinstance(item, list):
+            return any(owns_break(child) for child in item)
+        if not isinstance(item, Mapping):
+            return False
+        if item.get("type") == "BreakStatement":
+            return item.get("label") is None
+        if item.get("type") in _OPAQUE_TO_LOOP_EXITS:
+            return False
+        return any(
+            owns_break(child) for key, child in item.items()
+            if key not in {"type", "start", "end"}
+        )
+
+    def guarded(items: Sequence[Any], flag: str) -> list[Any] | None:
+        """``items`` with the switch's breaks as ``flag``; None to refuse."""
+
+        out: list[Any] = []
+        for index, item in enumerate(items):
+            if item.get("type") == "BreakStatement" and item.get("label") is None:
+                out.append(_flag_assignment(flag, item))
+                return out
+            if not owns_break(item):
+                out.append(item)
+                continue
+            kind = item.get("type")
+            if kind == "BlockStatement":
+                body = guarded(item.get("body", ()), flag)
+                if body is None:
+                    return None
+                out.append({**item, "body": body})
+            elif kind == "IfStatement":
+                arms = {}
+                for key in ("consequent", "alternate"):
+                    arm = item.get(key)
+                    if arm is None:
+                        arms[key] = None
+                        continue
+                    body = guarded(
+                        arm.get("body", ()) if arm.get("type") == "BlockStatement"
+                        else [arm],
+                        flag,
+                    )
+                    if body is None:
+                        return None
+                    arms[key] = {"type": "BlockStatement", **_at(arm), "body": body}
+                out.append({**item, **arms})
+            else:
+                return None
+            rest = list(items[index + 1:])
+            if rest:
+                out.append({
+                    "type": "IfStatement", **_at(item),
+                    "test": negate(identifier(flag, item), item),
+                    "consequent": {
+                        "type": "BlockStatement", **_at(item), "body": rest,
+                    },
+                    "alternate": None,
+                })
+                rest_guarded = guarded(rest, flag)
+                if rest_guarded is None:
+                    return None
+                out[-1]["consequent"]["body"] = rest_guarded
+            return out
+        return out
+
+    def switch(statement: Mapping[str, Any]) -> list[Any] | None:
+        cases = statement.get("cases", ())
+        for case in cases:
+            for item in case.get("consequent", ()):
+                if item.get("type") == "LabeledStatement" or (
+                    item.get("type") == "VariableDeclaration"
+                    and item.get("kind") in {"let", "const"}
+                ):
+                    return None
+        position = f"{statement.get('start')}:{statement.get('end')}"
+        names = {
+            word: f"%{word}@{position}"
+            for word in ("switch", "any", "matched", "switchbreak")
+        }
+        subject = identifier(names["switch"], statement)
+        tests = [case["test"] for case in cases if case.get("test") is not None]
+        any_match: Any = literal(False, statement)
+        for test in tests:
+            match = binary("===", subject, walk(test), test)
+            any_match = match if any_match.get("type") == "Literal" else binary(
+                "||", any_match, match, test,
+            )
+        out: list[Any] = [
+            declare(names["switch"], walk(statement["discriminant"]), statement),
+            declare(names["any"], any_match, statement),
+            declare(names["matched"], literal(False, statement), statement),
+            declare(names["switchbreak"], literal(False, statement), statement),
+        ]
+        for case in cases:
+            test = case.get("test")
+            entered = negate(identifier(names["any"], case), case) if test is None \
+                else binary("===", subject, walk(test), case)
+            body = guarded(walk(list(case.get("consequent", ()))), names["switchbreak"])
+            if body is None:
+                return None
+            out.append({
+                "type": "IfStatement", **_at(case),
+                "test": binary(
+                    "&&",
+                    negate(identifier(names["switchbreak"], case), case),
+                    binary("||", identifier(names["matched"], case), entered, case),
+                    case,
+                ),
+                "consequent": {
+                    "type": "BlockStatement", **_at(case),
+                    "body": [
+                        _flag_assignment(names["matched"], case),
+                        *body,
+                    ],
+                },
+                "alternate": None,
+            })
+        return out
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, list):
+            out: list[Any] = []
+            for child in item:
+                if isinstance(child, Mapping) and child.get("type") == "SwitchStatement":
+                    replaced = switch(child)
+                    if replaced is not None:
+                        out.extend(replaced)
+                        continue
+                out.append(walk(child))
+            return out
+        if isinstance(item, Mapping):
+            if item.get("type") in _FUNCTION_NODES:
+                return item
+            if item.get("type") == "SwitchStatement":
+                replaced = switch(item)
+                if replaced is not None:
+                    return {"type": "BlockStatement", **_at(item), "body": replaced}
+            return {key: walk(child) for key, child in item.items()}
+        return item
+
+    return walk(list(statements))
+
+
 class _JavaScriptProcessInterpreter:
     def __init__(
         self, graph: Any, *, owner: str, assumptions: Sequence[str] = (),
@@ -132,6 +656,15 @@ class _JavaScriptProcessInterpreter:
         self.last_version: dict[str, int] = {}
         self.loops: list[dict[str, Any]] = []
         self.loop_count = 0
+        # Labeled loops being interpreted: label -> their exit flags.
+        self.loop_labels: dict[str, dict[Any, str]] = {}
+        # What runs after the statement being interpreted, innermost first:
+        # each enclosing list's remaining statements and the names visible
+        # there.  A loop body starts a fresh stack (its rest is the next
+        # iteration, and its returns are already flags).
+        self.continuations: list[
+            tuple[Sequence[Mapping[str, Any]], frozenset[str]]
+        ] = []
         self.shortfalls: list[JavaScriptExpressionShortfall] = []
         self.bindings: dict[str, dict[str, Any]] = {}
         self.binding_records: list[dict[str, Any]] = []
@@ -422,6 +955,13 @@ class _JavaScriptProcessInterpreter:
             "Call", Handler.Call.name, operation, ((operand, "arg0"),),
             attributes={"callee": operation, "tensor_operation": operation},
             source=source, value_kind=kind,
+        )
+
+    def _boolean(self, value: bool, source: Mapping[str, Any]) -> int:
+        return self.make_node(
+            "Constant", Handler.Const.name, repr(bool(value)), (),
+            attributes={"value": bool(value)}, constant=bool(value),
+            source=source, output_roles=("value",), value_kind="boolean",
         )
 
     def _number(self, value: float, source: Mapping[str, Any]) -> int:
@@ -1167,7 +1707,206 @@ class _JavaScriptProcessInterpreter:
 
         return visit(node)
 
-    def loop(self, statement: Mapping[str, Any]) -> None:
+    def _own_exits(self, node: Any, label: str | None = None) -> set[Any]:
+        """Exits that leave THIS loop's iteration (the loop labeled ``label``).
+
+        ``break``/``continue`` of nested loops are theirs, but a ``return``
+        anywhere inside (nested loops included) leaves this loop too, as
+        does an exit labeled with this loop's label.  An exit labeled with
+        an enclosing loop's label (``self.loop_labels``) leaves this loop
+        and continues or breaks that one: it is reported as
+        ``(kind, label)``.  Any other labeled exit is ``LabeledExit``.
+        Functions are opaque.
+        """
+
+        kinds: set[Any] = set()
+
+        def visit(item: Any, nested: bool, inner_labels: frozenset) -> None:
+            if isinstance(item, Mapping):
+                kind = item.get("type")
+                if kind in _FUNCTION_NODES:
+                    return
+                if kind == "ReturnStatement":
+                    kinds.add("ReturnStatement")
+                elif kind in {"BreakStatement", "ContinueStatement"}:
+                    target = (item.get("label") or {}).get("name")
+                    if target is None:
+                        if not nested:
+                            kinds.add(str(kind))
+                    elif target == label:
+                        kinds.add(str(kind))
+                    elif target in inner_labels:
+                        pass
+                    elif target in self.loop_labels:
+                        kinds.add((str(kind), str(target)))
+                    else:
+                        kinds.add("LabeledExit")
+                    return
+                if kind == "LabeledStatement":
+                    inner_labels = inner_labels | {
+                        (item.get("label") or {}).get("name")
+                    }
+                inner = nested or kind in _OPAQUE_TO_LOOP_EXITS
+                for key, child in item.items():
+                    if key not in {"type", "start", "end", "label"}:
+                        visit(child, inner, inner_labels)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child, nested, inner_labels)
+
+        visit(node, False, frozenset())
+        return kinds
+
+    def _static_kind(
+        self,
+        expr: Mapping[str, Any],
+        declared: Mapping[str, Mapping[str, Any]] | None = None,
+        depth: int = 0,
+    ) -> str | None:
+        """The JavaScript value kind ``expr`` will have, read from its shape.
+
+        Used only to type a hidden loop result before the loop is
+        interpreted; a wrong guess is caught by the carried-kind check and
+        refused, never miscompiled.
+        """
+
+        kind = expr.get("type")
+        if kind == "Literal":
+            value = expr.get("value")
+            return (
+                "boolean" if isinstance(value, bool)
+                else "number" if isinstance(value, (int, float)) else None
+            )
+        if depth > 16:
+            return None
+        declared = declared or {}
+
+        def of(child: Mapping[str, Any]) -> str | None:
+            return self._static_kind(child, declared, depth + 1)
+
+        if kind == "Identifier":
+            name = str(expr.get("name"))
+            if name in declared:
+                return of(declared[name])
+            record = self.bindings.get(name)
+            if record is None:
+                return "number" if name in {"NaN", "Infinity"} else None
+            found = self._kind(int(record["value_node"]))
+            return found if found in {"number", "boolean"} else None
+        if kind == "UnaryExpression":
+            return "boolean" if expr.get("operator") == "!" else "number"
+        if kind == "BinaryExpression":
+            return (
+                "boolean"
+                if expr.get("operator") in {
+                    "<", "<=", ">", ">=", "===", "!==", "==", "!=",
+                }
+                else "number"
+            )
+        if kind == "LogicalExpression":
+            left = of(expr["left"])
+            return left if left == of(expr["right"]) else None
+        if kind == "ConditionalExpression":
+            yes = of(expr["consequent"])
+            return yes if yes == of(expr["alternate"]) else None
+        if kind == "CallExpression":
+            spelling = _callee_spelling(expr.get("callee"))
+            if spelling in {"Number.isNaN", "Number.isFinite", "isNaN", "isFinite"}:
+                return "boolean"
+            return "number" if spelling.startswith("Math.") else None
+        return None
+
+    def _exit_flags(
+        self,
+        statements: Sequence[Mapping[str, Any]],
+        flags: Mapping[Any, str],
+        label: str | None = None,
+    ) -> list[Mapping[str, Any]]:
+        """Rewrite ``break``/``continue`` as assignments to hidden flags.
+
+        ``break`` sets ``flags["BreakStatement"]``, ``continue`` sets
+        ``flags["ContinueStatement"]``; the rest of every statement list
+        after a statement that may set one runs only while neither is set
+        (an ``if`` on the flags around it, in its own block: the names it
+        declares end with the list anyway).  Nested loops keep theirs.
+        An exit labeled with an enclosing loop's label sets that loop's
+        flag (``flags[(kind, label)]``), which this loop also stops on.
+        """
+
+        def again(items: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+            return self._exit_flags(items, flags, label)
+
+        lowered: list[Mapping[str, Any]] = []
+        for index, statement in enumerate(statements):
+            kind = statement.get("type")
+            if kind == "ReturnStatement" and "ReturnStatement" in flags:
+                if statement.get("argument") is None:
+                    # Left for ``sequence`` to refuse (undefined result).
+                    lowered.append(statement)
+                else:
+                    lowered.append(_flag_assignment(
+                        flags["%result"], statement, statement["argument"],
+                    ))
+                    lowered.append(
+                        _flag_assignment(flags["ReturnStatement"], statement)
+                    )
+            elif kind in {"BreakStatement", "ContinueStatement"}:
+                target = (statement.get("label") or {}).get("name")
+                key = kind if target in {None, label} else (kind, target)
+                lowered.append(_flag_assignment(flags[key], statement))
+            elif _loop_of(statement) is not None and (
+                "ReturnStatement" in flags
+                and "ReturnStatement" in self._own_exits(statement, label)
+            ):
+                # The inner loop's own return check, rewritten into ours.
+                lowered.append({**statement, "%returns_checked": True})
+                lowered.extend(again([_return_check(_loop_of(statement))]))
+            elif kind == "IfStatement":
+                lowered.append({
+                    **statement,
+                    "consequent": {
+                        "type": "BlockStatement",
+                        "body": again(
+                            self._statement_body(statement.get("consequent")),
+                        ),
+                    },
+                    "alternate": None if statement.get("alternate") is None else {
+                        "type": "BlockStatement",
+                        "body": again(
+                            self._statement_body(statement.get("alternate")),
+                        ),
+                    },
+                })
+            elif kind == "BlockStatement":
+                lowered.append({
+                    **statement,
+                    "body": again(list(statement.get("body", ()))),
+                })
+            else:
+                lowered.append(statement)
+            if kind in {
+                "BreakStatement", "ContinueStatement", "ReturnStatement",
+            } or self._own_exits(statement, label):
+                rest = again(statements[index + 1:])
+                if rest:
+                    lowered.append({
+                        "type": "IfStatement",
+                        "test": _flags_clear(
+                            (
+                                name for key, name in flags.items()
+                                if key != "%result"
+                            ),
+                            statement,
+                        ),
+                        "consequent": {"type": "BlockStatement", "body": rest},
+                        "alternate": None,
+                    })
+                break
+        return lowered
+
+    def loop(
+        self, statement: Mapping[str, Any], label: str | None = None,
+    ) -> None:
         """``for``/``while`` as a loop region with one Phi per carried name.
 
         Every binding the loop assigns that is visible at its head becomes a
@@ -1177,37 +1916,130 @@ class _JavaScriptProcessInterpreter:
         the graph itself stays acyclic -- with the id ranges the header and
         body occupy (node ids are creation order).  After the loop each
         outer name reads its Phi: the loop leaves through the header.
+
+        ``break`` and ``continue`` become hidden boolean flags: a carried
+        break flag (the header's condition is ``!broken && test``) and a
+        per-iteration continue flag; the statements after an exit run only
+        while both are clear, and a ``for`` update only while not broken.
+        So the iteration that breaks carries its values at the break to the
+        header, which then exits with them.  A ``return`` is a break that
+        also sets a hidden carried result (typed from the return arguments'
+        shape); ``sequence`` follows the loop with ``if (returned) return
+        result``.  A labeled exit to this loop is its own exit; one to an
+        enclosing labeled loop sets that loop's flag, and this loop stops on
+        it as on its own break.
         """
 
         kind = statement.get("type")
-        exit_kind = self._loop_exit(statement.get("body"))
-        if exit_kind is not None or statement.get("test") is None:
+        own = self._own_exits(statement.get("body"), label)
+        outward = {
+            item: self.loop_labels[item[1]].get(item[0])
+            for item in own if isinstance(item, tuple)
+        }
+        if None in outward.values():
+            own.add("LabeledExit")
+        if "LabeledExit" in own or (
+            statement.get("test") is None
+            and not own & {"BreakStatement", "ReturnStatement"}
+            and not outward
+        ):
             self.unsupported(
                 str(kind),
                 "unsupported-loop-exit",
-                f"{exit_kind or 'a loop without a condition'} leaves the loop "
-                "other than through its condition",
+                f"{'a labeled exit' if 'LabeledExit' in own else 'a loop without a condition, break or return'} "
+                "leaves the loop other than through its condition",
                 source=statement,
             )
             return
         outer = dict(self.bindings)
         self.bindings = dict(outer)
+        enclosing, self.continuations = self.continuations, []
+        try:
+            self._loop(statement, label, kind, own, outward, outer)
+        finally:
+            self.continuations = enclosing
+
+    def _loop(
+        self,
+        statement: Mapping[str, Any],
+        label: str | None,
+        kind: Any,
+        own: set[Any],
+        outward: Mapping[Any, Any],
+        outer: dict[str, dict[str, Any]],
+    ) -> None:
         initializer = statement.get("init")
         if initializer is not None:
             self.sequence([
                 initializer if initializer.get("type") == "VariableDeclaration"
                 else {"type": "ExpressionStatement", "expression": initializer},
             ])
+        loop_id = self.loop_count
+        # Keyed by position: a nested loop names an enclosing loop's flags
+        # for its labeled exits.
+        position = f"{statement.get('start')}:{statement.get('end')}"
+        flags: dict[Any, str] = {
+            exit: f"%{word}@{position}"
+            for exit, word in (
+                ("BreakStatement", "break"), ("ContinueStatement", "continue"),
+            )
+            if exit in own
+        }
+        if "ReturnStatement" in own:
+            result_kind = self._loop_result_kind(statement.get("body"))
+            if result_kind is None:
+                self.unsupported(
+                    str(kind),
+                    "unproved-loop-return-kind",
+                    "a return inside the loop has no statically known "
+                    "JavaScript value kind",
+                    source=statement,
+                )
+                self.bindings = outer
+                return
+            # Keyed by position: an enclosing loop names the same flags
+            # when it rewrites this loop's return check into its own.
+            flags["ReturnStatement"], flags["%result"] = _return_names(statement)
+            self.bind(
+                flags["%result"],
+                self._number(0.0, statement) if result_kind == "number"
+                else self._boolean(False, statement),
+                statement, kind="let",
+            )
+        own_stops = tuple(
+            flags[key] for key in ("BreakStatement", "ReturnStatement")
+            if key in flags
+        )
+        for name in own_stops:
+            self.bind(
+                name, self._boolean(False, statement), statement, kind="let",
+            )
+        # An enclosing loop's flag set from in here stops this loop too.
+        stops = (*own_stops, *sorted(set(outward.values())))
+        guards = {**flags, **outward}
         body = self._statement_body(statement.get("body"))
+        if guards:
+            body = self._exit_flags(body, guards, label)
+        if "ContinueStatement" in flags:
+            body = [_flag_declaration(flags["ContinueStatement"], statement), *body]
         update = statement.get("update")
         if update is not None:
-            body = [*body, {"type": "ExpressionStatement", "expression": update}]
+            step = {"type": "ExpressionStatement", "expression": update}
+            if stops:
+                step = {
+                    "type": "IfStatement",
+                    "test": _flags_clear(stops, update),
+                    "consequent": step, "alternate": None,
+                }
+            body = [*body, step]
+        # A nested loop's labeled exit sets this loop's (or an enclosing
+        # loop's) flags only once that loop is interpreted, so every flag
+        # this loop stops on is carried from the start.
         carried = sorted(
-            self._assigned_names([statement.get("test"), body])
+            (self._assigned_names([statement.get("test"), body]) | set(stops))
             & set(self.bindings)
         )
         # Numbered on entry: an inner loop finishes (and is recorded) first.
-        loop_id = self.loop_count
         self.loop_count += 1
         header_start = self.next_id
         phis: dict[str, int] = {}
@@ -1224,10 +2056,28 @@ class _JavaScriptProcessInterpreter:
                 return
             phis[name] = phi
             phi_records[name] = self.bindings[name]
-        condition_value = self.expression(statement["test"])
-        condition = self.truthy(condition_value, statement["test"])
+        test = statement.get("test")
+        condition = None
+        if test is not None:
+            condition = self.truthy(self.expression(test), test)
+        for stop in reversed(stops):
+            running = self._node(
+                Handler.LNot, ((self.read_identifier(
+                    {"type": "Identifier", "name": stop},
+                ), "operand"),), statement, "boolean",
+            )
+            condition = running if condition is None else self._node(
+                Handler.LAnd, ((running, "left"), (condition, "right")),
+                statement, "boolean",
+            )
         condition_end = self.next_id
-        _value, _returned, visible = self._branch(body, dict(self.bindings))
+        if label is not None:
+            self.loop_labels[label] = flags
+        try:
+            _value, _returned, visible = self._branch(body, dict(self.bindings))
+        finally:
+            if label is not None:
+                self.loop_labels.pop(label, None)
         carried_next = {
             name: int(visible[name]["value_node"]) for name in carried
         }
@@ -1251,6 +2101,50 @@ class _JavaScriptProcessInterpreter:
         self.bindings = {
             name: phi_records.get(name, record) for name, record in outer.items()
         }
+        # The return flag and result stay readable for the return check
+        # that follows the loop.
+        for key in ("ReturnStatement", "%result"):
+            if key in flags and flags[key] in phi_records:
+                self.bindings[flags[key]] = phi_records[flags[key]]
+
+    def _loop_result_kind(self, body: Any) -> str | None:
+        """The one kind every ``return`` argument inside ``body`` has.
+
+        Names declared inside the loop are typed by their initializers.
+        """
+
+        arguments: list[Mapping[str, Any]] = []
+        declared: dict[str, Mapping[str, Any]] = {}
+
+        def visit(item: Any) -> None:
+            if isinstance(item, Mapping):
+                kind = item.get("type")
+                if kind in _FUNCTION_NODES:
+                    return
+                if kind == "ReturnStatement" and item.get("argument") is not None:
+                    arguments.append(item["argument"])
+                if kind == "VariableDeclarator" and (
+                    (item.get("id") or {}).get("type") == "Identifier"
+                    and item.get("init") is not None
+                ):
+                    declared.setdefault(str(item["id"]["name"]), item["init"])
+                for key, child in item.items():
+                    if key not in {"type", "start", "end"}:
+                        visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+
+        visit(body)
+        saved = self.bindings
+        kinds = set()
+        try:
+            for argument in arguments:
+                kind = self._static_kind(argument, declared)
+                kinds.add(kind)
+        finally:
+            self.bindings = saved
+        return kinds.pop() if len(kinds) == 1 and None not in kinds else None
 
     def sequence(
         self, statements: Sequence[Mapping[str, Any]],
@@ -1264,7 +2158,10 @@ class _JavaScriptProcessInterpreter:
                     self.unsupported(
                         str(statement.get("kind")),
                         "unsupported-binding-kind",
-                        "var bindings are function scoped and hoisted",
+                        "this var can be read while still undefined (before "
+                        "its declaration, outside its block, or without an "
+                        "initializer); only a var that reads like a let is "
+                        "translated",
                         source=statement,
                     )
                     index += 1
@@ -1299,9 +2196,15 @@ class _JavaScriptProcessInterpreter:
                 return self.expression(argument), True
             if kind == "BlockStatement":
                 outer = dict(self.bindings)
-                value, returned, visible = self._branch(
-                    list(statement.get("body", ())), outer,
+                self.continuations.append(
+                    (statements[index + 1:], frozenset(outer)),
                 )
+                try:
+                    value, returned, visible = self._branch(
+                        list(statement.get("body", ())), outer,
+                    )
+                finally:
+                    self.continuations.pop()
                 self.bindings = visible
                 if returned:
                     return value, True
@@ -1315,19 +2218,29 @@ class _JavaScriptProcessInterpreter:
                 outer = dict(self.bindings)
                 condition_value = self.expression(statement["test"])
                 condition = self.truthy(condition_value, statement["test"])
-                yes, yes_returns, yes_bindings = self._branch(
-                    self._statement_body(statement.get("consequent")), outer,
+                self.continuations.append(
+                    (statements[index + 1:], frozenset(outer)),
                 )
-                no, no_returns, no_bindings = self._branch(
-                    self._statement_body(statement.get("alternate")), outer,
-                )
+                try:
+                    yes, yes_returns, yes_bindings = self._branch(
+                        self._statement_body(statement.get("consequent")), outer,
+                    )
+                    no, no_returns, no_bindings = self._branch(
+                        self._statement_body(statement.get("alternate")), outer,
+                    )
+                finally:
+                    self.continuations.pop()
                 rest = list(statements[index + 1:])
                 if yes_returns and not no_returns:
                     self.bindings = no_bindings
                     no, no_returns = self.sequence(rest)
+                    if not no_returns:
+                        no, no_returns = self._continue()
                 elif no_returns and not yes_returns:
                     self.bindings = yes_bindings
                     yes, yes_returns = self.sequence(rest)
+                    if not yes_returns:
+                        yes, yes_returns = self._continue()
                 if yes_returns and no_returns:
                     self.bindings = outer
                     if yes is None or no is None:
@@ -1377,8 +2290,32 @@ class _JavaScriptProcessInterpreter:
                 )
                 index += 1
                 continue
-            if kind in {"ForStatement", "WhileStatement"}:
-                self.loop(statement)
+            loop_statement = _loop_of(statement)
+            if loop_statement is not None:
+                label = None
+                if kind == "LabeledStatement":
+                    label = str((statement.get("label") or {}).get("name"))
+                self.loop(loop_statement, label)
+                checked = statement.get("%returns_checked")
+                statement = loop_statement
+                if not checked and (
+                    "ReturnStatement" in self._own_exits(statement)
+                ):
+                    # A loop that may return is followed by its check;
+                    # the rest of the function runs on the other path.
+                    test = statement.get("test")
+                    endless = "BreakStatement" not in self._own_exits(
+                        statement.get("body"),
+                    ) and (test is None or (
+                        test.get("type") == "Literal" and test.get("value") is True
+                    ))
+                    if endless:
+                        # Left only through a return: nothing after it runs.
+                        check = _return_check(statement)["consequent"]["body"]
+                        return self.sequence(check)
+                    return self.sequence([
+                        _return_check(statement), *statements[index + 1:],
+                    ])
                 index += 1
                 continue
             if kind == "EmptyStatement":
@@ -1392,6 +2329,32 @@ class _JavaScriptProcessInterpreter:
             )
             index += 1
         return None, False
+
+    def _continue(self) -> tuple[int | None, bool]:
+        """Run what follows the enclosing lists, on this path alone.
+
+        A path that returned early in a nested arm leaves the others to fall
+        out of that arm into the rest of the function; this interprets that
+        rest for them, so the arm returns on every path.  Each enclosing
+        list's rest runs with the names visible there (an arm's own
+        declarations end with it) and with the continuation outside it.
+        """
+
+        saved = self.continuations
+        try:
+            while self.continuations:
+                rest, visible = self.continuations[-1]
+                self.continuations = self.continuations[:-1]
+                self.bindings = {
+                    name: record for name, record in self.bindings.items()
+                    if name in visible
+                }
+                value, returned = self.sequence(rest)
+                if returned:
+                    return value, True
+            return None, False
+        finally:
+            self.continuations = saved
 
     def function(
         self,
@@ -1434,7 +2397,13 @@ class _JavaScriptProcessInterpreter:
             self.bind(parameter_name, value_node, parameter, kind="parameter")
         body = function.get("body") or {}
         if body.get("type") == "BlockStatement":
-            value, returned = self.sequence(body.get("body", ()))
+            value, returned = self.sequence(_var_as_let(
+                _do_as_while(_switch_as_ifs(body.get("body", ()))),
+                frozenset(
+                    str(parameter.get("name"))
+                    for parameter in function.get("params", ())
+                ),
+            ))
         else:
             value, returned = self.expression(body), True
         if not returned or value is None:

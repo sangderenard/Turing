@@ -97,8 +97,8 @@ _ELEMENT_SPELLINGS = {
 }
 
 
-def limb_element_facts(element: Any = None) -> dict:
-    """The facts row for a limb element.
+def limb_element_name(element: Any = None) -> str:
+    """The canonical name of a limb element.
 
     ``None`` means the value never had a dtype stamped, which today is
     always the binary64 default the scalar path assumes. A PRESENT but
@@ -107,14 +107,20 @@ def limb_element_facts(element: Any = None) -> dict:
     """
 
     if element is None:
-        return LIMB_ELEMENTS["float64"]
+        return "float64"
     name = _ELEMENT_SPELLINGS.get(str(element).casefold())
     if name is None:
         raise ValueError(
             f"no limb arithmetic facts for element {element!r}; "
             "supported elements are float64 and float32"
         )
-    return LIMB_ELEMENTS[name]
+    return name
+
+
+def limb_element_facts(element: Any = None) -> dict:
+    """The facts row for a limb element (see ``limb_element_name``)."""
+
+    return LIMB_ELEMENTS[limb_element_name(element)]
 
 
 def _complex_dtype(value: Any) -> bool:

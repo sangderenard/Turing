@@ -1007,7 +1007,13 @@ def _managed_native_feeds_by_id(
             # same authored optional field.  Those exact field aliases do not
             # become new ProgramABI payload declarations, but they still need
             # a defined filler value while the shared presence bit is false.
-            dtype = str(argument.dtype or "float64").casefold()
+            if not argument.dtype:
+                raise ValueError(
+                    f"optional field {optional_key} value %t{value_id} has "
+                    "no recorded dtype, so its absent-presence filler has no "
+                    "type"
+                )
+            dtype = str(argument.dtype).casefold()
             physical[value_id] = (
                 False if dtype in {"bool", "i1", "uint8", "u8"}
                 else 0 if dtype in {"int", "int32", "i32", "int64", "i64"}

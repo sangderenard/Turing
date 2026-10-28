@@ -167,6 +167,51 @@
                 ? binary_value(b, a[i], op)
                 : binary_value(a[i], b, op);
     }
+
+    static int64_t binary_int64_value(int64_t a, int64_t b, int op) {
+        int64_t remainder;
+        switch (op) {
+            case CT_OP_ADD: return (int64_t)((uint64_t)a + (uint64_t)b);
+            case CT_OP_SUB: return (int64_t)((uint64_t)a - (uint64_t)b);
+            case CT_OP_MUL: return (int64_t)((uint64_t)a * (uint64_t)b);
+            case CT_OP_MOD:
+                remainder = a % b;
+                return remainder != 0 && ((remainder < 0) != (b < 0))
+                    ? remainder + b : remainder;
+            case CT_OP_LT: return a < b;
+            case CT_OP_LE: return a <= b;
+            case CT_OP_GT: return a > b;
+            case CT_OP_GE: return a >= b;
+            case CT_OP_EQ: return a == b;
+            case CT_OP_NE: return a != b;
+            case CT_OP_MAXIMUM: return a > b ? a : b;
+            case CT_OP_MINIMUM: return a < b ? a : b;
+            case CT_OP_BITAND: return a & b;
+            case CT_OP_BITOR: return a | b;
+            case CT_OP_BITXOR: return a ^ b;
+            case CT_OP_SHL:
+                return (int64_t)((uint64_t)a << ((uint64_t)b & 63));
+            case CT_OP_SHR: return a >> ((uint64_t)b & 63);
+            case CT_OP_LOGICAL_AND: return a != 0 && b != 0;
+            case CT_OP_LOGICAL_OR: return a != 0 || b != 0;
+            default: return 0;
+        }
+    }
+
+    void binary_int64(
+        const int64_t* a, const int64_t* b, int64_t* out, int n, int op) {
+        for (int i = 0; i < n; ++i)
+            out[i] = binary_int64_value(a[i], b[i], op);
+    }
+
+    void binary_scalar_int64(
+        const int64_t* a, int64_t b, int64_t* out, int n, int op,
+        int reverse) {
+        for (int i = 0; i < n; ++i)
+            out[i] = reverse
+                ? binary_int64_value(b, a[i], op)
+                : binary_int64_value(a[i], b, op);
+    }
     void matmul_double(const double* a, const double* b, double* out, int m, int n, int p) {
         for (int i = 0; i < m; ++i) {
             for (int j = 0; j < p; ++j) {
@@ -473,6 +518,36 @@
         free(output_stride);
     }
 
+    void broadcast_int64(
+        const int64_t* input, int64_t* output, const int* input_shape,
+        int input_ndim, const int* output_shape, int output_ndim) {
+        int total = 1;
+        int* input_stride = (int*)malloc(input_ndim * sizeof(int));
+        int* output_stride = (int*)malloc(output_ndim * sizeof(int));
+        for (int i = 0; i < output_ndim; ++i) total *= output_shape[i];
+        input_stride[input_ndim - 1] = 1;
+        output_stride[output_ndim - 1] = 1;
+        for (int i = input_ndim - 2; i >= 0; --i)
+            input_stride[i] = input_stride[i + 1] * input_shape[i + 1];
+        for (int i = output_ndim - 2; i >= 0; --i)
+            output_stride[i] = output_stride[i + 1] * output_shape[i + 1];
+        int offset = output_ndim - input_ndim;
+        for (int flat = 0; flat < total; ++flat) {
+            int remaining = flat;
+            int input_flat = 0;
+            for (int axis = 0; axis < output_ndim; ++axis) {
+                int coordinate = remaining / output_stride[axis];
+                remaining %= output_stride[axis];
+                int input_axis = axis - offset;
+                if (input_axis >= 0 && input_shape[input_axis] != 1)
+                    input_flat += coordinate * input_stride[input_axis];
+            }
+            output[flat] = input[input_flat];
+        }
+        free(input_stride);
+        free(output_stride);
+    }
+
     void cumsum_dim_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim) {
@@ -595,6 +670,110 @@
                         b * source_count + start + j * step
                     ) * after,
                     after * sizeof(double));
+    }
+
+    static void scatter_reduce_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values, int reduction) {
+        int before = 1;
+        int after = 1;
+        int output_count = 1;
+        for (int axis = 0; axis < ndim; ++axis) {
+            output_count *= shape[axis];
+            if (axis < dim) before *= shape[axis];
+            if (axis > dim) after *= shape[axis];
+        }
+        memcpy(output, input, output_count * sizeof(double));
+        int* counts = NULL;
+        if (reduction == 1) {
+            counts = (int*)malloc(shape[dim] * sizeof(int));
+            if (counts != NULL) {
+                for (int destination = 0; destination < shape[dim]; ++destination)
+                    counts[destination] = 1;
+                for (int item = 0; item < index_count; ++item) {
+                    int64_t destination = indices[item];
+                    if (destination >= 0 && destination < shape[dim])
+                        counts[destination] += 1;
+                }
+            }
+        }
+        for (int batch = 0; batch < before; ++batch)
+            for (int item = 0; item < index_count; ++item)
+                for (int element = 0; element < after; ++element) {
+                    int64_t destination = indices[item];
+                    if (destination < 0 || destination >= shape[dim])
+                        continue;
+                    int source_index = (
+                        (batch * index_count + item) * after + element
+                    );
+                    int output_index = (
+                        (batch * shape[dim] + (int)destination) * after
+                        + element
+                    );
+                    double value = values[source_index];
+                    if (reduction == 2)
+                        output[output_index] = (
+                            isnan(value) || value >= output[output_index]
+                            ? value : output[output_index]
+                        );
+                    else if (reduction == 3)
+                        output[output_index] = (
+                            isnan(value) || value <= output[output_index]
+                            ? value : output[output_index]
+                        );
+                    else
+                        output[output_index] += value;
+                }
+        if (reduction == 1) {
+            for (int batch = 0; batch < before; ++batch)
+                for (int destination = 0; destination < shape[dim]; ++destination) {
+                    int count = counts == NULL ? 1 : counts[destination];
+                    if (counts == NULL) {
+                        for (int item = 0; item < index_count; ++item)
+                            if (indices[item] == destination) count += 1;
+                    }
+                    for (int element = 0; element < after; ++element) {
+                        int output_index = (
+                            (batch * shape[dim] + destination) * after + element
+                        );
+                        output[output_index] /= (double)count;
+                    }
+                }
+            free(counts);
+        }
+    }
+
+    void scatter_sum_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values) {
+        scatter_reduce_double(
+            input, output, shape, ndim, dim, indices, index_count, values, 0);
+    }
+
+    void scatter_mean_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values) {
+        scatter_reduce_double(
+            input, output, shape, ndim, dim, indices, index_count, values, 1);
+    }
+
+    void scatter_max_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values) {
+        scatter_reduce_double(
+            input, output, shape, ndim, dim, indices, index_count, values, 2);
+    }
+
+    void scatter_min_double(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count,
+        const double* values) {
+        scatter_reduce_double(
+            input, output, shape, ndim, dim, indices, index_count, values, 3);
     }
 
     void index_assign_double(
@@ -744,6 +923,11 @@
         for (int i = 0; i < n; ++i) out[i] = a[i];
     }
 
+    void cast_int64_to_double_values(
+        const int64_t* a, double* out, int n) {
+        for (int i = 0; i < n; ++i) out[i] = (double)a[i];
+    }
+
     void cast_double_to_bool_values(const double* a, double* out, int n) {
         for (int i = 0; i < n; ++i) out[i] = (a[i] != 0.0) ? 1.0 : 0.0;
     }
@@ -859,6 +1043,14 @@
     void create_arange(double start, double step, int n, double* out) {
         for (int i = 0; i < n; i++) {
             out[i] = start + i * step;
+        }
+    }
+
+    void create_arange_int64(
+        int64_t start, int64_t step, int n, int64_t* out) {
+        for (int i = 0; i < n; i++) {
+            out[i] = (int64_t)((uint64_t)start
+                + (uint64_t)i * (uint64_t)step);
         }
     }
 

@@ -1,0 +1,6 @@
+{
+  "counter_checksum": {
+    "probes": [[0], [1], [7]],
+    "expected_probe_results": [0, 0, 21]
+  }
+}

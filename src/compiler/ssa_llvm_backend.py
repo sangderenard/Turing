@@ -188,6 +188,17 @@ _FUSED_UNARY: dict[str, str] = {
 }
 
 
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
+
+
 def _fused_opcode_name(opcode: int) -> str | None:
     from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         C_TENSOR_OPCODE_ORDER,
@@ -769,11 +780,26 @@ _INTEGER_COMPARISON: dict[str, str] = {
 _INTEGER_SELECTION: dict[str, str] = {"Max": "sgt", "Min": "slt"}
 
 
+_INTEGER_LLVM_TYPES = frozenset({"i1", "i8", "i16", "i32", "i64", "i128"})
+
+
+def _unsigned_value(value: _Any) -> bool:
+    # audit(uint64 Add(9007199254740993, 0)) previously reached floating
+    # addition and lost one. Width alone also cannot distinguish uint64
+    # from int64 once i64 storage is correct. Read the same physical dtype
+    # record which owns the value's LLVM storage spelling.
+    from ..transmogrifier.dtype_layout import resolve
+    accounting = getattr(value, "accounting", None) or {}
+    layout = resolve(accounting.get("physical_dtype") or getattr(value, "dtype", None))
+    return layout is not None and layout.kind in {"uint", "bool"}
+
+
 def integer_scalar_lines(
     operation: str,
     operand_type: str,
     operands: list[str],
     register: str,
+    *, unsigned: bool = False,
 ) -> tuple[list[str], str] | None:
     """(lines, result type) for an integer-domain scalar op, else ``None``.
 
@@ -788,6 +814,11 @@ def integer_scalar_lines(
     ):
         # ``math.floor(n)``/``round(n)`` of an int is the int itself (corpus
         # c437); a round trip through double would lose bits above 2**53.
+        return ([f"{register} = add {operand_type} {operands[0]}, 0"], operand_type)
+    if unsigned and operation in {"Div", "FloorDiv", "Mod"} and len(operands) == 2:
+        opcode = "urem" if operation == "Mod" else "udiv"
+        return ([f"{register} = {opcode} {operand_type} {operands[0]}, {operands[1]}"], operand_type)
+    if unsigned and operation in {"Abs", "abs"} and len(operands) == 1:
         return ([f"{register} = add {operand_type} {operands[0]}, 0"], operand_type)
     if operation == "FloorDiv" and len(operands) == 2:
         # Heap-parent indexing in the compiler's own graph kernel uses
@@ -845,15 +876,21 @@ def integer_scalar_lines(
             f"{operand_type} {operands[0]}, {operands[1]}"
         ], operand_type)
     if operation in _INTEGER_SELECTION and len(operands) == 2:
+        predicate = _INTEGER_SELECTION[operation]
+        if unsigned:
+            predicate = "u" + predicate[1:]
         return ([
-            f"{register}.cmp = icmp {_INTEGER_SELECTION[operation]} "
+            f"{register}.cmp = icmp {predicate} "
             f"{operand_type} {operands[0]}, {operands[1]}",
             f"{register} = select i1 {register}.cmp, "
             f"{operand_type} {operands[0]}, {operand_type} {operands[1]}",
         ], operand_type)
     if operation in _INTEGER_COMPARISON and len(operands) == 2:
+        predicate = _INTEGER_COMPARISON[operation]
+        if unsigned and predicate.startswith("s"):
+            predicate = "u" + predicate[1:]
         return ([
-            f"{register} = icmp {_INTEGER_COMPARISON[operation]} "
+            f"{register} = icmp {predicate} "
             f"{operand_type} {operands[0]}, {operands[1]}"
         ], "i1")
     if operation == "Neg" and len(operands) == 1:
@@ -1071,8 +1108,8 @@ def _align(llvm_type: _Any) -> int:
     alignment on an under-aligned address is a miscompile waiting for the
     right optimisation pass, not a cosmetic wart.
 
-    Over-aligning an ``alloca`` is a different case and stays at 8: there the
-    number is a request for the allocation, and asking for more is safe.
+    An ``alloca`` requests at least this alignment (and retains the historical
+    minimum of 8). Internal i128 cells require 16 before a load may promise 16.
     """
 
     return _LLVM_TYPE_BYTES.get(str(llvm_type), 8)
@@ -1096,7 +1133,7 @@ def _frame_slot(
 
     byte_count = int(count) * _LLVM_TYPE_BYTES.get(str(llvm_type), 8)
     if byte_count <= _FRAME_HEAP_BYTES:
-        allocas.append(f"  {register} = alloca {llvm_type}, i64 {count}, align 8")
+        allocas.append(f"  {register} = alloca {llvm_type}, i64 {count}, align {max(8, _align(llvm_type))}")
         return
     allocas.append(f"  {register} = call ptr @malloc(i64 {byte_count})")
     frees.append(f"  call void @free(ptr {register})")
@@ -1115,8 +1152,35 @@ def _release_frame_before_returns(lines: list[str], frees: list[str]) -> None:
     lines[:] = released
 
 
+def _public_numpy_dtype(value: _Any) -> str:
+    """Host element type derived from the public SSA physical dtype record."""
+    from ..transmogrifier.dtype_layout import resolve
+    llvm_type = _value_llvm_type(value)
+    accounting = getattr(value, "accounting", None) or {}
+    layout = resolve(accounting.get("physical_dtype") or getattr(value, "dtype", None))
+    if llvm_type == "ptr":
+        return "uintp"
+    if layout is not None and layout.kind in {"int", "uint", "bool"}:
+        if layout.numpy_dtype is None:
+            raise ValueError(f"internal dtype {layout.name!r} has no public buffer ABI")
+        return str(layout.numpy_dtype)
+    return _llvm_abi_numpy_table()[llvm_type]
+
+
 def _value_llvm_type(value: _Any) -> str:
     accounting = getattr(value, "accounting", {}) or {}
+    # Existing structural carriers are address tables, not scalar dtype
+    # names. Resolve them before consulting the scalar layout catalogue.
+    if str(getattr(value, "dtype", "")) in {"ssa.aggregate", "ptrptr_float64"}:
+        return "ptr"
+    if (
+        str(getattr(value, "dtype", "")).casefold() == "none"
+        and not accounting.get("physical_dtype")
+    ):
+        # Structural absence is not a numeric dtype: it is the inert scalar
+        # carrier cell the C emitter spells ``double`` for ``none`` (see
+        # ``_scalar_c_type``), holding the zero sentinel.
+        return "double"
     if accounting.get("heap_owner") or accounting.get("heap_element_dtype") is not None:
         # These are declared native pointer CELLS, not a typed address whose
         # dtype names the pointee. Raw ptr spelling alone historically means
@@ -1884,7 +1948,9 @@ def _emit_repository_call_module(
             ring_id, count_id = history_ids(raw_id)
             appended_history.append(_SSAValue(
                 ring_id,
-                dtype=getattr(value, "dtype", None) or "float64",
+                dtype=_settled_dtype(
+                    getattr(value, "dtype", None), raw_id,
+                    "watched history value dtype"),
                 shape=(depth,),
             ))
             appended_history.append(_SSAValue(count_id, dtype="int64"))
@@ -2108,6 +2174,7 @@ def _emit_repository_call_module(
             for value in function.args
             if (value.accounting or {}).get("tensor_extent_kind") == "shape"
         }
+        span_address_unsigned: dict[int, bool] = {}
         # Element storage of a static aggregate constant read only through
         # element addresses: the payload's own scalar kind, not the
         # ``ssa.aggregate`` result's default ``double``.
@@ -2267,58 +2334,39 @@ def _emit_repository_call_module(
 
         def convert_loaded(
             loaded: str, source_type: str, wanted: str, tag: str,
+            *, source_unsigned: bool = False, target_unsigned: bool = False,
         ) -> str:
-            """Convert an already-loaded scalar by the module's ABI rules."""
-
+            """Convert one exact physical scalar, preserving its signedness."""
             if source_type == wanted:
                 return loaded
             converted = f"%convert.{tag}"
-            # ``float`` (a float32 span element) meets every other type through
-            # double: widen exactly, or round once on the way in.
             if source_type == "float":
-                body.append(
-                    f"  {converted}.wide = fpext float {loaded} to double"
-                )
-                return convert_loaded(
-                    f"{converted}.wide", "double", wanted, f"{tag}.wide",
-                )
+                body.append(f"  {converted}.wide = fpext float {loaded} to double")
+                return convert_loaded(f"{converted}.wide", "double", wanted, f"{tag}.wide",
+                                      target_unsigned=target_unsigned)
             if wanted == "float":
-                narrow = convert_loaded(loaded, source_type, "double", f"{tag}.n")
+                narrow = convert_loaded(loaded, source_type, "double", f"{tag}.n",
+                                        source_unsigned=source_unsigned)
                 body.append(f"  {converted} = fptrunc double {narrow} to float")
-                return converted
-            if wanted == "double" and source_type in {"i1", "i32", "i64"}:
-                opcode = "uitofp" if source_type == "i1" else "sitofp"
-                body.append(
-                    f"  {converted} = {opcode} {source_type} {loaded} to double"
-                )
-                return converted
-            if wanted in {"i32", "i64"} and source_type == "double":
-                body.append(
-                    f"  {converted} = fptosi double {loaded} to {wanted}"
-                )
-                return converted
-            # Native context length counts Cast(Eq(owner, handle), int64).
-            # The old fallthrough returned its i1 register unchanged and then
-            # stored it as i64. Bool's numerical value is 0/1, not signed -1.
-            if wanted in {"i32", "i64"} and source_type == "i1":
-                body.append(f"  {converted} = zext i1 {loaded} to {wanted}")
-                return converted
-            if wanted == "i64" and source_type == "i32":
-                body.append(f"  {converted} = sext i32 {loaded} to i64")
-                return converted
-            if wanted == "i32" and source_type == "i64":
-                body.append(f"  {converted} = trunc i64 {loaded} to i32")
                 return converted
             if wanted == "i1":
                 zero = "0.0" if source_type == "double" else "0"
                 comparison = "fcmp une" if source_type == "double" else "icmp ne"
-                body.append(
-                    f"  {converted} = {comparison} {source_type} {loaded}, {zero}"
-                )
+                body.append(f"  {converted} = {comparison} {source_type} {loaded}, {zero}")
                 return converted
-            return loaded
+            if wanted == "double" and source_type in _INTEGER_LLVM_TYPES:
+                opcode = "uitofp" if source_unsigned or source_type == "i1" else "sitofp"
+            elif wanted in _INTEGER_LLVM_TYPES and source_type == "double":
+                opcode = "fptoui" if target_unsigned else "fptosi"
+            elif wanted in _INTEGER_LLVM_TYPES and source_type in _INTEGER_LLVM_TYPES:
+                opcode = ("trunc" if int(wanted[1:]) < int(source_type[1:])
+                          else "zext" if source_unsigned or source_type == "i1" else "sext")
+            else:
+                raise ValueError(f"unsupported exact LLVM scalar conversion {source_type} -> {wanted}")
+            body.append(f"  {converted} = {opcode} {source_type} {loaded} to {wanted}")
+            return converted
 
-        def load_as(value: _Any, wanted: str, tag: str) -> str:
+        def load_as(value: _Any, wanted: str, tag: str, *, target_unsigned: bool = False) -> str:
             slot_home = pointer(value)
             cached = (
                 register_cache.get(slot_home) if _reuse_registers else None
@@ -2334,7 +2382,9 @@ def _emit_repository_call_module(
                 )
                 if _reuse_registers and slot_home.startswith(_CACHEABLE_SLOT):
                     register_cache[slot_home] = (loaded, source_type)
-            return convert_loaded(loaded, source_type, wanted, tag)
+            return convert_loaded(loaded, source_type, wanted, tag,
+                                  source_unsigned=_unsigned_value(value),
+                                  target_unsigned=target_unsigned)
 
         scheduled_instructions = [
             (block_name, instruction)
@@ -2891,8 +2941,15 @@ def _emit_repository_call_module(
                         len(flattened) == 1
                         and _declared_span_rank(result) == 0
                         and not tuple(result.shape or ())
+                        and _value_llvm_type(result) in (
+                            *_INTEGER_LLVM_TYPES, "float", "double",
+                        )
                     ):
                         # A one-limb index tuple used as a scalar offset.
+                        # A static iterable (1.5,) is instead ssa.aggregate:
+                        # its empty shape names an address carrier, not a
+                        # scalar. Collapsing it discarded its double element
+                        # layout and made the following GEP address i64.
                         payload = flattened[0]
                     else:
                         aggregate_items = tuple(flattened) or (0,)
@@ -3373,8 +3430,9 @@ def _emit_repository_call_module(
                     # double dereferenced as an address: an access
                     # violation whose program was oracle-exact, which is
                     # branch three of the diagnostic decision tree.
-                    and formal_positions.get(int(instruction.args[0].id))
-                    in callee_aggregate_parameter_positions.get(name, set())
+                    and (formal_positions.get(int(instruction.args[0].id))
+                         in callee_aggregate_parameter_positions.get(name, set())
+                         or str(instruction.args[0].dtype) == "ptrptr_float64")
                 ):
                     slot = f"%aggregate.slot.{tag}"
                     body.append(
@@ -3395,7 +3453,11 @@ def _emit_repository_call_module(
                     # contract. In particular a heap column formal is a
                     # pointer cell, not a directly passed element arena.
                     declared_base = values_by_function[name].get(int(base.id))
-                    if declared_base is not None and (declared_base.accounting or {}).get("heap_element_dtype") is not None:
+                    # checked extend(float32 <- int64) recreates column 0
+                    # as a shape-less operand. Its formal owns the rank-1
+                    # float storage. Reading the weaker occurrence selected
+                    # double stride/stores and overwrote adjacent rows.
+                    if declared_base is not None:
                         base = declared_base
                     heap_element = (base.accounting or {}).get("heap_element_dtype")
                     if heap_element is not None and len(instruction.args) != 2:
@@ -3484,6 +3546,7 @@ def _emit_repository_call_module(
                         pointers[result_id] = computed
                         span_addresses[result_id] = computed
                         span_address_types[result_id] = element_type
+                        span_address_unsigned[result_id] = _unsigned_value(base)
                         if heap_element is not None:
                             owned_heap_addresses.add(result_id)
                         continue
@@ -3550,7 +3613,7 @@ def _emit_repository_call_module(
                     if (
                         stored_type is not None
                         and stored_type != loaded_type
-                        and "double" in {stored_type, loaded_type}
+                        and (stored_type, loaded_type) != ("float", "double")
                     ):
                         # Loading an integer from a double cell (or the
                         # reverse) reads the other kind's bit pattern.
@@ -3559,7 +3622,7 @@ def _emit_repository_call_module(
                             f"{stored_type} element of %t{int(address_argument.id)}; "
                             "explicit conversion required"))
                         continue
-                    if (loaded_type in {"double", "i32", "i1"}
+                    if (loaded_type in {"double", "float", *_INTEGER_LLVM_TYPES}
                             or int(address_argument.id) in owned_heap_addresses
                             or (result.dtype in {'int64', 'uint64', 'opaque_ref'} and not result.shape)):
                         # Pin the loaded scalar to its own slot.
@@ -3584,13 +3647,21 @@ def _emit_repository_call_module(
                         # Aggregate/address representations remain below;
                         # LLVM i64 alone is not the semantic discriminator.
                         pinned = f"%pinned.load.{tag}"
+                        # float32 row storage is float even when its scalar
+                        # SSA result uses the documented double register.
+                        # Read four bytes, then widen; never load eight bytes
+                        # from a four-byte row to obtain the scalar policy.
+                        read_type = stored_type or loaded_type
                         body.append(
-                            f"  {pinned} = load {loaded_type}, ptr "
-                            f"{addressed}, align {_align(loaded_type) if heap_address else 8}"
+                            f"  {pinned} = load {read_type}, ptr "
+                            f"{addressed}, align {_align(read_type)}"
                         )
+                        pinned = convert_loaded(pinned, read_type, loaded_type,
+                                                f"pinned.{tag}",
+                                                target_unsigned=_unsigned_value(result))
                         body.append(
                             f"  store {loaded_type} {pinned}, ptr "
-                            f"{pointer(result)}, align 8"
+                            f"{pointer(result)}, align {_align(loaded_type)}"
                         )
                         continue
                     pointers[result_id] = addressed
@@ -3648,10 +3719,11 @@ def _emit_repository_call_module(
                 )
                 loaded_value = load_as(
                     source, destination_type, f"store.{tag}",
+                    target_unsigned=span_address_unsigned.get(int(address.id), False),
                 )
                 body.append(
                     f"  store {destination_type} {loaded_value}, "
-                    f"ptr {destination}, align {_align(destination_type) if int(address.id) in owned_heap_addresses else 8}"
+                    f"ptr {destination}, align {_align(destination_type)}"
                 )
                 register_cache.clear()
                 continue
@@ -3942,7 +4014,7 @@ def _emit_repository_call_module(
                             )
                             body.append(
                                 f"  {temporary} = alloca {llvm_type}, "
-                                f"i64 {count}, align 8"
+                                f"i64 {count}, align {max(8, _align(llvm_type))}"
                             )
                             result_ptrs.append(temporary)
                     elif (
@@ -3977,7 +4049,7 @@ def _emit_repository_call_module(
                                 )
                                 body.append(
                                     f"  {temporary} = alloca {llvm_type}, "
-                                    f"i64 {count}, align 8"
+                                    f"i64 {count}, align {max(8, _align(llvm_type))}"
                                 )
                                 result_ptrs.append(temporary)
                     elif declared_ids:
@@ -4036,7 +4108,7 @@ def _emit_repository_call_module(
                                 )
                                 body.append(
                                     f"  {temporary} = alloca {llvm_type}, "
-                                    f"i64 {count}, align 8"
+                                    f"i64 {count}, align {max(8, _align(llvm_type))}"
                                 )
                                 result_ptrs.append(temporary)
                     else:
@@ -4049,7 +4121,7 @@ def _emit_repository_call_module(
                                 count = _value_element_count(value)
                                 temporary = f"%call.output.{tag}.{output_index}"
                                 body.append(
-                                    f"  {temporary} = alloca {llvm_type}, i64 {count}, align 8"
+                                    f"  {temporary} = alloca {llvm_type}, i64 {count}, align {max(8, _align(llvm_type))}"
                                 )
                                 result_ptrs.append(temporary)
                     semantic_arguments = list(instruction.args)
@@ -4107,6 +4179,25 @@ def _emit_repository_call_module(
                             f"row receipts={row_receipts!r}; unresolved rows="
                             f"{tuple(function.metadata.get('unresolved_record_sequence_rows', ()))!r}",
                         ))
+                        continue
+                    # A pointer ABI does not erase the pointed-to type.
+                    # uint64 and int64 share i64 but differ at every signed
+                    # operation in the callee. Require an explicit conversion
+                    # before the call rather than reinterpret its caller slot.
+                    call_type_disagreements = []
+                    for position, (argument, formal) in enumerate(zip(
+                        semantic_arguments, module.functions[symbol].args,
+                    )):
+                        actual = values_by_function[name].get(int(argument.id), argument)
+                        actual_type, formal_type = _value_llvm_type(actual), _value_llvm_type(formal)
+                        if actual_type in _INTEGER_LLVM_TYPES and formal_type in _INTEGER_LLVM_TYPES:
+                            if (actual_type != formal_type
+                                    or _unsigned_value(actual) != _unsigned_value(formal)):
+                                call_type_disagreements.append((position, actual.dtype, formal.dtype))
+                    if call_type_disagreements:
+                        shortfalls.append(LLVMEmissionShortfall(name, symbol,
+                            "call integer storage requires explicit conversion: "
+                            + repr(call_type_disagreements)))
                         continue
                     required_positions = callee_aggregate_parameter_positions.get(
                         symbol, ()
@@ -4408,6 +4499,7 @@ def _emit_repository_call_module(
                     )
                 converted = convert_loaded(
                     loaded, source_type, result_type, f"cast.{tag}",
+                    source_unsigned=_unsigned_value(source), target_unsigned=_unsigned_value(result),
                 )
                 body.extend((
                     f"  %cast.dst.{tag} = getelementptr {result_type}, "
@@ -4426,7 +4518,8 @@ def _emit_repository_call_module(
             if operation in {"Cast", "CastLike", "cast_like"} and result is not None and instruction.args:
                 result_type = _value_llvm_type(result)
                 rendered = load_as(
-                    instruction.args[0], result_type, f"cast.{tag}"
+                    instruction.args[0], result_type, f"cast.{tag}",
+                    target_unsigned=_unsigned_value(result)
                 )
                 cast_target = pointer(result)
                 body.append(
@@ -4629,6 +4722,18 @@ def _emit_repository_call_module(
                     f"label %{done}"
                 )
                 body.append(f"{loop_body}:")
+                # Rank changes the sweep, not the integer promotion law.
+                # x:uint64[dynamic] + 2:int64 must not bypass the scalar
+                # common-dtype refusal and reinterpret x's high bit as signed.
+                integer_sides = [argument for argument in instruction.args
+                                 if _value_llvm_type(argument) in _INTEGER_LLVM_TYPES
+                                 and _value_llvm_type(argument) != "i1"]
+                if (len({_unsigned_value(argument) for argument in integer_sides}) > 1
+                        and not any(_value_llvm_type(argument) in {"float", "double"}
+                                    for argument in instruction.args)):
+                    shortfalls.append(LLVMEmissionShortfall(name, operation,
+                        "mixed signed/unsigned arithmetic requires an explicit common dtype conversion"))
+                    continue
                 # A comparison computes in its operands' domain and stores
                 # truth: an i1 element type would compare doubles as bits.
                 compute_type = element_type
@@ -4639,7 +4744,7 @@ def _emit_repository_call_module(
                         for argument in instruction.args
                     }
                     compute_type = (
-                        "i64" if operand_types <= {"i1", "i32", "i64"}
+                        max(operand_types, key=lambda t: int(t[1:])) if operand_types <= _INTEGER_LLVM_TYPES
                         and operation in _INTEGER_COMPARISON
                         else "double"
                     )
@@ -4667,14 +4772,27 @@ def _emit_repository_call_module(
                         )
                     operands.append(convert_loaded(
                         slot, source_type, compute_type,
-                        f"ew.{tag}.{position}",
+                        f"ew.{tag}.{position}", source_unsigned=_unsigned_value(argument),
+                        target_unsigned=_unsigned_value(result),
                     ))
                 computed = f"%ew.val.{tag}"
-                if predicate and compute_type == "i64":
-                    rendered = (
-                        f"{computed} = icmp {_INTEGER_COMPARISON[operation]} "
-                        f"i64 {operands[0]}, {operands[1]}"
+                if compute_type in _INTEGER_LLVM_TYPES:
+                    # token_kind_batch and c620: a rank-one integer span
+                    # times a scalar reached ``fmul double`` with i64
+                    # operands. The scalar emitter already owns the integer
+                    # law; span rank changes the sweep, not the declared dtype.
+                    integer = integer_scalar_lines(
+                        operation, compute_type, operands, computed,
+                        unsigned=_unsigned_value(instruction.args[0]),
                     )
+                    if integer is None:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, operation,
+                            f"integer elementwise {operation} has no "
+                            f"LLVM emission for {compute_type}",
+                        ))
+                        continue
+                    rendered = "\n".join(integer[0])
                 else:
                     rendered = template.format(*operands, out=computed)
                 for rendered_line in rendered.splitlines():
@@ -4689,7 +4807,7 @@ def _emit_repository_call_module(
                 )
                 body.append(
                     f"  store {element_type} {computed}, "
-                    f"ptr %ew.dst.{tag}, align 8"
+                    f"ptr %ew.dst.{tag}, align {_align(element_type)}"
                 )
                 body.append(f"  {nxt} = add i32 {index}, 1")
                 body.append(f"  br label %{head}")
@@ -4789,7 +4907,7 @@ def _emit_repository_call_module(
                 accumulator_type = (
                     "i1" if operation in {"any", "all"} else result_type
                 )
-                if accumulator_type not in {"i1", "i32", "i64", "double"}:
+                if accumulator_type not in {*_INTEGER_LLVM_TYPES, "double"}:
                     shortfalls.append(LLVMEmissionShortfall(
                         name, operation,
                         f"flat {operation} reduction into {accumulator_type}",
@@ -4834,7 +4952,8 @@ def _emit_repository_call_module(
                         return truth
                     return convert_loaded(
                         loaded, element_type, accumulator_type,
-                        f"red.{label}.{tag}",
+                        f"red.{label}.{tag}", source_unsigned=_unsigned_value(source),
+                        target_unsigned=_unsigned_value(result),
                     )
 
                 if ordered:
@@ -4907,7 +5026,7 @@ def _emit_repository_call_module(
                         body.append(f"  {keep} = or i1 {keep}.cmp, {keep}.nan")
                     else:
                         body.append(
-                            f"  {keep} = icmp {'sgt' if operation == 'max' else 'slt'} "
+                            f"  {keep} = icmp {('u' if _unsigned_value(result) else 's') + ('gt' if operation == 'max' else 'lt')} "
                             f"{accumulator_type} {item}, {acc}"
                         )
                     body.append(
@@ -4958,11 +5077,30 @@ def _emit_repository_call_module(
                 # narrowing a float discards its value. Where the DECLARED
                 # result is integral the reconciliation below still converts
                 # the result back.
+                integer_arguments = [argument for argument in instruction.args
+                                     if _value_llvm_type(argument) in _INTEGER_LLVM_TYPES
+                                     and _value_llvm_type(argument) != "i1"]
+                integer_signs = {_unsigned_value(argument) for argument in integer_arguments}
+                if len(integer_signs) > 1 and not any(t in {"float", "double"} for t in operand_argument_types):
+                    shortfalls.append(LLVMEmissionShortfall(name, operation,
+                        "mixed signed/unsigned arithmetic requires an explicit common dtype conversion"))
+                    continue
+                compute_unsigned = next(iter(integer_signs), False)
                 operand_type = (
-                    "double" if "double" in operand_argument_types
-                    else operand_argument_types[0]
+                    "double" if any(t in {"float", "double"} for t in operand_argument_types)
+                    else max(operand_argument_types, key=lambda t: int(t[1:]))
                     if operand_argument_types else result_type
                 )
+                if (
+                    result_type in _INTEGER_LLVM_TYPES and result_type != "i1"
+                    and operand_argument_types
+                    and all(kind == "i1" for kind in operand_argument_types)
+                ):
+                    # Authored Python bool arithmetic has an integer result:
+                    # True + True is int64 2, not add i1 followed by extension
+                    # of the wrapped zero. The declared result owns this
+                    # arithmetic domain; predicates and logical ops keep i1.
+                    operand_type = result_type
                 # The logical templates are spelled over i1; an operand that
                 # arrives in its double storage type must be coerced to a
                 # boolean, not passed through in whatever width it was
@@ -4976,7 +5114,8 @@ def _emit_repository_call_module(
                     # declared-result rule already does.
                     operand_type = "double"
                 operands = [
-                    load_as(argument, operand_type, f"{tag}.{position}")
+                    load_as(argument, operand_type, f"{tag}.{position}",
+                            target_unsigned=compute_unsigned)
                     for position, argument in enumerate(instruction.args)
                 ]
                 register = f"%scalar.{tag}"
@@ -4997,9 +5136,10 @@ def _emit_repository_call_module(
                         f"  {register} = {float_cast[operation]} "
                         f"{operand_type} {operands[0]} to {result_type}"
                     )
-                elif operand_type in {"i1", "i32", "i64"}:
+                elif operand_type in _INTEGER_LLVM_TYPES:
                     integer = integer_scalar_lines(
                         operation, operand_type, operands, register,
+                        unsigned=compute_unsigned,
                     )
                     if integer is None:
                         shortfalls.append(LLVMEmissionShortfall(
@@ -5043,40 +5183,12 @@ def _emit_repository_call_module(
                 # read back as double turned row*4 into a denormal ~0).
                 declared_type = _value_llvm_type(result)
                 if declared_type != result_type:
-                    converted = f"%declared.{tag}"
-                    if declared_type == "double" and result_type in {
-                        "i32", "i64",
-                    }:
-                        body.append(
-                            f"  {converted} = sitofp {result_type} "
-                            f"{register} to double"
-                        )
-                        register, result_type = converted, "double"
-                    elif declared_type == "double" and result_type == "i1":
-                        body.append(
-                            f"  {converted} = uitofp i1 {register} to double"
-                        )
-                        register, result_type = converted, "double"
-                    elif declared_type in {"i32", "i64"} and result_type == (
-                        "double"
-                    ):
-                        body.append(
-                            f"  {converted} = fptosi double {register} "
-                            f"to {declared_type}"
-                        )
-                        register, result_type = converted, declared_type
-                    elif (
-                        declared_type in {"i32", "i64"}
-                        and result_type in {"i32", "i64"}
-                    ):
-                        opcode_word = (
-                            "sext" if declared_type == "i64" else "trunc"
-                        )
-                        body.append(
-                            f"  {converted} = {opcode_word} {result_type} "
-                            f"{register} to {declared_type}"
-                        )
-                        register, result_type = converted, declared_type
+                    register = convert_loaded(
+                        register, result_type, declared_type, f"declared.{tag}",
+                        source_unsigned=compute_unsigned and not is_predicate_operation(operation),
+                        target_unsigned=_unsigned_value(result),
+                    )
+                    result_type = declared_type
                 scalar_target = pointer(result)
                 body.append(
                     f"  store {result_type} {register}, ptr {scalar_target}, "
@@ -5183,9 +5295,23 @@ def _emit_repository_call_module(
         )
     )
     public_values = [*root_public_args, *root_outputs]
+    # Internal exact arithmetic may use wider integers, but the host buffer
+    # contract has no NumPy/ctypes 128-bit integer cell. Refuse that boundary
+    # explicitly; internal calls retain their existing pointer-only ABI.
+    unsupported_public = [value for value in public_values
+                          if _value_llvm_type(value) == "i128"]
+    if unsupported_public:
+        return LLVMFunctionArtifact(
+            name=entry_name, llvm_ir="", buffer_order=(), buffer_shapes=(),
+            extent_order=(), shortfalls=tuple(LLVMEmissionShortfall(
+                function_name, "ProgramABI",
+                f"internal dtype {value.dtype!r} value {value.id} has no public 128-bit buffer ABI",
+            ) for value in unsupported_public),
+        )
     buffer_order: list[int] = []
     buffer_shapes: list[tuple[_Any, ...]] = []
     buffer_dtypes: list[str] = []
+    buffer_element_dtypes: list[str] = []
     public_pointer: dict[int, str] = {}
     wrapper: list[str] = ["entry:"]
     # The wrapper's units are posted under the root function's row.
@@ -5227,6 +5353,7 @@ def _emit_repository_call_module(
             else ()
         ))
         buffer_dtypes.append(_value_llvm_type(value))
+        buffer_element_dtypes.append(_public_numpy_dtype(value))
         address = f"%public.addr.{slot}"
         loaded = f"%public.{slot}"
         wrapper.append(f"  {address} = getelementptr ptr, ptr %buffers, i64 {slot}")
@@ -5588,6 +5715,7 @@ def _emit_repository_call_module(
         extent_order=tuple(module_extent_order),
         shortfalls=tuple(shortfalls),
         buffer_dtypes=tuple(buffer_dtypes),
+        buffer_element_dtypes=tuple(buffer_element_dtypes),
         output_extent_sources=tuple(output_extent_sources),
         buffer_ranks=public_ranks,
         buffer_roles=public_roles,
@@ -5617,6 +5745,9 @@ class LLVMFunctionArtifact:
     extent_order: tuple[tuple[int, str, int | None], ...]
     shortfalls: tuple[LLVMEmissionShortfall, ...]
     buffer_dtypes: tuple[str, ...] = ()
+    # Derived publication of each public SSA value's physical dtype. LLVM
+    # i64 alone cannot tell the host whether its bytes are int64 or uint64.
+    buffer_element_dtypes: tuple[str, ...] = ()
     #: The registry-owned platform contract selected before lowering.  This
     #: is not inferred from the emitted text when the object compiler runs.
     build_target: _Any = None
@@ -5698,8 +5829,10 @@ class LLVMFunctionArtifact:
             entry=self.name, backend="llvm", extent_type="int32_t",
             buffer_order=self.buffer_order,
             buffer_dtypes=tuple(
-                numpy_names.get(str(dtype), str(dtype))
-                for dtype in (self.buffer_dtypes or tuple(
+                self.buffer_element_dtypes[position]
+                if position < len(self.buffer_element_dtypes)
+                else numpy_names.get(str(dtype), str(dtype))
+                for position, dtype in enumerate(self.buffer_dtypes or tuple(
                     "double" for _ in self.buffer_order
                 ))
             ),
@@ -5803,9 +5936,9 @@ def prepare_artifact_execution(
     }
     buffers: dict[int, _Any] = {}
     extent_sources = dict(artifact.output_extent_sources or ())
-    for value_id, authored_shape, llvm_dtype in zip(
+    for position, (value_id, authored_shape, llvm_dtype) in enumerate(zip(
         artifact.buffer_order, artifact.buffer_shapes, llvm_dtypes
-    ):
+    )):
         value_id = int(value_id)
         if value_id in extent_sources and value_id not in shape_overrides:
             source = feed_values.get(int(extent_sources[value_id]))
@@ -5815,7 +5948,9 @@ def prepare_artifact_execution(
                     f"input {extent_sources[value_id]}, which was not fed"
                 )
             shape_overrides[value_id] = tuple(np.shape(source))
-        dtype = numpy_dtypes.get(str(llvm_dtype))
+        dtype = (np.dtype(artifact.buffer_element_dtypes[position])
+                 if position < len(artifact.buffer_element_dtypes)
+                 else numpy_dtypes.get(str(llvm_dtype)))
         if dtype is None:
             raise ValueError(f"unsupported LLVM ABI dtype {llvm_dtype!r}")
         if value_id in feed_values:
@@ -6645,6 +6780,7 @@ def emit_ssa_function_to_llvm(
             buffer_order=tuple(piece["buffer_order"]),
             buffer_shapes=tuple(piece["buffer_shapes"]),
             buffer_dtypes=tuple(piece["buffer_dtypes"]),
+            buffer_element_dtypes=tuple(piece.get("buffer_element_dtypes", ())),
             extent_order=tuple(piece["extent_order"]), shortfalls=(),
             build_target=artifact_build_target,
             linked_objects=tuple(piece["linked_objects"]),
@@ -6677,6 +6813,14 @@ def emit_ssa_function_to_llvm(
         len(repository_closure) > 1
         or len(module.functions[function_name].blocks) > 1
         or calls_piece
+        or any(_value_llvm_type(value) == "float" for value in function.args)
+        # The repository module emitter owns exact physical integer widths
+        # and signedness; the legacy register-only leaf path has no such ABI.
+        or any(_value_llvm_type(v) in {"i8", "i16", "i128"}
+               or (_unsigned_value(v) and _value_llvm_type(v) != "i1")
+               for v in (*function.args, *(v
+                   for b in function.blocks.values() for i in b.instrs
+                   for v in (*i.args, *((i.res,) if i.res is not None else ())))))
         or any(str(i.op) == "Alloca" or i.attributes.get("native_heap_abi")
                for b in module.functions[function_name].blocks.values() for i in b.instrs)
     ):
@@ -6824,6 +6968,16 @@ def emit_ssa_function_to_llvm(
         rendering, kind = known
         if kind == wanted:
             return rendering
+        if wanted in {"i32", "i64"} and kind == "i1":
+            # A single-leaf Python bool Add has an int64 result just as a
+            # repository call does. Preserve that declared domain by extending
+            # its bool operands before arithmetic, rather than refusing the
+            # exact i1 -> integer conversion as an unavailable operand.
+            if not rendering.startswith("%"):
+                return str(int(rendering))
+            register = f"%conv.{tag}"
+            lines.append(f"  {register} = zext {kind} {rendering} to {wanted}")
+            return register
         if wanted == "double" and kind in {"i1", "i32", "i64"}:
             if not rendering.startswith("%"):
                 return _double_literal(float(int(rendering)))

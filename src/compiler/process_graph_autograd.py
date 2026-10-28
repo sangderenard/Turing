@@ -204,6 +204,18 @@ def abstract_tensor_program_to_process_graph(
         Derived, Mode, Novel, current_identity_book,
     )
 
+    if _owns_new_reverse_book():
+        # Direct AbstractTensor ingestion is also a public graph entry.
+        # The plain VJP test ingested under the detached default book, then
+        # SSA assembly attached a fresh empty book while its value cells
+        # remained in the detached one.  Start this graph's real book before
+        # posting its first program value, and keep it for differentiation
+        # and lowering as obtain_graph_reverse already does.
+        from .identity_concordance import begin_identity_book
+
+        standalone, _token = begin_identity_book()
+        standalone.standalone_reverse_compile = True
+
     graph = ProcessGraph(materialize_memory=False)
     constants: dict[int, Any] = {}
     named_values = {
@@ -226,11 +238,17 @@ def abstract_tensor_program_to_process_graph(
     def post_program_value(
         value_id: int, op: str, callee: str, shape: Any, dtype: Any,
     ) -> None:
+        if not dtype:
+            raise ProcessGraphAutogradError(
+                f"SSA AbstractTensor value {int(value_id)} ({op} {callee}) "
+                "has no recorded dtype; the forward program never settled "
+                "its type"
+            )
         program_cells[int(value_id)] = book.post(
             ABSTRACT_TENSOR_PROGRAM_VALUE, (scope, int(value_id)),
             AbstractTensorValueFact(
                 str(op), str(callee), tuple(map(int, shape or ())),
-                str(dtype or "float64"),
+                str(dtype),
             ),
             stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
             mode=Mode.CONCORD,
@@ -242,12 +260,17 @@ def abstract_tensor_program_to_process_graph(
         parents: Iterable[int] = (),
         *,
         shape: Iterable[int] = (),
-        dtype: str | None = "float64",
+        dtype: str | None,
         attributes: Mapping[str, Any] | None = None,
         constant: Any = None,
         sources: Iterable[int] = (),
     ) -> None:
         value_id = int(value_id)
+        if not dtype:
+            raise ProcessGraphAutogradError(
+                f"SSA AbstractTensor node {value_id} ({op}) has no recorded "
+                "dtype; the forward program never settled its type"
+            )
         node_sources[value_id] = tuple(dict.fromkeys(
             (value_id, *map(int, sources))
         ))
@@ -263,7 +286,7 @@ def abstract_tensor_program_to_process_graph(
             attributes=dict(attributes or {}), extra_args={},
             tensor={
                 "shape": tuple(map(int, shape or ())),
-                "dtype": str(dtype or "float64"),
+                "dtype": str(dtype),
             },
             control={}, constant=copy.deepcopy(constant),
             expr_obj=None, store_id=None,
@@ -650,6 +673,11 @@ def _program_adjoint_binding_graph(
         data = forward.G.nodes[value_id]
         attributes = dict(data.get("attributes") or {})
         tensor = dict(data.get("tensor") or {})
+        if not tensor.get("dtype"):
+            raise ProcessGraphAutogradError(
+                f"{path} retains control value {value_id} whose forward "
+                "tensor record has no dtype"
+            )
         if value_id not in graph:
             graph.add_node(
                 value_id,
@@ -658,7 +686,7 @@ def _program_adjoint_binding_graph(
                 kind=kind,
                 storage="resident",
                 shape=tuple(tensor.get("shape") or ()),
-                dtype=str(tensor.get("dtype") or "float64"),
+                dtype=str(tensor["dtype"]),
                 binding_name=str(
                     attributes.get("binding_name")
                     or attributes.get("name")
@@ -1619,6 +1647,11 @@ class _AdjointBindingGraphBuilder:
             "product"
         )
         tensor = dict(data.get("tensor") or {})
+        if not tensor.get("dtype"):
+            raise ProcessGraphAutogradError(
+                f"forward value {forward_id} reaches the adjoint graph with "
+                "no recorded tensor dtype"
+            )
         existing = self.graph.nodes.get(forward_id, {})
         effective_storage = (
             "resident"
@@ -1632,7 +1665,7 @@ class _AdjointBindingGraphBuilder:
             kind=kind,
             storage=effective_storage,
             shape=tuple(tensor.get("shape") or ()),
-            dtype=str(tensor.get("dtype") or "float64"),
+            dtype=str(tensor["dtype"]),
             binding_name=str(
                 attributes.get("binding_name")
                 or identity
@@ -2581,6 +2614,12 @@ def differentiate_process_graph(
         )
     _annotate_numeric_metadata(builder.backward)
     binding_graph = builder.bindings.finish()
+    for forward_id in builder.saved:
+        if not (forward.G.nodes[forward_id].get("tensor") or {}).get("dtype"):
+            raise ProcessGraphAutogradError(
+                f"saved forward value {int(forward_id)} has no recorded "
+                "tensor dtype"
+            )
     saved_contracts = {
         int(forward_id): SavedValueContract(
             forward_value_id=int(forward_id),
@@ -2589,10 +2628,7 @@ def differentiate_process_graph(
                 (forward.G.nodes[forward_id].get("tensor") or {}).get("shape")
                 or ()
             ),
-            dtype=str(
-                (forward.G.nodes[forward_id].get("tensor") or {}).get("dtype")
-                or "float64"
-            ),
+            dtype=str(forward.G.nodes[forward_id]["tensor"]["dtype"]),
             storage=builder.saved_storage.get(int(forward_id), "resident"),
         )
         for forward_id, backward_id in builder.saved.items()
@@ -2948,14 +2984,6 @@ def obtain_graph_reverse(
             raise TypeError(
                 "AbstractTensor graph-reverse acquisition requires bindings"
             )
-        if _owns_new_reverse_book():
-            # A standalone reverse acquisition is one program's compile: it
-            # ingests here, so its book starts here and stays current for
-            # the lowering its caller runs next (until the next compile).
-            from .identity_concordance import begin_identity_book
-
-            standalone, _token = begin_identity_book()
-            standalone.standalone_reverse_compile = True
         forward = abstract_tensor_program_to_process_graph(
             source, bindings=bindings,
         )
@@ -2984,14 +3012,12 @@ def lower_training_motion_to_repository_ssa(
     ``FusedProgram`` nor manufactures a second instruction language.
     """
 
-    from types import SimpleNamespace
-
     from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
         c_backend_repository_ssa_reference,
     )
-    from .fortran_c_shell import _class_surface_ssa_program
-    from .glsl_deployment_strategy import strategize_shell_deployment
-    from .shell_reference_tables import build_class_navigation_table
+    from .fortran_c_shell import _lower_resolved_process_graph_deployment
+    from .process_graph_fusion import extract_clean_process_subgraph
+    from .shell_reference_tables import build_map_dependency_regions
 
     graph = motion.graph
     _annotate_numeric_metadata(graph)
@@ -3053,9 +3079,36 @@ def lower_training_motion_to_repository_ssa(
         identity_table[name] = (node_id,)
     identity_table.update({name: (node_id,) for name, node_id in outputs.items()})
 
+    # The AST reducer normally posts version-zero formal bindings.  This
+    # motion has no AST: each formal is an existing AbstractTensor input
+    # copied into the motion, so its binding derives from that input cell.
+    from .concordance_declarations import (
+        BindingFact, FORWARD_LOSS_BACKWARD_FUSION, NAME_BINDING,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+
+    motion_scope = graph.G.graph["ingestion_value_scope"]
+    graph.G.graph["lexical_read_scope"] = motion_scope
+    for parameter_name in parameter_names:
+        value_id = int(identity_table[parameter_name][0])
+        current_identity_book().post(
+            NAME_BINDING, (motion_scope, parameter_name, 0),
+            BindingFact(value_id, False, (None,) * 4, ""),
+            stage=FORWARD_LOSS_BACKWARD_FUSION,
+            provenance=Derived((_graph_node_cell(graph, value_id),)),
+            mode=Mode.CONCORD,
+        )
+
+    # The generated VJP is defined by the fused motion's roots.  Their
+    # ingestion cells derive from the exact forward/backward producers, so
+    # they are the definition cells for its FunctionTable address.
+    definition_cells = tuple(dict.fromkeys(
+        _graph_node_cell(graph, int(root)) for root in graph.roots
+    ))
     function_reference = graph.function_table.declare(
         function_name,
         qualified_name=function_name,
+        source=definition_cells,
     )
     graph.function_table.resolve_graph(function_reference, graph)
     graph.G.graph.update({
@@ -3103,23 +3156,39 @@ def lower_training_motion_to_repository_ssa(
             )
         },
     }
-    deployment = None
+    # The motion is generated, so no AST reducer publishes its ordered
+    # semantic returns.  The generated outputs are exact motion nodes;
+    # publish their rows from those cells before any shell reads them.
+    from .concordance_declarations import SEMANTIC_OUTPUT
+
+    for position, (output_name, output_id) in enumerate((
+        *outputs.items(),
+        *zip(hidden_retained_names, retained_forward_products),
+    )):
+        current_identity_book().post(
+            SEMANTIC_OUTPUT, (motion_scope, position),
+            (str(output_name), int(output_id)),
+            stage=FORWARD_LOSS_BACKWARD_FUSION,
+            provenance=Derived((_graph_node_cell(graph, int(output_id)),)),
+            mode=Mode.CONCORD,
+        )
+
+    # Source catalogue and executable function are distinct in the ordinary
+    # resolved-unit route.  This graph is both only because the motion was
+    # generated in memory; an empty catalogue retains its FunctionTable while
+    # the table entry keeps the exact executable graph and its value cells.
+    catalogue = extract_clean_process_subgraph(graph, ())
+    catalogue.G.graph.pop("function_name", None)
+    catalogue.G.graph.pop("function_ref", None)
+    closure = build_map_dependency_regions(graph, function_name)
     try:
-        deployment_type = strategize_shell_deployment(
-            graph,
-            backend="fortran",
+        module, _section_outputs, exports = _lower_resolved_process_graph_deployment(
+            catalogue,
+            function_name,
+            selected_function_references=closure.runtime,
+            activation_function_references=(int(function_reference.address),),
+            name="training_motion",
             runtime_closure_only=True,
-        )
-        deployment = deployment_type(profiling=False, shell_language="glsl")
-        deployment.compile_process_graph(prepare_ephemerals=False)
-        deployment.prepare_graph_precompile(structural_ssa_only=True)
-        compilation = SimpleNamespace(
-            deployment=deployment,
-            class_navigation=build_class_navigation_table(graph),
-        )
-        module, _section_outputs, exports = _class_surface_ssa_program(
-            compilation,
-            "training_motion",
             tensor_ssa_reference=(
                 tensor_ssa_reference or c_backend_repository_ssa_reference()
             ),
@@ -3128,8 +3197,6 @@ def lower_training_motion_to_repository_ssa(
         graph.roots = original_roots
         graph.G.graph["function_outputs"] = original_function_outputs
         graph.G.graph["identity_table"] = original_identity_table
-        if deployment is not None:
-            deployment.release()
 
     if module is None:
         raise ProcessGraphAutogradError(

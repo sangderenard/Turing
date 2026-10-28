@@ -522,7 +522,7 @@ def _compile_sympy_equations_uncached(
         # preserve predicates and narrow only those residual numeric values.
         for instruction in scheduled:
             for value in (*instruction.args, instruction.res):
-                if value is not None and value.dtype in {None, "float64", "double", "f64"}:
+                if value is not None and value.dtype in {None, "float64"}:
                     value.dtype = "float32"
     input_instructions = {
         int(instruction.res.id): instruction
@@ -582,7 +582,7 @@ def _compile_sympy_equations_uncached(
     if dtype == "float32":
         for instruction in body:
             for value in (*instruction.args, instruction.res):
-                if value is not None and value.dtype in {None, "float64", "double", "f64"}:
+                if value is not None and value.dtype in {None, "float64"}:
                     value.dtype = "float32"
     output_values = [SSAValue(int(root), dtype) for root in roots]
     body.append(Instr("Ret", output_values, None))
@@ -647,7 +647,7 @@ def _compile_sympy_equations_uncached(
             for block in current.blocks.values():
                 for instruction in block.instrs:
                     for value in (*instruction.args, instruction.res):
-                        if value is not None and value.dtype in {None, "float64", "double", "f64"}:
+                        if value is not None and value.dtype in {None, "float64"}:
                             value.dtype = "float32"
     return SymbolicEquationCompilation(
         equations=authored,

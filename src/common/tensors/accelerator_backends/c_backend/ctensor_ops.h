@@ -125,6 +125,46 @@ void index_select_double(
     const int* indices,
     int index_count);
 
+void scatter_sum_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count,
+    const double* values);
+
+void scatter_mean_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count,
+    const double* values);
+
+void scatter_max_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count,
+    const double* values);
+
+void scatter_min_double(
+    const double* input,
+    double* output,
+    const int* shape,
+    int ndim,
+    int dim,
+    const int64_t* indices,
+    int index_count,
+    const double* values);
+
 void index_assign_double(
     double* target,
     const int* shape,
@@ -177,6 +217,18 @@ void fold2d_double(
     int dilation_w);
 
 void sign_double(const double* input, double* output, int n);
+
+void binary_int64(
+    const int64_t* a, const int64_t* b, int64_t* out, int n, int op);
+void binary_scalar_int64(
+    const int64_t* a, int64_t b, int64_t* out, int n, int op, int reverse);
+void broadcast_int64(
+    const int64_t* input, int64_t* output, const int* input_shape,
+    int input_ndim, const int* output_shape, int output_ndim);
+void cast_int64_to_double_values(
+    const int64_t* input, double* output, int n);
+void create_arange_int64(
+    int64_t start, int64_t step, int n, int64_t* output);
 
 int ctensor_execute_primitive_program(
     const CTensorPrimitiveInstruction* instructions,

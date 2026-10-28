@@ -122,7 +122,13 @@ def _publish_formal_shape(
     )
 
     extents = tuple(int(e) for e in (descriptor.get("shape") or ()))
-    dtype = str(descriptor.get("dtype") or "float64")
+    if not descriptor.get("dtype"):
+        raise ValueError(
+            f"formal shape ledger: caller {caller!r} proved a shape for "
+            f"{function}.{parameter} but its argument descriptor records no "
+            "dtype; the formal's element type was never settled"
+        )
+    dtype = str(descriptor["dtype"])
     book = current_identity_book()
     row = (authored_function_name(function), str(parameter))
     previous = book.latest_ref(FORMAL_SHAPE, row)

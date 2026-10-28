@@ -722,6 +722,14 @@ CALLEE_UNRESOLVED = declare_reason("callee_unresolved")
 #: ``place_loop_carried_region_producers.owned_regions``' marker-region
 #: fallback.
 REGION_OWNERSHIP_UNKNOWN = declare_reason("region_ownership_unknown")
+#: A region value whose dtype no record settled when the hierarchy plan was
+#: frozen BEFORE callsite planning / actual-to-formal binding / linked-ABI
+#: settlement.  The structure is frozen; the type is an outstanding
+#: obligation until the strict (post-settlement) freeze settles or refuses it.
+REGION_VALUE_DTYPE_AWAITS_SETTLEMENT = declare_reason(
+    "region_value_dtype_awaits_settlement"
+)
+HIERARCHY_PLAN_FREEZE = declare_stage("hierarchy_plan_freeze")
 
 
 # -- facts -------------------------------------------------------------------
@@ -886,6 +894,12 @@ LOOP_CARRIED_BINDING = declare_page("loop_carried_binding", (
 LOOP_REGION_MEMBERSHIP = declare_page("loop_region_membership", (
     RowField("read_scope", K.SCOPE), RowField("loop", K.VALUE_ID),
 ), tuple)                              # mode REVISE
+#: Fact: the dtype a hierarchy-plan freeze settled for a region value, or
+#: ``Unresolved(REGION_VALUE_DTYPE_AWAITS_SETTLEMENT)`` while the freeze was
+#: non-terminal and nothing had settled it.  Mode REVISE.
+PLAN_REGION_VALUE_DTYPE = declare_page("plan_region_value_dtype", (
+    RowField("read_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), str)                                # str | Unresolved; mode REVISE
 LOOP_RESULT_PORT_BINDING = declare_page("loop_result_port_binding", (
     RowField("read_scope", K.SCOPE), RowField("port", K.VALUE_ID),
 ), str)                                # mode CONCORD
@@ -1199,6 +1213,12 @@ REVOKE_PHYSICAL = _PhysicalSentinel("REVOKE_PHYSICAL")
 SSA_VALUE_PHYSICAL_STORAGES = frozenset({
     "scalar", "span", "reference", "record", "sequence", "table", "keyed",
 })
+#: ``keyed``/``table`` are ProgramABI access policies over descriptor-backed
+#: resident ``sequence`` storage.  The SSA row keeps the declared policy; a
+#: ValueTypeABI arm states only the physical kind.  This is the one place that
+#: maps one to the other (``_physical_type_arms`` and the physical view both
+#: read it).
+POLICY_PHYSICAL_KIND = {"keyed": "sequence", "table": "sequence"}
 SSA_VALUE_PHYSICAL_FIELDS = (
     "physical_dtype", "storage", "rank", "arena", "device",
 )
@@ -1626,7 +1646,7 @@ PHYSICAL_CALL_INPUT_ADAPTATION_ROUND = declare_page(
 CALL_INPUT_CONVERSION = declare_page("call_input_conversion", (
     RowField("caller", K.SCOPE), RowField("actual", K.VALUE_ID),
     RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
-), tuple)                              # mode REVISE
+), tuple)                              # (converted,source dtype,target dtype,kind[,source callsite,block]); REVISE
 CALL_INPUT_STORAGE = declare_page("call_input_storage_concordance", (
     RowField("caller", K.SCOPE), RowField("actual", K.VALUE_ID),
 ), str)                                # mode CONCORD
@@ -2198,17 +2218,19 @@ SEQUENCE_RESIDENCY = declare_page("sequence_residency", (
 ), ResidencyFact)
 
 # -- pages: re-declared (census 75, step 7) ----------------------------------
-#: The callsite moves from the column into the row: one row per binding.
-#: Fact ``ArgumentBindingFact`` or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``.
-#: CONCORD; rows written raw before this step keep ``"binding"`` as their
-#: third element with the callsite as the column.
+#: One row per binding, qualified by the caller as well as the call-local
+#: site. Distinct specialized callers reuse local site IDs and can bind the
+#: same callee shell formal to different literals. Fact ``ArgumentBindingFact``
+#: or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``. Legacy rows written before
+#: this step keep ``"binding"`` as their third element with callsite in column.
 ARGUMENT_BINDING = declare_page("argument_binding", (
-    RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
+    RowField("callee", K.NAME), RowField("caller", K.NAME),
+    RowField("formal", K.VALUE_ID),
     RowField("callsite", K.LABEL),
 ), ArgumentBindingFact)
 ARGUMENT_BINDING_RESOLUTION = declare_page("argument_binding_resolution", (
-    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
-    RowField("source", K.VALUE_ID),
+    RowField("callee", K.SCOPE), RowField("caller", K.SCOPE),
+    RowField("formal", K.VALUE_ID), RowField("source", K.VALUE_ID),
 ), tuple)                              # REVISE (next column)
 #: (callsite, callee, formal); CONCORD, DERIVED(the slot's cell, the formal's cell).
 FRAME_LEASE = declare_page("frame_lease_link", (
@@ -2309,7 +2331,7 @@ FORMAL_ACTUAL_OCCURRENCE = declare_page("formal_actual_occurrence_concordance", 
     RowField("caller", K.NAME), RowField("block", K.NAME),
     RowField("instruction", K.INDEX), RowField("position", K.INDEX),
     RowField("caller_scope", K.SCOPE),
-), int)                                # DERIVED(actual ssa_value); CONCORD
+), int)                                # DERIVED(actual SSA); exact control rebind REVISE
 FORMAL_STORAGE_RESOLUTION = declare_page("formal_storage_resolution", (
     RowField("function", K.SCOPE), RowField("formal", K.VALUE_ID),
 ), tuple)                              # DERIVED(incoming occurrences); REVISE
@@ -2811,6 +2833,7 @@ class SSABlockKind(Enum):
     STATE_NEXT = "state_next"
     STATE_MERGE = "state_merge"
     CHILD_TABLE_LIVE = "child_table_live"
+    TABLE_ROW_LIVE = "table_row_live"
     MAPPING_SETDEFAULT_FOUND = "mapping_setdefault_found"
     MAPPING_SETDEFAULT_MISSING = "mapping_setdefault_missing"
     MAPPING_SETDEFAULT_MERGE = "mapping_setdefault_merge"
@@ -4072,9 +4095,10 @@ ASSIGNMENT_PROJECTION_SOURCE = declare_page(
 )
 
 # -- operation-owned result domains and scalar kernel operands ---------------
-#: ``plan_region_to_ssa_instrs``: the truth type a predicate operation owns,
-#: ``(function scope, closure, region name, output value)`` -> ``(opcode,
-#: "bool")``, CONCORD, DERIVED(the output's ``canonical_value`` cell).
+#: ``plan_region_to_ssa_instrs``: the domain an operation owns after the
+#: existing numeric promotion/conversion law. ``(function scope, closure,
+#: region name, output value)`` -> ``(opcode, dtype)``, CONCORD, DERIVED
+#: from the exact output identity and consumed operand/conversion identities.
 OPERATOR_RESULT_TYPE = declare_page("operator_result_type_concordance", (
     RowField("function_scope", K.SCOPE), RowField("closure", K.INDEX),
     RowField("region", K.NAME), RowField("output", K.VALUE_ID),

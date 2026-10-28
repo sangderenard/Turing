@@ -84,6 +84,9 @@ def _fortran_storage_index(
     Resident feedback arenas stay in Fortran order and require no copies.
     """
 
+    if str(getattr(parameter, "layout", "") or "") == "dense-row-major":
+        return linear_index
+
     dynamic_dimensions = tuple(getattr(parameter, "extents", ()) or ())
     shape = (
         tuple(extents[str(name)] for name in dynamic_dimensions)

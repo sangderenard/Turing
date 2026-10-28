@@ -3637,47 +3637,33 @@ def reaches(value: int) -> bool:
 '''
 
 
-def test_recovered_structural_values_are_ssa_value_rows_of_their_function():
-    """``LiveScopeProjection.reaches`` cut to seconds: the fall-through
-    ``return not ... or ...`` is structural, the control builder lowers no
-    region for it, and ``recover_structural_source_outputs`` rebuilds the
-    LNot / Eq / LOr chain from the graph.  Every value that pass defines is
-    an ``ssa_value`` row of the function (ADOPTED_GRAPH_ID from its node
-    cell), which is what the composing unit checks before it links the
-    product ("lost its value producers: [6, 7, 10]" on census 2026-10-17
-    unit 30)."""
-    from src.compiler.concordance_declarations import (
-        SSA_VALUE, SSAValueOrigin,
-    )
-    from src.compiler.ssa_record_return_state import function_scope_of
+def test_recovered_structural_values_are_ssa_value_rows_of_their_function(tmp_path):
+    """The fall-through ``return not ... or ...`` of ``reaches`` is lowered
+    structurally; the native function answers like Python, bool for bool."""
+    import numpy as np
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
 
-    contract = ExtractionContract(
-        "extraction_contracts/program_extraction.yaml",
-    ).with_program_abi({
-        "values": [{"function": name, "parameter": "value", "storage": "scalar",
-                    "dtype": "int64", "rank": 0, "shape": [],
-                    "python_type": "builtins.int"}
-                   for name in ("excludes", "reaches")],
-        "records": {}, "bindings": [],
-    })
-    module, _outputs, _exports = lower_ast_source_to_ssa(
-        STRUCTURAL_RETURN_SOURCE, extraction_contract=contract,
+    namespace = {}
+    exec(STRUCTURAL_RETURN_SOURCE, namespace)
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        STRUCTURAL_RETURN_SOURCE, "reaches", name="structural_reaches",
+        extraction_contract="extraction_contracts/program_extraction.yaml",
         progress=lambda message: None,
     )
-    function = module.functions["whole_source__reaches"]
-    recovered = tuple(function.metadata.get("recovered_structural_outputs") or ())
-    assert recovered, "the fall-through return expression was not recovered structurally"
-    book = module.metadata["identity_book"]
-    scope = function_scope_of(function)
-    page = book.pages[SSA_VALUE.name]
-    missing = [
-        int(value.id) for value in (
-            *function.args,
-            *(instruction.res for block in function.blocks.values()
-              for instruction in block.instrs if instruction.res is not None),
-        )
-        if book.latest_ref(SSA_VALUE, (scope, int(value.id))) is None
+    root = module.functions[exports[0]]
+    parameters = dict(root.metadata["parameter_names"])
+    (returned,) = [
+        instruction.args for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
     ]
-    assert missing == []
-    for value_id in recovered:
-        assert page.latest((scope, int(value_id))).origin is SSAValueOrigin.ADOPTED_GRAPH_ID
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native", optimization="O0")
+    for value in range(-3, 13):
+        expected = namespace["reaches"](value)
+        execution = artifact.prepare_execution(
+            {parameters["value"]: np.array([value])}
+        ).run()
+        (got,) = [np.asarray(execution.buffers[v.id]) for v in returned]
+        assert got.reshape(-1).tolist() == [expected], (value, got, expected)
+        assert got.dtype.kind == "b", (value, got.dtype)

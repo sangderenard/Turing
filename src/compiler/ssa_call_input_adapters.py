@@ -21,6 +21,43 @@ from ..transmogrifier.ssa import Instr, SSAValue
 _NUMERIC_DTYPES = {'bool', 'int32', 'int64', 'float32', 'float64'}
 
 
+def _publish_converted_frame_binding(call_records, caller, callee, instruction,
+                                     formal, actual, converted, conversion_cell):
+    """The native frame is a converted view of the source argument edge."""
+    if not instruction.attributes.get('source_linked') or instruction.attributes.get('plan_callsite_id') is None:
+        return
+    from dataclasses import replace
+    from .identity_concordance import ConcordanceRefusal
+    book = current_identity_book()
+    if call_records is None or call_records.book is not book:
+        raise ConcordanceRefusal('source call conversion lacks its authoritative call table')
+    records = tuple(call_records.get(str(caller.name), ()))
+    matches = tuple((index, record) for index, record in enumerate(records)
+                    if record.callsite_id == instruction.attributes['plan_callsite_id']
+                    and str(record.callee_symbol) == str(callee.name)
+                    and record.resolution == 'native_call')
+    if len(matches) != 1:
+        raise ConcordanceRefusal('source call conversion lacks one exact native activation')
+    index, record = matches[0]
+    old = tuple((kind, source) for value_id, kind, source in record.frame_bindings
+                if int(value_id) == int(formal.id))
+    if (len(old) != 1 or old[0][0] not in {'caller_value', 'caller_storage', 'caller_alias'}
+            or int(old[0][1]) != int(actual.id)):
+        raise ConcordanceRefusal('source call conversion disagrees with its current physical frame')
+    bindings = tuple((value_id, 'caller_value', int(converted.id))
+                     if int(value_id) == int(formal.id) else (value_id, kind, source)
+                     for value_id, kind, source in record.frame_bindings)
+    revised = list(records)
+    revised[index] = replace(record, frame_bindings=bindings)
+    # The semantic PlanCall argument stays original. The existing Cast and
+    # conversion receipt own this exact activation's physical argument, so
+    # later frame projection cannot restore the old bool over its int64 view.
+    call_records.assign(str(caller.name), tuple(revised),
+                        sources=(record.cell, conversion_cell,
+                                 ssa_value_identity_cell(caller, converted.id)),
+                        stage=PHYSICAL_CALL_INPUT_ADAPTATION)
+
+
 def call_input_rank_updates(callee, actual, formal, *, by_value_kernel_formal=False):
     """Rank updates for one already-bound call edge; the caller posts changes."""
     # N4 advance_pieces region111 converts scalar int64 zero to double for
@@ -439,30 +476,110 @@ def _concord_exact_region_feed_dtypes(
                         # binding, through the same revise writer the
                         # dtype/shape adapter uses; a posted formal field
                         # is never overwritten.
-                        _actual_fact = posted_ssa_value_fact(
-                            caller, int(actual.id), book=book)
-                        _formal_fact = posted_ssa_value_fact(
-                            callee, int(formal.id), book=book)
-                        if _actual_fact is not None and _formal_fact is not None:
-                            _inherit = {
-                                name: getattr(_actual_fact, name)
-                                for name in (
-                                    'physical_dtype', 'storage', 'rank',
-                                    'arena', 'device',
+                        source_structure, source_cell = function_value_structure(
+                            caller,
+                            int(actual.id),
+                            book=book,
+                        )
+
+                        target_structure, target_cell = function_value_structure(
+                            callee,
+                            int(formal.id),
+                            book=book,
+                        )
+
+                        if (
+                            source_structure.kind == 'scalar'
+                            and target_structure.kind == 'scalar'
+                        ):
+                            _inherit = {}
+
+                            if (
+                                source_structure.physical_dtype is not None
+                                and target_structure.physical_dtype is None
+                            ):
+                                _inherit['physical_dtype'] = (
+                                    source_structure.physical_dtype
                                 )
-                                if getattr(_actual_fact, name)
-                                not in (None, False)
-                                and getattr(_formal_fact, name)
-                                in (None, False)
-                            }
+
+                            if (
+                                source_structure.declared_storage is not None
+                                and target_structure.declared_storage is None
+                            ):
+                                _inherit['storage'] = (
+                                    source_structure.declared_storage
+                                )
+
+                            if (
+                                source_structure.rank is not None
+                                and target_structure.rank is None
+                            ):
+                                _inherit['rank'] = source_structure.rank
+
+                            if source_structure.arena and not target_structure.arena:
+                                _inherit['arena'] = True
+
                             if _inherit:
                                 revise_value_row(
-                                    callee, int(formal.id), formal.dtype,
+                                    callee,
+                                    int(formal.id),
+                                    formal.dtype,
                                     formal.shape,
-                                    ssa_value_identity_cell(
-                                        caller, int(actual.id), book=book,
-                                    ),
+                                    source_structure.source,
+                                    target_structure.source,
                                     physical=_inherit,
+                                )
+
+                            # Program: ``while (lim - total).item() > 0.5:
+                            # total = total + 1.0`` (the region formal is
+                            # the loop variable's logical graph id, whose
+                            # row a scalar constant seed also posts).  Wrong
+                            # record: the formal's row posted
+                            # scalar/rank-0/``physical_dtype`` while the
+                            # feeding actual -- a loop Phi or an arithmetic
+                            # result of a region, whose operands carry no
+                            # contract row -- posted none of them, so the
+                            # transport refused (producer None, consumer
+                            # float64).  Rule: the same carried variable at
+                            # the same dtype and shape is one scalar
+                            # representation; the actual's UNPOSTED physical
+                            # fields are DERIVED from the formal's posted
+                            # row at this binding, through the same revise
+                            # writer, and a posted actual field is never
+                            # overwritten.
+                            _actual_inherit = {}
+
+                            if (
+                                target_structure.physical_dtype is not None
+                                and source_structure.physical_dtype is None
+                            ):
+                                _actual_inherit['physical_dtype'] = (
+                                    target_structure.physical_dtype
+                                )
+
+                            if (
+                                target_structure.declared_storage is not None
+                                and source_structure.declared_storage is None
+                            ):
+                                _actual_inherit['storage'] = (
+                                    target_structure.declared_storage
+                                )
+
+                            if (
+                                target_structure.rank is not None
+                                and source_structure.rank is None
+                            ):
+                                _actual_inherit['rank'] = target_structure.rank
+
+                            if _actual_inherit:
+                                revise_value_row(
+                                    caller,
+                                    int(actual.id),
+                                    actual.dtype,
+                                    actual.shape,
+                                    target_structure.source,
+                                    source_structure.source,
+                                    physical=_actual_inherit,
                                 )
                         # An actual that declares ``ssa_storage_view`` of its
                         # own id is the declared view, not the storage: its
@@ -632,7 +749,6 @@ def _infer_pointer_storage(functions, native_storage=None):
     two authorities depending on which implementation was installed.  Rule:
     the witness scan below is the one publisher; the accelerator's answer is
     a cross-check, and a disagreement refuses."""
-    canonical = {'double': 'float64', 'float': 'float32', 'i64': 'int64', 'i32': 'int32', 'i1': 'bool'}
     for function in functions.values():
         instructions = [instruction for block in function.blocks.values() for instruction in block.instrs]
         for formal in function.args:
@@ -666,14 +782,14 @@ def _infer_pointer_storage(functions, native_storage=None):
                     dtype = instruction.args[0].dtype
                     witnesses.append(instruction.args[0])
                 if dtype is not None:
-                    types.add(canonical.get(dtype, dtype))
+                    types.add(dtype)
             native = (
                 None if native_storage is None
                 else native_storage.get((function.name, int(formal.id)))
             )
             if len(types) == 1 and 'ptr' not in types:
                 inferred = next(iter(types))
-                if native is not None and canonical.get(native, native) != inferred:
+                if native is not None and native != inferred:
                     from .identity_concordance import ConcordanceRefusal
                     raise ConcordanceRefusal(
                         'pointer storage inference disagrees with the native '
@@ -805,7 +921,6 @@ def _read_only_module_inputs(functions):
     blocked = [0] * len(identities)
     kinds, results, offsets, operands, formals, writes = [], [], [0], [], [], []
     active, memory_addresses, memory_dtypes = [], [], []
-    canonical = {'double': 'float64', 'float': 'float32', 'i64': 'int64', 'i32': 'int32', 'i1': 'bool'}
     dtype_ids = {'ptr': 1}
     for function in functions.values():
         interface = function.metadata.get('native_interface') or function.metadata.get('linked_piece_interface')
@@ -832,7 +947,7 @@ def _read_only_module_inputs(functions):
                 if memory_dtype is None:
                     memory_dtypes.append(0)
                 else:
-                    dtype = canonical.get(memory_dtype, memory_dtype)
+                    dtype = memory_dtype
                     memory_dtypes.append(dtype_ids.setdefault(dtype, len(dtype_ids) + 1))
                 callee = functions.get(str(instruction.attributes.get('callee', '')))
                 matched = callee is not None and len(instruction.args) == len(callee.args)
@@ -944,9 +1059,127 @@ def _read_only_feed(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Numeric conversion contract.
+#
+# Numeric conversions are semantic operations. Backends implement the selected
+# contract; they do not choose rounding, overflow, or narrowing behavior.
+#
+# Modes:
+#
+#   compute
+#       Conventional machine-numeric behavior. Nearest rounding resolves exact
+#       ties to even.
+#
+#   scientific
+#       Conventional magnitude-preserving decimal/scientific rounding.
+#       Nearest rounding resolves exact ties away from zero.
+#
+#   stochastic
+#       Nearest rounding away from a boundary. Exact midpoint collisions are
+#       resolved by the Pigeon stochastic/stoichiometric decider so no fixed
+#       parity or directional ownership is imposed on the discontinuity.
+#
+# This definition belongs eventually in the numeric contract/concordance layer.
+# The call adapter consumes the contract and materializes its required SSA.
+# ---------------------------------------------------------------------------
+
+_NUMERIC_CONVERSION_MODES = {
+    "compute": {
+        "float_to_integer_rounding": "nearest_even",
+        "float_precision_rounding": "nearest_even",
+        "overflow": "trap",
+        "integer_narrowing": "trap",
+        "signedness": "preserve",
+        "implicit_conversion": "allow",
+    },
+
+    "scientific": {
+        "float_to_integer_rounding": "nearest_away_from_zero",
+        "float_precision_rounding": "nearest_away_from_zero",
+        "overflow": "trap",
+        "integer_narrowing": "trap",
+        "signedness": "preserve",
+        "implicit_conversion": "allow",
+    },
+
+    "stochastic": {
+        "float_to_integer_rounding": "pigeon_stochastic",
+        "float_precision_rounding": "pigeon_stochastic",
+        "overflow": "trap",
+        "integer_narrowing": "trap",
+        "signedness": "preserve",
+        "implicit_conversion": "allow",
+    },
+}
+
+
+_DEFAULT_NUMERIC_MODE = "scientific"
+
+
+def _numeric_conversion_attributes(
+    source_dtype,
+    target_dtype,
+    *,
+    mode=_DEFAULT_NUMERIC_MODE,
+):
+    """Return the numeric semantics for one conversion edge.
+
+    This is the current contract-selection surface. It should eventually read
+    the numeric contract recorded for the exact conversion edge from
+    concordance rather than selecting a module default here.
+    """
+
+    try:
+        contract = _NUMERIC_CONVERSION_MODES[mode]
+    except KeyError:
+        raise ValueError(f"unknown numeric conversion mode {mode!r}")
+
+    source = str(source_dtype)
+    target = str(target_dtype)
+
+    source_float = source.startswith("float")
+    target_float = target.startswith("float")
+
+    if source_float and not target_float:
+        return {
+            "numeric_conversion": True,
+            "numeric_mode": mode,
+            "conversion_kind": "float_to_integer",
+            "rounding": contract["float_to_integer_rounding"],
+            "overflow": contract["overflow"],
+        }
+
+    if source_float and target_float:
+        return {
+            "numeric_conversion": True,
+            "numeric_mode": mode,
+            "conversion_kind": "float_precision",
+            "rounding": contract["float_precision_rounding"],
+            "overflow": contract["overflow"],
+        }
+
+    if not source_float and target_float:
+        return {
+            "numeric_conversion": True,
+            "numeric_mode": mode,
+            "conversion_kind": "integer_to_float",
+            "rounding": contract["float_precision_rounding"],
+            "overflow": contract["overflow"],
+        }
+
+    return {
+        "numeric_conversion": True,
+        "numeric_mode": mode,
+        "conversion_kind": "integer_conversion",
+        "overflow": contract["integer_narrowing"],
+        "signedness": contract["signedness"],
+    }
+
 def _adapt_physical_call_inputs_round(
     functions, *, progress=None, round_index=0,
     defer_unsettled_region_call_results=False,
+    call_records=None,
 ) -> int:
     """Perform one ordered physical-call adaptation round.
 
@@ -1245,17 +1478,70 @@ def _adapt_physical_call_inputs_round(
                         # float into an int implicitly.  Rule: a call input
                         # conversion from a floating actual to an integer or
                         # bool formal is refused by name, never cast.
-                        if (str(source_dtype).startswith('float')
-                                and not str(target_dtype).startswith('float')):
-                            raise ValueError(
-                                'call input conversion would truncate: '
-                                f'{caller.name} passes {source_dtype} value '
-                                f'{int(actual.id)} to {target_dtype} formal '
-                                f'{int(formal.id)} of {callee.name}; Python '
-                                'never converts a float to an integer '
-                                'implicitly (a list mixing int and float rows '
-                                'has no single arena type)'
+                        # Numeric conversion semantics are selected by the
+                        # numeric contract and materialized explicitly in SSA.
+                        numeric_policy = _numeric_conversion_attributes(
+                            source_dtype,
+                            target_dtype,
+                        )
+
+                        conversion_source = actual
+                        conversion_op = 'Cast'
+
+                        if (
+                            str(source_dtype).startswith('float')
+                            and str(target_dtype) in {'int32', 'int64'}
+                        ):
+                            rounding_op = {
+                                'nearest_even': 'RoundNearestEven',
+                                'nearest_away_from_zero': 'RoundNearestAway',
+                                'pigeon_stochastic': 'RoundStochastic',
+                            }[numeric_policy['rounding']]
+
+                            rounded_id = mint_ssa_value(
+                                caller,
+                                CONTROL_CAST,
+                                (
+                                    actual,
+                                    ssa_value_identity_cell(
+                                        callee, formal.id,
+                                    ),
+                                ),
+                                dtype=source_dtype,
+                                shape=actual.shape,
+                                stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                                physical={
+                                    'physical_dtype': source_dtype,
+                                    'device': actual.device,
+                                },
                             )
+
+                            rounded_fact = posted_ssa_value_fact(
+                                caller, rounded_id,
+                            )
+
+                            rounded = SSAValue(
+                                rounded_id,
+                                dtype=source_dtype,
+                                shape=actual.shape,
+                                device=actual.device,
+                                accounting={
+                                    'physical_dtype':
+                                        rounded_fact.physical_dtype,
+                                },
+                            )
+
+                            rewritten.append(
+                                Instr(
+                                    rounding_op,
+                                    [actual],
+                                    rounded,
+                                    attributes=numeric_policy,
+                                )
+                            )
+
+                            conversion_source = rounded
+                            conversion_op = 'FpToSi'
                         # Shape is retained; a span conversion is elementwise.
                         # These six energy-helper conversions used to mint
                         # outside the book. The source value and the exact
@@ -1265,31 +1551,64 @@ def _adapt_physical_call_inputs_round(
                         # dtype, the actual's device) DERIVED from the actual's
                         # cell and the callee formal's cell; its accounting is
                         # set FROM that posted fact.
-                        converted_id = mint_ssa_value(caller, CONTROL_CAST,
-                            (actual, ssa_value_identity_cell(callee, formal.id)),
-                            dtype=target_dtype, shape=actual.shape,
+                        converted_id = mint_ssa_value(
+                            caller,
+                            CONTROL_CAST,
+                            (
+                                conversion_source,
+                                ssa_value_identity_cell(callee, formal.id),
+                            ),
+                            dtype=target_dtype,
+                            shape=actual.shape,
                             stage=PHYSICAL_CALL_INPUT_ADAPTATION,
-                            physical={'physical_dtype': target_dtype,
-                                'device': actual.device})
-                        converted_fact = posted_ssa_value_fact(caller, converted_id)
-                        converted = SSAValue(converted_id, dtype=target_dtype, shape=actual.shape, device=actual.device,
-                            accounting={'physical_dtype': converted_fact.physical_dtype,
-                                'call_input_conversion': (caller.name, int(actual.id), callee.name, int(formal.id)),
+                            physical={
+                                'physical_dtype': target_dtype,
+                                'device': actual.device,
+                            },
+                        )
+                        converted_fact = posted_ssa_value_fact(
+                            caller, converted_id,
+                        )
+                        converted = SSAValue(
+                            converted_id,
+                            dtype=target_dtype,
+                            shape=actual.shape,
+                            device=actual.device,
+                            accounting={
+                                'physical_dtype':
+                                    converted_fact.physical_dtype,
+                                'call_input_conversion': (
+                                    caller.name,
+                                    int(actual.id),
+                                    callee.name,
+                                    int(formal.id),
+                                ),
                                 'call_input_conversion_kind': (
                                     'read_only_scalar_numeric'
-                                    if logical_scalar_conversion or logical_pointer_scalar_conversion
+                                    if (
+                                        logical_scalar_conversion
+                                        or logical_pointer_scalar_conversion
+                                    )
                                     else 'physical_region'
-                                )})
+                                ),
+                            },
+                        )
                         conversion_attributes = {
                             'target_dtype': target_dtype,
                             'source_dtype': source_dtype,
+                            **_numeric_conversion_attributes(
+                                source_dtype,
+                                target_dtype,
+                            ),
                         }
                         if logical_scalar_conversion or logical_pointer_scalar_conversion:
                             conversion_attributes['concordant_call_input_conversion'] = True
                         else:
                             conversion_attributes['physical_region_input_conversion'] = True
                         rewritten.append(Instr(
-                            'Cast', [actual], converted,
+                            conversion_op,
+                            [conversion_source],
+                            converted,
                             attributes=conversion_attributes,
                         ))
                         instruction.args[index] = converted
@@ -1354,13 +1673,19 @@ def _adapt_physical_call_inputs_round(
                             str(caller.name), int(actual.id),
                             str(callee.name), int(formal.id),
                         )
-                        current_identity_book().post(CALL_INPUT_CONVERSION, row, (
+                        conversion_fact = (
                             int(converted.id), str(source_dtype),
                             str(target_dtype), conversion['kind'],
-                        ), stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                        )
+                        if instruction.attributes.get('source_linked') and instruction.attributes.get('plan_callsite_id') is not None:
+                            conversion_fact += (int(instruction.attributes['plan_callsite_id']), str(block_name))
+                        conversion_cell = current_identity_book().post(CALL_INPUT_CONVERSION, row, conversion_fact,
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION,
                             provenance=Derived(identity_cells(caller, actual, converted,
                                 ssa_value_identity_cell(callee, formal.id))),
                             mode=Mode.REVISE)
+                        _publish_converted_frame_binding(call_records, caller, callee, instruction,
+                                                         formal, actual, converted, conversion_cell)
                         count += 1
                 publication = None
                 output_position = instruction.attributes.get('ssa_output_argument')
@@ -1488,6 +1813,7 @@ def _adaptation_state_signature(functions):
 def adapt_physical_call_inputs(
     functions, *, progress=None,
     defer_unsettled_region_call_results=False,
+    call_records=None,
 ) -> int:
     """Converge physical call-edge contracts and record every adaptation.
 
@@ -1569,6 +1895,7 @@ def adapt_physical_call_inputs(
             defer_unsettled_region_call_results=(
                 defer_unsettled_region_call_results
             ),
+            call_records=call_records,
         )
         book.post(PHYSICAL_CALL_INPUT_ADAPTATION_ROUND, (round_scope, round_index),
                   int(changed), stage=PHYSICAL_CALL_INPUT_ADAPTATION,

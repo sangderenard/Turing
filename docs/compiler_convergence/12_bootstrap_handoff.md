@@ -324,3 +324,46 @@ complete and natively verified units. If a further blocker remains, provide its
 exact source/SSA records, first wrong writer, reproducible small command and
 next actionable repair. Keep the draft PR and evidence current; do not claim
 that reporting a missing operation implements it.
+
+## Supplied native library cases (2026-10-26)
+
+Use the existing project-product CLI for explicit golden verification:
+
+```powershell
+python -u -m tools.compile_project_catalogue --source src/compiler/compiler_benchmark_workload.py --entry recurrence --output build/native-library-cases --jobs 1 --emit-native --verification-cases tools/compiler_probes/native_library_cases.json
+```
+
+The YAML/JSON mapping is keyed by authored entry name. Each entry requires
+`probes` and `expected_probe_results`; optional `warmups`, `repetitions`, and
+`work_iterations` enable labelled direct-native-library timing after golden
+correctness. The emitted API selects the existing scalar/sequence/record
+verifier. Every probe and timed native invocation must use native with zero
+fallback. Unsupported ABI routes refuse explicitly. Lowered SSA, native build,
+verification, paths, hashes, and cold build times are reported separately.
+Compilation alone does not install a deployment.
+
+The shipped million-iteration recurrence has independent matrix-exponentiation
+goldens. `tests/test_project_native_cases.py` also proves fresh-worker static SSA
+dependency reuse by exact leaf artifact path/hash and native consumer outputs;
+this does not claim external DLL linking. Literal-safe golden cases replay
+through the existing descriptor-call-v1 activation and registry, with exact
+source/API/library/case-file hash checks. Arbitrary object codecs are unsupported.
+
+For imported sources outside existing roots, an extraction sheet can declare
+`sources: [{name: package.module, path: /exact/source.py}]`. Relative paths are
+relative to that sheet. This serializes the same selective module-name AND path
+admission as `ExtractionContract.with_sources`, so fresh project workers retain
+the audit's source pursuit. Pass the sheet with `--extraction-contract`; making
+a module importable alone does not admit its implementation.
+
+For a scalar entry that constructs private record state, select verification
+from the published public input/output roles. Local `record_tables` metadata
+does not turn workspace fields into authored record arguments. The scalar
+verifier delegates published workspaces to the incumbent
+`FortranCoreNative.prepare_execution` path, including null managed-context
+cells and known extents. Unresolved extents refuse; verification supplies no
+capacity guesses. A small reproducible example is:
+
+```powershell
+python -u -m tools.compile_project_catalogue --source src/compiler/compiler_counter_benchmark_consumer.py --entry counter_checksum --output build/native-counter-cases --jobs 1 --emit-native --verification-cases tools/compiler_probes/native_counter_cases.json
+```
