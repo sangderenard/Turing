@@ -51616,6 +51616,24 @@ def _class_surface_ssa_program(
                         },
                     )
                     forwarded_frame_result = _retain_forwarded_aggregate_storage(native_call, callee)
+                    # The linker has revised this call's record in flight
+                    # (result bindings re-keyed to the callee's semantic
+                    # outputs, the returned formal's pair added).  The
+                    # frame-aliased projection reads the book, so publish the
+                    # revision first; its reference then proves the binding.
+                    published_row = call_records[caller_symbol]
+                    published_at = [
+                        index for index, item in enumerate(published_row)
+                        if int(item.callsite_id) == int(record.callsite_id)
+                        and str(item.callee_symbol) == str(record.callee_symbol)
+                    ]
+                    if len(published_at) == 1 and published_row[published_at[0]] != record:
+                        published_row.replace(
+                            published_at[0], record,
+                            sources=_frame_cells(published_row[published_at[0]].cell),
+                            stage=FRAME_BINDING,
+                        )
+                        record = call_records[caller_symbol][published_at[0]]
                     _refresh_frame_aliased_result(native_call, callee, record=record)
                     aggregate_unpack = []
                     if returns_aggregate and result is not None and not forwarded_frame_result:
