@@ -1089,6 +1089,27 @@ def _callsite_argument_descriptor(
     return _tensor_descriptor(caller, int(argument_id))
 
 
+def _formal_is_mutated_in_place(callee_graph: Any, parameter: str) -> bool:
+    """Whether the callee mutates the collection bound to ``parameter``.
+
+    Program: ``def trim(values: list[int]): values.pop(); for v in values:
+    total += v`` called as ``trim([1, 2, 3, 4])``.  Wrong record: the
+    literal argument specialized the copy, which unrolled the loop over the
+    authored four elements and ignored the pop (10, not 6).  Rule: a literal
+    is a value of the copy only while the copy never mutates it; a mutated
+    formal stays the caller's storage.
+    """
+
+    inputs = {
+        int(node_id)
+        for node_id, data in callee_graph.nodes(data=True)
+        if data.get("type") == "Input"
+        and str((data.get("attributes") or {}).get("binding_name"))
+        == str(parameter)
+    }
+    return bool(inputs & set(_mutated_sequence_node_ids(callee_graph)))
+
+
 def _formal_storage_is_mutated(callee_graph: Any, parameter: str) -> bool:
     """Whether the callee needs the caller's storage behind ``parameter``.
 
@@ -20118,7 +20139,7 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
                     caller, int(parent),
                 ) and _callsite_argument_is_initializer(
                     caller, int(_node_id), int(parent),
-                ):
+                ) and not _formal_is_mutated_in_place(callee.G, parameter):
                     try:
                         value = _source_static_literal(caller, int(parent))
                     except ValueError:
@@ -21680,7 +21701,7 @@ def _propagate_callsite_tensor_specializations(
                 caller, int(parent),
             ) and _callsite_argument_is_initializer(
                 caller, int(node_id), int(parent),
-            )
+            ) and not _formal_is_mutated_in_place(callee.G, parameter)
             leaves = _authored_aggregate_leaves(caller, int(parent))
             if leaves and not static_argument and all(
                 int(leaf) in caller.G for leaf in leaves
@@ -31241,7 +31262,7 @@ def _callsite_specialized_shell_type(
             caller, int(parent),
         ) and _callsite_argument_is_initializer(
             caller, int(node_id), int(parent),
-        )
+        ) and not _formal_is_mutated_in_place(original.G, parameter)
         leaves = _authored_aggregate_leaves(caller, int(parent))
         if leaves and not static_argument and _aggregate_binds_by_member(
             caller.G, int(parent), original.G, parameter, int(node_id),

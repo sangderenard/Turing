@@ -60,3 +60,12 @@ every variant of `width`, so the generic variant counted live flags that its
 runtime caller never wrote, and `len(values)` read 0 with no error.  An
 authored list formal is the caller's storage viewed as a list: it keeps
 deleted rows only when its function deletes from it.
+
+## A literal argument the callee mutates (corpus c900, c901)
+
+`trim(values: list[int]): values.pop(); for v in values: ...` called with
+`[1, 2, 3, 4]`.  The literal specialized the callee (a callsite copy with
+two callers, the catalogue fold with one), the loop unrolled over the
+authored four elements, and the pop was ignored.  A literal is now a value
+of the callee only while the callee never mutates that formal
+(`_formal_is_mutated_in_place`).
