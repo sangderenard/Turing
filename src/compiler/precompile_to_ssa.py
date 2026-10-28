@@ -19056,10 +19056,15 @@ class _ControlSSABuilder(TiledObject):
         # Program: ``d = {1: 10, 2: 20, 3: 30}; del d[2]; for k in d: ...``.
         # Wrong record: the loop ran over the physical rows, and a keyed
         # delete only clears the row's live flag, so the deleted key was
-        # still visited (57 for 37).  Nothing here skips a cleared row.
-        # Rule: iterating a table with a keyed delete is refused.  (A list
-        # formal a filtered loop reads also carries live flags, c359; those
-        # mark kept rows, not deletions, so they are not refused.)
+        # still visited (57 for 37).  Nothing here skipped a cleared row,
+        # and the loop was refused.  Rule: an iteration over a table with a
+        # keyed delete reads each row's live flag first and takes the
+        # latch for a cleared one, as a selected child table's does; the
+        # latch's carried values for that edge are the body-entry ones.
+        # (A list formal a filtered loop reads also carries live flags,
+        # c359; those mark kept rows, not deletions, so they are not
+        # skipped.)
+        table_live_block_names: set[str] = set()
         for iterable_id, _target_id, induction_name, *_projection in (
             *self.program.iterable_bindings,
             *self.program.projected_iterable_bindings,
@@ -19076,12 +19081,27 @@ class _ControlSSABuilder(TiledObject):
                 and descriptor.live_flags_value_id is not None
                 and sequence_id in self.keyed_deletion_sequence_ids
             ):
-                raise ValueError(
-                    f"{path}: loop {loop.induction} iterates table "
-                    f"{sequence_id}, whose deleted rows stay resident behind "
-                    "cleared live flags; iteration over a table with "
-                    "deletions is not lowered"
+                live_address = self.fresh_value(
+                    dtype="ptr", transform=ADDRESS, operands=(induction,),
                 )
+                live = self.fresh_value(
+                    dtype="bool", transform=LOAD, operands=(live_address,),
+                )
+                active = self.new_block("table_row_live")
+                self.emit(
+                    Handler.GetElementPtr,
+                    [self.external_value(descriptor.live_flags_value_id), induction],
+                    live_address,
+                    attributes={"binding": "table_row_live"},
+                )
+                self.emit(
+                    Handler.Load, [live_address], live,
+                    attributes={"binding": "table_row_live"},
+                )
+                self.conditional_branch(live, active, latch)
+                self.current = active
+                table_live_block_names.add(active.name)
+                break
         for iterable_id, target_id, induction_name in (
             self.program.iterable_bindings
         ):
@@ -19672,6 +19692,7 @@ class _ControlSSABuilder(TiledObject):
             candidate
             for candidate in self.blocks.values()
             if candidate.name not in blocks_before_body or candidate.name == body.name
+            or candidate.name in table_live_block_names
         ]
         # A nested retained loop may carry the same source state as this loop.
         # Its exit Phi is then the value produced by this iteration, but the
