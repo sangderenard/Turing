@@ -1832,7 +1832,7 @@ def evaporate_unrolled_loops(
             _retain_source_sequence_mutation_records,
         )
 
-        _retain_source_sequence_mutation_records(graph.G)
+        _retain_source_sequence_mutation_records(graph.G, getattr(graph, "function_table", None))
         live.update(
             int(effect_id)
             for effect_id in (

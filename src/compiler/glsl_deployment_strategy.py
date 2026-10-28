@@ -10090,7 +10090,9 @@ def _retain_source_control_records(graph_obj: Any) -> None:
         graph_obj.graph["source_control_records"] = records
 
 
-def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
+def _retain_source_sequence_mutation_records(
+    graph_obj: Any, function_table: Any = None,
+) -> None:
     """Snapshot authored sequence method effects before structural reduction.
 
     Program: ``xs = [5, n, 2]; xs.pop(); return xs[0] * 10 + xs[1] +
@@ -10107,10 +10109,16 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
     from .resident_sequence_materialization import (
         _RECEIVER_READING_METHODS,
         _receiver_collection_kind,
+        _returned_formal_sequence_aliases,
     )
 
     records = dict(
         graph_obj.graph.get("source_sequence_mutation_records") or {}
+    )
+    # A call whose result is its argument's own list (``t = mk(b)``) is that
+    # list (rule 8): an effect on ``t`` is an effect on ``b``'s storage.
+    forwarded_sequences = _returned_formal_sequence_aliases(
+        graph_obj, function_table,
     )
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
@@ -10197,9 +10205,10 @@ def _retain_source_sequence_mutation_records(graph_obj: Any) -> None:
                 mutation_arguments = (*key_leaves, *mutation_arguments[1:])
         records[int(node_id)] = {
             "expression": expression,
-            "sequence_value_id": int(destination_data.get(
-                "value_id", destination
-            )),
+            "sequence_value_id": forwarded_sequences.get(
+                int(destination_data.get("value_id", destination)),
+                (int(destination_data.get("value_id", destination)),),
+            )[0],
             "argument_value_ids": mutation_arguments,
             # ``s.update(xs)`` on a set inserts each element of one
             # iterable under the set's unique policy: the sequence
@@ -12710,7 +12719,9 @@ def _sequence_effect_read_edges(graph: Any) -> frozenset[tuple[int, int]]:
     effect ends.  Effects inside a loop are ordered by the loop composer.
     """
 
-    _retain_source_sequence_mutation_records(graph.G)
+    _retain_source_sequence_mutation_records(
+        graph.G, getattr(graph, "function_table", None),
+    )
     records = graph.G.graph.get("source_sequence_mutation_records") or {}
     loop_nodes = [
         (int(expression.lineno), int(getattr(expression, "end_lineno", expression.lineno)),
@@ -24309,7 +24320,9 @@ def _tensor_descriptor_rule(
                     or display_members
                 )
             ):
-                _retain_source_sequence_mutation_records(graph.G)
+                _retain_source_sequence_mutation_records(
+                    graph.G, getattr(graph, "function_table", None),
+                )
                 node_by_value = {
                     int(member_data.get("value_id", member)): int(member)
                     for member, member_data in graph.G.nodes(data=True)
@@ -25705,7 +25718,7 @@ def _remove_dead_metadata_nodes(
     # missing node, the effect was placed after every read, and ``len(s)``
     # missed the row (silently).  Rule: a node a retained sequence mutation
     # names as its effect is an effect, never dead metadata.
-    _retain_source_sequence_mutation_records(graph.G)
+    _retain_source_sequence_mutation_records(graph.G, getattr(graph, "function_table", None))
     effect_ids = {
         int(effect_id)
         for effect_id in (
@@ -25999,7 +26012,7 @@ def _fold_callsite_structural_values(
     # folds/removes structural nodes so later region overlay can reconstruct
     # the exact branch tree in each function shell.
     _retain_source_control_records(graph.G)
-    _retain_source_sequence_mutation_records(graph.G)
+    _retain_source_sequence_mutation_records(graph.G, getattr(graph, "function_table", None))
     # Resolve capability before getattr(..., default) can select its default.
     _resolve_grounded_method_references(graph)
 
@@ -30589,6 +30602,17 @@ def _callsite_specialized_shell_type(
             )
             if class_cell is not None:
                 parameter_class_cells[parameter] = (class_cell,)
+                # The called inventory (called_inventory.py): this call edge's
+                # actual is one record the callee formal's class set is
+                # gathered from.
+                from .called_inventory import post_call_edge_actual
+
+                post_call_edge_actual(
+                    current_identity_book(),
+                    str(original.G.graph.get("function_name") or ""),
+                    parameter, caller_scope, int(node_id),
+                    str(class_fact[0]), class_cell,
+                )
         declared_record_abi = dict(
             original.G.graph.get("parameter_record_abi") or {}
         ).get(parameter)
@@ -34899,7 +34923,7 @@ def strategize_shell_deployment(
     )
     selection_phase(
         "retain-source-sequence-mutation-records",
-        lambda: _retain_source_sequence_mutation_records(graph.G),
+        lambda: _retain_source_sequence_mutation_records(graph.G, getattr(graph, "function_table", None)),
     )
 
     # Inherit whatever the compilation asked for, then record it so the

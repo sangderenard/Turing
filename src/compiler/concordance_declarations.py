@@ -483,8 +483,18 @@ ROOT_CALL_RECORD = declare_page("root_call_record", (
 class CalledInventoryFact:
     classes: tuple          # exact class spellings, sorted, e.g. ("float", "int")
     selected: str | None    # the class this specialized copy lowers
+    root: bool = False      # a root-call contract fed it: ingestion may type
+                            # the formal from it (internal-edge inventories are
+                            # provenance; callsite specialization types those)
 
 
+#: One internal call edge's actual for one callee formal: the exact class the
+#: caller's SOURCE_VALUE_CLASS cell states for the argument.  Derived from
+#: that cell.  Mode REVISE.
+CALL_EDGE_ACTUAL = declare_page("call_edge_actual", (
+    RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("formal", K.NAME),
+), str)
 CALLED_INVENTORY = declare_page("called_inventory", (
     RowField("function_identity", K.NAME), RowField("formal", K.NAME),
 ), CalledInventoryFact)
