@@ -13,6 +13,7 @@ from functools import cached_property
 from typing import Any, Mapping
 
 from .monotonic_ids import GLOBAL_MONOTONIC_IDS
+from ..transmogrifier.dtype_layout import python_float_result_dtype
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -540,7 +541,9 @@ def plan_region_to_ssa_instrs(
             "float", "float16", "float32", "float64", "double",
             "f16", "f32", "f64",
         }):
-            return promoted_float_dtype(value_ids) or "float64"
+            return promoted_float_dtype(value_ids) or python_float_result_dtype(
+                dtype_of.get(int(value_id)) for value_id in value_ids
+            )
         from ..transmogrifier.dtype_layout import (
             common_integer_dtype, resolve as resolve_dtype,
         )
@@ -621,10 +624,13 @@ def plan_region_to_ssa_instrs(
                 inferred = scalar_cast_dtypes[opcode]
             elif opcode in {"truediv", "div"}:
                 # True division is floating: the operands' widest declared
-                # float width, float64 when none is declared.
+                # float width; over integral operands, Python's float.
                 inferred = (
                     promoted_float_dtype(semantic_input_ids(item))
-                    or "float64"
+                    or python_float_result_dtype(
+                        dtype_of.get(int(value_id))
+                        for value_id in semantic_input_ids(item)
+                    )
                 )
             elif opcode in dtype_preserving_ops:
                 inferred = (

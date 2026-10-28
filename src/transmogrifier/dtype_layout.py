@@ -20,6 +20,43 @@ from typing import Mapping
 #: The dtype every lane assumes when a value declares none.
 DEFAULT_DTYPE = "float64"
 
+#: Python's ``float`` class is IEEE binary64.  This is the language's record
+#: for a value whose class is ``float`` and that declares no other width: a
+#: float literal, and the result of true division (or ``math.sqrt``/``exp``/
+#: ``log``) whose operands are all ``int``/``bool``.
+PYTHON_FLOAT_DTYPE = "float64"
+
+#: Integer and boolean spellings whose true quotient is a Python ``float``.
+PYTHON_INTEGRAL_DTYPES = frozenset({
+    "bool", "i1", "int", "int8", "int16", "int32", "int64", "int128",
+    "uint8", "uint16", "uint32", "uint64", "i32", "i64", "long",
+})
+
+
+def python_float_result_dtype(operand_dtypes) -> str | None:
+    """The record for a float-valued result over ``operand_dtypes``.
+
+    The widest float the operands carry wins (``float`` spells binary64).
+    With no float operand the result is a Python ``float`` only when every
+    operand is integral; an operand with no settled dtype leaves the result
+    unsettled (``None``), never assumed.
+    """
+
+    from ..common.tensors.topological_reducer import _widest_element
+
+    dtypes = tuple(operand_dtypes)
+    widest = _widest_element(*(
+        {"float": PYTHON_FLOAT_DTYPE}.get(str(d), str(d))
+        for d in dtypes if d
+    ))
+    if widest is not None:
+        return widest
+    if dtypes and all(
+        d and str(d).casefold() in PYTHON_INTEGRAL_DTYPES for d in dtypes
+    ):
+        return PYTHON_FLOAT_DTYPE
+    return None
+
 
 @dataclass(frozen=True)
 class DTypeLayout:
@@ -555,6 +592,8 @@ def shell_numpy_dtype(dtype: object) -> str | None:
 
 __all__ = [
     "DEFAULT_DTYPE",
+    "PYTHON_FLOAT_DTYPE",
+    "python_float_result_dtype",
     "DTypeLayout",
     "DTYPES",
     "ALIASES",
