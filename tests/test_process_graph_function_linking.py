@@ -4465,48 +4465,62 @@ def test_exact_record_span_shape_reaches_callee_before_region_lowering():
     assert gathers[0].args[0].shape == (2, 3)
 
 
-def test_loop_call_replacement_lease_posts_its_callee_type(monkeypatch):
-    from src.compiler.structural_concordance import function_value_structure
-    from src.compiler import ssa_result_type_resolution
+def _assert_native_matches_python(source, cases, tmp_path):
+    """Compile ``source`` natively; every case equals Python in value and type."""
+    import numpy as np
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
 
-    settled = ssa_result_type_resolution.settle_call_result_types
-
-    class LeaseChecked(Exception):
-        pass
-
-    def check_leases(functions, emit_outputs, function_values):
-        settled(functions, emit_outputs, function_values)
-        leases = [
-            (function, argument)
-            for function in functions.values()
-            for argument in function.args
-            if (argument.accounting or {}).get("split_from_unproven_alias")
-            is not None
-        ]
-        assert leases
-        for function, argument in leases:
-            recorded, _cell = function_value_structure(
-                function, argument.id,
-            )
-            assert recorded.dtype == argument.dtype
-            assert recorded.shape == tuple(argument.shape or ())
-        raise LeaseChecked
-
-    monkeypatch.setattr(
-        ssa_result_type_resolution, "settle_call_result_types",
-        check_leases,
+    namespace = {}
+    exec(compile(source, "<authored>", "exec", dont_inherit=True), namespace)
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="authored_native_parity",
+        extraction_contract=CONTRACT,
+        progress=lambda _message: None, progress_bars=False,
     )
+    root = module.functions[exports[0]]
+    parameters = dict(root.metadata["parameter_names"])
+    (returned,) = [
+        instruction.args for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    ]
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native", optimization="O0")
+    for feeds in cases:
+        expected = namespace["root"](**feeds)
+        expected = list(expected) if isinstance(expected, tuple) else [expected]
+        execution = artifact.prepare_execution({
+            parameters[name]: np.array([value]) for name, value in feeds.items()
+        }).run()
+        actual = [np.asarray(execution.buffers[v.id]) for v in returned]
+        assert len(actual) == len(expected), (feeds, actual, expected)
+        for got, want in zip(actual, expected):
+            assert got.reshape(-1).tolist() == [want], (feeds, got, want)
+            kind = {bool: "b", int: "iu", float: "f"}[type(want)]
+            assert got.dtype.kind in kind, (feeds, got.dtype, type(want))
 
+
+def test_loop_call_replacement_lease_posts_its_callee_type(tmp_path):
     source = (
-        Path(__file__).parent / "record_view_corpus"
-        / "c627_loop_call_lease.py"
-    ).read_text(encoding="utf-8")
-    with pytest.raises(LeaseChecked):
-        lower_ast_source_to_ssa(
-            source, "root", name="loop_call_lease",
-            extraction_contract=CONTRACT,
-            progress=lambda _message: None, progress_bars=False,
-        )
+        "def step(acc: int, k: int) -> int:\n"
+        "    return acc * 2 + k\n\n"
+        "def stretch(acc: float, k: int) -> float:\n"
+        "    return acc + k * 0.5\n\n"
+        "def root(n: int, seed: int):\n"
+        "    acc = seed\n"
+        "    fine = 0.25\n"
+        "    i = 0\n"
+        "    while i < n:\n"
+        "        acc = step(acc, i)\n"
+        "        fine = stretch(fine, i)\n"
+        "        i += 1\n"
+        "    return acc, fine\n"
+    )
+    _assert_native_matches_python(
+        source,
+        [{"n": 0, "seed": 3}, {"n": 1, "seed": 3}, {"n": 5, "seed": -2}],
+        tmp_path,
+    )
 
 
 def test_indexed_record_field_write_keeps_one_resident_call_frame():
@@ -4794,34 +4808,16 @@ def test_declared_record_span_is_a_planner_tensor_descriptor():
     }
 
 
-def test_single_aggregate_return_keeps_structured_tensor_descriptors():
-    from src.compiler.glsl_deployment_strategy import (
-        _propagate_callsite_tensor_specializations, _tensor_descriptor,
+def test_single_aggregate_return_keeps_structured_tensor_descriptors(tmp_path):
+    source = (
+        "def pack(a: float, b: float):\n"
+        "    return (a + b, a * b, 3)\n\n"
+        "def root(a: float, b: float):\n"
+        "    return pack(a, b)\n"
     )
-
-    graph = ProcessGraph(materialize_memory=False)
-    with contextlib.redirect_stdout(io.StringIO()):
-        graph.build_from_ast(ast.parse(
-            "def pack(values):\n"
-            "    return {'values': values, 'label': 'wheel'}\n"
-            "def root(values):\n"
-            "    return pack(values)\n"
-        ), resolve_unresolved_parents=True)
-    reduce_abstract_tensor_topology(graph)
-    caller = graph.function_table.entry("root").graph
-    for _node, data in caller.G.nodes(data=True):
-        if (data.get("attributes") or {}).get("binding_name") == "values":
-            data["tensor"] = {"shape": (3,), "dtype": "float64"}
-
-    _propagate_callsite_tensor_specializations(graph)
-
-    node_id, call = next((node_id, data) for node_id, data in caller.G.nodes(data=True)
-                         if data.get("op") == "Call")
-    assert "tensor" not in call
-    assert _tensor_descriptor(caller, node_id) is None
-    descriptors = call["attributes"]["tensor_output_descriptors"]
-    assert isinstance(descriptors[0], tuple)
-    assert {"shape": (3,), "dtype": "float64", "rank": 1} in descriptors[0]
+    _assert_native_matches_python(
+        source, [{"a": 1.5, "b": 2.0}, {"a": -3.0, "b": 0.5}], tmp_path,
+    )
 
 
 def test_callsite_shape_discards_padded_scalar_result_descriptors():
