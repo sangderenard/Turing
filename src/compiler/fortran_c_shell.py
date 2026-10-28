@@ -10885,9 +10885,6 @@ def _field_slot_ops(
                         str(receiver_record.get("identity") or ""), attribute,
                     )
                     if proven is not None:
-                        data.setdefault("attributes", {})[
-                            "mapping_value_dtype"
-                        ] = proven[0]
                         graph_obj.graph.setdefault(
                             "nested_tensor_value_dtypes", {}
                         )[int(sequence_id)] = proven[0]
