@@ -422,8 +422,16 @@ def verify_wasm_source(
     from ..common.tensors.fused_ir import ordered_feed_ids
     from .fused_program_wasm_backend import WasmEmissionError, emit_wasm_module
 
+    # The feeds are this check's runtime inputs, not compile-time literals:
+    # name them as the program's mutable parameters so the planner keeps
+    # them as values (their shapes and dtypes stay the Program-ABI contract)
+    # instead of specializing the entry on them.  As bound literals they had
+    # no record on the identity book and every program stopped with
+    # "planner_specialization: no source cell ... the binding came from the
+    # caller of the compile".
     aot = compile_ast_aot(
-        source, entrypoint, dict(feeds), precompile_only=True, remove_loops=True
+        source, entrypoint, dict(feeds), precompile_only=True, remove_loops=True,
+        mutable_parameters=tuple(feeds),
     )
     program = project_public_numerical_program(aot)
     module = emit_wasm_module(program, name=entrypoint, dtype=dtype)
