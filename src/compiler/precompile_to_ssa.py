@@ -30046,6 +30046,25 @@ def lower_control_sections_to_ssa(
                             _posted_arena.row, _posted_arena.column,
                         )
                     )
+                    # The kind is read, in order, from the row's own posted
+                    # storage, then from the descriptor's SEQUENCE_CONTRACT
+                    # cell (a region reads a column arena as the contiguous
+                    # ``span`` its rank is taken from).  With neither record
+                    # there is nothing to derive it from, so it is refused.
+                    _arena_formal_storage = getattr(
+                        _posted_fact, "storage", None,
+                    )
+                    if _arena_formal_storage not in {"sequence", "span"}:
+                        _arena_formal_storage = None
+                    if _arena_formal_storage is None:
+                        if not _descriptor_cells:
+                            raise ValueError(
+                                "region sequence arena formal "
+                                f"{int(argument.id)} of {region_function.name} "
+                                "has neither a posted storage kind nor a "
+                                "sequence contract cell to derive it from"
+                            )
+                        _arena_formal_storage = "span"
                     _formal_cell = revise_ssa_value(
                         region_function, int(argument.id),
                         dtype=argument.dtype,
@@ -30053,11 +30072,7 @@ def lower_control_sections_to_ssa(
                         stage=CONTROL_SSA_REGION,
                         sources=_descriptor_cells, book=_control_book,
                         physical={
-                            "storage": (
-                                "sequence"
-                                if getattr(_posted_fact, "storage", None)
-                                == "sequence" else "span"
-                            ),
+                            "storage": _arena_formal_storage,
                             "rank": 1 + len(row_shape),
                         },
                     )
