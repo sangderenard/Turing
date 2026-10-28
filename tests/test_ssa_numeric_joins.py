@@ -39,6 +39,34 @@ def root(n: int, c: int):
         s = n * 0.5
     return s > 3
 """,
+    "added_to_itself": """
+def root(n: int, c: int):
+    if c == 2:
+        s = n
+    else:
+        s = n * 0.5
+    return s + s
+""",
+    "carried_read_with_another_carried_read": """
+def root(t: int):
+    xs = [2.5, t * 1.5]
+    s = 0
+    r = 0
+    for v in xs:
+        r = r + s
+        s += v
+    return r
+""",
+    "carried_read_by_floordiv": """
+def root(t: int) -> float:
+    xs = [2.5, t * 1.5]
+    s = 0
+    q = 0.0
+    for v in xs:
+        q = q + s // 2
+        s += v
+    return s + q
+""",
     "optional_payload_mod_int": """
 def pick(n, c):
     if c == 1:
