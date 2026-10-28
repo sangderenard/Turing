@@ -106,3 +106,20 @@ def test_internal_call_edges_feed_the_inventory_and_are_cited():
     cited = [ref for ref, _stage in book.edges_into(cell)]
     assert len(cited) == 2
     assert {book.page(CALL_EDGE_ACTUAL).cell(r.row, r.column) for r in cited} == {"int", "float"}
+
+
+def test_revisited_call_edge_is_not_reposted():
+    """Nested specialization revisits a call edge; restating the same actual
+    from the same class cell must not be a REVISE without a changed source."""
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = (
+        "def step(x: int) -> int:\n    return x + 1\n\n"
+        "def mid(x: int) -> int:\n    return step(x) + step(x)\n\n"
+        "def root(x: int) -> int:\n    return mid(x) + mid(x)\n"
+    )
+    lower_ast_source_to_ssa(
+        source, "root", name="inv_revisit", progress=lambda _: None,
+        extraction_contract="extraction_contracts/program_extraction.yaml",
+        identity_book=None,
+    )
