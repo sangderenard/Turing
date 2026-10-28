@@ -55,7 +55,7 @@ def test_empty_inventory_refuses_by_name(book):
             __import__("src.compiler.concordance_declarations", fromlist=["CONTRACT_DEMAND"]).CONTRACT_DEMAND, ()),
         mode=Mode.CONCORD,
     )
-    book.post(CALLED_INVENTORY, ("root", "n"), CalledInventoryFact((), None),
+    book.post(CALLED_INVENTORY, ("root", "n"), CalledInventoryFact((), None, True),
               stage=INGESTION, provenance=Derived((cell,)), mode=Mode.REVISE)
     with pytest.raises(ValueError, match="no call record or contract reaches formal n of root"):
         called_class(book, "root", "n")
@@ -69,3 +69,40 @@ def test_selection_outside_inventory_refuses(book):
 def test_distinct_signatures():
     sigs = distinct_signatures([{"a": 1, "b": 2}, {"a": 1.5, "b": 2}, {"a": 4, "b": 5}])
     assert sigs == [{"a": "int", "b": "int"}, {"a": "float", "b": "int"}]
+
+
+def test_internal_call_edges_feed_the_inventory_and_are_cited():
+    """A callee reached by int and float actuals: its CALLED_INVENTORY cell
+    cites both call-edge cells, each Derived from the caller's class cell."""
+    from src.compiler.concordance_declarations import CALL_EDGE_ACTUAL
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_concordance import current_identity_book
+    import src.compiler.called_inventory as inv
+
+    seen = {}
+    real = inv.post_call_edge_actual
+
+    def spy(book, *args):
+        real(book, *args)
+        seen["book"] = book
+
+    inv.post_call_edge_actual = spy
+    try:
+        source = (
+            "def f(x):\n    return x * 2\n\n"
+            "def root(n: int):\n    return f(n) + f(2.5)\n"
+        )
+        lower_ast_source_to_ssa(
+            source, "root", name="inv_edges", progress=lambda _: None,
+            extraction_contract="extraction_contracts/program_extraction.yaml",
+            identity_book=None,
+        )
+    finally:
+        inv.post_call_edge_actual = real
+    book = seen["book"]
+    fact = book.page(CALLED_INVENTORY).latest(("f", "x"))
+    assert fact.classes == ("float", "int")
+    cell = book.latest_ref(CALLED_INVENTORY, ("f", "x"))
+    cited = [ref for ref, _stage in book.edges_into(cell)]
+    assert len(cited) == 2
+    assert {book.page(CALL_EDGE_ACTUAL).cell(r.row, r.column) for r in cited} == {"int", "float"}
