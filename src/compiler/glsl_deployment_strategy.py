@@ -1276,6 +1276,14 @@ def _call_returns_argument(caller: Any, call_id: int, argument_id: int) -> bool:
     storage, so the initializer is not its contents after the call.
     """
 
+    # Program: ``def leaf(flag, limit): ... return limit`` called with a
+    # literal ``limit``.  Wrong record: the scalar was refused as an
+    # initializer, so the optional's payload lost its typed literal and the
+    # region saw an untyped feed.  Rule: only mutable storage is identity
+    # forwarded; a scalar is a value, never an owner of storage.
+    if str(((caller.G.nodes.get(int(argument_id), {}).get("attributes") or {})
+            .get("aggregate_kind"))) not in _MUTABLE_RETURN_KINDS:
+        return False
     function_table = getattr(caller, "function_table", None)
     data = caller.G.nodes.get(int(call_id), {})
     attributes = data.get("attributes") or {}
