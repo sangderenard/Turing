@@ -30521,6 +30521,17 @@ def _callsite_specialized_shell_type(
             )
             if class_cell is not None:
                 parameter_class_cells[parameter] = (class_cell,)
+                # The called inventory (called_inventory.py): this call edge's
+                # actual is one record the callee formal's class set is
+                # gathered from.
+                from .called_inventory import post_call_edge_actual
+
+                post_call_edge_actual(
+                    current_identity_book(),
+                    str(original.G.graph.get("function_name") or ""),
+                    parameter, caller_scope, int(node_id),
+                    str(class_fact[0]), class_cell,
+                )
         declared_record_abi = dict(
             original.G.graph.get("parameter_record_abi") or {}
         ).get(parameter)
