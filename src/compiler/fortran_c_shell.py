@@ -25343,7 +25343,7 @@ def _class_surface_ssa_program(
         Program: ``def root(n): return n * n`` with ``n`` an int64 formal no
         interval bounds.  Wrong record: the product was int64 arithmetic,
         which wraps (stage 1 reports it as ``NativeIntOverflow`` instead).
-        Rule (``python_int_overflow``): under the ``exact`` policy, a builtin
+        Rule (``python_int_overflow``): under ``python_exact``, a builtin
         ``int`` result of ``+``, ``-``, ``*`` or unary ``-`` on int64
         operands whose interval nothing proves is the native value union
         ``int64 | Precision``.  The op is computed at int128, which is exact
@@ -25361,12 +25361,11 @@ def _class_surface_ssa_program(
             _int_range_cell as _overflow_range_cell,
         )
         from .python_int_overflow import (
-            PRECISION_INT_CARRIER, carrier_arm, python_int_overflow_policy,
+            PRECISION_INT_CARRIER, carrier_arm, python_int_continues_exactly,
             widening_operand_roles,
         )
 
-        function_name = planned_graph.graph.get("function_name")
-        if python_int_overflow_policy(function_name) != "exact":
+        if not python_int_continues_exactly():
             return
         returned = {
             int(member)

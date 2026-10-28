@@ -104,11 +104,12 @@ def test_returned_unproven_product_is_the_int_precision_union():
     assert union_alternatives() == ("Precision", "builtins.int")
 
 
-def test_python_semantics_is_the_default_int_overflow_policy():
-    from src.compiler.python_int_overflow import python_int_overflow_policy
+def test_python_exact_contract_is_what_continues_the_overflow():
+    from src.compiler.python_int_overflow import python_int_continues_exactly
+    from src.compiler.ssa_call_input_adapters import integer_arithmetic_policy
 
-    assert python_int_overflow_policy() == "exact"
-    assert python_int_overflow_policy("any.source.scope") == "exact"
+    assert integer_arithmetic_policy() == "python_exact"
+    assert python_int_continues_exactly()
 
 
 def test_carrier_limbs_read_back_exactly():

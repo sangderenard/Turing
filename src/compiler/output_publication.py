@@ -181,9 +181,10 @@ def return_value_plan(function: Any) -> tuple:
     value.  Every other returned slot is its own value (its buffer).
 
     The plan is plain data (it pickles with an artifact); one row per Python
-    value: ``("value", value_id)`` or ``("union", tag_id, {tag: (kind,
-    (cell ids...))})`` with ``kind`` one of ``bool``/``int``/``float``/
-    ``none``/``int_carrier``.
+    value: ``("value", slot)`` or ``("union", tag slot, {tag: (kind,
+    (cell slots...))})`` with ``kind`` one of ``bool``/``int``/``float``/
+    ``none``/``int_carrier``; a slot is the value ids every public Ret
+    gives that position.
     """
 
     from .python_int_overflow import is_int_overflow_union
@@ -198,7 +199,21 @@ def return_value_plan(function: Any) -> tuple:
         raise ValueError(
             f"{function.name} has {len(returns)} public returns, expected one"
         )
-    slots = [int(value.id) for value in returns[0].args]
+    # A fault exit carries the same frame in its own value ids; the public
+    # buffer of a slot is named by whichever Ret the lane published.
+    exits = [
+        instruction
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret" and instruction.attributes.get("fault_exit")
+        and len(instruction.args) == len(returns[0].args)
+    ]
+    slots = [
+        tuple(dict.fromkeys(
+            int(ret.args[position].id) for ret in (*exits, returns[0])
+        ))
+        for position in range(len(returns[0].args))
+    ]
     metadata = dict(getattr(function, "metadata", {}) or {})
     facts = dict(metadata.get("native_value_type_abi") or {})
     union_layouts = tuple(metadata.get("native_value_union_return_layouts", ()))
@@ -261,10 +276,16 @@ def python_return_values(plan: tuple, buffers: Mapping[int, Any]) -> list:
 
     from .python_int_overflow import python_int_from_carrier
 
-    def cells(value_ids) -> list:
+    def buffer_of(slot_ids):
+        for value_id in slot_ids:
+            if int(value_id) in buffers:
+                return buffers[int(value_id)]
+        raise KeyError(f"no public buffer for return slot {slot_ids!r}")
+
+    def cells(slot_ids_list) -> list:
         out = []
-        for value_id in value_ids:
-            buffer = buffers[int(value_id)]
+        for slot_ids in slot_ids_list:
+            buffer = buffer_of(slot_ids)
             reshape = getattr(buffer, "reshape", None)
             out.extend(reshape(-1).tolist() if reshape is not None else [buffer])
         return out
@@ -272,7 +293,7 @@ def python_return_values(plan: tuple, buffers: Mapping[int, Any]) -> list:
     values = []
     for row in plan:
         if row[0] == "value":
-            values.append(buffers[int(row[1])])
+            values.append(buffer_of(row[1]))
             continue
         _union, tag_id, arms = row
         kind, cell_ids = arms[int(cells((tag_id,))[0])]

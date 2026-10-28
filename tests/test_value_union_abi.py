@@ -553,7 +553,17 @@ def test_exact_local_receiver_class_does_not_invent_a_physical_type_abi():
     function = module.functions[exports[0]]
     assert [argument.dtype for argument in function.args] == ["int64"]
     table = module.value_union_tables.get(function.name)
-    assert table is None or not table.unions
+    # The receiver invents no union.  ``value + 1`` past int64 continues as
+    # Python's exact int (``python_int_overflow``), so the returned sum's
+    # ``int64 | Precision`` union is the only one.
+    from src.compiler.python_int_overflow import is_int_overflow_union
+
+    assert table is None or all(
+        is_int_overflow_union(
+            sorted(arm.name for arm in descriptor.alternatives)
+        )
+        for descriptor in table.unions.values()
+    )
 
 
 def test_mapping_value_column_uses_writer_union_abi():

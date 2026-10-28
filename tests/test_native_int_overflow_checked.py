@@ -192,14 +192,21 @@ def _lower(source):
         extraction_contract=str(CONTRACT), progress=lambda _message: None,
     )
     root = module.functions[exports[0]]
-    outputs = [
-        int(value.id)
-        for block in root.blocks.values()
-        for instruction in block.instrs
-        if instruction.op == "Ret" and not instruction.attributes.get("fault_exit")
-        for value in instruction.args
-    ]
-    return module, exports[0], dict(root.metadata["parameter_names"]), outputs
+    # ``root``'s returned sum is the int64 | Precision union
+    # (``python_int_overflow``): read it through its frame.
+    from src.compiler.output_publication import return_value_plan
+
+    return (
+        module, exports[0], dict(root.metadata["parameter_names"]),
+        return_value_plan(root),
+    )
+
+
+def _value(plan, execution):
+    from src.compiler.output_publication import python_return_values
+
+    (value,) = python_return_values(plan, execution.buffers)
+    return int(value.reshape(-1)[0]) if hasattr(value, "reshape") else value
 
 
 def _inputs(parameters, a, b):
@@ -217,7 +224,7 @@ def _c_lane(tmp_path, source, a, b):
     assert artifact.complete, artifact.shortfalls
     artifact.compile(tmp_path / "native")
     execution = artifact.prepare_execution(_inputs(parameters, a, b)).run()
-    return int(execution.buffers[outputs[0]].reshape(-1)[0])
+    return _value(outputs, execution)
 
 
 def _llvm_lane(tmp_path, source, a, b):
@@ -232,7 +239,7 @@ def _llvm_lane(tmp_path, source, a, b):
     execution = prepare_artifact_execution(
         artifact, _inputs(parameters, a, b)
     ).run()
-    return int(execution.buffers[outputs[0]].reshape(-1)[0])
+    return _value(outputs, execution)
 
 
 LANES = pytest.mark.parametrize("lane", [_c_lane, _llvm_lane], ids=["c", "llvm"])

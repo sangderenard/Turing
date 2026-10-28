@@ -3267,24 +3267,44 @@ def lower_precision_operations(
                     emitted.append(instruction)
                     continue
 
+                # Every Ret of a function (a fault exit's too) carries the
+                # same frame, so the layout is revised from the one built
+                # by the control builder, once per function.
                 union_layouts = tuple(
-                    function.metadata.get("native_value_union_return_layouts")
+                    function.metadata.get("precision_union_source_layouts")
+                    or function.metadata.get("native_value_union_return_layouts")
                     or ()
                 )
+
+                # The arm's declared limbs (its VALUE_TYPE_ABI span), so an
+                # inactive arm's placeholder (a fault exit's) gets as many.
+                arm_widths = {
+                    int(declared): next((
+                        int(tuple(arm.shape)[-1])
+                        for arm in getattr(
+                            dict(function.metadata.get(
+                                "native_value_type_abi"
+                            ) or {}).get(int(declared)),
+                            "physical_alternatives", (),
+                        )
+                        if str(arm.identity) == "Precision"
+                        and str(arm.storage) == "span"
+                        and len(tuple(arm.shape)) == 1
+                    ), 0)
+                    for declared, _role_slots in union_layouts
+                }
+                precision_slots = {
+                    int(slot): arm_widths[int(declared)]
+                    for declared, role_slots in union_layouts
+                    for role, slot in role_slots
+                    if role[0] == "alternative" and role[1] == "Precision"
+                    and int(slot) < len(instruction.args)
+                    and arm_widths[int(declared)] > 1
+                } if operation in ("Ret", "ret") else {}
                 if (
-                    operation in ("Ret", "ret")
-                    and union_layouts
+                    precision_slots
                     and not instruction.attributes.get(
                         "precision_union_limbs_bound"
-                    )
-                    and any(
-                        role[0] == "alternative"
-                        and int(slot) < len(instruction.args)
-                        and len(limbs.get(
-                            int(instruction.args[int(slot)].id), ()
-                        )) > 1
-                        for _declared, role_slots in union_layouts
-                        for role, slot in role_slots
                     )
                 ):
                     # Program: ``def root(n): return n * n`` whose overflow
@@ -3295,24 +3315,32 @@ def lower_precision_operations(
                     # union arm's Precision payload is its limbs; they are
                     # appended after every existing slot (no slot moves) and
                     # the frame layout names them as the arm's cells 0..n-1.
+                    # A Ret whose arm is inactive appends exact zeros.
+                    function.metadata["precision_union_source_layouts"] = (
+                        union_layouts
+                    )
                     revised = []
-                    collapsed = set(map(int, function.metadata.get(
-                        "precision_union_collapsed_slots", ()
-                    )))
+                    collapsed = set()
                     for declared, role_slots in union_layouts:
                         rows = []
                         for role, slot in role_slots:
-                            held = (
-                                limbs.get(
-                                    int(instruction.args[int(slot)].id), ()
-                                )
-                                if role[0] == "alternative"
-                                and int(slot) < len(instruction.args)
-                                else ()
-                            )
-                            if len(held) <= 1:
+                            if int(slot) not in precision_slots:
                                 rows.append((role, slot))
                                 continue
+                            value = instruction.args[int(slot)]
+                            held = list(limbs.get(int(value.id), ()))
+                            if len(held) <= 1:
+                                held = [
+                                    scalar_constant(0.0, value)
+                                    for _ in range(precision_slots[int(slot)])
+                                ]
+                            if len(held) != precision_slots[int(slot)]:
+                                raise ValueError(
+                                    "union Precision arm carries "
+                                    f"{len(held)} limbs, declared "
+                                    f"{precision_slots[int(slot)]}: "
+                                    f"{function_name} slot {int(slot)}"
+                                )
                             # The slot keeps the collapsed head (one float)
                             # for readers that name it; no frame role does.
                             collapsed.add(int(slot))

@@ -5,10 +5,9 @@ bounds.  Python's product is exact; int64 arithmetic wraps.  Stage 1 made the
 native op report the overflow (``native_faults.INT_OVERFLOW``).  This module
 holds the two decisions that turn that report into Python's exact result:
 
-* the POLICY (``python_int_overflow_policy``): Python semantics, ``exact``,
-  is the default; ``fault`` (stage 1) and ``wrap`` (C semantics) are the
-  configurable alternatives a later per-source / per-region int policy will
-  choose.  It is the one place that decision is read.
+* the POLICY: the numeric contract's ``integer_arithmetic`` (``python_exact``
+  by default, or ``wrap``), read through ``python_int_continues_exactly``;
+  ``python_exact`` is this continuation, there is no separate switch.
 * the CARRIER (``PRECISION_INT_CARRIER``): the exact value continues in the
   existing ``Precision`` limb type (n binary64 limbs whose exact sum is the
   integer), as the second arm of an ordinary native value union
@@ -30,22 +29,19 @@ from types import SimpleNamespace
 from typing import Any, Iterable
 
 
-#: ``exact``: Python semantics, the result continues in the carrier arm.
-#: ``fault``: the result raises ``NativeIntOverflow`` (stage 1).
-#: ``wrap``: two's complement int64 (C semantics; opt-in only).
-INT_OVERFLOW_POLICIES = ("exact", "fault", "wrap")
+def python_int_continues_exactly() -> bool:
+    """Whether an int64 result past int64 continues as Python's exact int.
 
-
-def python_int_overflow_policy(scope: Any = None) -> str:
-    """The int overflow policy in force for ``scope`` (a source/region).
-
-    The one decision point.  Python semantics is the default for every
-    scope; a configurable policy (like ``precision_policy.PrecisionPolicy``)
-    is a change to this function alone.
+    No switch of its own: the numeric contract's ``integer_arithmetic``
+    (``python_exact`` or ``wrap``) read through the same predicate that gates
+    stage 1's checked ops (``ssa_llvm_backend._python_int_exact``).  Under
+    ``python_exact`` the overflow continues in the carrier arm; under
+    ``wrap`` nothing here applies.
     """
 
-    del scope
-    return "exact"
+    from .ssa_llvm_backend import _python_int_exact
+
+    return _python_int_exact()
 
 
 @dataclass(frozen=True)
