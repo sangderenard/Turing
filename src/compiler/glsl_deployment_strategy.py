@@ -2315,6 +2315,14 @@ def _planned_scalar_dtypes_from(
 
     collection_kinds = {"list", "tuple", "set", "dict"}
 
+    # ``def put(xs, t): xs.append(t)``: an unannotated parameter that a
+    # retained append grows is a collection; its rows are what it appends.
+    grown_receivers = {
+        int(record.get("sequence_value_id", -1))
+        for record in (G.graph.get("source_sequence_mutation_records") or {}).values()
+        if str(record.get("operator")) in {"append", "add", "insert"}
+    }
+
     def is_collection(node_id):
         data = G.nodes.get(int(node_id), {})
         return (
@@ -2323,6 +2331,10 @@ def _planned_scalar_dtypes_from(
             ))
             or (data.get("attributes") or {}).get("aggregate_kind")
             in collection_kinds
+            or (
+                operation(data) == "input"
+                and int(data.get("value_id", node_id)) in grown_receivers
+            )
         )
 
     records = G.graph.get("source_sequence_mutation_records") or {}
@@ -2578,6 +2590,8 @@ def _planned_scalar_dtypes_from(
                     # An unannotated one takes its class from its call edge
                     # (c690): the same ``sequence_element_class_ref``, on a
                     # parameter whose settled class is the collection's.
+                    # So is an unannotated one a retained append grows:
+                    # its element class is its writers' join.
                     if (
                         (
                             attributes.get("aggregate_kind") in collection_kinds
@@ -2588,6 +2602,9 @@ def _planned_scalar_dtypes_from(
                             attributes.get("sequence_element_class_ref")
                             or attributes.get("mapping_value_class_ref")
                         )
+                    ) or (
+                        attributes.get("aggregate_kind") is None
+                        and int(data.get("value_id", node_id)) in grown_receivers
                     ):
                         pass
                     else:
@@ -3052,6 +3069,21 @@ def _planned_scalar_dtypes_from(
                     writers.append(classes.get(str(
                         attributes["sequence_element_class_ref"]
                     ).removeprefix("builtins.")))
+                # Program: ``self._c = []`` in ``__init__``, then ``for v in
+                # self._c`` in a method that appends ints.  Wrong record:
+                # the unannotated field states no element class, so ``v``
+                # had no row though the class field contract the reducer
+                # stamps on the field's GetAttr (``sequence_column_dtypes``)
+                # holds int64 rows.  Rule: a positional record field's one
+                # column dtype is its element class.
+                elif (
+                    attributes.get("producer_kind") == "record_field"
+                    and attributes.get("aggregate_kind") in {"list", "tuple", "set"}
+                    and len(tuple(attributes.get("sequence_column_dtypes") or ())) == 1
+                    and str(attributes["sequence_column_dtypes"][0])
+                    in {"int64", "float64", "bool"}
+                ):
+                    writers.append(str(attributes["sequence_column_dtypes"][0]))
                 for record in records.values():
                     if int(record.get("sequence_value_id", -1)) == int(
                         data.get("value_id", node_id)

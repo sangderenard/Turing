@@ -232,6 +232,21 @@ _REGION_MARKER = re.compile(r"^__scheduled_region_(\d+)__$")
 _CALLSITE_MARKER = re.compile(r"^__plan_callsite_(\d+)__$")
 
 
+def _sequence_column_element_dtype(column) -> str:
+    """The element dtype a sequence column stores.
+
+    A column an earlier descriptor already made a heap cell is a ``ptr``
+    whose element layout is its ``heap_element_dtype``
+    (``_heap_sequence_contract``): ``self._c.append(t); len(self._c)``
+    reads one field storage twice, and the second view must name the same
+    element layout as the first, not the cell.
+    """
+
+    element = (column.accounting or {}).get("heap_element_dtype")
+    if str(column.dtype) == "ptr" and element:
+        return str(element)
+    return str(column.dtype or "unknown")
+
 def _region_value_dtype(value_id, value_dtypes, existing, control_name):
     """The dtype the region's value record carries, or a named refusal."""
     declared = (value_dtypes or {}).get(value_id)
@@ -11945,9 +11960,9 @@ class _ControlSSABuilder(TiledObject):
         # Rule: the descriptor's column dtypes are posted to the row
         # concordance at birth, derived from the arena cells they came from;
         # the two records state one row layout.
-        born_column_dtypes = (
-            str(data.dtype or "unknown"),
-            *(str(column.dtype or "unknown") for column in extra_columns),
+        born_column_dtypes = tuple(
+            _sequence_column_element_dtype(column)
+            for column in (data, *extra_columns)
         )
         if born_column_dtypes != tuple(concorded_column_dtypes):
             concord_sequence_row_dtypes(
@@ -12015,10 +12030,7 @@ class _ControlSSABuilder(TiledObject):
             status_address_id=(
                 None if status_address is None else int(status_address.id)
             ),
-            column_dtypes=(
-                str(data.dtype or "unknown"),
-                *(str(column.dtype or "unknown") for column in extra_columns),
-            ),
+            column_dtypes=born_column_dtypes,
             column_shapes=proposed_column_shapes,
             key_columns=key_columns,
             live_flags_value_id=(

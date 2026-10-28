@@ -519,7 +519,22 @@ def _storage_structure(read, authority, owner, value_id, sequence_owner, active=
     descriptor = read(page, row)
     cell = read.ref(page, row)
     if descriptor is None:
-        raise ConcordanceRefusal(f"withdrawn {authority} descriptor: {row!r}")
+        # A concordant duplicate sequence is withdrawn with the resident
+        # descriptor that superseded it as its source.  A live projection
+        # registered on the duplicate (an element Load of a re-read field)
+        # reads that resident; any other withdrawal still refuses.
+        successors = () if authority != "sequence" or cell is None else tuple(
+            parent for parent in read.sources(cell)
+            if parent.page == SEQUENCE_DESCRIPTOR and parent.row != row
+            and parent.row[0] == owner
+            and read(SEQUENCE_DESCRIPTOR, parent.row) is not None
+        )
+        if len(successors) != 1:
+            raise ConcordanceRefusal(f"withdrawn {authority} descriptor: {row!r}")
+        return _storage_structure(
+            read, authority, owner, int(successors[0].row[1]), sequence_owner,
+            active, column_scope=column_scope,
+        )
     if authority == "record":
         fields = []
         for field in descriptor.fields:
