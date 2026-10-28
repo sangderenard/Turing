@@ -5026,6 +5026,17 @@ class _ControlSSABuilder(TiledObject):
         self, result_id: int, sequence_id: int, index_id: int,
         index_literal: int | None, column: int, _row_value_id: int,
     ) -> None:
+        if (
+            int(sequence_id) not in self.sequence_descriptors
+            and int(sequence_id) in self.child_table_selections
+            and int(sequence_id) not in self.empty_default_child_ids
+        ):
+            # ``d[k][j]``: the keyed lookup selected a pool slice; its view
+            # is built where the first positional access asks for it.
+            self._sequence_descriptor(
+                int(sequence_id), policy="duplicates", writable=True,
+                location=f"{self.function_name}.mapping_row_view",
+            )
         descriptor = self.sequence_descriptors.get(int(sequence_id))
         if descriptor is None or not 0 <= int(column) < len(
             descriptor.column_value_ids
@@ -16624,6 +16635,13 @@ class _ControlSSABuilder(TiledObject):
                     required=not optional_none,
                 )
                 return
+            if operation == "setdefault" and (
+                mutation.argument_kind == "mapping_child_row"
+            ):
+                self._emit_mapping_child_row_birth(
+                    mutation, destination, location=location,
+                )
+                return
             if operation == "setdefault":
                 pool = destination.child_table_pool
                 key_count = len(destination.key_columns)
@@ -18012,6 +18030,106 @@ class _ControlSSABuilder(TiledObject):
                 ),
             ],
             attributes={"binding": "ssa_sequence_status"},
+        )
+
+    def _emit_mapping_child_row_birth(
+        self, mutation: ControlSequenceMutation,
+        destination: SSASequenceDescriptor, *, location: str,
+    ) -> None:
+        """One list value of a dict display: a new row in the child pool.
+
+        The display cleared the mapping, so its keys are new: the row's
+        handle is the table's length (as ``setdefault`` allocates), its
+        length starts at zero, and the key's row stores the handle.  The row
+        then takes its member appends like any selected child (no found
+        branch, so the selection needs no validity guard).
+        """
+
+        pool = destination.child_table_pool
+        key_count = len(destination.key_columns)
+        if pool is None or len(mutation.argument_value_ids) != key_count + 1:
+            self.shortfalls.append(SSALoweringShortfall(
+                "ssa-table", "mapping-child-row", location,
+                "a dict display of lists requires a resolved child-table "
+                "pool and exact key columns; "
+                f"child_pool={pool is not None}, "
+                f"key_columns={destination.key_columns}",
+            ))
+            return
+        handle_dtype = destination.column_dtypes[pool.handle_column]
+        key_ids = tuple(map(int, mutation.argument_value_ids[:key_count]))
+        outer_length_cell = self.sequence_storage_values[
+            int(destination.sequence_id)
+        ][len(destination.column_value_ids)]
+        outer_length_address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(outer_length_cell,),
+        )
+        self.emit(
+            Handler.GetElementPtr,
+            [outer_length_cell, self.constant_value(0, outer_length_cell)],
+            outer_length_address,
+            attributes={"binding": "ssa_mapping_setdefault_length_address"},
+        )
+        outer_length = self.fresh_value(
+            dtype="int64", transform=LOAD, operands=(outer_length_address,),
+        )
+        self.emit(
+            Handler.Load, [outer_length_address], outer_length,
+            attributes={"binding": "ssa_mapping_setdefault_handle"},
+        )
+        new_handle = self.fresh_value(
+            dtype=handle_dtype, transform=CONTROL_CAST,
+            operands=(outer_length,),
+        )
+        self.emit(
+            Handler.Cast, [outer_length], new_handle,
+            attributes={"target_dtype": handle_dtype},
+        )
+        self._bind(
+            int(new_handle.id), new_handle, BindingKind.SEQUENCE_RESULT,
+            outer_length,
+        )
+        pool_length = self.external_value(int(pool.length_value_id))
+        child_length_address = self.fresh_value(
+            dtype="ptr", transform=ADDRESS, operands=(pool_length, new_handle),
+        )
+        self.emit(
+            Handler.GetElementPtr, [pool_length, new_handle],
+            child_length_address,
+            attributes={"binding": "ssa_child_table_length"},
+        )
+        self.emit(
+            Handler.Store,
+            [self.constant_value(0, child_length_address), child_length_address],
+            attributes={"binding": "ssa_child_table_initialize"},
+        )
+        if pool.status_value_id is not None:
+            pool_status = self.external_value(int(pool.status_value_id))
+            child_status_address = self.fresh_value(
+                dtype="ptr", transform=ADDRESS,
+                operands=(pool_status, new_handle),
+            )
+            self.emit(
+                Handler.GetElementPtr, [pool_status, new_handle],
+                child_status_address,
+                attributes={"binding": "ssa_child_table_status"},
+            )
+            self.emit(
+                Handler.Store,
+                [self.constant_value(0, child_status_address),
+                 child_status_address],
+                attributes={"binding": "ssa_child_table_initialize"},
+            )
+        self._emit_table_store(
+            int(mutation.effect_node_id), key_ids, int(new_handle.id),
+            int(destination.sequence_id),
+        )
+        self.child_table_selections[int(mutation.effect_node_id)] = (
+            pool, new_handle,
+        )
+        self._bind(
+            int(mutation.effect_node_id), new_handle,
+            BindingKind.SEQUENCE_RESULT, outer_length,
         )
 
     def _emit_child_row_birth(

@@ -11990,6 +11990,48 @@ def _normalize_lexical_values(
                 parent for _role, _ordinal, parent
                 in aggregate_member_positions
             )
+            if aggregate_kind == "dict":
+                # A display whose every value is a list is a mapping of child
+                # lists: the value column holds child-pool row handles, as a
+                # ``setdefault(key, [])`` receiver's does.
+                member_attributes = tuple(
+                    (graph.G.nodes[parent].get("attributes") or {})
+                    for role, _ordinal, parent in aggregate_member_positions
+                    if role in {"values", "value", "keys", "key"}
+                    and parent in graph.G
+                )
+                value_attributes = tuple(
+                    (graph.G.nodes[parent].get("attributes") or {})
+                    for role, _ordinal, parent in aggregate_member_positions
+                    if role in {"values", "value"} and parent in graph.G
+                )
+                key_attributes = tuple(
+                    (graph.G.nodes[parent].get("attributes") or {})
+                    for role, _ordinal, parent in aggregate_member_positions
+                    if role in {"keys", "key"} and parent in graph.G
+                )
+                if (
+                    value_attributes
+                    and all(
+                        item.get("aggregate_kind") == "list"
+                        for item in value_attributes
+                    )
+                    and all(
+                        item.get("aggregate_kind") is None
+                        for item in key_attributes
+                    )
+                ):
+                    aggregate_attributes.update({
+                        "mapping_value_aggregate_kind": "list",
+                        "mapping_key_column_count": 1,
+                    })
+                    for _role, _ordinal, parent in aggregate_member_positions:
+                        if _role in {"values", "value"} and parent in graph.G:
+                            # The row is born by the mapping's display, in
+                            # the child pool: it owns no arena of its own.
+                            graph.G.nodes[parent].setdefault(
+                                "attributes", {}
+                            )["mapping_display_child"] = True
             source_members = []
             for role, ordinal, member_id in aggregate_member_positions:
                 member_cell = node_identity_cell(graph, int(member_id))
