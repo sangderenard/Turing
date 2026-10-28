@@ -1732,9 +1732,10 @@ def _runtime_rank_physical(
 
     from .identity_concordance import (
         SHAPE_STATE_PAGE, descriptor_from_shape_transformation_state,
+        shape_transformation_state,
     )
 
-    if shape_scope is None or tuple(value.shape or ()):
+    if shape_scope is None:
         return None
     row = (tuple(shape_scope), int(value.id))
     cell = book.latest_ref(SHAPE_STATE_PAGE, row)
@@ -1744,6 +1745,33 @@ def _runtime_rank_physical(
     if not (isinstance(fact, tuple) and fact and fact[0] == "resolved"):
         return None
     descriptor = descriptor_from_shape_transformation_state(fact[1])
+    # Program: ``acc = acc * 2 + i`` in a ``while`` (every int loop).  Wrong
+    # record: the computed update posted no storage/rank/physical dtype while
+    # the carried slot's literal initial posted them, so the loop-carry
+    # transport disagreed.  Rule: a result whose shape state is a resolved
+    # static numeric one of the value's own dtype and shape posts that
+    # state's physical view, DERIVED from the state cell (this producer
+    # owns it; the structural view no longer infers it).
+    state = shape_transformation_state(fact[1])
+    if state is not None and state[3] == "static":
+        from ..transmogrifier.dtype_layout import resolve
+
+        shape, dtype, rank, _metadata, _row_shape = state
+        layout = resolve(dtype)
+        if (
+            layout is not None
+            and layout.kind in {"bool", "int", "uint", "float"}
+            and str(dtype) == str(value.dtype)
+            and str(dtype) != "opaque_ref"
+            and rank == len(shape)
+            and tuple(shape) == tuple(value.shape or ())
+        ):
+            return {
+                "physical_dtype": str(dtype),
+                "storage": "span" if rank else "scalar", "rank": rank,
+            }, cell
+    if tuple(value.shape or ()):
+        return None
     if not (
         descriptor is not None
         and not tuple(descriptor.get("shape") or ())

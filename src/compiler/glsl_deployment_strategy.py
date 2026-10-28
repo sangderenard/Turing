@@ -1029,6 +1029,29 @@ def _callsite_argument_is_initializer(
     """
 
     argument_id = int(argument_id)
+    # Program: ``i = 0; while i < n: acc = step(acc, i); i += 1``.  Wrong
+    # record: the call's argument edge names ``i``'s initial ``Constant 0``,
+    # so ``step`` was specialized with ``k`` folded to 0 and returned
+    # ``acc * 2`` (-64, not -38).  Rule: the loop's own
+    # ``loop_carried_bindings`` say that initial is not the value of ``i``
+    # inside the loop; a call within that loop is not specialized on it.
+    import networkx as nx
+
+    for loop_id, loop_data in caller.G.nodes(data=True):
+        carried = (loop_data.get("attributes") or {}).get(
+            "loop_carried_bindings"
+        ) or {}
+        for pair in (*carried.values(), *(
+            (loop_data.get("attributes") or {}).get(
+                "loop_break_bindings"
+            ) or {}
+        ).values()):
+            if (
+                isinstance(pair, (tuple, list)) and pair
+                and int(pair[0]) == argument_id
+                and int(call_id) in nx.ancestors(caller.G, loop_id)
+            ):
+                return False
     if argument_id not in _mutated_sequence_node_ids(caller.G):
         return True
     from .resident_sequence_materialization import _call_escaped_argument_edges
