@@ -3494,6 +3494,17 @@ def _expand_unresolved_ast_parents(
     # stamped as they are appended.
     _annotate_visual_source_owners(module)
     root_bindings = _import_ast_bindings(module, bindings, package=package)
+    # A module-level ``def max``/``class sum`` shadows the builtin of that
+    # name, as in Python.  Without its definition here the builtin fallback
+    # below bound the name, and the call was classified ``builtins.max``
+    # while reduction resolved it to the program's own function.
+    for statement in module.body:
+        if (
+            isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef))
+            and hasattr(builtins, statement.name)
+        ):
+            root_bindings.setdefault(statement.name, statement)
     # Built-ins are ordinary lexical fallback bindings in Python.  Put them
     # through the same source/host-code implementation resolver as imports and
     # globals so a source-less builtin can be decompiled rather than becoming

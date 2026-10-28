@@ -653,6 +653,28 @@ def node_ingestion_scopes(graph: Any) -> tuple[Any, ...]:
     )
 
 
+def _drop_spelled_tensor_operation(attributes: dict, expression: Any) -> None:
+    """A call whose callee resolved to a source function is that function.
+
+    Ingestion reads a call's spelling against the tensor catalog
+    (``relu(x)``, ``max(a, b)``, ``sum_(a, b)``) before the callee resolves.
+    Once lexical reduction has bound the callee to the program's own
+    definition, that spelling is not an identity: left on the node, the
+    planner re-derived the catalog operation's result over the callee's
+    exact return every specialization round.  The catalog's own source
+    references (``_tensor_code_reference``) are the operation's
+    implementation and keep it.
+    """
+
+    operation = attributes.get("tensor") or attributes.get("tensor_candidate")
+    if operation is None or getattr(
+        expression, "_tensor_code_reference", None,
+    ) == operation:
+        return
+    attributes.pop("tensor", None)
+    attributes.pop("tensor_candidate", None)
+
+
 def node_identity_cell(graph: Any, node_id: int) -> Any:
     """The cell that identifies graph node ``node_id`` (plan 60, seam 1).
 
@@ -11350,10 +11372,12 @@ def _normalize_lexical_values(
                 )
                 callee_reference = callee_attributes.get("function_ref")
                 if callee_reference is not None and node_id in graph.G:
-                    graph.G.nodes[node_id].setdefault(
+                    call_attributes = graph.G.nodes[node_id].setdefault(
                         "attributes",
                         {},
-                    )["callee_ref"] = callee_reference
+                    )
+                    call_attributes["callee_ref"] = callee_reference
+                    _drop_spelled_tensor_operation(call_attributes, expression)
                 method_reference = callee_attributes.get("method_ref")
                 if method_reference is not None and node_id in graph.G:
                     graph.G.nodes[node_id].setdefault(
@@ -11414,6 +11438,7 @@ def _normalize_lexical_values(
                     attributes["callee_ref"] = reference_attributes[
                         "function_ref"
                     ]
+                    _drop_spelled_tensor_operation(attributes, expression)
                 if "class_ref" in reference_attributes:
                     attributes["class_ref"] = reference_attributes[
                         "class_ref"
