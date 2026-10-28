@@ -60177,9 +60177,16 @@ def _class_surface_ssa_program(
 
     # The last writer of physical scalar dtypes has run: a carried Phi of a
     # narrower class than its update is a trip-count-dependent result class.
-    from .ssa_self_check import check_loop_carried_class_widening
+    # Any other scalar Phi narrower than an arm is the same wrong record.
+    from .ssa_self_check import (
+        check_loop_carried_class_widening,
+        check_phi_narrower_than_arm,
+    )
 
-    carried_widening = check_loop_carried_class_widening(lowered_module)
+    carried_widening = [
+        *check_loop_carried_class_widening(lowered_module),
+        *check_phi_narrower_than_arm(lowered_module),
+    ]
     if carried_widening:
         raise ValueError(
             "; ".join(
