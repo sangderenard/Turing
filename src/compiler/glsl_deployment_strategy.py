@@ -30867,7 +30867,14 @@ def _expand_specialized_unbroadcast_identity(graph: Any) -> bool:
     the control planner to carry a tensor through a Python ``for`` loop.
     """
 
-    if str(graph.G.graph.get("function_name") or "") != "unbroadcast":
+    # The identity is the authored definition, not its spelling: a program's
+    # own ``def unbroadcast(G, target_shape)`` was rewritten to sum/reshape.
+    from ..common.tensors import backward_registry
+
+    identity = graph.G.graph.get("authored_function_identity")
+    if not identity or tuple(identity)[1:2] != ("unbroadcast",):
+        return False
+    if str(tuple(identity)[0]) != backward_registry.__name__:
         return False
     descriptors = graph.G.graph.get("planner_tensor_descriptors") or {}
     specializations = graph.G.graph.get("planner_specializations") or {}
