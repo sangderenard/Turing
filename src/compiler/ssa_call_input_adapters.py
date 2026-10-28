@@ -1092,6 +1092,7 @@ _NUMERIC_CONVERSION_MODES = {
         "integer_narrowing": "trap",
         "signedness": "preserve",
         "implicit_conversion": "allow",
+        "integer_arithmetic": "python_exact",
     },
 
     "scientific": {
@@ -1101,6 +1102,7 @@ _NUMERIC_CONVERSION_MODES = {
         "integer_narrowing": "trap",
         "signedness": "preserve",
         "implicit_conversion": "allow",
+        "integer_arithmetic": "python_exact",
     },
 
     "stochastic": {
@@ -1110,11 +1112,34 @@ _NUMERIC_CONVERSION_MODES = {
         "integer_narrowing": "trap",
         "signedness": "preserve",
         "implicit_conversion": "allow",
+        "integer_arithmetic": "python_exact",
     },
 }
 
 
 _DEFAULT_NUMERIC_MODE = "scientific"
+
+#: ``integer_arithmetic``: what an int result that leaves int64 means.
+#: ``python_exact`` -- Python's ``int``: the native op is overflow-checked and
+#: never returns a wrapped value.  ``wrap`` -- two's-complement int64, as
+#: NumPy computes it: no check.  One field for scalars and tensor lanes.
+_INTEGER_ARITHMETIC_POLICIES = ("python_exact", "wrap")
+
+
+def integer_arithmetic_policy(mode=None):
+    """The numeric contract's ``integer_arithmetic`` for ``mode``."""
+
+    try:
+        contract = _NUMERIC_CONVERSION_MODES[mode or _DEFAULT_NUMERIC_MODE]
+    except KeyError:
+        raise ValueError(f"unknown numeric conversion mode {mode!r}")
+    policy = contract["integer_arithmetic"]
+    if policy not in _INTEGER_ARITHMETIC_POLICIES:
+        raise ValueError(
+            f"integer_arithmetic must be one of {_INTEGER_ARITHMETIC_POLICIES}, "
+            f"got {policy!r}"
+        )
+    return policy
 
 
 def _numeric_conversion_attributes(

@@ -18,6 +18,13 @@ MAPPING_KEY_ABSENT = 84
 #: limbs, the native module reports it rather than return a wrapped value.
 INT_OVERFLOW = 86
 
+#: ``a << b`` or ``a >> b`` with ``b < 0``: Python raises ``ValueError``.
+NEGATIVE_SHIFT_COUNT = 87
+
+#: ``a // 0`` or ``a % 0`` on ints: Python raises ``ZeroDivisionError``; the
+#: native divide would trap the host process instead.
+INT_ZERO_DIVISION = 88
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -25,6 +32,14 @@ class NativeIndexError(RuntimeError, IndexError):
 
 class NativeIntOverflow(RuntimeError, OverflowError):
     """An int64 result past int64 that Python would have kept exact."""
+
+
+class NativeValueError(RuntimeError, ValueError):
+    """``ValueError`` raised from a native validation code."""
+
+
+class NativeZeroDivisionError(RuntimeError, ZeroDivisionError):
+    """``ZeroDivisionError`` raised from a native validation code."""
 
 
 class NativeKeyError(RuntimeError, KeyError):
@@ -44,5 +59,11 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
     if int(code) == INT_OVERFLOW:
         return NativeIntOverflow(
             f"int result left int64; no interval proves it ({runtime_message})"
+        )
+    if int(code) == NEGATIVE_SHIFT_COUNT:
+        return NativeValueError(f"negative shift count ({runtime_message})")
+    if int(code) == INT_ZERO_DIVISION:
+        return NativeZeroDivisionError(
+            f"integer division or modulo by zero ({runtime_message})"
         )
     return RuntimeError(runtime_message)

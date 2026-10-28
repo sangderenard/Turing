@@ -301,6 +301,92 @@ _FLOORED_INT128 = {
 }
 
 
+#: Python ``int`` operations spelled by ``_python_int_statement`` when
+#: ``python_int_overflow_checked`` holds, with their operand counts.
+_PYTHON_INT_OPERATIONS = {
+    "Shl": 2, "Shr": 2, "FloorDiv": 2, "Mod": 2, "Abs": 1, "abs": 1, "Neg": 1,
+}
+_C_INT64_MIN = "(-9223372036854775807LL - 1)"
+
+
+def _python_int_overflow_checked(instruction) -> bool:
+    from .ssa_llvm_backend import python_int_overflow_checked
+
+    return python_int_overflow_checked(instruction)
+
+
+def _python_int_spelled(op: str, instruction) -> bool:
+    """Whether ``_python_int_statement`` spells this op (its LLVM rule).
+
+    ``<< >> // %`` keep Python's semantics proven or not; ``abs`` and unary
+    ``-`` only need it while no interval proves the result inside int64.
+    """
+
+    from .ssa_llvm_backend import python_int_operation
+
+    if op in {"Abs", "abs", "Neg"}:
+        return _python_int_overflow_checked(instruction)
+    return python_int_operation(instruction)
+
+
+def _python_int_statement(op: str, args, target: str) -> str:
+    """C for Python's ``<< >> // %``, ``abs`` and unary ``-`` on an int64.
+
+    The LLVM lane's ``_python_int_lines``: Python's value or a named fault
+    (``NEGATIVE_SHIFT_COUNT``, ``INT_ZERO_DIVISION``, ``INT_OVERFLOW``),
+    computed on a safe operand so no C operation is undefined.  The
+    statement opens ``int64_t <target> = <value>;`` so a loop's later
+    definition can assign the incumbent local instead.
+    """
+
+    from .native_faults import INT_ZERO_DIVISION, NEGATIVE_SHIFT_COUNT
+
+    def fault(code: int) -> str:
+        return f"turing_validation_error({int(code)}u);"
+
+    overflow = fault(_INT_OVERFLOW_CODE)
+    if op == "Neg":
+        (value,) = args
+        return (
+            f"int64_t {target} = 0; if (__builtin_sub_overflow("
+            f"(int64_t)0, (int64_t)({value}), &{target})) {overflow}"
+        )
+    if op in {"Abs", "abs"}:
+        (value,) = args
+        return (
+            f"int64_t {target} = (({value}) < 0 ? (int64_t)(0 - "
+            f"(uint64_t)({value})) : ({value})); "
+            f"if (({value}) == {_C_INT64_MIN}) {overflow}"
+        )
+    left, right = (f"((int64_t)({argument}))" for argument in args)
+    if op in {"Shl", "Shr"}:
+        inrange = f"({right} >= 0 && {right} < 64)"
+        negative = f"if ({right} < 0) {fault(NEGATIVE_SHIFT_COUNT)}"
+        if op == "Shr":
+            # Python ``>>`` floors: arithmetic, and 0 / -1 past 63 bits.
+            return (
+                f"int64_t {target} = ({left} >> ({inrange} ? {right} : 63)); "
+                f"{negative}"
+            )
+        return (
+            f"int64_t {target} = (int64_t)((uint64_t){left} << "
+            f"({inrange} ? {right} : 0)); {negative} "
+            f"else if ({right} < 64 ? (({target} >> {right}) != {left}) "
+            f": ({left} != 0)) {overflow}"
+        )
+    wide = f"({left} == {_C_INT64_MIN} && {right} == -1)"
+    helper = "turing_ifloordiv" if op == "FloorDiv" else "turing_imod"
+    statement = (
+        f"int64_t {target} = {helper}({left}, "
+        f"({right} == 0 || {wide}) ? 1 : {right}); "
+        f"if ({right} == 0) {fault(INT_ZERO_DIVISION)}"
+    )
+    if op == "FloorDiv":
+        # -2**63 // -1 == 2**63; -2**63 % -1 == 0 is the safe divisor's.
+        statement += f" else if {wide} {overflow}"
+    return statement
+
+
 def _floored_integer_helper(op: str, operands) -> str:
     """The floored integer helper whose domain holds every operand."""
 
@@ -4572,7 +4658,29 @@ def emit_ssa_module_to_c(
                         sum_start = scalar_operand(instruction.args[1])
                         if sum_start is None:
                             continue
-                    if count == 1:
+                    # ``sum(xs)`` of Python ints: each step is int ``+``.
+                    checked_sum = (
+                        op == "sum" and result_type == "int64_t"
+                        and _python_int_overflow_checked(instruction)
+                    )
+                    if checked_sum:
+                        prototype = (
+                            "void turing_validation_error(uint32_t error_code);"
+                        )
+                        if prototype not in prototypes:
+                            prototypes.append(prototype)
+                        needs_validation_runtime = True
+                    if count == 1 and checked_sum:
+                        scalar = scalar_operand(source)
+                        if scalar is None:
+                            continue
+                        body.append(
+                            f"        int64_t t{result_id} = 0; "
+                            f"if (__builtin_add_overflow((int64_t)({sum_start}), "
+                            f"(int64_t)({scalar}), &t{result_id})) "
+                            f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                        )
+                    elif count == 1:
                         scalar = scalar_operand(source)
                         if scalar is None:
                             continue
@@ -4621,6 +4729,12 @@ def emit_ssa_module_to_c(
                         elif op == "sum":
                             # Left to right from ``start``, as Python adds.
                             step = (
+                                f"if (__builtin_add_overflow("
+                                f"turing_red_{result_id}, "
+                                f"(int64_t)turing_red_{result_id}_v, "
+                                f"&turing_red_{result_id})) "
+                                f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
+                                if checked_sum else
                                 f"turing_red_{result_id} += "
                                 f"({result_type})turing_red_{result_id}_v;"
                             )
@@ -6385,6 +6499,23 @@ def emit_ssa_module_to_c(
                         )
                         + ";"
                     )
+                elif (
+                    op in _PYTHON_INT_OPERATIONS
+                    and len(args) == _PYTHON_INT_OPERATIONS[op]
+                    and _scalar_c_type(instruction.res.dtype) == "int64_t"
+                    and all(
+                        is_integer(value) and not _is_unsigned_dtype(value.dtype)
+                        for value in instruction.args
+                    )
+                    and _python_int_spelled(op, instruction)
+                ):
+                    prototype = "void turing_validation_error(uint32_t error_code);"
+                    if prototype not in prototypes:
+                        prototypes.append(prototype)
+                    needs_validation_runtime = True
+                    integer_ids.add(result_id)
+                    declared_storage_type = "int64_t"
+                    declared = _python_int_statement(op, args, f"t{result_id}")
                 elif op == "Pow" and len(args) == 2:
                     if _is_integer_dtype(instruction.res.dtype):
                         shortfalls.append(CEmissionShortfall(
@@ -6447,6 +6578,19 @@ def emit_ssa_module_to_c(
                     from .ssa_llvm_backend import python_int_overflow_checked
 
                     if (
+                        integral and op == "Add" and kind == "int64_t"
+                        and (instruction.attributes or {}).get("binding")
+                        == "loop_induction_step"
+                    ):
+                        # A range loop's induction step saturates, as the
+                        # LLVM lane's ``llvm.sadd.sat`` (precompile_to_ssa).
+                        declared = (
+                            f"int64_t t{result_id} = 0; if (__builtin_add_overflow("
+                            f"(int64_t)({args[0]}), (int64_t)({args[1]}), "
+                            f"&t{result_id})) t{result_id} = "
+                            f"((int64_t)({args[1]}) > 0) ? INT64_MAX : INT64_MIN;"
+                        )
+                    elif (
                         integral and op in {"Add", "Sub", "Mul"}
                         and kind == "int64_t"
                         and python_int_overflow_checked(instruction)
