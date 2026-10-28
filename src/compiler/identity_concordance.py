@@ -4161,6 +4161,48 @@ class CorrelationTable:
         metadata = dict(getattr(module, "metadata", {}) or {})
         book = metadata.get("identity_book")
         found = []
+        # An ``int`` key column is the narrowest width holding the join of
+        # every writer's member interval: each view cites the
+        # ``source_int_range_concordance`` cells it read (none: the int64
+        # range).  Re-derive that join from the cited cells.
+        from .concordance_declarations import SOURCE_INT_RANGE
+        from ..transmogrifier.dtype_layout import python_int_range_dtype
+
+        int64_bounds = (-(1 << 63), (1 << 63) - 1)
+        joined_key_widths: dict = {}
+        if book is not None:
+            joins: dict = {}
+            for view in metadata.get("mapping_child_contract_evidence") or ():
+                for index, cell in enumerate(view.get("key_range_cells") or ()):
+                    interval = int64_bounds
+                    if isinstance(cell, Ref) and cell.page == SOURCE_INT_RANGE:
+                        fact = book.page(SOURCE_INT_RANGE).cell(cell.row, cell.column)
+                        interval = (int(fact[0]), int(fact[1]))
+                    key = (view.get("field_cell"), index)
+                    low, high = joins.get(key, interval)
+                    joins[key] = (min(low, interval[0]), max(high, interval[1]))
+            joined_key_widths = {
+                key: python_int_range_dtype(*interval)
+                for key, interval in joins.items()
+            }
+
+        def int_key_dtype(view, index, cell, expected):
+            if expected != "int64":
+                return expected
+            range_cells = tuple(view.get("key_range_cells") or ())
+            if index < len(range_cells):
+                range_cell = range_cells[index]
+                if range_cell is not None and (
+                    not isinstance(range_cell, Ref)
+                    or range_cell.page != SOURCE_INT_RANGE
+                    or int(range_cell.row[1]) != int(cell.row[1])
+                ):
+                    return None
+                return joined_key_widths.get(
+                    (view.get("field_cell"), index), expected,
+                )
+            return expected
+
         for view in metadata.get("mapping_child_contract_evidence") or ():
             field, scalar, key = (view.get(name) for name in (
                 "field_cell", "class_cell", "key_layout_cell",
@@ -4188,7 +4230,7 @@ class CorrelationTable:
                 if expected != view.get("dtype") or int(class_fact[1]) != 1:
                     problem = f"child dtype {view.get('dtype')!r} disagrees with operand class {class_fact!r}"
                 elif key_fact is None or int(key_fact[1]) != 1 or tuple(view.get("key_dtypes", ())) != (
-                    {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0])),
+                    int_key_dtype(view, 0, key_cell, {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]))),
                 ):
                     problem = "scalar key dtype disagrees with its exact key class"
             else:
@@ -4203,7 +4245,7 @@ class CorrelationTable:
                     elif len(view.get("key_class_cells", ())) != len(layout.members) or len(view.get("key_dtypes", ())) != len(layout.members):
                         problem = "child key column type view has the wrong member count"
                     else:
-                        for member, cell, dtype in zip(layout.members, view["key_class_cells"], view["key_dtypes"], strict=True):
+                        for index, (member, cell, dtype) in enumerate(zip(layout.members, view["key_class_cells"], view["key_dtypes"], strict=True)):
                             if cell is None:
                                 if dtype != "unknown":
                                     problem = "unproved key member was assigned a physical dtype"
@@ -4212,7 +4254,7 @@ class CorrelationTable:
                                 problem = "key class does not name its exact ordered member"
                                 break
                             key_fact = book.page(SOURCE_VALUE_CLASS).cell(cell.row, cell.column)
-                            expected_key = {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]), "unknown")
+                            expected_key = int_key_dtype(view, index, cell, {"builtins.int": "int64", "builtins.float": "float64", "builtins.bool": "bool"}.get(str(key_fact[0]), "unknown"))
                             if dtype != expected_key:
                                 problem = "key dtype disagrees with its exact member class"
                                 break

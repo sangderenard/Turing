@@ -25008,6 +25008,45 @@ def _class_surface_ssa_program(
                 and dtype == primitive_class
             ):
                 dtype = str(primitive_receipt["dtype"])
+            if (
+                identity == "builtins.int"
+                and storage == "scalar"
+                and dtype in {"", "int", "int64"}
+            ):
+                # Program: ``self.find_existing(domain, hi, lo)`` with ``hi,
+                # lo`` Token Orchard's fingerprint pair (corpus c794).
+                # Wrong record: the formal's arm took the ``int`` receipt's
+                # int64 while every actual is proven ``[0, 2**64-1]``, so
+                # the uint64 actuals were refused as incompatible call
+                # inputs.  Rule: a builtin ``int`` scalar's width is the
+                # narrowest holding its proven interval
+                # (``source_int_range_concordance``), as the planner's is.
+                from ..common.tensors.topological_reducer import (
+                    _int_range_cell as _arm_range_cell,
+                )
+                from ..transmogrifier.dtype_layout import (
+                    python_int_range_dtype as _arm_range_dtype,
+                )
+                from .concordance_declarations import (
+                    SOURCE_INT_RANGE as _ARM_INT_RANGE,
+                )
+
+                range_cell = _arm_range_cell(owner, int(value_id))
+                interval = (
+                    None if range_cell is None
+                    else shape_identity_book.page(_ARM_INT_RANGE).cell(
+                        range_cell.row, range_cell.column,
+                    )
+                )
+                proven = (
+                    None if interval is None
+                    else _arm_range_dtype(int(interval[0]), int(interval[1]))
+                )
+                if proven in {"uint64", "int128"}:
+                    dtype = str(proven)
+                    source_cells = tuple(dict.fromkeys((
+                        *source_cells, range_cell,
+                    )))
             shape = tuple(map(int, contract.get("shape") or ()))
             rank = int(contract.get(
                 "rank",
@@ -28339,13 +28378,42 @@ def _class_surface_ssa_program(
                 parameter_value_dtypes[int(value_id)] = str(descriptor["dtype"])
             if descriptor.get("shape") is not None:
                 parameter_value_shapes[int(value_id)] = tuple(descriptor["shape"])
+        from ..common.tensors.topological_reducer import (
+            _int_range_cell as _linked_range_cell,
+        )
+        from ..transmogrifier.dtype_layout import (
+            python_int_range_dtype as _linked_range_dtype,
+        )
+        from .concordance_declarations import (
+            SOURCE_INT_RANGE as _LINKED_INT_RANGE,
+        )
+
         for value_id, value_abi in dict(
             graph_obj.graph.get("linked_value_abi") or {}
         ).items():
             if value_abi.get("dtype") is not None:
-                parameter_value_dtypes[int(value_id)] = str(
-                    value_abi["dtype"]
-                )
+                linked_dtype = str(value_abi["dtype"])
+                if linked_dtype in {"int", "int64"} and not tuple(
+                    value_abi.get("shape") or ()
+                ):
+                    # Program: ``hi, lo = self.fingerprint(mode, n)`` with
+                    # ``-> tuple[int, int]`` (corpus c794).  Wrong record:
+                    # the members' linked contract spelled the declared
+                    # class's int64, so the key built from them was int64
+                    # while both are proven ``[0, 2**64-1]``.  Rule: a
+                    # scalar ``int``'s width is the narrowest holding its
+                    # proven interval, as its ABI arm's is.
+                    range_cell = _linked_range_cell(graph_obj, int(value_id))
+                    if range_cell is not None:
+                        interval = shape_identity_book.page(
+                            _LINKED_INT_RANGE
+                        ).cell(range_cell.row, range_cell.column)
+                        proven = _linked_range_dtype(
+                            int(interval[0]), int(interval[1]),
+                        )
+                        if proven in {"uint64", "int128"}:
+                            linked_dtype = str(proven)
+                parameter_value_dtypes[int(value_id)] = linked_dtype
             if value_abi.get("shape") is not None:
                 parameter_value_shapes[int(value_id)] = tuple(map(
                     int, value_abi["shape"]
@@ -30082,7 +30150,7 @@ def _class_surface_ssa_program(
         )
 
         from ..common.tensors.topological_reducer import (
-            _source_numeric_scope as _int_range_scope,
+            _int_range_scopes as _int_range_scope,
         )
 
         module_ir, shortfalls, shell_section_outputs = (

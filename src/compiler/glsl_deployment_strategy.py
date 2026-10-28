@@ -2290,9 +2290,6 @@ def _planned_scalar_dtypes_from(
     # A builtin ``int`` value's native width is the narrowest layout holding
     # its proven interval (``source_int_range_concordance``), the same law a
     # literal's width follows.  An unproven value keeps the int64 rule.
-    from ..common.tensors.topological_reducer import (
-        _source_numeric_scope as _range_scope,
-    )
     from .concordance_declarations import SOURCE_INT_RANGE
     from .identity_concordance import current_identity_book as _range_book
     from ..transmogrifier.dtype_layout import (
@@ -2300,16 +2297,21 @@ def _planned_scalar_dtypes_from(
         python_int_range_dtype,
     )
 
-    range_scope = _range_scope(G)
     range_page = _range_book().page(SOURCE_INT_RANGE)
+
+    from ..common.tensors.topological_reducer import (
+        _int_range_scopes as _range_scopes,
+        _int_range_cell as _range_cell,
+    )
+
+    range_scopes = _range_scopes(G)
 
     def range_dtype(node_id):
         data = G.nodes.get(int(node_id), {})
-        interval = range_page.latest(
-            (range_scope, int(data.get("value_id", node_id)))
-        )
-        if interval is None:
+        cell = _range_cell(range_scopes, int(data.get("value_id", node_id)))
+        if cell is None:
             return None
+        interval = range_page.cell(cell.row, cell.column)
         return python_int_range_dtype(int(interval[0]), int(interval[1]))
 
     scalar: dict[int, str] = {}

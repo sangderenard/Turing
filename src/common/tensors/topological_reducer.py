@@ -5106,9 +5106,17 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             members[key] = [(unit, node_id)]
 
     def callee_of(unit, node_id):
-        attributes = unit.G.nodes[node_id].get("attributes") or {}
+        data = unit.G.nodes[node_id]
+        attributes = data.get("attributes") or {}
         reference = attributes.get("callee_ref", attributes.get("method_ref"))
         if reference is None:
+            return None
+        if str(data.get("type")) == "GetAttr":
+            # Program: ``hi, lo = self.fingerprint(mode, n)`` (corpus c794).
+            # The bound-method READ ``self.fingerprint`` carries the same
+            # ``method_ref`` as the call, binds no argument, and so marked
+            # every formal unbound: no method formal was ever proven.  Only
+            # the call is a callsite.
             return None
         try:
             return by_address.get(int(reference))
@@ -5377,6 +5385,41 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 mode=_Mode.CONCORD,
             )
     return bool(posted)
+
+
+def _int_range_scopes(graph: Any) -> tuple:
+    """The interval scopes a value of ``graph`` is read through, in order.
+
+    A specialization's own scope first, then its authored function's: the
+    copy runs a subset of the authored function's executions, so the
+    authored interval holds for it.  A specialization minted before the
+    whole-program interval proof ran has no rows of its own (corpus c794:
+    ``intern``'s copy read the uint64 fingerprint members as int64).
+    """
+
+    target = getattr(graph, "G", graph)
+    scopes = [_source_numeric_scope(graph)]
+    authored = target.graph.get("authored_function_identity")
+    if authored is not None and tuple(authored) not in scopes:
+        scopes.append(tuple(authored))
+    return tuple(scopes)
+
+
+def _int_range_cell(graph_or_scopes: Any, value_id: int) -> Any:
+    """The ``source_int_range_concordance`` cell proving ``value_id``."""
+
+    from ...compiler.concordance_declarations import SOURCE_INT_RANGE
+
+    scopes = (
+        graph_or_scopes if isinstance(graph_or_scopes, tuple)
+        else _int_range_scopes(graph_or_scopes)
+    )
+    book = current_identity_book()
+    for scope in scopes:
+        cell = book.latest_ref(SOURCE_INT_RANGE, (scope, int(value_id)))
+        if cell is not None:
+            return cell
+    return None
 
 
 def _propagate_builtin_int_ranges(graph: Any) -> bool:
@@ -25516,6 +25559,41 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
     mapping_contract_views = {}
     mapping_contract_evidence = []
     unproved_mapping_fields = set()
+    # Program: Token Orchard's ``self._candidates.setdefault((domain, hi, lo,
+    # atom_count), [])`` with ``hi, lo`` the fingerprint pair, proven
+    # ``[0, 2**64-1]`` (corpus c794).  Wrong record: an ``int`` key column
+    # was int64 by class alone, so the uint64 key was refused against its
+    # own column.  Rule: an ``int`` key column holds the join of every
+    # writer's member interval (``source_int_range_concordance``; an
+    # unproven member is the int64 range), at the narrowest width holding
+    # it.  Each evidence view cites the range cells it read.
+    from ...compiler.concordance_declarations import SOURCE_INT_RANGE
+    from ...transmogrifier.dtype_layout import python_int_range_dtype
+
+    mapping_key_intervals: dict = {}
+    _int64_bounds = (-(1 << 63), (1 << 63) - 1)
+
+    def key_member_interval(wrapper, value_id, key_dtype):
+        if key_dtype != "int64":
+            return None, None
+        cell = _int_range_cell(wrapper, int(value_id))
+        if cell is None:
+            return _int64_bounds, None
+        interval = current_identity_book().page(SOURCE_INT_RANGE).cell(
+            cell.row, cell.column,
+        )
+        return (int(interval[0]), int(interval[1])), cell
+
+    def join_key_intervals(field_cell, intervals):
+        joined = mapping_key_intervals.setdefault(field_cell, list(intervals))
+        for index, interval in enumerate(intervals):
+            if interval is None or joined[index] is None:
+                joined[index] = None if interval is None else joined[index]
+                continue
+            joined[index] = (
+                min(joined[index][0], interval[0]),
+                max(joined[index][1], interval[1]),
+            )
     for entry in function_table:
         wrapper = getattr(entry, "graph", None)
         if wrapper is None:
@@ -25574,7 +25652,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 incumbent = mapping_contract_views.setdefault(field_cell, proposed)
                 if incumbent != proposed:
                     raise ValueError(f"mapping child writers disagree for declaration {field_cell!r}")
-                mapping_contract_evidence.append({"field_cell": field_cell, "class_cell": class_cell, "key_layout_cell": None, "dtype": str(dtype), "key_width": 1, "key_class_cells": (key_class_cell,), "key_dtypes": key_dtypes})
+                key_interval, key_range_cell = key_member_interval(wrapper, key_value, key_dtypes[0])
+                join_key_intervals(field_cell, (key_interval,))
+                mapping_contract_evidence.append({"field_cell": field_cell, "class_cell": class_cell, "key_layout_cell": None, "dtype": str(dtype), "key_width": 1, "key_class_cells": (key_class_cell,), "key_dtypes": key_dtypes, "key_range_cells": (key_range_cell,)})
                 continue
             layout = current_identity_book().page(_SOURCE_AGGREGATE_LAYOUT).cell(layout_cell.row, layout_cell.column)
             if layout.aggregate_kind != "tuple" or not layout.members:
@@ -25595,7 +25675,31 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             incumbent = mapping_contract_views.setdefault(field_cell, proposed)
             if incumbent != proposed:
                 raise ValueError(f"mapping child writers disagree for declaration {field_cell!r}")
-            mapping_contract_evidence.append({"field_cell": field_cell, "class_cell": class_cell, "key_layout_cell": layout_cell, "dtype": str(dtype), "key_width": len(layout.members), "key_class_cells": key_class_cells, "key_dtypes": key_dtypes})
+            member_intervals = tuple(
+                key_member_interval(wrapper, member.value_id, key_dtype)
+                for member, key_dtype in zip(layout.members, key_dtypes, strict=True)
+            )
+            join_key_intervals(field_cell, tuple(interval for interval, _cell in member_intervals))
+            mapping_contract_evidence.append({"field_cell": field_cell, "class_cell": class_cell, "key_layout_cell": layout_cell, "dtype": str(dtype), "key_width": len(layout.members), "key_class_cells": key_class_cells, "key_dtypes": key_dtypes, "key_range_cells": tuple(cell for _interval, cell in member_intervals)})
+    for field_cell, intervals in mapping_key_intervals.items():
+        if field_cell not in mapping_contract_views:
+            continue
+        widths = list(mapping_contract_views[field_cell]["mapping_key_column_dtypes"])
+        for index, interval in enumerate(intervals):
+            if interval is None:
+                continue
+            width = python_int_range_dtype(*interval)
+            if width is None:
+                raise ValueError(
+                    f"mapping key column {index} of {field_cell!r} holds "
+                    f"ints in {interval!r}, wider than any native integer"
+                )
+            widths[index] = width
+        widths = tuple(widths)
+        mapping_contract_views[field_cell]["mapping_key_column_dtypes"] = widths
+        for view in mapping_contract_evidence:
+            if view["field_cell"] == field_cell:
+                view["key_dtypes"] = widths
     if unproved_mapping_fields.intersection(mapping_contract_views):
         raise ValueError("mapping child writers include an unproved payload or key layout for the same field declaration")
     # Program: ``self._d = {}`` in ``__init__`` and ``self._d[k] = v`` in a
