@@ -48084,14 +48084,26 @@ def _class_surface_ssa_program(
                                 for spliced in reversed(sequence):
                                     # A frame-aliased call's result IS its
                                     # caller operand (the returned formal's
-                                    # storage); the marker's handle id is not
-                                    # a second definition of it.
+                                    # storage).  A marker naming a DIFFERENT
+                                    # id (the record handle) is not a second
+                                    # definition of it; a marker naming the
+                                    # call's own semantic result is its
+                                    # identity and is retained.
+                                    aliased_elsewhere = (
+                                        spliced.attributes.get(
+                                            "result_aliases_frame"
+                                        )
+                                        and spliced.attributes.get(
+                                            "semantic_result_id"
+                                        ) is not None
+                                        and int(spliced.attributes[
+                                            "semantic_result_id"
+                                        ]) != int(marker_result.id)
+                                    )
                                     if (
                                         spliced.op == "Call"
                                         and spliced.res is not None
-                                        and not spliced.attributes.get(
-                                            "result_aliases_frame"
-                                        )
+                                        and not aliased_elsewhere
                                     ):
                                         spliced.res = retain_result(marker_result, spliced.res)
                                         values[int(marker_result.id)] = (
