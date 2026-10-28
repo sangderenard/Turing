@@ -29,6 +29,13 @@ def class_spelling(value: Any) -> str:
     """The exact Python class of a call argument (a value or a class)."""
 
     cls = value if isinstance(value, type) else type(value)
+    # A list call record names its element class: ``list[int]`` types the
+    # formal's rows, where the bare ``list`` left every row dtype unsettled.
+    # An empty or mixed-class list proves no element class and stays ``list``.
+    if isinstance(value, list) and value:
+        elements = {type(item).__name__ for item in value}
+        if len(elements) == 1 and elements <= {"int", "float", "bool"}:
+            return f"list[{elements.pop()}]"
     return cls.__name__
 
 
@@ -85,7 +92,10 @@ def distinct_signatures(root_calls: Iterable[Mapping[str, Any]]) -> list[dict[st
 
 
 def signature_suffix(signature: Mapping[str, str]) -> str:
-    return "_".join(signature[name] for name in sorted(signature))
+    return "_".join(
+        signature[name].replace("[", "_").replace("]", "")
+        for name in sorted(signature)
+    )
 
 
 def called_class(book: Any, function_identity: str, formal: str):
@@ -130,7 +140,7 @@ def annotate_from_inventory(tree: Any, function_identity: str, book: Any) -> Non
                 if got is None:
                     continue
                 arg.annotation = ast.copy_location(
-                    ast.Name(id=got[0], ctx=ast.Load()), arg)
+                    ast.parse(got[0], mode="eval").body, arg)
 
 
 def post_call_edge_actual(
@@ -153,11 +163,20 @@ def post_call_edge_actual(
     if cls.startswith("builtins."):
         cls = cls[len("builtins."):]
     edge_row = (caller_scope, int(call_id), str(formal))
-    book.post(
-        CALL_EDGE_ACTUAL, edge_row, cls, stage=PLANNER_TENSOR_SPECIALIZATION,
-        provenance=Derived((class_cell,)), mode=Mode.REVISE,
-    )
     edge = book.latest_ref(CALL_EDGE_ACTUAL, edge_row)
+    # Nested specialization revisits an edge; a visit that restates the same
+    # actual from the same class cell has nothing to revise.
+    if not (
+        edge is not None
+        and book.page(CALL_EDGE_ACTUAL).latest(edge_row) == cls
+        and class_cell in [ref for ref, _stage in book.edges_into(edge)]
+    ):
+        book.post(
+            CALL_EDGE_ACTUAL, edge_row, cls,
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived((class_cell,)), mode=Mode.REVISE,
+        )
+        edge = book.latest_ref(CALL_EDGE_ACTUAL, edge_row)
     row = (str(callee_identity), str(formal))
     incumbent = book.page(CALLED_INVENTORY).latest(row)
     cell = book.latest_ref(CALLED_INVENTORY, row) if incumbent is not None else None

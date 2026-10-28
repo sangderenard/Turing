@@ -39,6 +39,43 @@ def root(n: int, c: int):
         s = n * 0.5
     return s > 3
 """,
+    "added_to_itself": """
+def root(n: int, c: int):
+    if c == 2:
+        s = n
+    else:
+        s = n * 0.5
+    return s + s
+""",
+    "carried_read_with_another_carried_read": """
+def root(t: int):
+    xs = [2.5, t * 1.5]
+    s = 0
+    r = 0
+    for v in xs:
+        r = r + s
+        s += v
+    return r
+""",
+    "carried_read_by_floordiv": """
+def root(t: int) -> float:
+    xs = [2.5, t * 1.5]
+    s = 0
+    q = 0.0
+    for v in xs:
+        q = q + s // 2
+        s += v
+    return s + q
+""",
+    "conditional_update_in_display_loop": """
+def root(t: int):
+    xs = [2.5, t * 1.5]
+    s = 0
+    for v in xs:
+        if v > 3.0:
+            s += v
+    return s
+""",
     "optional_payload_mod_int": """
 def pick(n, c):
     if c == 1:
@@ -81,3 +118,21 @@ def root(n: int, c: int) -> float:
     return s + 0.25
 """)
     assert module.metadata["numeric_join_promotions"] >= 1
+
+
+CONTINUE_UPDATE = """
+def root(t: int) -> float:
+    xs = [2.5, t * 1.5]
+    s = 0
+    for v in xs:
+        if v < 3.0:
+            continue
+        s += v
+    return s + 0.0
+"""
+
+
+def test_update_after_continue_is_refused_not_truncated():
+    # Python: 4.5 (s is an int on the skipped trip, a float after).
+    with pytest.raises(ValueError, match="union lowering is not built"):
+        _lower(CONTINUE_UPDATE)

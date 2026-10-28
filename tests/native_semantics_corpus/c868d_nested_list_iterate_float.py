@@ -1,4 +1,4 @@
-def root(n: int) -> float:
+def root(n):
     g = [[1.5, 2.5], [n * 0.5, 4.0, 1.0]]
     s = 0.0
     for r in g:

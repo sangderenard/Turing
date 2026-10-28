@@ -162,6 +162,7 @@ from .resident_sequence_materialization import (
     _joined_list_literal_mutations as _joined_list_literal_mutations,
     _list_literal_mutations as _list_literal_mutations,
     list_row_displays as list_row_displays,
+    dict_row_displays as dict_row_displays,
     list_row_reads as list_row_reads,
     list_row_pool_extents as list_row_pool_extents,
     _list_merged_from_unequal_displays as _list_merged_from_unequal_displays,
@@ -170,6 +171,7 @@ from .resident_sequence_materialization import (
     _linked_sequence_propagation_kind as _linked_sequence_propagation_kind,
     _loop_carried_storage_aliases as _loop_carried_storage_aliases,
     _promote_conditional_sequence_aliases as _promote_conditional_sequence_aliases,
+    _retarget_forwarded_sequence_effects as _retarget_forwarded_sequence_effects,
     _sequence_append_call_mutations as _sequence_append_call_mutations,
     _source_mapping_mutations as _source_mapping_mutations,
     _source_glyph_sequence_materializations as _source_glyph_sequence_materializations,
@@ -11079,6 +11081,10 @@ def _field_slot_ops(
             continue
         if aggregate_kind == "array" and attributes.get("producer_kind") != "sequence_materialization":
             continue
+        if attributes.get("mapping_display_child"):
+            # A list value of a dict display is a row of the mapping's child
+            # pool, born by the display; it is not a second allocation.
+            continue
         if attributes.get("producer_kind") in {"mapping_default_result", "mapping_lookup_result"}:
             # A setdefault result selects the mapping's child pool. It is
             # not another list allocation; its mutation uses that row view.
@@ -11540,11 +11546,19 @@ def _field_slot_ops(
                         source_data.setdefault("attributes", {})[
                             "sequence_column_dtypes"
                         ] = (str(declared_dtype),)
-                sequence_initializations.append((
-                    int(source_id),
-                    "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
-                    int(constructor_mapping_contracts.get(int(source_id), {}).get("mapping_key_column_count", 1)) + _mapping_value_column_count(constructor_mapping_contracts.get(int(source_id), {})) if aggregate_kind == "dict" else 1,
-                ))
+                # A field written from a constructor PARAMETER is the
+                # caller's own list (rule 8: one owner, the actual's
+                # storage).  Its descriptor is the formal's, born by the
+                # caller; initializing it here would reset the caller's
+                # length to zero (``Bag(a)`` read back an empty ``a``).
+                if (source_data.get("attributes") or {}).get(
+                    "binding_kind"
+                ) != "parameter":
+                    sequence_initializations.append((
+                        int(source_id),
+                        "unique" if aggregate_kind in {"set", "dict"} else "duplicates",
+                        int(constructor_mapping_contracts.get(int(source_id), {}).get("mapping_key_column_count", 1)) + _mapping_value_column_count(constructor_mapping_contracts.get(int(source_id), {})) if aggregate_kind == "dict" else 1,
+                    ))
                 storage_identity = f"{owner}.{canonical_field(str(attribute))}"
                 if storage_identity in retained_storage_identities:
                     retained_sequence_ids.add(int(source_id))
@@ -11792,9 +11806,14 @@ def _field_slot_ops(
                 # REAL(8) to the helper's INTEGER(8) formal.  Rule: the
                 # default keeps the authored literal's own type.
                 table_lookup_defaults[result_id] = literal
-            elif isinstance(literal, tuple) and not literal or isinstance(default_data.get("expr_obj"), ast.Tuple) and not default_data["expr_obj"].elts:
+            elif isinstance(literal, (tuple, list)) and not literal or isinstance(default_data.get("expr_obj"), (ast.Tuple, ast.List)) and not default_data["expr_obj"].elts:
                 # Keep the authored empty alternative. Integer handle zero
                 # is a valid child row, not the missing tuple.
+                # Program: ``for t in self.d.get(k, []): s += t`` over a
+                # dict-of-lists field.  Wrong record: only ``()`` was kept,
+                # so ``[]`` was dropped and a missing key read child row 0
+                # (silent 77 for 70).  Rule: an empty list is the same empty
+                # alternative.
                 table_lookup_defaults[result_id] = ()
     for node_id in sorted(graph_obj.nodes(), key=lambda value: int(value)):
         data = graph_obj.nodes[node_id]
@@ -16204,7 +16223,7 @@ def _install_lexical_sequence_queries(
         # born list of lists is a resident row sequence of its own, so its
         # length is the resident length query, as ``len(xs)`` is.
         list_row_query = (
-            expression.func.id in {"bool", "len"}
+            expression.func.id in {"bool", "len", "sum"}
             and len(arguments) == 1
             and int(sequence_data.get("value_id", sequence_id))
                 in set(map(int, list_row_reads(graph_obj)))
@@ -17783,6 +17802,16 @@ def _sequence_row_operations(
             else None
         )
 
+    # Program: ``xs[k] if k < 2 else 0`` specialized at ``k = 5`` (corpus
+    # c824).  Wrong record: the fold kept the dead arm's ``Indexed`` node, and
+    # its row load, now checked, raised IndexError for a read Python never
+    # makes.  Rule: a read nothing consumes and no return publishes is not a
+    # row load.
+    returned_ids = {
+        int(slot)
+        for slots in (graph_obj.graph.get("return_slot_values") or {}).values()
+        for slot in slots if slot is not None
+    }
     operations: list[tuple[Any, ...]] = []
     for node_id, data in sorted(graph_obj.nodes(data=True)):
         kind = str(data.get("op") or data.get("type") or "").casefold()
@@ -17791,6 +17820,12 @@ def _sequence_row_operations(
             outer_id = node_roles.get("base")
             column_node = node_roles.get("index")
             if outer_id is None or column_node is None:
+                continue
+            if (
+                not any(True for _ in graph_obj.successors(node_id))
+                and value_id(node_id) not in returned_ids
+                and int(node_id) not in returned_ids
+            ):
                 continue
             # Program: ``ys = xs[1:n]; sum(ys)`` (scratch c204).  Wrong
             # record: the slice was collected as a one-row load at index
@@ -17855,6 +17890,24 @@ def _sequence_row_operations(
                 sequence_id in positional_sequences
                 and widths[sequence_id] == 1
                 and value_id(base_node) in nested_row_reads
+            ):
+                operations.append((
+                    "store", value_id(node_id), int(sequence_id),
+                    value_id(row_index_node), integer_literal(row_index_node),
+                    (value_id(row_value_node),), value_id(base_node),
+                ))
+                continue
+            # Program: ``xs = [1, 2, 3]; xs[n] = 9`` with ``n`` out of range.
+            # Wrong record: the scalar store fell through to the region, a
+            # bare pointer write past the list (heap corruption).  Rule: a
+            # store into a one-column list is a row store, checked as a read
+            # is (``IndexError``, validation code 71).
+            if (
+                sequence_id in positional_sequences
+                and widths[sequence_id] == 1
+                and value_id(base_node) == sequence_id
+                and (graph_obj.nodes[row_value_node].get("attributes") or {})
+                .get("aggregate_kind") is None
             ):
                 operations.append((
                     "store", value_id(node_id), int(sequence_id),
@@ -20852,6 +20905,204 @@ def _drop_formals_and_call_operands(
                     _refresh_frame_aliased_result(instruction, function)
 
 
+def _select_handle_result(
+    caller: Any, callee: Any, native_call: Any, native_sequence: Any,
+    record: Any, selection: Any, data_placeholder: Any, *,
+    actual_by_formal: Mapping[int, Any],
+    all_sequence_tables: Mapping[str, Any],
+    callee_values: Mapping[int, Any],
+) -> None:
+    """Make the caller's list the arm the callee took, after the call.
+
+    Program: ``t = pick(a, n)`` where ``pick`` returns ``a`` when ``n > 2``
+    and a display of its own otherwise, then ``t.append(5)`` and
+    ``len(a)`` (c787).  Python's ``t`` IS ``a`` on one path, so the result
+    list is no storage this call was handed: its members (data arena,
+    length, capacity, owner, status) are the CALLER's own cells of the arm
+    taken.  The callee returns which arm that was (the conditional's
+    predicate, ``selection``'s tag); the caller joins its actual of each
+    arm's cell with one Phi per member, exactly as a list merged from
+    branches inside one function does (``_lower_sequence_handle_merge``):
+    a block split after the call, two empty arms, and the merge.  The arm
+    the callee built is the result lease the linker already minted for the
+    callee's own formals; the arm that is a parameter is the caller's actual.
+    """
+
+    from ..transmogrifier.ssa import BasicBlock, Instr, SSAValue
+
+    (
+        _predicate_id, tag_id, list_id, _true_id, _false_id, roles,
+    ) = selection
+    tag = native_call.res
+    if tag is None or int(tag.id) != int(tag_id):
+        raise FortranEmissionError(
+            "a call that returns which list arm it took has no tag result: "
+            f"callee={record.callee_symbol!r} callsite="
+            f"{int(record.callsite_id)}"
+        )
+    sequence = all_sequence_tables[str(record.caller)].by_id(int(list_id))
+    if sequence is None:
+        raise FortranEmissionError(
+            "a call result that is a handle onto a list has no caller "
+            f"descriptor: callee={record.callee_symbol!r} "
+            f"callsite={int(record.callsite_id)} result={int(list_id)}"
+        )
+    member_ids = {
+        ("column", position): int(value_id)
+        for position, value_id in enumerate(sequence.column_value_ids)
+    }
+    member_ids[("length",)] = int(sequence.length_address_id)
+    member_ids[("capacity",)] = int(sequence.capacity_value_id)
+    if sequence.status_address_id is not None:
+        member_ids[("status",)] = int(sequence.status_address_id)
+    if sequence.heap_owner_value_id is not None:
+        member_ids[("heap_owner",)] = int(sequence.heap_owner_value_id)
+    # The list's birth initialised its length to empty.  The call defines it
+    # now; that store would run over whichever arm was taken.
+    _strip_dead_cell_bookkeeping(caller, {int(sequence.length_address_id)})
+
+    def occurrence(value_id: int) -> Any:
+        if int(value_id) == int(data_placeholder.id):
+            return data_placeholder
+        for argument in caller.args:
+            if int(argument.id) == int(value_id):
+                return argument
+        for block in caller.blocks.values():
+            for instruction in block.instrs:
+                for argument in instruction.args:
+                    if int(argument.id) == int(value_id):
+                        return argument
+        return SSAValue(int(value_id))
+
+    block = next(
+        candidate for candidate in caller.blocks.values()
+        if any(item is native_sequence[-1] for item in candidate.instrs)
+    )
+    position = next(
+        index for index, item in enumerate(block.instrs)
+        if item is native_sequence[-1]
+    )
+    tail = block.instrs[position + 1:]
+    stem = f"sequence_handle_{int(record.callsite_id)}"
+    taken = BasicBlock(f"{stem}_true")
+    other = BasicBlock(f"{stem}_false")
+    merge = BasicBlock(f"{stem}_merge")
+    merged_members = []
+    for role, true_member, false_member, merged_member in roles:
+        role = tuple(role)
+        if role not in member_ids:
+            raise FortranEmissionError(
+                f"a handle result member has no caller cell: role={role!r} "
+                f"callee={record.callee_symbol!r}"
+            )
+        arms = []
+        for callee_formal in (true_member, false_member):
+            actual = actual_by_formal.get(int(callee_formal))
+            if actual is None:
+                raise FortranEmissionError(
+                    "a list arm returned by a call is not storage the "
+                    "caller passed: callee formal "
+                    f"{int(callee_formal)} of {record.callee_symbol!r} has "
+                    "no actual (an arm that lives in the callee's own frame "
+                    "dies at its return)"
+                )
+            arms.append(actual)
+        result = occurrence(member_ids[role])
+        source = callee_values[int(merged_member)]
+        result.dtype = source.dtype
+        result.shape = tuple(source.shape or ())
+        result.device = source.device
+        # The member names its sequence and position, as a formal member
+        # does (the merged member in the callee names the same position).
+        result.accounting = {
+            **dict(result.accounting or {}),
+            **{
+                key: value for key, value in dict(source.accounting or {}).items()
+                if key in {
+                    "heap_element_dtype", "sequence_row_shape",
+                    "compiler_frame_member",
+                }
+            },
+            "compiler_frame_storage": str(caller.name),
+            "compiler_frame_sequence_id": int(list_id),
+        }
+        merged_members.append(Instr(
+            "Phi", arms, result,
+            attributes={
+                "incoming_blocks": (taken.name, other.name),
+                "binding": "sequence_handle_member",
+                "sequence_value_id": int(list_id),
+            },
+        ))
+    placeholders = {int(instruction.res.id): instruction.res for instruction in merged_members}
+    caller.args = [
+        argument for argument in caller.args
+        if int(argument.id) not in placeholders
+    ]
+    # One member is one object: every reader holds the defining Phi's result,
+    # not a spelling of its id that carries no sequence/member identity.
+    for candidate_block in (*caller.blocks.values(), block, merge):
+        for instruction in candidate_block.instrs:
+            if instruction.op == "Phi" and instruction.res is not None and (
+                int(instruction.res.id) in placeholders
+            ):
+                continue
+            instruction.args = [
+                placeholders.get(int(argument.id), argument)
+                for argument in instruction.args
+            ]
+    block.instrs[position + 1:] = [Instr(
+        "CondBr", [tag], None,
+        attributes={
+            "true_target": taken.name, "false_target": other.name,
+        },
+    )]
+    for arm in (taken, other):
+        arm.instrs.append(Instr("Br", [], None, attributes={"target": merge.name}))
+        arm.successors.append(merge.name)
+    merge.instrs = [*merged_members, *tail]
+    merge.successors = list(block.successors)
+    block.successors = [taken.name, other.name]
+    # Successors that merge on this block's edge now merge on the join's.
+    for successor in merge.successors:
+        for instruction in caller.blocks[successor].instrs:
+            incoming = instruction.attributes.get("incoming_blocks")
+            if instruction.op == "Phi" and incoming:
+                instruction.attributes["incoming_blocks"] = tuple(
+                    merge.name if str(name) == block.name else name
+                    for name in incoming
+                )
+    # Each new block is a row of its own, derived from the block it was
+    # split from: the arms and the join of one ``if`` on the tag.
+    from .concordance_declarations import FRAME_LINK, SSA_BLOCK, SSABlockKind
+    from .identity_concordance import current_identity_book
+
+    split_cell = current_identity_book().latest_ref(
+        SSA_BLOCK, (
+            _frame_book_scope(caller), str(caller.name), str(block.name),
+        ),
+    )
+    for new_block, kind in (
+        (taken, SSABlockKind.IF_TRUE), (other, SSABlockKind.IF_FALSE),
+        (merge, SSABlockKind.IF_MERGE),
+    ):
+        _frame_post(
+            SSA_BLOCK, (
+                _frame_book_scope(caller), str(caller.name),
+                str(new_block.name),
+            ), kind, stage=FRAME_LINK, cells=(split_cell,),
+        )
+    rebuilt = {}
+    for name, candidate in caller.blocks.items():
+        rebuilt[name] = candidate
+        if candidate is block:
+            rebuilt[taken.name] = taken
+            rebuilt[other.name] = other
+            rebuilt[merge.name] = merge
+    caller.blocks.clear()
+    caller.blocks.update(rebuilt)
+
+
 def _strip_dead_cell_bookkeeping(function: Any, members: set[int]) -> set[int]:
     """Remove the bookkeeping of storage cells nothing reads anymore.
 
@@ -22170,6 +22421,17 @@ def _settle_linked_dynamic_sequences(
             # capacity (code 75).  Rule: a merged list is a local list
             # like a display; its leaf rows bound it when nothing grows it.
             if isinstance(data.get("expr_obj"), ast.List)
+            # A dict display with a runtime value.  An all-literal dict passed
+            # to a call binds as a static literal whose callee table differs
+            # from the caller's (``k in d`` answered False), so it keeps its
+            # refusal until that binding is one descriptor.
+            or (
+                isinstance(data.get("expr_obj"), ast.Dict)
+                and not all(
+                    isinstance(item, ast.Constant)
+                    for item in data["expr_obj"].values
+                )
+            )
             or (
                 (data.get("attributes") or {}).get("producer_kind")
                 == "aggregate_phi"
@@ -24040,6 +24302,30 @@ def _class_surface_ssa_program(
                 class_cell,
             )))
             contract = contracts.setdefault(value_id, {})
+            # Program: ``high, low = limb_step(high, low, byte)`` with an
+            # unannotated tuple-returning ``limb_step`` (corpus c791).  A
+            # declared ``-> tuple[int, int]`` states each member's physical
+            # carrier (``declared_tuple_surfaces``); without it the member's
+            # carrier is its class's: the reducer posted the callee's
+            # returned value's class on it (``call result member``), and a
+            # scalar primitive class owns its receipt's storage and dtype.
+            # The graph descriptor's scalar dtype is the domain default, not
+            # a record of the member.
+            if (
+                attributes.get("call_result_member_class_ref") is not None
+                and identity in {
+                    "builtins.int", "builtins.bool", "builtins.float",
+                }
+            ):
+                member_receipt = _authored_annotation_field_receipt(
+                    ast.Name(id=identity.rsplit(".", 1)[-1], ctx=ast.Load()),
+                )
+                if (
+                    member_receipt is not None
+                    and str(member_receipt["storage"]) == "scalar"
+                ):
+                    for key in ("storage", "dtype", "rank"):
+                        contract.setdefault(key, member_receipt[key])
             admitted = set(map(str, contract.get("python_types") or ()))
             if contract.get("python_type") is not None:
                 admitted.add(str(contract["python_type"]))
@@ -25854,8 +26140,97 @@ def _class_surface_ssa_program(
                     cells=(_node_cell,), mode=_ShapeMode.REVISE,
                 )
 
+    def _post_loop_update_minimum_trips(owner: Any) -> None:
+        """``loop_update_minimum_trips``: how often each carried update a
+        ``For`` computes in its body itself (not in a branch) runs before
+        the loop exits, when the loop's own record proves it runs at least
+        once (see the page)."""
+
+        from .concordance_declarations import (
+            LOOP_UPDATE_MINIMUM_TRIPS as _MINIMUM_TRIPS,
+        )
+        from .glsl_deployment_strategy import _mutated_sequence_node_ids
+
+        mutated = None
+        for node_id, data in owner.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            if data.get("type") != "For" or attributes.get("loop_break_sites"):
+                continue
+            roles: dict[str, list[int]] = {}
+            for parent in owner.predecessors(node_id):
+                roles.setdefault(
+                    str(owner.edges[parent, node_id].get("role")), [],
+                ).append(int(parent))
+
+            def literal(role: str, default: int) -> int | None:
+                parents = roles.get(role, [])
+                if not parents:
+                    return default
+                (parent,) = parents
+                node = owner.nodes[parent]
+                value = (node.get("attributes") or {}).get("value")
+                if node.get("type") != "Constant" or type(value) is not int:
+                    return None
+                return value
+
+            if roles.get("iterable"):
+                (iterable,) = roles["iterable"]
+                if mutated is None:
+                    mutated = _mutated_sequence_node_ids(owner)
+                members = [
+                    parent for parent in owner.predecessors(iterable)
+                    if owner.edges[parent, iterable].get("role") == "elts"
+                ]
+                if (
+                    owner.nodes[iterable].get("type") not in {"List", "Tuple"}
+                    or iterable in mutated
+                    # ``[*ys]`` has as many members as ``ys``.
+                    or any(
+                        owner.nodes[member].get("type") == "Starred"
+                        for member in members
+                    )
+                ):
+                    continue
+                trips = len(members)
+            else:
+                bounds = (
+                    literal("start", 0), literal("stop", 0),
+                    literal("step", 1),
+                )
+                if None in bounds or bounds[2] == 0:
+                    continue
+                trips = len(range(*bounds))
+            if trips < 1:
+                continue
+            loop_cell = _identity_cell(owner, int(node_id))
+            scope = _copy_scope(owner)[0]
+            statements = {
+                *roles.get("body", ()), *roles.get("carried_update", ()),
+            }
+            for update in map(int, attributes.get(
+                "loop_carried_updated_ids"
+            ) or ()):
+                # Only a statement of the body itself runs on every trip; a
+                # merge is the update's value on some paths only.
+                if update not in statements or owner.nodes[update].get(
+                    "type"
+                ) in {"Phi", "If"}:
+                    continue
+                update_cell = _identity_cell(owner, update)
+                if loop_cell is None or update_cell is None:
+                    continue
+                shape_identity_book.post(
+                    _MINIMUM_TRIPS,
+                    (scope, int(owner.nodes[update].get("value_id", update))),
+                    trips,
+                    stage=_LINKED_VALUE_ABI_SETTLEMENT,
+                    provenance=_ShapeDerived((loop_cell, update_cell)),
+                    mode=_ShapeMode.CONCORD,
+                )
+
     for planned_graph in planned_graphs_by_shell.values():
         contracts = linked_value_abi_by_graph.get(id(planned_graph), {})
+        _post_loop_update_minimum_trips(planned_graph)
         if contracts:
             from .concordance_declarations import (
                 SOURCE_VALUE_CLASS as _SOURCE_VALUE_CLASS,
@@ -27344,6 +27719,16 @@ def _class_surface_ssa_program(
                         int(entry.reference.address)
                     ] = candidates[0]
         callsite_shells = getattr(shell, "callsite_function_shells", {})
+        # The callee each call actually runs is its callsite's specialized
+        # copy; identity forwarding reads that copy, not the shared callee.
+        callsite_callee_graphs = {
+            int(callsite_id): child_graph
+            for callsite_id, child_shell in callsite_shells.items()
+            for child_graph in (getattr(
+                getattr(child_shell, "process_graph", None), "G", None,
+            ),)
+            if child_graph is not None
+        }
         transformed_call_source_ids: set[int] = set()
         transformed_parameters_by_reference: dict[int, set[int]] = {}
         for planned_call in local_plan_calls:
@@ -27485,6 +27870,7 @@ def _class_surface_ssa_program(
         returned_formal_sequence_aliases = _returned_formal_sequence_aliases(
             graph_obj, source_function_table,
             call_result_kinds=sequence_call_result_kinds,
+            callsite_graphs=callsite_callee_graphs,
         )
         (
             control,
@@ -27504,6 +27890,9 @@ def _class_surface_ssa_program(
             **returned_formal_sequence_aliases,
             **conditional_sequence_aliases,
         }
+        control = _retarget_forwarded_sequence_effects(
+            control, returned_formal_sequence_aliases,
+        )
         (
             sequence_concats,
             sequence_concat_aliases,
@@ -27646,6 +28035,20 @@ def _class_surface_ssa_program(
             )
             nested_sequence_ids = tuple(sorted({
                 *map(int, nested_sequence_ids), *local_list_rows,
+            }))
+        local_dict_rows = dict_row_displays(graph_obj)
+        if local_dict_rows:
+            # The rows of a mapping of lists are pool slices born at the dict
+            # display, with no arena of their own.
+            dict_row_ids = {
+                row for rows in local_dict_rows.values() for row, _node in rows
+            }
+            sequence_declarations = tuple(
+                declaration for declaration in sequence_declarations
+                if int(declaration[0]) not in dict_row_ids
+            )
+            nested_sequence_ids = tuple(sorted({
+                *map(int, nested_sequence_ids), *local_dict_rows,
             }))
         if conditional_sequence_destinations:
             sequence_declarations = tuple(
@@ -27921,7 +28324,13 @@ def _class_surface_ssa_program(
             graph_obj, joined_sequence_ids
         )
         literal_mutations = (*joined_literal_mutations, *_list_literal_mutations(
-            graph_obj, declared_sequence_ids - set(joined_sequence_ids) - native_handle_ids,
+            graph_obj,
+            declared_sequence_ids - set(joined_sequence_ids) - native_handle_ids
+            # A mapping of lists births its rows at the dict display.
+            - {
+                row for rows in dict_row_displays(graph_obj).values()
+                for row, _node in rows
+            },
         ))
         if glyph_sequence_mutations or token_glyph_mutations or literal_mutations:
             control, joined_literal_shortfalls = (
@@ -28495,7 +28904,7 @@ def _class_surface_ssa_program(
             graph_obj.graph.get("parameter_record_abi") or {}
         )
         descriptor_element_dtypes: dict[int, str] = {}
-        parameter_result_aliases = _identity_return_aliases(graph_obj, source_function_table)
+        parameter_result_aliases = _identity_return_aliases(graph_obj, source_function_table, callsite_callee_graphs)
         for record_parameter, record in declared_parameter_records.items():
             owner_ids = set(map(
                 int, identities.get(str(record_parameter), ())
@@ -28616,6 +29025,25 @@ def _class_surface_ssa_program(
 
         for outer_id in local_list_rows:
             nested_descriptor_sequence_dtypes[int(outer_id)] = ("int64",)
+        # A dict display of lists: key column(s), then the row-handle column.
+        for outer_id in local_dict_rows:
+            outer_data = next((
+                data for node, data in graph_obj.nodes(data=True)
+                if int(data.get("value_id", node)) == int(outer_id)
+            ), {})
+            key_values = [
+                graph_obj.nodes[parent].get("attributes") or {}
+                for parent, role in outer_data.get("parents") or ()
+                if str(role).startswith("keys") and parent in graph_obj
+            ]
+            if key_values and all(
+                isinstance(item.get("value"), int)
+                and not isinstance(item.get("value"), bool)
+                for item in key_values
+            ):
+                nested_descriptor_sequence_dtypes[int(outer_id)] = (
+                    "int64", "int64",
+                )
 
         self_record_fields = dict(
             (declared_parameter_records.get("self") or {}).get("fields") or {}
@@ -28679,7 +29107,7 @@ def _class_surface_ssa_program(
         scalar_writes = []
         scalar_write_sources = set()
         scalar_write_effect_ids = set()
-        returned_parameter_aliases = _identity_return_aliases(graph_obj, source_function_table)
+        returned_parameter_aliases = _identity_return_aliases(graph_obj, source_function_table, callsite_callee_graphs)
         for parameter, record in declared_parameter_records.items():
             receivers = set(map(int, identities.get(str(parameter), ())))
             receivers.update(alias for alias, original in returned_parameter_aliases.items()
@@ -29201,6 +29629,7 @@ def _class_surface_ssa_program(
             (_loop_carried_storage_aliases(graph_obj), None),
             (_identity_return_aliases(
                 graph_obj, getattr(graph, "function_table", None),
+                callsite_callee_graphs,
             ), None),
             # Enum.value changes semantic class to the declaration's value
             # type while retaining the Enum receiver's fixed-width resident
@@ -29752,6 +30181,10 @@ def _class_surface_ssa_program(
             _GraphView(G=graph_obj)
         )
 
+        from ..common.tensors.topological_reducer import (
+            _source_numeric_scope as _int_range_scope,
+        )
+
         module_ir, shortfalls, shell_section_outputs = (
             lower_control_sections_to_ssa(
                 control,
@@ -29765,6 +30198,7 @@ def _class_surface_ssa_program(
                 native_object_type_tests=native_type_tests,
                 native_value_type_abi=native_value_type_abi,
                 native_value_type_tests=native_value_type_tests,
+                int_range_scope=_int_range_scope(graph_obj),
                 callsite_stored_argument_ids=callsite_stored_argument_ids,
                 identity_table=dict(graph_obj.graph.get("identity_table") or {}),
                 function_outputs=tuple(
@@ -29986,6 +30420,20 @@ def _class_surface_ssa_program(
                             (), True,
                         )
                         for outer_id, rows in local_list_rows.items()
+                    },
+                    # A dict display of lists: the handle follows the key
+                    # column; a row holds the class its lists share.
+                    **{
+                        int(outer_id): (
+                            1,
+                            (str(next((
+                                planned_sequence_elements[int(row)]
+                                for row, _node in rows
+                                if planned_sequence_elements.get(int(row))
+                            ), "int64")),),
+                            (), True,
+                        )
+                        for outer_id, rows in local_dict_rows.items()
                     },
                 },
                 sequence_row_record_slots=_sequence_row_record_slots(
@@ -30696,7 +31144,7 @@ def _class_surface_ssa_program(
             module_ir.functions[symbol].metadata["static_mapping_capacity_bounds"] = (
                 dict(sequence_capacity_bounds)
             )
-            if local_list_rows:
+            if local_list_rows or local_dict_rows:
                 module_ir.functions[symbol].metadata[
                     "child_pool_static_extents"
                 ] = tuple(
@@ -43461,6 +43909,10 @@ def _class_surface_ssa_program(
             for instruction in block.instrs:
                 if instruction.op not in {"Ret", "ret", "Return", "return"}:
                     continue
+                if instruction.attributes.get("fault_exit"):
+                    # The zero outputs of a checked index's fault exit are
+                    # not the source outputs; there is nothing to settle.
+                    continue
                 by_id = {
                     int(argument.id): argument
                     for argument in instruction.args
@@ -44145,6 +44597,22 @@ def _class_surface_ssa_program(
                     caller_aliases = _concordant_function_aliases(caller)
                     for parameter_id in constructor_parameter_ids:
                         actual_id = int(remap[parameter_id])
+                        # Rule 8: an actual that is a forwarded call result
+                        # (``Bag(same(a))``) is the argument's own list.  The
+                        # constructor's list field is that ONE sequence, so
+                        # the formal binds the resident root's descriptor, not
+                        # a second sequence naming the same members.
+                        resident_actual = int(caller_aliases.get(actual_id, actual_id))
+                        if (
+                            resident_actual != actual_id
+                            and caller_sequences.by_id(actual_id) is None
+                            and caller_sequences.by_id(resident_actual) is not None
+                            and constructor_sequences.by_id(int(constructor_aliases.get(
+                                parameter_id, parameter_id,
+                            ))) is not None
+                        ):
+                            actual_id = resident_actual
+                            remap[parameter_id] = actual_id
                         _bind_sequence_storage_members(
                             remap,
                             constructor_sequences.by_id(int(constructor_aliases.get(
@@ -46187,6 +46655,9 @@ def _class_surface_ssa_program(
                     (int(value_id), caller_storage)
                     for value_id in field.value_ids
                 )
+        # Read by the callsite marker's result retention for any call, not
+        # only a method call that binds a receiver record.
+        caller_sequence_table = all_sequence_tables.get(caller_symbol)
         if receiver_record is not None and callee_record is not None:
             caller_fields = {
                 field.storage_identity: field
@@ -49111,6 +49582,49 @@ def _class_surface_ssa_program(
                     () if callee is None
                     else emit_outputs(record.callee_symbol, callee)
                 )
+                # Program: ``pick(a, n)`` returning ``a`` on one path and a
+                # local display on the other (c787).  The callee returns the
+                # conditional's predicate (which arm it took); the caller's
+                # result list is not this call's output but a selection
+                # between its own actuals of the two arms, made after the
+                # call (``handle_selections`` below).  The call's one output
+                # is that predicate, bound to a caller value of its own.
+                handle_returns = (
+                    () if callee is None else tuple(
+                        callee.metadata.get("sequence_handle_returns") or ()
+                    )
+                )
+                handle_selection = None
+                if handle_returns:
+                    for (
+                        predicate_id, merged_id, true_id, false_id, roles,
+                    ) in handle_returns:
+                        pair = next((
+                            (callee_id, caller_id)
+                            for callee_id, caller_id in record.result_bindings
+                            if int(callee_id) in {
+                                int(predicate_id), int(merged_id),
+                            }
+                        ), None)
+                        if pair is None:
+                            continue
+                        tag_id = mint_compiler_value_id(
+                            caller, FRAME_SCAFFOLD,
+                            (_frame_value_cell(callee, int(predicate_id)),),
+                            dtype="bool",
+                        )
+                        handle_selection = (
+                            int(predicate_id), int(tag_id), int(pair[1]),
+                            int(true_id), int(false_id), tuple(roles),
+                        )
+                        record = replace(record, result_bindings=tuple(
+                            (int(predicate_id), int(tag_id))
+                            if int(callee_id) == int(pair[0])
+                            and int(caller_id) == int(pair[1])
+                            else (int(callee_id), int(caller_id))
+                            for callee_id, caller_id in record.result_bindings
+                        ))
+                        break
                 callee_aggregate_outputs = (
                     tuple((callee_outputs[0].accounting or {}).get(
                         "ssa_aggregate_outputs", ()
@@ -52283,6 +52797,33 @@ def _class_surface_ssa_program(
                             output_physical = _frame_physical_fields(
                                 callee, int(callee_output.id),
                             )
+                            # Program: ``e, statuses, tokens = intern(...)`` then
+                            # ``tokens[0]`` / appends in the caller (string-core
+                            # ``repeated_manager`` value 148).  Wrong record: the
+                            # callee return's ``span`` was posted over a caller
+                            # value whose SEQUENCE_CONTRACT (and so its settled
+                            # ABI arm) says ``sequence``; the physical view then
+                            # refused the two.  Rule: a caller value with a
+                            # sequence contract is a resident sequence; the
+                            # callee's span is the view it was returned through.
+                            if (
+                                isinstance(output_physical, dict)
+                                and output_physical.get("storage") == "span"
+                            ):
+                                from .concordance_declarations import (
+                                    SEQUENCE_CONTRACT_CONCORDANCE as _FRAME_SEQUENCE_CONTRACT,
+                                )
+                                from .identity_concordance import (
+                                    current_identity_book as _frame_contract_book,
+                                )
+
+                                if _frame_contract_book().latest_ref(
+                                    _FRAME_SEQUENCE_CONTRACT,
+                                    (str(caller_symbol), caller_id),
+                                ) is not None:
+                                    output_physical = {
+                                        **output_physical, "storage": "sequence",
+                                    }
                             publish_ssa_value_type(
                                 caller, output, dtype=structure.dtype, shape=structure.shape,
                                 sources=_frame_cells(
@@ -52402,6 +52943,27 @@ def _class_surface_ssa_program(
                             "plan_callsite_id", -1
                         )) == int(record.callsite_id)
                     )
+                    handle_result_placeholder = None
+                    if handle_selection is not None:
+                        # The marker's result is the caller's list (its data
+                        # arena placeholder), which the selection below
+                        # defines; the call itself yields only the tag.
+                        for marker_block in caller.blocks.values():
+                            for marker_instruction in marker_block.instrs:
+                                marker_attributes = (
+                                    marker_instruction.attributes or {}
+                                )
+                                if (
+                                    marker_attributes.get("plan_callsite_marker")
+                                    and int(marker_attributes.get(
+                                        "plan_callsite_id", -1
+                                    )) == int(record.callsite_id)
+                                    and marker_instruction.res is not None
+                                ):
+                                    handle_result_placeholder = (
+                                        marker_instruction.res
+                                    )
+                                    marker_instruction.res = None
                     inserted = False
                     if instance_pool is not None and not returns_physical_result:
                         # The exact source edge is constructor-result ->
@@ -52472,6 +53034,15 @@ def _class_surface_ssa_program(
                     inserted = inserted or insert_at_loop_anchor(
                         record, native_sequence
                     )
+                    if handle_selection is not None and inserted:
+                        _select_handle_result(
+                            caller, callee, native_call, native_sequence,
+                            record, handle_selection,
+                            handle_result_placeholder,
+                            actual_by_formal=actual_by_formal,
+                            all_sequence_tables=all_sequence_tables,
+                            callee_values=function_values(callee),
+                        )
                     if (
                         returns_aggregate
                         and result is not None
@@ -60088,9 +60659,16 @@ def _class_surface_ssa_program(
 
     # The last writer of physical scalar dtypes has run: a carried Phi of a
     # narrower class than its update is a trip-count-dependent result class.
-    from .ssa_self_check import check_loop_carried_class_widening
+    # Any other scalar Phi narrower than an arm is the same wrong record.
+    from .ssa_self_check import (
+        check_loop_carried_class_widening,
+        check_phi_narrower_than_arm,
+    )
 
-    carried_widening = check_loop_carried_class_widening(lowered_module)
+    carried_widening = [
+        *check_loop_carried_class_widening(lowered_module),
+        *check_phi_narrower_than_arm(lowered_module),
+    ]
     if carried_widening:
         raise ValueError(
             "; ".join(

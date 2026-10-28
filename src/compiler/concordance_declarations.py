@@ -2915,6 +2915,8 @@ class SSABlockKind(Enum):
     SEQUENCE_QUERY_MERGE = "sequence_query_merge"
     SEQUENCE_POP_SELECTED = "sequence_pop_selected"
     SEQUENCE_POP_EMPTY = "sequence_pop_empty"
+    SEQUENCE_INDEX_IN_RANGE = "sequence_index_in_range"
+    SEQUENCE_INDEX_OUT_OF_RANGE = "sequence_index_out_of_range"
     SEQUENCE_REMOVE_SCAN = "sequence_remove_scan"
     SEQUENCE_REMOVE_COMPARE = "sequence_remove_compare"
     SEQUENCE_REMOVE_NEXT = "sequence_remove_next"
@@ -3528,6 +3530,20 @@ class ValueTypeABIFact:
 VALUE_TYPE_ABI = declare_page("value_type_abi", (
     RowField("copy_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), ValueTypeABIFact)                   # DERIVED(the value identity / incoming value_type_abi); REVISE
+
+#: How many times a ``For`` loop's carried update, computed in the body
+#: itself (not in a branch), runs before the loop exits, proven from the
+#: loop's own record: ``(copy scope, update value id)`` -> int >= 1.  Program: ``xs = [2.5,
+#: t * 1.5]; s = 0; for v in xs: s += v``.  The carried ``s`` is the seed's
+#: class (int) only when the loop runs zero times; a display of two members
+#: never mutated runs twice, so after the loop ``s`` is exactly the update's
+#: class (float).  Posted only for a loop with no break or continue site
+#: whose iterable is a non-empty, unmutated list/tuple display or a range of
+#: literal ints; an update with no proof has no row.  DERIVED from the
+#: loop's and the update's value identities; CONCORD.
+LOOP_UPDATE_MINIMUM_TRIPS = declare_page("loop_update_minimum_trips", (
+    RowField("copy_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), int)
 
 
 SEQUENCE_COLUMN_TYPE_ABI = declare_page("sequence_column_type_abi", (

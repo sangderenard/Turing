@@ -1061,6 +1061,8 @@ def _callsite_argument_is_initializer(
     argument_id = int(argument_id)
     if loop_carried_initial_at_call(caller.G, call_id, argument_id):
         return False
+    if _call_returns_argument(caller, call_id, argument_id):
+        return False
     if argument_id not in _mutated_sequence_node_ids(caller.G):
         return True
     from .resident_sequence_materialization import _call_escaped_argument_edges
@@ -1171,6 +1173,16 @@ def _aggregate_binds_by_member(
         _call_escaped_argument_edges,
     )
 
+    # Program: ``def at(d): return d[2]`` called as ``at({1: n, 2: 5, 3: 7})``.
+    # Wrong record: the dict's leaf ledger (keys then values) was bound as
+    # positional members, so the callee's subscript read the third leaf, a
+    # key (3 for 5; silent).  Rule: a mapping or set is a keyed table, not a
+    # positional aggregate; it is bound whole, as its storage.
+    if (
+        (caller_graph.nodes.get(int(actual_id), {}).get("attributes") or {})
+        .get("aggregate_kind") in {"dict", "set", "frozenset"}
+    ):
+        return False
     escapes_elsewhere = any(
         int(argument) == int(actual_id)
         and (call_id is None or int(call) != int(call_id))
@@ -1182,6 +1194,82 @@ def _aggregate_binds_by_member(
             caller_graph, include_call_escapes=False,
         )
         or _formal_storage_is_mutated(callee_graph, parameter)
+        or _formal_is_returned(callee_graph, parameter)
+    )
+
+
+def _returned_parameter_names(callee_graph: Any) -> frozenset[str]:
+    """Names of the formals a callee's return slots can hand back as ITSELF.
+
+    A return slot is a formal directly (``return a``) or a branch merge one
+    of whose arms is (``return a if k else [9]``): rule 8 identity
+    forwarding, read from the callee's own graph.
+    """
+
+    names: set[str] = set()
+    seen: set[int] = set()
+    pending = [
+        int(slot)
+        for site in (callee_graph.graph.get("return_slot_values") or {}).values()
+        for slot in site if slot is not None
+    ]
+    while pending:
+        node_id = pending.pop()
+        if node_id in seen or node_id not in callee_graph:
+            continue
+        seen.add(node_id)
+        data = callee_graph.nodes[node_id]
+        attributes = data.get("attributes") or {}
+        if attributes.get("binding_kind") == "parameter":
+            names.add(str(attributes.get("binding_name")))
+        if attributes.get("producer_kind") in {"aggregate_phi", "aggregate_merge"}:
+            pending.extend(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) in {"body", "orelse"}
+            )
+    return frozenset(names)
+
+
+def _formal_is_returned(callee_graph: Any, parameter: str) -> bool:
+    """Whether the callee's return slots hand back ``parameter`` itself.
+
+    Program: ``def same(a): return a; t = same(xs); t.append(5)``.  Wrong
+    record: ``xs`` was split into display members for the callee, so the
+    returned formal named an aggregate rebuilt from leaves and the caller's
+    result had no storage behind it.  Rule 8: a returned formal is the
+    caller's own storage (identity forwarding), so the argument is bound
+    whole -- one owner, the actual's arena -- never by member.
+    """
+
+    return str(parameter) in _returned_parameter_names(callee_graph)
+
+
+def _call_returns_argument(caller: Any, call_id: int, argument_id: int) -> bool:
+    """Whether the call's callee can return the storage ``argument_id`` names.
+
+    Program: ``a = [1, 2, 3]; t = pick(a, k); t.append(5)`` with ``pick``
+    returning ``a`` on one branch.  Wrong record: ``a`` was only the
+    caller's initializer here (nothing in the caller mutated it), so the
+    callee was specialized on its literal rows while its result was ``a``'s
+    own list, grown through ``t``.  Rule 8: the result IS the argument's
+    storage, so the initializer is not its contents after the call.
+    """
+
+    function_table = getattr(caller, "function_table", None)
+    data = caller.G.nodes.get(int(call_id), {})
+    attributes = data.get("attributes") or {}
+    reference = attributes.get("callee_ref", attributes.get("method_ref"))
+    if function_table is None or reference is None:
+        return False
+    callee = getattr(function_table.entry(int(reference)).graph, "G", None)
+    if callee is None:
+        return False
+    receiver, positional, _all = _method_parameter_layout(callee)
+    returned = _returned_parameter_names(callee)
+    return any(
+        int(parent) == int(argument_id)
+        and _callsite_parameter_name(str(role), receiver, positional) in returned
+        for parent, role in data.get("parents") or ()
     )
 
 
@@ -2230,7 +2318,9 @@ def _callee_return_scalar_dtype(
         aggregate = isinstance(returned, ast.Tuple) or (
             (node.get("attributes") or {}).get("aggregate_kind") is not None
         )
-        if aggregate and not isinstance(returned, ast.Tuple):
+        if aggregate and not isinstance(returned, ast.Tuple) and (
+            (node.get("attributes") or {}).get("aggregate_kind") != "list"
+        ):
             return None
         kinds.add("element" if aggregate else "scalar")
         found.append(dtypes.get(int(values[0])))
@@ -2576,11 +2666,25 @@ def _planned_scalar_dtypes_from(
             # class (corpus c27).  List and set comprehensions are not typed
             # here: they can be mutated after their birth, and their element
             # join belongs to the collection rule with its writers.
-            if op == "generatorexp":
+            # An INLINE list/set comprehension (``for y in [x * n for x in
+            # xs]``, corpus c265) is no different: bound to no name, its only
+            # readers are the loops that iterate it, so nothing can mutate it
+            # and its element type is the ``elt``'s class.
+            if op == "generatorexp" or (
+                op in {"listcomp", "setcomp"}
+                and isinstance(expression, (ast.ListComp, ast.SetComp))
+                and G.out_degree(node_id) > 0
+                and all(
+                    operation(G.nodes[reader]) == "for"
+                    and node_id in parents(G.nodes[reader], "iterable")
+                    for reader in G.successors(node_id)
+                )
+            ):
                 elts = parents(data, "elt")
                 if len(elts) == 1:
                     settle(element, node_id, scalar.get(elts[0]))
-                continue
+                if op == "generatorexp":
+                    continue
             if op == "input":
                 kind = attributes.get("binding_kind")
                 if kind == "parameter":
@@ -2652,6 +2756,18 @@ def _planned_scalar_dtypes_from(
                         pass
                     else:
                         continue
+                elif kind == "loop":
+                    # Program: ``for a, b in ps`` over ``ps:
+                    # list[tuple[int, int]]``, ``for k, v in d.items()``.
+                    # A destructured target has no single element class to
+                    # read off its iterable; the reducer concorded each
+                    # name's class from the annotation's position and
+                    # stamped it as ``result_class_ref``.  That declared
+                    # class is the target's dtype.
+                    settle(scalar, node_id, classes.get(str(
+                        attributes.get("result_class_ref") or ""
+                    ).removeprefix("builtins.")))
+                    continue
                 else:
                     continue
             if op == "for":
@@ -2690,6 +2806,18 @@ def _planned_scalar_dtypes_from(
                                 settle(scalar, int(target_id), "int64")
                 elif iterable and target_names:
                     held = element.get(iterable[0])
+                    if (
+                        (G.nodes[iterable[0]].get("attributes") or {}).get(
+                            "aggregate_kind"
+                        ) == "dict"
+                        and (G.nodes[iterable[0]].get("attributes") or {}).get(
+                            "mapping_key_class_ref"
+                        )
+                    ):
+                        # Iterating a mapping yields its keys: the
+                        # annotation's key class, concorded on the target,
+                        # is the dtype, not the value rows' class.
+                        held = None
                     for name in target_names:
                         for target_id, target in G.nodes(data=True):
                             if (
@@ -2744,6 +2872,55 @@ def _planned_scalar_dtypes_from(
                                 ):
                                     settle(scalar, int(target_id),
                                            element.get(argument))
+                # Program: ``ps = [(n, 2), (3, 4)]`` then ``for a, b in ps``.
+                # Wrong record: the tuple target's names had no rule over a
+                # list of tuple displays, so ``a * b`` had no dtype.  Rule:
+                # the i-th name is the join of the i-th member of every
+                # tuple the list displays (a member whose class is unknown
+                # leaves the name unknown, as any join does).
+                if (
+                    isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and iterable
+                    and isinstance(
+                        G.nodes[iterable[0]].get("expr_obj"),
+                        (ast.List, ast.Tuple),
+                    )
+                ):
+                    rows = parents(G.nodes[iterable[0]], "elts")
+                    width = len(loop_expression.target.elts)
+                    row_leaves = [
+                        tuple(int(leaf) for leaf in (
+                            G.nodes[row].get("attributes") or {}
+                        ).get("aggregate_leaf_value_ids") or ())
+                        for row in rows
+                    ]
+                    if rows and all(
+                        len(leaves) == width and all(
+                            leaf in G for leaf in leaves
+                        )
+                        for leaves in row_leaves
+                    ):
+                        for position, item in enumerate(
+                            loop_expression.target.elts
+                        ):
+                            held = join([
+                                scalar.get(leaves[position])
+                                for leaves in row_leaves
+                            ])
+                            for target_id, target in G.nodes(data=True):
+                                if (
+                                    operation(target) == "input"
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_name"
+                                    ) == item.id
+                                    and (target.get("attributes") or {}).get(
+                                        "binding_kind"
+                                    ) == "loop"
+                                ):
+                                    settle(scalar, int(target_id), held)
                 # Program: ``for k, x in enumerate(xs): t += k * x`` (c351).
                 # Wrong record: as with ``zip``, the tuple target's names were
                 # never typed, so ``x`` fell to the float64 default; C
@@ -3160,6 +3337,78 @@ def _planned_scalar_dtypes_from(
                             scalar.get(value)
                             for value in parents(child_data, "value")
                         )
+                    # A retained ``xs.append(v)`` / ``s.add(v)`` /
+                    # ``xs.insert(i, v)`` call on this collection: its value
+                    # argument is a writer.  Read from the call's own record
+                    # when the graph carries no mutation-record table (a
+                    # callee planned from its caller).
+                    elif (
+                        not records
+                        and str((child_data.get("attributes") or {}).get(
+                            "extraction_identity"
+                        )) in {
+                            "builtins.list.append", "builtins.set.add",
+                            "builtins.list.insert",
+                        }
+                        and node_id in parents(child_data, "operand")
+                    ):
+                        call_arguments = sorted(
+                            (int(str(role).split(":", 1)[1]), int(parent))
+                            for parent, role in child_data.get("parents") or ()
+                            if str(role).startswith("arg:")
+                            and int(parent) in G
+                        )
+                        if call_arguments:
+                            writers.append(scalar.get(call_arguments[-1][1]))
+                    # Program: ``fill(xs, n)`` with ``def fill(dst:
+                    # list[int], ...)`` (corpus c55).  Wrong record: the
+                    # list passed to an annotated collection formal had no
+                    # element writer, so ``for x in xs`` had no class.  Rule:
+                    # the callee formal's declared element class
+                    # (``sequence_element_class_ref``) is what the callee
+                    # accepts, so it is a writer of the actual.
+                    callee_reference = (child_data.get("attributes") or {}).get(
+                        "callee_ref"
+                    )
+                    if callee_reference is not None and operation(
+                        child_data
+                    ) == "call":
+                        for parent, role in child_data.get("parents") or ():
+                            if int(parent) != int(node_id) or not str(
+                                role
+                            ).startswith("arg:"):
+                                continue
+                            try:
+                                callee_graph = graph.function_table.entry(
+                                    int(callee_reference)
+                                ).graph.G
+                                formal_name = tuple(
+                                    callee_graph.graph.get(
+                                        "function_parameters"
+                                    ) or ()
+                                )[int(str(role).split(":", 1)[1])]
+                            except (
+                                AttributeError, KeyError, ValueError,
+                                TypeError, IndexError,
+                            ):
+                                continue
+                            for formal in callee_graph.nodes.values():
+                                formal_attributes = formal.get("attributes") or {}
+                                if (
+                                    operation(formal) == "input"
+                                    and formal_attributes.get("binding_kind")
+                                    == "parameter"
+                                    and formal_attributes.get("binding_name")
+                                    == str(formal_name)
+                                    and formal_attributes.get(
+                                        "sequence_element_class_ref"
+                                    )
+                                ):
+                                    writers.append(classes.get(str(
+                                        formal_attributes[
+                                            "sequence_element_class_ref"
+                                        ]
+                                    ).removeprefix("builtins.")))
                 if node_id in (assumed_elements or {}):
                     if observed_writers is not None:
                         observed_writers[node_id] = (
@@ -3519,6 +3768,83 @@ def _post_region_value_obligation(graph: Any, value_id: int) -> None:
         provenance=Derived(tuple(cell for cell in cells if cell is not None)),
         mode=Mode.REVISE,
     )
+
+
+def _owe_host_scalar_class(graph: Any, value_id: int) -> bool:
+    """Record that a host-scalar operand has no settled class yet.
+
+    The descriptor query found neither a ``source_value_class`` cell nor a
+    planned scalar dtype for ``value_id``: it posts the same open obligation
+    a non-terminal freeze posts for a region value (``region_value_dtype``,
+    ``Unresolved``), to be settled when the class arrives or refused by name
+    by the terminal freeze.  A graph that has not been canonically relabelled
+    is the pre-lowering root graph: its value ids are object addresses
+    (``id()``), reduction-local and unique only within that reduction, and a
+    lowering pass has not run on it, so it has no class to owe and posts
+    nothing.  Returns whether an obligation was posted.
+    """
+
+    if not graph.G.graph.get("canonical_value_ids"):
+        return False
+    if int(value_id) not in graph.G:
+        return False
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    try:
+        node_identity_cell(graph, int(value_id))
+    except ValueError:
+        # An obligation is DERIVED from the value's identity cell; a node
+        # that never entered the book has nothing to be owed against.
+        return False
+    _post_region_value_obligation(graph, int(value_id))
+    return True
+
+
+def _refuse_unsettled_host_scalars(graph: Any, planned_dtypes: Any) -> None:
+    """The terminal freeze: settle each owed host-scalar class or refuse it.
+
+    Reads, in order, the value's ``source_value_class`` cell and the planner's
+    settled scalar dtype; a value with neither is refused naming its
+    function, op and binding.
+    """
+
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from .concordance_declarations import SOURCE_VALUE_CLASS
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    scope = _source_numeric_scope(graph.G)
+    for value_id in outstanding_region_value_obligations(graph):
+        if int(value_id) not in graph.G:
+            continue
+        class_fact = book.page(SOURCE_VALUE_CLASS).latest((scope, int(value_id)))
+        class_cell = book.latest_ref(SOURCE_VALUE_CLASS, (scope, int(value_id)))
+        dtype = {
+            "builtins.int": "int64", "builtins.bool": "bool",
+            "builtins.float": "float64",
+        }.get(
+            str(class_fact[0])
+            if isinstance(class_fact, tuple) and class_fact else ""
+        ) or planned_dtypes.get(int(value_id))
+        if dtype is None and isinstance(class_fact, tuple) and class_fact:
+            # A recorded class with no element dtype (``None``, a record,
+            # a string) is a settled non-scalar: the obligation closes on it.
+            dtype = str(class_fact[0])
+        if dtype is not None:
+            _settle_region_value_obligation(
+                graph, int(value_id), dtype,
+                () if class_cell is None else (class_cell,),
+            )
+            continue
+        node = graph.G.nodes[int(value_id)]
+        binding = (node.get("attributes") or {}).get("binding_name")
+        raise ValueError(
+            f"value {int(value_id)} ({node.get('op') or node.get('type')}"
+            + (f" {binding!r}" if binding is not None else "")
+            + f" in function {graph.G.graph.get('function_name')!r}) was "
+            "consumed as a host scalar but has no source_value_class cell "
+            "and no planned scalar dtype"
+        )
 
 
 def _dtype_producer_cells(graph: Any, value_id: int, *extra: Any) -> tuple:
@@ -5351,11 +5677,6 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
-                        # A proven interval wider than int64 is the source's
-                        # width; the parents' int64 does not narrow it.
-                        proven = planned_scalar_dtypes().get(int(current))
-                        if proven in {"uint64", "int128"}:
-                            dtype = str(proven)
                 if operation in {"floor", "ceil", "trunc", "round"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so
@@ -5419,6 +5740,22 @@ def _build_shell_hierarchy_plan(
                             logical = (
                                 *batch_shape, left_shape[-2], right_shape[-1]
                             )
+                # A proven interval wider than int64 is the source's width;
+                # neither the parents' int64 nor a descriptor's class-only
+                # int64 narrows it, whatever the operation.  Program: corpus
+                # c790, ``high * (1 << 32) + low``: once ``shl`` had an
+                # elementwise descriptor its int64 reached the product and
+                # sum as ``tensor["dtype"]``, and a rule kept inside the
+                # no-descriptor branch never ran.  Corpus c793: a member of
+                # a call's returned tuple (``first, second = f(...)``) is no
+                # arithmetic operation at all, and kept int64.
+                proven = planned_scalar_dtypes().get(int(current))
+                if (
+                    proven in {"uint64", "int128"}
+                    and not tuple(logical or ())
+                    and dtype in {None, "int", "int64", "uint64", "int128"}
+                ):
+                    dtype = str(proven)
                 _shape_dtype_cache[current] = (logical, dtype)
                 states[current] = 2
             logical, dtype = _shape_dtype_cache.get(
@@ -5773,6 +6110,9 @@ def _build_shell_hierarchy_plan(
         )
         if int(value_id) in graph.G
     }
+
+    if terminal:
+        _refuse_unsettled_host_scalars(graph, planned_scalar_dtypes())
 
     planned = PlanClosure(
         name=str(
@@ -10134,6 +10474,7 @@ def _retain_source_sequence_mutation_records(
         _RECEIVER_READING_METHODS,
         _receiver_collection_kind,
         _returned_formal_sequence_aliases,
+        _returned_tuple_member_kinds,
     )
 
     records = dict(
@@ -10144,6 +10485,7 @@ def _retain_source_sequence_mutation_records(
     forwarded_sequences = _returned_formal_sequence_aliases(
         graph_obj, function_table,
     )
+    tuple_member_kinds = _returned_tuple_member_kinds(graph_obj, function_table)
     for node_id, data in graph_obj.nodes(data=True):
         expression = data.get("expr_obj")
         # Program: ``xs = [5, n, 9, 8]; del xs[1]`` (fuzzer p3_13).  Wrong
@@ -10201,7 +10543,8 @@ def _retain_source_sequence_mutation_records(
         ):
             continue
         destination_data = graph_obj.nodes[destination]
-        destination_kind = _receiver_collection_kind(destination_data)
+        destination_kind = _receiver_collection_kind(destination_data) or tuple_member_kinds.get(
+            int(destination_data.get("value_id", destination)))
         mapping_default = destination_kind == "dict" and expression.func.attr == "setdefault"
         if destination_kind not in {"list", "set", "bytes", "bytearray", "array"} and not mapping_default:
             continue
@@ -23081,6 +23424,12 @@ _ELEMENTWISE_BINARY_OPERATIONS = frozenset({
     "maximum", "minimum", "emax", "emin", "clamp_min", "clamp_max",
     "logical_and", "logical_or", "logical_xor",
     "bitwise_and", "bitwise_or", "bitwise_xor",
+    # The process graph spells Python's bit operators ``bitand``/``bitor``/
+    # ``bitxor``/``shl``/``shr`` (ast_process_graph).  Only the catalogue
+    # spellings above were listed, so ``low ^ byte`` of two integers had no
+    # descriptor, and the consumer that finds a descriptor-less scalar operand
+    # (``(low ^ byte) % m``) typed that operand float64.
+    "bitand", "bitor", "bitxor", "shl", "shr",
 })
 
 #: The elementwise binary operations whose result is a truth value.
@@ -23551,13 +23900,13 @@ def _tensor_descriptor(
             and not polymorphic_specialization
             and not collection_result
         ):
-            return {
-                "shape": settled,
-                "dtype": str(
-                    (_deepest_fact(page, row) or ("", (), "float64"))[2]
-                ),
-                "rank": len(settled),
-            }
+            deepest = _deepest_fact(page, row)
+            if deepest is not None:
+                return {
+                    "shape": settled,
+                    "dtype": str(deepest[2]),
+                    "rank": len(settled),
+                }
     except Exception as error:
         if os.environ.get("TURING_DEBUG_SEQUENCE_ROW_LAYOUT"):
             print(
@@ -24193,7 +24542,16 @@ def _tensor_descriptor_rule(
                 tensor = dict(inherited)
                 # Both projections expose real-valued elements while
                 # preserving the source tensor's storage/rank contract.
-                tensor["dtype"] = "float64"
+                # The projection's element is the complex width's real
+                # half; a source that is not complex keeps its own dtype.
+                tensor["dtype"] = {
+                    "complex64": "float32", "complex128": "float64",
+                }.get(str(inherited.get("dtype")), inherited.get("dtype"))
+                if tensor["dtype"] is None:
+                    raise ValueError(
+                        f"{field_name!r} of value {receiver}: the receiver "
+                        "descriptor records no dtype"
+                    )
     if (
         "shape" not in tensor
         and data.get("type") == "Input"
@@ -24899,7 +25257,69 @@ def _tensor_descriptor_rule(
                         _ELEMENTWISE_BINARY_OPERATIONS
                     ):
                         continue
-                    sides[index] = {"shape": (), "dtype": "float64"}
+                    # The host scalar's dtype is its recorded class (the
+                    # concordance's source-value-class cell, posted by the
+                    # pass that made the value).  With no class cell the
+                    # side stays undescribed: unsettled, never float64.
+                    from ..common.tensors.topological_reducer import (
+                        _source_numeric_scope as _host_scope,
+                    )
+                    from .concordance_declarations import (
+                        SOURCE_VALUE_CLASS as _HOST_CLASS,
+                    )
+                    from .identity_concordance import (
+                        current_identity_book as _host_book,
+                    )
+
+                    host_class = _host_book().page(_HOST_CLASS).latest((
+                        _host_scope(graph.G), int(operand),
+                    ))
+                    host_dtype = {
+                        "builtins.int": "int64",
+                        "builtins.bool": "bool",
+                        "builtins.float": "float64",
+                    }.get(
+                        str(host_class[0])
+                        if isinstance(host_class, tuple) and host_class
+                        else ""
+                    )
+                    class_cell = _host_book().latest_ref(_HOST_CLASS, (
+                        _host_scope(graph.G), int(operand),
+                    ))
+                    if host_dtype is None and host_class is None:
+                        # Next record: the planner's proven scalar dtype
+                        # for this value (literals, range targets, region
+                        # operator rules, collection element joins).
+                        stamp = (
+                            graph.G.number_of_nodes(),
+                            graph.G.number_of_edges(),
+                        )
+                        memo = graph.G.graph.get("_host_scalar_planned")
+                        if memo is None or memo[0] != stamp:
+                            memo = (stamp, _planned_scalar_dtypes(graph))
+                            graph.G.graph["_host_scalar_planned"] = memo
+                        host_dtype = memo[1].get(int(operand))
+                    if host_dtype is not None:
+                        # The class is settled: close the value's open
+                        # obligation (if the query owed one) citing it.
+                        _settle_region_value_obligation(
+                            graph, int(operand), host_dtype,
+                            () if class_cell is None else (class_cell,),
+                        )
+                    elif host_class is None:
+                        # No class cell, no planned dtype: the value is
+                        # unsettled.  The query records that as an open
+                        # obligation (``refresh_hierarchy_plan(terminal=True)``
+                        # settles or refuses it by name) rather than raising
+                        # mid-fixpoint.  A value whose class IS recorded but
+                        # has no element dtype (``None``, a record, a
+                        # string) is settled as a non-scalar, not owed.
+                        _owe_host_scalar_class(graph, int(operand))
+                    if host_dtype is None:
+                        continue
+                    sides[index] = {
+                        "shape": (), "dtype": host_dtype, "rank": 0,
+                    }
                 # An empty shape is a rank-0 scalar only when the node
                 # produces a scalar.  For a tensor-producing node it is what
                 # the query returns while its extents are still unsettled,
@@ -25133,12 +25553,13 @@ def _tensor_descriptor_rule(
                                 for side in sides
                                 if str(side.get("dtype") or "unknown")
                                 != "unknown"
-                            ), "float64")
-                            return {
-                                "shape": tuple(result),
-                                "dtype": dtype,
-                                "rank": len(result),
-                            }
+                            ), None)
+                            if dtype is not None:
+                                return {
+                                    "shape": tuple(result),
+                                    "dtype": dtype,
+                                    "rank": len(result),
+                                }
                     elif left and right:
                         left_vector = len(left) == 1
                         right_vector = len(right) == 1
@@ -25167,12 +25588,13 @@ def _tensor_descriptor_rule(
                                     if str(
                                         side.get("dtype") or "unknown"
                                     ) != "unknown"
-                                ), "float64")
-                                return {
-                                    "shape": tuple(result),
-                                    "dtype": dtype,
-                                    "rank": len(result),
-                                }
+                                ), None)
+                                if dtype is not None:
+                                    return {
+                                        "shape": tuple(result),
+                                        "dtype": dtype,
+                                        "rank": len(result),
+                                    }
         if operation in {
             "sum", "mean", "prod", "min", "max", "any", "all",
             "argmin", "argmax",
@@ -25617,8 +26039,11 @@ def _tensor_descriptor_rule(
                         break
                     path.insert(0, int(top_index))
                     top = top_base
+                # A dict's subscript is a key lookup: its leaves are keys and
+                # values in display order, not positional members.
                 if (
                     leaves
+                    and base_attributes.get("aggregate_kind") != "dict"
                     and isinstance(index, int)
                     and not isinstance(index, bool)
                     and -len(leaves) <= index < len(leaves)
@@ -26921,10 +27346,27 @@ def _fold_callsite_structural_values(
             if selected is None:
                 return unresolved
             fixed = known.get(selected, unresolved)
+            # Program: ``pick(a, 1)`` whose ``if n > 2: t = a else: t =
+            # [7, n, 2]`` folds on the constant argument (corpus c820, c821).
+            # Wrong record: the merge Phi took the selected display's literal
+            # VALUE, so it became a second Constant that kept the
+            # ``aggregate_phi`` producer with no arm to merge (a list "bound
+            # to lists of different shapes" / two heap owners for one list)
+            # while the display kept its own birth.  Rule: a merge selecting
+            # a mutable collection is that arm's storage, so it aliases the
+            # arm; only an immutable value is copied.
+            selected_attributes = (
+                graph.G.nodes[selected].get("attributes") or {}
+                if selected in graph.G else {}
+            )
+            selected_is_mutable_collection = str(
+                selected_attributes.get("aggregate_kind") or ""
+            ) in {"list", "set", "dict"} or isinstance(fixed, (list, set, dict))
             return (
                 _StructuralValueAlias(selected)
                 if fixed is unresolved
                 or isinstance(fixed, _ProgramABIValueFact)
+                or selected_is_mutable_collection
                 else fixed
             )
         if isinstance(expression, ast.UnaryOp):
@@ -28128,6 +28570,7 @@ def _fold_callsite_structural_values(
                     "add", "sub", "mult", "mul", "div", "truediv",
                     "floordiv", "mod", "pow", "maximum", "minimum", "emax", "emin",
                     "max", "min",
+                    "bitand", "bitor", "bitxor", "shl", "shr",
                 } | comparison_operations
                 or semantic_operation in comparison_operations
             ) and not (
