@@ -30025,6 +30025,27 @@ def lower_control_sections_to_ssa(
                             _column_dtype
                         ).name
                         argument.accounting = dict(accounting)
+                    # Program: ``add_all(a, b)`` over caller lists (c196) and
+                    # the string-core ``repeated_manager`` audit.  Wrong
+                    # record: region formals share the control function's
+                    # row, which already posted this resident arena as
+                    # ``sequence`` (SEQUENCE_CONTRACT owns a resident
+                    # collection's physical kind); the hard-coded ``span``
+                    # overwrote it and the ABI arm disagreed.  Rule: a row
+                    # that already declares ``sequence`` keeps it; ``span``
+                    # is posted only where nothing declared a kind.
+                    from .ssa_record_return_state import (
+                        function_scope_of as _formal_row_scope,
+                    )
+                    _posted_arena = _control_book.latest_ref(
+                        SSA_VALUE, (_formal_row_scope(region_function), int(argument.id)),
+                    )
+                    _posted_fact = (
+                        None if _posted_arena is None
+                        else _control_book.page(SSA_VALUE).cell(
+                            _posted_arena.row, _posted_arena.column,
+                        )
+                    )
                     _formal_cell = revise_ssa_value(
                         region_function, int(argument.id),
                         dtype=argument.dtype,
@@ -30032,7 +30053,12 @@ def lower_control_sections_to_ssa(
                         stage=CONTROL_SSA_REGION,
                         sources=_descriptor_cells, book=_control_book,
                         physical={
-                            "storage": "span", "rank": 1 + len(row_shape),
+                            "storage": (
+                                "sequence"
+                                if getattr(_posted_fact, "storage", None)
+                                == "sequence" else "span"
+                            ),
+                            "rank": 1 + len(row_shape),
                         },
                     )
                     _formal_fact = (
