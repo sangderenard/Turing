@@ -262,6 +262,7 @@ def build_web(output: Path) -> Path:
         }
         if kind == "buffer":
             descriptor["offset"] = buffer_offset
+            descriptor["dtype"] = dict(wasm.output_dtypes).get(value_id, "float64")
             buffer_offset += 8
         descriptors.append(descriptor)
     contract = {
