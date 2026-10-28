@@ -17862,6 +17862,24 @@ def _sequence_row_operations(
                     (value_id(row_value_node),), value_id(base_node),
                 ))
                 continue
+            # Program: ``xs = [1, 2, 3]; xs[n] = 9`` with ``n`` out of range.
+            # Wrong record: the scalar store fell through to the region, a
+            # bare pointer write past the list (heap corruption).  Rule: a
+            # store into a one-column list is a row store, checked as a read
+            # is (``IndexError``, validation code 71).
+            if (
+                sequence_id in positional_sequences
+                and widths[sequence_id] == 1
+                and value_id(base_node) == sequence_id
+                and (graph_obj.nodes[row_value_node].get("attributes") or {})
+                .get("aggregate_kind") is None
+            ):
+                operations.append((
+                    "store", value_id(node_id), int(sequence_id),
+                    value_id(row_index_node), integer_literal(row_index_node),
+                    (value_id(row_value_node),), value_id(base_node),
+                ))
+                continue
             if sequence_id is None:
                 # ``item.members[index][1]=value`` is a column write to the
                 # existing row, not a dereference of a scalar row payload.
