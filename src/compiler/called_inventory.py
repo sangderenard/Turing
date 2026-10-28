@@ -288,3 +288,36 @@ def post_call_edge_actual(
         stage=PLANNER_TENSOR_SPECIALIZATION,
         provenance=Derived(tuple(dict.fromkeys(cited))), mode=Mode.REVISE,
     )
+
+
+def post_call_edge_range(
+    book: Any, formal: str, caller_scope: Any, call_id: int,
+    interval: tuple[int, int], range_cell: Any,
+) -> tuple:
+    """Record the interval one internal call edge's actual is proven in.
+
+    Program: String Core's ``fnv1a_limb_step(high, low, byte)`` called from
+    ``fingerprint_atom_step``'s loop with limbs ``% 2**32`` and ``byte = ...
+    % 256``.  Wrong record: the callsite copy's formals inherited the
+    authored function's interval, the join over EVERY caller (one passes an
+    unbounded root input), so each limb operation stayed overflow-checked.
+    Rule: the edge's actual interval is a call record, DERIVED from the
+    actual's range cell; the copy minted for that interval reads it as its
+    formal's interval.  Returns the edge row.
+    """
+
+    from .concordance_declarations import (
+        CALL_EDGE_INT_RANGE, PLANNER_TENSOR_SPECIALIZATION,
+    )
+    from .identity_concordance import Derived, Mode
+
+    row = (caller_scope, int(call_id), str(formal))
+    fact = (int(interval[0]), int(interval[1]))
+    incumbent = book.page(CALL_EDGE_INT_RANGE).latest(row)
+    if incumbent is None or tuple(incumbent) != fact:
+        book.post(
+            CALL_EDGE_INT_RANGE, row, fact,
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived((range_cell,)), mode=Mode.REVISE,
+        )
+    return row

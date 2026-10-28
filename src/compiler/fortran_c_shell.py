@@ -27685,6 +27685,18 @@ def _class_surface_ssa_program(
             specialization_contract = (
                 *specialization_contract, element_specialization,
             )
+        # Program: ``step(x % 2**32, y % 256)`` and ``step(x, y)``.  Wrong
+        # record: the copy minted for the proven intervals and the unproven
+        # one lowered under one symbol, so one caller ran the other's
+        # checks (or lack of them).  Rule: each formal's proven callsite
+        # interval is part of the callsite contract.
+        int_range_specialization = (
+            graph_obj.graph.get("planner_parameter_int_ranges") or {}
+        )
+        if int_range_specialization:
+            specialization_contract = (
+                *specialization_contract, int_range_specialization,
+            )
         # A record-only callsite variant IS a different executable contract.
         # root(Actual)->relay(Declared)->leaf(Declared) used to overwrite both
         # variants under one symbol because only literals/tensors were keyed.
@@ -44162,10 +44174,6 @@ def _class_surface_ssa_program(
         for block in function.blocks.values():
             for instruction in block.instrs:
                 if instruction.op not in {"Ret", "ret", "Return", "return"}:
-                    continue
-                if instruction.attributes.get("fault_exit"):
-                    # The zero outputs of a checked index's fault exit are
-                    # not the source outputs; there is nothing to settle.
                     continue
                 by_id = {
                     int(argument.id): argument
