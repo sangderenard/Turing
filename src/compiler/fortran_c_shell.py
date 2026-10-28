@@ -21840,7 +21840,21 @@ def _settle_linked_dynamic_sequences(
         graph_obj.graph["linked_bounded_sequence_ids"] = tuple(sorted(
             value_id
             for node_id, data in graph_obj.nodes(data=True)
+            # Program: ``t = [n, 1] if n > 2 else [7, n]`` passed to a
+            # callee that only reads it (c651).  Wrong record: only list
+            # displays were candidates, so the merge (an ``aggregate_phi``,
+            # which the survey counts as a local list of its leaf rows)
+            # stayed escaped-unbounded and its FIXED fill ran out of
+            # capacity (code 75).  Rule: a merged list is a local list
+            # like a display; its leaf rows bound it when nothing grows it.
             if isinstance(data.get("expr_obj"), ast.List)
+            or (
+                (data.get("attributes") or {}).get("producer_kind")
+                == "aggregate_phi"
+                and (data.get("attributes") or {}).get("aggregate_kind")
+                == "list"
+                and (data.get("attributes") or {}).get("aggregate_leaf_value_ids")
+            )
             for value_id in (int(node_id),)
             if value_id in escapes
             and (
