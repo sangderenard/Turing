@@ -21010,6 +21010,21 @@ def _prune_dead_local_sequences(
     return removed
 
 
+_CHILD_POOL_MEMBER_ROLES = (
+    "length_value_id", "capacity_value_id", "row_stride_value_id",
+    "shape_value_id", "rank_value_id", "shape_stride_value_id",
+    "status_value_id", "live_flags_value_id",
+)
+
+
+def _child_pool_identity_fields(pool) -> dict[str, Any]:
+    """A child-table pool's member cells, by role."""
+    return {
+        "column_value_ids": tuple(pool.column_value_ids),
+        **{role: getattr(pool, role) for role in _CHILD_POOL_MEMBER_ROLES},
+    }
+
+
 def _retire_concordant_sequence_aliases(
     all_functions: Mapping[str, Any],
     all_sequence_tables: Mapping[str, Any],
@@ -21066,6 +21081,27 @@ def _retire_concordant_sequence_aliases(
         def resident(value_id: int) -> int:
             return int(aliases.get(int(value_id), int(value_id)))
 
+        def pool_members(pool) -> tuple[int, ...]:
+            if pool is None:
+                return ()
+            return (
+                *map(int, pool.column_value_ids),
+                *(int(getattr(pool, role)) for role in _CHILD_POOL_MEMBER_ROLES
+                  if getattr(pool, role) is not None),
+            )
+
+        def bind_pool_members(bindings, stale, incumbent) -> None:
+            # A setdefault receiver re-read in one method carries a second
+            # view of the same child-table pool.  Its pool cells are the
+            # resident pool's, role by role, exactly as the outer columns.
+            if stale.child_table_pool is None or incumbent.child_table_pool is None:
+                return
+            for alias, target in zip(
+                pool_members(stale.child_table_pool),
+                pool_members(incumbent.child_table_pool),
+            ):
+                bindings.setdefault(int(alias), int(target))
+
         for sequence_id, descriptor in tuple(sequence_table.sequences.items()):
             sequence_id = int(sequence_id)
             resident_id = resident(sequence_id)
@@ -21089,6 +21125,26 @@ def _retire_concordant_sequence_aliases(
                 capacity_value_id=int(incumbent.capacity_value_id),
                 status_address_id=incumbent.status_address_id,
                 live_flags_value_id=incumbent.live_flags_value_id,
+                # The pool's member cells are the same frame bookkeeping:
+                # equal contracts with every role present on both sides
+                # are one pool.
+                child_table_pool=(
+                    incumbent.child_table_pool
+                    if descriptor.child_table_pool is not None
+                    and incumbent.child_table_pool is not None
+                    and len(descriptor.child_table_pool.column_value_ids)
+                    == len(incumbent.child_table_pool.column_value_ids)
+                    and all(
+                        (getattr(descriptor.child_table_pool, role) is None)
+                        == (getattr(incumbent.child_table_pool, role) is None)
+                        for role in _CHILD_POOL_MEMBER_ROLES
+                    )
+                    and replace(
+                        descriptor.child_table_pool,
+                        **_child_pool_identity_fields(incumbent.child_table_pool),
+                    ) == incumbent.child_table_pool
+                    else descriptor.child_table_pool
+                ),
             )
             if resolved != incumbent or sequence_id in physical_ids:
                 continue
@@ -21100,6 +21156,7 @@ def _retire_concordant_sequence_aliases(
                   if descriptor.status_address_id is not None else ()),
                 *((int(descriptor.live_flags_value_id),)
                   if descriptor.live_flags_value_id is not None else ()),
+                *pool_members(descriptor.child_table_pool),
             }
             # Prove the stale cells are only removable bookkeeping before
             # mutating the real function.  A call/return use means this is
@@ -21114,6 +21171,7 @@ def _retire_concordant_sequence_aliases(
             # removable initialization stores above must not reset the owner.
             member_bindings: dict[int, int] = {}
             _bind_sequence_storage_members(member_bindings, descriptor, incumbent)
+            bind_pool_members(member_bindings, descriptor, incumbent)
             rebind_member_reads(trial, member_bindings)
             if any(
                 int(argument.id) in stale_private
@@ -21170,6 +21228,11 @@ def _retire_concordant_sequence_aliases(
         for stale_id, resident_id in sorted(replacements.items()):
             member_bindings: dict[int, int] = {}
             _bind_sequence_storage_members(
+                member_bindings,
+                sequence_table.by_id(int(stale_id)),
+                sequence_table.by_id(int(resident_id)),
+            )
+            bind_pool_members(
                 member_bindings,
                 sequence_table.by_id(int(stale_id)),
                 sequence_table.by_id(int(resident_id)),
