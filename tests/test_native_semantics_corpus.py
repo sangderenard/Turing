@@ -32,19 +32,33 @@ _RUNNER = r'''
 import pickle, sys
 import numpy as np
 artifact, parameters, outputs, cases = pickle.load(open(sys.argv[1], "rb"))
+classes = {"builtins.int": int, "builtins.float": float, "builtins.bool": bool,
+           "builtins.NoneType": type(None)}
 for feeds, expected in cases:
     execution = artifact.prepare_execution({
         parameters[name]: np.array([value]) for name, value in feeds.items()
     }).run()
-    got = [
-        float(item)
-        for value_id in outputs
-        for item in execution.buffers[value_id].reshape(-1).tolist()
-    ]
-    want = [float(item) for item in expected]
-    assert len(got) == len(want), (feeds, got, want)
-    for left, right in zip(got, want):
-        assert abs(left - right) <= 1e-12 * max(1.0, abs(right)), (feeds, got, want)
+    got = []
+    for output in outputs:
+        if isinstance(output, tuple):
+            # A value union's frame: the tag names the live arm, and only
+            # that arm's payload is the value, with that arm's class.
+            tag_id, arms = output
+            name, payload_id = arms[int(execution.buffers[tag_id].reshape(-1)[0])]
+            got.append((name, None if payload_id is None
+                        else execution.buffers[payload_id].reshape(-1)[0].item()))
+            continue
+        got.extend(float(item) for item in execution.buffers[output].reshape(-1).tolist())
+    assert len(got) == len(expected), (feeds, got, expected)
+    for left, right in zip(got, expected):
+        if isinstance(left, tuple):
+            name, payload = left
+            assert classes.get(name) is type(right), (feeds, got, expected)
+            left = None if right is None else float(payload)
+            if right is None:
+                continue
+        right = float(right)
+        assert abs(left - right) <= 1e-12 * max(1.0, abs(right)), (feeds, got, expected)
 '''
 
 
@@ -134,7 +148,29 @@ def test_native_program_matches_python(program, tmp_path):
             for instruction in block.instrs
             if instruction.op == "Ret" and not instruction.attributes.get("fault_exit")
         ]) == 1
-        outputs = [int(value.id) for value in returns[0]]
+        ids = [int(value.id) for value in returns[0]]
+        # A value union leaves the program as its frame (an int64 tag and one
+        # payload cell per arm, ``module.value_union_tables``); it is read as
+        # one value at its first member's position.
+        table = getattr(module, "value_union_tables", {}).get(exports[0])
+        frames = {}
+        for union in ([] if table is None else dict(table.unions).values()):
+            members = {int(union.tag_value_id)} | {
+                int(value_id) for arm in union.alternatives for value_id in arm.value_ids
+            }
+            if members <= set(ids):
+                frames[min(ids.index(member) for member in members)] = (union, members)
+        covered = {member for _union, members in frames.values() for member in members}
+        outputs = []
+        for position, value_id in enumerate(ids):
+            if position in frames:
+                union, _members = frames[position]
+                outputs.append((int(union.tag_value_id), [
+                    (str(arm.name), int(arm.value_ids[0]) if arm.value_ids else None)
+                    for arm in union.alternatives
+                ]))
+            elif value_id not in covered:
+                outputs.append(value_id)
         artifact = emit_ssa_to_c(module, exports[0])
         assert artifact.complete, artifact.shortfalls
         run_dir = tmp_path / f"run{index}"

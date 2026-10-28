@@ -181,6 +181,7 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
 
 #: Scalar dtypes a ``Const`` may declare; a declared one is kept as stated.
 from ..transmogrifier.dtype_layout import DTYPES as _DTYPE_LAYOUTS
+from ..transmogrifier.dtype_layout import python_float_result_dtype
 
 _CANONICAL_INTEGER_DTYPES = frozenset(
     name for name, layout in _DTYPE_LAYOUTS.items()
@@ -547,13 +548,21 @@ def _propagate_scalar_dtypes(functions) -> None:
                     candidate is not None for candidate in operand_dtypes
                 ):
                     if any(candidate in floats for candidate in operand_dtypes):
-                        inferred = declared_float(instruction) or "float64"
+                        # Non-literal widths first; else the float operand's
+                        # own record (a literal ``2.5`` is binary64).
+                        inferred = (
+                            declared_float(instruction)
+                            or python_float_result_dtype(operand_dtypes)
+                        )
                 operation_claim = operation_domain(instruction, result_id)
                 if operation_claim is not None:
                     inferred, operation_cell = operation_claim
                     operation_domain_cells[result_id] = operation_cell
                 elif instruction.op in {"Div", "Sqrt", "Exp", "Log"}:
-                    inferred = declared_float(instruction) or "float64"
+                    inferred = (
+                        declared_float(instruction)
+                        or python_float_result_dtype(operand_dtypes)
+                    )
                 # A Const's DECLARED integer width is its identity (rule
                 # above) and survives; only an inferred integer widens to
                 # int64.  tensor_ssa_lowering mints kernel shape vectors as
