@@ -378,6 +378,272 @@ def _without_init(statement: Mapping[str, Any]) -> dict[str, Any]:
     return {**statement, "init": None}
 
 
+def _do_as_while(statements: Sequence[Mapping[str, Any]]) -> list[Any]:
+    """Every ``do body while (test)`` rewritten into a ``while`` loop.
+
+    ``let %first = true; while (%first || !!test) { %first = false; body }``
+    runs the body once before the first test, and a ``continue`` in the
+    body (a flag the loop rewrite guards the rest of the body with) still
+    reaches the test.  Positions are the do loop's, so its hidden flags
+    keep their keys.  Functions are left alone.
+    """
+
+    def loop(statement: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """``[declaration, while]`` for a (labeled) do loop."""
+
+        if statement.get("type") == "LabeledStatement":
+            declaration, inner = loop(statement["body"])
+            return [declaration, {**statement, "body": inner}]
+        first = f"%first@{statement.get('start')}:{statement.get('end')}"
+        at = _at(statement)
+        test = statement.get("test") or {}
+        body = walk(statement.get("body"))
+        return [
+            {**_flag_declaration(first, statement), "declarations": [{
+                "type": "VariableDeclarator", **at,
+                "id": {"type": "Identifier", "name": first, **at},
+                "init": {"type": "Literal", "value": True, **at},
+            }]},
+            {
+                "type": "WhileStatement", **at,
+                "test": {
+                    "type": "LogicalExpression", "operator": "||", **_at(test),
+                    "left": {"type": "Identifier", "name": first, **at},
+                    "right": {
+                        "type": "UnaryExpression", "operator": "!",
+                        "prefix": True, **_at(test),
+                        "argument": {
+                            "type": "UnaryExpression", "operator": "!",
+                            "prefix": True, **_at(test), "argument": walk(test),
+                        },
+                    },
+                },
+                "body": {
+                    "type": "BlockStatement", **_at(body or statement),
+                    "body": [
+                        _flag_assignment(first, statement, {
+                            "type": "Literal", "value": False, **at,
+                        }),
+                        *(
+                            body.get("body", ())
+                            if (body or {}).get("type") == "BlockStatement"
+                            else [body]
+                        ),
+                    ],
+                },
+            },
+        ]
+
+    def is_do(item: Any) -> bool:
+        while isinstance(item, Mapping) and item.get("type") == "LabeledStatement":
+            item = item.get("body")
+        return isinstance(item, Mapping) and item.get("type") == "DoWhileStatement"
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, list):
+            out: list[Any] = []
+            for child in item:
+                out.extend(loop(child) if is_do(child) else [walk(child)])
+            return out
+        if isinstance(item, Mapping):
+            if item.get("type") in _FUNCTION_NODES:
+                return item
+            if is_do(item):
+                return {"type": "BlockStatement", **_at(item), "body": loop(item)}
+            return {key: walk(child) for key, child in item.items()}
+        return item
+
+    return walk(list(statements))
+
+
+def _switch_as_ifs(statements: Sequence[Mapping[str, Any]]) -> list[Any]:
+    """Every ``switch`` rewritten into a run of guarded ``if`` statements.
+
+    ``let %switch = d; let %any = d === t1 || ...; let %matched = false;
+    let %switchbreak = false;`` then, per case in source order,
+    ``if (!%switchbreak && (%matched || %switch === t)) { %matched = true;
+    body }`` with ``!%any`` as the default's test, so a default anywhere
+    is entered only when no case matches and falls through to the cases
+    after it.  The switch's own ``break`` sets ``%switchbreak`` and the rest
+    of its statement list runs under ``if (!%switchbreak)``.  Case tests are
+    pure here, so evaluating them all up front agrees with JavaScript's
+    lazy order.  A switch whose cases declare a ``let``/``const`` (one
+    scope across every case) or label a statement is left alone, and the
+    interpreter refuses it.
+    """
+
+    def identifier(name: str, source: Mapping[str, Any]) -> dict[str, Any]:
+        return {"type": "Identifier", "name": name, **_at(source)}
+
+    def declare(name: str, init: Mapping[str, Any], source: Mapping[str, Any]):
+        return {
+            "type": "VariableDeclaration", "kind": "let", **_at(source),
+            "declarations": [{
+                "type": "VariableDeclarator", **_at(source),
+                "id": identifier(name, source), "init": init,
+            }],
+        }
+
+    def literal(value: bool, source: Mapping[str, Any]) -> dict[str, Any]:
+        return {"type": "Literal", "value": value, **_at(source)}
+
+    def binary(operator: str, left: Any, right: Any, source: Mapping[str, Any]):
+        return {
+            "type": "LogicalExpression" if operator in {"&&", "||"}
+            else "BinaryExpression",
+            "operator": operator, "left": left, "right": right, **_at(source),
+        }
+
+    def negate(argument: Any, source: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "type": "UnaryExpression", "operator": "!", "prefix": True,
+            "argument": argument, **_at(source),
+        }
+
+    def owns_break(item: Any) -> bool:
+        if isinstance(item, list):
+            return any(owns_break(child) for child in item)
+        if not isinstance(item, Mapping):
+            return False
+        if item.get("type") == "BreakStatement":
+            return item.get("label") is None
+        if item.get("type") in _OPAQUE_TO_LOOP_EXITS:
+            return False
+        return any(
+            owns_break(child) for key, child in item.items()
+            if key not in {"type", "start", "end"}
+        )
+
+    def guarded(items: Sequence[Any], flag: str) -> list[Any] | None:
+        """``items`` with the switch's breaks as ``flag``; None to refuse."""
+
+        out: list[Any] = []
+        for index, item in enumerate(items):
+            if item.get("type") == "BreakStatement" and item.get("label") is None:
+                out.append(_flag_assignment(flag, item))
+                return out
+            if not owns_break(item):
+                out.append(item)
+                continue
+            kind = item.get("type")
+            if kind == "BlockStatement":
+                body = guarded(item.get("body", ()), flag)
+                if body is None:
+                    return None
+                out.append({**item, "body": body})
+            elif kind == "IfStatement":
+                arms = {}
+                for key in ("consequent", "alternate"):
+                    arm = item.get(key)
+                    if arm is None:
+                        arms[key] = None
+                        continue
+                    body = guarded(
+                        arm.get("body", ()) if arm.get("type") == "BlockStatement"
+                        else [arm],
+                        flag,
+                    )
+                    if body is None:
+                        return None
+                    arms[key] = {"type": "BlockStatement", **_at(arm), "body": body}
+                out.append({**item, **arms})
+            else:
+                return None
+            rest = list(items[index + 1:])
+            if rest:
+                out.append({
+                    "type": "IfStatement", **_at(item),
+                    "test": negate(identifier(flag, item), item),
+                    "consequent": {
+                        "type": "BlockStatement", **_at(item), "body": rest,
+                    },
+                    "alternate": None,
+                })
+                rest_guarded = guarded(rest, flag)
+                if rest_guarded is None:
+                    return None
+                out[-1]["consequent"]["body"] = rest_guarded
+            return out
+        return out
+
+    def switch(statement: Mapping[str, Any]) -> list[Any] | None:
+        cases = statement.get("cases", ())
+        for case in cases:
+            for item in case.get("consequent", ()):
+                if item.get("type") == "LabeledStatement" or (
+                    item.get("type") == "VariableDeclaration"
+                    and item.get("kind") in {"let", "const"}
+                ):
+                    return None
+        position = f"{statement.get('start')}:{statement.get('end')}"
+        names = {
+            word: f"%{word}@{position}"
+            for word in ("switch", "any", "matched", "switchbreak")
+        }
+        subject = identifier(names["switch"], statement)
+        tests = [case["test"] for case in cases if case.get("test") is not None]
+        any_match: Any = literal(False, statement)
+        for test in tests:
+            match = binary("===", subject, walk(test), test)
+            any_match = match if any_match.get("type") == "Literal" else binary(
+                "||", any_match, match, test,
+            )
+        out: list[Any] = [
+            declare(names["switch"], walk(statement["discriminant"]), statement),
+            declare(names["any"], any_match, statement),
+            declare(names["matched"], literal(False, statement), statement),
+            declare(names["switchbreak"], literal(False, statement), statement),
+        ]
+        for case in cases:
+            test = case.get("test")
+            entered = negate(identifier(names["any"], case), case) if test is None \
+                else binary("===", subject, walk(test), case)
+            body = guarded(walk(list(case.get("consequent", ()))), names["switchbreak"])
+            if body is None:
+                return None
+            out.append({
+                "type": "IfStatement", **_at(case),
+                "test": binary(
+                    "&&",
+                    negate(identifier(names["switchbreak"], case), case),
+                    binary("||", identifier(names["matched"], case), entered, case),
+                    case,
+                ),
+                "consequent": {
+                    "type": "BlockStatement", **_at(case),
+                    "body": [
+                        _flag_assignment(names["matched"], case),
+                        *body,
+                    ],
+                },
+                "alternate": None,
+            })
+        return out
+
+    def walk(item: Any) -> Any:
+        if isinstance(item, list):
+            out: list[Any] = []
+            for child in item:
+                if isinstance(child, Mapping) and child.get("type") == "SwitchStatement":
+                    replaced = switch(child)
+                    if replaced is not None:
+                        out.extend(replaced)
+                        continue
+                out.append(walk(child))
+            return out
+        if isinstance(item, Mapping):
+            if item.get("type") in _FUNCTION_NODES:
+                return item
+            if item.get("type") == "SwitchStatement":
+                replaced = switch(item)
+                if replaced is not None:
+                    return {"type": "BlockStatement", **_at(item), "body": replaced}
+            return {key: walk(child) for key, child in item.items()}
+        return item
+
+    return walk(list(statements))
+
+
 class _JavaScriptProcessInterpreter:
     def __init__(
         self, graph: Any, *, owner: str, assumptions: Sequence[str] = (),
@@ -2132,7 +2398,7 @@ class _JavaScriptProcessInterpreter:
         body = function.get("body") or {}
         if body.get("type") == "BlockStatement":
             value, returned = self.sequence(_var_as_let(
-                body.get("body", ()),
+                _do_as_while(_switch_as_ifs(body.get("body", ()))),
                 frozenset(
                     str(parameter.get("name"))
                     for parameter in function.get("params", ())
