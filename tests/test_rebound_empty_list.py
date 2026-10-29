@@ -50,6 +50,17 @@ def root(seed, n):
     return len(atoms) * 1000 + atoms[len(atoms) - 1] if atoms else -1
 '''
 
+REBOUND_UNGROWN = '''
+def root(seed, n):
+    atoms = []
+    if n > 1:
+        atoms = [seed, n, 7]
+    total = len(atoms) * 1000
+    for a in atoms:
+        total += a
+    return total
+'''
+
 CASES = ((0, 0), (0, 2), (2, 3), (1, 5))
 
 
@@ -111,7 +122,7 @@ def _run_llvm(tmp_path, lowered, seed, n):
     return int(execution.buffers[outputs[0]].reshape(-1)[0])
 
 
-@pytest.mark.parametrize("source", [REBOUND_GROWN, REBOUND_ONE_APPEND], ids=["rebound_grown", "rebound_one_append"])
+@pytest.mark.parametrize("source", [REBOUND_GROWN, REBOUND_ONE_APPEND, REBOUND_UNGROWN], ids=["rebound_grown", "rebound_one_append", "rebound_ungrown"])
 @pytest.mark.parametrize("run", [_run_c, _run_llvm], ids=["c", "llvm"])
 def test_rebound_empty_list_matches_python(tmp_path, run, source):
     lowered = _lowered(source)
