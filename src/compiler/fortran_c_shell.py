@@ -22287,6 +22287,42 @@ def _callee_accounting_in_caller(
     )
 
 
+def _materialized_sequence_pair(
+    callee_table: Any, callee_id: int, caller_table: Any, caller_id: int,
+) -> bool:
+    """Whether a callee formal and its actual are both published sequences.
+
+    Program: ``def one(atoms): return atoms[0] * 10 + len(atoms)`` called
+    as ``one([n % 5 + 1, 2])``.  Wrong record: ``atoms[0]`` split the
+    unannotated parameter into member formals, and the whole parameter was
+    then never bound, although the callee still publishes ``atoms`` as a
+    sequence (for ``len``) and the caller's display is one.  The callee's
+    view was leased a fresh arena that nothing sized (refused as
+    dynamic-growth-unavailable) instead of the caller's list.  Rule: a
+    split parameter whose callee view and caller actual are both published
+    sequences of one column count is bound to that actual.
+    """
+
+    def published(table: Any, value_id: int) -> Any:
+        if table is None:
+            return None
+        descriptor = table.by_id(int(value_id))
+        if descriptor is not None:
+            return descriptor
+        return next((
+            candidate for candidate in table.sequences.values()
+            if int(value_id) in map(int, candidate.column_value_ids)
+        ), None)
+
+    callee_view = published(callee_table, callee_id)
+    caller_view = published(caller_table, caller_id)
+    return (
+        callee_view is not None and caller_view is not None
+        and len(callee_view.column_value_ids)
+        == len(caller_view.column_value_ids)
+    )
+
+
 def _native_row_dtype(dtype: Any) -> bool:
     """Whether ``dtype`` is a native scalar row layout (8 bytes at most)."""
 
@@ -28794,6 +28830,17 @@ def _class_surface_ssa_program(
             for sequence_id, _policy, _columns in sequence_initializations
         }
         for sequence_id in sorted(generated_sequence_ids):
+            # Program: ``def one(atoms): return atoms[0] * 10 + len(atoms)``
+            # called as ``one([n % 5 + 1, 2])``.  Wrong record: ``len`` of
+            # the parameter queried a sequence this function then
+            # initialized empty, so ``len(atoms)`` read 0 (and, once bound
+            # to the caller's list, cleared it).  Rule: a parameter's
+            # storage is its caller's; a query of it never starts it empty.
+            if (
+                (graph_obj.nodes.get(int(sequence_id), {}).get("attributes") or {})
+                .get("binding_kind") == "parameter"
+            ):
+                continue
             if sequence_id not in initialized_sequence_ids:
                 policy, columns = next(
                     (policy, columns) for value_id, policy, columns, _writable in sequence_declarations
@@ -46271,8 +46318,6 @@ def _class_surface_ssa_program(
             ):
                 if position >= len(positional_names):
                     continue
-                if str(parameter_name) in aggregate_split_names:
-                    continue
                 identities = tuple(child_identities.get(
                     str(parameter_name), ()
                 ))
@@ -46283,6 +46328,16 @@ def _class_surface_ssa_program(
                         "parameter_names", ()
                     ),
                 )
+                if str(parameter_name) in aggregate_split_names and not (
+                    retained_id is not None
+                    and _materialized_sequence_pair(
+                        all_sequence_tables.get(callee_symbol),
+                        int(retained_id),
+                        all_sequence_tables.get(caller_symbol),
+                        int(caller_id),
+                    )
+                ):
+                    continue
                 if retained_id is not None:
                     exact_bindings.setdefault(retained_id, int(caller_id))
         # An identity-table history is a sequence of distinct SSA versions of
