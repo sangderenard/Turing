@@ -15469,36 +15469,42 @@ def _install_lexical_sequence_mutations(
     # ("Call reads a value defined at while_body").  Rule: inside its guard's
     # arm an effect is placed as at any other level -- in the innermost loop
     # whose per-iteration lines hold it (``insert_in_enclosing_loop``).
-    arm_placement_node: list = [None]
-
-    def insert_in_arm(arm_block, mutation_block):
-        node_id = arm_placement_node[0]
-        if node_id is None or int(node_id) not in graph.G:
+    def insert_in_arm(arm_block, mutation_block, placement_node):
+        if placement_node is None or int(placement_node) not in graph.G:
             return insert_ordered(arm_block, mutation_block)
-        return insert_in_enclosing_loop(arm_block, mutation_block, int(node_id))
+        return insert_in_enclosing_loop(
+            arm_block, mutation_block, int(placement_node),
+        )
 
-    def insert_in_conditional(block, owner_id, arm, mutation_block):
+    def insert_in_conditional(
+        block, owner_id, arm, mutation_block, placement_node,
+    ):
         if isinstance(block, ConditionalBlock):
             if int(block.source_node_id or -1) == int(owner_id):
                 if str(arm) == "body":
                     return replace(
                         block,
-                        body=insert_in_arm(block.body, mutation_block),
+                        body=insert_in_arm(
+                            block.body, mutation_block, placement_node,
+                        ),
                     ), True
                 return replace(
                     block,
                     orelse=insert_in_arm(
                         block.orelse or SequenceBlock(()), mutation_block,
+                        placement_node,
                     ),
                 ), True
             body, inserted = insert_in_conditional(
-                block.body, owner_id, arm, mutation_block
+                block.body, owner_id, arm, mutation_block,
+                placement_node,
             )
             if inserted:
                 return replace(block, body=body), True
             if block.orelse is not None:
                 orelse, inserted = insert_in_conditional(
-                    block.orelse, owner_id, arm, mutation_block
+                    block.orelse, owner_id, arm, mutation_block,
+                    placement_node,
                 )
                 if inserted:
                     return replace(block, orelse=orelse), True
@@ -15508,24 +15514,28 @@ def _install_lexical_sequence_mutations(
             inserted = False
             for child in block.blocks:
                 projected, child_inserted = insert_in_conditional(
-                    child, owner_id, arm, mutation_block
+                    child, owner_id, arm, mutation_block,
+                    placement_node,
                 )
                 children.append(projected)
                 inserted |= child_inserted
             return SequenceBlock(tuple(children)), inserted
         if isinstance(block, LoopBlock):
             body, inserted = insert_in_conditional(
-                block.body, owner_id, arm, mutation_block
+                block.body, owner_id, arm, mutation_block,
+                placement_node,
             )
             return replace(block, body=body), inserted
         if isinstance(block, WhileBlock):
             body, inserted = insert_in_conditional(
-                block.body, owner_id, arm, mutation_block
+                block.body, owner_id, arm, mutation_block,
+                placement_node,
             )
             return replace(block, body=body), inserted
         if isinstance(block, CallBlock):
             callee, inserted = insert_in_conditional(
-                block.callee, owner_id, arm, mutation_block
+                block.callee, owner_id, arm, mutation_block,
+                placement_node,
             )
             return replace(block, callee=callee), inserted
         return block, False
@@ -15760,7 +15770,7 @@ def _install_lexical_sequence_mutations(
 
         inserted = False
         item = mutation_block
-        arm_placement_node[0] = (
+        placement_node = (
             int(mutation.effect_node_id)
             if isinstance(mutation, ScalarFieldWriteBlock)
             else _sequence_mutation_owner_id(mutation)
@@ -15768,7 +15778,9 @@ def _install_lexical_sequence_mutations(
         for owner_id, arm in sorted(
             guarded, key=lambda entry: node_position(entry[0]), reverse=True,
         ):
-            root, inserted = insert_in_conditional(root, owner_id, arm, item)
+            root, inserted = insert_in_conditional(
+                root, owner_id, arm, item, placement_node,
+            )
             if inserted:
                 break
             item = synthesize(owner_id, arm, item)
@@ -28621,7 +28633,8 @@ def _class_surface_ssa_program(
         # contract, so both lowered under one symbol and the FIXED caller
         # bound the DYNAMIC view ("bound sequence views disagree about
         # dynamic capacity").  Rule: a copy's settled capacity policy for
-        # its formals is part of its callsite contract.
+        # its formals is part of its callsite contract, always (not only
+        # when another part of the contract already specialized it).
         linked_dynamic_ids = set(
             map(int, graph_obj.graph.get("linked_dynamic_sequence_ids", ()))
         )
@@ -28632,7 +28645,7 @@ def _class_surface_ssa_program(
             and (data.get("attributes") or {}).get("binding_name") is not None
             and int(data.get("value_id", node_id)) in linked_dynamic_ids
         ))
-        if dynamic_formals and any(specialization_contract):
+        if dynamic_formals:
             specialization_contract = (
                 *specialization_contract, ("dynamic_formals", dynamic_formals),
             )
