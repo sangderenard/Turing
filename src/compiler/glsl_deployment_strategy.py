@@ -29035,6 +29035,35 @@ def _fold_callsite_structural_values(
                 if str(role) in {"value", "base", "operand", "object"}
             ), None)
             base_fact = known.get(base, unresolved)
+            base_attributes = (
+                (graph.G.nodes[int(base)].get("attributes") or {})
+                if base is not None and int(base) in graph.G else {}
+            )
+            if (
+                base_fact is unresolved
+                and base_attributes.get("materialization_kind")
+                == "unrolled_loop"
+            ):
+                # Program: ``lanes, capacity = (int(n) for n in
+                # octets.shape)`` (the x86 read head's ``_peek``).  Wrong
+                # record: loop evaporation published the generator's ordered
+                # element producers (``materialized_value_ids``), but the
+                # unpack's element reads were left unknown, so ``lanes``
+                # never folded and ``arange(lanes)`` had no extent.  Rule:
+                # an unrolled generator's elements are its published element
+                # producers, exactly as ``tuple(...)`` over it reads them.
+                elements = tuple(
+                    known.get(int(value_id), unresolved)
+                    for value_id in base_attributes.get(
+                        "materialized_value_ids", ()
+                    )
+                )
+                if elements and not any(
+                    element is unresolved
+                    or isinstance(element, _ProgramABIValueFact)
+                    for element in elements
+                ):
+                    base_fact = elements
             if (
                 isinstance(base_fact, _ProgramABIValueFact)
                 and base_fact.storage == "keyed"
