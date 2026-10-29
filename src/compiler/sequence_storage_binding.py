@@ -229,6 +229,18 @@ def _bind_sequence_storage_members(
             caller_sequence.column_shapes or ((),) * len(caller_sequence.column_value_ids)
         ):
             return False
+        # One heap arena is one hash-index contract: a view that disagrees
+        # about the carrier would size the arena without the index, or write
+        # rows the other view's index never sees (``hash_index_carrier``).
+        from .ir_sequence_tables import hash_index_carrier
+        if hash_index_carrier(callee_sequence) != hash_index_carrier(caller_sequence):
+            raise ValueError(
+                "bound heap sequence views disagree about their hash index: "
+                f"callee sequence={int(callee_sequence.sequence_id)} "
+                f"carrier={hash_index_carrier(callee_sequence)!r}, "
+                f"caller sequence={int(caller_sequence.sequence_id)} "
+                f"carrier={hash_index_carrier(caller_sequence)!r}"
+            )
     provisional_targets = set(map(int, provisional_targets))
 
     def bind(callee_id: int, caller_id: int) -> None:
