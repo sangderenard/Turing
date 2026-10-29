@@ -21,6 +21,8 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_SSA_ROUTE,
     SOURCE_EXCEPTION_SSA_HANDLER_ARM,
     SOURCE_EXCEPTION_SSA_HANDLER_STATE,
+    SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
+    SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
     SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
     SOURCE_EXCEPTION_SSA_HANDLER_PHI,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
@@ -161,7 +163,12 @@ def root(x: float) -> int:
             lexical_read_scope=try_blocks[0][0],
             planning_scope=region_rows[0][0],
             region_callees={region_rows[0][1]: "numerical_region_0"},
-            region_signatures={region_rows[0][1]: ((), ())},
+            region_signatures={region_rows[0][1]: (
+                (), (int(arm_facts[0].canonical_value.row[1]),),
+            )},
+            constant_value_ids=(
+                int(arm_facts[1].canonical_value.row[1]),
+            ),
         )
         assert any(
             shortfall.name == "native_try_dispatch" for shortfall in shortfalls
@@ -187,6 +194,46 @@ def root(x: float) -> int:
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
         assert CorrelationTable._source_exception_ssa_handler_entry_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        continuation_row, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+        ).rows())
+        continuation = book.page(
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+        ).latest(continuation_row)
+        assert continuation.source_phi == try_fact.carried[1]
+        assert len(continuation.incoming_arms) == 2
+        assert tuple(
+            book.page(SOURCE_EXCEPTION_SSA_CONTINUATION_ARM).latest(
+                cell.row
+            ).source_arm
+            for cell in continuation.incoming_arms
+        ) == tuple(
+            book.latest_ref(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE, row)
+            for row in arm_rows
+        )
+        join_block = lowered.blocks[continuation.join_block.row[2]]
+        join_phi, = tuple(
+            instruction for instruction in join_block.instrs
+            if instruction.attributes.get("binding")
+            == "native_exception_continuation_phi"
+        )
+        assert tuple(arg.id for arg in join_phi.args) == tuple(
+            book.page(SOURCE_EXCEPTION_SSA_CONTINUATION_ARM).latest(
+                cell.row
+            ).incoming_value.row[1]
+            for cell in continuation.incoming_arms
+        )
+        assert all(
+            join_block.name in lowered.blocks[
+                book.page(SOURCE_EXCEPTION_SSA_CONTINUATION_ARM).latest(
+                    cell.row
+                ).exit_block.row[2]
+            ].successors
+            for cell in continuation.incoming_arms
+        )
+        assert CorrelationTable._source_exception_ssa_continuation_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
     finally:
@@ -707,6 +754,19 @@ def root(x: float) -> float:
                 handler_entry.entry_block.row[2]
             ].instrs
         )
+        continuation_row, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+        ).rows())
+        continuation = book.page(
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+        ).latest(continuation_row)
+        assert len(continuation.incoming_arms) == 2
+        assert continuation.join_block.row[2] in lowered.blocks[
+            handler_entry.entry_block.row[2]
+        ].successors
+        assert CorrelationTable._source_exception_ssa_continuation_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
         binding = book.page(CONTROL_VALUE_BINDING).latest((
             handler_entry_row[0], input_id,
         ))

@@ -1562,6 +1562,7 @@ class CorrelationTable:
         found.extend(self._source_exception_ssa_handler_arm_findings(module))
         found.extend(self._source_exception_ssa_handler_state_findings(module))
         found.extend(self._source_exception_ssa_handler_entry_findings(module))
+        found.extend(self._source_exception_ssa_continuation_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_handler_arm_value_findings(module))
@@ -3187,6 +3188,145 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-ssa-handler-phi-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_continuation_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Post-Try native joins consume every exact source arm value."""
+        from .concordance_declarations import (
+            PHI_CONDITIONAL, SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
+            SOURCE_EXCEPTION_CONTINUATION_PHI,
+            SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
+            SSA_BLOCK, SSA_VALUE, ExceptionContinuationArmValueFact,
+            ExceptionContinuationPhiFact, ExceptionSSAContinuationArmFact,
+            ExceptionSSAContinuationPhiFact, SSABlockKind,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or (
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI.name not in book.pages
+        ):
+            return []
+        phis = book.page(SOURCE_EXCEPTION_SSA_CONTINUATION_PHI)
+        arms = book.page(SOURCE_EXCEPTION_SSA_CONTINUATION_ARM)
+        source_arms = book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE)
+        found = []
+        for row in phis.rows():
+            fact = phis.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_CONTINUATION_PHI, row)
+            problem = None
+            if not isinstance(fact, ExceptionSSAContinuationPhiFact) or not all(
+                isinstance(cell, Ref) for cell in (
+                    fact.source_phi, fact.join_block,
+                    fact.result_value, *fact.incoming_arms,
+                )
+            ):
+                problem = "native Try continuation lacks exact cells"
+            else:
+                source_phi = book.page(
+                    SOURCE_EXCEPTION_CONTINUATION_PHI
+                ).latest(fact.source_phi.row)
+                expected = tuple(
+                    book.latest_ref(
+                        SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
+                        source_row,
+                    )
+                    for source_row in sorted(
+                        source_arms.rows(), key=lambda item: int(item[2]),
+                    )
+                    if isinstance(source_arms.latest(source_row),
+                                  ExceptionContinuationArmValueFact)
+                    and source_arms.latest(source_row).source_phi
+                    == fact.source_phi
+                )
+                actual = tuple(
+                    arms.latest(cell.row).source_arm
+                    if isinstance(arms.latest(cell.row),
+                                  ExceptionSSAContinuationArmFact)
+                    else None
+                    for cell in fact.incoming_arms
+                )
+                mint = book.mint_of(fact.result_value)
+                if (
+                    fact.source_phi.page != SOURCE_EXCEPTION_CONTINUATION_PHI
+                    or not isinstance(source_phi,
+                                      ExceptionContinuationPhiFact)
+                    or fact.join_block.page != SSA_BLOCK
+                    or book.page(SSA_BLOCK).latest(
+                        fact.join_block.row
+                    ) is not SSABlockKind.EXCEPTION_JOIN
+                    or fact.result_value.page != SSA_VALUE
+                    or fact.result_value.row[0] != row[0]
+                    or mint is None or mint[0] != PHI_CONDITIONAL
+                    or not expected or actual != expected
+                    or any(
+                        cell.page != SOURCE_EXCEPTION_SSA_CONTINUATION_ARM
+                        or cell.row[:2] != row
+                        for cell in fact.incoming_arms
+                    )
+                    or any(book.latest_ref(cell.page, cell.row) != cell
+                           for cell in (
+                               fact.source_phi, fact.join_block,
+                               fact.result_value, *fact.incoming_arms,
+                           ))
+                ):
+                    problem = "native Try continuation disagrees with source arms"
+                elif receipt is None or {
+                    cause for cause, _stage in book.edges_into(receipt)
+                } != {
+                    fact.source_phi, fact.join_block,
+                    fact.result_value, *fact.incoming_arms,
+                }:
+                    problem = "native Try continuation provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-continuation-disagreement",
+                    str(row), None, problem,
+                ))
+        for row in arms.rows():
+            fact = arms.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
+                                      row)
+            problem = None
+            if not isinstance(fact, ExceptionSSAContinuationArmFact) or not all(
+                isinstance(cell, Ref) for cell in (
+                    fact.source_arm, fact.exit_block, fact.incoming_value,
+                )
+            ):
+                problem = "native Try continuation arm lacks exact cells"
+            else:
+                source = source_arms.latest(fact.source_arm.row)
+                if (
+                    fact.source_arm.page
+                    != SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE
+                    or not isinstance(source,
+                                      ExceptionContinuationArmValueFact)
+                    or int(source.canonical_phi.row[1]) != int(row[1])
+                    or int(fact.source_arm.row[2]) != int(row[2])
+                    or fact.exit_block.page != SSA_BLOCK
+                    or fact.incoming_value.page != SSA_VALUE
+                    or fact.incoming_value.row[0] != row[0]
+                    or any(book.latest_ref(cell.page, cell.row) != cell
+                           for cell in (
+                               fact.source_arm, fact.exit_block,
+                               fact.incoming_value,
+                           ))
+                ):
+                    problem = "native Try continuation arm disagrees with source"
+                elif receipt is None or {
+                    cause for cause, _stage in book.edges_into(receipt)
+                } != {
+                    fact.source_arm, fact.exit_block, fact.incoming_value,
+                }:
+                    problem = "native Try continuation arm provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-continuation-arm-disagreement",
                     str(row), None, problem,
                 ))
         return found

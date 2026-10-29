@@ -1393,6 +1393,42 @@ SOURCE_EXCEPTION_SSA_HANDLER_PHI = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSAContinuationArmFact:
+    """One source Try continuation arm's value at its native exit."""
+
+    source_arm: Ref
+    exit_block: Ref
+    incoming_value: Ref
+
+
+SOURCE_EXCEPTION_SSA_CONTINUATION_ARM = declare_page(
+    "source_exception_ssa_continuation_arm", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("canonical_phi", K.VALUE_ID),
+        RowField("arm", K.INDEX),
+    ), ExceptionSSAContinuationArmFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionSSAContinuationPhiFact:
+    """Post-Try SSA value joined from exact source continuation arms."""
+
+    source_phi: Ref
+    join_block: Ref
+    result_value: Ref
+    incoming_arms: tuple[Ref, ...]
+
+
+SOURCE_EXCEPTION_SSA_CONTINUATION_PHI = declare_page(
+    "source_exception_ssa_continuation_phi", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("canonical_phi", K.VALUE_ID),
+    ), ExceptionSSAContinuationPhiFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionHandlerEntryFact:
     """Candidate failure edges and binding versions at one handler entry."""
 

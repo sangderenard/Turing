@@ -12035,6 +12035,8 @@ class _ControlSSABuilder(TiledObject):
         """Select exact status routes while admission remains shut."""
         from .concordance_declarations import (
             CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+            SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
+            SOURCE_EXCEPTION_CONTINUATION_PHI,
             SOURCE_EXCEPTION_HANDLER_CLASS,
             SOURCE_EXCEPTION_HANDLER_ENTRY,
             SOURCE_EXCEPTION_HANDLER_PHI,
@@ -12043,13 +12045,18 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_SSA_HANDLER_PHI,
             SOURCE_EXCEPTION_SSA_HANDLER_STATE,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
             SOURCE_EXCEPTION_SSA_ROUTE, SOURCE_EXCEPTION_STATUS_ROUTE,
+            ExceptionContinuationArmValueFact,
+            ExceptionContinuationPhiFact,
             ExceptionHandlerArmValueFact, ExceptionHandlerClassFact,
             ExceptionHandlerEntryFact, ExceptionHandlerPhiFact,
             ExceptionRegionStateFact,
             ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
             ExceptionSSAHandlerPhiFact, ExceptionSSAHandlerStateFact,
-            ExceptionSSARouteFact,
+            ExceptionSSAContinuationArmFact,
+            ExceptionSSAContinuationPhiFact, ExceptionSSARouteFact,
             ExceptionStatusRouteFact,
         )
 
@@ -12087,6 +12094,99 @@ class _ControlSSABuilder(TiledObject):
             self.lower(block.orelse, path=f"{path}.try_else")
         self.lower(block.finalbody, path=f"{path}.try_finally")
         normal = self.current
+        continuation_sources = {}
+        for source_phi in block.continuation_phi_cells:
+            phi = book.page(SOURCE_EXCEPTION_CONTINUATION_PHI).cell(
+                source_phi.row, source_phi.column,
+            )
+            if not isinstance(phi, ExceptionContinuationPhiFact):
+                raise ValueError(
+                    "native Try continuation has no exact source Phi: "
+                    f"phi={source_phi!r}"
+                )
+            arm_rows = tuple(sorted((
+                row for row in book.page(
+                    SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE
+                ).rows()
+                if book.page(
+                    SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE
+                ).latest(row).source_phi == source_phi
+            ), key=lambda row: int(row[2])))
+            arms = tuple(
+                (book.latest_ref(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
+                                 row),
+                 book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE).latest(
+                     row,
+                 ))
+                for row in arm_rows
+            )
+            if not arms or any(
+                cell is None or not isinstance(
+                    fact, ExceptionContinuationArmValueFact,
+                ) for cell, fact in arms
+            ):
+                raise ValueError(
+                    "native Try continuation lacks source arm values: "
+                    f"phi={source_phi!r}"
+                )
+            continuation_sources[source_phi] = (phi, arms)
+
+        captured_continuation: dict[Ref, dict[Ref, tuple[BasicBlock, SSAValue]]] = {
+            source_phi: {} for source_phi in continuation_sources
+        }
+
+        def capture_continuation(
+            source_phi: Ref, kind: str, source_control: Ref,
+            canonical_control_id: int, exit_block: BasicBlock,
+        ) -> bool:
+            _phi, arms = continuation_sources[source_phi]
+            selected = tuple(
+                (cell, fact) for cell, fact in arms
+                if fact.arm_kind == kind
+                and fact.source_control == source_control
+                and int(fact.canonical_control.row[1])
+                == int(canonical_control_id)
+            )
+            if not selected:
+                return False
+            if len(selected) != 1:
+                raise ValueError(
+                    "native Try continuation has duplicate source arms: "
+                    f"phi={source_phi!r}, control={source_control!r}"
+                )
+            arm_cell, arm = selected[0]
+            value_id = int(arm.canonical_value.row[1])
+            incoming = self.external_values.get(value_id)
+            if incoming is None and value_id in self.constant_value_ids:
+                incoming = self.external_value(value_id)
+            if incoming is None or not self._value_dominates_block(
+                incoming, exit_block.name,
+            ):
+                raise ValueError(
+                    "native Try continuation arm has no live SSA value: "
+                    f"phi={source_phi!r}, arm={arm_cell!r}"
+                )
+            captured_continuation[source_phi][arm_cell] = (
+                exit_block, incoming,
+            )
+            return True
+
+        join = None
+        if continuation_sources:
+            for source_phi, (phi, _arms) in continuation_sources.items():
+                if not capture_continuation(
+                    source_phi, "success", phi.owner,
+                    block.source_try_node_id, normal,
+                ):
+                    raise ValueError(
+                        "native Try continuation has no success arm: "
+                        f"phi={source_phi!r}"
+                    )
+            join = self.new_block(
+                "exception_join",
+                also=tuple(continuation_sources), owner=frame["owner"],
+            )
+            self.branch(join)
         handler_entries: dict[Ref, BasicBlock] = {}
         handler_incoming: dict[Ref, list[Ref]] = {}
         handler_ordinals: dict[Ref, int] = {}
@@ -12374,9 +12474,9 @@ class _ControlSSABuilder(TiledObject):
                         "native Try handler identity has two control arms: "
                         f"handler={route.selected_handler!r}"
                     )
-                # A selected route reaches its handler entry. Its body
-                # still ends in status propagation until the continuation
-                # and pending finalizer outcomes are executable.
+                # A selected route reaches its handler entry. The source
+                # continuation facts decide whether its body falls through
+                # to the post-Try join or terminates separately.
                 self.branch(entry)
                 handler_incoming[route.selected_handler].append(
                     ssa_route_cell
@@ -12660,6 +12760,45 @@ class _ControlSSABuilder(TiledObject):
                 block.handlers[handler_ordinals[source_handler]].body,
                 path=f"{path}.try_handler[{handler_ordinals[source_handler]}]",
             )
+            handled = tuple(
+                any(
+                    fact.arm_kind == "handler"
+                    and fact.source_control == source_handler
+                    and int(fact.canonical_control.row[1]) == int(
+                        block.handlers[
+                            handler_ordinals[source_handler]
+                        ].source_handler_node_id
+                    )
+                    for _cell, fact in arms
+                )
+                for _phi, arms in continuation_sources.values()
+            )
+            if join is not None and handled and all(handled):
+                self.lower(
+                    block.finalbody,
+                    path=f"{path}.try_handler_finally["
+                    f"{handler_ordinals[source_handler]}]",
+                )
+                handled_exit = self.current
+                for source_phi in continuation_sources:
+                    if not capture_continuation(
+                        source_phi, "handler", source_handler,
+                        block.handlers[
+                            handler_ordinals[source_handler]
+                        ].source_handler_node_id,
+                        handled_exit,
+                    ):
+                        raise ValueError(
+                            "native Try handler lost continuation arm: "
+                            f"handler={source_handler!r}"
+                        )
+                self.branch(join)
+                continue
+            if any(handled):
+                raise ValueError(
+                    "native Try handler participates in only some joins: "
+                    f"handler={source_handler!r}"
+                )
             self.emit(
                 Handler.Call, [status_phi],
                 attributes={
@@ -12672,15 +12811,118 @@ class _ControlSSABuilder(TiledObject):
                     "native handler entry has no fault exit"
                 )
             self.branch(self._fault_exit)
-        self.current = normal
-        # The status is taken on the exact protected edge and restored
-        # before the existing fault exit. Until dispatch, joins and pending
-        # finalizer outcomes consume the route facts, no artifact may claim
-        # this Try is executable.
+        if join is not None:
+            join_cell = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, join.name),
+            )
+            if join_cell is None:
+                raise ValueError("native Try continuation has no join cell")
+            for source_phi, (_phi, arms) in continuation_sources.items():
+                captured = captured_continuation[source_phi]
+                if set(captured) != {cell for cell, _fact in arms}:
+                    raise ValueError(
+                        "native Try continuation lacks an exact exit arm: "
+                        f"phi={source_phi!r}"
+                    )
+                exits = tuple(captured[cell][0] for cell, _fact in arms)
+                values = tuple(captured[cell][1] for cell, _fact in arms)
+                dtype = self._numeric_join(values) or next((
+                    value.dtype for value in values
+                    if value.dtype not in {None, "unknown", "none", "None"}
+                ), values[0].dtype)
+                converted = self._numeric_join_arms(
+                    dtype, tuple(zip(exits, values)),
+                )
+                if len({str(value.dtype) for value in converted
+                        if value.dtype not in {None, "unknown", "none", "None"}
+                       }) > 1:
+                    raise ValueError(
+                        "native Try continuation has unsettled arm classes: "
+                        f"phi={source_phi!r}"
+                    )
+                arm_cells = []
+                for (source_arm, arm), exit_block, value in zip(
+                    arms, exits, converted,
+                ):
+                    exit_cell = book.latest_ref(
+                        SSA_BLOCK,
+                        (self._scope(), self.function_name, exit_block.name),
+                    )
+                    if exit_cell is None:
+                        raise ValueError(
+                            "native Try continuation arm lacks exit block: "
+                            f"arm={source_arm!r}"
+                        )
+                    # Program: try: y=int(x); except ValueError: y=2.
+                    # Success yields canonical 6, handler yields canonical
+                    # 1. The final name y is not an arm identity; each
+                    # exit records its own source arm and SSA value.
+                    arm_cells.append(book.post(
+                        SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
+                        (self._scope(), int(arm.canonical_phi.row[1]),
+                         int(source_arm.row[2])),
+                        ExceptionSSAContinuationArmFact(
+                            source_arm, exit_cell, self._value_cell(value),
+                        ),
+                        stage=self._stage(),
+                        provenance=Derived((
+                            source_arm, exit_cell, self._value_cell(value),
+                        )),
+                        mode=Mode.CONCORD,
+                    ))
+                canonical_phis = {fact.canonical_phi for _cell, fact in arms}
+                if len(canonical_phis) != 1:
+                    raise ValueError(
+                        "native Try continuation arms disagree on Phi: "
+                        f"phi={source_phi!r}"
+                    )
+                canonical_phi = int(next(iter(canonical_phis)).row[1])
+                self.current = join
+                merged = self.fresh_value(
+                    dtype=dtype, transform=PHI_CONDITIONAL,
+                    operands=(source_phi, *arm_cells, *converted),
+                )
+                self.emit(
+                    Handler.Phi, list(converted), merged,
+                    attributes={
+                        "incoming_blocks": tuple(
+                            exit_block.name for exit_block in exits
+                        ),
+                        "binding": "native_exception_continuation_phi",
+                        "source_exception_continuation_phi_cell": source_phi,
+                    },
+                )
+                self._bind(
+                    canonical_phi, merged, BindingKind.CONDITIONAL_MERGE,
+                    source_phi, *arm_cells,
+                )
+                book.post(
+                    SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
+                    (self._scope(), canonical_phi),
+                    ExceptionSSAContinuationPhiFact(
+                        source_phi, join_cell, self._value_cell(merged),
+                        tuple(arm_cells),
+                    ),
+                    stage=self._stage(),
+                    provenance=Derived((
+                        source_phi, join_cell, self._value_cell(merged),
+                        *arm_cells,
+                    )),
+                    mode=Mode.CONCORD,
+                )
+            self.current = join
+        else:
+            self.current = normal
+        # The status is taken at the protected edge. Selected handlers with
+        # source continuation arms join normal control; unmatched status
+        # still reaches the fault exit without full finalizer unwinding.
+        # Until every abrupt outcome and nested transfer is represented,
+        # no public artifact may claim this Try is executable.
         self.shortfalls.append(SSALoweringShortfall(
             "control", "native_try_dispatch", path,
-            "authored Try selects concorded status routes but has no "
-            "executable handler join or pending finalizer outcomes",
+            "authored Try has source-owned handler joins but lacks "
+            "complete unmatched unwinding and pending finalizer outcomes",
         ))
 
     def _lower(self, block: ControlBlock, *, path: str = "root") -> None:
