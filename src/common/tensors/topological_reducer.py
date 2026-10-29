@@ -23017,19 +23017,47 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
             else None
         )
+        # Program: ``def parse(v) -> Lvl | None`` returning ``Lvl(v)`` on
+        # one path and ``None`` on others (bootstrap
+        # ``parse_identity_log_level``, c938).  Wrong record: the one
+        # returned construction was posted as the class of every call
+        # result, contradicting the returned ``None``.  Rule: a result is a
+        # constructed class only when every exit of the function itself
+        # (never a nested definition's) returns a construction of it.
+        def own_returns(node: ast.AST):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (
+                    ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                    ast.ClassDef,
+                )):
+                    continue
+                if isinstance(child, ast.Return):
+                    yield child
+                yield from own_returns(child)
+
+        def always_exits(body: list[ast.stmt]) -> bool:
+            if not body:
+                return False
+            last = body[-1]
+            if isinstance(last, (ast.Return, ast.Raise)):
+                return True
+            if isinstance(last, ast.If):
+                return always_exits(last.body) and always_exits(last.orelse)
+            return False
+
+        returns = tuple(own_returns(definition))
         returned_classes = {
-            returned.func.id
-            for returned in (
-                node.value for node in ast.walk(definition)
-                if isinstance(node, ast.Return) and node.value is not None
-            )
-            if isinstance(returned, ast.Call)
-            and isinstance(returned.func, ast.Name)
-            and returned.func.id in graph.G.graph["class_table"]
+            returned.value.func.id
+            if isinstance(returned.value, ast.Call)
+            and isinstance(returned.value.func, ast.Name)
+            and returned.value.func.id in graph.G.graph["class_table"]
+            else None
+            for returned in returns
         }
         inferred_class = declared_class or (
             next(iter(returned_classes))
-            if len(returned_classes) == 1 else None
+            if len(returned_classes) == 1 and always_exits(definition.body)
+            else None
         )
         return None if inferred_class is None else str(inferred_class)
 
