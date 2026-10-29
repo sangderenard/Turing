@@ -48,10 +48,11 @@ chunk is a numbered prerequisite of it.
 from __future__ import annotations
 
 import hashlib
+import dataclasses
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from ..common.tensors.fused_ir import FusedProgram, ordered_feed_ids
+from ..common.tensors.fused_ir import FusedProgram, Meta, ordered_feed_ids
 from .process_graph_fusion import (
     DispatchRegion, dispatch_region_to_fused_program,
     fused_program_to_process_graph,
@@ -796,6 +797,23 @@ def _boundary_region(
     return DispatchRegion(window, input_ids, outputs, score=0.0)
 
 
+def _carry_working_dtype(
+    chunk: FusedProgram, working_dtype: str | None,
+) -> FusedProgram:
+    """Record the parent's working dtype on a chunk's undescribed feeds."""
+
+    if working_dtype is None:
+        return chunk
+    meta = dict(chunk.meta or {})
+    for feed_id in chunk.feeds:
+        entry = meta.get(feed_id)
+        if entry is None:
+            meta[feed_id] = Meta(dtype=working_dtype)
+        elif not entry.dtype:
+            meta[feed_id] = dataclasses.replace(entry, dtype=working_dtype)
+    return dataclasses.replace(chunk, meta=meta)
+
+
 def partition_reduced_program(
     program: FusedProgram, *, chunk_size: int, owner_name: str
 ) -> list[ClassModuleSpec]:
@@ -863,10 +881,26 @@ def partition_reduced_program(
         len(windows) - 1,
     )
 
+    # Every chunk is a cut of one module family and runs in the parent's
+    # working type. A boundary feed is an intermediate the parent never gave
+    # a record of its own, so the chunk would otherwise arrive with no dtype.
+    working_dtype = next(
+        (
+            str(entry.dtype)
+            for entry in (
+                (program.meta or {}).get(feed_id)
+                for feed_id in ordered_feed_ids(program)
+            )
+            if entry is not None and entry.dtype
+        ),
+        None,
+    )
     specs: list[ClassModuleSpec] = []
     for index, window in enumerate(windows):
         region = _boundary_region(graph, window, topological)
-        chunk_program = dispatch_region_to_fused_program(graph, region)
+        chunk_program = _carry_working_dtype(
+            dispatch_region_to_fused_program(graph, region), working_dtype,
+        )
         depends_on = sorted({
             chunk_of[value_id]
             for value_id in region.input_ids

@@ -1,6 +1,6 @@
 import pytest
 
-from src.common.tensors.fused_ir import FusedProgram, OpStep
+from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from src.compiler import machine_targets
 from src.compiler.fused_program_wasm_backend import (
     WasmEmissionError,
@@ -8,9 +8,15 @@ from src.compiler.fused_program_wasm_backend import (
 )
 
 
+def _float64_meta(feeds):
+    """The feeds' dtype record: a hand-built program states its element type."""
+
+    return {int(feed): Meta(dtype="float64") for feed in feeds}
+
+
 def _program(*steps: OpStep, feeds, outputs) -> FusedProgram:
     return FusedProgram(
-        version=1, feeds=set(feeds), steps=list(steps), outputs=dict(outputs)
+        version=1, feeds=set(feeds), meta=_float64_meta(set(feeds)), steps=list(steps), outputs=dict(outputs)
     )
 
 

@@ -2,16 +2,22 @@ import struct
 
 import pytest
 
-from src.common.tensors.fused_ir import FusedProgram, OpStep
+from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from src.compiler.fused_program_wasm_backend import emit_wasm_module
 from src.compiler.wasm_binary import (
     CodeBuilder, WasmImport, build_module, sleb, uleb,
 )
 
 
+def _float64_meta(feeds):
+    """The feeds' dtype record: a hand-built program states its element type."""
+
+    return {int(feed): Meta(dtype="float64") for feed in feeds}
+
+
 def _program(steps, feeds, outputs):
     return FusedProgram(
-        version=1, feeds=set(feeds), steps=list(steps), outputs=dict(outputs)
+        version=1, feeds=set(feeds), meta=_float64_meta(set(feeds)), steps=list(steps), outputs=dict(outputs)
     )
 
 
@@ -77,14 +83,14 @@ def test_an_incomplete_program_assembles_nothing():
     """A program with a step WebAssembly cannot express must not produce a
     binary that quietly omits it.
 
-    tan is the example now that the catalogue covers the transcendentals:
-    it has poles inside any interval worth tabulating, so no bounded table
-    describes it and it stays refused rather than approximated.
+    sort is the example: a shape operation, not a function of one element,
+    so no elementwise lowering expresses it (tan, the old example, is lowered
+    through the sin/cos tables now).
     """
 
     module = emit_wasm_module(
         _program(
-            [OpStep(step_id=0, op_name="tan", input_ids=[1], attrs={}, result_id=2)],
+            [OpStep(step_id=0, op_name="sort", input_ids=[1], attrs={}, result_id=2)],
             (1,),
             {"result": 2},
         ),
@@ -144,7 +150,7 @@ def test_a_program_using_tanh_bakes_the_table_and_reserves_room_for_it():
     from src.compiler.fused_program_wasm_backend import emit_wasm_module, tanh_table
 
     program = FusedProgram(
-        version=1, feeds={1},
+        version=1, feeds={1}, meta=_float64_meta({1}),
         steps=[OpStep(step_id=0, op_name="tanh", input_ids=[1], attrs={}, result_id=2)],
         outputs={"result": 2},
     )
@@ -311,7 +317,7 @@ def test_feed_order_follows_the_program_not_the_id_allocator():
     high, low, mid = 900, 100, 500
     program = FusedProgram(
         version=1,
-        feeds={high, low, mid},
+        feeds={high, low, mid}, meta=_float64_meta({high, low, mid}),
         steps=[
             OpStep(step_id=0, op_name="add", input_ids=[high, low], attrs={}, result_id=10),
             OpStep(step_id=1, op_name="mul", input_ids=[10, mid], attrs={}, result_id=11),
@@ -329,7 +335,7 @@ def test_a_feed_nothing_reads_still_gets_a_parameter():
     from src.compiler.fused_program_wasm_backend import program_feed_order
 
     program = FusedProgram(
-        version=1, feeds={7, 3},
+        version=1, feeds={7, 3}, meta=_float64_meta({7, 3}),
         steps=[OpStep(step_id=0, op_name="abs", input_ids=[7], attrs={}, result_id=9)],
         outputs={"result": 9},
     )
@@ -346,7 +352,7 @@ def test_feeds_are_named_after_their_source_parameters():
     from src.compiler.fused_program_wasm_backend import feed_names
 
     program = FusedProgram(
-        version=1, feeds={11, 22},
+        version=1, feeds={11, 22}, meta=_float64_meta({11, 22}),
         steps=[OpStep(step_id=0, op_name="add", input_ids=[11, 22], attrs={}, result_id=3)],
         outputs={"result": 3},
         extras={"capture_feed_origins": {
@@ -364,12 +370,12 @@ def test_unnamed_or_unusable_names_fall_back_positionally():
     from src.compiler.fused_program_wasm_backend import feed_names
 
     steps = [OpStep(step_id=0, op_name="add", input_ids=[11, 22], attrs={}, result_id=3)]
-    bare = FusedProgram(version=1, feeds={11, 22}, steps=steps,
+    bare = FusedProgram(version=1, feeds={11, 22}, meta=_float64_meta({11, 22}), steps=steps,
                         outputs={"result": 3})
     assert feed_names(bare, [11, 22]) == ["feed0", "feed1"]
 
     awkward = FusedProgram(
-        version=1, feeds={11, 22}, steps=steps, outputs={"result": 3},
+        version=1, feeds={11, 22}, meta=_float64_meta({11, 22}), steps=steps, outputs={"result": 3},
         extras={"capture_feed_origins": {
             11: {"binding_name": "not an identifier"},
             22: {"binding_name": "cx"},
@@ -383,7 +389,7 @@ def test_colliding_names_are_made_unique():
     from src.compiler.fused_program_wasm_backend import feed_names
 
     program = FusedProgram(
-        version=1, feeds={11, 22},
+        version=1, feeds={11, 22}, meta=_float64_meta({11, 22}),
         steps=[OpStep(step_id=0, op_name="add", input_ids=[11, 22], attrs={}, result_id=3)],
         outputs={"result": 3},
         extras={"capture_feed_origins": {
