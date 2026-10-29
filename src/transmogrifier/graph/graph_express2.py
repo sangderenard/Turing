@@ -38,6 +38,7 @@ from .python_special_cases import (
     is_python_static_literal,
     lower_python_shell_file_contexts,
     lower_python_threading,
+    method_receiver_formal,
     python_dispatch_entry_expressions,
 )
 from .python_identity_programs import resolve_python_identity
@@ -1564,13 +1565,14 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
                 if isinstance(target, ast.Name):
                     add_attribute(target.id, None, "class", member, definition)
     for method in methods:
+        receiver = method_receiver_formal(method)
         for statement in ast.walk(method):
             if isinstance(statement, ast.Assign):
                 for target in statement.targets:
                     if (
                         isinstance(target, ast.Attribute)
                         and isinstance(target.value, ast.Name)
-                        and target.value.id == "self"
+                        and target.value.id == receiver
                     ):
                         add_attribute(
                             target.attr, None, "instance", statement, method,
@@ -1580,7 +1582,7 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
                 if (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
+                    and target.value.id == receiver
                 ):
                     add_attribute(
                         target.attr,

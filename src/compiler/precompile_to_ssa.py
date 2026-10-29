@@ -28961,6 +28961,7 @@ def lower_control_sections_to_ssa(
     region_output_value_ids: Mapping[int, tuple[int, ...]] | None = None,
     record_field_write_value_ids: tuple[int, ...] = (),
     self_value_id: int | None = None,
+    receiver_parameter: str | None = None,
     field_ops: tuple[tuple[str, int, int], ...] = (),
     field_write_state_cells: tuple[Any, ...] = (),
     field_const_sources: Mapping[int, Any] | None = None,
@@ -29099,6 +29100,11 @@ def lower_control_sections_to_ssa(
     known_value_ids.update(map(int, control_dependency_value_ids(control)))
     known_value_ids.update(int(value_id) for _kind, value_id, _slot in field_ops)
     if self_value_id is not None:
+        if receiver_parameter is None:
+            raise ValueError(
+                f"control section {control_name!r} has a receiver value "
+                f"{int(self_value_id)} but no receiver formal names it"
+            )
         known_value_ids.add(int(self_value_id))
     known_value_ids.update(map(int, required_output_value_ids))
     known_value_ids.update(map(int, record_field_write_value_ids))
@@ -29524,7 +29530,7 @@ def lower_control_sections_to_ssa(
             )
         if self_value_id is not None:
             storage_formals.setdefault(int(self_value_id), None)
-            formal_names.setdefault(int(self_value_id), "self")
+            formal_names.setdefault(int(self_value_id), str(receiver_parameter))
         # A formal-rooted candidate needs a row column only when its formal
         # is declared as a record / row handle carrying the payload (or
         # nothing declares it).  A declared span is its own binding: it is
@@ -32229,7 +32235,7 @@ def lower_control_sections_to_ssa(
         # owning class and the value stored there is that record instance:
         # read from the class field declaration and the value's own cell.
         declared_receiver = dict(
-            dict(parameter_record_abi or {}).get("self") or {}
+            dict(parameter_record_abi or {}).get(receiver_parameter) or {}
         )
         field_declaration_cell = _record_field_declaration_cell(
             declared_receiver, slot_name, identity=record_identity,
@@ -32332,7 +32338,7 @@ def lower_control_sections_to_ssa(
     scalar_field_accounting = {
         compact_slot[old_slot]: {
             "program_abi_record": str(record_identity),
-            "program_abi_parameter": "self",
+            "program_abi_parameter": str(receiver_parameter),
             "program_abi_field": str(field_names[old_slot]),
             "program_abi_mutable": bool(
                 (record_field_mutability or {}).get(field_names[old_slot], False)
@@ -32354,7 +32360,7 @@ def lower_control_sections_to_ssa(
     # accounting FROM the posted fact.
     from .frame_identity_book import _record_field_declaration_cell as _decl
     _field_receiver = dict(
-        dict(parameter_record_abi or {}).get("self") or {}
+        dict(parameter_record_abi or {}).get(receiver_parameter) or {}
     )
     scalar_field_physical = {
         compact_slot[old_slot]: (
@@ -32396,7 +32402,7 @@ def lower_control_sections_to_ssa(
         non_self_parameters = tuple(
             (str(name), int((identity_table or {})[name][0]))
             for name in function_parameters
-            if name != "self" and (identity_table or {}).get(name)
+            if name != receiver_parameter and (identity_table or {}).get(name)
         )
         non_self_param_ids = tuple(
             value_id for _name, value_id in non_self_parameters
@@ -32425,7 +32431,7 @@ def lower_control_sections_to_ssa(
             receiver_accounting=(
                 {
                     "program_abi_record": str(record_identity),
-                    "program_abi_parameter": "self",
+                    "program_abi_parameter": str(receiver_parameter),
                 }
                 if record_identity is not None else None
             ),

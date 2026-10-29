@@ -161,6 +161,7 @@ from ...transmogrifier.graph.python_special_cases import (
     interpret_python_special_case,
     interpret_python_static_value,
     is_python_static_literal,
+    method_receiver_formal,
 )
 from ...transmogrifier.graph.python_identity_programs import (
     resolve_python_identity,
@@ -6386,6 +6387,11 @@ def _normalize_lexical_values(
         else None
     )
     graph = function_graph
+    # The formal Python binds this method's receiver to, whatever it is
+    # named (``def __init__(me, n)``); ``None`` outside a class.
+    receiver_formal = (
+        method_receiver_formal(statement) if method_owner is not None else None
+    )
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
     deleted_names: set[str] = set()
@@ -10475,9 +10481,9 @@ def _normalize_lexical_values(
                 receiver_class = (
                     str(method_owner)
                     if (
-                        method_owner is not None
+                        receiver_formal is not None
                         and isinstance(expression.value, ast.Name)
-                        and expression.value.id in {"self", "cls"}
+                        and expression.value.id == receiver_formal
                     )
                     else refined_class or receiver_class_identity(receiver)
                 )
@@ -14999,9 +15005,9 @@ def _normalize_lexical_values(
             # never the RHS id or the SetAttr id.
             declared_field_cell = declared_field_schema_cell(
                 str(method_owner)
-                if method_owner is not None
+                if receiver_formal is not None
                 and isinstance(target.value, ast.Name)
-                and target.value.id in {"self", "cls"}
+                and target.value.id == receiver_formal
                 else receiver_class_identity(receiver),
                 target.attr,
             )

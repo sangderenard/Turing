@@ -1048,6 +1048,7 @@ def test_record_field_getattr_becomes_a_loaded_region_capture():
         function_outputs=("result",),
         function_parameters=("self", "input"),
         self_value_id=5,
+        receiver_parameter="self",
         field_ops=(("read", 6, 0),),
         field_count=1,
         field_names=("gain",),
