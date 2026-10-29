@@ -4825,6 +4825,101 @@ def _refuse_unsettled_host_scalars(graph: Any, planned_dtypes: Any) -> None:
         )
 
 
+_STATIC_READ_MISSING = object()
+
+
+def _static_literal_value(graph, value_id: int, depth: int = 0):
+    """The Python value a constant, or a field/element read off one, holds.
+
+    Follows ``GetAttr`` and constant-index ``Indexed`` reads down to a
+    ``const`` node; anything else (a computed value, a runtime input)
+    answers ``_STATIC_READ_MISSING``.
+    """
+
+    if depth > 16:
+        return _STATIC_READ_MISSING
+    data = graph.G.nodes.get(int(value_id), {})
+    kind = str(data.get("op") or data.get("type") or "").casefold()
+    if kind in {"const", "constant"}:
+        return data.get("constant")
+    parents = {
+        str(role): int(parent) for parent, role in (data.get("parents") or ())
+    }
+    if kind in {"getattr", "attribute"}:
+        field = (data.get("attributes") or {}).get("attribute")
+        receiver = next(
+            (parents[role] for role in ("value", "base", "object")
+             if role in parents),
+            None,
+        )
+        if field is None or receiver is None:
+            return _STATIC_READ_MISSING
+        holder = _static_literal_value(graph, receiver, depth + 1)
+        if holder is _STATIC_READ_MISSING:
+            return holder
+        try:
+            return getattr(holder, str(field))
+        except AttributeError:
+            return _STATIC_READ_MISSING
+    if kind == "indexed" and "base" in parents and "index" in parents:
+        holder = _static_literal_value(graph, parents["base"], depth + 1)
+        index = _static_literal_value(graph, parents["index"], depth + 1)
+        if holder is _STATIC_READ_MISSING or type(index) is not int:
+            return _STATIC_READ_MISSING
+        try:
+            return holder[index]
+        except (IndexError, KeyError, TypeError):
+            return _STATIC_READ_MISSING
+    return _STATIC_READ_MISSING
+
+
+def _static_literal_dtype(graph, value_id: int):
+    """The element dtype of a static literal read, or ``None``."""
+
+    data = graph.G.nodes.get(int(value_id), {})
+    if str(data.get("op") or data.get("type") or "").casefold() in {
+        "const", "constant",
+    }:
+        # A bare constant is typed by the literal rules elsewhere.
+        return None
+    value = _static_literal_value(graph, int(value_id))
+    if value is _STATIC_READ_MISSING:
+        return None
+    return _literal_element_dtype(value)
+
+
+def _literal_element_dtype(value: Any, depth: int = 0):
+    """The class a static literal's elements share, or ``None``.
+
+    A tuple or list of literals (``config.rows``) holds one element class
+    when every element settles to the same dtype; mixed or unsettled
+    elements answer ``None``.
+    """
+
+    if value is None or depth > 16:
+        return None
+    if isinstance(value, (tuple, list)):
+        dtypes = {_literal_element_dtype(item, depth + 1) for item in value}
+        if len(dtypes) == 1 and None not in dtypes:
+            return next(iter(dtypes))
+        return None
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+        try:
+            return python_int_literal_dtype(value)
+        except OverflowError:
+            return None
+    if isinstance(value, float):
+        return "float64"
+    dtype = getattr(value, "dtype", None)
+    if dtype is not None and hasattr(value, "shape"):
+        return str(dtype)
+    return None
+
+
 def _dtype_producer_cells(graph: Any, value_id: int, *extra: Any) -> tuple:
     """The cells that proved a region value's type, as the book holds them.
 
@@ -6071,9 +6166,9 @@ def _build_shell_hierarchy_plan(
             ) is not None:
                 return
             dtype = (
-                "bool" if type(literal) is bool else
-                python_int_literal_dtype(literal) if type(literal) is int else
-                "float64"
+                "bool" if isinstance(literal, bool) else
+                python_int_literal_dtype(literal) if isinstance(literal, int)
+                else "float64"
             )
             record_shape_transformation(
                 scope, int(value_id), scope, int(value_id),
@@ -6321,6 +6416,19 @@ def _build_shell_hierarchy_plan(
                         .get(str(receiver_binding))
                         if receiver_binding is not None else None
                     )
+                    receiver_node = (
+                        graph.G.nodes.get(receiver_id, {})
+                        if receiver_id is not None else {}
+                    )
+                    if receiver_value is None and str(
+                        receiver_node.get("op") or receiver_node.get("type")
+                        or ""
+                    ).casefold() in {"const", "constant"}:
+                        # A receiver the structural fold already replaced by
+                        # its bound record (``state.cursor`` once ``state``
+                        # is a specialized literal) holds the same object
+                        # as its constant; its field is read the same way.
+                        receiver_value = receiver_node.get("constant")
                     if receiver_value is not None:
                         try:
                             field_value = getattr(
@@ -6374,6 +6482,13 @@ def _build_shell_hierarchy_plan(
                         dtype = python_int_literal_dtype(literal)
                     elif isinstance(literal, float):
                         dtype = "float64"
+                if dtype is None and operation in {"getattr", "indexed"}:
+                    # A field or element read off a bound literal
+                    # (``config.rows[0]`` once the structural fold made
+                    # ``config`` a constant) is that literal's own value;
+                    # its class is read structurally, so the arithmetic it
+                    # feeds settles from its operands.
+                    dtype = _static_literal_dtype(graph, int(current))
                 # Callable/operator-reference edges are provenance, not
                 # numeric operands.  Letting their default domain dtype enter
                 # scalar promotion made an all-integer ``min`` or arithmetic
@@ -6924,6 +7039,14 @@ def _build_shell_hierarchy_plan(
                 for source in nx.ancestors(graph.G, int(value_id))
             ):
                 return None, ()
+            # A read off a bound literal (``self.config.rows[0]`` once the
+            # structural fold made ``self`` a constant) is that literal's own
+            # field or element: its class is the value's, read structurally.
+            static_dtype = _static_literal_dtype(graph, int(value_id))
+            if static_dtype is not None:
+                return (record[0], record[1], static_dtype), (
+                    _dtype_producer_cells(graph, int(value_id))
+                )
             if not terminal:
                 _post_region_value_obligation(graph, int(value_id))
                 return None, ()
@@ -25868,7 +25991,7 @@ def _tensor_descriptor_rule(
                             return None
                     if isinstance(literal, bool):
                         dtype = "bool"
-                    elif type(literal) is int:
+                    elif isinstance(literal, int):
                         from ..transmogrifier.dtype_layout import (
                             python_int_literal_dtype,
                         )
@@ -26351,7 +26474,7 @@ def _tensor_descriptor_rule(
                                 # weak scalar (``_promoting_sides``).
                                 if isinstance(literal, bool):
                                     literal_dtype = "bool"
-                                elif type(literal) is int:
+                                elif isinstance(literal, int):
                                     from ..transmogrifier.dtype_layout import (
                                         python_int_literal_dtype,
                                     )
@@ -29312,6 +29435,17 @@ def _fold_callsite_structural_values(
                 return bool(np.array_equal(left, right))
             except (TypeError, ValueError):
                 return False
+        from .concordance_declarations import literal_identity
+
+        left_key = literal_identity(left)
+        right_key = literal_identity(right)
+        if left_key is not left or right_key is not right:
+            # An AbstractTensor literal, or a record holding one, answers
+            # ``==`` elementwise and its truth value refuses, so the same
+            # value read as "changed" on every round and the fixed point
+            # never closed.
+
+            return left_key == right_key
         try:
             return bool(left == right)
         except (TypeError, ValueError):
@@ -29356,7 +29490,7 @@ def _fold_callsite_structural_values(
                         # A scalar literal operand is an exact rank-0 value.
                         if isinstance(literal, bool):
                             literal_dtype = "bool"
-                        elif type(literal) is int:
+                        elif isinstance(literal, int):
                             from ..transmogrifier.dtype_layout import (
                                 python_int_literal_dtype,
                             )
