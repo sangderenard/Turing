@@ -132,6 +132,34 @@ except ImportError:
         return False
 
 
+def _bind_resident_entry(root, artifact, libraries, entries):
+    """Load an artifact's library once and declare its entry ABI once.
+
+    A loader behaves like any Python library with native code: every image
+    it can call is loaded when the loader loads, and a call goes straight
+    into the resident entry instead of loading on first use and redeclaring
+    ``argtypes`` on every call.  Keyed by the ARTIFACT, never by the method:
+    one method owns a deployment row per baked width, each its own library
+    with its own entry symbol.
+    """
+
+    key = (str(artifact["library_path"]), str(artifact["name"]))
+    entry = entries.get(key)
+    if entry is not None:
+        return entry
+    library = libraries.get(key[0])
+    if library is None:
+        library = ctypes.CDLL(str(Path(root) / key[0]))
+        libraries[key[0]] = library
+    entry = library[key[1]]
+    entry.restype = None
+    entry.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32),
+    ]
+    entries[key] = entry
+    return entry
+
+
 class CompiledObjectReverse:
     """Generated Python ABI for the product's compiled method VJPs."""
 
@@ -147,6 +175,12 @@ class CompiledObjectReverse:
         self._methods = {item["name"]: item for item in record["methods"]}
         self._artifacts = record["artifacts"]
         self._libraries = {}
+        self._entries = {}
+        for method in self.methods:
+            _bind_resident_entry(
+                self.root, self._artifacts[method]["parametric_reverse"],
+                self._libraries, self._entries,
+            )
 
     @staticmethod
     def _checked_feed(value, declared, dtype, method, value_id):
@@ -234,20 +268,9 @@ class CompiledObjectReverse:
                 extents.append(0)
             else:
                 raise ValueError(f"cannot derive reverse extent {(value_id, kind, axis)!r}")
-        # Keyed by the ARTIFACT, never by the method: one method now owns a
-        # deployment row per baked width, each its own library with its own
-        # entry symbol, and a per-method cache handed the baseline's library
-        # to a specialized call, which then could not find its entry point.
-        cache_key = str(artifact["library_path"])
-        library = self._libraries.get(cache_key)
-        if library is None:
-            library = ctypes.CDLL(str(self.root / artifact["library_path"]))
-            self._libraries[cache_key] = library
-        entry = getattr(library, artifact["name"])
-        entry.restype = None
-        entry.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32),
-        ]
+        entry = _bind_resident_entry(
+            self.root, artifact, self._libraries, self._entries,
+        )
         extent_array = (ctypes.c_int32 * len(extents))(*extents)
         entry(pointers, extent_array)
         gradients = {
@@ -275,6 +298,23 @@ class CompiledStandardObject:
         self.deployment_matrix = tuple(record["deployment_matrix"])
         self._artifacts = record["artifacts"]
         self._libraries = {}
+        self._entries = {}
+        for method in self.methods:
+            artifacts = self._artifacts[method]
+            for forward in (
+                artifacts["parametric_forward"],
+                *artifacts.get("specialized_forwards", ()),
+            ):
+                # A forward that publishes no artifact has no image to load;
+                # calling it natively refuses in ``_call`` as before.
+                if (
+                    forward.get("kind") == "captured_graph"
+                    and "artifact" in forward
+                ):
+                    _bind_resident_entry(
+                        self.root, forward["artifact"],
+                        self._libraries, self._entries,
+                    )
         self._installations = {}
         #: Installed-call routing evidence, in the spirit of the kernel bank's
         #: routing_log: how many calls each method served from a baked core and
@@ -552,20 +592,9 @@ class CompiledStandardObject:
                 extents.append(int(value.shape[int(axis)]))
             else:
                 raise ValueError(f"cannot derive forward extent {(value_id, kind, axis)!r}")
-        # Keyed by the ARTIFACT, never by the method: one method now owns a
-        # deployment row per baked width, each its own library with its own
-        # entry symbol, and a per-method cache handed the baseline's library
-        # to a specialized call, which then could not find its entry point.
-        cache_key = str(artifact["library_path"])
-        library = self._libraries.get(cache_key)
-        if library is None:
-            library = ctypes.CDLL(str(self.root / artifact["library_path"]))
-            self._libraries[cache_key] = library
-        entry = getattr(library, artifact["name"])
-        entry.restype = None
-        entry.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int32),
-        ]
+        entry = _bind_resident_entry(
+            self.root, artifact, self._libraries, self._entries,
+        )
         extent_array = (ctypes.c_int32 * len(extents))(*extents)
         entry(pointers, extent_array)
         outputs = tuple(

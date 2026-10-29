@@ -31,6 +31,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from .native_residency import resident_library
+
 _CONTRACTS = Path(__file__).resolve().parents[2] / "extraction_contracts"
 
 #: The slot ABI of every external: the piece buffer ABI.
@@ -1098,7 +1100,7 @@ def bind_external_slots(artifact: Any, implementations: Mapping[str, Any]) -> Ex
     if missing:
         raise ValueError(f"{artifact.name}: externals not supplied: {missing}")
     artifact.entry()
-    library = ctypes.CDLL(str(artifact.library_path))
+    library = resident_library(artifact.library_path)
     binder = getattr(library, f"{artifact.name}__bind_external")
     binder.restype = ctypes.c_int32
     binder.argtypes = [ctypes.c_int32, ctypes.c_void_p]
@@ -1126,6 +1128,6 @@ def check_external_faults(artifact: Any) -> None:
         return
     binding = _BINDINGS.get((str(artifact.library_path), artifact.name))
     if binding is None:
-        library = ctypes.CDLL(str(artifact.library_path))
+        library = resident_library(artifact.library_path)
         binding = ExternalSlotBinding(artifact, library, artifact.name, [])
     binding.check()
