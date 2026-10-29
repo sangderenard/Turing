@@ -1871,31 +1871,51 @@ def _indexed_store_source(graph: Any, value_id: Any) -> Any:
     stores into is that list's one storage, as a store version is, so the
     walk crosses ``LoopResult`` ``value`` edges -- but answers only through
     a store it reaches; a loop result that carries no store is itself.
+
+    Program: ``status, count = envelope(...); out = [0] * count; if status
+    == 0: while ...: out[i] = ...`` then ``return status, out`` (the core's
+    ``intern_batch``).  Wrong record: the returned version was the
+    conditional's merge of the loop's version and the untouched list, so
+    the walk stopped at the merge and the caller's views of ``out`` named no
+    storage ("capacity ... not a formal, never defined").  Rule: a merge
+    whose arms are versions of one list is that list's one storage, as a
+    store version is; arms that reach different storage are a real merge and
+    stay themselves.
     """
 
     target = getattr(graph, "G", graph)
-    roles = {"IndexedStore": "base", "LoopResult": "value"}
-    seen: set[int] = set()
-    current, stored = value_id, value_id
-    while (
-        isinstance(current, int)
-        and current in target
-        and current not in seen
-        and target.nodes[current].get("type") in roles
-    ):
-        seen.add(current)
+    roles = {"IndexedStore": ("base",), "LoopResult": ("value",),
+             "Phi": ("body", "orelse")}
+
+    def storage(current: Any, seen: frozenset) -> tuple[Any, bool]:
+        """(the storage ``current`` versions, whether a store was crossed)."""
+
+        if (
+            not isinstance(current, int)
+            or current not in target
+            or current in seen
+            or target.nodes[current].get("type") not in roles
+        ):
+            return current, False
         kind = target.nodes[current].get("type")
-        current = next(
-            (
-                parent
-                for parent, role in target.nodes[current].get("parents") or ()
-                if role == roles[kind]
-            ),
-            None,
+        parents = target.nodes[current].get("parents") or ()
+        arms = [
+            next((parent for parent, role in parents if role == wanted), None)
+            for wanted in roles[kind]
+        ]
+        if any(arm is None for arm in arms):
+            return current, False
+        resolved = [storage(arm, seen | {current}) for arm in arms]
+        sources = {source for source, _stored in resolved}
+        crossed = kind == "IndexedStore" or any(
+            stored for _source, stored in resolved
         )
-        if kind == "IndexedStore":
-            stored = current
-    return stored
+        if len(sources) != 1 or not crossed:
+            return current, False
+        return next(iter(sources)), True
+
+    source, crossed = storage(value_id, frozenset())
+    return source if crossed else value_id
 
 
 def _is_row_collection(graph: Any, value_id: Any) -> bool:
