@@ -32482,12 +32482,24 @@ def lower_control_sections_to_ssa(
                     _function_value_dtypes.setdefault(
                         int(_value.id), set()
                     ).add(str(_value.dtype))
+    # Program: ``self.steps = 0`` in a constructor that never reads it.
+    # Wrong record: the written constant is no instruction's operand in the
+    # function (the field store is the epilogue's), so its op carried no
+    # dtype and the slot was refused.  Rule: a value no instruction carries
+    # is typed by the plan that typed it (``value_dtypes``, the record the
+    # constant materializer reads).
     for _name in undeclared_scalar_fields:
         _slot = field_names.index(_name)
         _seen = set()
         for _kind, _value_id, _op_slot in field_ops:
             if int(_op_slot) == _slot:
-                _seen |= _function_value_dtypes.get(int(_value_id), set())
+                _carried = _function_value_dtypes.get(int(_value_id))
+                _planned = (value_dtypes or {}).get(int(_value_id))
+                _seen |= (
+                    _carried if _carried
+                    else {str(_planned)} if _planned is not None
+                    else set()
+                )
         if len(_seen) != 1:
             raise ValueError(
                 f"record scalar slot ABI lacks dtype in {control_function.name} "
