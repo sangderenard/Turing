@@ -45743,12 +45743,16 @@ def _class_surface_ssa_program(
             for value in (caller_graph.graph.get(key),)
             if value
         }
+        from .glsl_deployment_strategy import _call_projection_scope
+
+        projection_scope = _call_projection_scope(caller_graph)
         caller_projections = {
-            int(path[0]): int(row[1])
-            for row in projection_identity_page.scope_rows(callsite_id)
+            int(path[0]): int(row[2])
+            for row in projection_identity_page.scope_rows(projection_scope)
             for path in (projection_identity_page.latest(row),)
             if (
-                isinstance(row, tuple) and len(row) == 2
+                isinstance(row, tuple) and len(row) == 3
+                and int(row[1]) == callsite_id
                 and path and len(path) == 1
             )
         }
@@ -45794,7 +45798,7 @@ def _class_surface_ssa_program(
                 ),
                 projection_book.latest_ref(
                     _CALL_RESULT_PROJECTION,
-                    (callsite_id, int(caller_projection_id)),
+                    (projection_scope, callsite_id, int(caller_projection_id)),
                 ),
                 _frame_graph_cell(caller_graph, callsite_id),
                 _frame_graph_cell(caller_graph, int(caller_projection_id)),

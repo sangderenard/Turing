@@ -2036,6 +2036,23 @@ def _authored_output_paths(graph, outputs):
     return paths
 
 
+def _call_projection_scope(graph) -> str:
+    """The calling function a CALL_RESULT_PROJECTION row is scoped to.
+
+    Program: ``env, s, t = v.batch(...)`` in ``root`` and again in ``one``
+    (string-core ``intern_batch`` then ``intern``).  Wrong record: rows were
+    keyed by (call node, projection node) alone, and node ids are local to
+    one function's graph, so ``root``'s ``t[0]`` and ``one``'s ``s[0]``
+    shared a row and the second post was refused as a disagreement.  Rule:
+    the row names its calling function.
+    """
+
+    attributes = getattr(graph, "G", graph).graph
+    return str(
+        attributes.get("qualified_name") or attributes.get("function_name") or ""
+    )
+
+
 def _post_call_result_projections(graph, node_id):
     """Find the call's ``Indexed`` projections and post their CALL_RESULT_PROJECTION rows.
 
@@ -2072,10 +2089,12 @@ def _post_call_result_projections(graph, node_id):
     from ..common.tensors.topological_reducer import node_identity_cell
 
     book = current_identity_book()
+    scope = _call_projection_scope(graph)
     # Each projection derives from the call node's cell and its own.
     for path, value_id in caller_paths.items():
         book.post(
-            CALL_RESULT_PROJECTION, (int(node_id), int(value_id)), tuple(path),
+            CALL_RESULT_PROJECTION, (scope, int(node_id), int(value_id)),
+            tuple(path),
             stage=PLANNER_HIERARCHY,
             provenance=Derived(tuple(dict.fromkeys(
                 cell for cell in (
@@ -2164,15 +2183,15 @@ def _projection_result_bindings(graph, node_id, payload_ids):
     if page is None:
         return ()
     bindings = []
-    for row in page.rows():
-        if int(row[0]) != int(node_id):
+    for row in page.scope_rows(_call_projection_scope(graph)):
+        if int(row[1]) != int(node_id):
             continue
         path = page.latest(row)
         if (
             isinstance(path, tuple) and len(path) == 1
             and isinstance(path[0], int) and 0 <= path[0] < len(payload_ids)
         ):
-            bindings.append((path[0], int(payload_ids[path[0]]), int(row[1])))
+            bindings.append((path[0], int(payload_ids[path[0]]), int(row[2])))
     return tuple((payload, projection)
                  for _position, payload, projection in sorted(bindings))
 
