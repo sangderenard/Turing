@@ -8666,12 +8666,29 @@ def emit_ssa_function_to_llvm(
                     )
                 else:
                     domain = "double"
+                # Program: ``round(x)``, ``math.floor(x)``, ``math.ceil(x)``
+                # of a float, declared int (c920, c921).  Wrong record: the
+                # declared i64 became the compute type, so the double operand
+                # was truncated by ``fptosi`` first and the rounding op on
+                # the int was ``add x, 0``: round(2.7) gave 2, round(-1.5)
+                # -1, math.floor(-1.5) -1.  Rule: an integer-valued rounding
+                # of a double rounds in the double column
+                # (``llvm.roundeven/floor/ceil/trunc``, exact IEEE ops) and
+                # only its integral result converts to the declared int.
+                rounds_double = (
+                    domain in {"i32", "i64"}
+                    and str(operation).casefold()
+                    in {"floor", "ceil", "round", "trunc"}
+                    and "double" in operand_types
+                )
+                operand_domain = "double" if rounds_double else domain
 
                 operands = []
                 trouble = None
                 for position, argument in enumerate(instruction.args):
                     rendering = as_type(
-                        int(argument.id), domain, f"{result_id}.{position}"
+                        int(argument.id), operand_domain,
+                        f"{result_id}.{position}",
                     )
                     if rendering is None:
                         trouble = (
@@ -8686,7 +8703,7 @@ def emit_ssa_function_to_llvm(
                     continue
                 register = f"%scalar.{result_id}"
                 integer = (
-                    None if domain == "double"
+                    None if domain == "double" or rounds_double
                     else integer_scalar_lines(
                         str(operation), domain, operands, register,
                         checked=python_int_operation(instruction),
