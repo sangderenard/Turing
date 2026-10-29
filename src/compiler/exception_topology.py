@@ -30,6 +30,80 @@ class ExceptionTransfer:
     unwind_finally_node_ids: tuple[int, ...]
 
 
+def resolved_handler_declarations(
+    graph: Any, handler_node_id: int,
+) -> tuple[tuple[int, str], ...]:
+    """Return handler class values and identities from static-use edges.
+
+    The authored ``except`` type occurrence is the key.  Its
+    ``static_reference_use`` provenance names the actual class declaration;
+    a coincidentally equal name is never enough to select a native handler.
+    """
+
+    from .concordance_declarations import (
+        STATIC_REFERENCE_USE, STATIC_SYMBOL_DEFINITION,
+    )
+    from .identity_concordance import current_identity_book
+
+    G = getattr(graph, "G", graph)
+    handler = G.nodes[int(handler_node_id)].get("expr_obj")
+    if not isinstance(handler, ast.ExceptHandler):
+        raise ValueError(
+            f"exception handler {handler_node_id} has no exact source AST"
+        )
+    if handler.type is None:
+        return ()
+    type_id = next((
+        int(parent) for parent, role in G.nodes[int(handler_node_id)].get("parents", ())
+        if str(role) == "type"
+    ), None)
+    if type_id is None or type_id not in G:
+        raise ValueError(f"handler {handler_node_id} has no type value edge")
+    declarations = (
+        tuple(handler.type.elts)
+        if isinstance(handler.type, ast.Tuple) else (handler.type,)
+    )
+    values = (
+        tuple(next((
+            int(parent)
+            for parent, role in G.nodes[type_id].get("parents", ())
+            if str(role) == f"elt:{index}"
+        ), None) for index in range(len(declarations)))
+        if isinstance(handler.type, ast.Tuple)
+        else (type_id,)
+    )
+    if any(value is None for value in values):
+        raise ValueError(
+            f"handler {handler_node_id} lacks exact declaration value edges"
+        )
+    book = current_identity_book()
+    uses = book.page(STATIC_REFERENCE_USE)
+    result = []
+    for declaration, value_id in zip(declarations, values):
+        identities = set()
+        for row in uses.rows():
+            if int(row[1]) != id(declaration):
+                continue
+            use_cell = book.latest_ref(STATIC_REFERENCE_USE, row)
+            if use_cell is None:
+                continue
+            identities.update(
+                (str(source.row[0]), str(source.row[1]))
+                for source, _stage in book.edges_into(use_cell)
+                if source.page == STATIC_SYMBOL_DEFINITION
+                and len(source.row) == 3 and not source.row[2]
+            )
+        if len(identities) != 1:
+            raise ValueError(
+                "handler exception declaration has no unique static "
+                f"identity: handler={handler_node_id}, "
+                f"occurrence={id(declaration)}, identities={identities!r}"
+            )
+        module, qualname = identities.pop()
+        result.append((int(value_id), f"{module}.{qualname}"))
+    return tuple(result)
+
+
 def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
     """Post exact source exceptional edges to the process graph's book.
 

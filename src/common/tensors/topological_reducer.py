@@ -17105,6 +17105,49 @@ def _normalize_lexical_values(
             for handler in body_statement.handlers:
                 environment.clear()
                 environment.update(before)
+                # Program: tensor_octets_to_bytes catches
+                # (TypeError, ValueError, OverflowError) and then raises a
+                # new ValueError.  Wrong record: the handler's exception
+                # declarations remained unbound Name nodes, so native
+                # control had no source identity for matching the raised
+                # class to this handler.  Resolve the authored type in the
+                # handler's lexical environment before reducing its body;
+                # each static reference use is posted to the concordance.
+                if handler.type is not None:
+                    declarations = (
+                        tuple(handler.type.elts)
+                        if isinstance(handler.type, ast.Tuple)
+                        else (handler.type,)
+                    )
+                    resolved_types = []
+                    for declaration in declarations:
+                        resolved = resolve_expression(declaration)
+                        if isinstance(resolved, _StaticPythonReference):
+                            resolved = static_reference_node(resolved)
+                        if isinstance(resolved, int) and resolved in graph.G:
+                            resolved_types.append(int(resolved))
+                    type_node_id = id(handler.type)
+                    if (
+                        isinstance(handler.type, ast.Tuple)
+                        and type_node_id in graph.G
+                        and len(resolved_types) == len(declarations)
+                    ):
+                        _replace_inputs(graph, type_node_id, tuple(
+                            (value_id, f"elt:{index}")
+                            for index, value_id in enumerate(resolved_types)
+                        ))
+                    elif (
+                        not isinstance(handler.type, ast.Tuple)
+                        and len(resolved_types) == 1
+                        and id(handler) in graph.G
+                    ):
+                        _replace_inputs(graph, id(handler), (
+                            *((int(parent), str(role))
+                              for parent, role in (
+                                  graph.G.nodes[id(handler)].get("parents") or ()
+                              ) if str(role) != "type"),
+                            (resolved_types[0], "type"),
+                        ))
                 if handler.name:
                     input_value(
                         handler.name,
