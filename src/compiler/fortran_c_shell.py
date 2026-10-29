@@ -3580,6 +3580,27 @@ def _linked_caller_member_cell(
     )
 
 
+def _is_call_bound_type_tag_formal(formal: Any) -> bool:
+    """A union formal's native type tag, bound from its subject's actual.
+
+    Program: ``f(y)`` with ``def f(x: int | None)`` and ``y`` None on one
+    path.  Wrong record: x's tag formal was leased as frame storage, so the
+    root grew a tag formal nobody fills (zero, the NoneType tag) and f read
+    None at every call.  A tag is not storage: native call linking binds it
+    from the subject actual (forwarded, remapped or the exact constant).
+    """
+
+    accounting = dict(getattr(formal, "accounting", None) or {})
+    return accounting.get("native_type_tag_for_value_id") is not None and not any(
+        accounting.get(key)
+        for key in (
+            "compiler_frame_storage",
+            "linked_call_frame_storage",
+            "returned_record_storage",
+        )
+    )
+
+
 def _restore_linked_sequence_member(
     caller: Any, values: dict, member_id: int, callee_formal: Any,
     callee_symbol: str, callsite_id: int,
@@ -48316,6 +48337,16 @@ def _class_surface_ssa_program(
                 frame_bindings.append((
                     value_id, "caller_storage", int(linked_discovery),
                 ))
+            elif _is_call_bound_type_tag_formal(value):
+                # Program: ``f(y)`` with ``def f(x: int | None)`` and ``y``
+                # None on one path.  Wrong record: x's native type tag
+                # formal fell to the storage-from-absence lease below, so
+                # the root grew a tag formal nobody fills (zero, the
+                # NoneType tag) and f read None for every call.  Rule: a
+                # tag formal is not frame storage; the call's tag is the
+                # subject actual's own (forwarded, remapped, or the exact
+                # constant), which native call linking binds.
+                pass
             elif "record_instance" in dict(value.accounting or {}):
                 # Storage introduced while constructing an object remains
                 # part of that function's physical ABI even when it is not a
@@ -50778,6 +50809,12 @@ def _class_surface_ssa_program(
                         for argument in callee.args:
                             argument_id = int(argument.id)
                             if argument_id in bound_frame_ids:
+                                continue
+                            if _is_call_bound_type_tag_formal(argument):
+                                # The tag of a union formal is the subject
+                                # actual's own tag, bound by native call
+                                # linking; leasing it gave the root a tag
+                                # nobody fills (see the frame binding walk).
                                 continue
                             # A callee argument that is a record field
                             # (``program_abi_parameter``/``program_abi_field``
@@ -62061,6 +62098,10 @@ def _class_surface_ssa_program(
     from .ssa_optional_values import lower_optional_scalar_returns
     lowered_module.metadata["optional_scalar_return_lowerings"] = len(
         lower_optional_scalar_returns(lowered_module)
+    )
+    from .ssa_optional_values import lower_optional_scalar_arguments
+    lowered_module.metadata["optional_scalar_argument_lowerings"] = len(
+        lower_optional_scalar_arguments(lowered_module)
     )
     # A join of int and float arms is one physical class; refuse it where
     # Python would see each arm's own class (``ssa_numeric_joins``).

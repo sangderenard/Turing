@@ -29395,6 +29395,39 @@ def _fold_callsite_structural_values(
             }
             left = known.get(parents.get("lhs", parents.get("left")), unresolved)
             right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            if isinstance(expression.ops[0], (ast.Is, ast.IsNot)) and (
+                left is None or right is None
+            ):
+                # Program: ``y = None; if n > 2: y = n; return f(y)``.
+                # Wrong record: f's copy bound x to the payload's
+                # descriptor (int64); that fact reads as storage that
+                # cannot be None, so ``x is None`` folded to False and
+                # f(None) returned 0 instead of 7.  Rule: a formal whose
+                # actual at this callsite may be None keeps ``is None`` as
+                # a runtime test of the presence the call carries.
+                optional_actuals = set(
+                    graph.G.graph.get("planner_parameter_optional_actuals")
+                    or ()
+                )
+                subject_id = (
+                    parents.get("lhs", parents.get("left"))
+                    if right is None
+                    else parents.get("rhs", parents.get("right"))
+                )
+                subject = (
+                    graph.G.nodes.get(int(subject_id), {})
+                    if subject_id is not None else {}
+                )
+                subject_name = (subject.get("attributes") or {}).get(
+                    "binding_name"
+                )
+                if (
+                    optional_actuals
+                    and str(subject.get("type") or "") in {"Input", "input"}
+                    and subject_name is not None
+                    and str(subject_name) in optional_actuals
+                ):
+                    return unresolved
             if (
                 isinstance(expression.ops[0], (ast.Is, ast.IsNot))
                 and left is unresolved
@@ -33098,6 +33131,67 @@ def _authored_formal_int_range(original: Any, formal: str):
     return None
 
 
+def _callsite_actual_may_be_none(caller: Any, value_id: int) -> bool:
+    """Whether a caller value may be ``None`` at runtime, structurally.
+
+    A literal ``None``, a merge (Phi) any arm of which may be None, and a
+    call whose callee returns a value that may be None (followed into the
+    callee's own returned identities).  Nothing else is claimed.
+    """
+
+    seen: set[tuple[int, int]] = set()
+    stack = [(caller, int(value_id), 0)]
+    while stack:
+        owner, current, depth = stack.pop()
+        graph = owner.G
+        if (id(graph), current) in seen or current not in graph or depth > 8:
+            continue
+        seen.add((id(graph), current))
+        data = graph.nodes[current]
+        node_type = str(data.get("type") or "")
+        expression = data.get("expr_obj")
+        if node_type in {"Constant", "const", "Const"}:
+            if isinstance(expression, ast.Constant) and expression.value is None:
+                return True
+            continue
+        if node_type in {"Input", "input"}:
+            # A formal this copy was specialized for an optional actual
+            # forwards that optional (``f(x)`` passing ``x`` to ``h(x)``).
+            binding_name = (data.get("attributes") or {}).get("binding_name")
+            if binding_name is not None and str(binding_name) in set(
+                graph.graph.get("planner_parameter_optional_actuals") or ()
+            ):
+                return True
+            continue
+        if node_type in {"Phi", "phi"}:
+            stack.extend(
+                (owner, int(parent), depth)
+                for parent, role in data.get("parents") or ()
+                if str(role) not in {"test", "condition", "predicate"}
+            )
+            continue
+        function_table = getattr(owner, "function_table", None)
+        if node_type in {"Call", "call"} and function_table is not None:
+            reference = (data.get("attributes") or {}).get("callee_ref")
+            if reference is None:
+                continue
+            try:
+                callee = function_table.entry(int(reference)).graph
+            except (KeyError, TypeError, ValueError):
+                continue
+            if callee is None:
+                continue
+            identities = callee.G.graph.get("identity_table") or {}
+            outputs = tuple(callee.G.graph.get("function_outputs") or ())
+            if len(outputs) != 1:
+                continue
+            stack.extend(
+                (callee, int(returned), depth + 1)
+                for returned in identities.get(str(outputs[0]), ())
+            )
+    return False
+
+
 def _callsite_specialized_shell_type(
     owner: Any,
     node_id: int,
@@ -33158,6 +33252,10 @@ def _callsite_specialized_shell_type(
         "source_value_class_concordance"
     )
     bound_parameters: set[str] = set()
+    #: Parameters whose actual at this callsite may be ``None`` (a merge
+    #: with a None arm, an optional call result).  The copy keeps
+    #: ``is None`` tests of them as runtime tests of their presence.
+    parameter_optional_actuals: dict[str, bool] = {}
     data = caller.G.nodes[int(node_id)]
     caller_record_abi = dict(
         caller.G.graph.get("parameter_record_abi") or {}
@@ -33196,6 +33294,8 @@ def _callsite_specialized_shell_type(
         parameter = str(parameter)
         bound_parameters.add(parameter)
         class_fact = caller_class_page.latest((caller_scope, int(parent)))
+        if _callsite_actual_may_be_none(caller, int(parent)):
+            parameter_optional_actuals[parameter] = True
         # The actual's element class (``list[int]`` against ``list[float]``)
         # is part of the signature the copy is built for: the called
         # inventory's classes for the formal are exact.
@@ -33452,6 +33552,7 @@ def _callsite_specialized_shell_type(
         tuple(sorted(parameter_classes.items())),
         tuple(sorted(parameter_element_classes.items())),
         tuple(sorted(parameter_int_ranges.items())),
+        tuple(sorted(parameter_optional_actuals)),
     )
     key = (
         tuple(policy.items()), generation,
@@ -33570,6 +33671,9 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_parameter_element_classes"] = dict(
         parameter_element_classes
+    )
+    specialized.G.graph["planner_parameter_optional_actuals"] = tuple(
+        sorted(parameter_optional_actuals)
     )
     specialized.G.graph["planner_parameter_class_cells"] = dict(
         parameter_class_cells
