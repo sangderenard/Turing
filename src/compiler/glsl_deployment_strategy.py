@@ -25374,21 +25374,27 @@ class _DescriptorQuery(set):
     that reached it, not on the node.
     """
 
-    __slots__ = ("answers", "cut_counter", "polymorphic")
+    __slots__ = ("answers", "cut_counter", "polymorphic", "levels")
 
     def __init__(self, members: Any = (), *, answers: Any = None,
-                 cut_counter: Any = None, polymorphic: Any = None) -> None:
+                 cut_counter: Any = None, polymorphic: Any = None,
+                 levels: Any = None) -> None:
         super().__init__(members)
         self.answers = {} if answers is None else answers
         self.cut_counter = [0] if cut_counter is None else cut_counter
         #: One-element holder shared by every branch of the query.
         self.polymorphic = [None] if polymorphic is None else polymorphic
+        #: The graph's dependency levels, read once per query: the graph is
+        #: not mutated while the query runs, and fingerprinting every node
+        #: and edge again for each recorded proof made the managed tire's
+        #: planning quadratic in graph size.
+        self.levels = [None] if levels is None else levels
 
     def branch(self) -> "_DescriptorQuery":
         """This path, extended by the caller: same query, own path set."""
         return _DescriptorQuery(
             self, answers=self.answers, cut_counter=self.cut_counter,
-            polymorphic=self.polymorphic,
+            polymorphic=self.polymorphic, levels=self.levels,
         )
 
     def cut(self) -> None:
@@ -25659,10 +25665,16 @@ def _tensor_descriptor(
             if extents and not dynamic:
                 from .identity_concordance import record_proven_shape
 
+                if query is not None:
+                    if query.levels[0] is None:
+                        query.levels[0] = _dependency_levels(graph)
+                    levels = query.levels[0]
+                else:
+                    levels = _dependency_levels(graph)
                 record_proven_shape(
                     row[0], row[1], extents,
                     (answer or {}).get("dtype"),
-                    int(_dependency_levels(graph).get(int(node_id), 0)),
+                    int(levels.get(int(node_id), 0)),
                 )
             row_shape = (
                 answer.get("sequence_row_shape") if answer else None
