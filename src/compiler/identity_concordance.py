@@ -1937,7 +1937,8 @@ class CorrelationTable:
             DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
             INGESTION_VALUE, NATIVE_STATUS_CLASS, SCOPE_ORIGIN,
             SOURCE_EXCEPTION_FINALIZER_PHI,
-            SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_HANDLER_PHI,
+            SOURCE_EXCEPTION_SITE_STATE,
             SOURCE_EXCEPTION_TRANSFER,
             STATIC_SYMBOL_DEFINITION,
         )
@@ -2136,12 +2137,36 @@ class CorrelationTable:
                     f"owner={fact.owner!r}, handler={fact.handler!r}",
                 ))
             selected = tuple(fact.unanimous_bindings)
+            merged = tuple(fact.merged_bindings)
             names = tuple(name for name, _cell in selected)
             if len(names) != len(set(names)) or names != tuple(sorted(names)):
                 found.append(Finding(
                     "source-exception-handler-bindings-disagree",
                     str(row[0]), int(row[1]), f"names={names!r}",
                 ))
+            if set(names) & {name for name, _cell in merged}:
+                found.append(Finding(
+                    "source-exception-handler-merged-names-disagree",
+                    str(row[0]), int(row[1]), f"merged={merged!r}",
+                ))
+            for name, phi_value in merged:
+                phi_row = (row[0], int(phi_value.row[1]))
+                phi_fact = book.page(SOURCE_EXCEPTION_HANDLER_PHI).latest(
+                    phi_row
+                )
+                phi_ref = book.latest_ref(SOURCE_EXCEPTION_HANDLER_PHI,
+                                          phi_row)
+                if (
+                    phi_fact is None or phi_fact.handler != fact.handler
+                    or phi_fact.owner != fact.owner
+                    or phi_fact.name != name
+                    or phi_value not in causes or phi_ref not in causes
+                ):
+                    found.append(Finding(
+                        "source-exception-handler-phi-disagree",
+                        str(row[0]), int(row[1]),
+                        f"{name!r} phi={phi_value!r}",
+                    ))
             for transfer_cell in fact.incoming_transfers:
                 transfer = page.cell(
                     transfer_cell.row, transfer_cell.column,
@@ -2169,6 +2194,43 @@ class CorrelationTable:
                             f"{name!r} from {transfer_cell!r} "
                             f"is not {value_cell!r}",
                         ))
+        handler_phi_page = book.page(SOURCE_EXCEPTION_HANDLER_PHI)
+        for row in handler_phi_page.rows():
+            fact = handler_phi_page.latest(row)
+            phi_cell = book.latest_ref(SOURCE_EXCEPTION_HANDLER_PHI, row)
+            causes = {
+                source for source, _stage in (
+                    () if phi_cell is None else book.edges_into(phi_cell)
+                )
+            }
+            if (
+                fact.phi.row != row
+                or any(cell not in causes for cell in (
+                    fact.owner, fact.handler, fact.phi,
+                ))
+            ):
+                found.append(Finding(
+                    "source-exception-handler-phi-owner-disagree",
+                    str(row[0]), int(row[1]), f"phi={fact!r}",
+                ))
+            for transfer_cell, value_cell in fact.entries:
+                transfer = (
+                    page.cell(transfer_cell.row, transfer_cell.column)
+                    if transfer_cell.page == SOURCE_EXCEPTION_TRANSFER else None
+                )
+                if (
+                    transfer is None
+                    or transfer.catch_try != fact.owner
+                    or dict(transfer.entry_bindings).get(fact.name)
+                    != value_cell
+                    or transfer_cell not in causes
+                    or value_cell not in causes
+                ):
+                    found.append(Finding(
+                        "source-exception-handler-phi-arm-disagree",
+                        str(row[0]), int(row[1]),
+                        f"transfer={transfer_cell!r}, value={value_cell!r}",
+                    ))
         finalizer_page = book.page(SOURCE_EXCEPTION_FINALIZER_PHI)
         for row in finalizer_page.rows():
             fact = finalizer_page.latest(row)

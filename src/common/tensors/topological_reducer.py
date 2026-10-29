@@ -5147,9 +5147,13 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
         )
         exception_phi = (
             str(data.get("type") or data.get("op") or "").casefold() == "phi"
-            and (data.get("attributes") or {}).get(
-                "source_exception_finally_id"
-            ) is not None
+            and any(
+                (data.get("attributes") or {}).get(key) is not None
+                for key in (
+                    "source_exception_finally_id",
+                    "source_exception_handler_id",
+                )
+            )
         )
         loop_attributes = data.get("attributes") or {}
         if (
@@ -17413,6 +17417,7 @@ def _normalize_lexical_values(
                     body_environment if body_ends_in_raise else before
                 )
                 selected_entry_bindings: dict[str, int] = {}
+                merged_entry_bindings: dict[str, int] = {}
                 if body_exception_states:
                     entry_names = set().union(*(
                         set(candidate) for candidate in body_exception_states
@@ -17434,18 +17439,51 @@ def _normalize_lexical_values(
                         else:
                             environment.pop(name, None)
                             if name in handler_reads:
-                                raise ValueError(
-                                    "handler entry requires an exceptional "
-                                    "value Phi before reducing its read: "
-                                    f"try={id(body_statement)}, "
-                                    f"handler={id(handler)}, name={name!r}, "
-                                    f"sites={body_exception_sites!r}, "
-                                    f"incoming={incoming!r}"
+                                if None in incoming:
+                                    raise ValueError(
+                                        "handler reads a name absent from an "
+                                        "exceptional predecessor: "
+                                        f"try={id(body_statement)}, "
+                                        f"handler={id(handler)}, name={name!r}, "
+                                        f"sites={body_exception_sites!r}"
+                                    )
+                                parents = tuple(
+                                    (int(candidate[name]), f"entry:{index}")
+                                    for index, candidate in enumerate(
+                                        body_exception_states
+                                    )
+                                )
+                                entry_phi = new_node(
+                                    "Phi", name,
+                                    attributes={
+                                        "source_exception_handler_id": id(handler),
+                                        "source_exception_handler_name": name,
+                                        "source_exception_handler_sites": (
+                                            body_exception_sites
+                                        ),
+                                    },
+                                    parents=parents,
+                                    source=handler,
+                                    source_cell=tuple(dict.fromkeys((
+                                        node_identity_cell(graph, id(handler)),
+                                        *(current_identity_book().latest_ref(
+                                            _SOURCE_EXCEPTION_SITE_STATE,
+                                            (ingestion_read_scope, site_id),
+                                        ) for site_id in body_exception_sites),
+                                        *(node_identity_cell(graph, value_id)
+                                          for value_id, _role in parents),
+                                    ))),
+                                )
+                                environment[name] = entry_phi
+                                merged_entry_bindings[name] = entry_phi
+                                identity_bindings.setdefault(name, []).append(
+                                    entry_phi
                                 )
                 handler_entry_receipts[id(handler)] = {
                     "try_id": id(body_statement),
                     "sites": body_exception_sites,
                     "selected": tuple(sorted(selected_entry_bindings.items())),
+                    "merged": tuple(sorted(merged_entry_bindings.items())),
                 }
                 # Program: tensor_octets_to_bytes catches
                 # (TypeError, ValueError, OverflowError) and then raises a
@@ -19217,10 +19255,12 @@ def _normalize_lexical_values(
             continue
         source_ids = tuple(map(int, receipt["sites"]))
         selected = tuple(receipt["selected"])
+        merged = tuple(receipt.get("merged", ()))
         missing = tuple(
             value_id for value_id in (
                 *source_ids,
                 *(int(value_id) for _name, value_id in selected),
+                *(int(value_id) for _name, value_id in merged),
             ) if value_id not in mapping
         )
         if missing:
@@ -19234,6 +19274,10 @@ def _normalize_lexical_values(
             "selected": tuple(
                 (name, int(mapping[int(value_id)]))
                 for name, value_id in selected
+            ),
+            "merged": tuple(
+                (name, int(mapping[int(value_id)]))
+                for name, value_id in merged
             ),
         }
     ordered_graph.graph["source_exception_handler_entries"] = (
@@ -20122,6 +20166,26 @@ def _normalize_lexical_values(
             attributes["source_exception_finally_entries"] = tuple(
                 (str(kind), int(mapping[int(source_id)]))
                 for kind, source_id in predecessors
+            )
+        if "source_exception_handler_id" in attributes:
+            handler_id = int(attributes["source_exception_handler_id"])
+            site_ids = tuple(map(
+                int, attributes["source_exception_handler_sites"],
+            ))
+            missing = tuple(
+                source_id for source_id in (handler_id, *site_ids)
+                if source_id not in mapping
+            )
+            if missing:
+                raise ValueError(
+                    "handler Phi lost exact source identities: "
+                    f"phi={node_id}, missing={missing!r}"
+                )
+            attributes["source_exception_handler_id"] = int(
+                mapping[handler_id]
+            )
+            attributes["source_exception_handler_sites"] = tuple(
+                int(mapping[source_id]) for source_id in site_ids
             )
         if "initial_value_id" in attributes:
             initial_value_id = attributes["initial_value_id"]

@@ -119,8 +119,9 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
     from .concordance_declarations import (
         EXCEPTION_TOPOLOGY, SOURCE_CONTROL_SPECIALIZATION,
         SOURCE_EXCEPTION_FINALIZER_PHI, SOURCE_EXCEPTION_HANDLER_ENTRY,
+        SOURCE_EXCEPTION_HANDLER_PHI,
         SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_TRANSFER,
-        ExceptionFinalizerPhiFact,
+        ExceptionFinalizerPhiFact, ExceptionHandlerPhiFact,
         ExceptionHandlerEntryFact, ExceptionTransferFact,
     )
     from .identity_concordance import Derived, Mode, current_identity_book
@@ -357,6 +358,67 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             mode=Mode.CONCORD if previous is None or previous == fact
             else Mode.REVISE,
         )
+    for phi_id, data in G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if "source_exception_handler_id" not in attributes:
+            continue
+        handler_id = int(attributes["source_exception_handler_id"])
+        receipt = (G.graph.get("source_exception_handler_entries") or {}).get(
+            handler_id
+        )
+        if receipt is None:
+            raise ValueError(
+                f"handler Phi {phi_id} has no exact handler entry receipt"
+            )
+        owner_cell = node_identity_cell(graph, int(receipt["try_id"]))
+        handler_cell = node_identity_cell(graph, handler_id)
+        phi_cell = node_identity_cell(graph, int(phi_id))
+        name = str(attributes["source_exception_handler_name"])
+        sites = tuple(map(int, attributes["source_exception_handler_sites"]))
+        parents = tuple(data.get("parents") or ())
+        if len(sites) != len(parents):
+            raise ValueError(
+                f"handler Phi {phi_id} has unequal sites and value arms"
+            )
+        arms = []
+        for index, (site_id, (value_id, role)) in enumerate(zip(
+            sites, parents,
+        )):
+            transfer_cell = book.latest_ref(
+                SOURCE_EXCEPTION_TRANSFER, (scope, site_id),
+            )
+            value_cell = node_identity_cell(graph, int(value_id))
+            transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest((
+                scope, site_id,
+            ))
+            if (
+                role != f"entry:{index}"
+                or transfer_cell is None or value_cell is None
+                or transfer is None
+                or dict(transfer.entry_bindings).get(name) != value_cell
+                or transfer.catch_try != owner_cell
+            ):
+                raise ValueError(
+                    "handler Phi arm disagrees with exact source transfer: "
+                    f"phi={phi_id}, site={site_id}, value={value_id}"
+                )
+            arms.append((transfer_cell, value_cell))
+        fact = ExceptionHandlerPhiFact(
+            owner_cell, handler_cell, phi_cell, name, tuple(arms),
+        )
+        row = (scope, int(phi_id))
+        previous = book.page(SOURCE_EXCEPTION_HANDLER_PHI).latest(row)
+        book.post(
+            SOURCE_EXCEPTION_HANDLER_PHI, row, fact,
+            stage=EXCEPTION_TOPOLOGY,
+            provenance=Derived(tuple(dict.fromkeys((
+                owner_cell, handler_cell, phi_cell,
+                *(cell for transfer_cell, value_cell in arms
+                  for cell in (transfer_cell, value_cell)),
+            )))),
+            mode=Mode.CONCORD if previous is None or previous == fact
+            else Mode.REVISE,
+        )
     for handler_id, entry in sorted((
         G.graph.get("source_exception_handler_entries") or {}
     ).items()):
@@ -388,6 +450,19 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             (name, node_identity_cell(graph, int(value_id)))
             for name, value_id in entry["selected"]
         )
+        merged = tuple(
+            (name, node_identity_cell(graph, int(phi_id)))
+            for name, phi_id in entry.get("merged", ())
+        )
+        merged_phi_cells = tuple(
+            book.latest_ref(SOURCE_EXCEPTION_HANDLER_PHI,
+                            (scope, int(phi_cell.row[1])))
+            for _name, phi_cell in merged
+        )
+        if any(cell is None for cell in merged_phi_cells):
+            raise ValueError(
+                f"handler {handler_id} has a merged name without a Phi fact"
+            )
         for transfer_cell in incoming:
             transfer_fact = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
                 transfer_cell.row, transfer_cell.column,
@@ -402,7 +477,7 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
                         f"source={transfer_cell.row[1]}"
                     )
         fact = ExceptionHandlerEntryFact(
-            owner_cell, handler_cell, tuple(incoming), selected,
+            owner_cell, handler_cell, tuple(incoming), selected, merged,
         )
         row = (scope, int(handler_id))
         previous = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest(row)
@@ -412,6 +487,8 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             provenance=Derived(tuple(dict.fromkeys((
                 owner_cell, handler_cell, *incoming,
                 *(cell for _name, cell in selected),
+                *(cell for _name, cell in merged),
+                *merged_phi_cells,
             )))),
             mode=Mode.CONCORD if previous is None or previous == fact
             else Mode.REVISE,

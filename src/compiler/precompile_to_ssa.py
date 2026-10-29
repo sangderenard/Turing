@@ -93,6 +93,7 @@ from .concordance_declarations import (
     NO_PRODUCER_AT_USE,
     PHI_CONDITIONAL,
     PHI_EXCEPTION_FINALIZER,
+    PHI_EXCEPTION_HANDLER,
     PHI_LOOP_EXIT,
     PHI_LOOP_HEADER,
     PHI_RETURN_MERGE,
@@ -2186,6 +2187,8 @@ class _NativeTryFrame:
     block: NativeTryBlock
     owner: Ref | None
     handler_entries: tuple[BasicBlock, ...]
+    handler_phi_facts: dict[int, tuple[tuple[int, Any, Ref], ...]] = field(default_factory=dict)
+    handler_edges: dict[int, list[tuple[BasicBlock, tuple[SSAValue, ...]]]] = field(default_factory=dict)
     phase: str = "body"
     finalizer_entry: BasicBlock | None = None
     finalizer_facts: tuple[tuple[int, Any, Ref], ...] = ()
@@ -10145,6 +10148,9 @@ class _ControlSSABuilder(TiledObject):
                 # this ABI, but a native width/result-class limitation is
                 # not an authored exception. Its status must propagate.
                 unmatched = self.new_block("native_try_call_failure")
+                self._native_handler_edge(
+                    frame, index, transfer_cell, path=location,
+                )
                 self.conditional_branch(
                     status_matches(all_known), frame.handler_entries[index],
                     unmatched,
@@ -10179,6 +10185,9 @@ class _ControlSSABuilder(TiledObject):
             if not codes:
                 continue
             next_handler = self.new_block("native_try_call_failure")
+            self._native_handler_edge(
+                frame, index, transfer_cell, path=location,
+            )
             self.conditional_branch(
                 status_matches(codes), frame.handler_entries[index],
                 next_handler,
@@ -10508,6 +10517,73 @@ class _ControlSSABuilder(TiledObject):
             self._function_exit = self.new_block("function_exit")
         return self._function_exit
 
+    def _native_handler_edge(
+        self, frame: _NativeTryFrame, index: int, transfer_cell: Ref,
+        *, path: str,
+    ) -> None:
+        """Capture the transfer's lexical values on its actual SSA branch."""
+
+        if self.current.name in self._dead_control_blocks:
+            return
+        values = []
+        for phi_id, fact, _fact_cell in frame.handler_phi_facts.get(index, ()):
+            matches = tuple(
+                value_cell for edge_cell, value_cell in fact.entries
+                if edge_cell == transfer_cell
+            )
+            if len(matches) != 1 or matches[0].page != CANONICAL_VALUE:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-handler", path,
+                    f"handler Phi {phi_id} has no unique canonical transfer arm",
+                ))
+                return
+            values.append(self.external_value(int(matches[0].row[1])))
+        frame.handler_edges.setdefault(index, []).append(
+            (self.current, tuple(values))
+        )
+
+    def _finish_native_handler(
+        self, frame: _NativeTryFrame, index: int, *, path: str,
+    ) -> None:
+        """Bind each source-owned handler Phi at the handler's CFG entry."""
+
+        edges = tuple(frame.handler_edges.get(index, ()))
+        facts = frame.handler_phi_facts.get(index, ())
+        if facts and not edges:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "native-handler", path,
+                "handler Phi has no reachable exceptional predecessor",
+            ))
+            return
+        blocks = tuple(predecessor.name for predecessor, _values in edges)
+        for position, (phi_id, _fact, fact_cell) in enumerate(facts):
+            arms = tuple(values[position] for _predecessor, values in edges)
+            dtypes = {str(value.dtype) for value in arms}
+            if len(dtypes) != 1:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-handler", path,
+                    f"handler Phi {phi_id} has incompatible arm dtypes: "
+                    f"{tuple(sorted(dtypes))!r}",
+                ))
+                continue
+            merged = self.fresh_value(
+                dtype=next(iter(dtypes)), transform=PHI_EXCEPTION_HANDLER,
+                operands=(fact_cell, *arms),
+                physical=self._phi_physical(*arms),
+            )
+            self.emit(
+                Handler.Phi, list(arms), merged,
+                attributes={
+                    "incoming_blocks": blocks,
+                    "binding": "exception_handler_entry",
+                    "source_handler_phi_cell": fact_cell,
+                },
+            )
+            self._bind(
+                phi_id, merged, BindingKind.EXCEPTION_HANDLER_MERGE,
+                fact_cell,
+            )
+
     def _native_finalizer_edge(
         self, frame: _NativeTryFrame, status: SSAValue,
         *, kind: str, source: Ref, path: str,
@@ -10644,7 +10720,7 @@ class _ControlSSABuilder(TiledObject):
 
     def _native_raise_handler(
         self, block: ValidationBlock, *, path: str,
-    ) -> tuple[BasicBlock, int, Ref] | None:
+    ) -> tuple[BasicBlock, int, Ref, _NativeTryFrame, int] | None:
         """Find the authored handler edge for a source Raise, if it has one.
 
         The source exception-transfer row owns containment.  In particular,
@@ -10741,7 +10817,7 @@ class _ControlSSABuilder(TiledObject):
 
         def authorized_handler_edge(
             frame: _NativeTryFrame, index: int,
-        ) -> tuple[BasicBlock, int, Ref] | None:
+        ) -> tuple[BasicBlock, int, Ref, _NativeTryFrame, int] | None:
             handler_id = int(frame.block.handlers[index].source_handler_node_id)
             entry = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest((
                 self.lexical_read_scope, handler_id,
@@ -10757,7 +10833,7 @@ class _ControlSSABuilder(TiledObject):
                     f"handler={handler_id}, source={block.source_raise_node_id}",
                 ))
                 return None
-            return frame.handler_entries[index], handler_id, transfer_cell
+            return frame.handler_entries[index], handler_id, transfer_cell, frame, index
 
         for frame in reversed(self.native_try_frames[:active + 1]):
             if frame.phase != "body":
@@ -12507,6 +12583,7 @@ class _ControlSSABuilder(TiledObject):
         if isinstance(block, NativeTryBlock):
             from .concordance_declarations import (
                 CANONICAL_VALUE, SOURCE_EXCEPTION_FINALIZER_PHI,
+                SOURCE_EXCEPTION_HANDLER_PHI,
                 SOURCE_EXCEPTION_TRANSFER,
             )
 
@@ -12561,6 +12638,20 @@ class _ControlSSABuilder(TiledObject):
             )
             exit_block = self.new_block("native_try_exit")
             frame = _NativeTryFrame(block, owner, handlers)
+            handler_phi_page = self._book().page(SOURCE_EXCEPTION_HANDLER_PHI)
+            for index, handler in enumerate(block.handlers):
+                handler_cell = self._book().latest_ref(
+                    CANONICAL_VALUE,
+                    (self.lexical_read_scope, int(handler.source_handler_node_id)),
+                )
+                frame.handler_phi_facts[index] = tuple(
+                    (int(row[1]), handler_phi_page.latest(row),
+                     self._book().latest_ref(SOURCE_EXCEPTION_HANDLER_PHI, row))
+                    for row in handler_phi_page.rows()
+                    if row[0] == self.lexical_read_scope
+                    and handler_phi_page.latest(row).owner == owner
+                    and handler_phi_page.latest(row).handler == handler_cell
+                )
             if _flatten_control_sequence(block.finalbody):
                 frame.finalizer_entry = self.new_block(
                     "native_try_exception_finally"
@@ -12601,6 +12692,9 @@ class _ControlSSABuilder(TiledObject):
                 for index, handler in enumerate(block.handlers):
                     self.current = handlers[index]
                     frame.phase = "handler"
+                    self._finish_native_handler(
+                        frame, index, path=f"{path}.handler[{index}]",
+                    )
                     self.lower(
                         handler.body,
                         path=f"{path}.handler[{index}]",
@@ -13149,7 +13243,10 @@ class _ControlSSABuilder(TiledObject):
             self.current = failed
             handler_edge = self._native_raise_handler(block, path=path)
             if handler_edge is not None:
-                destination, handler_id, transfer_cell = handler_edge
+                destination, handler_id, transfer_cell, frame, handler_index = handler_edge
+                self._native_handler_edge(
+                    frame, handler_index, transfer_cell, path=path,
+                )
                 self.branch(destination)
                 self.current.instrs[-1].attributes.update({
                     "source_control": "raise",

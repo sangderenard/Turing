@@ -1190,6 +1190,7 @@ class ExceptionHandlerEntryFact:
     handler: Ref
     incoming_transfers: tuple[Ref, ...]
     unanimous_bindings: tuple[tuple[str, Ref], ...]
+    merged_bindings: tuple[tuple[str, Ref], ...] = ()
 
 
 SOURCE_EXCEPTION_HANDLER_ENTRY = declare_page(
@@ -1197,6 +1198,23 @@ SOURCE_EXCEPTION_HANDLER_ENTRY = declare_page(
         RowField("source_scope", K.SCOPE),
         RowField("handler_node", K.VALUE_ID),
     ), ExceptionHandlerEntryFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionHandlerPhiFact:
+    owner: Ref
+    handler: Ref
+    phi: Ref
+    name: str
+    entries: tuple[tuple[Ref, Ref], ...]
+
+
+SOURCE_EXCEPTION_HANDLER_PHI = declare_page(
+    "source_exception_handler_phi", (
+        RowField("source_scope", K.SCOPE),
+        RowField("phi_node", K.VALUE_ID),
+    ), ExceptionHandlerPhiFact,
 )
 
 
@@ -1399,6 +1417,7 @@ CONTROL_EXPRESSION = declare_transform("control_expression", 1)
 CONTROL_CAST = declare_transform("control_cast", 1)
 PHI_CONDITIONAL = declare_transform("phi_conditional", 1)
 PHI_EXCEPTION_FINALIZER = declare_transform("phi_exception_finalizer", 1)
+PHI_EXCEPTION_HANDLER = declare_transform("phi_exception_handler", 1)
 PHI_LOOP_HEADER = declare_transform("phi_loop_header", 1)
 PHI_LOOP_EXIT = declare_transform("phi_loop_exit", 1)
 PHI_RETURN_MERGE = declare_transform("phi_return_merge", 1)
@@ -1579,6 +1598,7 @@ class BindingKind(Enum):
     RESTORED = "restored"
     CONDITIONAL_MERGE = "conditional_merge"
     EXCEPTION_FINALIZER_MERGE = "exception_finalizer_merge"
+    EXCEPTION_HANDLER_MERGE = "exception_handler_merge"
     LOOP_RESULT_PORT = "loop_result_port"
     LOOP_SEED = "loop_seed"
     LOOP_HEADER = "loop_header"
