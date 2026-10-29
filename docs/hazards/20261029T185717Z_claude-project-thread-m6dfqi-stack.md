@@ -1,0 +1,4 @@
+2026-10-29 Precision limb/receiver dtype rules removed (MEASURED, tests/test_rational_compiler.py complex-rational-precision tests):
+- Removed from `_typed_value_shape`: the `field_declaration_cell` row match on ("src.common.tensors.extended_precision", "Precision", "_stack") (a rule keyed on one field's name), and the "external name used only as a tensor-namespace receiver is not a value" rule (a rule nothing recorded). Both came from #978.
+- Effect: the focused suite (complex precision, rational compiler, precision pipeline, microprecision profiler, string-core instance argument) is unchanged vs main: 85 passed, the two complex-rational-precision tests still error. They refuse by name at `_exp` parameter `value` (no call-edge native ABI after settlement, reached through `_rebalanced`'s `shift`).
+- Still open: the limb read `Precision.term(k)` / `self._stack[k]` needs a written record of its element type before these tests can lower.
