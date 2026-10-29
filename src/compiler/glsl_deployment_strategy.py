@@ -13818,9 +13818,10 @@ def _source_control_nesting_hints(
     loop_plans: "Iterable[LoopPlan]",
     graph: Any,
     *,
+    try_programs: "Sequence[ControlProgram]" = (),
     authored_control_site_sink: "dict[tuple[int, int], AuthoredControlSite] | None" = None,
 ) -> dict[int, frozenset[int]]:
-    """Correlate loop and conditional controls by authored AST identity.
+    """Correlate loop, conditional, and Try controls by authored AST identity.
 
     Overlay receives a heterogeneous control catalogue.  Region containment
     proves most nesting, but equal-region controls and comprehension clauses
@@ -13831,6 +13832,7 @@ def _source_control_nesting_hints(
 
     reductions = tuple(reductions)
     conditionals = tuple(conditional_programs)
+    tries = tuple(try_programs)
     offset = len(reductions)
     expressions: dict[int, ast.AST] = {}
     source_node_ids: dict[int, int] = {}
@@ -13862,6 +13864,31 @@ def _source_control_nesting_hints(
         if isinstance(expression, ast.AST):
             expressions[offset + local_index] = expression
             source_node_ids[offset + local_index] = int(block.source_node_id)
+
+    from .control_source import NativeTryBlock
+    try_offset = offset + len(conditionals)
+    for local_index, program in enumerate(tries):
+        block = next((
+            item for item in (
+                program.root.blocks
+                if isinstance(program.root, SequenceBlock)
+                else (program.root,)
+            )
+            if isinstance(item, NativeTryBlock)
+        ), None)
+        if block is None:
+            raise ValueError(
+                "source Try control program has no NativeTryBlock owner"
+            )
+        source_id = int(block.source_try_node_id)
+        expression = graph.G.nodes.get(source_id, {}).get("expr_obj")
+        if not isinstance(expression, ast.Try):
+            raise ValueError(
+                "source Try control owner has no exact authored Try: "
+                f"node={source_id}"
+            )
+        expressions[try_offset + local_index] = expression
+        source_node_ids[try_offset + local_index] = source_id
 
     children: dict[int, set[int]] = {
         int(parent): set(map(int, nested))
@@ -14062,6 +14089,15 @@ def _source_control_nesting_hints(
                           for ordinal, statement in enumerate(parent.body))
             fields.extend(("orelse", ordinal, statement)
                           for ordinal, statement in enumerate(parent.orelse))
+        elif isinstance(parent, ast.Try):
+            fields.extend(("body", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.body))
+            fields.extend(("handler", ordinal, handler)
+                          for ordinal, handler in enumerate(parent.handlers))
+            fields.extend(("orelse", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.orelse))
+            fields.extend(("finalbody", ordinal, statement)
+                          for ordinal, statement in enumerate(parent.finalbody))
         elif isinstance(parent, ast.IfExp):
             fields.extend((
                 ("body", 0, parent.body),

@@ -3070,6 +3070,24 @@ def _marker_scope_paths(
                 block.orelse, nested_regions, path + (f"{label}.orelse",),
             ))
         return found
+    if isinstance(block, NativeTryBlock):
+        label = f"try(node={block.source_try_node_id})"
+        found.update(_marker_scope_paths(
+            block.body, nested_regions, path + (f"{label}.body",),
+        ))
+        for index, handler in enumerate(block.handlers):
+            found.update(_marker_scope_paths(
+                handler.body, nested_regions,
+                path + (f"{label}.handler[{index}]",),
+            ))
+        if block.orelse is not None:
+            found.update(_marker_scope_paths(
+                block.orelse, nested_regions, path + (f"{label}.orelse",),
+            ))
+        found.update(_marker_scope_paths(
+            block.finalbody, nested_regions, path + (f"{label}.finalbody",),
+        ))
+        return found
     if isinstance(block, LoopBlock):
         found.update(_marker_scope_paths(
             block.body, nested_regions,
@@ -3846,6 +3864,13 @@ def _markers_within(block: "ControlBlock") -> tuple[int, ...]:
             visit(item.body)
         elif isinstance(item, LoopBlock):
             visit(item.body)
+        elif isinstance(item, NativeTryBlock):
+            visit(item.body)
+            for handler in item.handlers:
+                visit(handler.body)
+            if item.orelse is not None:
+                visit(item.orelse)
+            visit(item.finalbody)
 
     visit(block)
     return tuple(found)
@@ -4082,6 +4107,48 @@ def overlay_scheduled_control(
                 ),
                 body_consumed or else_consumed,
             )
+        if isinstance(block, NativeTryBlock):
+            body, body_consumed = embed(
+                block.body, nested_root, nested_regions
+            )
+            handlers = []
+            consumed_arms = [body_consumed]
+            for handler in block.handlers:
+                handler_body, consumed = embed(
+                    handler.body, nested_root, nested_regions
+                )
+                handlers.append(replace(
+                    handler, body=(
+                        handler_body if handler_body is not None
+                        else nested_root if consumed else SequenceBlock(())
+                    ),
+                ))
+                consumed_arms.append(consumed)
+            orelse = None
+            if block.orelse is not None:
+                orelse, consumed = embed(
+                    block.orelse, nested_root, nested_regions
+                )
+                if orelse is None and consumed:
+                    orelse = nested_root
+                consumed_arms.append(consumed)
+            finalbody, consumed = embed(
+                block.finalbody, nested_root, nested_regions
+            )
+            consumed_arms.append(consumed)
+            if sum(consumed_arms) > 1:
+                raise ValueError(
+                    "scheduled nested control crosses authored Try arms"
+                )
+            return replace(
+                block,
+                body=(body if body is not None else
+                      nested_root if body_consumed else SequenceBlock(())),
+                handlers=tuple(handlers),
+                orelse=orelse,
+                finalbody=(finalbody if finalbody is not None else
+                           nested_root if consumed else SequenceBlock(())),
+            ), any(consumed_arms)
         if isinstance(block, LoopBlock):
             body, consumed = embed(
                 block.body, nested_root, nested_regions

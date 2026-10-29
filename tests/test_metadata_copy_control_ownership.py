@@ -5,8 +5,96 @@ from types import SimpleNamespace
 import networkx as nx
 import pytest
 
-from src.compiler.control_source import ConditionalBlock, ControlProgram, StatementBlock
+from src.compiler.control_source import (
+    ConditionalBlock, ControlProgram, NativeExceptionHandler, NativeTryBlock,
+    SequenceBlock, StatementBlock, overlay_scheduled_control,
+)
 from src.compiler.glsl_deployment_strategy import _source_control_nesting_hints
+
+
+def test_try_control_owns_each_exact_authored_arm():
+    source = """\
+try:
+    if a: x = 1
+except ValueError:
+    if b: x = 2
+else:
+    if c: x = 3
+finally:
+    if d: x = 4
+"""
+    authored_try = ast.parse(source).body[0]
+    inner = (
+        authored_try.body[0], authored_try.handlers[0].body[0],
+        authored_try.orelse[0], authored_try.finalbody[0],
+    )
+    graph_data = nx.DiGraph()
+    graph_data.add_node(1, expr_obj=authored_try)
+    for index, expression in enumerate(inner, start=2):
+        graph_data.add_node(index, expr_obj=expression)
+    graph = SimpleNamespace(G=graph_data)
+    controls = tuple(
+        ControlProgram(
+            ConditionalBlock(10 + index, SequenceBlock(()),
+                             source_node_id=index),
+            region_indices=(),
+        )
+        for index in range(2, 6)
+    )
+    owner = ControlProgram(
+        NativeTryBlock(
+            SequenceBlock(()),
+            (NativeExceptionHandler(SequenceBlock(()), 6),),
+            SequenceBlock(()), SequenceBlock(()), 1,
+        ),
+        region_indices=(),
+    )
+    sites = {}
+
+    hints = _source_control_nesting_hints(
+        (), controls, (), graph, try_programs=(owner,),
+        authored_control_site_sink=sites,
+    )
+
+    assert hints == {4: frozenset({0, 1, 2, 3})}
+    assert tuple(sites[(4, child)].slot for child in range(4)) == (
+        "body", "handler", "orelse", "finalbody",
+    )
+    assert sites[(4, 1)].ordinal == 0
+
+
+def test_try_overlay_embeds_nested_control_in_its_body_only():
+    owner = ControlProgram(
+        NativeTryBlock(
+            SequenceBlock((StatementBlock(("__scheduled_region_0__",)),)),
+            (NativeExceptionHandler(
+                SequenceBlock((StatementBlock(("__scheduled_region_1__",)),)),
+                7,
+            ),),
+            None, SequenceBlock(()), 6,
+        ),
+        region_indices=(0, 1),
+    )
+    nested = ControlProgram(
+        ConditionalBlock(
+            10, StatementBlock(("__scheduled_region_0__",)),
+            source_node_id=8,
+        ),
+        region_indices=(0,),
+    )
+
+    result = overlay_scheduled_control(
+        (0, 1), (owner, nested), known_nesting={0: (1,)},
+    )
+
+    try_block, = (
+        block for block in result.root.blocks
+        if isinstance(block, NativeTryBlock)
+    )
+    assert isinstance(try_block.body.blocks[0], ConditionalBlock)
+    assert try_block.handlers[0].body.blocks == (
+        StatementBlock(("__scheduled_region_1__",)),
+    )
 
 
 @pytest.mark.parametrize("in_predicate", [True, False])
