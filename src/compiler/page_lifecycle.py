@@ -249,6 +249,7 @@ PAGE_LIFECYCLE: dict[str, PageLifecycle] = {
     "call_edge_actual": PageLifecycle(LOWERING, LOWERING, LOWERING),
     "parameter_annotation": PageLifecycle(CLOSURE, LOWERING, LOWERING),
     "parameter_record_class": PageLifecycle(LOWERING, LOWERING, LOWERING),
+    "host_callback_admission": PageLifecycle(CLOSURE, FUNCTIONS, FUNCTIONS),
     "phi_edge_projection_placement_concordance": PageLifecycle(None, LOWERING, LOWERING),
     "phi_initial_binding": PageLifecycle(FUNCTIONS, FUNCTIONS, FUNCTIONS),
     "physical_call_input_adaptation_fixed_point": PageLifecycle(None, LOWERING, LOWERING),

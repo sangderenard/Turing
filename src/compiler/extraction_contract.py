@@ -54,6 +54,10 @@ class ExecutionContract:
     python_callbacks: str
     numeric_semantics: str
     scalar_promotion: str
+    #: ``Class.field`` stored callables the contract names as Python host
+    #: callbacks.  Only a named field is ever lowered as one, and only under
+    #: ``host_runtime: python`` with ``python_callbacks: contract_only``.
+    python_callback_whitelist: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, raw: Any) -> "ExecutionContract":
@@ -66,7 +70,7 @@ class ExecutionContract:
             "numeric_semantics", "scalar_promotion",
         }
         missing = sorted(required - set(raw))
-        extra = sorted(set(raw) - required)
+        extra = sorted(set(raw) - required - {"python_callback_whitelist"})
         if missing or extra:
             raise ExtractionContractError(
                 "execution must define exactly the execution-mode fields; "
@@ -108,9 +112,32 @@ class ExecutionContract:
             raise ExtractionContractError(
                 "execute_in_python fallback requires host_runtime: python"
             )
+        whitelist = raw.get("python_callback_whitelist") or ()
+        if isinstance(whitelist, str) or not all(
+            isinstance(item, str) and item.count(".") >= 1 and all(
+                part.isidentifier() for part in item.split(".")
+            )
+            for item in whitelist
+        ):
+            raise ExtractionContractError(
+                "execution.python_callback_whitelist must list Class.field names"
+            )
+        whitelist = tuple(dict.fromkeys(whitelist))
+        if whitelist and (
+            values["python_callbacks"] != "contract_only"
+            or values["host_runtime"] != "python"
+            or require_full_native
+        ):
+            raise ExtractionContractError(
+                "execution.python_callback_whitelist names Python host "
+                "callbacks, which only host_runtime: python with "
+                "python_callbacks: contract_only and require_full_native: "
+                "false can run"
+            )
         return cls(
             **values,
             require_full_native=require_full_native,
+            python_callback_whitelist=whitelist,
         )
 
     def receipt(self) -> dict[str, Any]:
@@ -123,6 +150,7 @@ class ExecutionContract:
             "require_full_native": self.require_full_native,
             "backward_source": self.backward_source,
             "python_callbacks": self.python_callbacks,
+            "python_callback_whitelist": list(self.python_callback_whitelist),
             "numeric_semantics": self.numeric_semantics,
             "scalar_promotion": self.scalar_promotion,
         }

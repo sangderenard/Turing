@@ -3256,6 +3256,24 @@ class ParameterAbiKind(Enum):
     REFERENCE = "reference"
 
 
+#: Whether the execution contract admits a call through a stored callable
+#: field as a host callback (``turing-host-callback-v1``).  A host callback
+#: calls code the host process owns -- a live Python interpreter, when the
+#: host is Python -- through a pointer handed in at run time, so only a
+#: field the contract names in ``python_callback_whitelist``, under a
+#: Python-hosted contract that keeps callbacks (``host_runtime: python``,
+#: ``python_callbacks: contract_only``, ``require_full_native: false``), is
+#: admitted.  Row: the field, the contract's three deciding fields and
+#: whether the whitelist names the field.
+#: Fact: ``"admit"`` or the refusal.  NOVEL(HOST_CALLBACK_ADMISSION_DECISION);
+#: CONCORD.  Writer and reader: ``fortran_c_shell._host_callback_admission``.
+HOST_CALLBACK_ADMISSION_DECISION = declare_transform("host_callback_admission", 0)
+HOST_CALLBACK_ADMISSION = declare_page("host_callback_admission", (
+    RowField("owner", K.NAME), RowField("field", K.NAME),
+    RowField("host_runtime", K.LABEL), RowField("python_callbacks", K.LABEL),
+    RowField("require_full_native", K.LABEL), RowField("whitelisted", K.LABEL),
+), str)
+
 #: The extraction contract declares a parameter's ABI kind at the function
 #: signature.  Operand: the parameter's version-0 ``name_binding`` cell.
 PARAMETER_ABI_DECLARATION = declare_transform("parameter_abi_declaration", 1)

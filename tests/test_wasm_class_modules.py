@@ -8,7 +8,7 @@ import subprocess
 
 import pytest
 
-from src.common.tensors.fused_ir import FusedProgram, OpStep
+from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from src.compiler.wasm_class_modules import (
     build_embedded_class_graph, build_hued_process_graph_views, build_manifest, build_module_process_graph,
     describe_process_graph_api, emit_class_modules,
@@ -17,6 +17,12 @@ from src.compiler.wasm_class_modules import (
     module_node_names,
     schedule_module_levels,
 )
+
+
+def _float64_meta(feeds):
+    """The feeds' dtype record: a hand-built program states its element type."""
+
+    return {int(feed): Meta(dtype="float64") for feed in feeds}
 
 
 def _linear_program(n_steps: int, feed_id: int = 1) -> FusedProgram:
@@ -33,7 +39,7 @@ def _linear_program(n_steps: int, feed_id: int = 1) -> FusedProgram:
         ))
         previous = result_id
     return FusedProgram(
-        version=1, feeds={feed_id}, steps=steps, outputs={"result": previous},
+        version=1, feeds={feed_id}, meta=_float64_meta({feed_id}), steps=steps, outputs={"result": previous},
     )
 
 
@@ -63,7 +69,7 @@ def test_a_larger_program_is_cut_into_contiguous_chunks():
 def test_thread_partition_vertically_fuses_before_parallel_waves():
     program = FusedProgram(
         version=1,
-        feeds={1, 2},
+        feeds={1, 2}, meta=_float64_meta({1, 2}),
         steps=[
             OpStep(0, "mul", [1], {"right_scalar": 2.0}, 10),
             OpStep(1, "add", [10], {"right_scalar": 1.0}, 11),
@@ -95,7 +101,7 @@ def test_extent_effect_marks_whole_invocation_reductions_collective():
     pointwise = _linear_program(3)
     collective = FusedProgram(
         version=1,
-        feeds={1},
+        feeds={1}, meta=_float64_meta({1}),
         steps=[OpStep(0, "sum", [1], {}, 2)],
         outputs={"result": 2},
     )
@@ -133,7 +139,7 @@ def test_chunk_size_must_be_positive():
 
 
 def test_an_empty_program_still_produces_one_root_module():
-    program = FusedProgram(version=1, feeds=set(), steps=[], outputs={})
+    program = FusedProgram(version=1, feeds=set(), meta=_float64_meta(set()), steps=[], outputs={})
     specs = partition_reduced_program(program, chunk_size=4, owner_name="kernel")
     assert len(specs) == 1
     assert specs[0].is_root
@@ -141,7 +147,7 @@ def test_an_empty_program_still_produces_one_root_module():
 
 def test_partition_prunes_a_dead_tail_after_the_declared_output():
     program = FusedProgram(
-        version=1, feeds={1},
+        version=1, feeds={1}, meta=_float64_meta({1}),
         steps=[
             OpStep(0, "mul", [1], {"right_scalar": 2.0}, 2),
             OpStep(1, "mul", [2], {"right_scalar": 3.0}, 3),
@@ -188,7 +194,7 @@ def test_link_calls_false_produces_independently_instantiable_modules():
 
 def test_shared_memory_modules_import_one_global_memory_with_disjoint_static_data():
     program = FusedProgram(
-        version=1, feeds={1},
+        version=1, feeds={1}, meta=_float64_meta({1}),
         steps=[
             OpStep(0, "sin", [1], {}, 2),
             OpStep(1, "cos", [2], {}, 3),
@@ -307,7 +313,7 @@ def test_build_manifest_derives_edges_from_the_cut_boundary():
 def test_manifest_uses_the_emitted_module_feed_order_not_boundary_set_order():
     program = FusedProgram(
         version=1,
-        feeds={1, 2},
+        feeds={1, 2}, meta=_float64_meta({1, 2}),
         steps=[OpStep(0, "sub", [2, 1], result_id=3)],
         outputs={"result": 3},
     )
@@ -487,7 +493,7 @@ def test_describe_process_graph_api_collapses_a_value_needed_by_several_chunks()
     chunk that happens to need it."""
 
     program = FusedProgram(
-        version=1, feeds={1},
+        version=1, feeds={1}, meta=_float64_meta({1}),
         steps=[
             OpStep(step_id=0, op_name="mul", input_ids=[1],
                    attrs={"right_scalar": 2.0}, result_id=101),
@@ -530,7 +536,7 @@ def test_embedded_graph_can_redirect_a_logical_input_to_output_storage():
 def test_state_feedback_names_an_originless_feed_before_inventory_consumes_it():
     program = FusedProgram(
         version=1,
-        feeds={4},
+        feeds={4}, meta=_float64_meta({4}),
         steps=[OpStep(
             step_id=0, op_name="add", input_ids=[4],
             attrs={"right_scalar": 1.0}, result_id=5,
@@ -569,7 +575,7 @@ def test_describe_process_graph_api_falls_back_to_a_synthetic_name():
     a usable, if less pretty, parameter name -- never a crash."""
 
     program = FusedProgram(
-        version=1, feeds={1},
+        version=1, feeds={1}, meta=_float64_meta({1}),
         steps=[OpStep(step_id=0, op_name="mul", input_ids=[1],
                        attrs={"right_scalar": 2.0}, result_id=2)],
         outputs={"result": 2},
