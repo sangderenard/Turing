@@ -1933,7 +1933,7 @@ class CorrelationTable:
 
         from .concordance_declarations import (
             CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ENTRY,
-            SOURCE_EXCEPTION_TRANSFER,
+            SOURCE_EXCEPTION_TRANSFER, STATIC_SYMBOL_DEFINITION,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -1983,6 +1983,19 @@ class CorrelationTable:
                     else book.edges_into(transfer_cell)
                 )
             }
+            class_cell = fact.raised_class_definition
+            if class_cell is not None and (
+                fact.source_kind != "raise"
+                or class_cell.page != STATIC_SYMBOL_DEFINITION
+                or len(class_cell.row) != 3
+                or bool(class_cell.row[2])
+                or class_cell not in causes
+            ):
+                found.append(Finding(
+                    "source-exception-class-definition-disagree",
+                    str(row[0]), int(row[1]),
+                    f"raised class {class_cell!r} has no exact static cause",
+                ))
             if len(names) != len(set(names)) or names != tuple(sorted(names)):
                 found.append(Finding(
                     "source-exception-entry-bindings-disagree", str(row[0]),

@@ -292,6 +292,19 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
 
     for source_id, transfer in sorted(transfers.items()):
         source_cell = node_identity_cell(graph, source_id)
+        source_expression = G.nodes[source_id].get("expr_obj")
+        raised_class_definition = None
+        if isinstance(source_expression, ast.Raise):
+            from .control_source import validation_raise_class_cell
+
+            # Program: `raise ValueError(...)` in the codec's handler.
+            # The old SSA reader trusted a cached class spelling on its
+            # ValidationBlock. The authored constructor's static-use edge
+            # is the class authority; carry that exact cell on the transfer.
+            raised_class_definition = validation_raise_class_cell(
+                G, source_expression,
+                lambda expression: source_node(expression, required=False),
+            )
         target_cell = (
             None if transfer.catch_try_node_id is None
             else node_identity_cell(graph, transfer.catch_try_node_id)
@@ -315,7 +328,8 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
         )
         fact = ExceptionTransferFact(
             source_cell, transfer.source_kind, target_cell,
-            scope_cells, finalizer_cells, entry_bindings,
+            scope_cells, finalizer_cells, raised_class_definition,
+            entry_bindings,
         )
         dependencies = tuple(dict.fromkeys((
             source_cell,
@@ -323,6 +337,7 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             *(item for owner, _arm, handler, _has_finally in scope_cells
               for item in (owner, handler) if item is not None),
             *finalizer_cells,
+            *((raised_class_definition,) if raised_class_definition is not None else ()),
             *(cell for _name, cell in entry_bindings),
         )))
         row = (scope, source_id)

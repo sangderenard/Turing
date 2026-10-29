@@ -1154,6 +1154,9 @@ class ExceptionTransferFact:
     catch_try: Ref | None
     scopes: tuple[tuple[Ref, str, Ref | None, bool], ...]
     unwind_finally: tuple[Ref, ...]
+    # A Raise constructor's exact STATIC_SYMBOL_DEFINITION cell. A protected
+    # Call has no fixed raised class and keeps this None.
+    raised_class_definition: Ref | None
     # The exact lexical values live before this source operation completes.
     # A handler entry selects only the exceptional predecessors reaching it.
     entry_bindings: tuple[tuple[str, Ref], ...]

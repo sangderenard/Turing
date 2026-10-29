@@ -10285,6 +10285,7 @@ class _ControlSSABuilder(TiledObject):
             return None
         from .concordance_declarations import (
             SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
+            STATIC_SYMBOL_DEFINITION,
             canonical_python_subtype_identities,
         )
         from .native_faults import authored_raise_status
@@ -10327,7 +10328,29 @@ class _ControlSSABuilder(TiledObject):
                 f"source exception target {target!r} has no active native Try",
             ))
             return None
-        raised_name = str(block.extraction_identity or "")
+        class_cell = transfer.raised_class_definition
+        if (
+            class_cell is None
+            or class_cell.page != STATIC_SYMBOL_DEFINITION
+            or len(class_cell.row) != 3
+            or class_cell.row[2]
+        ):
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "raise", path,
+                "source raise has no exact exception class definition: "
+                f"source={block.source_raise_node_id}",
+            ))
+            return None
+        raised_name = f"{class_cell.row[0]}.{class_cell.row[1]}"
+        if block.extraction_identity != raised_name:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "raise", path,
+                "source raise cached class disagrees with its transfer: "
+                f"source={block.source_raise_node_id}, "
+                f"cached={block.extraction_identity!r}, "
+                f"definition={raised_name!r}",
+            ))
+            return None
         if authored_raise_status(raised_name) is None:
             self.shortfalls.append(SSALoweringShortfall(
                 "control", "raise", path,
@@ -12575,11 +12598,49 @@ class _ControlSSABuilder(TiledObject):
                 self.current = passed
             return
         if isinstance(block, ValidationBlock):
+            from .concordance_declarations import (
+                SOURCE_EXCEPTION_TRANSFER, STATIC_SYMBOL_DEFINITION,
+            )
             from .native_faults import (
                 AUTHORED_RAISE_STATUSES, authored_raise_status,
             )
 
-            native_status = authored_raise_status(block.extraction_identity)
+            raised_identity = block.extraction_identity
+            if block.source_raise_node_id is not None:
+                transfer = (
+                    None if self.lexical_read_scope is None else
+                    self._book().page(SOURCE_EXCEPTION_TRANSFER).latest((
+                        self.lexical_read_scope,
+                        int(block.source_raise_node_id),
+                    ))
+                )
+                definition = (
+                    None if transfer is None else
+                    transfer.raised_class_definition
+                )
+                if (
+                    transfer is None
+                    or transfer.source_kind != "raise"
+                    or definition is None
+                    or definition.page != STATIC_SYMBOL_DEFINITION
+                    or len(definition.row) != 3
+                    or definition.row[2]
+                ):
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "control", "raise", path,
+                        "authored raise has no concorded exception class "
+                        f"definition: source={block.source_raise_node_id}",
+                    ))
+                    return
+                raised_identity = f"{definition.row[0]}.{definition.row[1]}"
+                if block.extraction_identity != raised_identity:
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "control", "raise", path,
+                        "authored raise class cache disagrees with source "
+                        f"transfer: source={block.source_raise_node_id}",
+                    ))
+                    return
+            native_status = authored_raise_status(raised_identity)
             if block.source_raise_node_id is not None and native_status is None:
                 self.shortfalls.append(SSALoweringShortfall(
                     "control", "raise", path,

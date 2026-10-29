@@ -589,12 +589,12 @@ class ValidationBlock(TiledObject):
     source_raise_node_id: int | None = None
 
 
-def validation_raise_identity(
+def validation_raise_class_cell(
     graph: Any,
     statement: ast.Raise,
     node_for_expression: Callable[[ast.AST], int | None],
-) -> str | None:
-    """Read a raise constructor's exact static-use definition edge.
+) -> Any:
+    """Read the raise constructor's exact static definition cell.
 
     Program: ``raise ValueError(...)`` in tensor_octets_to_bytes. Wrong
     record: a matching AST spelling plus the compiler host's ``builtins``
@@ -664,7 +664,7 @@ def validation_raise_identity(
         if use_cell is None:
             continue
         definitions.update(
-            (str(source.row[0]), str(source.row[1]))
+            source
             for source, _stage in book.edges_into(use_cell)
             if source.page == STATIC_SYMBOL_DEFINITION
             and len(source.row) == 3 and not source.row[2]
@@ -676,8 +676,20 @@ def validation_raise_identity(
         )
     if not definitions:
         return None
-    module, qualname = definitions.pop()
-    return f"{module}.{qualname}"
+    return definitions.pop()
+
+
+def validation_raise_identity(
+    graph: Any,
+    statement: ast.Raise,
+    node_for_expression: Callable[[ast.AST], int | None],
+) -> str | None:
+    """Render the class identity from the same static definition cell."""
+
+    cell = validation_raise_class_cell(
+        graph, statement, node_for_expression,
+    )
+    return None if cell is None else f"{cell.row[0]}.{cell.row[1]}"
 
 
 def validation_diagnostic_value_ids(
