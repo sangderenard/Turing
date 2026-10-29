@@ -47515,6 +47515,46 @@ def _class_surface_ssa_program(
                 # but the BINDING is not a proven fact -- it is recorded as
                 # Unresolved(STORAGE_MINTED_FROM_ABSENCE) below, beside the
                 # ``result_storage_binding`` row the lease wrote.
+                #
+                # Program: ``one(atoms)`` passes its unannotated ``atoms``
+                # to ``batch(self, values: list[int], offsets)``, which
+                # bounds-checks ``values[offsets[i]]``.  Wrong record: the
+                # argument carried no length cell, so the length, capacity
+                # and status members of ``values`` fell here and were
+                # leased as fresh storage nobody wrote; the bounds check
+                # read garbage (IndexError where Python returns 97).  Rule:
+                # a member of an authored parameter carries the argument's
+                # own state, so storage minted from absence is never its
+                # binding.  A member the callee never reads is harmless, so
+                # the refusal is recorded on the formal here and raised
+                # after the final prune only if an instruction reads it.
+                parameter_accounting = dict(value.accounting or {})
+                if (
+                    parameter_accounting.get("program_abi_parameter")
+                    is not None
+                    and not any(
+                        parameter_accounting.get(key)
+                        for key in (
+                            "compiler_frame_storage",
+                            "linked_call_frame_storage",
+                            "returned_record_storage",
+                            "heap_owner",
+                        )
+                    )
+                ):
+                    value.accounting = {
+                        **parameter_accounting,
+                        "unbound_parameter_member": (
+                            "parameter member has no caller binding: "
+                            f"{caller_symbol} callsite "
+                            f"{planned_call.callsite_id} -> {callee_symbol} "
+                            f"formal {value_id} is the "
+                            f"{parameter_accounting.get('program_abi_storage')!r}"
+                            " member of parameter "
+                            f"{parameter_accounting['program_abi_parameter']!r}"
+                            ", and the argument supplies no such member"
+                        ),
+                    }
                 absent_bindings.add(value_id)
                 frame_bindings.append((
                     value_id,
@@ -64732,6 +64772,26 @@ def _lower_ast_source_to_ssa_impl(
                 module.functions, final_call_records,
                 module.sequence_tables,
             )
+            # A parameter member leased from absence at a call binding (see
+            # ``unbound_parameter_member`` in the frame binding walk) is
+            # caller state no caller writes.  A member its callee never
+            # reads is harmless; one an instruction reads would be read
+            # uninitialized, so it is refused by name.  A call operand only
+            # forwards the slot; the callee's own formal answers for it.
+            for function in module.functions.values():
+                read_ids = {
+                    int(operand.id)
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op not in {"Call", "call"}
+                    for operand in instruction.args
+                }
+                for formal in function.args:
+                    unbound = dict(formal.accounting or {}).get(
+                        "unbound_parameter_member"
+                    )
+                    if unbound and int(formal.id) in read_ids:
+                        raise ValueError(str(unbound))
             final_pruned_entry_field_aliases = _prune_dead_entry_field_aliases(
                 module.functions, final_call_records,
             )
