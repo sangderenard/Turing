@@ -15469,36 +15469,42 @@ def _install_lexical_sequence_mutations(
     # ("Call reads a value defined at while_body").  Rule: inside its guard's
     # arm an effect is placed as at any other level -- in the innermost loop
     # whose per-iteration lines hold it (``insert_in_enclosing_loop``).
-    arm_placement_node: list = [None]
-
-    def insert_in_arm(arm_block, mutation_block):
-        node_id = arm_placement_node[0]
-        if node_id is None or int(node_id) not in graph.G:
+    def insert_in_arm(arm_block, mutation_block, placement_node):
+        if placement_node is None or int(placement_node) not in graph.G:
             return insert_ordered(arm_block, mutation_block)
-        return insert_in_enclosing_loop(arm_block, mutation_block, int(node_id))
+        return insert_in_enclosing_loop(
+            arm_block, mutation_block, int(placement_node),
+        )
 
-    def insert_in_conditional(block, owner_id, arm, mutation_block):
+    def insert_in_conditional(
+        block, owner_id, arm, mutation_block, placement_node,
+    ):
         if isinstance(block, ConditionalBlock):
             if int(block.source_node_id or -1) == int(owner_id):
                 if str(arm) == "body":
                     return replace(
                         block,
-                        body=insert_in_arm(block.body, mutation_block),
+                        body=insert_in_arm(
+                            block.body, mutation_block, placement_node,
+                        ),
                     ), True
                 return replace(
                     block,
                     orelse=insert_in_arm(
                         block.orelse or SequenceBlock(()), mutation_block,
+                        placement_node,
                     ),
                 ), True
             body, inserted = insert_in_conditional(
-                block.body, owner_id, arm, mutation_block
+                block.body, owner_id, arm, mutation_block,
+                placement_node,
             )
             if inserted:
                 return replace(block, body=body), True
             if block.orelse is not None:
                 orelse, inserted = insert_in_conditional(
-                    block.orelse, owner_id, arm, mutation_block
+                    block.orelse, owner_id, arm, mutation_block,
+                    placement_node,
                 )
                 if inserted:
                     return replace(block, orelse=orelse), True
@@ -15508,24 +15514,28 @@ def _install_lexical_sequence_mutations(
             inserted = False
             for child in block.blocks:
                 projected, child_inserted = insert_in_conditional(
-                    child, owner_id, arm, mutation_block
+                    child, owner_id, arm, mutation_block,
+                    placement_node,
                 )
                 children.append(projected)
                 inserted |= child_inserted
             return SequenceBlock(tuple(children)), inserted
         if isinstance(block, LoopBlock):
             body, inserted = insert_in_conditional(
-                block.body, owner_id, arm, mutation_block
+                block.body, owner_id, arm, mutation_block,
+                placement_node,
             )
             return replace(block, body=body), inserted
         if isinstance(block, WhileBlock):
             body, inserted = insert_in_conditional(
-                block.body, owner_id, arm, mutation_block
+                block.body, owner_id, arm, mutation_block,
+                placement_node,
             )
             return replace(block, body=body), inserted
         if isinstance(block, CallBlock):
             callee, inserted = insert_in_conditional(
-                block.callee, owner_id, arm, mutation_block
+                block.callee, owner_id, arm, mutation_block,
+                placement_node,
             )
             return replace(block, callee=callee), inserted
         return block, False
@@ -15760,7 +15770,7 @@ def _install_lexical_sequence_mutations(
 
         inserted = False
         item = mutation_block
-        arm_placement_node[0] = (
+        placement_node = (
             int(mutation.effect_node_id)
             if isinstance(mutation, ScalarFieldWriteBlock)
             else _sequence_mutation_owner_id(mutation)
@@ -15768,7 +15778,9 @@ def _install_lexical_sequence_mutations(
         for owner_id, arm in sorted(
             guarded, key=lambda entry: node_position(entry[0]), reverse=True,
         ):
-            root, inserted = insert_in_conditional(root, owner_id, arm, item)
+            root, inserted = insert_in_conditional(
+                root, owner_id, arm, item, placement_node,
+            )
             if inserted:
                 break
             item = synthesize(owner_id, arm, item)
@@ -23831,9 +23843,11 @@ def _class_surface_ssa_program(
         )
 
     def post_shape_statement(
-        owner: Any, value_id: int, fact: Any, source: Any,
+        owner: Any, value_id: int, fact: Any, source: Any, *, also: tuple = (),
     ) -> Any:
-        """The stating copy's ``copy_value_shape`` cell for ``fact``."""
+        """The stating copy's ``copy_value_shape`` cell for ``fact``;
+        ``also`` names the record cells the statement is read from beyond
+        the value's identity (a copy's ``planner_specialization`` row)."""
         row = (_copy_scope(owner)[0], int(value_id))
         statement = _CopyShapeFact(
             str(fact[0]), tuple(fact[1] or ()), str(fact[2] or ""),
@@ -23842,7 +23856,7 @@ def _class_surface_ssa_program(
         latest = shape_identity_book.latest_ref(_COPY_VALUE_SHAPE, row)
         if latest is not None and _cell_fact(latest) == statement:
             return latest
-        cells = [_identity_cell(owner, value_id)]
+        cells = [_identity_cell(owner, value_id), *also]
         if source is not None:
             source_owner, source_id = source
             cells.append(
@@ -23898,7 +23912,7 @@ def _class_surface_ssa_program(
 
     def note_shape(
         owner: Any, value_id: int, fact: Any, *, source: Any = None,
-        callsites_disagree: bool = False,
+        callsites_disagree: bool = False, also: tuple = (),
     ) -> None:
         """Record one copy's shape statement for ``value_id``.
 
@@ -23906,7 +23920,9 @@ def _class_surface_ssa_program(
         carried over a call edge came from.  ``callsites_disagree`` is the
         within-copy case (two callsites of this copy stated different
         shapes): the polymorphism derives from this copy's standing
-        statement and the new caller's statement.  A row the book proves
+        statement and the new caller's statement.  ``also`` is the record
+        cells a statement is read from (see ``post_shape_statement``).
+        A row the book proves
         polymorphic gets no further ``value_shape`` entries; its readers
         read ``value_shape_polymorphism``."""
         row = (str(owner.graph.get("function_name")), int(value_id))
@@ -23929,7 +23945,7 @@ def _class_surface_ssa_program(
         ) is not None:
             return
         if stated:
-            cell = post_shape_statement(owner, value_id, fact, source)
+            cell = post_shape_statement(owner, value_id, fact, source, also=also)
             disagreeing = tuple(
                 other for other_row in copy_statement_rows.get(row, ())
                 if other_row != cell.row
@@ -24169,37 +24185,52 @@ def _class_surface_ssa_program(
         # ``[0, 2, 3]`` has no call edge stating its extent, so the other
         # copy's (2,) stood alone on the authored row and was compared
         # against this copy's (3,) (refused as a shape disagreement).
-        # Rule: a formal a copy folded to a flat literal sequence states
-        # that literal's extent for the copy, as its own SSA does; two
-        # copies stating different extents are polymorphic.
+        # Rule: the copy's ``planner_specialization`` row names the literal
+        # sequence a formal is for this copy; the copy states that literal's
+        # extent, at the element dtype the literal rules give it
+        # (``_literal_element_dtype``), DERIVED from that row; two copies
+        # stating different extents are polymorphic.  A literal whose
+        # elements share no dtype states nothing.
+        from .concordance_declarations import (
+            PLANNER_SPECIALIZATION_PAGE as _SPECIALIZATION_PAGE,
+            SpecializationFact as _SpecializationFact,
+        )
+        from .glsl_deployment_strategy import _literal_element_dtype
+
+        copy_read_scope = planned_graph.graph.get("lexical_read_scope")
+        specialization_page = shape_identity_book.pages.get(
+            _SPECIALIZATION_PAGE.name
+        )
         for parameter_name in sorted(map(str, (
             planned_graph.graph.get("function_parameters") or ()
         ))):
+            if copy_read_scope is None or specialization_page is None:
+                break
+            specialization_row = (tuple(copy_read_scope), parameter_name)
+            specialization = specialization_page.latest(specialization_row)
+            if not isinstance(specialization, _SpecializationFact):
+                continue
+            literal = specialization.value
+            if not (
+                isinstance(literal, (list, tuple)) and literal
+                and all(
+                    isinstance(item, (bool, int, float)) for item in literal
+                )
+            ):
+                continue
+            literal_dtype = _literal_element_dtype(literal)
+            if literal_dtype is None:
+                continue
+            specialization_cell = shape_identity_book.latest_ref(
+                _SPECIALIZATION_PAGE, specialization_row,
+            )
             for value_id in identities.get(parameter_name, ()):
-                literal_data = planned_graph.nodes.get(int(value_id)) or {}
-                literal_attributes = literal_data.get("attributes") or {}
-                literal = literal_attributes.get("value")
-                if not (
-                    literal_attributes.get("structural_specialization")
-                    and literal_attributes.get("aggregate_kind") in {
-                        "list", "tuple",
-                    }
-                    and isinstance(literal, (list, tuple))
-                    and literal
-                    and all(
-                        isinstance(item, (bool, int, float)) for item in literal
-                    )
-                ):
-                    continue
                 note_shape(planned_graph, int(value_id), (
                     "folded literal formal",
                     (len(literal),),
-                    "bool" if all(isinstance(item, bool) for item in literal)
-                    else "float64" if any(
-                        isinstance(item, float) for item in literal
-                    ) else "int64",
+                    literal_dtype,
                     "span",
-                ))
+                ), also=(specialization_cell,))
 
         # Concrete source annotations also declare semantic class identity.
         # Physical parameter ABI is established by the existing scalar/span/
@@ -28602,7 +28633,8 @@ def _class_surface_ssa_program(
         # contract, so both lowered under one symbol and the FIXED caller
         # bound the DYNAMIC view ("bound sequence views disagree about
         # dynamic capacity").  Rule: a copy's settled capacity policy for
-        # its formals is part of its callsite contract.
+        # its formals is part of its callsite contract, always (not only
+        # when another part of the contract already specialized it).
         linked_dynamic_ids = set(
             map(int, graph_obj.graph.get("linked_dynamic_sequence_ids", ()))
         )
@@ -28613,7 +28645,7 @@ def _class_surface_ssa_program(
             and (data.get("attributes") or {}).get("binding_name") is not None
             and int(data.get("value_id", node_id)) in linked_dynamic_ids
         ))
-        if dynamic_formals and any(specialization_contract):
+        if dynamic_formals:
             specialization_contract = (
                 *specialization_contract, ("dynamic_formals", dynamic_formals),
             )
@@ -30239,28 +30271,6 @@ def _class_surface_ssa_program(
             if not (0 <= int(slot) < len(field_names)):
                 continue
             field = dict(self_record_fields.get(field_names[int(slot)]) or {})
-            if field.get("dtype") is None and _kind == "read" and (
-                int(value_id) in graph_obj
-            ):
-                # Program: the structure driver's ``fold(d,
-                # vocabulary.epoch)`` on a local ``Vocabulary()``.  Wrong
-                # record: only a receiver PARAMETER's record fields were
-                # read here, so a local record's field read, consumed only
-                # as a call actual, reached the slot ABI with no dtype.
-                # Rule: the read carries its class field's declared scalar
-                # storage (stamped at ingestion from the field's storage
-                # contract); that is the slot's dtype.
-                read = graph_obj.nodes[int(value_id)]
-                descriptor = read.get("tensor") or {}
-                if (
-                    str(read.get("op") or read.get("type") or "").casefold()
-                    == "getattr"
-                    and (read.get("attributes") or {}).get("value_kind")
-                    == "scalar"
-                    and not tuple(descriptor.get("shape") or ())
-                    and descriptor.get("dtype") is not None
-                ):
-                    field = {"dtype": str(descriptor["dtype"])}
             if field.get("dtype") is not None:
                 parameter_value_dtypes[int(value_id)] = str(field["dtype"])
             if field.get("shape") is not None:
