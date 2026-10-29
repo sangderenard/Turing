@@ -3176,6 +3176,37 @@ def _planned_scalar_dtypes_from_graph(
             )
         )
 
+    def concatenated_empty_display(node_id):
+        """The ``+`` an empty list display is read by alone, or ``None``.
+
+        ``[]`` (a display with no members, or its folded ``[]`` constant)
+        whose one reader is a concatenation: it states no element class of
+        its own, and its zero rows are stored in the concatenation's.
+        """
+
+        data = G.nodes.get(int(node_id), {})
+        attributes = data.get("attributes") or {}
+        constant = data.get("constant", attributes.get("value"))
+        empty = (
+            attributes.get("aggregate_leaf_value_ids") == ()
+            and attributes.get("producer_kind") == "aggregate"
+        ) or (
+            operation(data) in {"const", "constant"}
+            and attributes.get("aggregate_kind") == "list"
+            and isinstance(constant, (list, tuple))
+            and not constant
+        )
+        readers = set(G.successors(int(node_id))) if empty else set()
+        if len(readers) != 1:
+            return None
+        reader = next(iter(readers))
+        reader_data = G.nodes[reader]
+        if operation(reader_data) != "add" or int(node_id) not in parents(
+            reader_data, "lhs", "rhs",
+        ):
+            return None
+        return int(reader)
+
     records = G.graph.get("source_sequence_mutation_records") or {}
     # Program: ``xs = collect(n); return sum(xs)`` (corpus c152).  Wrong
     # record: the call result's element type was unread, so ``sum`` fell to
@@ -3259,6 +3290,16 @@ def _planned_scalar_dtypes_from_graph(
                 # class-only contract does not narrow it.
                 scalar[node_id] = proven_width
                 changed = True
+            # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca``
+            # (the structure-queries cover rebuild).  Wrong record: the
+            # empty display states no element class, so it entered the
+            # concatenation's region with no dtype.  Rule: an empty display
+            # read only by a concatenation stores its zero rows in the
+            # concatenation's class.
+            concatenation = concatenated_empty_display(node_id)
+            if concatenation is not None and element.get(concatenation):
+                settle(element, node_id, element[concatenation])
+                continue
             # Program: ``k.mul(x) + k.scale`` with ``def mul(self, x: int) ->
             # int`` (corpus c426).  Wrong record: a method call is named by
             # its method (``mul``), so no operator rule typed it and its
@@ -4574,7 +4615,23 @@ def _planned_scalar_dtypes_from_graph(
                     and all(is_collection(o) or o in element for o in operands)
                     and not any(o in scalar for o in operands)
                 ):
-                    writers = [element.get(o) for o in operands]
+                    # Program: ``rebuilt = []; for c in cover: ...;
+                    # rebuilt = rebuilt + ca`` (structure_queries).  Wrong
+                    # record: the empty display states no element class, so
+                    # the concatenation's join never closed.  Rule (as for
+                    # a branch join's empty arm): an empty display that
+                    # only this concatenation reads states no class; the
+                    # rows are the other operand's, and its zero rows are
+                    # stored in that class.
+                    empty_operands = [
+                        o for o in operands
+                        if concatenated_empty_display(o) == node_id
+                        and element.get(o) is None
+                    ]
+                    writers = [
+                        element.get(o) for o in operands
+                        if o not in empty_operands
+                    ]
                     for child in G.successors(node_id):
                         child_data = G.nodes[child]
                         if operation(child_data) in {"indexedstore", "setitem"}:
@@ -7416,6 +7473,26 @@ def _build_shell_hierarchy_plan(
             if isinstance(literal, list) and literal and all(
                 isinstance(member, (list, tuple)) for member in literal
             )
+        )
+        # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca``.
+        # Wrong record: the folded ``[]`` has no tensor extent, so its
+        # ``Const`` line got a scalar record and was dropped above, and the
+        # concatenation's region refused it.  Rule: an empty list constant
+        # is a list of zero rows of its element class (the planner's, from
+        # the concatenation it feeds); no class, no record.
+        value_shapes += tuple(
+            (int(value_id), (0,), str(record[2]))
+            for value_id in sorted(materialised)
+            if int(value_id) not in produced
+            and int(value_id) not in captured
+            and int(value_id) not in {row[0] for row in value_shapes}
+            for literal in ((
+                (graph.G.nodes.get(int(value_id)) or {}).get("attributes")
+                or {}
+            ).get("value"),)
+            if isinstance(literal, list) and not literal
+            for record in (_typed_value_shape(value_id),)
+            if record is not None and record[2] is not None
         )
         value_ranks = tuple(
             (
@@ -11043,6 +11120,20 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
             str(role) == "kw:reduce"
             and str(data.get("op") or node_type) == "scatter"
             and _constant_value(parent_data) in {"sum", "mean", "max", "min"}
+        ):
+            continue
+        # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca`` (the
+        # structure-queries cover rebuild).  Wrong record: the folded empty
+        # display is a constant no tensor flattens, so the concatenation was
+        # classified coordinator metadata and dropped: its result had no
+        # producer, became a root formal, and the list read back empty.
+        # Rule: a sequence constant operand of ``+`` is a sequence, and the
+        # ``+`` is the structural concatenation ``_sequence_concat_ops``
+        # lowers, not a Python object dependency.
+        if (
+            node_type == "Add"
+            and (parent_data.get("attributes") or {}).get("aggregate_kind")
+            in {"list", "bytes", "bytearray"}
         ):
             continue
         try:
