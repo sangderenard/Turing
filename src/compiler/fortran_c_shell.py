@@ -484,6 +484,71 @@ def _accepted_record_sequence_members(
     return candidates[0] if candidates else ()
 
 
+def _post_positional_return_slots(
+    function: Any, graph: Any, terminator: Any,
+    previous_ids: tuple[int, ...], *, declared_ids: tuple[int, ...],
+) -> None:
+    """Publish the physical ``function_output`` slots a positional Ret
+    reassembly changed (c924), before block geometry reads them.
+
+    Each changed or new slot is DERIVED from its value's ``ssa_value`` and
+    graph cells, the source return-site cells, and the aggregate layout of
+    every declared output: the positions are the source's, not this
+    writer's.  A slot whose value is unchanged keeps its row.
+    """
+
+    from .concordance_declarations import (
+        AGGREGATE_RETURN_LAYOUT, CONTROL_SSA_FINISH, FUNCTION_OUTPUT,
+    )
+    from .identity_concordance import (
+        ConcordanceRefusal, Derived, Mode, current_identity_book,
+    )
+    from .ssa_record_return_state import (
+        function_scope_of, return_site_cells, ssa_value_identity_cell,
+    )
+
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    page = book.page(FUNCTION_OUTPUT)
+    layout_cells = tuple(
+        cell for value_id in dict.fromkeys(declared_ids)
+        for cell in (book.current_ref(
+            AGGREGATE_RETURN_LAYOUT, (scope, int(value_id)),
+        ),)
+        if cell is not None
+    )
+    site_cells = tuple(dict.fromkeys(
+        return_site_cells(graph.graph).values()
+    ))
+    for slot, argument in enumerate(terminator.args):
+        value_id = int(argument.id)
+        if slot < len(previous_ids) and previous_ids[slot] == value_id:
+            continue
+        row = (scope, int(slot))
+        incumbent = page.latest(row)
+        name = (
+            incumbent[0]
+            if incumbent is not None and int(incumbent[1]) == value_id
+            else None
+        )
+        sources = tuple(dict.fromkeys(cell for cell in (
+            _frame_graph_cell(graph, value_id),
+            ssa_value_identity_cell(function, value_id, book=book),
+            *layout_cells,
+            *site_cells,
+        ) if cell is not None))
+        if not sources:
+            raise ConcordanceRefusal(
+                "positional return slot has no source identity: "
+                f"function={function.name!r}, slot={slot}, value={value_id}"
+            )
+        book.post(
+            FUNCTION_OUTPUT, row, (name, value_id),
+            stage=CONTROL_SSA_FINISH, provenance=Derived(sources),
+            mode=Mode.REVISE if incumbent is not None else Mode.CONCORD,
+        )
+
+
 def _publish_concorded_output_identities(
     function: Any, bindings: Mapping[int, int],
 ) -> dict[int, int]:
@@ -35633,7 +35698,31 @@ def _class_surface_ssa_program(
                             "structural_formal_replacements"
                         ] = (*prior_replacements, replacement_receipt)
         aggregate_layouts = aggregate_return_layouts(function)
-        if aggregate_layouts:
+        # The source's top-level return positions, repeats kept:
+        # ``return x, x`` is ``('x', 'x')``.  ``output_names`` is the set
+        # of names (deduplicated) the recovery publishes; it is not a
+        # position list.
+        positional_output_names = tuple((
+            *tuple(graph.graph.get("function_outputs") or ()),
+            *(
+                name for name in output_names
+                if name not in tuple(graph.graph.get("function_outputs") or ())
+            ),
+        ))
+        declared_order: list[int] = []
+        for output_name in positional_output_names:
+            history = tuple(identities.get(str(output_name), ()))
+            if not history and str(output_name) not in named_output_ids:
+                continue
+            output_id = int(
+                named_output_ids[str(output_name)]
+                if str(output_name) in named_output_ids
+                else history[-1]
+            )
+            declared_order.extend(
+                aggregate_layouts.get(output_id, (output_id,))
+            )
+        if aggregate_layouts or len(set(declared_order)) < len(declared_order):
             # The Ret is the function's physical output ABI.  Its order is the
             # declared output order with every aggregate output expanded in
             # place -- ``total, (hub, angle), valid`` returns
@@ -35641,27 +35730,52 @@ def _class_surface_ssa_program(
             # path order a caller's PlanCall binds its projections in.
             # Appending recovered leaves at the end would let a positional
             # correlation pair ``hub`` with ``valid``.
-            declared_order: list[int] = []
-            for output_name in output_names:
-                history = tuple(identities.get(str(output_name), ()))
-                if not history and str(output_name) not in named_output_ids:
-                    continue
-                output_id = int(
-                    named_output_ids[str(output_name)]
-                    if str(output_name) in named_output_ids
-                    else history[-1]
-                )
-                declared_order.extend(
-                    aggregate_layouts.get(output_id, (output_id,))
-                )
-            rank = {
-                value_id: position
-                for position, value_id in enumerate(declared_order)
+            #
+            # Program: ``return (x, (x, 1.0))`` (c924).  Wrong record: the
+            # Ret was assembled by value id -- the leaf ``x`` of the inner
+            # tuple was "already published" by the outer ``x`` -- and the
+            # order was a sort by first rank, so the Ret was ``[x, 1.0]``
+            # for Python's three leaves ``x, x, 1.0`` on every backend.
+            # Rule: each declared position is its own slot.  A position
+            # takes the next unused Ret occurrence of its value; a value
+            # the Ret already carries but at fewer positions than declared
+            # is the same SSA value repeated.  A value the Ret does not
+            # carry at all is not invented here, and Ret values no declared
+            # position names (union frames, presence flags) keep their
+            # order after the declared ones, as the rank sort left them.
+            unused: dict[int, list[Any]] = {}
+            for argument in terminator.args:
+                unused.setdefault(int(argument.id), []).append(argument)
+            carried = {
+                value_id: arguments[0] for value_id, arguments in unused.items()
             }
-            terminator.args = sorted(
-                terminator.args,
-                key=lambda value: rank.get(int(value.id), len(rank)),
-            )
+            ordered = []
+            for value_id in declared_order:
+                if unused.get(value_id):
+                    ordered.append(unused[value_id].pop(0))
+                elif value_id in carried:
+                    ordered.append(carried[value_id])
+            leftover = {
+                id(argument)
+                for arguments in unused.values() for argument in arguments
+            }
+            previous_ids = tuple(int(argument.id) for argument in terminator.args)
+            terminator.args = ordered + [
+                argument for argument in terminator.args
+                if id(argument) in leftover
+            ]
+            if tuple(int(a.id) for a in terminator.args) != previous_ids:
+                _post_positional_return_slots(
+                    function, graph, terminator, previous_ids,
+                    declared_ids=tuple(
+                        int(named_output_ids[str(name)])
+                        if str(name) in named_output_ids
+                        else int(tuple(identities.get(str(name), ()))[-1])
+                        for name in positional_output_names
+                        if tuple(identities.get(str(name), ()))
+                        or str(name) in named_output_ids
+                    ),
+                )
         # A named output the builder already resolved through its name
         # history stands in the Ret under the carried phi's id, which the
         # graph's identity table cannot know -- so the recovery above may
