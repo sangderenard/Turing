@@ -1552,6 +1552,7 @@ class CorrelationTable:
         found.extend(self._name_binding_capture_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_page_declaration_findings(module))
+        found.extend(self._source_exception_graph_findings(module))
         found.extend(self._graph_work_publication_findings(module))
         found.extend(self._tile_storage_findings(module))
         found.extend(self._source_field_identity_findings(module))
@@ -1918,6 +1919,49 @@ class CorrelationTable:
                 found.append(Finding(
                     "value-type-tag-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_graph_findings(module: Any) -> list[Finding]:
+        """Every exception edge must retain two existing source identities."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE, SOURCE_EXCEPTION_GRAPH,
+            SourceExceptionGraph,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_GRAPH.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_GRAPH)
+        for row in page.rows():
+            fact = page.latest(row)
+            detail = None
+            if not isinstance(fact, SourceExceptionGraph):
+                detail = "invalid exception graph fact"
+            elif len(fact.edges) != len(fact.roles):
+                detail = "exception edge and role counts disagree"
+            elif len(set(fact.nodes)) != len(fact.nodes):
+                detail = "exception graph repeats a node identity"
+            elif any(
+                len(edge) != 2 or edge[0] not in fact.nodes
+                or edge[1] not in fact.nodes
+                for edge in fact.edges
+            ):
+                detail = "exception edge names an absent node"
+            else:
+                ref = book.latest_ref(SOURCE_EXCEPTION_GRAPH, row)
+                sources = {
+                    source for source, _stage in book.edges_into(ref)
+                    if source.page in {CANONICAL_VALUE, INGESTION_VALUE}
+                }
+                if sources != set(fact.nodes):
+                    detail = "exception graph lacks exact node provenance"
+            if detail is not None:
+                found.append(Finding(
+                    "source-exception-graph-disagreement", str(row[0]), None,
+                    detail,
                 ))
         return found
 

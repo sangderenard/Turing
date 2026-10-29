@@ -91,6 +91,19 @@ class NodeFact:
 
 
 @dataclass(frozen=True)
+class SourceExceptionGraph:
+    """Existing scoped ProcessGraph IDs and exception operand edges.
+
+    A Ref holds the existing node ID and its owning scope. ``edges`` contains
+    only node pairs; ``roles`` labels their authored operand relationships.
+    """
+
+    nodes: tuple[Ref, ...]
+    edges: tuple[tuple[Ref, Ref], ...]
+    roles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class BindingFact:
     value_id: int
     authored: bool
@@ -412,6 +425,9 @@ CONTRACT_DEMAND_PAGE = declare_page("contract_demand", (
 INGESTION_VALUE = declare_page("ingestion_value", (
     RowField("ingestion_scope", K.SCOPE), RowField("ingestion_id", K.VALUE_ID),
 ), NodeFact)
+SOURCE_EXCEPTION_GRAPH = declare_page("source_exception_graph", (
+    RowField("source_scope", K.SCOPE),
+), SourceExceptionGraph)
 CANONICAL_VALUE = declare_page("canonical_value", (
     RowField("read_scope", K.SCOPE), RowField("canonical_id", K.VALUE_ID),
 ), tuple, rows_level=IdentityLogLevel.FULL)
