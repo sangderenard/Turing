@@ -34230,10 +34230,20 @@ class ProcessGraphGLSLDeployment(TiledObject):
             )
         if self._callsite_planning_deferred:
             self.callsite_function_shells = {}
-        elif self.runtime_closure_only:
+        elif self.runtime_closure_only or self.activation_root_references:
             # The module shell owns the definition catalogue, not another
             # execution of every function body in the source file.  Submitted
             # target shells above are the activation roots in this mode.
+            #
+            # Program: ``def f(x): return g(x, 4)`` through ``compile_ast_aot``
+            # (whole-program retention).  Wrong record: the module shell
+            # planned ``g(x, 4)`` -- a node of ``f``'s body -- as its own
+            # activation, though the book's activation roots
+            # (SOURCE_PURSUIT_ACTIVATION caused by the PURSUIT_ROOT contract
+            # demand) name ``f`` and not the module; the module graph has no
+            # reachability row, so the return was refused.  Rule: retention
+            # and executable-root identity are separate; when the book names
+            # exact activation roots, the module shell is not one of them.
             self.callsite_function_shells = {}
         else:
             plan_callsites(self)
