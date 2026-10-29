@@ -22366,6 +22366,37 @@ def _settle_linked_dynamic_sequences(
                 left, right = find(arm_key), find(merged_key)
                 if left != right:
                     parent[left] = right
+    # Program: ``out = [0] * count; while i < count: out[i] = ...; return
+    # count, out`` (string core ``graph_delta_since_row``), called as
+    # ``count, rows = store.delta(first)``.  Wrong record: the result edge
+    # names the returned VERSION of ``out`` (the loop's carried store
+    # result), while the growth seed names its birth, so the two never met:
+    # the caller's view stayed FIXED and the callee's fill exhausted it
+    # (code 75, heap corruption past it).  Rule: a store or loop version of
+    # a sequence is the SAME storage (``_loop_carried_storage_aliases``); a
+    # linked version joins its storage's component.
+    from .resident_sequence_materialization import (
+        _loop_carried_storage_aliases,
+    )
+
+    # The aliases are one level per node (loop result -> store -> birth);
+    # joining is repeated until no linked version reaches a new storage.
+    storage_aliases = tuple(
+        ((id(graph_obj), int(version_id)), (id(graph_obj), int(storage_id)))
+        for graph_obj in graphs
+        for version_id, storage_id in _loop_carried_storage_aliases(
+            graph_obj
+        ).items()
+    )
+    joined = True
+    while joined:
+        joined = False
+        for version, storage in storage_aliases:
+            if version in parent or storage in parent:
+                left, right = find(version), find(storage)
+                if left != right:
+                    parent[left] = right
+                    joined = True
     linked = set(parent)
     seeds: set[tuple[int, int]] = set()
     for graph_obj in graphs:
@@ -46445,6 +46476,30 @@ def _class_surface_ssa_program(
                 caller_sequence = caller_result_sequences.by_id(
                     int(caller_result_id)
                 )
+                if callee_sequence is None and callee_result_sequences is not None:
+                    # ``out = [0] * count; while ...: out[i] = ...; return
+                    # count, out`` returns the loop's version of ``out``: the
+                    # same storage as its birth (loop result -> store ->
+                    # birth, ``_loop_carried_storage_aliases``).  Without
+                    # this the caller's arena members (heap owner, length,
+                    # capacity) were never bound to the callee's.
+                    from .resident_sequence_materialization import (
+                        _loop_carried_storage_aliases as returned_store_aliases,
+                    )
+                    storage_aliases = returned_store_aliases(
+                        getattr(child_graph, "G", child_graph)
+                    )
+                    storage_id, seen = int(callee_result_id), set()
+                    while (
+                        callee_sequence is None
+                        and storage_id in storage_aliases
+                        and storage_id not in seen
+                    ):
+                        seen.add(storage_id)
+                        storage_id = int(storage_aliases[storage_id])
+                        callee_sequence = callee_result_sequences.by_id(
+                            storage_id
+                        )
                 if callee_sequence is None or caller_sequence is None:
                     continue
                 if (
