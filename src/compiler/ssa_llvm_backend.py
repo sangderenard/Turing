@@ -1184,6 +1184,12 @@ def integer_narrowing_c_check(
     low, high = bounds
 
     def literal(bound: int) -> str:
+        # ``INT64_C(-9223372036854775808)`` is the negation of a constant
+        # too large for ``long``: GCC types it unsigned, so the bound read
+        # +2**63 and every int128 -> int64 narrowing reported overflow.
+        # That one bound is spelled ``-INT64_C(2**63 - 1) - 1``.
+        if bound == -(1 << 63):
+            return f"(({c_type})(-INT64_C({(1 << 63) - 1}) - 1))"
         if -(1 << 63) <= bound < (1 << 63):
             return f"(({c_type})INT64_C({bound}))"
         if 0 <= bound < (1 << 64):
@@ -4145,10 +4151,22 @@ def _emit_repository_call_module(
                             int(base.id), _value_llvm_type(base),
                         )
                         base_pointer = pointer(base)
+                        element_unsigned = _unsigned_value(base)
                         heap_element = (base.accounting or {}).get("heap_element_dtype")
                         if heap_element is not None:
                             from ..transmogrifier.dtype_layout import layout_for
-                            element_type = layout_for(heap_element).llvm_type
+                            # Program: ``values = array("Q");
+                            # values.append(18446744073709551615)`` (LLVM
+                            # only).  Wrong record: a heap cell's base is a
+                            # pointer, so its signedness read the pointer's
+                            # dtype, the uint64 element was taken as int64,
+                            # and the store's narrowing check faulted 86 on
+                            # a value Python accepts.  Rule: the element is
+                            # the heap cell's element class, width and
+                            # signedness alike.
+                            element_layout = layout_for(heap_element)
+                            element_type = element_layout.llvm_type
+                            element_unsigned = element_layout.kind in {"uint", "bool"}
                             base_pointer = load_as(base, "ptr", f"heap.base.{tag}")
                         if element_type == "ptr":
                             element_type = "i64"
@@ -4163,7 +4181,7 @@ def _emit_repository_call_module(
                         pointers[result_id] = computed
                         span_addresses[result_id] = computed
                         span_address_types[result_id] = element_type
-                        span_address_unsigned[result_id] = _unsigned_value(base)
+                        span_address_unsigned[result_id] = element_unsigned
                         if heap_element is not None:
                             owned_heap_addresses.add(result_id)
                         continue

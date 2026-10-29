@@ -2194,8 +2194,12 @@ def _control_sequence_capacity_bounds(control: Any, sequence_ids: Iterable[int])
         except (SyntaxError, ValueError, TypeError):
             return None
 
+    # A conditional's merged sequence spelling is its initial arena.
+    merged_storage: dict[int, int] = {}
+
     def mutate(mutation, state):
         sequence_id = int(mutation.sequence_value_id)
+        sequence_id = merged_storage.get(sequence_id, sequence_id)
         if sequence_id not in state:
             return state
         state = dict(state)
@@ -2222,7 +2226,33 @@ def _control_sequence_capacity_bounds(control: Any, sequence_ids: Iterable[int])
                     break
             return state
         if isinstance(block, ConditionalBlock):
-            return join(visit(block.body, dict(state)), visit(block.orelse, dict(state)))
+            # Program: ``rep = [1]; if k > 2: rep = [k, 2]``, then
+            # ``rep.append(3)`` (Lane D's report).  Wrong record: the arm's
+            # display replaces the pre-branch arena at the merge
+            # (``carried_sequence_aliases``), but that copy was no effect
+            # here, so the arena's bound counted one row plus the append
+            # and the append after a two-row arm hit capacity (error 75).
+            # Rule: each arm leaves the initial arena with the extent of
+            # the value it selects.
+            for aliases in block.carried_sequence_aliases:
+                merged_storage[int(aliases[3])] = merged_storage.get(
+                    int(aliases[2]), int(aliases[2]),
+                )
+            arms = []
+            for position, arm in ((0, block.body), (1, block.orelse)):
+                arm_state = visit(arm, dict(state))
+                for aliases in block.carried_sequence_aliases:
+                    selected, storage = int(aliases[position]), int(aliases[2])
+                    if storage not in arm_state or selected == storage:
+                        continue
+                    arm_state = dict(arm_state)
+                    arm_state[storage] = arm_state.get(selected)
+                    peaks[storage] = (
+                        None if peaks[storage] is None or arm_state[storage] is None
+                        else max(peaks[storage], arm_state[storage])
+                    )
+                arms.append(arm_state)
+            return join(*arms)
         if isinstance(block, CallBlock):
             return visit(block.callee, state)
         if isinstance(block, (LoopBlock, WhileBlock)):

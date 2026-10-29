@@ -318,6 +318,25 @@ class _ShellFileContextLowerer(ast.NodeTransformer):
         ]
 
 
+def method_receiver_formal(definition: Any) -> str | None:
+    """The formal Python binds a method's receiver to, as the source spells it.
+
+    Python passes the instance (or, for a classmethod, the class) as the first
+    positional argument, whatever that parameter is named; a staticmethod has
+    no receiver.  The caller states that ``definition`` is a class member.
+    """
+
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    if any(
+        isinstance(decorator, ast.Name) and decorator.id == "staticmethod"
+        for decorator in definition.decorator_list
+    ):
+        return None
+    positional = (*definition.args.posonlyargs, *definition.args.args)
+    return positional[0].arg if positional else None
+
+
 def lower_python_shell_file_contexts(tree: ast.AST) -> ast.AST:
     """Lower resolved, non-escaping Python file contexts in ``tree``."""
 

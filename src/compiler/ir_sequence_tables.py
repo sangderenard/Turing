@@ -397,8 +397,13 @@ def lower_sequence_allocate(
     builder = _Builder(_first_fresh_identity(descriptor, values=storage))
     entry = builder.block("entry")
     capacity = values[int(descriptor.capacity_value_id)]
+    carrier = hash_index_carrier(descriptor)
+    # The zeroed carrier is an index of no rows (``M == 0 == length``).
+    carrier_count = (None if carrier is None
+                     else _hash_index_arena_count(builder, entry, capacity))
     for index, column_id in enumerate(descriptor.column_value_ids):
-        entry.instrs.append(heap_allocate(capacity, owner, values[int(column_id)],
+        entry.instrs.append(heap_allocate(
+            carrier_count if index == carrier else capacity, owner, values[int(column_id)],
             element_dtype=descriptor.column_dtypes[index], zero_initialize=True))
     zero = builder.const(entry, 0, dtype="int64")
     if pool is not None:
@@ -454,6 +459,409 @@ def _status_branch(
     value = builder.const(block, status)
     builder.branch(block, target)
     return value
+
+
+# ---------------------------------------------------------------------------
+# Hash index of a keyed heap table.
+#
+# Program: the string core's golden workload (``repeated_manager``), whose
+# ``Vocabulary._candidates`` and ``._prefix`` dictionaries gain one key per
+# minted token.  Wrong record: every lookup, setdefault and store scanned
+# every row, so 10x the rounds cost ~80x the native time while Python's dict
+# stayed linear (rounds 30000: Python 3.9 s, C 5.9 s, LLVM 6.3 s).  Rule: a
+# keyed table whose arenas its own heap owner allocates (only
+# ``lower_sequence_allocate`` and the two reserves do) carries an
+# open-addressing index in its CARRIER key column's arena, past the
+# ``capacity`` rows:
+#
+#   carrier[0 : C]            the rows (unchanged)
+#   carrier[C]                M, the row count the index covers
+#   carrier[C + 1 : 3C + 1]   2C slots; 0 is empty, otherwise row + 1
+#
+# The index is trusted only while ``M == length``; otherwise every helper
+# scans exactly as before.  Reserve rebuilds it into the fresh zeroed arena,
+# a table store appends the row it wrote, and every other helper store to the
+# length cell sets ``M = -1`` (``_guard_hash_indexes``), so a row change the
+# index did not see can never answer a lookup.  A hit always compares every
+# key column, so the hash only chooses where to look.
+# ---------------------------------------------------------------------------
+
+_HASH_INDEX_KEY_DTYPES = frozenset({"int64", "uint64", "int32", "uint32"})
+_HASH_INDEX_PRIME = 2147483647
+_HASH_INDEX_MULTIPLIER = 1000003
+
+
+def hash_index_carrier(descriptor: SSASequenceDescriptor) -> int | None:
+    """The key column position whose arena carries the table's hash index.
+
+    ``None`` keeps the incumbent linear scan: no heap owner (the arenas are
+    caller- or host-sized), no keys, a key dtype the hash does not read
+    exactly (floats, opaque references, bools), a shaped key, or no unaliased
+    int64 key column to hold the slots.
+    """
+
+    if descriptor.heap_owner_value_id is None or not descriptor.key_columns:
+        return None
+    dtypes = tuple(map(str, descriptor.column_dtypes))
+    if len(dtypes) != len(descriptor.column_value_ids):
+        return None
+    shapes = descriptor.column_shapes or ((),) * len(dtypes)
+    if any(
+        dtypes[column] not in _HASH_INDEX_KEY_DTYPES or shapes[column]
+        for column in descriptor.key_columns
+    ):
+        return None
+    ids = [int(value_id) for value_id in descriptor.column_value_ids]
+    for column in sorted(descriptor.key_columns):
+        if dtypes[column] == "int64" and ids.count(ids[column]) == 1:
+            return int(column)
+    return None
+
+
+def _hash_index_capacity_limit(maximum: int) -> int:
+    """The largest capacity whose carrier arena (3C + 1 int64) still fits."""
+
+    return min(int(maximum), ((2**63 - 1 - 8) // 8 - 1) // 3)
+
+
+def _hash_index_arena_count(builder, block, capacity):
+    count = builder.fresh("int64")
+    tripled = builder.fresh("int64")
+    builder.emit(block, "Mul", [capacity, builder.const(block, 3, dtype="int64")], tripled)
+    builder.emit(block, "Add", [tripled, builder.const(block, 1, dtype="int64")], count)
+    return count
+
+
+def _hash_index_slot(builder, block, keys, capacity):
+    """Return ``(slot, slots)``: the first probe in ``[0, 2C)`` and ``2C``.
+
+    ``keys`` are ``(column position, value)`` pairs.
+
+    Each key component is reduced modulo a prime in its own dtype, so the
+    residue is exact and below 2**31 before it joins the int64 accumulator;
+    no product can leave int64.
+    """
+
+    zero = builder.const(block, 0, dtype="int64")
+    # Hash in column order, whatever order a view lists its key columns in.
+    keys = [key for _column, key in sorted(keys, key=lambda pair: pair[0])]
+    prime = builder.const(block, _HASH_INDEX_PRIME, dtype="int64")
+    multiplier = builder.const(block, _HASH_INDEX_MULTIPLIER, dtype="int64")
+    accumulated = zero
+    for key in keys:
+        dtype = str(key.dtype)
+        residue = builder.fresh(dtype)
+        builder.emit(block, "Mod", [key, builder.const(block, _HASH_INDEX_PRIME, dtype=dtype)], residue)
+        if dtype != "int64":
+            widened = builder.fresh("int64")
+            builder.emit(block, "Cast", [residue], widened, attributes={
+                "target_dtype": "int64", "source_dtype": dtype,
+                "binding": "ssa_sequence_hash_index_residue",
+            })
+            residue = widened
+        scaled, summed, reduced = (builder.fresh("int64") for _ in range(3))
+        builder.emit(block, "Mul", [accumulated, multiplier], scaled)
+        builder.emit(block, "Add", [scaled, residue], summed)
+        builder.emit(block, "Mod", [summed, prime], reduced)
+        accumulated = reduced
+    slots, raw, lifted, slot = (builder.fresh("int64") for _ in range(4))
+    negative = builder.fresh("bool")
+    builder.emit(block, "Add", [capacity, capacity], slots)
+    builder.emit(block, "Mod", [accumulated, slots], raw)
+    builder.emit(block, "Lt", [raw, zero], negative)
+    builder.emit(block, "Add", [raw, slots], lifted)
+    builder.emit(block, "Select", [negative, lifted, raw], slot)
+    return slot, slots
+
+
+def _hash_index_slot_address(builder, block, carrier, capacity, slot):
+    """Address of slot ``slot``: element ``C + 1 + slot`` of the carrier."""
+
+    base, position = builder.fresh("int64"), builder.fresh("int64")
+    address = builder.fresh("ptr")
+    builder.emit(block, "Add", [capacity, builder.const(block, 1, dtype="int64")], base)
+    builder.emit(block, "Add", [base, slot], position)
+    builder.emit(block, "GetElementPtr", [carrier, position], address)
+    return address
+
+
+def _hash_index_next_slot(builder, block, slot, slots):
+    following, wrapped = builder.fresh("int64"), builder.fresh("int64")
+    at_end = builder.fresh("bool")
+    builder.emit(block, "Add", [slot, builder.const(block, 1, dtype="int64")], following)
+    builder.emit(block, "Eq", [following, slots], at_end)
+    builder.emit(block, "Select", [at_end, builder.const(block, 0, dtype="int64"), following], wrapped)
+    return wrapped
+
+
+def _hash_index_carrier_value(descriptor):
+    carrier = hash_index_carrier(descriptor)
+    return SSAValue(descriptor.column_value_ids[carrier], dtype="int64")
+
+
+def _hash_index_valid(builder, block, descriptor, capacity, length, *, label):
+    """Branch on ``C > 0 and M == length``; return ``(valid_block, invalid_block)``.
+
+    The capacity test comes first: a capacity-0 table may have no arena.
+    """
+
+    carrier = _hash_index_carrier_value(descriptor)
+    marker_block = builder.block(f"{label}_index_marker")
+    valid_block = builder.block(f"{label}_index_valid")
+    invalid_block = builder.block(f"{label}_index_invalid")
+    allocated = builder.fresh("bool")
+    builder.emit(block, "Gt", [capacity, builder.const(block, 0, dtype="int64")], allocated)
+    builder.cond(block, allocated, marker_block, invalid_block)
+    marker_address, marker = builder.fresh("ptr"), builder.fresh("int64")
+    covers = builder.fresh("bool")
+    builder.emit(marker_block, "GetElementPtr", [carrier, capacity], marker_address)
+    builder.emit(marker_block, "Load", [marker_address], marker)
+    builder.emit(marker_block, "Eq", [marker, length], covers)
+    builder.cond(marker_block, covers, valid_block, invalid_block)
+    return valid_block, invalid_block
+
+
+def _hash_index_place(builder, block, descriptor, capacity, keys, row, *, label):
+    """Store ``row + 1`` in the first empty slot of ``keys``' probe sequence.
+
+    The caller guarantees an empty slot exists: at most C rows over 2C slots.
+    Returns the block that continues after the placement.
+    """
+
+    carrier = _hash_index_carrier_value(descriptor)
+    slot0, slots = _hash_index_slot(builder, block, list(zip(descriptor.key_columns, keys)), capacity)
+    header = builder.block(f"{label}_place_header")
+    latch = builder.block(f"{label}_place_latch")
+    place = builder.block(f"{label}_place")
+    builder.branch(block, header)
+    slot, next_slot = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(header, "Phi", [slot0, next_slot], slot, attributes={
+        "incoming_blocks": (block.name, latch.name),
+    })
+    address = _hash_index_slot_address(builder, header, carrier, capacity, slot)
+    occupant, empty = builder.fresh("int64"), builder.fresh("bool")
+    builder.emit(header, "Load", [address], occupant)
+    builder.emit(header, "Eq", [occupant, builder.const(header, 0, dtype="int64")], empty)
+    builder.cond(header, empty, place, latch)
+    wrapped = _hash_index_next_slot(builder, latch, slot, slots)
+    builder.emit(latch, "Add", [wrapped, builder.const(latch, 0, dtype="int64")], next_slot)
+    builder.branch(latch, header)
+    entry = builder.fresh("int64")
+    builder.emit(place, "Add", [row, builder.const(place, 1, dtype="int64")], entry)
+    builder.emit(place, "Store", [entry, address])
+    return place
+
+
+def _hash_index_probe(builder, block, descriptor, capacity, queries, *, label,
+                      found, absent, key_match):
+    """Probe ``queries``; branch to ``found`` or ``absent``.
+
+    Returns ``(row, probe_block)``: the matching row (valid in ``found``) and
+    the block that branches to ``found``, for the caller's row Phi.
+    """
+
+    carrier = _hash_index_carrier_value(descriptor)
+    slot0, slots = _hash_index_slot(builder, block, list(zip(descriptor.key_columns, queries)), capacity)
+    header = builder.block(f"{label}_probe_header")
+    body = builder.block(f"{label}_probe_body")
+    latch = builder.block(f"{label}_probe_latch")
+    builder.branch(block, header)
+    slot, next_slot = builder.fresh("int64"), builder.fresh("int64")
+    builder.emit(header, "Phi", [slot0, next_slot], slot, attributes={
+        "incoming_blocks": (block.name, latch.name),
+    })
+    address = _hash_index_slot_address(builder, header, carrier, capacity, slot)
+    occupant, empty = builder.fresh("int64"), builder.fresh("bool")
+    builder.emit(header, "Load", [address], occupant)
+    builder.emit(header, "Eq", [occupant, builder.const(header, 0, dtype="int64")], empty)
+    builder.cond(header, empty, absent, body)
+    row = builder.fresh("int64")
+    builder.emit(body, "Sub", [occupant, builder.const(body, 1, dtype="int64")], row)
+    builder.cond(body, key_match(body, row), found, latch)
+    wrapped = _hash_index_next_slot(builder, latch, slot, slots)
+    builder.emit(latch, "Add", [wrapped, builder.const(latch, 0, dtype="int64")], next_slot)
+    builder.branch(latch, header)
+    return row, body, header
+
+
+def _key_row_match(builder, descriptor, key_dtypes, queries):
+    """``key_match(block, row)``: every key column equals its query and the
+    row is live -- the incumbent scan's comparison, for any row."""
+
+    def key_match(block, row):
+        matches = None
+        for key_column, key_dtype, query in zip(
+            descriptor.key_columns, key_dtypes, queries
+        ):
+            key_address = builder.fresh("ptr")
+            existing_key = builder.fresh(key_dtype)
+            component_match = builder.fresh("bool")
+            builder.emit(block, "GetElementPtr", [
+                SSAValue(descriptor.column_value_ids[key_column], dtype=key_dtype), row
+            ], key_address)
+            builder.emit(block, "Load", [key_address], existing_key)
+            builder.emit(block, "Eq", [existing_key, query], component_match)
+            if matches is None:
+                matches = component_match
+            else:
+                combined = builder.fresh("bool")
+                builder.emit(block, "LAnd", [matches, component_match], combined)
+                matches = combined
+        assert matches is not None
+        if descriptor.live_flags_value_id is not None:
+            live_address = builder.fresh("ptr")
+            live = builder.fresh("bool")
+            active_match = builder.fresh("bool")
+            builder.emit(block, "GetElementPtr", [
+                SSAValue(descriptor.live_flags_value_id, dtype="bool"), row
+            ], live_address)
+            builder.emit(block, "Load", [live_address], live)
+            builder.emit(block, "LAnd", [matches, live], active_match)
+            matches = active_match
+        return matches
+
+    return key_match
+
+
+def _hash_index_rebuild(builder, block, descriptor, capacity, length, *, label):
+    """Index rows ``[0, length)`` into a fresh zeroed carrier; set ``M``.
+
+    Columns are read through their published cells, so call this only after
+    the reserve stored the new arenas and ``capacity`` is the new extent.
+    Returns the continuing block.
+    """
+
+    carrier = _hash_index_carrier_value(descriptor)
+    key_dtypes = tuple(str(descriptor.column_dtypes[column]) for column in descriptor.key_columns)
+    header = builder.block(f"{label}_rebuild_header")
+    body = builder.block(f"{label}_rebuild_body")
+    done = builder.block(f"{label}_rebuild_done")
+    zero = builder.const(block, 0, dtype="int64")
+    builder.branch(block, header)
+    row, next_row = builder.fresh("int64"), builder.fresh("int64")
+    more = builder.fresh("bool")
+    phi = builder.emit(header, "Phi", [zero, next_row], row, attributes={
+        "incoming_blocks": (block.name, None),
+    })
+    builder.emit(header, "Lt", [row, length], more)
+    builder.cond(header, more, body, done)
+    keys = []
+    for column, dtype in zip(descriptor.key_columns, key_dtypes):
+        address, key = builder.fresh("ptr"), builder.fresh(dtype)
+        builder.emit(body, "GetElementPtr", [
+            SSAValue(descriptor.column_value_ids[column], dtype=dtype), row
+        ], address)
+        builder.emit(body, "Load", [address], key)
+        keys.append(key)
+    placed = _hash_index_place(builder, body, descriptor, capacity, keys, row, label=label + "_rebuild")
+    builder.emit(placed, "Add", [row, builder.const(placed, 1, dtype="int64")], next_row)
+    builder.branch(placed, header)
+    phi.attributes["incoming_blocks"] = (block.name, placed.name)
+    marker_address = builder.fresh("ptr")
+    builder.emit(done, "GetElementPtr", [carrier, capacity], marker_address)
+    builder.emit(done, "Store", [length, marker_address])
+    return done
+
+
+def _length_cell_stores(function: Function, length_id: int):
+    """``(block_name, position)`` of every Store into the length cell."""
+
+    addresses = {int(length_id)}
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            if (instruction.op == "GetElementPtr" and instruction.res is not None
+                    and instruction.args and int(instruction.args[0].id) == int(length_id)):
+                addresses.add(int(instruction.res.id))
+    return [
+        (block.name, position)
+        for block in function.blocks.values()
+        for position, instruction in enumerate(block.instrs)
+        if instruction.op == "Store" and len(instruction.args) == 2
+        and int(instruction.args[1].id) in addresses
+        and not instruction.attributes.get("hash_index_guarded")
+    ]
+
+
+def _invalidate_hash_index_after_length_stores(function: Function, descriptor) -> None:
+    """After each length store: ``if C > 0: M = -1`` (see the section note)."""
+
+    if hash_index_carrier(descriptor) is None:
+        return
+    stores = _length_cell_stores(function, int(descriptor.length_address_id))
+    if not stores:
+        return
+    carrier_id = int(descriptor.column_value_ids[hash_index_carrier(descriptor)])
+    capacity_id = int(descriptor.capacity_value_id)
+    formals = {int(value.id) for value in function.args}
+    if carrier_id not in formals or capacity_id not in formals:
+        raise ValueError(
+            f"hash-indexed table {int(descriptor.sequence_id)}: helper "
+            f"{function.name!r} stores its length without the carrier column "
+            "and capacity it must invalidate"
+        )
+    builder = _Builder(0)
+    builder.blocks = function.blocks
+    carrier = SSAValue(carrier_id, dtype="int64")
+    capacity = SSAValue(capacity_id, dtype="int64")
+    counter = 0
+    while stores:
+        block_name, position = stores[0]
+        block = function.blocks[block_name]
+        store = block.instrs[position]
+        store.attributes = {**store.attributes, "hash_index_guarded": True}
+        tail_instructions = block.instrs[position + 1:]
+        del block.instrs[position + 1:]
+        counter += 1
+        while f"{block_name}_index_guard_{counter}" in function.blocks:
+            counter += 1
+        invalidate = builder.block(f"{block_name}_index_invalidate_{counter}")
+        tail = builder.block(f"{block_name}_index_guard_{counter}")
+        tail.instrs = tail_instructions
+        tail.successors = list(block.successors)
+        block.successors = []
+        allocated = builder.fresh("bool")
+        builder.emit(block, "Gt", [capacity, builder.const(block, 0, dtype="int64")], allocated)
+        builder.cond(block, allocated, invalidate, tail)
+        marker_address = builder.fresh("ptr")
+        builder.emit(invalidate, "GetElementPtr", [carrier, capacity], marker_address)
+        builder.emit(invalidate, "Store", [builder.const(invalidate, -1, dtype="int64"), marker_address])
+        builder.branch(invalidate, tail)
+        for successor in tail.successors:
+            for instruction in function.blocks[successor].instrs:
+                if instruction.op != "Phi":
+                    continue
+                incoming = tuple(instruction.attributes.get("incoming_blocks", ()))
+                if block_name in incoming:
+                    instruction.attributes = {**instruction.attributes, "incoming_blocks": tuple(
+                        tail.name if name == block_name else name for name in incoming
+                    )}
+        stores = _length_cell_stores(function, int(descriptor.length_address_id))
+
+
+def _guard_hash_indexes(lowerer):
+    """Apply the length-store invalidation to every helper a lowerer builds."""
+
+    import functools
+    import inspect
+
+    signature = inspect.signature(lowerer)
+
+    @functools.wraps(lowerer)
+    def guarded(*args, **kwargs):
+        lowering = lowerer(*args, **kwargs)
+        if not isinstance(lowering, SSASequenceLowering):
+            return lowering
+        bound = signature.bind_partial(*args, **kwargs)
+        descriptors = [value for value in bound.arguments.values()
+                       if isinstance(value, SSASequenceDescriptor)]
+        for descriptor in descriptors:
+            if hash_index_carrier(descriptor) is None:
+                continue
+            for function in lowering.functions:
+                _invalidate_hash_index_after_length_stores(function, descriptor)
+        return lowering
+
+    return guarded
 
 
 def _unsupported_destination(
@@ -532,6 +940,10 @@ def lower_sequence_reserve(
     builder.emit(entry, "Load", [length_slot], length)
     maximum = min((2**63 - 1 - 8) // layout_for(dtype).byte_size
                   for dtype in descriptor.column_dtypes)
+    carrier = hash_index_carrier(descriptor)
+    carrier_id = None if carrier is None else descriptor.column_value_ids[carrier]
+    if carrier is not None:
+        maximum = _hash_index_capacity_limit(maximum)
     maximum_value = builder.const(entry, maximum, dtype="int64")
     predicates = []
     for op, left, right in (("Ge", required, zero), ("Ge", length, zero),
@@ -568,11 +980,14 @@ def lower_sequence_reserve(
     builder.emit(allocate, "Phi", [required, candidate], new_capacity,
                  attributes={"incoming_blocks": (exact.name, geometric.name)})
     new_columns = {}
+    carrier_count = (None if carrier is None
+                     else _hash_index_arena_count(builder, allocate, new_capacity))
     for column_id, dtype in zip(descriptor.column_value_ids, descriptor.column_dtypes, strict=True):
         if column_id in new_columns:
             continue  # Exact same pointer cell, already allocated/copied.
         column = builder.fresh("ptr")
-        allocate.instrs.append(heap_allocate(new_capacity, owner, column,
+        allocate.instrs.append(heap_allocate(
+            carrier_count if column_id == carrier_id else new_capacity, owner, column,
             element_dtype=dtype, zero_initialize=True))
         new_columns[column_id] = column
     for column_id, column in new_columns.items():
@@ -581,7 +996,13 @@ def lower_sequence_reserve(
     for column_id, column in new_columns.items():
         builder.emit(allocate, "Store", [column, values[column_id]])
     builder.emit(allocate, "Store", [new_capacity, capacity])
-    builder.branch(allocate, complete)
+    if carrier is not None:
+        rebuilt = _hash_index_rebuild(
+            builder, allocate, descriptor, new_capacity, length, label="reserve",
+        )
+        builder.branch(rebuilt, complete)
+    else:
+        builder.branch(allocate, complete)
     outcomes = [(block, _status_branch(builder, block, status, result))
                 for block, status in ((unchanged, 0), (complete, 1), (invalid, 2))]
     status = builder.fresh("int")
@@ -632,6 +1053,10 @@ def _lower_sequence_child_pool_reserve(descriptor, *, function_name):
     builder.emit(entry, "Load", [slot], length)
     maximum = min((2**63 - 1 - 8) // layout_for(dtype).byte_size
                   for dtype in (*descriptor.column_dtypes, *pool.column_dtypes, "int64", "int"))
+    carrier = hash_index_carrier(descriptor)
+    carrier_id = None if carrier is None else descriptor.column_value_ids[carrier]
+    if carrier is not None:
+        maximum = _hash_index_capacity_limit(maximum)
     maximum_value = builder.const(entry, maximum, dtype="int64")
     valid = None
     for op, left, right in (("Ge", required, zero), ("Ge", required_stride, zero),
@@ -715,8 +1140,11 @@ def _lower_sequence_child_pool_reserve(descriptor, *, function_name):
     flattened = builder.fresh("int64")
     builder.emit(allocate, "Mul", [new_capacity, new_stride], flattened)
     replacements = {}
+    carrier_count = (None if carrier is None
+                     else _hash_index_arena_count(builder, allocate, new_capacity))
     allocation_specs = (
-        *((column, dtype, new_capacity, length) for column, dtype in zip(descriptor.column_value_ids, descriptor.column_dtypes)),
+        *((column, dtype, carrier_count if column == carrier_id else new_capacity, length)
+          for column, dtype in zip(descriptor.column_value_ids, descriptor.column_dtypes)),
         (pool.length_value_id, "int64", new_capacity, length),
         *(() if pool.status_value_id is None else ((pool.status_value_id, "int", new_capacity, length),)),
         *((column, dtype, flattened, None) for column, dtype in zip(pool.column_value_ids, pool.column_dtypes)),
@@ -769,8 +1197,13 @@ def _lower_sequence_child_pool_reserve(descriptor, *, function_name):
     builder.emit(publish, "Store", [new_capacity, capacity])
     builder.emit(publish, "Store", [flattened, values[pool.capacity_value_id]])
     builder.emit(publish, "Store", [new_stride, stride])
+    published = publish
+    if carrier is not None:
+        published = _hash_index_rebuild(
+            builder, publish, descriptor, new_capacity, length, label="reserve",
+        )
     outcomes = [(block, _status_branch(builder, block, status, result))
-                for block, status in ((unchanged, 0), (publish, 1), (invalid, 2))]
+                for block, status in ((unchanged, 0), (published, 1), (invalid, 2))]
     status = builder.fresh("int")
     builder.emit(result, "Phi", [value for _, value in outcomes], status,
                  attributes={"incoming_blocks": tuple(block.name for block, _ in outcomes)})
@@ -3796,47 +4229,39 @@ def lower_table_lookup(
     ], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
-    builder.branch(entry, header)
+    key_match = _key_row_match(builder, descriptor, key_dtypes, queries)
+    found_rows: list[tuple[SSAValue, BasicBlock]] = []
+    scan = entry
+    if hash_index_carrier(descriptor) is not None:
+        capacity = SSAValue(descriptor.capacity_value_id, dtype="int64")
+        indexed, scan = _hash_index_valid(
+            builder, entry, descriptor, capacity, length, label="lookup",
+        )
+        probed_row, probe_body, _probe_header = _hash_index_probe(
+            builder, indexed, descriptor, capacity, queries, label="lookup",
+            found=found, absent=absent, key_match=key_match,
+        )
+        found_rows.append((probed_row, probe_body))
+    builder.branch(scan, header)
     index = builder.fresh("int64")
     next_index = builder.fresh("int64")
     builder.emit(header, "Phi", [zero, next_index], index, attributes={
-        "incoming_blocks": (entry.name, latch.name)
+        "incoming_blocks": (scan.name, latch.name)
     })
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, length], continues)
     builder.cond(header, continues, body, absent)
-    matches = None
-    for key_column, key_dtype, query in zip(
-        descriptor.key_columns, key_dtypes, queries
-    ):
-        key_address = builder.fresh("ptr")
-        existing_key = builder.fresh(key_dtype)
-        component_match = builder.fresh("bool")
-        builder.emit(body, "GetElementPtr", [
-            SSAValue(descriptor.column_value_ids[key_column], dtype=key_dtype), index
-        ], key_address)
-        builder.emit(body, "Load", [key_address], existing_key)
-        builder.emit(body, "Eq", [existing_key, query], component_match)
-        if matches is None:
-            matches = component_match
-        else:
-            combined = builder.fresh("bool")
-            builder.emit(body, "LAnd", [matches, component_match], combined)
-            matches = combined
-    assert matches is not None
-    if descriptor.live_flags_value_id is not None:
-        live_address = builder.fresh("ptr")
-        live = builder.fresh("bool")
-        active_match = builder.fresh("bool")
-        builder.emit(body, "GetElementPtr", [
-            SSAValue(descriptor.live_flags_value_id, dtype="bool"), index
-        ], live_address)
-        builder.emit(body, "Load", [live_address], live)
-        builder.emit(body, "LAnd", [matches, live], active_match)
-        matches = active_match
-    builder.cond(body, matches, found, latch)
+    builder.cond(body, key_match(body, index), found, latch)
     builder.emit(latch, "Add", [index, one], next_index)
     builder.branch(latch, header)
+    found_rows.append((index, body))
+    if len(found_rows) > 1:
+        row = builder.fresh("int64")
+        builder.emit(found, "Phi", [value for value, _ in found_rows], row, attributes={
+            "incoming_blocks": tuple(block.name for _, block in found_rows),
+        })
+    else:
+        row = index
     found_values = []
     for value_column, value_dtype in zip(value_columns, value_dtypes):
         value_address = builder.fresh("ptr")
@@ -3844,7 +4269,7 @@ def lower_table_lookup(
         builder.emit(found, "GetElementPtr", [
             SSAValue(
                 descriptor.column_value_ids[value_column], dtype=value_dtype,
-            ), index,
+            ), row,
         ], value_address)
         builder.emit(found, "Load", [value_address], found_value)
         found_values.append(found_value)
@@ -4159,47 +4584,40 @@ def lower_table_store(
     ], length_slot)
     builder.emit(entry, "Load", [length_slot], length)
     builder.emit(entry, "GetElementPtr", [status_arena, zero], status_slot)
-    builder.branch(entry, header)
+    key_match = _key_row_match(builder, descriptor, key_dtypes, queries)
+    indexed_table = hash_index_carrier(descriptor) is not None
+    capacity = SSAValue(descriptor.capacity_value_id, dtype="int64")
+    found_rows: list[tuple[SSAValue, BasicBlock]] = []
+    scan = entry
+    if indexed_table:
+        indexed, scan = _hash_index_valid(
+            builder, entry, descriptor, capacity, length, label="store",
+        )
+        probed_row, probe_body, _probe_header = _hash_index_probe(
+            builder, indexed, descriptor, capacity, queries, label="store",
+            found=update, absent=capacity_check, key_match=key_match,
+        )
+        found_rows.append((probed_row, probe_body))
+    builder.branch(scan, header)
     index = builder.fresh("int64")
     next_index = builder.fresh("int64")
     builder.emit(header, "Phi", [zero, next_index], index, attributes={
-        "incoming_blocks": (entry.name, latch.name)
+        "incoming_blocks": (scan.name, latch.name)
     })
     continues = builder.fresh("bool")
     builder.emit(header, "Lt", [index, length], continues)
     builder.cond(header, continues, body, capacity_check)
-    matches = None
-    for key_column, key_dtype, query in zip(
-        descriptor.key_columns, key_dtypes, queries
-    ):
-        key_address = builder.fresh("ptr")
-        existing_key = builder.fresh(key_dtype)
-        component_match = builder.fresh("bool")
-        builder.emit(body, "GetElementPtr", [
-            SSAValue(descriptor.column_value_ids[key_column], dtype=key_dtype), index
-        ], key_address)
-        builder.emit(body, "Load", [key_address], existing_key)
-        builder.emit(body, "Eq", [existing_key, query], component_match)
-        if matches is None:
-            matches = component_match
-        else:
-            combined = builder.fresh("bool")
-            builder.emit(body, "LAnd", [matches, component_match], combined)
-            matches = combined
-    assert matches is not None
-    if descriptor.live_flags_value_id is not None:
-        live_address = builder.fresh("ptr")
-        live = builder.fresh("bool")
-        active_match = builder.fresh("bool")
-        builder.emit(body, "GetElementPtr", [
-            SSAValue(descriptor.live_flags_value_id, dtype="bool"), index
-        ], live_address)
-        builder.emit(body, "Load", [live_address], live)
-        builder.emit(body, "LAnd", [matches, live], active_match)
-        matches = active_match
-    builder.cond(body, matches, update, latch)
+    builder.cond(body, key_match(body, index), update, latch)
     builder.emit(latch, "Add", [index, one], next_index)
     builder.branch(latch, header)
+    found_rows.append((index, body))
+    if len(found_rows) > 1:
+        row = builder.fresh("int64")
+        builder.emit(update, "Phi", [value for value, _ in found_rows], row, attributes={
+            "incoming_blocks": tuple(block.name for _, block in found_rows),
+        })
+    else:
+        row = index
     for value_column, value_dtype, new_value in zip(
         value_columns, value_dtypes, new_values, strict=True,
     ):
@@ -4209,7 +4627,7 @@ def lower_table_store(
                 descriptor.column_value_ids[value_column],
                 dtype=value_dtype,
             ),
-            index,
+            row,
         ], update_address)
         builder.emit(update, "Store", [new_value, update_address])
     builder.emit(update, "Store", [three, status_slot])
@@ -4232,6 +4650,15 @@ def lower_table_store(
     )
 
     def emit_insert(block, slot):
+        # ``slot < C`` on both insert paths, so the carrier arena exists:
+        # an index that covered every row before this one covers this too.
+        covered = None
+        if indexed_table:
+            marker_address, marker = builder.fresh("ptr"), builder.fresh("int64")
+            covered = builder.fresh("bool")
+            builder.emit(block, "GetElementPtr", [_hash_index_carrier_value(descriptor), capacity], marker_address)
+            builder.emit(block, "Load", [marker_address], marker)
+            builder.emit(block, "Eq", [marker, slot], covered)
         for column_id, dtype, value in inserted_columns:
             address = builder.fresh("ptr")
             builder.emit(block, "GetElementPtr", [
@@ -4248,7 +4675,21 @@ def lower_table_store(
         builder.emit(block, "Add", [slot, one], next_length)
         builder.emit(block, "Store", [next_length, length_slot])
         builder.emit(block, "Store", [one, status_slot])
-        builder.branch(block, complete)
+        if covered is None:
+            builder.branch(block, complete)
+            return
+        # The length store above is guarded (``M = -1``); the covered path
+        # then indexes the new row and restores ``M`` to the new length.
+        maintain = builder.block(f"{block.name}_index_append")
+        builder.cond(block, covered, maintain, complete)
+        placed = _hash_index_place(
+            builder, maintain, descriptor, capacity, queries, slot,
+            label=f"{block.name}_index",
+        )
+        marker_address = builder.fresh("ptr")
+        builder.emit(placed, "GetElementPtr", [_hash_index_carrier_value(descriptor), capacity], marker_address)
+        builder.emit(placed, "Store", [next_length, marker_address])
+        builder.branch(placed, complete)
 
     emit_insert(insert, length)
     # Program: ``d = {2: 5}; for i in range(n): d[1] = i; del d[1]`` (corpus
@@ -5215,6 +5656,16 @@ def lower_sequence_aggregate_constants(
             function.metadata["sequence_aggregate_inputs"] = tuple(
                 sorted(promoted)
             )
+
+
+# Every helper a lowerer builds over a hash-indexed table invalidates the
+# index after its length stores (see ``hash_index_carrier``).  Wrapping the
+# module's lowerers once means a new lowerer cannot forget it; nested calls
+# resolve these globals, and the guard is idempotent per store.
+for _lowerer_name, _lowerer in tuple(globals().items()):
+    if _lowerer_name.startswith("lower_") and callable(_lowerer):
+        globals()[_lowerer_name] = _guard_hash_indexes(_lowerer)
+del _lowerer_name, _lowerer
 
 
 __all__ = [

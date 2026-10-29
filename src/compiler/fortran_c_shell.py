@@ -60,6 +60,7 @@ from ..transmogrifier.graph.edge_roles import (
     ordered_arguments,
     positional_argument_index,
 )
+from ..transmogrifier.graph.python_special_cases import method_receiver_formal
 from .bounded_fixed_point import BoundedFixedPoint, bound_for
 from .shell_telemetry import (
     compile_count,
@@ -7709,6 +7710,19 @@ def _annotated_parameter_record_identity(
     return identity
 
 
+def _graph_receiver_formal(graph: Any) -> str | None:
+    """The formal a method graph's receiver is bound to, as authored.
+
+    Python binds the instance (or the class, for a classmethod) to the first
+    positional parameter whatever its name; other graphs have no receiver.
+    """
+
+    if graph.graph.get("method_binding") not in {"instance", "class"}:
+        return None
+    positional = tuple(graph.graph.get("positional_parameters") or ())
+    return str(positional[0]) if positional else None
+
+
 def _reduced_initializer_list_fields(graph: Any) -> dict:
     """Read physical list fields from the reducer's existing identity rows."""
 
@@ -7736,7 +7750,7 @@ def _reduced_initializer_list_fields(graph: Any) -> dict:
                          if edge.get("role") == "object"]
             if len(receivers) != 1 or (
                 target.nodes[receivers[0]].get("attributes") or {}
-            ).get("binding_name") != "self":
+            ).get("binding_name") != _graph_receiver_formal(target):
                 continue
             sources = [source for source, _dest, edge in target.in_edges(_node_id, data=True)
                        if edge.get("role") == "value"]
@@ -7933,6 +7947,7 @@ def _authored_dataclass_record_views(
             elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 methods[statement.name] = statement
         initializer = methods.get("__init__")
+        initializer_receiver = method_receiver_formal(initializer)
         if initializer is not None:
             # ``self.scale = scale`` stores the parameter's authored
             # annotation as surely as ``self.scale: int = scale`` does, while
@@ -8001,7 +8016,7 @@ def _authored_dataclass_record_views(
                 if not (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
+                    and target.value.id == initializer_receiver
                     and receipt is not None
                 ):
                     continue
@@ -8034,7 +8049,7 @@ def _authored_dataclass_record_views(
                 if isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Attribute)
                 and isinstance(node.targets[0].value, ast.Name)
-                and node.targets[0].value.id == "self"
+                and node.targets[0].value.id == initializer_receiver
                 and (
                     (isinstance(node.value, ast.List) and not node.value.elts)
                     or (
@@ -8048,6 +8063,7 @@ def _authored_dataclass_record_views(
             }
             appended: dict[str, list[str | None]] = {}
             for method in methods.values():
+                receiver = method_receiver_formal(method)
                 parameter_classes = {
                     argument.arg: scalar_classes.get(
                         argument.annotation.id
@@ -8079,7 +8095,7 @@ def _authored_dataclass_record_views(
                         and node.func.attr in {"append", "insert"}
                         and isinstance(node.func.value, ast.Attribute)
                         and isinstance(node.func.value.value, ast.Name)
-                        and node.func.value.value.id == "self"
+                        and node.func.value.value.id == receiver
                         and node.func.value.attr in empty_list_fields
                         and node.args
                     ):
@@ -8252,6 +8268,7 @@ def _authored_dataclass_record_views(
         method = class_methods.get(class_name, {}).get(method_name)
         if method is None:
             return None
+        receiver = method_receiver_formal(method)
         direct: dict[str, bool] = {}
         nested_calls: set[str] = set()
         for node in ast.walk(method):
@@ -8259,7 +8276,7 @@ def _authored_dataclass_record_views(
                 continue
             if not (
                 isinstance(node.value, ast.Name)
-                and node.value.id in {"self", "cls"}
+                and node.value.id == receiver
             ):
                 continue
             if node.attr in class_methods.get(class_name, {}):
@@ -8291,8 +8308,9 @@ def _authored_dataclass_record_views(
             fields = method_fields(class_name, method_name)
             if fields is None or not fields:
                 continue
+            receiver = method_receiver_formal(methods[method_name])
             views[f"{class_name}.{method_name}"] = {
-                "self": {
+                receiver: {
                     "identity": class_name,
                     "fields": {
                         name: dict(class_fields[class_name][name])
@@ -8301,7 +8319,7 @@ def _authored_dataclass_record_views(
                 }
             }
             for name, mutable in fields.items():
-                views[f"{class_name}.{method_name}"]["self"]["fields"][name][
+                views[f"{class_name}.{method_name}"][receiver]["fields"][name][
                     "mutable"
                 ] = mutable
 
@@ -8315,6 +8333,7 @@ def _authored_dataclass_record_views(
     def add_annotated_parameter_views(
         qualified_name: str,
         method: ast.FunctionDef | ast.AsyncFunctionDef,
+        receiver: str | None,
     ) -> None:
         arguments = (
             *method.args.posonlyargs,
@@ -8322,7 +8341,7 @@ def _authored_dataclass_record_views(
             *method.args.kwonlyargs,
         )
         for argument in arguments:
-            if argument.arg in {"self", "cls"}:
+            if argument.arg == receiver:
                 continue
             record_name = annotation_class_name(argument.annotation)
             if record_name not in class_fields:
@@ -8374,12 +8393,13 @@ def _authored_dataclass_record_views(
 
     for statement in tree.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            add_annotated_parameter_views(statement.name, statement)
+            add_annotated_parameter_views(statement.name, statement, None)
         elif isinstance(statement, ast.ClassDef):
             for member in statement.body:
                 if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     add_annotated_parameter_views(
                         f"{statement.name}.{member.name}", member,
+                        method_receiver_formal(member),
                     )
     return views
 
@@ -10501,8 +10521,10 @@ def _field_slot_ops(
         if owner in class_table
         else (next(iter(class_table.values())) if len(class_table) == 1 else None)
     )
+    receiver = _graph_receiver_formal(graph_obj)
     declared_self_record = dict(
-        (graph_obj.graph.get("parameter_record_abi") or {}).get("self") or {}
+        (graph_obj.graph.get("parameter_record_abi") or {}).get(receiver) or {}
+        if receiver is not None else {}
     )
     declared_fields = tuple(dict(declared_self_record.get("fields") or {}))
     # Once a method receiver has a ProgramABI record, that declaration is its
@@ -10535,7 +10557,7 @@ def _field_slot_ops(
         committed_sequence_contract,
     )
     from .concordance_declarations import PLANNING_VALUE, SHELL_HANDOFF
-    self_history = identity.get("self") or ()
+    self_history = (identity.get(receiver) or ()) if receiver is not None else ()
     self_value_id = int(self_history[-1]) if self_history else None
 
     # Order field ops by SOURCE order (node id), not the data-dependency
@@ -14074,12 +14096,24 @@ def _member_completion_position(
     # callsite is placed), so ``Q(b=x, a=y).get() + Q(x, y).a`` (corpus
     # c428) placed its ``+`` region at its start, ahead of both calls, and
     # pulled ``get()`` before the ``__init__`` that writes what it reads.
+    # Program: ``env, s = batch(n, 2); return env * 1000 + s[0] * 100 +
+    # s[1]`` (string core ``intern`` after ``intern_batch``).  Wrong record:
+    # the ``+`` region completed at its start (``env``), ahead of the
+    # region reading ``s[1]``, so it consumed that row before it was loaded
+    # (refused: "Call reads a value defined at").  Rule: an operator
+    # executes after all its operands, so a member reading any operand
+    # expression -- a row read as well as a display or a call -- completes
+    # after that operand ends.  The operand lies inside the member's own
+    # expression, so nothing outside it moves past.
     for parent, _role in data.get("parents") or ():
         if int(parent) not in graph_obj:
             continue
         display = graph_obj.nodes[int(parent)].get("expr_obj")
         if (
-            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Call))
+            isinstance(display, (
+                ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Call,
+                ast.Subscript,
+            ))
             and getattr(display, "end_lineno", None) is not None
         ):
             position = max(position, (
@@ -24054,7 +24088,9 @@ def _class_surface_ssa_program(
         # deliberately read from the accepted source cell, not from a live
         # Python class or from the value's eventual dtype.
         method_owner = planned_graph.graph.get("method_owner")
-        receiver_ids = set(map(int, identities.get("self", ())))
+        receiver_ids = set(map(int, identities.get(
+            _graph_receiver_formal(planned_graph), (),
+        )))
         if method_owner is not None and receiver_ids:
             from .concordance_declarations import (
                 CLASS_FIELD_DECLARATION as _ABI_FIELD_DECLARATION,
@@ -27931,6 +27967,29 @@ def _class_surface_ssa_program(
         record_specialization = graph_obj.graph.get("parameter_record_abi") or {}
         if record_specialization and shape_scope_is_variant(graph_obj):
             specialization_contract = (*specialization_contract, record_specialization)
+        # Program: ``intern_batch(1, [65, 66, 67], [0, 3])`` beside
+        # ``intern_batch(1, atoms, ...)`` with ``atoms`` grown by appends
+        # (string-core intern driver).  Wrong record: the two
+        # ``_validate_atom_span`` copies settled their list formal FIXED and
+        # DYNAMIC (``_settle_linked_dynamic_sequences``) but carried one
+        # contract, so both lowered under one symbol and the FIXED caller
+        # bound the DYNAMIC view ("bound sequence views disagree about
+        # dynamic capacity").  Rule: a copy's settled capacity policy for
+        # its formals is part of its callsite contract.
+        linked_dynamic_ids = set(
+            map(int, graph_obj.graph.get("linked_dynamic_sequence_ids", ()))
+        )
+        dynamic_formals = tuple(sorted(
+            str((data.get("attributes") or {}).get("binding_name"))
+            for node_id, data in graph_obj.nodes(data=True)
+            if str(data.get("type") or data.get("op") or "").casefold() == "input"
+            and (data.get("attributes") or {}).get("binding_name") is not None
+            and int(data.get("value_id", node_id)) in linked_dynamic_ids
+        ))
+        if dynamic_formals and any(specialization_contract):
+            specialization_contract = (
+                *specialization_contract, ("dynamic_formals", dynamic_formals),
+            )
         if (
             any(specialization_contract)
             and (
@@ -29534,7 +29593,9 @@ def _class_surface_ssa_program(
                 )
 
         self_record_fields = dict(
-            (declared_parameter_records.get("self") or {}).get("fields") or {}
+            (declared_parameter_records.get(
+                _graph_receiver_formal(graph_obj)
+            ) or {}).get("fields") or {}
         )
         for _kind, value_id, slot in field_ops:
             if not (0 <= int(slot) < len(field_names)):
@@ -29562,7 +29623,7 @@ def _class_surface_ssa_program(
             for parameter_name in dict(
                 graph_obj.graph.get("parameter_record_abi") or {}
             )
-            if str(parameter_name) != "self"
+            if str(parameter_name) != _graph_receiver_formal(graph_obj)
         }
         record_parameter_value_ids = {
             int(value_id)
@@ -30754,6 +30815,7 @@ def _class_surface_ssa_program(
                     if value_id not in scalar_write_sources
                 )),
                 self_value_id=self_id,
+                receiver_parameter=_graph_receiver_formal(graph_obj),
                 field_ops=field_ops,
                 field_write_state_cells=tuple(
                     graph_obj.graph.get("field_write_state_cells") or ()
@@ -30767,7 +30829,7 @@ def _class_surface_ssa_program(
                     for field_name, field in dict(
                         (
                             (graph_obj.graph.get("parameter_record_abi") or {})
-                            .get("self") or {}
+                            .get(_graph_receiver_formal(graph_obj)) or {}
                         ).get("fields") or {}
                     ).items()
                     if field.get("dtype") is not None
@@ -30777,7 +30839,7 @@ def _class_surface_ssa_program(
                     for field_name, field in dict(
                         (
                             (graph_obj.graph.get("parameter_record_abi") or {})
-                            .get("self") or {}
+                            .get(_graph_receiver_formal(graph_obj)) or {}
                         ).get("fields") or {}
                     ).items()
                 },
@@ -30786,7 +30848,7 @@ def _class_surface_ssa_program(
                     for field_name, field in dict(
                         (
                             (graph_obj.graph.get("parameter_record_abi") or {})
-                            .get("self") or {}
+                            .get(_graph_receiver_formal(graph_obj)) or {}
                         ).get("fields") or {}
                     ).items()
                 },
@@ -45841,12 +45903,16 @@ def _class_surface_ssa_program(
             for value in (caller_graph.graph.get(key),)
             if value
         }
+        from .glsl_deployment_strategy import _call_projection_scope
+
+        projection_scope = _call_projection_scope(caller_graph)
         caller_projections = {
-            int(path[0]): int(row[1])
-            for row in projection_identity_page.scope_rows(callsite_id)
+            int(path[0]): int(row[2])
+            for row in projection_identity_page.scope_rows(projection_scope)
             for path in (projection_identity_page.latest(row),)
             if (
-                isinstance(row, tuple) and len(row) == 2
+                isinstance(row, tuple) and len(row) == 3
+                and int(row[1]) == callsite_id
                 and path and len(path) == 1
             )
         }
@@ -45892,7 +45958,7 @@ def _class_surface_ssa_program(
                 ),
                 projection_book.latest_ref(
                     _CALL_RESULT_PROJECTION,
-                    (callsite_id, int(caller_projection_id)),
+                    (projection_scope, callsite_id, int(caller_projection_id)),
                 ),
                 _frame_graph_cell(caller_graph, callsite_id),
                 _frame_graph_cell(caller_graph, int(caller_projection_id)),
@@ -47637,6 +47703,46 @@ def _class_surface_ssa_program(
                 # but the BINDING is not a proven fact -- it is recorded as
                 # Unresolved(STORAGE_MINTED_FROM_ABSENCE) below, beside the
                 # ``result_storage_binding`` row the lease wrote.
+                #
+                # Program: ``one(atoms)`` passes its unannotated ``atoms``
+                # to ``batch(self, values: list[int], offsets)``, which
+                # bounds-checks ``values[offsets[i]]``.  Wrong record: the
+                # argument carried no length cell, so the length, capacity
+                # and status members of ``values`` fell here and were
+                # leased as fresh storage nobody wrote; the bounds check
+                # read garbage (IndexError where Python returns 97).  Rule:
+                # a member of an authored parameter carries the argument's
+                # own state, so storage minted from absence is never its
+                # binding.  A member the callee never reads is harmless, so
+                # the refusal is recorded on the formal here and raised
+                # after the final prune only if an instruction reads it.
+                parameter_accounting = dict(value.accounting or {})
+                if (
+                    parameter_accounting.get("program_abi_parameter")
+                    is not None
+                    and not any(
+                        parameter_accounting.get(key)
+                        for key in (
+                            "compiler_frame_storage",
+                            "linked_call_frame_storage",
+                            "returned_record_storage",
+                            "heap_owner",
+                        )
+                    )
+                ):
+                    value.accounting = {
+                        **parameter_accounting,
+                        "unbound_parameter_member": (
+                            "parameter member has no caller binding: "
+                            f"{caller_symbol} callsite "
+                            f"{planned_call.callsite_id} -> {callee_symbol} "
+                            f"formal {value_id} is the "
+                            f"{parameter_accounting.get('program_abi_storage')!r}"
+                            " member of parameter "
+                            f"{parameter_accounting['program_abi_parameter']!r}"
+                            ", and the argument supplies no such member"
+                        ),
+                    }
                 absent_bindings.add(value_id)
                 frame_bindings.append((
                     value_id,
@@ -53313,9 +53419,23 @@ def _class_surface_ssa_program(
                             )
                             caller_tensor = caller_node.get("tensor") or {}
                             caller_id = int(caller_id)
+                            # Program: ``env, t = batch(n, 2)`` in ``root``
+                            # beside another call (string-core
+                            # ``intern_batch`` then ``intern``).  Wrong
+                            # record: the callee's sequences were read from
+                            # a table bound by an earlier loop over other
+                            # calls (the last callee it linked), so this
+                            # call's returned list was not recognised as a
+                            # caller arena and was also loaded out of the
+                            # aggregate; the load then retired the arena
+                            # formal and the call read undefined operands.
+                            # Rule: the sequences are this record's callee's.
+                            record_callee_sequences = all_sequence_tables.get(
+                                str(record.callee_symbol)
+                            )
                             if (
-                                callee_result_sequences is not None
-                                and callee_result_sequences.by_id(
+                                record_callee_sequences is not None
+                                and record_callee_sequences.by_id(
                                     int(callee_id)
                                 ) is not None
                                 and any(
@@ -61127,12 +61247,23 @@ def _class_surface_ssa_program(
                 # that concordance row are posted on the value's
                 # ``ssa_value`` row (DERIVED from the row's cell, the
                 # source above) and the accounting labels are set FROM the
-                # posted fact.
+                # posted fact.  Program: ``env, statuses = batch(d, 2)`` in a
+                # function that is itself called (string-core ``intern``
+                # after ``intern_batch``).  Wrong record: the kept
+                # ``sequence`` storage was left out of the fields mirrored
+                # here, so the ``span`` default stood in accounting over a
+                # row that says ``sequence`` (refused as a disagreement).
+                # Rule: the labels mirror the row as it now stands.
+                _now_posted = _frame_physical_fields(_function, int(_value_id))
                 _value.accounting.update(_frame_accounting_from_posted({
                     "program_abi_rank": len(_shape),
                     "program_abi_storage": _storage or "span",
                     "shape_materialized_from_concordance": True,
-                }, _shape_physical))
+                }, {
+                    **_shape_physical,
+                    **({"storage": _posted_storage} if _posted_storage else {}),
+                    **(_now_posted if isinstance(_now_posted, dict) else {}),
+                }))
             _row = (str(_function_name), int(_value_id))
             _proposed = _SSAShapeMaterializationFact(
                 _shape, _dtype, _storage, _owner,
@@ -64854,6 +64985,26 @@ def _lower_ast_source_to_ssa_impl(
                 module.functions, final_call_records,
                 module.sequence_tables,
             )
+            # A parameter member leased from absence at a call binding (see
+            # ``unbound_parameter_member`` in the frame binding walk) is
+            # caller state no caller writes.  A member its callee never
+            # reads is harmless; one an instruction reads would be read
+            # uninitialized, so it is refused by name.  A call operand only
+            # forwards the slot; the callee's own formal answers for it.
+            for function in module.functions.values():
+                read_ids = {
+                    int(operand.id)
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op not in {"Call", "call"}
+                    for operand in instruction.args
+                }
+                for formal in function.args:
+                    unbound = dict(formal.accounting or {}).get(
+                        "unbound_parameter_member"
+                    )
+                    if unbound and int(formal.id) in read_ids:
+                        raise ValueError(str(unbound))
             final_pruned_entry_field_aliases = _prune_dead_entry_field_aliases(
                 module.functions, final_call_records,
             )

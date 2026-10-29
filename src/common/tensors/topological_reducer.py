@@ -161,6 +161,7 @@ from ...transmogrifier.graph.python_special_cases import (
     interpret_python_special_case,
     interpret_python_static_value,
     is_python_static_literal,
+    method_receiver_formal,
 )
 from ...transmogrifier.graph.python_identity_programs import (
     resolve_python_identity,
@@ -973,16 +974,19 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         (("iterated_class", identity), domain)
         for identity, domain in sorted(iterable_domains.items(), key=lambda item: repr(item[0]))
     ) + tuple(
-        # Program: ``v.cover(n % 7 + 3)`` and ``v.cover(BASE + n % 2)``:
-        # two copies of one method minted for different actual intervals.
-        # Wrong record: the receipt omitted the intervals, so both copies
-        # shared one numeric scope and its formal's interval row disagreed
-        # ((3, 9) against (1000, 1001)).  Rule: the interval a copy was
-        # minted for is part of what the copy is.
-        (f"range:{name}", (int(interval[0]), int(interval[1])))
-        for name, interval in sorted(dict(
-            metadata.get("planner_parameter_int_ranges") or {}
-        ).items())
+        # Program: ``check(1 + seed % 2, n)`` and ``check(1 << 64, n)``
+        # (string-core ``validate_batch_envelope(1 << 64, ...)`` beside
+        # ``intern(1, ...)``).  Wrong record: the two callsite copies differ
+        # only by their actual's proven interval, which the receipt left
+        # out, so both shared one numeric scope and the second copy's
+        # formal range ((2**64, 2**64)) disagreed with the first's ((1, 2)):
+        # ``source_int_range_concordance disagreement``.  Rule: the interval
+        # a copy is minted for (``planner_parameter_int_ranges``) is part of
+        # its numeric identity.
+        (f"int_range:{name}", (int(interval[0]), int(interval[1])))
+        for name, interval in sorted(
+            dict(metadata.get("planner_parameter_int_ranges") or {}).items()
+        )
     )
     digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
     scope = (authored_scope, "specialization", digest)
@@ -1870,26 +1874,63 @@ def _concord_aggregate_merge_class(graph: Any, value_id: Any) -> None:
 
 
 def _indexed_store_source(graph: Any, value_id: Any) -> Any:
-    """The sequence an ``IndexedStore`` chain writes, by its ``base`` edges."""
+    """The sequence an ``IndexedStore`` chain writes, by its ``base`` edges.
+
+    Program: ``out = [0] * count; while i < count: out[i] = i + d; i += 1;
+    return out`` (string core ``intern_batch``'s statuses).  Wrong record:
+    only a straight store chain was walked, so the loop's version of ``out``
+    (a ``LoopResult`` carrying the body's store) stood as the returned
+    output; the call bound the caller to a value with no sequence, the
+    callee kept its own frame arena and the caller's view of it was
+    withdrawn (refused).  Rule: a loop-carried version of a list the body
+    stores into is that list's one storage, as a store version is, so the
+    walk crosses ``LoopResult`` ``value`` edges -- but answers only through
+    a store it reaches; a loop result that carries no store is itself.
+
+    Program: ``status, count = envelope(...); out = [0] * count; if status
+    == 0: while ...: out[i] = ...`` then ``return status, out`` (the core's
+    ``intern_batch``).  Wrong record: the returned version was the
+    conditional's merge of the loop's version and the untouched list, so
+    the walk stopped at the merge and the caller's views of ``out`` named no
+    storage ("capacity ... not a formal, never defined").  Rule: a merge
+    whose arms are versions of one list is that list's one storage, as a
+    store version is; arms that reach different storage are a real merge and
+    stay themselves.
+    """
 
     target = getattr(graph, "G", graph)
-    seen: set[int] = set()
-    while (
-        isinstance(value_id, int)
-        and value_id in target
-        and value_id not in seen
-        and target.nodes[value_id].get("type") == "IndexedStore"
-    ):
-        seen.add(value_id)
-        value_id = next(
-            (
-                parent
-                for parent, role in target.nodes[value_id].get("parents") or ()
-                if role == "base"
-            ),
-            None,
+    roles = {"IndexedStore": ("base",), "LoopResult": ("value",),
+             "Phi": ("body", "orelse")}
+
+    def storage(current: Any, seen: frozenset) -> tuple[Any, bool]:
+        """(the storage ``current`` versions, whether a store was crossed)."""
+
+        if (
+            not isinstance(current, int)
+            or current not in target
+            or current in seen
+            or target.nodes[current].get("type") not in roles
+        ):
+            return current, False
+        kind = target.nodes[current].get("type")
+        parents = target.nodes[current].get("parents") or ()
+        arms = [
+            next((parent for parent, role in parents if role == wanted), None)
+            for wanted in roles[kind]
+        ]
+        if any(arm is None for arm in arms):
+            return current, False
+        resolved = [storage(arm, seen | {current}) for arm in arms]
+        sources = {source for source, _stored in resolved}
+        crossed = kind == "IndexedStore" or any(
+            stored for _source, stored in resolved
         )
-    return value_id
+        if len(sources) != 1 or not crossed:
+            return current, False
+        return next(iter(sources)), True
+
+    source, crossed = storage(value_id, frozenset())
+    return source if crossed else value_id
 
 
 def _is_row_collection(graph: Any, value_id: Any) -> bool:
@@ -6544,6 +6585,66 @@ def _return_display_flattens(definition: Any, returned: Any) -> bool:
     )
 
 
+def _is_source_array_allocation(
+    expression: Any, static_bindings: Mapping[str, Any],
+) -> bool:
+    """Whether ``expression`` is ``array(typecode)`` of the stdlib ``array``.
+
+    The callee is read through the function's lexical bindings
+    (``from array import array`` or ``import array``); only the one-argument
+    form (an empty array of that typecode) is an allocation.
+    """
+
+    from array import array as source_array
+    import array as source_array_module
+
+    if not (
+        isinstance(expression, ast.Call)
+        and len(expression.args) == 1 and not expression.keywords
+    ):
+        return False
+    callee = expression.func
+    if isinstance(callee, ast.Name):
+        return static_bindings.get(callee.id) is source_array
+    return (
+        isinstance(callee, ast.Attribute)
+        and callee.attr == "array"
+        and isinstance(callee.value, ast.Name)
+        and static_bindings.get(callee.value.id) is source_array_module
+    )
+
+
+def _stamp_source_array_allocation(wrapper: Any, data: dict) -> None:
+    """Declare one ``array(typecode)`` call node an array allocation.
+
+    The typecode literal is the array's authored element layout
+    (``array("Q")`` holds uint64 rows).  It is posted on the allocation
+    itself, the same column contract a typed record field's constructor
+    edge stamps, so an element read of a local array is typed by its
+    typecode and not by its append operands.
+    """
+
+    from ...transmogrifier.dtype_layout import array_typecode_dtype
+
+    data.setdefault("attributes", {}).update({
+        "aggregate_kind": "array",
+        "producer_kind": "sequence_materialization",
+        "sequence_column_count": 1,
+        "sequence_key_columns": (),
+        "sequence_writable": True,
+    })
+    typecode_dtype = next((
+        array_typecode_dtype(
+            (wrapper.G.nodes[int(parent)].get("attributes") or {})
+            .get("value", wrapper.G.nodes[int(parent)].get("constant"))
+        )
+        for parent, role in data.get("parents") or ()
+        if role == "arg:0" and int(parent) in wrapper.G
+    ), None)
+    if typecode_dtype is not None:
+        data["attributes"]["sequence_column_dtypes"] = (typecode_dtype,)
+
+
 def _normalize_lexical_values(
     function_graph: Any,
     statement: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -6595,6 +6696,11 @@ def _normalize_lexical_values(
         else None
     )
     graph = function_graph
+    # The formal Python binds this method's receiver to, whatever it is
+    # named (``def __init__(me, n)``); ``None`` outside a class.
+    receiver_formal = (
+        method_receiver_formal(statement) if method_owner is not None else None
+    )
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
     deleted_names: set[str] = set()
@@ -10684,9 +10790,9 @@ def _normalize_lexical_values(
                 receiver_class = (
                     str(method_owner)
                     if (
-                        method_owner is not None
+                        receiver_formal is not None
                         and isinstance(expression.value, ast.Name)
-                        and expression.value.id in {"self", "cls"}
+                        and expression.value.id == receiver_formal
                     )
                     else refined_class or receiver_class_identity(receiver)
                 )
@@ -15230,9 +15336,9 @@ def _normalize_lexical_values(
             # never the RHS id or the SetAttr id.
             declared_field_cell = declared_field_schema_cell(
                 str(method_owner)
-                if method_owner is not None
+                if receiver_formal is not None
                 and isinstance(target.value, ast.Name)
-                and target.value.id in {"self", "cls"}
+                and target.value.id == receiver_formal
                 else receiver_class_identity(receiver),
                 target.attr,
             )
@@ -21854,7 +21960,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     and keyword.value.value is True
                     for keyword in decorator.keywords
                 )
-                for decorator in definition.decorator_list
+                for decorator in getattr(
+                    definition, "_turing_declared_decorators",
+                    definition.decorator_list,
+                )
             ),
         }
         for class_name, definition in class_definitions.items()
@@ -23245,19 +23354,47 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             )
             else None
         )
+        # Program: ``def parse(v) -> Lvl | None`` returning ``Lvl(v)`` on
+        # one path and ``None`` on others (bootstrap
+        # ``parse_identity_log_level``, c938).  Wrong record: the one
+        # returned construction was posted as the class of every call
+        # result, contradicting the returned ``None``.  Rule: a result is a
+        # constructed class only when every exit of the function itself
+        # (never a nested definition's) returns a construction of it.
+        def own_returns(node: ast.AST):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (
+                    ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                    ast.ClassDef,
+                )):
+                    continue
+                if isinstance(child, ast.Return):
+                    yield child
+                yield from own_returns(child)
+
+        def always_exits(body: list[ast.stmt]) -> bool:
+            if not body:
+                return False
+            last = body[-1]
+            if isinstance(last, (ast.Return, ast.Raise)):
+                return True
+            if isinstance(last, ast.If):
+                return always_exits(last.body) and always_exits(last.orelse)
+            return False
+
+        returns = tuple(own_returns(definition))
         returned_classes = {
-            returned.func.id
-            for returned in (
-                node.value for node in ast.walk(definition)
-                if isinstance(node, ast.Return) and node.value is not None
-            )
-            if isinstance(returned, ast.Call)
-            and isinstance(returned.func, ast.Name)
-            and returned.func.id in graph.G.graph["class_table"]
+            returned.value.func.id
+            if isinstance(returned.value, ast.Call)
+            and isinstance(returned.value.func, ast.Name)
+            and returned.value.func.id in graph.G.graph["class_table"]
+            else None
+            for returned in returns
         }
         inferred_class = declared_class or (
             next(iter(returned_classes))
-            if len(returned_classes) == 1 else None
+            if len(returned_classes) == 1 and always_exits(definition.body)
+            else None
         )
         return None if inferred_class is None else str(inferred_class)
 
@@ -25701,6 +25838,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         # exact static environment on the function graph consumed by compiled
         # shells; otherwise those globals reappear as missing runtime inputs.
         function_graph.python_bindings = definition_static_bindings
+        # Program: ``values = array("Q")`` then ``while ...:
+        # values.append(v)`` (string-core repro r5d).  Wrong record: an
+        # array allocation was declared only at graph finalization, after
+        # this function's body walk classified its loop effects, so a local
+        # array appended in a loop stayed the default opaque native effect
+        # and the loop was refused ("opaque-state-effect").
+        # Rule: a call of the static ``array.array`` with one argument (the
+        # typecode) is an array allocation from the moment the function's
+        # lexical bindings are known, which is now.
+        for _member_id, member_data in function_graph.G.nodes(data=True):
+            if _is_source_array_allocation(
+                member_data.get("expr_obj"), definition_static_bindings,
+            ) and len(tuple(
+                role for _parent, role in member_data.get("parents") or ()
+                if role != "callee"
+            )) == 1:
+                _stamp_source_array_allocation(function_graph, member_data)
         function_graph.levels = {
             member: level
             for member, level in graph.levels.items()
@@ -26128,6 +26282,24 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             caller = caller_entry.graph.G
             if not caller.graph.get("source_pursuit_active"):
                 continue
+            # Program: ``drive(advance, t)`` where ``drive`` calls its
+            # ``step`` parameter (the managed tire passes
+            # ``balloon_tire_managed_advance`` to ``run_superstep``;
+            # corpus c971).  Wrong record: pursuit followed only calls that
+            # name their callee, so ``advance`` -- reached only through the
+            # parameter -- stayed inactive, and its own calls never got
+            # reachability rows.  Rule: a source function whose address an
+            # active function takes as a value is reachable from it.
+            for _reference_id, reference_data in caller.nodes(data=True):
+                address = (reference_data.get("attributes") or {}).get(
+                    "first_class_function_ref"
+                )
+                if address is None or int(address) not in entries:
+                    continue
+                referenced = entries[int(address)].graph.G
+                if not referenced.graph.get("source_pursuit_active"):
+                    referenced.graph["source_pursuit_active"] = True
+                    changed = True
             caller_scope = _source_numeric_scope(caller, caller_entry.name)
             for call_id, call_data in tuple(caller.nodes(data=True)):
                 call_attributes = call_data.get("attributes") or {}
@@ -26997,32 +27169,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if tuple(role for _parent, role in source_data.get("parents") or ()
                      if role != "callee") != ("arg:0",):
                 continue
-            source_data.setdefault("attributes", {}).update({
-                "aggregate_kind": "array",
-                "producer_kind": "sequence_materialization",
-                "sequence_column_count": 1,
-                "sequence_key_columns": (),
-                "sequence_writable": True,
-            })
-            # The typecode literal is the array's authored element layout
-            # (``array("Q")`` holds uint64 rows).  Post it on the allocation
-            # itself, the same column contract a typed record field's
-            # constructor edge stamps, so an element read of a local array
-            # is typed by its typecode and not by its append operands.
-            from ...transmogrifier.dtype_layout import array_typecode_dtype
-
-            typecode_dtype = next((
-                array_typecode_dtype(
-                    (source_wrapper.G.nodes[int(parent)].get("attributes") or {})
-                    .get("value", source_wrapper.G.nodes[int(parent)].get("constant"))
-                )
-                for parent, role in source_data.get("parents") or ()
-                if role == "arg:0" and int(parent) in source_wrapper.G
-            ), None)
-            if typecode_dtype is not None:
-                source_data["attributes"]["sequence_column_dtypes"] = (
-                    typecode_dtype,
-                )
+            _stamp_source_array_allocation(source_wrapper, source_data)
     graph.python_bindings = canonicalize_python_static_bindings(
         graph.python_bindings
     )

@@ -378,6 +378,28 @@ def _native_integer_conversion(expression: str, dtype: str) -> str:
     return f"{intrinsic}({expression}, {kind})"
 
 
+#: The signed kind in which a fixed-width signed ``+ - *`` of a narrower
+#: catalogue width cannot overflow (byte size -> kind).
+_WRAP_WIDE_KIND = {1: "c_int64_t", 2: "c_int64_t", 4: "c_int64_t", 8: "16"}
+
+
+def _wrapped_signed(wide: str, layout) -> str:
+    """The two's-complement low ``layout`` bits of an exact wide integer.
+
+    ``ibits`` keeps bits 0..n-2 (a non-negative value of the narrow kind)
+    and the sign bit contributes ``-2**(n-1)``: no operation can overflow,
+    so GNU has no signed overflow to fold (``MAX + one == MIN`` holds).
+    """
+
+    bits = 8 * int(layout.byte_size)
+    kind = str(layout.fortran_kind).split("(", 1)[1].rstrip(")")
+    minimum = f"(-huge(0_{kind}) - 1_{kind})"
+    return (
+        f"(int(ibits({wide}, 0, {bits - 1}), {kind}) + "
+        f"merge({minimum}, 0_{kind}, btest({wide}, {bits - 1})))"
+    )
+
+
 def _unsigned_dtype(dtype: str) -> bool:
     layout = resolve_dtype_layout(dtype)
     return layout is not None and layout.kind == "uint"
@@ -4127,6 +4149,179 @@ class _FunctionEmitter:
         ))
         return lines
 
+    def _python_int_statements(self, instr: Instr) -> list[str] | None:
+        """Python ``int`` arithmetic on int64: Python's value or C's fault.
+
+        Program: c910-c912 (``a + b``, ``-a``, ``abs(a)``, ``a // b``,
+        ``a % b``, ``a << b``, ``a >> b``, ``a / b`` on ints at the int64
+        edges).  Wrong records: this lane ignored the integer arithmetic
+        policy the C and LLVM lanes read -- ``+ - *`` wrapped (and needed
+        -funsigned), ``(-2**63) // 3`` and ``(2**63 - 1) // -2`` overflowed
+        ``a - modulo(a, b)``, ``// 0``, ``% 0`` and ``-2**63 // -1`` trapped
+        the host with SIGFPE, ``1 << 64`` gave 0, ``1 << -1`` gave
+        INT64_MIN, and ``(2**53 + 1) / 3`` rounded twice.  Rule: the same
+        predicates as C (``python_int_overflow_checked``,
+        ``python_int_operation``, ``python_int_true_division``) choose the
+        same statements, and each fault is the C lane's code through this
+        lane's ``error stop`` (``native_faults``: INT_OVERFLOW 86,
+        NEGATIVE_SHIFT_COUNT 87, INT_ZERO_DIVISION 88,
+        INT_TRUE_DIVISION_INEXACT 91).  Every guarded operation runs on a
+        safe operand, so nothing traps or overflows natively.
+        """
+
+        from .native_faults import (
+            INT_OVERFLOW, INT_TRUE_DIVISION_INEXACT, INT_ZERO_DIVISION,
+            NEGATIVE_SHIFT_COUNT,
+        )
+        from .ssa_llvm_backend import (
+            python_int_operation, python_int_overflow_checked,
+            python_int_true_division,
+        )
+
+        op = instr.op
+        if instr.res is None or tuple(instr.res.shape or ()):
+            return None
+
+        def signed_operands() -> bool:
+            for value in instr.args:
+                layout = resolve_dtype_layout(
+                    str(self._typed(value).dtype or self.dtype)
+                )
+                if layout is None or layout.kind != "int":
+                    return False
+            return True
+
+        def operands() -> list[str] | None:
+            args = [self._operand(value) for value in instr.args]
+            if len(args) == 2:
+                args = self._conform(instr, args)
+                if args is None:
+                    return None
+            return [f"int({argument}, c_int64_t)" for argument in args]
+
+        target = _name(instr.res)
+        int64_min = "(-huge(0_c_int64_t) - 1_c_int64_t)"
+
+        def stop(condition: str, code: int) -> str:
+            return f"    if ({condition}) error stop {int(code)}"
+
+        if python_int_true_division(instr):
+            if not signed_operands():
+                return None
+            args = operands()
+            if args is None:
+                return None
+            left, right = args
+
+            def exact(value: str) -> str:
+                # A double is the int exactly when it is below 2**63 and
+                # converts back to it; the conversion reads a guarded value.
+                double = f"real({value}, c_double)"
+                fits = f"({double} < 9223372036854775808.0_c_double)"
+                return (
+                    f"({fits} .and. int(merge({double}, 0.0_c_double, "
+                    f"{fits}), c_int64_t) == {value})"
+                )
+
+            return [
+                stop(f"{right} == 0_c_int64_t", INT_ZERO_DIVISION),
+                stop(
+                    f".not. ({exact(left)} .and. {exact(right)})",
+                    INT_TRUE_DIVISION_INEXACT,
+                ),
+                f"    {target} = (real({left}, c_double) / "
+                f"real({right}, c_double))",
+            ]
+
+        if str(instr.res.dtype or self.dtype) != "int64":
+            return None
+        checked_ops = {"Add", "Sub", "Mul", "Neg", "Abs", "abs"}
+        if op in checked_ops:
+            if not python_int_overflow_checked(instr):
+                return None
+        elif op in {"Shl", "Shr", "FloorDiv", "Mod"}:
+            if not python_int_operation(instr):
+                return None
+        else:
+            return None
+        if not signed_operands():
+            return None
+        arity = 1 if op in {"Neg", "Abs", "abs"} else 2
+        if len(instr.args) != arity:
+            return None
+        args = operands()
+        if args is None:
+            return None
+
+        if op in {"Add", "Sub", "Mul"}:
+            # Exact in kind 16 (an int64 product is below 2**126).
+            wide = f"{target}_wide"
+            self._discard_declarations[wide] = "integer(16)"
+            symbol = {"Add": "+", "Sub": "-", "Mul": "*"}[op]
+            return [
+                f"    {wide} = (int({args[0]}, 16) {symbol} int({args[1]}, 16))",
+                stop(
+                    f"{wide} > int(huge(0_c_int64_t), 16) .or. "
+                    f"{wide} < int({int64_min}, 16)",
+                    INT_OVERFLOW,
+                ),
+                f"    {target} = int({wide}, c_int64_t)",
+            ]
+        if op in {"Neg", "Abs", "abs"}:
+            (value,) = args
+            spelled = f"(-{value})" if op == "Neg" else f"abs({value})"
+            return [
+                stop(f"{value} == {int64_min}", INT_OVERFLOW),
+                f"    {target} = {spelled}",
+            ]
+        left, right = args
+        if op in {"Shl", "Shr"}:
+            statements = [stop(f"{right} < 0_c_int64_t", NEGATIVE_SHIFT_COUNT)]
+            if op == "Shr":
+                # Python ``>>`` floors: arithmetic, and 0 / -1 past 63 bits.
+                return statements + [
+                    f"    {target} = shifta({left}, "
+                    f"int(min({right}, 63_c_int64_t)))",
+                ]
+            # ``<<`` is exact or INT_OVERFLOW: past 63 bits only 0 survives;
+            # otherwise shifting back must restore the operand.
+            return statements + [
+                f"    if ({right} > 63_c_int64_t) then",
+                stop(f"{left} /= 0_c_int64_t", INT_OVERFLOW).replace(
+                    "    if", "      if", 1,
+                ),
+                f"      {target} = 0_c_int64_t",
+                "    else",
+                f"      {target} = shiftl({left}, int({right}))",
+                stop(
+                    f"shifta({target}, int({right})) /= {left}", INT_OVERFLOW,
+                ).replace("    if", "      if", 1),
+                "    end if",
+            ]
+        statements = [stop(f"{right} == 0_c_int64_t", INT_ZERO_DIVISION)]
+        if op == "Mod":
+            # ``modulo`` takes the divisor's sign, as Python's ``%``; a
+            # divisor of -1 always leaves 0, so 1 stands in for it and
+            # ``-2**63 % -1`` never reaches the native divide.
+            return statements + [
+                f"    {target} = modulo({left}, merge(1_c_int64_t, {right}, "
+                f"{right} == -1_c_int64_t))",
+            ]
+        # Python floors; Fortran's ``/`` truncates.  The truncated quotient
+        # steps down once when the remainder's sign differs from the
+        # divisor's -- no intermediate leaves int64 (``a - modulo(a, b)``
+        # did at -2**63 // 3).  ``-2**63 // -1`` is 2**63: INT_OVERFLOW.
+        return statements + [
+            stop(
+                f"{left} == {int64_min} .and. {right} == -1_c_int64_t",
+                INT_OVERFLOW,
+            ),
+            f"    {target} = ({left} / {right})",
+            f"    if (mod({left}, {right}) /= 0_c_int64_t .and. "
+            f"((mod({left}, {right}) < 0_c_int64_t) .neqv. "
+            f"({right} < 0_c_int64_t))) {target} = {target} - 1_c_int64_t",
+        ]
+
     def _statements(self, instr: Instr) -> list[str] | None:
         """Ops that are a Fortran *statement* rather than one expression.
 
@@ -4140,6 +4335,9 @@ class _FunctionEmitter:
         operation = instr.attributes.get("tensor_operation") or instr.op
         if instr.res is None:
             return None
+        python_int = self._python_int_statements(instr)
+        if python_int is not None:
+            return python_int
         sequence_reduction = self._sequence_reduction(instr, operation)
         if sequence_reduction is not None:
             return sequence_reduction
@@ -4847,8 +5045,23 @@ class _FunctionEmitter:
                 # at every catalogue width, as C/LLVM do. Plain signed
                 # Fortran overflow lets GNU fold ``MAX + runtime_one == MIN``
                 # to false.
-                # Perform the operation in the catalogue's matching unsigned
-                # domain, then convert the resulting bits to the signed kind.
+                # The same two's-complement bits are spelled without
+                # ``unsigned`` (GNU's -funsigned exists only from gfortran
+                # 15; on 13, 348 of 612 corpus programs failed to build
+                # through ``int(uint(a) + uint(b))``): the operation runs in
+                # the next wider signed kind, where it cannot overflow, and
+                # the low bits are kept (``_wrapped_signed``).
+                wide_kind = _WRAP_WIDE_KIND.get(result_layout.byte_size)
+                if wide_kind is not None:
+                    return _wrapped_signed(
+                        template.format(*(
+                            f"int({argument}, {wide_kind})" for argument in args
+                        )),
+                        result_layout,
+                    )
+                # int128 has no wider Fortran kind.  The C lane spells it in
+                # the native unsigned 128-bit domain, and so does this lane:
+                # that needs -funsigned and is refused by name without it.
                 unsigned_dtype = f"uint{8 * result_layout.byte_size}"
                 unsigned_args = [
                     _native_integer_conversion(argument, unsigned_dtype)

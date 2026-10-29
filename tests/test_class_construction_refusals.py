@@ -126,3 +126,28 @@ def test_alias_of_record_stored_by_call_is_refused(body):
     # storing-call mark named ``acc``, not the record ``old`` also names.
     with pytest.raises(ValueError, match="record_stored_by_call"):
         _lower(_STORED_ALIAS_PRELUDE + body, "stored_alias_refused")
+
+
+def test_call_result_is_not_one_returned_construction_among_none_exits():
+    # ``make`` returns ``Box(v)`` on one path and ``None`` on another.  The
+    # one construction was posted as the class of every call result, and
+    # topology reduction refused on the contradicting ``None`` exit
+    # (bootstrap ``parse_identity_log_level``).
+    source = '''
+class Box:
+    def __init__(self, k: int) -> None:
+        self.k = k
+def make(v: int):
+    if v > 2:
+        return Box(v)
+    return None
+def root(n: int) -> int:
+    b = make(n)
+    if b is None:
+        return -1
+    return b.k * 2
+'''
+    try:
+        _lower(source, "optional_construction_result")
+    except Exception as error:  # a later, loud refusal is not this stop
+        assert "source call result identity concordance" not in str(error)
