@@ -97,6 +97,39 @@ def root(n: int) -> int:
     return d
 '''
 
+# The entry returns the int128 sum itself: its public slot is int64.
+WIDE_RETURN = '''
+def f(a: int, b: int) -> int:
+    d = a % 4611686018427387847
+    return d * 1000003 + b
+
+
+def root(a: int, b: int):
+    return f(a, b)
+'''
+
+# Proven int128 ([0, 4.6e24]): it fits int64 for small ``a`` only.
+PROVEN_WIDE_RETURN = '''
+def f(a: int) -> int:
+    d = a % 4611686018427387847
+    return d * 1000003
+
+
+def root(a: int, b: int):
+    return f(a)
+'''
+
+# Proven wholly above int64: no input fits the public int64 return.
+NEVER_FITS_RETURN = '''
+def f(a: int) -> int:
+    d = a % 1000
+    return d * 1000003 + 1208925819614629174706176
+
+
+def root(a: int):
+    return f(a)
+'''
+
 BIG_D = 4611686018427387000
 
 
@@ -225,3 +258,22 @@ def test_wrap_policy_keeps_the_proven_width(tmp_path, run, monkeypatch):
     )
     cases = [(7, 3), (42, 20)]
     assert list(run(tmp_path, MIX, cases)) == [_python(MIX, case) for case in cases]
+
+
+@RUNS
+def test_wide_return_is_narrowed_checked_into_int64(tmp_path, run):
+    from src.compiler.native_faults import NativeIntOverflow
+
+    for position, source in enumerate((WIDE_RETURN, PROVEN_WIDE_RETURN)):
+        directory = tmp_path / f"source{position}"
+        cases = [(5, 3), (9000, -5), (0, -(2**63))]
+        assert list(run(directory, source, cases)) == [
+            _python(source, case) for case in cases
+        ]
+        with pytest.raises(NativeIntOverflow):
+            list(run(directory / "big", source, [(BIG_D, 1)]))
+
+
+def test_return_proven_outside_int64_is_refused_by_name():
+    with pytest.raises(ValueError, match="wholly outside int64"):
+        _lowered(NEVER_FITS_RETURN)

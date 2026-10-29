@@ -2667,6 +2667,148 @@ def _resolved_source_literals_by_symbol(
     }
 
 
+def _narrow_public_wide_int_returns(
+    module: Any, outputs: Mapping[str, Any], exports: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    """An exported int128 scalar return enters the public int64 slot checked.
+
+    Program: ``def f(a, b): d = a % M; return d * 1000003 + b`` returned by
+    the entry.  The sum computes in int128 (an operand proven past int64);
+    the host's return buffer has no 128-bit cell.  Wrong record: every
+    build refused ("no public 128-bit buffer ABI"), though Python's value
+    fits int64 for most inputs.  Rule: the stage-1 rule at the boundary --
+    the returned value converts to int64 through the numeric contract's
+    ``integer_narrowing`` (``trap`` reports ``INT_OVERFLOW`` for a value
+    int64 does not hold), as a store into an int64 slot does.  A value
+    whose proven interval lies wholly outside int64 can never fit: that
+    build is refused by name.
+    """
+
+    from .concordance_declarations import CONTROL_CAST, PHYSICAL_CALL_INPUT_ADAPTATION
+    from .ssa_call_input_adapters import _numeric_conversion_attributes
+    from .ssa_llvm_backend import _INT64_BOUNDS, python_int_proven_range
+    from .ssa_record_return_state import mint_ssa_value
+    from ..transmogrifier.ssa import Instr, SSAValue
+
+    def producers_of(function):
+        return {
+            int(instruction.res.id): instruction
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+
+    # A region result keeps its source id across the region, the function
+    # that loads it and the caller of that function, so its proof is read
+    # where the region computed it.
+    region_proofs = {
+        int(instruction.res.id): python_int_proven_range(instruction)
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+        and python_int_proven_range(instruction) is not None
+    }
+
+    def proven_range(function, value_id, depth=0):
+        """The interval proven for a returned value, through its callees."""
+
+        producer = producers_of(function).get(int(value_id))
+        interval = python_int_proven_range(producer)
+        if interval is not None or producer is None or depth > 8:
+            return interval
+        if producer.op == "Load":
+            return region_proofs.get(int(value_id))
+        callee = module.functions.get(
+            str((producer.attributes or {}).get("callee") or "")
+        )
+        if producer.op != "Call" or callee is None:
+            return None
+        joined = None
+        for block in callee.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op != "Ret" or (
+                    instruction.attributes or {}
+                ).get("fault_exit"):
+                    continue
+                if len(instruction.args) != 1:
+                    return None
+                arm = proven_range(callee, instruction.args[0].id, depth + 1)
+                if arm is None:
+                    return None
+                joined = arm if joined is None else (
+                    min(joined[0], arm[0]), max(joined[1], arm[1]),
+                )
+        return joined
+
+    receipts: list[dict[str, Any]] = []
+    for export in exports:
+        function = module.functions.get(export)
+        if function is None:
+            continue
+        narrowed: dict[int, SSAValue] = {}
+        for block in function.blocks.values():
+            for position in range(len(block.instrs) - 1, -1, -1):
+                ret = block.instrs[position]
+                if ret.op != "Ret" or (ret.attributes or {}).get("fault_exit"):
+                    continue
+                for index, value in enumerate(tuple(ret.args)):
+                    if (
+                        str(value.dtype) != "int128"
+                        or tuple(value.shape or ())
+                    ):
+                        continue
+                    proven = proven_range(function, value.id)
+                    if proven is not None and (
+                        proven[0] > _INT64_BOUNDS[1]
+                        or proven[1] < _INT64_BOUNDS[0]
+                    ):
+                        raise ValueError(
+                            f"{export}: the returned int is proven in "
+                            f"{proven}, wholly outside int64; the public "
+                            "int64 return slot can never hold it"
+                        )
+                    converted = narrowed.get(int(value.id))
+                    if converted is None:
+                        converted_id = mint_ssa_value(
+                            function, CONTROL_CAST, (value,),
+                            dtype="int64", shape=(),
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                            physical={
+                                "physical_dtype": "int64",
+                                "device": value.device,
+                            },
+                        )
+                        converted = SSAValue(
+                            converted_id, dtype="int64", shape=(),
+                            device=value.device,
+                        )
+                        block.instrs.insert(position, Instr(
+                            "Cast", [value], converted,
+                            attributes={
+                                "target_dtype": "int64",
+                                "source_dtype": "int128",
+                                "public_return_narrowing": True,
+                                **_numeric_conversion_attributes(
+                                    "int128", "int64",
+                                ),
+                            },
+                        ))
+                        narrowed[int(value.id)] = converted
+                        receipts.append({
+                            "function": export,
+                            "value": int(value.id),
+                            "narrowed": int(converted_id),
+                        })
+                    ret.args[index] = converted
+        if narrowed and export in outputs:
+            outputs[export] = type(outputs[export])(
+                narrowed.get(int(value.id), value)
+                for value in outputs[export]
+            )
+    return tuple(receipts)
+
+
 def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, Any]) -> None:
     """Retain unresolved invocation edges to surviving callable inputs."""
     from ..transmogrifier.ssa import SSACallRecord
@@ -65054,6 +65196,11 @@ def _lower_ast_source_to_ssa_impl(
     # therefore drops its closure/callable provenance at publication.
     final_source_graphs_by_symbol = _resolved_source_graphs_by_symbol(graph)
     compile_stage("pre-native-repairs")
+    public_return_narrowings = _narrow_public_wide_int_returns(
+        module, outputs, tuple(exports),
+    )
+    if public_return_narrowings:
+        module.metadata["public_return_narrowings"] = public_return_narrowings
     compile_substage("release selected deployment planning state")
     # The deployment (every planned shell, its callsite copies and dispatch
     # subgraphs) was local to that call and is unreachable now; its shell
