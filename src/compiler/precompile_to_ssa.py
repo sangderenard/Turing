@@ -31826,6 +31826,35 @@ def lower_control_sections_to_ssa(
                 f"captures={len(effective_captures)} outputs={len(outputs)} "
                 f"instructions={len(instructions)}"
             )
+    # Program: ``rebuilt = []; rebuilt = rebuilt + ca; len(rebuilt)``.
+    # Wrong record: the shell posted the concatenation, but no region planned
+    # its ``+`` (an operand ``[]`` states no element class, so the classifier
+    # made it coordinator metadata); nothing scheduled it, the result's arena
+    # stayed at its empty initialization and ``len`` read 0 (silent).  Rule:
+    # every concatenation the shell posted is scheduled by the region that
+    # plans it, or the section refuses naming it.
+    scheduled_concat_ids = {
+        int(arguments[0])
+        for operations in table_region_operations.values()
+        for name, arguments in operations
+        if name == "reset"
+    }
+    for result_id, (lhs_id, rhs_id, kind, _lhs, _rhs) in sorted(
+        sequence_concat_by_result.items()
+    ):
+        if (
+            int(result_id) in scheduled_concat_ids
+            or int(result_id) in packed_concat_ids
+            or int(result_id) in prepend_by_result
+        ):
+            continue
+        raise ValueError(
+            f"{kind} concatenation {int(result_id)} (of sequences "
+            f"{int(lhs_id)} and {int(rhs_id)}) in {control_name!r} is planned "
+            "by no region, so nothing produces its rows: its ``+`` was "
+            "classified coordinator metadata (an empty ``[]`` operand whose "
+            "declaration posts no element class is one such cause)"
+        )
     compile_substage(f"SSA section {control_name}: settle control dependencies")
     report("settling control dependencies and lexical lookups")
     table_epilogue_operations: list[tuple[str, tuple[Any, ...]]] = []
