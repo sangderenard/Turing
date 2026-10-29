@@ -771,7 +771,7 @@ _INTEGER_BINARY: dict[str, str] = {
     "And": "and", "Or": "or", "Xor": "xor",
     "LAnd": "and", "LOr": "or",
     "BitAnd": "and", "BitOr": "or", "BitXor": "xor",
-    "Shl": "shl", "Shr": "lshr",
+    "Shl": "shl", "Shr": "lshr", "AShr": "ashr",
 }
 # Python ``int`` arithmetic no interval proves inside int64
 # (``python_int_overflow_checked``): the signed overflow intrinsics.

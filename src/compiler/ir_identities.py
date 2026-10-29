@@ -2606,6 +2606,371 @@ class WideExpansionEmitter:
                 products.extend((high, low))
         return self.renormalise(products, width)
 
+    # -- integer limbs ------------------------------------------------------
+    #
+    # The twin of ``extended_precision``'s integer kernels, step for step:
+    # a Python ``int`` as place-valued integer limbs, high first, head
+    # signed in ``[-B, B)`` and every lower limb in ``[0, B)``, with
+    # ``B = 2**digit_bits`` read from the element's ``LIMB_ELEMENTS`` row.
+    # ``self.element`` names that row (``int64``, or ``int128`` where the
+    # lane spells it); every limb is a value of its ``container`` dtype.
+    # Each limb operation is exact by construction (the bounds are the
+    # kernels' own), so none is Python-int checked; the kernels return the
+    # predicates -- top overflow (``INT_OVERFLOW``) and a zero divisor
+    # (``INT_ZERO_DIVISION``) -- and the lowering pass faults on them.
+
+    def integer_digit_bits(self) -> int:
+        from ..common.tensors.extended_precision import (
+            integer_limb_element, limb_element_facts,
+        )
+
+        if not integer_limb_element(self.element):
+            raise ValueError(
+                f"integer limbs need an integer element; got {self.element!r}"
+            )
+        return int(limb_element_facts(self.element)["digit_bits"])
+
+    def integer_constant(self, number: int, like):
+        """An exact integer constant in ``like``'s container."""
+
+        result = SSAValue(
+            self._mint(
+                self.function, self._constant_kind, (like,),
+                dtype=like.dtype, shape=(), stage=self._stage,
+            ),
+            dtype=like.dtype,
+            shape=(),
+            device=like.device,
+        )
+        self.emitted.append(Instr("Const", [], result, attributes={
+            "value": int(number),
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.integer_constant",
+        }))
+        self.known_scalar_ids.add(int(result.id))
+        return result
+
+    def _int(self, op, left, right):
+        return self.put(op, (left, right), left)
+
+    def _int_where(self, mask, when_true, when_false):
+        return self.select(mask, when_true, when_false)
+
+    def _int_and(self, left, right):
+        return self._predicate("And", (left, right))
+
+    def _int_or(self, left, right):
+        return self._predicate("Or", (left, right))
+
+    def _int_not(self, test):
+        return self._predicate("Not", (test,))
+
+    def _int_eq(self, value, number: int):
+        return self.compare(
+            "Eq", value, self.integer_constant(number, value),
+        )
+
+    def integer_align(self, terms, count: int):
+        terms = list(terms)
+        return [
+            self.integer_constant(0, terms[0])
+            for _index in range(count - len(terms))
+        ] + terms
+
+    def integer_split(self, product, digit_bits: int):
+        """``product == high * B + low`` exactly, ``low`` in ``[0, B)``."""
+
+        high = self._int(
+            "AShr", product, self.integer_constant(digit_bits, product),
+        )
+        low = self._int(
+            "BitAnd", product,
+            self.integer_constant((1 << digit_bits) - 1, product),
+        )
+        return high, low
+
+    def integer_carry(self, columns, digit_bits: int):
+        digits = list(columns)
+        carry = None
+        for index in range(len(digits) - 1, 0, -1):
+            column = (
+                digits[index] if carry is None
+                else self._int("Add", digits[index], carry)
+            )
+            carry, digits[index] = self.integer_split(column, digit_bits)
+        if carry is not None:
+            digits[0] = self._int("Add", digits[0], carry)
+        return digits
+
+    def integer_renormalise(self, columns, limbs: int, digit_bits: int):
+        """``(limbs, overflow)``; see ``extended_precision.integer_renormalise``."""
+
+        working = list(columns)
+        while len(working) < int(limbs) + 1:
+            working.insert(0, self.integer_constant(0, working[0]))
+        digits = self.integer_carry(working, digit_bits)
+        mask = (1 << digit_bits) - 1
+        cut = len(digits) - int(limbs)
+        excess, kept = digits[:cut], digits[cut:]
+        held_zero = self._int_eq(excess[0], 0)
+        held_minus = self._int_eq(excess[0], -1)
+        for each in excess[1:]:
+            held_zero = self._int_and(held_zero, self._int_eq(each, 0))
+            held_minus = self._int_and(held_minus, self._int_eq(each, mask))
+        lowered = self._int(
+            "Sub",
+            self._int("Sub", kept[0], self.integer_constant(mask, kept[0])),
+            self.integer_constant(1, kept[0]),
+        )
+        head = self._int_where(held_minus, lowered, kept[0])
+        overflow = self._int_not(self._int_or(held_zero, held_minus))
+        return [head, *kept[1:]], overflow
+
+    def integer_negate(self, terms):
+        return [
+            self._int("Sub", self.integer_constant(0, term), term)
+            for term in terms
+        ]
+
+    def integer_add_expansions(self, left, right, limbs: int, digit_bits: int):
+        count = max(len(left), len(right))
+        columns = [
+            self._int("Add", a, b)
+            for a, b in zip(
+                self.integer_align(left, count),
+                self.integer_align(right, count),
+            )
+        ]
+        return self.integer_renormalise(columns, limbs, digit_bits)
+
+    def integer_multiply_expansions(self, left, right, limbs: int,
+                                    digit_bits: int):
+        count = len(left) + len(right)
+        columns = [None] * count
+
+        def deposit(position, value):
+            columns[position] = (
+                value if columns[position] is None
+                else self._int("Add", columns[position], value)
+            )
+
+        for i, a in enumerate(left):
+            for j, b in enumerate(right):
+                high, low = self.integer_split(
+                    self._int("Mul", a, b), digit_bits,
+                )
+                deposit(i + j + 1, low)
+                deposit(i + j, high)
+        return self.integer_renormalise(columns, limbs, digit_bits)
+
+    def integer_compare(self, left, right, digit_bits: int):
+        """``(negative, zero)`` of ``left - right``, exactly."""
+
+        count = max(len(left), len(right)) + 1
+        digits = self.integer_carry([
+            self._int("Sub", a, b)
+            for a, b in zip(
+                self.integer_align(left, count),
+                self.integer_align(right, count),
+            )
+        ], digit_bits)
+        zero = self._int_eq(digits[0], 0)
+        for each in digits[1:]:
+            zero = self._int_and(zero, self._int_eq(each, 0))
+        negative = self.compare(
+            "Lt", digits[0], self.integer_constant(0, digits[0]),
+        )
+        return negative, zero
+
+    def integer_divmod_expansions(self, left, right, limbs: int,
+                                  digit_bits: int):
+        """``(quotient, remainder, zero_divisor, overflow)``: Python's floor
+        ``//`` and ``%``; see ``extended_precision``'s twin."""
+
+        mask = (1 << digit_bits) - 1
+        count = int(limbs) + 1
+        dividend = self.integer_carry(
+            self.integer_align(left, count), digit_bits,
+        )
+        divisor = self.integer_carry(
+            self.integer_align(right, count), digit_bits,
+        )
+
+        def negative(value):
+            return self.compare(
+                "Lt", value, self.integer_constant(0, value),
+            )
+
+        def flipped(mask_value, digit):
+            return self._int_where(
+                mask_value,
+                self._int("Sub", self.integer_constant(0, digit), digit),
+                digit,
+            )
+
+        dividend_negative = negative(dividend[0])
+        divisor_negative = negative(divisor[0])
+        magnitude = self.integer_carry(
+            [flipped(dividend_negative, digit) for digit in dividend],
+            digit_bits,
+        )
+        divisor_magnitude = self.integer_carry(
+            [flipped(divisor_negative, digit) for digit in divisor],
+            digit_bits,
+        )
+        zero_divisor = self._int_eq(divisor_magnitude[0], 0)
+        for digit in divisor_magnitude[1:]:
+            zero_divisor = self._int_and(
+                zero_divisor, self._int_eq(digit, 0),
+            )
+
+        anchor = magnitude[0]
+        remainder = [self.integer_constant(0, anchor) for _ in range(count)]
+        quotient = [None] * count
+        positions = [(0, 0)] + [
+            (index, shift)
+            for index in range(1, count)
+            for shift in range(digit_bits - 1, -1, -1)
+        ]
+        for index, shift in positions:
+            bit = self._int(
+                "BitAnd",
+                self._int(
+                    "AShr", magnitude[index],
+                    self.integer_constant(shift, anchor),
+                ),
+                self.integer_constant(1, anchor),
+            )
+            shifted = []
+            for place in range(count):
+                incoming = (
+                    bit if place == count - 1
+                    else self._int(
+                        "AShr", remainder[place + 1],
+                        self.integer_constant(digit_bits - 1, anchor),
+                    )
+                )
+                doubled = self._int(
+                    "BitAnd",
+                    self._int(
+                        "Mul", remainder[place],
+                        self.integer_constant(2, anchor),
+                    ),
+                    self.integer_constant(mask, anchor),
+                )
+                shifted.append(self._int("Add", doubled, incoming))
+            trial = self.integer_carry([
+                self._int("Sub", r, d)
+                for r, d in zip(shifted, divisor_magnitude)
+            ], digit_bits)
+            fits = self.compare(
+                "Ge", trial[0], self.integer_constant(0, anchor),
+            )
+            remainder = [
+                self._int_where(fits, t, r) for t, r in zip(trial, shifted)
+            ]
+            taken = self._int(
+                "Mul",
+                self._int_where(
+                    fits, self.integer_constant(1, anchor),
+                    self.integer_constant(0, anchor),
+                ),
+                self.integer_constant(1 << shift, anchor),
+            )
+            quotient[index] = (
+                taken if quotient[index] is None
+                else self._int("Add", quotient[index], taken)
+            )
+
+        opposite = self.compare("Ne", dividend_negative, divisor_negative)
+        remainder_zero = self._int_eq(remainder[0], 0)
+        for digit in remainder[1:]:
+            remainder_zero = self._int_and(
+                remainder_zero, self._int_eq(digit, 0),
+            )
+        adjust = self._int_and(opposite, self._int_not(remainder_zero))
+        quotient = [flipped(opposite, digit) for digit in quotient]
+        quotient[-1] = self._int_where(
+            adjust,
+            self._int(
+                "Sub", quotient[-1], self.integer_constant(1, anchor),
+            ),
+            quotient[-1],
+        )
+        remainder = [flipped(dividend_negative, digit) for digit in remainder]
+        remainder = [
+            self._int_where(adjust, self._int("Add", r, d), r)
+            for r, d in zip(remainder, divisor)
+        ]
+        quotient, quotient_overflow = self.integer_renormalise(
+            quotient, limbs, digit_bits,
+        )
+        remainder, remainder_overflow = self.integer_renormalise(
+            remainder, limbs, digit_bits,
+        )
+        return (
+            quotient, remainder, zero_divisor,
+            self._int_or(quotient_overflow, remainder_overflow),
+        )
+
+    def integer_from_int64(self, value, limbs: int, digit_bits: int, like):
+        """An int64 as integer limbs of ``like``'s container:
+        ``(limbs, overflow)``. A narrower source widens exactly first."""
+
+        if str(value.dtype) != str(like.dtype):
+            from .ssa_call_input_adapters import _numeric_conversion_attributes
+
+            widened = self.fresh(like)
+            self.emitted.append(Instr("Cast", [value], widened, attributes={
+                "target_dtype": str(like.dtype),
+                "source_dtype": str(value.dtype),
+                **_numeric_conversion_attributes(
+                    str(value.dtype), str(like.dtype),
+                ),
+                PRECISION_SECTION_ATTRIBUTE: True,
+                "lowered_from": "precision.integer_widen",
+            }))
+            value = widened
+        return self.integer_renormalise([value], limbs, digit_bits)
+
+    def integer_to_int64(self, terms, digit_bits: int):
+        """``(value, outside)`` in the limbs' container; see the eager twin.
+        A container wider than int64 holds the exact value, which then
+        narrows to int64 without loss wherever ``outside`` is false."""
+
+        from ..common.tensors.extended_precision import integer_int64_limbs
+
+        count = integer_int64_limbs(digit_bits)
+        held, outside = self.integer_renormalise(terms, count, digit_bits)
+        head = held[0]
+        head_bits = 63 - (count - 1) * int(digit_bits)
+        if head_bits < int(digit_bits):
+            bound = 1 << head_bits
+            outside = self._int_or(outside, self._int_or(
+                self.compare(
+                    "Lt", head, self.integer_constant(-bound, head),
+                ),
+                self.compare(
+                    "Ge", head, self.integer_constant(bound, head),
+                ),
+            ))
+        head = self._int_where(
+            outside, self.integer_constant(0, head), head,
+        )
+        value = head
+        for digit in held[1:]:
+            value = self._int(
+                "Add",
+                self._int(
+                    "Mul", value,
+                    self.integer_constant(1 << digit_bits, value),
+                ),
+                self._int_where(
+                    outside, self.integer_constant(0, digit), digit,
+                ),
+            )
+        return value, outside
+
     def lead(self, expansion):
         return (
             expansion[0] if len(expansion) == 1

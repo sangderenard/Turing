@@ -89,12 +89,51 @@ LIMB_ELEMENTS: dict[str, dict] = {
         "ladder": (2, 4, 6, 8),
         "sensible_limit": 16,
     },
+    # INTEGER limbs: a Python ``int`` carried as a bigint. The same type,
+    # the same planar high-first stack, the same ``limbs`` width -- only the
+    # carrier differs, so only the facts a carrier owns differ.
+    #
+    # * ``container`` is the integer dtype a limb is held in. ``int128``
+    #   exists only where a lane spells it (``dtype_layout.DTYPES``); NumPy
+    #   spells none, so the eager surface carries ``int64`` limbs.
+    # * ``digit_bits`` is the integer counterpart of Veltkamp's half
+    #   significand: one bit short of half the container, so a limb
+    #   product (``integer_split``) is exact in the container with room for
+    #   the column sums a multiply accumulates.
+    # * ``digits_per_limb`` is ``digit_bits * log10(2)``, as for floats.
+    #
+    # ``split`` (a float splitting constant) and the error-tolerance
+    # planning rows ``max_limbs``/``ladder`` have no integer meaning: an
+    # integer limb never rounds, so there is no error to plan a width
+    # against. ``sensible_limit`` is where a floating expansion should give
+    # way to an integer significand (module note); this IS one, so None.
+    "int64": {
+        "container": "int64",
+        "digit_bits": 31,
+        "digits_per_limb": 9.33,
+        "sensible_limit": None,
+    },
+    "int128": {
+        "container": "int128",
+        "digit_bits": 63,
+        "digits_per_limb": 18.96,
+        "sensible_limit": None,
+    },
 }
 
 _ELEMENT_SPELLINGS = {
     "float64": "float64", "f64": "float64", "double": "float64",
     "float32": "float32", "f32": "float32", "single": "float32",
+    "int64": "int64", "i64": "int64",
+    "int128": "int128", "i128": "int128",
 }
+
+def integer_limb_element(element: Any) -> bool:
+    """Whether ``element`` names an integer limb element: its
+    ``LIMB_ELEMENTS`` row is the one that carries ``digit_bits``."""
+
+    name = _ELEMENT_SPELLINGS.get(str(element).casefold())
+    return name is not None and "digit_bits" in LIMB_ELEMENTS[name]
 
 
 def limb_element_name(element: Any = None) -> str:
@@ -112,7 +151,7 @@ def limb_element_name(element: Any = None) -> str:
     if name is None:
         raise ValueError(
             f"no limb arithmetic facts for element {element!r}; "
-            "supported elements are float64 and float32"
+            "supported elements are float64, float32, int64 and int128"
         )
     return name
 
@@ -140,6 +179,72 @@ def _complex_dtype(value: Any) -> bool:
     return "complex" in str(dtype).casefold()
 
 
+def _dtype_of(value: Any):
+    dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        try:
+            dtype = value.get_dtype()
+        except (AttributeError, NotImplementedError):
+            dtype = getattr(getattr(value, "data", None), "dtype", None)
+    return dtype
+
+
+def _integer_dtype(value: Any) -> bool:
+    """Whether ``value`` is a signed-integer tensor (an integer limb carrier).
+
+    A Python ``int`` scalar is not a tensor and is handled where it meets
+    one (``_python_int_limbs``); ``bool`` is not an integer here.
+    """
+
+    from ...transmogrifier.dtype_layout import resolve
+
+    if not hasattr(value, "shape"):
+        return False
+    layout = resolve(str(_dtype_of(value)))
+    return layout is not None and layout.kind == "int"
+
+
+def _as_int64(value: Any) -> Any:
+    """An integer tensor in the eager integer container (``LIMB_ELEMENTS``
+    ``int64`` row): NumPy spells no int128, so the eager lane is int64."""
+
+    from ...transmogrifier.dtype_layout import resolve
+
+    container = LIMB_ELEMENTS["int64"]["container"]
+    layout = resolve(str(_dtype_of(value)))
+    return value if layout is not None and layout.name == container else value.long()
+
+
+def _any_true(predicate: Any) -> bool:
+    held = predicate.tolist() if hasattr(predicate, "tolist") else predicate
+    return any(bool(each) for each in _flatten(held))
+
+
+def _raise_integer_overflow(predicate: Any, where: str) -> None:
+    """``INT_OVERFLOW`` where an integer result left its limbs: Python's
+    int never loses digits, so the value is refused, never truncated."""
+
+    if _any_true(predicate):
+        from ...compiler.native_faults import INT_OVERFLOW, NativeIntOverflow
+
+        raise NativeIntOverflow(
+            f"{where}: the integer result does not fit its Precision limbs "
+            f"(fault {INT_OVERFLOW}); a wider Precision holds it exactly"
+        )
+
+
+def _raise_zero_division(predicate: Any, where: str) -> None:
+    if _any_true(predicate):
+        from ...compiler.native_faults import (
+            INT_ZERO_DIVISION, NativeZeroDivisionError,
+        )
+
+        raise NativeZeroDivisionError(
+            f"{where}: integer division or modulo by zero "
+            f"(fault {INT_ZERO_DIVISION})"
+        )
+
+
 # Dekker's splitting constant for binary64: 2**27 + 1. The binary64 alias
 # survives because the eager path below IS binary64; element-aware callers
 # read ``limb_element_facts`` instead.
@@ -155,6 +260,8 @@ def limbs_for_digits(digits: int, element: Any = None) -> int:
 
     facts = limb_element_facts(element)
     needed = int(math.ceil(float(digits) / facts["digits_per_limb"]))
+    if facts["sensible_limit"] is None:
+        return int(max(needed, 1))
     return int(min(max(needed, 1), facts["sensible_limit"]))
 
 
@@ -376,6 +483,295 @@ def divide_expansions(left: Sequence, right: Sequence, limbs: int) -> list:
 
 
 # --------------------------------------------------------------------------
+# integer expansions: a Python ``int`` on integer limbs
+#
+# The same representation as above, with an integer carrier. A float limb
+# carries its own weight in its exponent; an integer limb has none, so its
+# weight is its place: high limb first, limb ``k`` of ``n`` weighs
+# ``B**(n-1-k)`` with ``B = 2**digit_bits``, and the value is the exact sum
+# of the weighted limbs. Non-overlapping is the integer reading of the
+# distilled form: every limb below the head lies in ``[0, B)`` and the head,
+# which carries the sign, in ``[-B, B)``. ``n`` limbs therefore hold
+# exactly ``[-B**n, B**n)``.
+#
+# Every step keeps the exact total, as the float steps do. The error-free
+# transformations become carries: ``integer_split`` writes a limb product
+# as ``high * B + low`` exactly (``two_product``'s counterpart), and a carry
+# sweep replaces a column and its neighbour by a pair with the same total
+# (the distillation's). Nothing can fall BELOW an integer's precision, so
+# the one place a float expansion discards -- the tail past ``limbs`` --
+# has no counterpart; what can be lost is at the TOP, and that is reported
+# as a predicate (``native_faults.INT_OVERFLOW``), never truncated.
+#
+# Each kernel returns its predicates beside its limbs, as the compiler twin
+# (``ir_identities.WideExpansionEmitter``) does; ``Precision`` raises on
+# them. Kernels are written in + - * & >> == < and ``where`` only, the
+# operations every integer destination has, step for step as the twin
+# spells them.
+
+
+def _int_where(mask, when_true, when_false):
+    from .abstraction import AbstractTensor
+
+    return AbstractTensor.where(mask, when_true, when_false)
+
+
+def _int_align(terms: Sequence, count: int) -> list:
+    """``terms`` at ``count`` limbs: zeros above, so the total is unchanged."""
+
+    terms = list(terms)
+    zero = terms[0] * 0
+    return [zero] * (count - len(terms)) + terms
+
+
+def integer_split(product, digit_bits: int):
+    """``product == high * B + low`` exactly, ``low`` in ``[0, B)``.
+
+    The integer ``two_product`` residual: ``>>`` floors and ``&`` keeps the
+    low ``digit_bits`` of the two's-complement value, so the pair is exact
+    for either sign.
+    """
+
+    return product >> digit_bits, product & ((1 << digit_bits) - 1)
+
+
+def integer_carry(columns: Sequence, digit_bits: int) -> list:
+    """One carry sweep, low limb to high: the same total, every limb below
+    the head in ``[0, B)``, the head signed. The distillation sweep's
+    counterpart -- each step replaces a column and the carry into the next
+    by a pair with the same total.
+    """
+
+    digits = list(columns)
+    carry = None
+    for index in range(len(digits) - 1, 0, -1):
+        column = digits[index] if carry is None else digits[index] + carry
+        carry, digits[index] = integer_split(column, digit_bits)
+    if carry is not None:
+        digits[0] = digits[0] + carry
+    return digits
+
+
+def integer_renormalise(columns: Sequence, limbs: int, digit_bits: int):
+    """Reduce place-valued columns to ``limbs`` non-overlapping limbs.
+
+    Returns ``(limbs, overflow)``. The columns are carried at one limb more
+    than kept, so the part above the kept limbs is a signed excess; the
+    total fits ``limbs`` exactly when that excess is 0 or -1 (the head then
+    absorbs it), and ``overflow`` is true where it is anything else -- the
+    value left ``[-B**limbs, B**limbs)`` and nothing was kept in its place.
+    """
+
+    working = list(columns)
+    while len(working) < int(limbs) + 1:
+        working.insert(0, working[0] * 0)
+    digits = integer_carry(working, digit_bits)
+    mask = (1 << digit_bits) - 1
+    cut = len(digits) - int(limbs)
+    excess, kept = digits[:cut], digits[cut:]
+    held_zero = excess[0] == 0
+    held_minus = excess[0] == -1
+    for each in excess[1:]:
+        held_zero = held_zero & (each == 0)
+        held_minus = held_minus & (each == mask)
+    head = _int_where(held_minus, kept[0] - mask - 1, kept[0])
+    return [head, *kept[1:]], ~(held_zero | held_minus)
+
+
+def integer_negate(terms: Sequence) -> list:
+    """Each limb negated: the same columns with the total's sign flipped.
+    Not yet non-overlapping; the consumer renormalises."""
+
+    return [term * 0 - term for term in terms]
+
+
+def integer_add_expansions(left: Sequence, right: Sequence, limbs: int,
+                           digit_bits: int):
+    """Exact sum, column by column, renormalised: ``(limbs, overflow)``."""
+
+    count = max(len(left), len(right))
+    columns = [
+        a + b for a, b in zip(_int_align(left, count), _int_align(right, count))
+    ]
+    return integer_renormalise(columns, limbs, digit_bits)
+
+
+def integer_multiply_expansions(left: Sequence, right: Sequence, limbs: int,
+                                digit_bits: int):
+    """Every limb against every limb, each product split exactly into the
+    two columns it spans, then renormalised: ``(limbs, overflow)``."""
+
+    count = len(left) + len(right)
+    columns = [None] * count
+
+    def deposit(position, value):
+        columns[position] = (
+            value if columns[position] is None else columns[position] + value
+        )
+
+    for i, a in enumerate(left):
+        for j, b in enumerate(right):
+            high, low = integer_split(a * b, digit_bits)
+            deposit(i + j + 1, low)
+            deposit(i + j, high)
+    return integer_renormalise(columns, limbs, digit_bits)
+
+
+def integer_compare(left: Sequence, right: Sequence, digit_bits: int):
+    """``(negative, zero)`` of ``left - right``, exactly.
+
+    The difference is carried at one limb more than either operand, where
+    it cannot overflow; a non-overlapping value is negative exactly when its
+    head is, and zero exactly when every limb is.
+    """
+
+    count = max(len(left), len(right)) + 1
+    digits = integer_carry([
+        a - b
+        for a, b in zip(_int_align(left, count), _int_align(right, count))
+    ], digit_bits)
+    zero = digits[0] == 0
+    for each in digits[1:]:
+        zero = zero & (each == 0)
+    return digits[0] < 0, zero
+
+
+def integer_divmod_expansions(left: Sequence, right: Sequence, limbs: int,
+                              digit_bits: int):
+    """Python's floor ``//`` and ``%``: ``(quotient, remainder, zero_divisor,
+    overflow)``.
+
+    Restoring long division on the magnitudes, one bit of the dividend at a
+    time, every step exact integer arithmetic; then Python's floor rule
+    (the remainder takes the divisor's sign). The only quotient that can
+    leave ``limbs`` is ``-B**limbs // -1``, reported as ``overflow``.
+    ``zero_divisor`` is the ``ZeroDivisionError`` predicate; the arithmetic
+    under it is never a native division, so it cannot trap.
+    """
+
+    mask = (1 << digit_bits) - 1
+    count = int(limbs) + 1
+    dividend = integer_carry(_int_align(left, count), digit_bits)
+    divisor = integer_carry(_int_align(right, count), digit_bits)
+    dividend_negative = dividend[0] < 0
+    divisor_negative = divisor[0] < 0
+    magnitude = integer_carry([
+        _int_where(dividend_negative, digit * 0 - digit, digit)
+        for digit in dividend
+    ], digit_bits)
+    divisor_magnitude = integer_carry([
+        _int_where(divisor_negative, digit * 0 - digit, digit)
+        for digit in divisor
+    ], digit_bits)
+    zero_divisor = divisor_magnitude[0] == 0
+    for digit in divisor_magnitude[1:]:
+        zero_divisor = zero_divisor & (digit == 0)
+
+    zero = magnitude[0] * 0
+    one = zero + 1
+    remainder = [zero] * count
+    quotient = [None] * count
+    # A magnitude of ``limbs`` limbs is at most ``B**limbs``, so its top
+    # limb is 0 or 1 and only that limb's lowest bit can be set.
+    positions = [(0, 0)] + [
+        (index, shift)
+        for index in range(1, count)
+        for shift in range(digit_bits - 1, -1, -1)
+    ]
+    for index, shift in positions:
+        bit = (magnitude[index] >> shift) & 1
+        shifted = []
+        for place in range(count):
+            incoming = (
+                bit if place == count - 1
+                else remainder[place + 1] >> (digit_bits - 1)
+            )
+            shifted.append(((remainder[place] * 2) & mask) + incoming)
+        trial = integer_carry(
+            [r - d for r, d in zip(shifted, divisor_magnitude)], digit_bits,
+        )
+        fits = trial[0] >= 0
+        remainder = [_int_where(fits, t, r) for t, r in zip(trial, shifted)]
+        taken = _int_where(fits, one, zero) * (1 << shift)
+        quotient[index] = (
+            taken if quotient[index] is None else quotient[index] + taken
+        )
+
+    opposite = dividend_negative != divisor_negative
+    remainder_zero = remainder[0] == 0
+    for digit in remainder[1:]:
+        remainder_zero = remainder_zero & (digit == 0)
+    adjust = opposite & ~remainder_zero
+    quotient = [_int_where(opposite, d * 0 - d, d) for d in quotient]
+    quotient[-1] = _int_where(adjust, quotient[-1] - 1, quotient[-1])
+    remainder = [
+        _int_where(dividend_negative, d * 0 - d, d) for d in remainder
+    ]
+    remainder = [
+        _int_where(adjust, r + d, r) for r, d in zip(remainder, divisor)
+    ]
+    quotient, quotient_overflow = integer_renormalise(
+        quotient, limbs, digit_bits,
+    )
+    remainder, remainder_overflow = integer_renormalise(
+        remainder, limbs, digit_bits,
+    )
+    return (
+        quotient, remainder, zero_divisor,
+        quotient_overflow | remainder_overflow,
+    )
+
+
+def integer_int64_limbs(digit_bits: int) -> int:
+    """Limbs that hold every int64: ``B**(n-1)`` times a head in ``[-B, B)``
+    must reach ``2**63``."""
+
+    return -(-63 // int(digit_bits))
+
+
+def integer_from_int64(value, limbs: int, digit_bits: int):
+    """An int64 as ``limbs`` integer limbs: ``(limbs, overflow)``, exactly.
+    ``overflow`` where the value does not fit ``limbs``."""
+
+    return integer_renormalise([value], limbs, digit_bits)
+
+
+def integer_to_int64(terms: Sequence, digit_bits: int):
+    """The value as one int64: ``(value, outside)``, exactly.
+
+    ``outside`` where it is not in ``[-2**63, 2**63)`` -- the stage-1
+    narrowing rule; there the value is 0 and must not be read. Built by
+    Horner from limbs whose head is already bounded, so no step can wrap.
+    """
+
+    count = integer_int64_limbs(digit_bits)
+    held, outside = integer_renormalise(terms, count, digit_bits)
+    head = held[0]
+    head_bits = 63 - (count - 1) * int(digit_bits)
+    if head_bits < int(digit_bits):
+        bound = 1 << head_bits
+        outside = outside | (head < -bound) | (head >= bound)
+    head = _int_where(outside, head * 0, head)
+    value = head
+    for digit in held[1:]:
+        value = value * (1 << digit_bits) + _int_where(
+            outside, digit * 0, digit,
+        )
+    return value, outside
+
+
+def _python_int_limbs(number: int, digit_bits: int) -> list:
+    """An exact Python ``int`` as the fewest non-overlapping limbs."""
+
+    base = 1 << int(digit_bits)
+    rest, low = int(number), []
+    while not -base <= rest < base:
+        rest, digit = divmod(rest, base)
+        low.append(digit)
+    return [rest, *reversed(low)]
+
+
+# --------------------------------------------------------------------------
 # carrying limbs on a tensor
 
 
@@ -431,6 +827,14 @@ def to_float_list(value: Any, limbs: int) -> list:
 _DIRECT = {"add", "iadd", "sub", "isub", "mul", "imul", "truediv", "itruediv"}
 _REVERSED = {"radd", "rsub", "rmul", "rtruediv"}
 _HANDLED = _DIRECT | _REVERSED | {"neg"}
+
+#: The operators integer limbs carry: Python's ``int`` arithmetic minus
+#: true division (an ``int / int`` is a float in Python).
+_INTEGER_ORDER = frozenset({"lt", "le", "gt", "ge", "eq", "ne"})
+_INTEGER_HANDLED = frozenset({
+    "add", "sub", "mul", "floordiv", "mod", "neg",
+}) | _INTEGER_ORDER
+_REVERSED_INTEGER = frozenset({"radd", "rsub", "rmul", "rfloordiv", "rmod"})
 
 
 def apply(op: str, left: Any, right: Any, *, limbs: int = 1,
@@ -647,12 +1051,53 @@ class Precision:
                 "ComplexPrecision.of() to widen real and imaginary "
                 "coefficients independently."
             )
+        if _integer_dtype(value):
+            # An int tensor is an integer expansion: the value is split into
+            # place-valued limbs exactly, or the promotion is refused where
+            # it does not fit ``limbs`` (``INT_OVERFLOW``).
+            digit_bits = limb_element_facts("int64")["digit_bits"]
+            terms, overflow = integer_from_int64(
+                _as_int64(value), width, digit_bits,
+            )
+            _raise_integer_overflow(overflow, f"Precision.of(..., {width})")
+            return cls(terms, width)
         zero = plain(value, "mul", 0.0)
         return cls([value] + [zero] * (width - 1), width)
 
-    def collapse(self) -> Any:
-        """Back to an ordinary tensor, paying the rounding once."""
+    @property
+    def integer(self) -> bool:
+        """Whether the limbs are an integer element (a Python ``int``)."""
 
+        return _integer_dtype(self.term(0))
+
+    def _integer_only(self, name: str) -> None:
+        if not self.integer:
+            raise TypeError(
+                f"Precision.{name} is defined on integer limbs; a floating "
+                "expansion has no exact floor division, modulus or order"
+            )
+
+    def _float_only(self, name: str) -> None:
+        if self.integer:
+            raise TypeError(
+                f"Precision does not endorse {name!r} on integer limbs. "
+                "Integer Precision supports + - * // % neg, comparisons "
+                "and collapse() to an exact int64."
+            )
+
+    def collapse(self) -> Any:
+        """Back to an ordinary tensor, paying the rounding once.
+
+        Integer limbs have no rounding to pay: the value is recombined
+        exactly into one int64, and a value outside int64 is refused
+        (``INT_OVERFLOW``, the stage-1 narrowing rule) rather than wrapped.
+        """
+
+        if self.integer:
+            digit_bits = limb_element_facts("int64")["digit_bits"]
+            value, outside = integer_to_int64(self.terms(), digit_bits)
+            _raise_integer_overflow(outside, "Precision.collapse() to int64")
+            return value
         total = self.term(0)
         for index in range(1, self.limbs):
             total = plain(total, "add", self.term(index))
@@ -798,6 +1243,17 @@ class Precision:
         width = self.limbs if width is None else int(width)
         if width == self.limbs:
             return [self.term(index) for index in range(self.limbs)]
+        if self.integer:
+            # Place-valued limbs widen ABOVE (zeros of higher weight leave
+            # the total unchanged) and narrow only by renormalising, which
+            # refuses a value the narrower width cannot hold.
+            held = [self.term(index) for index in range(self.limbs)]
+            if width > self.limbs:
+                return _int_align(held, width)
+            digit_bits = limb_element_facts("int64")["digit_bits"]
+            narrowed, overflow = integer_renormalise(held, width, digit_bits)
+            _raise_integer_overflow(overflow, f"Precision.terms({width})")
+            return narrowed
         if width < self.limbs:
             return [self.term(index) for index in range(width)]
         held = [self.term(index) for index in range(self.limbs)]
@@ -836,6 +1292,11 @@ class Precision:
                  accumulate_output: bool = False) -> "Precision":
         """One operator at a stated width, on operands of any width."""
 
+        if any(
+            isinstance(each, Precision) and each.integer
+            for each in (left, right)
+        ):
+            return cls._integer_dispatch(op, left, right, limbs=limbs)
         if op not in _HANDLED:
             raise TypeError(
                 f"Precision supports the basic arithmetic operators; {op!r} "
@@ -898,6 +1359,98 @@ class Precision:
         # flatten and used to make scalar AOT parameters fail here.
         return cls(pieces, width)
 
+    @classmethod
+    def _integer_dispatch(cls, op: str, left: Any, right: Any, *,
+                          limbs: int = 1):
+        """One operator on integer limbs: Python ``int`` semantics, exactly.
+
+        The same width rule as the floating arm -- the widest of the
+        caller's ``limbs`` and the operands' -- where a plain int64 tensor
+        is as wide as it takes to hold any int64 and a Python ``int`` as
+        wide as its own limbs. Results are renormalised to that width; one
+        that does not fit raises ``INT_OVERFLOW`` instead of losing its top.
+        """
+
+        base = op[1:] if op in _REVERSED_INTEGER else op.lstrip("i")
+        if base not in _INTEGER_HANDLED:
+            raise TypeError(
+                f"integer Precision supports + - * // % neg and comparisons; "
+                f"{op!r} is not one of them (Python's int / int is a float)"
+            )
+        digit_bits = limb_element_facts("int64")["digit_bits"]
+        native_width = integer_int64_limbs(digit_bits)
+        template = (left.term(0) if isinstance(left, Precision)
+                    and left.integer else right.term(0))
+
+        def width_of(value):
+            if isinstance(value, Precision):
+                if not value.integer:
+                    raise TypeError(
+                        "an integer Precision cannot meet a floating one; "
+                        "collapse one side first and mean it"
+                    )
+                return value.limbs
+            if value is None:
+                return 1
+            if isinstance(value, bool) or not isinstance(value, int):
+                if not _integer_dtype(value):
+                    raise TypeError(
+                        "an integer Precision meets ints only; "
+                        f"got {type(value).__name__}"
+                    )
+                return native_width
+            return len(_python_int_limbs(value, digit_bits))
+
+        width = max(int(limbs or 1), width_of(left), width_of(right))
+
+        def operand(value):
+            if isinstance(value, Precision):
+                return value.terms(width)
+            if hasattr(value, "shape"):
+                terms, _overflow = integer_from_int64(
+                    _as_int64(value), width, digit_bits,
+                )
+                return terms
+            zero = template * 0
+            return _int_align(
+                [zero + digit for digit in _python_int_limbs(value, digit_bits)],
+                width,
+            )
+
+        if base == "neg":
+            pieces, overflow = integer_renormalise(
+                integer_negate(operand(left)), width, digit_bits,
+            )
+            _raise_integer_overflow(overflow, "-Precision")
+            return cls(pieces, width)
+        first, second = operand(left), operand(right)
+        if op in _REVERSED_INTEGER:
+            first, second = second, first
+        if base in _INTEGER_ORDER:
+            negative, zero = integer_compare(first, second, digit_bits)
+            return {
+                "lt": negative, "le": negative | zero, "eq": zero,
+                "ne": ~zero, "gt": ~(negative | zero), "ge": ~negative,
+            }[base]
+        if base in {"floordiv", "mod"}:
+            quotient, remainder, zero_divisor, overflow = (
+                integer_divmod_expansions(first, second, width, digit_bits)
+            )
+            _raise_zero_division(zero_divisor, f"Precision {base}")
+            pieces = quotient if base == "floordiv" else remainder
+        elif base == "mul":
+            pieces, overflow = integer_multiply_expansions(
+                first, second, width, digit_bits,
+            )
+        else:
+            pieces, overflow = integer_add_expansions(
+                first,
+                second if base == "add" else integer_negate(second),
+                width, digit_bits,
+            )
+        _raise_integer_overflow(overflow, f"Precision {base}")
+        return cls(pieces, width)
+
     def __add__(self, other): return _composed_binary("add", self, other)
     def __radd__(self, other): return _composed_binary("add", other, self)
     def __sub__(self, other): return _composed_binary("sub", self, other)
@@ -907,6 +1460,30 @@ class Precision:
     def __truediv__(self, other): return _composed_binary("truediv", self, other)
     def __rtruediv__(self, other): return _composed_binary("truediv", other, self)
     def __neg__(self) -> "Precision": return Precision.dispatch("neg", self, None)
+
+    # Floor division, modulus and order: Python's ``int`` operations on
+    # integer limbs. A floating expansion refuses them (``dispatch``).
+    def __floordiv__(self, other): return _composed_binary("floordiv", self, other)
+    def __rfloordiv__(self, other): return _composed_binary("floordiv", other, self)
+    def __mod__(self, other): return _composed_binary("mod", self, other)
+    def __rmod__(self, other): return _composed_binary("mod", other, self)
+    def __lt__(self, other): return _composed_binary("lt", self, other)
+    def __le__(self, other): return _composed_binary("le", self, other)
+    def __gt__(self, other): return _composed_binary("gt", self, other)
+    def __ge__(self, other): return _composed_binary("ge", self, other)
+
+    def __eq__(self, other):
+        # A floating Precision keeps identity equality, as before.
+        if not self.integer:
+            return NotImplemented
+        return _composed_binary("eq", self, other)
+
+    def __ne__(self, other):
+        if not self.integer:
+            return NotImplemented
+        return _composed_binary("ne", self, other)
+
+    __hash__ = object.__hash__
 
     # -- the rest of the basic surface, limb-correct ---------------------
     #
@@ -951,9 +1528,19 @@ class Precision:
         """The sign of the whole expansion, as an ordinary tensor.
 
         The leading limb decides: a distilled expansion keeps every tail
-        below an ulp of the head, so no tail can outvote it.
+        below an ulp of the head, so no tail can outvote it. Integer limbs
+        are read the same way from the head down: a non-overlapping head is
+        negative exactly when the value is, and a zero head defers to the
+        next limb (an integer's limbs have fixed places, so a small value's
+        head is zero rather than its leading digit).
         """
 
+        if self.integer:
+            digit_bits = limb_element_facts("int64")["digit_bits"]
+            terms = self.terms()
+            negative, zero = integer_compare(terms, [terms[0] * 0], digit_bits)
+            one = terms[0] * 0 + 1
+            return _int_where(negative, one * -1, _int_where(zero, one * 0, one))
         return self.term(0).sign()
 
     def __abs__(self) -> "Precision":
@@ -963,6 +1550,8 @@ class Precision:
         number: ``|a| + |b|`` is not ``|a + b|`` when the tail opposes the
         head, which for a distilled expansion is the usual case.
         """
+
+        self._float_only("abs")
 
         sign = self.sign()
         return self._map_limbs(lambda term: term * sign)
@@ -974,6 +1563,8 @@ class Precision:
         sum of two limbs of which exactly one is zero is exact, so the chosen
         expansion arrives untouched -- no limb is ever rounded on its own.
         """
+
+        self._float_only("where")
 
         width = max(self.limbs, Precision.width_of(other))
         mine = self.terms(width)
@@ -1013,6 +1604,8 @@ class Precision:
         lower one, and the head alone cannot see that.
         """
 
+        self._float_only("floor")
+
         candidate = self.collapse().floor()
         residual = (self - candidate).collapse()
         return candidate - (residual < 0.0) * 1.0
@@ -1026,6 +1619,8 @@ class Precision:
         them, so the count is read from the width rather than fixed, plus
         one for the seed's own last bit.
         """
+
+        self._float_only("sqrt")
 
         import math
 
@@ -1045,6 +1640,8 @@ class Precision:
         a strictly positive base; negative-base integer powers keep using the
         exact repeated-squaring path.
         """
+
+        self._float_only("pow")
 
         if isinstance(exponent, float) and exponent.is_integer():
             exponent = int(exponent)
@@ -1088,6 +1685,7 @@ class Precision:
     # caller, or to the signal surface that owns turns and binades.
 
     def _core(self, name: str) -> "Precision":
+        self._float_only(name)
         from .signal_symbolic import CORE_RADII, evaluate_proof
 
         radius = CORE_RADII.get(name)
@@ -1129,6 +1727,8 @@ class Precision:
         product remain at this value's limb width.
         """
 
+        self._float_only("exp")
+
         import math
 
         from .signal_symbolic import constant_limbs
@@ -1146,6 +1746,8 @@ class Precision:
         the answer.  Two square roots move the mantissa into the proved
         ``log1p`` interval; the wide ln(2) reconstruction then restores scale.
         """
+
+        self._float_only("log")
 
         import math
 
@@ -1233,6 +1835,8 @@ class Precision:
         in the measurement this class's docstring opens with, and it
         looked like an ordinary answer.
         """
+
+        self._float_only("mean")
 
         return self.sum() / float(max(self.element_count(), 1))
 
@@ -1798,6 +2402,25 @@ def _precision_coefficient(
         if value.limbs == width:
             return value
         return Precision(value.terms(width), width)
+    template = _coefficient_template(like)
+    if template is not None and _integer_dtype(template):
+        # Meeting integer limbs: an int stays an int, at the width it takes.
+        digit_bits = limb_element_facts("int64")["digit_bits"]
+        if isinstance(value, int) and not isinstance(value, bool):
+            digits = _python_int_limbs(value, digit_bits)
+            width = max(width, len(digits))
+            zero = template * 0
+            return Precision(
+                _int_align([zero + digit for digit in digits], width), width,
+            )
+        if _integer_dtype(value):
+            return Precision.of(
+                value, max(width, integer_int64_limbs(digit_bits)),
+            )
+        raise TypeError(
+            "an integer Precision meets ints only; "
+            f"got {type(value).__name__}"
+        )
     return Precision.of(_real_coefficient(value, like=like), width)
 
 
