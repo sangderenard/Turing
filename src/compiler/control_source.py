@@ -2534,15 +2534,17 @@ def place_loop_carried_region_producers(
 def _anchored_control(control: "ControlProgram") -> bool:
     """A region-less control the overlay must place by anchor, not drop.
 
-    Only source conditionals qualify: a region-less loop is handled by the
-    existing sequence-mutation / call-only-induction rule below.
+    Source conditionals and authored Try blocks qualify: a region-less
+    loop is handled by the existing sequence-mutation / call-only-induction
+    rule below.
     """
 
     if control.region_indices:
         return False
     root = control.root
     blocks = root.blocks if isinstance(root, SequenceBlock) else (root,)
-    return any(isinstance(block, ConditionalBlock) for block in blocks)
+    return any(isinstance(block, (ConditionalBlock, NativeTryBlock))
+               for block in blocks)
 
 
 def enrich_represented_conditionals(

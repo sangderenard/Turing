@@ -12747,6 +12747,83 @@ def _short_circuit_control_program(
     )
 
 
+def _authored_arm_return_control(
+    graph: Any,
+    statements: Sequence[ast.stmt],
+    return_slot_values: Mapping[tuple[int, int, int, int], tuple],
+    *,
+    inside_loop: bool,
+) -> Any:
+    """The existing source return-site edge for one lexical control arm."""
+
+    from .control_source import LoopControlBlock
+    from .ssa_record_return_state import return_site_cell_for
+    from .identity_concordance import RowFieldKind
+
+    if not statements:
+        return None
+    terminal = statements[-1]
+    if (
+        isinstance(terminal, ast.Return)
+        and terminal.value is None
+        and not inside_loop
+        and not tuple(graph.G.graph.get("function_outputs") or ())
+    ):
+        # Program: `if v == 0: dst.append(7); return` then
+        # `dst.append(8)`. A value-less procedure return needs the same
+        # function-exit edge as a return carrying recorded result slots.
+        return LoopControlBlock(
+            "return", None, True, None,
+            source_action="return", return_value_ids=(),
+        )
+    if not isinstance(terminal, ast.Return) or terminal.value is None:
+        return None
+    returned = terminal.value
+    slots = return_slot_values.get((
+        int(getattr(returned, "lineno", -1)),
+        int(getattr(returned, "col_offset", -1)),
+        int(getattr(returned, "end_lineno", -1)),
+        int(getattr(returned, "end_col_offset", -1)),
+    ))
+    if slots is None:
+        return None
+    signature = lambda expr: (
+        *(getattr(expr, key, None) for key in (
+            "lineno", "col_offset", "end_lineno", "end_col_offset")),
+        ast.dump(expr, include_attributes=False),
+    )
+    sites = [
+        int(node_id) for node_id, node_data in graph.G.nodes(data=True)
+        if isinstance(node_data.get("expr_obj"), ast.AST)
+        and signature(node_data["expr_obj"]) == signature(returned)
+    ]
+    site_cell = return_site_cell_for(graph, returned)
+    # A reduced tuple may have no expression node. Its exact return-site
+    # cell still supplies a surviving VALUE_ID for the position hint.
+    site_cell_node = next((
+        int(item) for declared, item in zip(
+            site_cell.page.row_fields, site_cell.row
+        )
+        if declared.kind is RowFieldKind.VALUE_ID
+        and isinstance(item, int) and int(item) in graph.G
+    ), None) if site_cell is not None else None
+    site_id = min(sites) if sites else (
+        site_cell_node if site_cell_node is not None else next((
+            int(value_id) for value_id in reversed(slots)
+            if value_id is not None and int(value_id) in graph.G
+        ), None)
+    )
+    if inside_loop and site_id is None:
+        return None
+    # The return site, rather than a returned value or lexical position,
+    # identifies this edge when the control overlay composes loop exits.
+    return LoopControlBlock(
+        "return", None, True, None,
+        source_action="return", site_node_id=site_id,
+        return_value_ids=tuple(slots), return_site_cell=site_cell,
+    )
+
+
 def _ordinary_conditional_control_programs(
     graph: Any,
     retained_regions: Iterable[int],
@@ -13042,83 +13119,9 @@ def _ordinary_conditional_control_programs(
             )
 
         def arm_return_control(statements):
-            if not statements:
-                return None
-            terminal = statements[-1]
-            if (
-                isinstance(terminal, ast.Return)
-                and terminal.value is None
-                and not inside_loop
-                and not tuple(graph.G.graph.get("function_outputs") or ())
-            ):
-                # Program: ``if v == 0: dst.append(7); return`` then
-                # ``dst.append(8)`` (``append_decimal_integer_glyphs``'s
-                # zero case).  Wrong record: a value-less return produced no
-                # control, so the statements after the guard also ran ("0"
-                # was spelled "00").  Rule: a bare return in a procedure is
-                # the same return edge to the function exit, carrying the
-                # procedure's zero result slots.
-                return LoopControlBlock(
-                    "return", None, True, None,
-                    source_action="return",
-                    return_value_ids=(),
-                )
-            if not isinstance(terminal, ast.Return) or terminal.value is None:
-                return None
-            returned = terminal.value
-            slots = return_slot_values.get((
-                int(getattr(returned, "lineno", -1)),
-                int(getattr(returned, "col_offset", -1)),
-                int(getattr(returned, "end_lineno", -1)),
-                int(getattr(returned, "end_col_offset", -1)),
-            ))
-            if slots is None:
-                return None
-            # ``site_node_id`` is a position hint (the returned expression's
-            # node, as LoopComposer.describe's hint); the SITE is
-            # ``return_site_cell`` below. Tuple containers can be reduced
-            # away, in which case the last surviving exact slot is the hint.
-            signature = lambda expr: (
-                *(getattr(expr, key, None) for key in (
-                    "lineno", "col_offset", "end_lineno", "end_col_offset")),
-                ast.dump(expr, include_attributes=False),
-            )
-            sites = [int(node_id) for node_id, node_data in graph.G.nodes(data=True)
-                     if isinstance(node_data.get("expr_obj"), ast.AST)
-                     and signature(node_data["expr_obj"]) == signature(returned)]
-            # ``return ()`` (a TUPLE container, zero slots): the returned
-            # expression's node and every slot are gone, so the arm's own
-            # ``return_site_cell`` names the position hint -- the VALUE_ID of
-            # its row, read through the page's declared shape.  A zero-slot
-            # arm inside a loop otherwise has no hint and lost its
-            # control-owned return (the guard If dropped its CondBr).
-            from .identity_concordance import RowFieldKind
-            from .ssa_record_return_state import return_site_cell_for
-            site_cell = return_site_cell_for(graph, returned)
-            site_cell_node = next((
-                int(item) for declared, item in zip(
-                    site_cell.page.row_fields, site_cell.row)
-                if declared.kind is RowFieldKind.VALUE_ID
-                and isinstance(item, int) and int(item) in graph.G
-            ), None) if site_cell is not None else None
-            site_id = min(sites) if sites else (
-                site_cell_node if site_cell_node is not None else next((
-                    int(value_id) for value_id in reversed(slots)
-                    if value_id is not None and int(value_id) in graph.G
-                ), None)
-            )
-            if inside_loop and site_id is None:
-                return None
-            # The site's identity is the return construct's cell, the same
-            # cell ``LoopComposer.describe`` keys the loop's copy by: the
-            # overlay matches the two by site, never by the value returned.
-            from .ssa_record_return_state import return_site_cell_for
-            return LoopControlBlock(
-                "return", None, True, None,
-                source_action="return",
-                site_node_id=site_id,
-                return_value_ids=tuple(slots),
-                return_site_cell=return_site_cell_for(graph, returned),
+            return _authored_arm_return_control(
+                graph, statements, return_slot_values,
+                inside_loop=inside_loop,
             )
 
         body_return_control = (
@@ -13621,11 +13624,40 @@ def _source_try_control_programs(
                 )
             owned.setdefault(key, []).append(region)
 
-        def arm_body(key: tuple[str, int]) -> SequenceBlock:
-            return SequenceBlock(tuple(
+        return_slot_values = dict(
+            graph.G.graph.get("return_slot_values") or {}
+        )
+        enclosing_loop_spans = tuple(
+            (int(loop_expr.lineno), int(getattr(
+                loop_expr, "end_lineno", loop_expr.lineno,
+            )))
+            for _loop_id, loop_data in graph.G.nodes(data=True)
+            for loop_expr in (loop_data.get("expr_obj"),)
+            if isinstance(loop_expr, (ast.For, ast.While))
+        )
+        inside_loop = any(
+            start <= int(expression.lineno) <= end
+            for start, end in enclosing_loop_spans
+        )
+
+        def arm_body(
+            key: tuple[str, int], statements: Sequence[ast.stmt],
+        ) -> SequenceBlock:
+            children = tuple(
                 StatementBlock((f"__scheduled_region_{region}__",))
                 for region in owned.get(key, ())
-            ))
+            )
+            # Program: `try: raise ValueError(); except ValueError:
+            # return 2`. The handler has no deployment region; dropping its
+            # source return made the selected edge fall through. Use the
+            # existing exact return-site cell and slot values for this arm.
+            terminal = _authored_arm_return_control(
+                graph, statements, return_slot_values,
+                inside_loop=inside_loop,
+            )
+            return SequenceBlock(
+                (*children, terminal) if terminal is not None else children
+            )
 
         handlers = []
         for index, handler in enumerate(expression.handlers):
@@ -13738,7 +13770,7 @@ def _source_try_control_programs(
                         mode=Mode.CONCORD,
                     )
             handlers.append(NativeExceptionHandler(
-                arm_body(("handler", index)),
+                arm_body(("handler", index), handler.body),
                 canonical_from_source(fact.handler),
                 tuple(canonical_from_source(value)
                       for value, _declaration in fact.declarations),
@@ -13948,15 +13980,41 @@ def _source_try_control_programs(
                         )),
                         mode=Mode.CONCORD,
                     )
+        anchor_region = None
+        if not regions:
+            try_end = (
+                int(getattr(expression, "end_lineno", expression.lineno)),
+                int(getattr(expression, "end_col_offset",
+                            expression.col_offset)),
+            )
+            for region_index in retained_regions:
+                positions = []
+                for node_id in subgraphs[region_index].G.graph.get(
+                    "deployment_nodes", (),
+                ):
+                    span = graph.G.nodes[int(node_id)].get("source_span") or {}
+                    if span.get("line") is not None:
+                        positions.append((
+                            int(span["line"]), int(span.get("column", 0)),
+                        ))
+                if positions and min(positions) > try_end:
+                    anchor_region = region_index
+                    break
+        # Program: `try: raise ValueError('bad'); except ValueError:
+        # return 2`. The retained Try owns no numerical region. Without
+        # the existing source-position anchor the overlay dropped the
+        # entire control tree; preserve its exact source owner in place.
         program = ControlProgram(
             NativeTryBlock(
-                arm_body(("body", 0)), tuple(handlers),
-                arm_body(("orelse", 0)) if expression.orelse else None,
-                arm_body(("finalbody", 0)), int(try_id),
+                arm_body(("body", 0), expression.body), tuple(handlers),
+                arm_body(("orelse", 0), expression.orelse)
+                if expression.orelse else None,
+                arm_body(("finalbody", 0), expression.finalbody), int(try_id),
                 continuation_phi_cells=tuple(continuation_cells),
                 protected_transfer_cells=tuple(protected_transfers),
             ),
             region_indices=regions,
+            anchor_region=anchor_region,
         )
         post_control_program(
             graph, program, stage=CONTROL_PROGRAM_BUILD, cause=(owner,),

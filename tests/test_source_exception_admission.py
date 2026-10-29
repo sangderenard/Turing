@@ -800,6 +800,144 @@ def root(x: float) -> float:
         end_identity_book(token)
 
 
+def test_finally_reads_post_try_join_before_its_region_runs(monkeypatch):
+    source = """\
+def root(x: float) -> float:
+    y = 0.0
+    try:
+        y = int(x)
+    except ValueError:
+        y = 2.0
+    finally:
+        y = y + 1.0
+    return y
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+    observed = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append((
+                program, args[0], tuple(kwargs["dispatch_subgraphs"]),
+            ))
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_finally_join", identity_book=book)
+        (program, graph, subgraphs), = observed
+        site_row, = tuple(book.page(SOURCE_EXCEPTION_REGION_SITE).rows())
+        arm_facts = tuple(
+            book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE).latest(row)
+            for row in sorted(
+                book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE).rows(),
+                key=lambda row: row[2],
+            )
+        )
+        assert tuple(fact.arm_kind for fact in arm_facts) == (
+            "success", "handler",
+        )
+        phi_id = int(arm_facts[0].canonical_phi.row[1])
+        try_row, = tuple(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        constants = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("op")).casefold() == "const"
+        )
+        lowered, shortfalls = lower_control_program_to_ssa(
+            program, function_name="exception_finally_join_probe",
+            first_value_id=1000,
+            lexical_read_scope=try_row[0], planning_scope=site_row[0],
+            region_callees={
+                0: "numerical_region_0", 1: "numerical_region_1",
+            },
+            region_signatures={
+                0: ((0,), (int(arm_facts[0].canonical_value.row[1]),)),
+                1: ((phi_id,), tuple(map(
+                    int, subgraphs[1].G.graph["deployment_nodes"],
+                ))),
+            },
+            constant_value_ids=constants,
+        )
+        assert any(
+            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
+        )
+        continuation_row, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+        ).rows())
+        continuation = book.page(
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+        ).latest(continuation_row)
+        join = lowered.blocks[continuation.join_block.row[2]]
+        finalizer_call, = tuple(
+            instruction for instruction in join.instrs
+            if instruction.attributes.get("callee") == "numerical_region_1"
+        )
+        assert finalizer_call.args[0].id == continuation.result_value.row[1]
+        assert not any(
+            instruction.attributes.get("callee") == "numerical_region_1"
+            for name, block in lowered.blocks.items()
+            if name != join.name
+            for instruction in block.instrs
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_regionless_authored_raise_keeps_try_control(monkeypatch):
+    source = """\
+def root(x: int) -> int:
+    try:
+        raise ValueError("bad")
+    except ValueError:
+        return 2
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.control_source import LoopControlBlock, NativeTryBlock
+
+    observed = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_regionless_raise", identity_book=book)
+        program, = observed
+        retained_try, = tuple(
+            child for child in program.root.blocks
+            if isinstance(child, NativeTryBlock)
+        )
+        assert retained_try.protected_transfer_cells
+        assert any(
+            isinstance(child, LoopControlBlock)
+            and child.action == "return"
+            and child.return_site_cell is not None
+            for child in retained_try.handlers[0].body.blocks
+        )
+        assert program.region_indices == ()
+    finally:
+        end_identity_book(token)
+
+
 def test_explicit_raise_status_uses_first_authored_matching_handler():
     source = """\
 def root(x: int) -> int:

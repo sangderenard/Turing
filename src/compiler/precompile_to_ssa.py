@@ -12092,7 +12092,6 @@ class _ControlSSABuilder(TiledObject):
             self._native_try_frames.pop()
         if block.orelse is not None:
             self.lower(block.orelse, path=f"{path}.try_else")
-        self.lower(block.finalbody, path=f"{path}.try_finally")
         normal = self.current
         continuation_sources = {}
         for source_phi in block.continuation_phi_cells:
@@ -12774,11 +12773,6 @@ class _ControlSSABuilder(TiledObject):
                 for _phi, arms in continuation_sources.values()
             )
             if join is not None and handled and all(handled):
-                self.lower(
-                    block.finalbody,
-                    path=f"{path}.try_handler_finally["
-                    f"{handler_ordinals[source_handler]}]",
-                )
                 handled_exit = self.current
                 for source_phi in continuation_sources:
                     if not capture_continuation(
@@ -12914,6 +12908,11 @@ class _ControlSSABuilder(TiledObject):
             self.current = join
         else:
             self.current = normal
+        # The source reducer defines post-Try Phi values before reducing
+        # finalbody. In `try: y=int(x); except ValueError: y=2; finally:
+        # y=y+1`, finalbody consumes that Phi. Emitting it before the join
+        # invents an input for the Phi and runs it only on the normal arm.
+        self.lower(block.finalbody, path=f"{path}.try_finally")
         # The status is taken at the protected edge. Selected handlers with
         # source continuation arms join normal control; unmatched status
         # still reaches the fault exit without full finalizer unwinding.
