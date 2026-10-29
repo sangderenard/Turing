@@ -21454,8 +21454,17 @@ def _propagate_callsite_planner_specializations(graph: Any) -> None:
             ), cells)
             continue
         first = values[0]
+        from .concordance_declarations import literal_identity
+
+        # A record holding tensors (``batch`` passed on to ``self._peek``)
+        # compares by content: tensor ``==`` is elementwise and refuses a
+        # truth value, which read as disagreeing callsites.
+        first_identity = literal_identity(first)
         try:
-            consistent = all(value == first for value in values[1:])
+            consistent = all(
+                literal_identity(value) == first_identity
+                for value in values[1:]
+            )
         except (TypeError, ValueError):
             consistent = False
         if not consistent:
@@ -25833,6 +25842,30 @@ def _tensor_descriptor_rule(
                     data.get("value_id", node_id),
                 ),
             }
+    if "shape" not in tensor and str(
+        data.get("op") or data.get("type") or ""
+    ).casefold() in {"getattr", "indexed"}:
+        # A tensor field of a bound literal (``state.cursor`` once the
+        # structural fold made ``state`` a constant) is that tensor: its
+        # extents and element class are the literal's, as a captured
+        # constant's are above.  No element is read.
+        from .concordance_declarations import is_array_literal
+
+        field_value = _static_literal_value(graph, int(node_id))
+        if field_value is not _STATIC_READ_MISSING and is_array_literal(
+            field_value
+        ):
+            try:
+                field_shape = tuple(int(e) for e in field_value.shape)
+            except (TypeError, ValueError):
+                field_shape = None
+            field_dtype = getattr(field_value, "dtype", None)
+            if field_shape is not None and field_dtype is not None:
+                tensor = {
+                    "shape": field_shape,
+                    "dtype": str(field_dtype),
+                    "rank": len(field_shape),
+                }
     if "shape" not in tensor and str(
         data.get("op") or data.get("type") or ""
     ).casefold() == "getattr":
