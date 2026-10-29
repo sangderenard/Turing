@@ -13,6 +13,7 @@ from src.compiler.concordance_declarations import (
     CONTROL_BLOCK, ControlBlockKind,
     NAME_BINDING, SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_SITE_STATE,
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
+    SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
     SOURCE_EXCEPTION_CONTINUATION_PHI,
@@ -264,6 +265,40 @@ def root(x: float) -> int:
         assert phi.name == "y"
         assert len(phi.arms) == 2
         assert phi.arms[0][1] != phi.arms[1][1]
+    finally:
+        end_identity_book(token)
+
+
+def test_explicit_raise_status_uses_first_authored_matching_handler():
+    source = """\
+def root(x: int) -> int:
+    try:
+        raise ValueError("bad")
+    except TypeError:
+        return 1
+    except Exception:
+        return 2
+    except ValueError:
+        return 3
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_status_first_match", identity_book=book)
+        rows = tuple(book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows())
+        assert len(rows) == 1
+        route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(rows[0])
+        assert route.status_class.page == NATIVE_STATUS_CLASS
+        assert len(route.examined_handlers) == 2
+        matched = book.page(SOURCE_EXCEPTION_HANDLER_CLASS).latest(
+            route.examined_handlers[-1].row
+        )
+        assert matched.ordinal == 1
+        assert route.selected_handler == matched.handler
+        assert route.matched_declaration == matched.declarations[0][1]
+        assert CorrelationTable._source_exception_status_route_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
     finally:
         end_identity_book(token)
 

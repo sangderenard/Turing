@@ -1196,6 +1196,7 @@ class ExceptionHandlerClassFact:
 
     owner: Ref
     handler: Ref
+    ordinal: int
     declarations: tuple[tuple[Ref, Ref | None], ...]
 
 
@@ -1204,6 +1205,28 @@ SOURCE_EXCEPTION_HANDLER_CLASS = declare_page(
         RowField("ingestion_scope", K.SCOPE),
         RowField("handler_node", K.VALUE_ID),
     ), ExceptionHandlerClassFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionStatusRouteFact:
+    """First authored handler selected for one declared native status."""
+
+    owner: Ref
+    transfer: Ref
+    status_class: Ref
+    examined_handlers: tuple[Ref, ...]
+    selected_handler: Ref | None
+    matched_declaration: Ref | None
+    unwind_finally: tuple[Ref, ...]
+
+
+SOURCE_EXCEPTION_STATUS_ROUTE = declare_page(
+    "source_exception_status_route", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("source_node", K.VALUE_ID),
+        RowField("status", K.INDEX),
+    ), ExceptionStatusRouteFact,
 )
 
 

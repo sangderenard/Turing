@@ -1554,6 +1554,7 @@ class CorrelationTable:
         found.extend(self._source_exception_site_state_findings(module))
         found.extend(self._source_exception_transfer_findings(module))
         found.extend(self._source_exception_handler_class_findings(module))
+        found.extend(self._source_exception_status_route_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_continuation_phi_findings(module))
@@ -2158,6 +2159,106 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-handler-class-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_status_route_findings(module: Any) -> list[Finding]:
+        """A status route must cite the first matching authored handler."""
+        from .concordance_declarations import (
+            NATIVE_STATUS_CLASS, SOURCE_EXCEPTION_HANDLER_CLASS,
+            SOURCE_EXCEPTION_STATUS_ROUTE, SOURCE_EXCEPTION_TRANSFER,
+            ExceptionStatusRouteFact, ExceptionTransferFact,
+            canonical_python_subtype_identities,
+        )
+        from .native_faults import authored_raise_status
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_STATUS_ROUTE.name not in book.pages:
+            return []
+        found = []
+        routes = book.page(SOURCE_EXCEPTION_STATUS_ROUTE)
+        handlers = book.page(SOURCE_EXCEPTION_HANDLER_CLASS)
+        for row in routes.rows():
+            route = routes.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_STATUS_ROUTE, row)
+            transfer = (
+                book.page(SOURCE_EXCEPTION_TRANSFER).latest(row[:2])
+            )
+            transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row[:2])
+            status_class = book.latest_ref(NATIVE_STATUS_CLASS, (row[2],))
+            problem = None
+            if (
+                not isinstance(route, ExceptionStatusRouteFact)
+                or not isinstance(transfer, ExceptionTransferFact)
+                or transfer.source_kind != "raise"
+                or transfer.raised_class_definition is None
+                or route.transfer != transfer_cell
+                or route.status_class != status_class
+                or book.page(NATIVE_STATUS_CLASS).latest((row[2],))
+                != transfer.raised_class_definition
+                or route.owner != transfer.catch_try
+                or route.unwind_finally != transfer.unwind_finally
+                or authored_raise_status(".".join(
+                    transfer.raised_class_definition.row[:2]
+                )) != int(row[2])
+            ):
+                problem = "status route disagrees with exact transfer or class"
+            else:
+                raised_identity = ".".join(
+                    transfer.raised_class_definition.row[:2]
+                )
+                ordered = sorted((
+                    (handlers.latest(handler_row).ordinal,
+                     book.latest_ref(SOURCE_EXCEPTION_HANDLER_CLASS, handler_row),
+                     handlers.latest(handler_row))
+                    for handler_row in handlers.scope_rows(row[0])
+                    if handlers.latest(handler_row).owner == route.owner
+                ), key=lambda item: item[0])
+                if tuple(item[0] for item in ordered) != tuple(range(len(ordered))):
+                    problem = "status route has incomplete handler order"
+                else:
+                    examined = []
+                    selected = matched = None
+                    for _ordinal, handler_cell, handler in ordered:
+                        examined.append(handler_cell)
+                        if not handler.declarations:
+                            selected = handler.handler
+                            break
+                        for _value, definition in handler.declarations:
+                            if definition is None:
+                                problem = "status route handler lacks class"
+                                break
+                            identity = ".".join(definition.row[:2])
+                            if raised_identity in canonical_python_subtype_identities(
+                                identity, book=book,
+                            ):
+                                selected, matched = handler.handler, definition
+                                break
+                        if problem is not None or selected is not None:
+                            break
+                    if problem is None and (
+                        route.examined_handlers != tuple(examined)
+                        or route.selected_handler != selected
+                        or route.matched_declaration != matched
+                    ):
+                        problem = "status route does not select first match"
+                expected = {
+                    transfer_cell, status_class,
+                    *((route.owner,) if route.owner is not None else ()),
+                    *route.examined_handlers,
+                    *((route.selected_handler,) if route.selected_handler is not None else ()),
+                    *((route.matched_declaration,) if route.matched_declaration is not None else ()),
+                    *route.unwind_finally,
+                }
+                if problem is None and {
+                    source for source, _stage in book.edges_into(receipt)
+                } != expected:
+                    problem = "status route provenance disagrees with selection"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-status-route-disagreement",
                     str(row), None, problem,
                 ))
         return found

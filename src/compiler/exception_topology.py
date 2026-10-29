@@ -9,13 +9,16 @@ from .concordance_declarations import (
     EXCEPTION_TOPOLOGY, INGESTION_VALUE, NAME_BINDING,
     SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_HANDLER_PHI,
+    SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
     SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_TRANSFER,
     STATIC_REFERENCE_USE, STATIC_SYMBOL_DEFINITION,
     ExceptionHandlerClassFact, ExceptionHandlerEntryFact,
-    ExceptionHandlerPhiFact,
+    ExceptionHandlerPhiFact, ExceptionStatusRouteFact,
     ExceptionSiteStateFact, ExceptionTransferFact,
+    canonical_python_subtype_identities, concorded_native_status_classes,
 )
 from .identity_concordance import Derived, Mode, Ref, current_identity_book
+from .native_faults import authored_raise_status
 from ..common.tensors.topological_reducer import node_identity_cell
 
 
@@ -175,7 +178,7 @@ def post_source_exception_transfers(
             raise ValueError(
                 f"retained Try has no ingestion cell: {id(owner_ast)}"
             )
-        for handler_ast in owner_ast.handlers:
+        for ordinal, handler_ast in enumerate(owner_ast.handlers):
             handler_id = id(handler_ast)
             if handler_id not in graph.G:
                 raise ValueError(
@@ -243,7 +246,7 @@ def post_source_exception_transfers(
                     )
                 resolved.append((value, next(iter(definitions), None)))
             fact = ExceptionHandlerClassFact(
-                owner, handler, tuple(resolved),
+                owner, handler, ordinal, tuple(resolved),
             )
             dependencies = tuple(dict.fromkeys((
                 owner, handler,
@@ -304,6 +307,88 @@ def post_source_exception_transfers(
                 stage=EXCEPTION_TOPOLOGY,
                 provenance=Derived(entry_causes), mode=Mode.CONCORD,
             )
+
+    # For `raise ValueError(...)` the constructor Call and the Raise are
+    # separate sites. Only the Raise has this exact static class; dispatch
+    # follows the authored handler ordinals and concorded subtype edges.
+    concorded_native_status_classes(book)
+    handler_page = book.page(SOURCE_EXCEPTION_HANDLER_CLASS)
+    for transfer_row in transfer_page.scope_rows(ingestion_scope):
+        transfer = transfer_page.latest(transfer_row)
+        if (
+            transfer.source_kind != "raise"
+            or transfer.raised_class_definition is None
+        ):
+            continue
+        raised_identity = ".".join(
+            transfer.raised_class_definition.row[:2]
+        )
+        status = authored_raise_status(raised_identity)
+        if status is None:
+            continue
+        status_class = book.latest_ref(NATIVE_STATUS_CLASS, (status,))
+        if (
+            status_class is None
+            or book.page(NATIVE_STATUS_CLASS).latest((status,))
+            != transfer.raised_class_definition
+        ):
+            raise ValueError(
+                f"authored raise status disagrees with class: {transfer_row!r}"
+            )
+        handlers = sorted((
+            (handler_page.latest(row).ordinal,
+             book.latest_ref(SOURCE_EXCEPTION_HANDLER_CLASS, row),
+             handler_page.latest(row))
+            for row in handler_page.scope_rows(ingestion_scope)
+            if handler_page.latest(row).owner == transfer.catch_try
+        ), key=lambda item: item[0])
+        if tuple(ordinal for ordinal, _cell, _fact in handlers) != tuple(
+            range(len(handlers))
+        ) or any(cell is None for _ordinal, cell, _fact in handlers):
+            raise ValueError(
+                f"catch owner has incomplete authored handler order: {transfer_row!r}"
+            )
+        examined = []
+        selected = matched = None
+        for _ordinal, handler_cell, handler in handlers:
+            examined.append(handler_cell)
+            if not handler.declarations:
+                selected = handler.handler
+                break
+            for _value, definition in handler.declarations:
+                if definition is None:
+                    raise ValueError(
+                        f"handler has no exact class declaration: {handler_cell!r}"
+                    )
+                handler_identity = ".".join(definition.row[:2])
+                if raised_identity in canonical_python_subtype_identities(
+                    handler_identity, book=book,
+                ):
+                    selected, matched = handler.handler, definition
+                    break
+            if selected is not None:
+                break
+        transfer_cell = book.latest_ref(
+            SOURCE_EXCEPTION_TRANSFER, transfer_row,
+        )
+        route = ExceptionStatusRouteFact(
+            transfer.catch_try, transfer_cell, status_class,
+            tuple(examined), selected, matched, transfer.unwind_finally,
+        )
+        causes = tuple(dict.fromkeys((
+            transfer_cell, status_class,
+            *((transfer.catch_try,) if transfer.catch_try is not None else ()),
+            *examined,
+            *((selected,) if selected is not None else ()),
+            *((matched,) if matched is not None else ()),
+            *transfer.unwind_finally,
+        )))
+        book.post(
+            SOURCE_EXCEPTION_STATUS_ROUTE,
+            (ingestion_scope, transfer_row[1], status), route,
+            stage=EXCEPTION_TOPOLOGY,
+            provenance=Derived(causes), mode=Mode.CONCORD,
+        )
 
     binding_page = book.page(NAME_BINDING)
     for phi_id, data in graph.G.nodes(data=True):
