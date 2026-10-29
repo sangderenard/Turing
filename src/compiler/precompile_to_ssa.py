@@ -5132,9 +5132,18 @@ class _ControlSSABuilder(TiledObject):
         # A selected pool row's columns are the slice addresses built where
         # the row was selected; they are the descriptor's storage values and
         # have no other binding.
+        # Program: ``commit([(1, 2), (3, 4)], 2)`` reading
+        # ``fingerprints[i][1]``.  Wrong record: a column past column 0 is
+        # minted with its descriptor and is no external value, so reading
+        # it here minted a second formal of the same id (refused as a
+        # binding receipt naming one formal twice).  Rule: a column beyond
+        # the data arena is the descriptor's own storage value.
         source = (
             self.sequence_storage_values[int(sequence_id)][int(column)]
-            if int(sequence_id) in self.child_table_selections
+            if (
+                int(sequence_id) in self.child_table_selections
+                or int(column) > 0
+            )
             and int(sequence_id) in self.sequence_storage_values
             else self.external_value(
                 int(descriptor.column_value_ids[int(column)]),
