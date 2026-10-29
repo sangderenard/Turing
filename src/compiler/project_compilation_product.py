@@ -34,6 +34,8 @@ import time
 import types
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .native_residency import resident_library
+
 
 PROJECT_PRODUCT_SCHEMA = "turing.project-compilation-product.v1"
 UNIT_ARTIFACT_SCHEMA = "turing.project-compilation-unit.v1"
@@ -555,7 +557,7 @@ class ProjectCompilationProduct:
                     parent = str(dependency_path.parent.resolve())
                     if parent not in {str(handle) for handle in runtime_handles}:
                         runtime_handles.append(os.add_dll_directory(parent))
-        library = ctypes.CDLL(str(library_path.resolve()))
+        library = resident_library(library_path)
         native = getattr(library, str(entry.get("symbol") or entry_name))
         workspace_core = None
         if any(parameter.get("role") in {"workspace", "extent"} for parameter in parameters):
@@ -888,7 +890,7 @@ class ProjectCompilationProduct:
                     if parent not in parents:
                         parents.add(parent)
                         runtime_handles.append(os.add_dll_directory(parent))
-        library = ctypes.CDLL(str(library_path.resolve()))
+        library = resident_library(library_path)
         packed_contract = dict(
             (metadata.get("packed_entrypoints") or {}).get(entry_name) or {}
         )
@@ -1719,7 +1721,7 @@ class ProjectCompilationProduct:
                     if parent not in parents:
                         parents.add(parent)
                         runtime_handles.append(os.add_dll_directory(parent))
-        library = ctypes.CDLL(str(library_path.resolve()))
+        library = resident_library(library_path)
         native = getattr(library, str(entry.get("symbol") or entry_name))
         native.argtypes = [
             (
@@ -2085,7 +2087,7 @@ class ProjectCompilationProduct:
                     runtime_handles.append(os.add_dll_directory(
                         str(dependency_path.parent.resolve())
                     ))
-        library = ctypes.CDLL(str(library_path.resolve()))
+        library = resident_library(library_path)
         native = getattr(library, str(entry.get("symbol") or entry_name))
 
         def parameter_ctype(parameter: Mapping[str, Any]):
@@ -4639,7 +4641,7 @@ def _verify_native_scalar_source_region(
                 if directory not in seen_directories:
                     seen_directories.add(directory)
                     runtime_handles.append(os.add_dll_directory(directory))
-    library = ctypes.CDLL(str(library_path.resolve()))
+    library = resident_library(library_path)
     native = getattr(library, str(entry.get("symbol") or name))
     native.argtypes = [
         (
