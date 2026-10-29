@@ -35097,6 +35097,25 @@ def _class_surface_ssa_program(
         # consulted: it counts a formal handle as live, so it would keep
         # every unused frame-storage formal -- _reindex_in_place's folded
         # ``{}``/``[]`` defaults came back as unknown-dtype formals.)
+        # Program: ``cells: dict[int, int] = {}`` filled in a loop (corpus
+        # c942; bootstrap ``identity_spill._reindex_in_place``).  Wrong
+        # record: the dict's data arena was refined to its row dtype, which
+        # puts a new SSAValue object in the formals, while the store calls
+        # kept reading the earlier object with the same id.  The unused-
+        # formal test compared objects, so the arena read as unused and was
+        # dropped, and every call then read a value nothing defined.  Rule:
+        # a formal is used when an instruction reads its value id.
+        used_argument_ids = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
+        }
+        used_argument_objects.update(
+            id(argument)
+            for argument in function.args
+            if int(argument.id) in used_argument_ids
+        )
         frame_removable = {
             int(argument.id)
             for argument in function.args

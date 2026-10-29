@@ -3606,6 +3606,10 @@ class _ControlSSABuilder(TiledObject):
         for sequence_id, descriptor in sorted(self.sequence_descriptors.items()):
             if not descriptor.writable or int(sequence_id) in retained_residents:
                 continue
+            if int(descriptor.sequence_id) != int(sequence_id):
+                # An alias of another sequence's table (``_sequence_descriptor``)
+                # is initialized once, under the table's own id.
+                continue
             length_cell = self.sequence_storage_values[int(sequence_id)][
                 len(descriptor.column_value_ids)
             ]
@@ -12809,6 +12813,45 @@ class _ControlSSABuilder(TiledObject):
         )
         if concorded_column_dtypes:
             first_dtype = concorded_column_dtypes[0]
+        # Program: ``cells = {}; for i in range(n): cells[i * 3] = i`` and then
+        # ``for key in cells`` (corpus c942).  The store loop's result (seq 6)
+        # and the iterated value (seq 15) resolve by alias to the dict's own
+        # data cell (seq 3).  Wrong record: each minted its own value column,
+        # length, capacity and status beside seq 3's.  Nothing defined them,
+        # so the final concordance refused "not a formal, never defined".
+        # Rule: a data cell is one table.  A sequence that resolves to
+        # another descriptor's column 0 is that descriptor, with its storage.
+        # The alias is resolved before ``external_value``: asking it for the
+        # cell with this view's row dtype would refine the incumbent's heap
+        # pointer cell to that element dtype.
+        data_id, seen = value_id, set()
+        while data_id in self.value_aliases and data_id not in seen:
+            seen.add(data_id)
+            data_id = int(self.value_aliases[data_id])
+        incumbent_view = next((
+            (incumbent_id, view)
+            for incumbent_id, view in self.sequence_descriptors.items()
+            if int(incumbent_id) != value_id
+            and view.column_value_ids
+            and int(view.column_value_ids[0]) == data_id
+            and len(view.column_value_ids) == int(column_count)
+            and tuple(view.key_columns) == tuple(key_columns)
+        ), None)
+        if incumbent_view is not None:
+            incumbent_id, view = incumbent_view
+            self.sequence_descriptors[value_id] = view
+            self.sequence_storage_values[value_id] = (
+                self.sequence_storage_values[incumbent_id]
+            )
+            if incumbent_id in self.sequence_status_values:
+                self.sequence_status_values[value_id] = (
+                    self.sequence_status_values[incumbent_id]
+                )
+            if incumbent_id in self.sequence_heap_owners:
+                self.sequence_heap_owners[value_id] = (
+                    self.sequence_heap_owners[incumbent_id]
+                )
+            return view
         # Program: ``xs = [5, n, 2]; xs[0] = 7`` (scratch c140).  Wrong
         # record: with no row type concorded yet, the arena was minted from
         # the planner's region meta -- its float64 capture guess -- and that
@@ -24463,7 +24506,10 @@ class _ControlSSABuilder(TiledObject):
                 stage=self._stage(),
             )
 
-        for descriptor in self.sequence_descriptors.values():
+        for sequence_id, descriptor in self.sequence_descriptors.items():
+            if int(descriptor.sequence_id) != int(sequence_id):
+                # An alias of another sequence's table registers as that table.
+                continue
             register_sequence(sequence_table, descriptor)
         function = Function(
                 self.function_name,
