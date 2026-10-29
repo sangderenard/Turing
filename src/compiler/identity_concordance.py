@@ -5340,6 +5340,56 @@ class CorrelationTable:
             if key is not None:
                 caller_by_key[key].append(value_id)
 
+        frames_by_slot: dict[int, set] | None = None
+
+        def call_frames_of(value_id):
+            """The call frames of this caller whose storage ``value_id`` is,
+            read from the frame linker's rows."""
+
+            nonlocal frames_by_slot
+            if frames_by_slot is None:
+                from .concordance_declarations import (
+                    ARGUMENT_BINDING, FRAME_LEASE,
+                )
+
+                frames_by_slot = defaultdict(set)
+                # The caller's rows are in the book that owns it: an
+                # accepted dependency component's, else the module's.
+                component = (
+                    function.metadata or {}
+                ).get("accepted_ssa_component") or {}
+                book = (
+                    component.get("identity_book")
+                    or (getattr(module, "metadata", {}) or {}).get(
+                        "identity_book"
+                    )
+                    or current_identity_book()
+                )
+                lease_page = book.pages.get(FRAME_LEASE.name)
+                for row in () if lease_page is None else lease_page.rows():
+                    fact = lease_page.latest(row)
+                    if (
+                        str(row[0]) == str(name)
+                        and isinstance(fact, tuple) and len(fact) == 3
+                    ):
+                        frames_by_slot[int(row[1])].add(
+                            (str(fact[1]), fact[0])
+                        )
+                binding_page = book.pages.get(ARGUMENT_BINDING.name)
+                for row in () if binding_page is None else binding_page.rows():
+                    if len(row) != 4 or str(row[1]) != str(name):
+                        continue
+                    fact = binding_page.latest(row)
+                    if (
+                        isinstance(fact, tuple) and len(fact) == 2
+                        and fact[0] == "caller_storage"
+                        and isinstance(fact[1], int)
+                    ):
+                        frames_by_slot[int(fact[1])].add(
+                            (str(row[0]), row[3])
+                        )
+            return frozenset(frames_by_slot.get(int(value_id), ()))
+
         def sequence_roles_of(symbol, value_id):
             table = (getattr(module, "sequence_tables", {}) or {}).get(symbol)
             return frozenset(
@@ -5366,10 +5416,7 @@ class CorrelationTable:
                     if not accounting.get("linked_call_frame_storage"):
                         continue
                     formal_roles = sequence_roles_of(callee_name, int(callee_id))
-                    lease_frame = (
-                        accounting.get("linked_call_frame_storage"),
-                        accounting.get("callsite_id"),
-                    )
+                    lease_frames = call_frames_of(argument_id)
                     owned = []
                     for owner in caller_by_key.get(key, ()):
                         if owner == argument_id:
@@ -5380,20 +5427,17 @@ class CorrelationTable:
                         # ``batch`` frame and the lease it hands ``one``
                         # for ``one``'s inner ``batch`` frame share the
                         # compiler-frame key, and the lease was reported
-                        # as duplicate storage.  Rule: storage linked to
-                        # one call frame of this caller and a lease linked
-                        # to another call frame are two instances; an
-                        # owner that states no frame keeps the check.
-                        owner_accounting = formals[owner].accounting or {}
-                        owner_frame = (
-                            owner_accounting.get("linked_call_frame_storage"),
-                            owner_accounting.get("callsite_id"),
-                        )
+                        # as duplicate storage.  Rule: the frame linker's
+                        # records name the call frame each slot is storage
+                        # of -- ``frame_lease_link`` for a lease,
+                        # ``argument_binding`` (``caller_storage``) for the
+                        # caller's own frame storage -- and slots of two
+                        # different call frames are two instances; a slot
+                        # no record names keeps the check.
+                        owner_frames = call_frames_of(owner)
                         if (
-                            owner_frame[0] is not None
-                            and owner_frame[1] is not None
-                            and lease_frame[1] is not None
-                            and owner_frame != lease_frame
+                            owner_frames and lease_frames
+                            and owner_frames.isdisjoint(lease_frames)
                         ):
                             continue
                         owner_roles = sequence_roles_of(name, owner)
