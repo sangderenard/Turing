@@ -359,14 +359,34 @@ def _python_int_true_division_statement(args, target: str) -> str:
     )
 
 
-def _python_int_statement(op: str, args, target: str) -> str:
-    """C for Python's ``<< >> // %``, ``abs`` and unary ``-`` on an int64.
+#: The C spellings ``_python_int_statement`` computes Python ``int`` in:
+#: (signed type, unsigned type, bits, minimum literal, floored helpers).
+_PYTHON_INT_C_WIDTHS = {
+    "int64_t": (
+        "int64_t", "uint64_t", 64, _C_INT64_MIN,
+        ("turing_ifloordiv", "turing_imod"),
+    ),
+    # Arithmetic over an operand proven past int64 (an int128 result).
+    "__int128": (
+        "__int128", "__uint128_t", 128,
+        "((__int128)(((__uint128_t)1) << 127))",
+        ("turing_ifloordiv128", "turing_imod128"),
+    ),
+}
+
+
+def _python_int_statement(
+    op: str, args, target: str, kind: str = "int64_t",
+) -> str:
+    """C for Python's ``<< >> // %``, ``abs`` and unary ``-`` on an int.
 
     The LLVM lane's ``_python_int_lines``: Python's value or a named fault
     (``NEGATIVE_SHIFT_COUNT``, ``INT_ZERO_DIVISION``, ``INT_OVERFLOW``),
     computed on a safe operand so no C operation is undefined.  The
-    statement opens ``int64_t <target> = <value>;`` so a loop's later
-    definition can assign the incumbent local instead.
+    statement opens ``<kind> <target> = <value>;`` so a loop's later
+    definition can assign the incumbent local instead.  ``kind`` is
+    ``int64_t``, or ``__int128`` for arithmetic over an operand proven past
+    int64.
     """
 
     from .native_faults import INT_ZERO_DIVISION, NEGATIVE_SHIFT_COUNT
@@ -374,47 +394,105 @@ def _python_int_statement(op: str, args, target: str) -> str:
     def fault(code: int) -> str:
         return f"turing_validation_error({int(code)}u);"
 
+    signed, unsigned, bits, minimum, (floordiv, modulo) = (
+        _PYTHON_INT_C_WIDTHS[kind]
+    )
     overflow = fault(_INT_OVERFLOW_CODE)
     if op == "Neg":
         (value,) = args
         return (
-            f"int64_t {target} = 0; if (__builtin_sub_overflow("
-            f"(int64_t)0, (int64_t)({value}), &{target})) {overflow}"
+            f"{signed} {target} = 0; if (__builtin_sub_overflow("
+            f"({signed})0, ({signed})({value}), &{target})) {overflow}"
         )
     if op in {"Abs", "abs"}:
         (value,) = args
         return (
-            f"int64_t {target} = (({value}) < 0 ? (int64_t)(0 - "
-            f"(uint64_t)({value})) : ({value})); "
-            f"if (({value}) == {_C_INT64_MIN}) {overflow}"
+            f"{signed} {target} = (({value}) < 0 ? ({signed})(0 - "
+            f"({unsigned})({value})) : ({value})); "
+            f"if (({value}) == {minimum}) {overflow}"
         )
-    left, right = (f"((int64_t)({argument}))" for argument in args)
+    left, right = (f"(({signed})({argument}))" for argument in args)
     if op in {"Shl", "Shr"}:
-        inrange = f"({right} >= 0 && {right} < 64)"
+        inrange = f"({right} >= 0 && {right} < {bits})"
         negative = f"if ({right} < 0) {fault(NEGATIVE_SHIFT_COUNT)}"
         if op == "Shr":
-            # Python ``>>`` floors: arithmetic, and 0 / -1 past 63 bits.
+            # Python ``>>`` floors: arithmetic, and 0 / -1 past the width.
             return (
-                f"int64_t {target} = ({left} >> ({inrange} ? {right} : 63)); "
-                f"{negative}"
+                f"{signed} {target} = ({left} >> ({inrange} ? {right} : "
+                f"{bits - 1})); {negative}"
             )
         return (
-            f"int64_t {target} = (int64_t)((uint64_t){left} << "
+            f"{signed} {target} = ({signed})(({unsigned}){left} << "
             f"({inrange} ? {right} : 0)); {negative} "
-            f"else if ({right} < 64 ? (({target} >> {right}) != {left}) "
+            f"else if ({right} < {bits} ? (({target} >> {right}) != {left}) "
             f": ({left} != 0)) {overflow}"
         )
-    wide = f"({left} == {_C_INT64_MIN} && {right} == -1)"
-    helper = "turing_ifloordiv" if op == "FloorDiv" else "turing_imod"
+    wide = f"({left} == {minimum} && {right} == -1)"
+    helper = floordiv if op == "FloorDiv" else modulo
     statement = (
-        f"int64_t {target} = {helper}({left}, "
+        f"{signed} {target} = {helper}({left}, "
         f"({right} == 0 || {wide}) ? 1 : {right}); "
         f"if ({right} == 0) {fault(INT_ZERO_DIVISION)}"
     )
     if op == "FloorDiv":
-        # -2**63 // -1 == 2**63; -2**63 % -1 == 0 is the safe divisor's.
+        # MIN // -1 == -MIN; MIN % -1 == 0 is the safe divisor's.
         statement += f" else if {wide} {overflow}"
     return statement
+
+
+def _python_int_work_kind(instruction) -> str | None:
+    """The C type a Python ``int`` op computes in, else ``None``.
+
+    The operands' common width (the SSA converts them to one), never
+    narrower than the result: an int64 result of int128 operands
+    (``(d * 1000003 + b) % m``) computes in ``__int128`` and is narrowed
+    checked (``_python_int_narrowed_statement``), never through an int64
+    spelling that would truncate its operands.
+    """
+
+    from .ssa_llvm_backend import _PYTHON_INT_WIDTH_BOUNDS
+
+    result = str(instruction.res.dtype)
+    operands = {str(value.dtype) for value in instruction.args}
+    if (
+        result not in _PYTHON_INT_WIDTH_BOUNDS
+        or len(operands) != 1
+        or not operands <= set(_PYTHON_INT_WIDTH_BOUNDS)
+        or any(tuple(value.shape or ()) for value in instruction.args)
+    ):
+        return None
+    (operand,) = operands
+    bits = {"int64": 64, "int128": 128}
+    if bits[operand] < bits[result]:
+        return None
+    return _scalar_c_type(operand)
+
+
+def _python_int_narrowed_statement(instruction, wide: str, target: str) -> str:
+    """``wide`` (declaring ``<target>_wide``), then its checked narrowing.
+
+    The LLVM lane's ``python_int_narrowing_lines``: unless an interval
+    proves the result inside its declared width, a value outside it reports
+    ``INT_OVERFLOW``.  The statement opens ``<kind> <target> = 0;`` so a
+    loop's later definition can assign the incumbent local instead.
+    """
+
+    from .ssa_llvm_backend import (
+        _PYTHON_INT_WIDTH_BOUNDS, python_int_proven_within,
+    )
+
+    kind = _scalar_c_type(instruction.res.dtype)
+    low, high = _PYTHON_INT_WIDTH_BOUNDS[str(instruction.res.dtype)]
+    check = (
+        "" if python_int_proven_within(instruction, (low, high))
+        else f"if ({target}_wide < ({kind})({low + 1}LL - 1) || "
+        f"{target}_wide > ({kind})({high}LL)) "
+        f"turing_validation_error({_INT_OVERFLOW_CODE}u); else "
+    )
+    return (
+        f"{kind} {target} = 0; {{ {wide} {check}"
+        f"{target} = ({kind})({target}_wide); }}"
+    )
 
 
 def _floored_integer_helper(op: str, operands) -> str:
@@ -6644,14 +6722,7 @@ def emit_ssa_module_to_c(
                 elif (
                     op in _PYTHON_INT_OPERATIONS
                     and len(args) == _PYTHON_INT_OPERATIONS[op]
-                    and _scalar_c_type(instruction.res.dtype) == "int64_t"
-                    and all(
-                        # The spelling computes on int64 operands; an int128
-                        # operand (a uint64 widened for ``%``) is not narrowed
-                        # through it but takes the int128 floored helper.
-                        is_integer(value) and str(value.dtype) == "int64"
-                        for value in instruction.args
-                    )
+                    and _python_int_work_kind(instruction) is not None
                     and _python_int_spelled(op, instruction)
                 ):
                     prototype = "void turing_validation_error(uint32_t error_code);"
@@ -6659,8 +6730,19 @@ def emit_ssa_module_to_c(
                         prototypes.append(prototype)
                     needs_validation_runtime = True
                     integer_ids.add(result_id)
-                    declared_storage_type = "int64_t"
-                    declared = _python_int_statement(op, args, f"t{result_id}")
+                    kind = _scalar_c_type(instruction.res.dtype)
+                    work = _python_int_work_kind(instruction)
+                    declared_storage_type = kind
+                    if work == kind:
+                        declared = _python_int_statement(
+                            op, args, f"t{result_id}", kind,
+                        )
+                    else:
+                        declared = _python_int_narrowed_statement(
+                            instruction, _python_int_statement(
+                                op, args, f"t{result_id}_wide", work,
+                            ), f"t{result_id}",
+                        )
                 elif op == "Pow" and len(args) == 2:
                     if _is_integer_dtype(instruction.res.dtype):
                         shortfalls.append(CEmissionShortfall(
@@ -6737,7 +6819,7 @@ def emit_ssa_module_to_c(
                         )
                     elif (
                         integral and op in {"Add", "Sub", "Mul"}
-                        and kind == "int64_t"
+                        and kind in _PYTHON_INT_C_WIDTHS
                         and python_int_overflow_checked(instruction)
                     ):
                         # The LLVM lane's rule (python_int_overflow_checked):
@@ -6753,9 +6835,19 @@ def emit_ssa_module_to_c(
                             "Sub": "__builtin_sub_overflow",
                             "Mul": "__builtin_mul_overflow",
                         }[op]
+                        # Each operand enters in its own width: the builtin
+                        # computes the exact sum, difference or product and
+                        # reports one that leaves the result's width, so an
+                        # int128 operand of an int64 result is never
+                        # truncated on the way in.
+                        left_kind, right_kind = (
+                            _scalar_c_type(value.dtype)
+                            if str(value.dtype) == "int128" else kind
+                            for value in instruction.args
+                        )
                         declared = (
-                            f"int64_t t{result_id}; if ({builtin}("
-                            f"(int64_t)({args[0]}), (int64_t)({args[1]}), "
+                            f"{kind} t{result_id}; if ({builtin}("
+                            f"({left_kind})({args[0]}), ({right_kind})({args[1]}), "
                             f"&t{result_id})) "
                             f"turing_validation_error({_INT_OVERFLOW_CODE}u);"
                         )
