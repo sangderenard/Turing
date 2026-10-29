@@ -613,28 +613,48 @@ def validation_raise_identity(
     if node_id is None or int(node_id) not in graph_obj:
         return None
     scope = graph_obj.graph.get("lexical_read_scope")
-    if scope is None:
-        raise ValueError("source raise has no lexical concordance scope")
     occurrence = id(raised.func)
     book = current_identity_book()
     # Source call composition works on a forked read scope. The static-use
     # occurrence was posted when the authored graph was reduced. Follow the
     # book's scope_origin facts back to that ingestion scope, rather than
     # parsing the fork name or accepting a use from another specialization.
-    source_scopes = {scope}
-    cursor = scope
-    while True:
-        origin = book.page(SCOPE_ORIGIN).latest((cursor,))
-        if origin is None:
-            break
-        cursor = origin.source_scope
-        if cursor in source_scopes:
-            raise ValueError("source raise read-scope origin has a cycle")
-        source_scopes.add(cursor)
-    ingestion_scopes = {(item, "ingestion") for item in source_scopes}
+    ingestion_scopes = None
+    if scope is not None:
+        source_scopes = {scope}
+        cursor = scope
+        while True:
+            origin = book.page(SCOPE_ORIGIN).latest((cursor,))
+            if origin is None:
+                break
+            cursor = origin.source_scope
+            if cursor in source_scopes:
+                raise ValueError("source raise read-scope origin has a cycle")
+            source_scopes.add(cursor)
+        ingestion_scopes = {(item, "ingestion") for item in source_scopes}
+    # The aggregate source graph has no function-local read scope.  Program:
+    # tensor_octets_to_bytes's entry TypeError guard.  Its Call still has an
+    # exact callee edge to the static reference node; the static-use row
+    # names both that node and the authored occurrence.  Require that pair
+    # instead of reconstructing a scope from a function name.
+    callee_ids = {
+        int(parent) for parent, role in (
+            graph_obj.nodes[int(node_id)].get("parents") or ()
+        ) if str(role) == "callee"
+    }
+    if len(callee_ids) != 1:
+        raise ValueError(
+            "source raise constructor has no unique callee value edge: "
+            f"raise={id(statement)}, callees={callee_ids!r}"
+        )
+    callee_id = next(iter(callee_ids))
     definitions = set()
     for row in book.page(STATIC_REFERENCE_USE).rows():
-        if row[0] not in ingestion_scopes or int(row[1]) != occurrence:
+        if (
+            (ingestion_scopes is not None and row[0] not in ingestion_scopes)
+            or int(row[1]) != occurrence
+            or (ingestion_scopes is None and int(row[2]) != callee_id)
+        ):
             continue
         use_cell = book.latest_ref(STATIC_REFERENCE_USE, row)
         if use_cell is None:

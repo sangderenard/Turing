@@ -10285,9 +10285,9 @@ class _ControlSSABuilder(TiledObject):
             return None
         from .concordance_declarations import (
             SOURCE_EXCEPTION_TRANSFER,
+            canonical_python_subtype_identities,
         )
         from .native_faults import authored_raise_status
-        import builtins
 
         if self.lexical_read_scope is None:
             self.shortfalls.append(SSALoweringShortfall(
@@ -10334,7 +10334,15 @@ class _ControlSSABuilder(TiledObject):
                 f"source raise has no resolved native exception class: {raised_name!r}",
             ))
             return None
-        raised_class = getattr(builtins, raised_name.removeprefix("builtins."))
+        exception_identities = set(canonical_python_subtype_identities(
+            "builtins.BaseException", book=book,
+        ))
+        if raised_name not in exception_identities:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "raise", path,
+                f"raised class {raised_name!r} has no concorded exception base",
+            ))
+            return None
         for frame in reversed(self.native_try_frames[:active + 1]):
             if frame.phase != "body":
                 continue
@@ -10348,20 +10356,15 @@ class _ControlSSABuilder(TiledObject):
                     ))
                     return None
                 for identity in handler.exception_type_identities:
-                    if not str(identity).startswith("builtins."):
+                    if str(identity) not in exception_identities:
                         self.shortfalls.append(SSALoweringShortfall(
                             "control", "raise", path,
-                            f"handler class {identity!r} has no native match rule",
+                            f"handler class {identity!r} has no concorded exception base",
                         ))
                         return None
-                    candidate = getattr(builtins, str(identity).removeprefix("builtins."), None)
-                    if not isinstance(candidate, type) or not issubclass(candidate, BaseException):
-                        self.shortfalls.append(SSALoweringShortfall(
-                            "control", "raise", path,
-                            f"handler class {identity!r} is not an exception declaration",
-                        ))
-                        return None
-                    if issubclass(raised_class, candidate):
+                    if raised_name in canonical_python_subtype_identities(
+                        str(identity), book=book,
+                    ):
                         return frame.handler_entries[index], int(handler.source_handler_node_id), transfer_cell
             if frame.block.finalbody != SequenceBlock(()) and frame.owner != target:
                 self.shortfalls.append(SSALoweringShortfall(

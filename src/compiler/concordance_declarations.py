@@ -4492,11 +4492,23 @@ def ensure_builtin_class_topology(book: object) -> None:
         (builtins.str, builtins.object),
         (builtins.tuple, builtins.object),
     )
+    # Exception dispatch reads CLASS_SUBTYPE just like ordinary class
+    # settlement.  Ingest the builtin exception declarations and their
+    # declared direct bases here, once, so a native handler never decides
+    # catchability by reflecting on the compiler host during SSA lowering.
+    exception_declarations = tuple(sorted((
+        (candidate, base)
+        for candidate in vars(builtins).values()
+        if isinstance(candidate, type)
+        and candidate.__module__ == "builtins"
+        and issubclass(candidate, BaseException)
+        for base in candidate.__bases__
+    ), key=lambda pair: (pair[0].__name__, pair[1].__name__)))
     page = book.page(CLASS_SUBTYPE)
-    for derived, base in declarations:
+    for derived, base in (*declarations, *exception_declarations):
         row = (
-            canonical_python_type_identity(derived.__name__),
-            canonical_python_type_identity(base.__name__),
+            f"{derived.__module__}.{derived.__qualname__}",
+            f"{base.__module__}.{base.__qualname__}",
         )
         if page.latest(row) is None:
             book.post(
