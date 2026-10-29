@@ -31465,6 +31465,28 @@ def _class_surface_ssa_program(
                         )
                         if _native_row_dtype(planned)
                     },
+                    # Program: ``rebuilt = []; rebuilt = rebuilt + ca``.
+                    # Wrong record: the folded ``[]`` has no rows to settle
+                    # its column, so its descriptor kept an ``unknown`` row
+                    # the backends cannot lay out.  Rule: an empty list
+                    # constant's rows are of the class the planner settled
+                    # for it (the concatenation it feeds); it is declared
+                    # with that class at birth.
+                    **{
+                        int(sequence_id): (planned,)
+                        for sequence_id, _policy, column_count, _writable
+                        in sequence_declarations
+                        if int(column_count) == 1
+                        and int(sequence_id) in graph_obj
+                        and (
+                            graph_obj.nodes[int(sequence_id)].get("attributes")
+                            or {}
+                        ).get("value") == []
+                        for planned in (
+                            planned_sequence_elements.get(int(sequence_id)),
+                        )
+                        if _native_row_dtype(planned)
+                    },
                     **_sequence_column_dtype_contracts(
                         graph_obj, sequence_declarations
                     ),
