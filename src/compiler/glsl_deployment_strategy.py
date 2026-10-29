@@ -1938,7 +1938,15 @@ _MUTABLE_RETURN_KINDS = frozenset({"list", "set", "dict", "bytearray"})
 def _born_in_callee_list(child_graph: Any, value_id: int) -> bool:
     """A list this function creates (a display, a materialization or a
     comprehension), not a parameter's or another object's storage.  A store
-    version (``r[1] = n; return r``) is the list it writes."""
+    version (``r[1] = n; return r``) is the list it writes.
+
+    Program: ``if n > 3: return 1, []`` / ``return 0, list(xs)`` (string
+    core ``Vocabulary.expand`` and ``cover``: ``return STATUS_OK,
+    list(self.exact_atoms[b:e])``).  Wrong record: ``list(xs)`` is an
+    ``aggregate_materialization``, which this test did not name, so the
+    function was refused as returning a foreign collection although
+    ``list(...)`` always builds a new list.  Rule: a ``list(...)``
+    materialization is born here, like a display."""
 
     value_id = _indexed_store_source(child_graph, value_id)
     data = child_graph.nodes[value_id] if value_id in child_graph else {}
@@ -1948,7 +1956,10 @@ def _born_in_callee_list(child_graph: Any, value_id: int) -> bool:
         and attributes.get("binding_kind") != "parameter"
         and (
             attributes.get("producer_kind")
-            in {"aggregate", "sequence_materialization", "sequence_replication"}
+            in {
+                "aggregate", "aggregate_materialization",
+                "sequence_materialization", "sequence_replication",
+            }
             or data.get("type") == "LoopResult"
             or isinstance(data.get("expr_obj"), ast.ListComp)
         )
