@@ -291,12 +291,10 @@ def test_the_catalogue_decides_what_is_reachable():
     assert {"sin", "cos", "tanh", "exp", "exp2", "log", "asin", "atan"} <= _LUT_OPS
     # Nothing is both reachable and refused.
     assert not (_LUT_OPS & _NO_WASM_INSTRUCTION)
-    # What stays refused is refused for a reason, not for want of a table:
-    # tan has poles, mod/floordiv await an integer-remainder lowering, and the
-    # rest are predicates or shape operations rather than functions of one
-    # float. sign and pow ARE lowered (see _step_instructions / _assemble)
-    # and so are deliberately absent from this refusal set.
-    assert {"tan", "mod", "isnan"} <= _NO_WASM_INSTRUCTION
+    # tan (sin/cos tables), mod (integer and float remainder) and
+    # isnan (self-comparison) are lowered now, as sign and pow are (see
+    # _step_instructions / _assemble), so none of them is refused.
+    assert not ({"tan", "mod", "isnan", "sign", "pow"} & _NO_WASM_INSTRUCTION)
     assert not ({"sign", "pow"} & _NO_WASM_INSTRUCTION)
 
 
