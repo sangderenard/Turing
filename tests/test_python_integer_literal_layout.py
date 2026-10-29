@@ -134,3 +134,14 @@ def test_large_python_integer_literal_compares_exactly_natively(
         parameter_id: np.array([feed], dtype=np.int64),
     }).run().buffers[result_id].item()
     assert bool(result) is expected
+
+
+def test_python_integer_literal_layout_reads_an_int_enum_member_as_its_int():
+    import enum
+
+    class Phase(enum.IntEnum):
+        RUN = 3
+
+    assert python_int_literal_dtype(Phase.RUN) == "int64"
+    with pytest.raises(TypeError):
+        python_int_literal_dtype(True)

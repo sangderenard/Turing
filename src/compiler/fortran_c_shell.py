@@ -1783,7 +1783,8 @@ def _recover_late_source_literals(
                         "physical_dtype": str(instruction.res.dtype),
                         "storage": "scalar", "rank": 0, "arena": False,
                     }
-                    if type(literal) is int else KEEP_PHYSICAL
+                    if isinstance(literal, int) and not isinstance(literal, bool)
+                    else KEEP_PHYSICAL
                 ),
             )
     return tuple(recovered)
@@ -2220,7 +2221,7 @@ def _recover_late_source_pure_expressions(
                         return None
                     if isinstance(literal, bool):
                         dtype = "bool"
-                    elif type(literal) is int:
+                    elif isinstance(literal, int):
                         from ..transmogrifier.dtype_layout import (
                             python_int_literal_dtype,
                         )
@@ -11091,7 +11092,24 @@ def _field_slot_ops(
         column_count = (
             committed.column_count if committed is not None else
             2 if aggregate_kind == "dict" else
-            max(1, annotated_row_widths.get(int(sequence_id), 1))
+            max(
+                1, annotated_row_widths.get(int(sequence_id), 1),
+                # Program: ``commit([(1, n), (3, 4)], 2)`` into an
+                # unannotated formal.  Wrong record: only an annotation
+                # gave the formal its row width, so the member-bound
+                # aggregate whose rows are all two-value tuples (the
+                # planner's ``sequence_column_count``) was declared one
+                # column wide and the caller's two-column rows had no
+                # formal to bind.  Rule: the row width the call edge
+                # settled on the formal (``sequence_column_count``, from
+                # the member-bound aggregate or the caller's list) is
+                # evidence like an annotation.
+                int(attributes.get("sequence_column_count", 1))
+                if attributes.get("producer_kind") in {
+                    "aggregate", "aggregate_parameter",
+                }
+                else 1,
+            )
         )
         writable = (
             committed.writable if committed is not None else
@@ -11284,7 +11302,14 @@ def _field_slot_ops(
             or (
                 attributes.get("producer_kind") == "aggregate"
                 and isinstance(data.get("expr_obj"), ast.Tuple)
-                and int(node_id) in iterated_ids
+                and (
+                    int(node_id) in iterated_ids
+                    # Program: ``commit(((1, n), (3, 4)), 2)`` whose callee
+                    # reads ``fingerprints[i]``.  A tuple of fixed-width
+                    # rows is born as a local sequence of its rows, like
+                    # the list display of the same rows.
+                    or int(attributes.get("sequence_column_count", 1)) > 1
+                )
             )
         ))
         if not snapshot and aggregate_kind not in {
@@ -25341,10 +25366,26 @@ def _class_surface_ssa_program(
                 leaves = _authored_aggregate_leaves(
                     _SiteGraph(G=caller_graph), int(actual_id),
                 )
+                # Program: ``commit([(1, n), (3, 4)], 2)``.  Wrong record:
+                # the display's leaves are its tuple rows, while the call
+                # binds the rows' members, so the list was not recognised
+                # as bound by member and stayed an escaped list with no
+                # capacity.  Rule: a row that is itself an authored
+                # aggregate is bound through its own members.
+                pending_leaves = list(map(int, leaves or ()))
+                member_leaves: set[int] = set()
+                while pending_leaves:
+                    leaf = pending_leaves.pop()
+                    if leaf in member_leaves:
+                        continue
+                    member_leaves.add(leaf)
+                    pending_leaves.extend(map(int, _authored_aggregate_leaves(
+                        _SiteGraph(G=caller_graph), leaf,
+                    ) or ()))
                 if (
                     leaves
                     and int(actual_id) not in bound_callers
-                    and set(map(int, leaves)) & bound_callers
+                    and member_leaves & bound_callers
                 ):
                     linked_argument_sites.add((
                         id(caller_graph), int(planned_call.callsite_id),
@@ -34347,7 +34388,7 @@ def _class_surface_ssa_program(
                     return result
                 if isinstance(literal, bool):
                     dtype = "bool"
-                elif type(literal) is int:
+                elif isinstance(literal, int):
                     from ..transmogrifier.dtype_layout import (
                         python_int_literal_dtype,
                     )

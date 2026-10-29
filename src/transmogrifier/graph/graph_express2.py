@@ -2615,12 +2615,16 @@ def _import_ast_bindings(tree, bindings, package=None):
     """Make imports and literal module constants visible to source discovery."""
 
     resolved = dict(bindings)
+    # ``ast.walk`` sees every import, guarded ones included: a backend module
+    # imported under ``try`` can fail with any error when its library is
+    # absent (``torch_backend``: ``torch.Tensor`` on ``torch = None``).  A
+    # module that does not import here binds nothing here.
     for statement in ast.walk(tree):
         if isinstance(statement, ast.Import):
             for imported in statement.names:
                 try:
                     value = importlib.import_module(imported.name)
-                except ImportError:
+                except Exception:
                     continue
                 resolved[imported.asname or imported.name.split(".")[0]] = value
         elif isinstance(statement, ast.ImportFrom):
@@ -2630,7 +2634,7 @@ def _import_ast_bindings(tree, bindings, package=None):
             )
             try:
                 module = importlib.import_module(module_name, package=package)
-            except (ImportError, TypeError, ValueError):
+            except Exception:
                 continue
             for imported in statement.names:
                 try:
