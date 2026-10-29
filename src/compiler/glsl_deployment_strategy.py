@@ -31618,66 +31618,44 @@ def _fold_callsite_structural_values(
                     for statement in function_body[source_index + 1:]
                     for member in ast.walk(statement)
                 )
-            selected_return_id = None
+            # Program: ``if domain == DOMAIN_TEXT: return TEXT_EMPTY_TOKEN``
+            # then ``return BYTES_EMPTY_TOKEN``, both module ints, specialized
+            # on ``domain=1`` (string-core ``Vocabulary._empty_token``).
+            # Wrong record: the selected value was looked up by local binding
+            # or by matching source text; a module constant has neither, so
+            # the later return sites were kept and the fallthrough
+            # ``return`` overwrote the selected one (native 2, Python 1).
+            # Rule: the reducer's ``return_slot_values`` ledger, keyed by the
+            # returned expression's span, is what a return site returns --
+            # every slot of it; a selected return site the ledger does not
+            # hold is refused by name.
+            selected_span = None
+            selected_slot_values = ()
             if (
                 selected_statements
                 and isinstance(selected_statements[-1], ast.Return)
                 and selected_statements[-1].value is not None
             ):
                 returned_expression = selected_statements[-1].value
-                if isinstance(returned_expression, ast.Name):
-                    history = tuple(map(
-                        int,
-                        (graph.G.graph.get("identity_table") or {}).get(
-                            returned_expression.id, ()
-                        ),
-                    ))
-                    selected_return_id = next((
-                        value_id for value_id in reversed(history)
-                        if value_id in graph.G
-                    ), None)
-                if selected_return_id is None:
-                    returned_signature = _ast_source_signature(
-                        returned_expression
-                    )
-                    matches = tuple(
-                        int(node_id)
-                        for node_id, data in graph.G.nodes(data=True)
-                        if isinstance(data.get("authored_expr_obj", data.get("expr_obj")), ast.AST)
-                        and _ast_source_signature(data.get("authored_expr_obj", data["expr_obj"]))
-                        == returned_signature
-                    )
-                    if len(matches) == 1:
-                        selected_return_id = matches[0]
-                # Program: ``if domain == DOMAIN_TEXT: return
-                # TEXT_EMPTY_TOKEN`` then ``return BYTES_EMPTY_TOKEN``, both
-                # module ints, specialized on ``domain=1`` (string-core
-                # ``Vocabulary._empty_token``).  Wrong record: a module
-                # constant is no local binding and its folded Constant has
-                # no authored expression, so neither lookup above found the
-                # selected value; the later return sites were kept and the
-                # fallthrough ``return`` overwrote the selected one (native
-                # 2, Python 1).  Rule: the reducer's ``return_slot_values``
-                # ledger, keyed by the returned expression's span, is the
-                # authority for what a single-slot site returns.
-                if (
-                    selected_return_id is None
-                    and getattr(returned_expression, "lineno", None) is not None
+                selected_span = (
+                    int(returned_expression.lineno),
+                    int(getattr(returned_expression, "col_offset", -1)),
+                    int(getattr(returned_expression, "end_lineno", -1)),
+                    int(getattr(returned_expression, "end_col_offset", -1)),
+                )
+                selected_slot_values = tuple(map(int, dict(
+                    graph.G.graph.get("return_slot_values") or {}
+                ).get(selected_span, ())))
+                if not selected_slot_values or any(
+                    slot not in graph.G for slot in selected_slot_values
                 ):
-                    site_slots = tuple(dict(
-                        graph.G.graph.get("return_slot_values") or {}
-                    ).get((
-                        int(returned_expression.lineno),
-                        int(getattr(returned_expression, "col_offset", -1)),
-                        int(getattr(returned_expression, "end_lineno", -1)),
-                        int(getattr(returned_expression, "end_col_offset", -1)),
-                    ), ()))
-                    if (
-                        len(site_slots) == 1
-                        and len(tuple(graph.G.graph.get("function_outputs") or ())) == 1
-                        and int(site_slots[0]) in graph.G
-                    ):
-                        selected_return_id = int(site_slots[0])
+                    raise ValueError(
+                        "structural fold selected the return at "
+                        f"{selected_span} of "
+                        f"{graph.G.graph.get('function_name')!r}, but "
+                        "return_slot_values holds no live slots for it "
+                        f"({selected_slot_values!r})"
+                    )
             control_signature = _ast_source_signature(expression)
             retained_control_id = next((
                 int(source_id)
@@ -31831,10 +31809,10 @@ def _fold_callsite_structural_values(
             remove_node(int(control_id))
             identities = graph.G.graph.get("identity_table") or {}
             return_sites_pruned_for_selected_arm = False
-            if selected_return_id is not None:
-                graph.roots = [int(selected_return_id)]
-                # ``selected_return_id`` is the return STATEMENT's value: for
-                # ``return a, b, c`` that is the Tuple node, not any slot.
+            if selected_slot_values:
+                graph.roots = list(selected_slot_values)
+                # The roots are the selected site's slots, not the return
+                # STATEMENT's value (for ``return a, b, c`` the Tuple node).
                 # The per-slot values of every return site are recorded by
                 # the reducer in ``return_slot_values``, keyed by the source
                 # span of the returned expression; that ledger is the
@@ -31849,17 +31827,7 @@ def _fold_callsite_structural_values(
                 # name-history repair then feeds the tuple to
                 # ``_propose_dt_pen(metrics, ...)`` and refuses the call with
                 # ``aggregate call binding for 'metrics' ... 3 != 0``.
-                returned_expression = selected_statements[-1].value
-                selected_span = (
-                    int(returned_expression.lineno),
-                    int(getattr(returned_expression, "col_offset", -1)),
-                    int(getattr(returned_expression, "end_lineno", -1)),
-                    int(getattr(returned_expression, "end_col_offset", -1)),
-                ) if getattr(returned_expression, "lineno", None) is not None else None
                 return_slots = dict(graph.G.graph.get("return_slot_values") or {})
-                selected_slot_values = tuple(
-                    return_slots.get(selected_span, ())
-                ) if selected_span is not None else ()
                 output_names = tuple(
                     graph.G.graph.get("function_outputs") or ()
                 )
@@ -31874,10 +31842,6 @@ def _fold_callsite_structural_values(
                         if index < len(selected_slot_values)
                         else None
                     )
-                    if slot_value is None and len(output_names) == 1:
-                        # A single-slot return has no container: the
-                        # statement's value is the slot's value.
-                        slot_value = int(selected_return_id)
                     if slot_value is not None and int(slot_value) in graph.G:
                         identities[str(output_name)] = (int(slot_value),)
                 if source_index is not None:
@@ -31892,7 +31856,6 @@ def _fold_callsite_structural_values(
                     selected_sites = {
                         site: slots for site, slots in return_slots.items()
                         if site == selected_span
-                        or tuple(slots) == (int(selected_return_id),)
                     }
                     if selected_sites:
                         graph.G.graph["return_slot_values"] = selected_sites
