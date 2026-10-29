@@ -1422,6 +1422,32 @@ def _authored_aggregate_descriptor_tree(graph: Any, value_id: int) -> Any:
             for leaf in leaves
         )
     descriptor = _tensor_descriptor(graph, value_id)
+    if descriptor is None and value_id in graph.G:
+        # Program: ``commit([(1, 2), (3, 4)], 2)`` binding its rows by
+        # member.  Wrong record: a literal member had no descriptor, so the
+        # callee's row reads had no dtype at all (refused).  Rule: an
+        # authored scalar literal states its own exact native layout.
+        member = graph.G.nodes[value_id]
+        if str(member.get("type") or "") in {"Constant", "Const", "const"}:
+            literal = (member.get("attributes") or {}).get(
+                "value", member.get("constant")
+            )
+            dtype = None
+            if type(literal) is bool:
+                dtype = "bool"
+            elif type(literal) is int:
+                from ..transmogrifier.dtype_layout import (
+                    python_int_literal_dtype,
+                )
+
+                try:
+                    dtype = python_int_literal_dtype(literal)
+                except OverflowError:
+                    dtype = None
+            elif type(literal) is float:
+                dtype = "float64"
+            if dtype is not None:
+                return {"shape": (), "dtype": dtype, "rank": 0}
     return (
         None if descriptor is None
         else copy.deepcopy(dict(descriptor))
@@ -6999,6 +7025,76 @@ def _build_shell_hierarchy_plan(
             )
             return (root, logical, dtype)
 
+        def _fixed_width_row_width(value_id):
+            """Width of the fixed-width tuple row ``value_id`` reads, or 1.
+
+            The row handle is read only by its literal column loads
+            (``_sequence_row_operations``).  Program: ``fingerprints[i][j]``
+            with a runtime ``j``, or ``sum(fingerprints[i])``.  Wrong
+            record: the handle reached a region as a scalar formal no
+            caller fills and every read gave 0 (silent).  Rule: any other
+            reader of a fixed-width row is refused here, before any record
+            of the row is used.
+            """
+
+            node = graph.G.nodes.get(int(value_id), {})
+            if str(node.get("type") or "") != "Indexed":
+                return 1
+            row_base = next((
+                int(parent) for parent, role in (node.get("parents") or ())
+                if str(role) == "base" and int(parent) in graph.G
+            ), None)
+            row_base_attributes = (
+                graph.G.nodes[row_base].get("attributes") or {}
+                if row_base is not None else {}
+            )
+            if row_base_attributes.get("aggregate_kind") not in {
+                "list", "tuple",
+            }:
+                return 1
+            row_width = max(
+                len(tuple(row_base_attributes.get(
+                    "sequence_member_class_refs", ()
+                ))),
+                int(row_base_attributes.get("sequence_column_count", 1) or 1),
+            )
+            if row_width <= 1:
+                return 1
+            from .resident_sequence_materialization import (
+                _loop_carried_initial_ids,
+            )
+
+            carried = set(_loop_carried_initial_ids(graph.G))
+            for child, role in node.get("children") or ():
+                reader = graph.G.nodes.get(int(child), {})
+                reader_roles = {
+                    str(reader_role): int(parent)
+                    for parent, reader_role in (reader.get("parents") or ())
+                }
+                column_node = graph.G.nodes.get(reader_roles.get("index"), {})
+                column = (column_node.get("attributes") or {}).get(
+                    "value", column_node.get("constant")
+                )
+                if not (
+                    str(role) == "base"
+                    and str(reader.get("type") or "") == "Indexed"
+                    and str(column_node.get("type") or "") in {
+                        "Constant", "Const", "const",
+                    }
+                    and reader_roles.get("index") not in carried
+                    and type(column) is int
+                    and 0 <= column < row_width
+                ):
+                    raise ValueError(
+                        f"row {int(value_id)} of a {row_width}-column tuple "
+                        "sequence in function "
+                        f"{graph.G.graph.get('function_name')!r} is read by "
+                        f"{reader.get('type') or reader.get('op')!r} (role "
+                        f"{str(role)!r}); only a literal column read of a "
+                        "fixed-width row is lowered"
+                    )
+            return row_width
+
         def _decide_value_shape(value_id):
             """A region value's record; a typed value with none refuses.
 
@@ -7008,6 +7104,7 @@ def _build_shell_hierarchy_plan(
             else without a settled dtype is a missing record: name it.
             """
 
+            _fixed_width_row_width(int(value_id))
             record = _value_shape_dtype(value_id)
             if record[2] is not None:
                 return record, _dtype_producer_cells(graph, int(value_id))
@@ -7030,9 +7127,37 @@ def _build_shell_hierarchy_plan(
                       or ()),
                     attributes.get("sequence_element_annotation_cell"),
                 )
+            member_classes = tuple(
+                str(member).removeprefix("builtins.")
+                for member in attributes.get("sequence_member_class_refs", ())
+            )
+            if (
+                attributes.get("aggregate_kind") in {"list", "tuple"}
+                and len(member_classes) > 1
+                and all(
+                    member in {"int", "float", "bool"}
+                    for member in member_classes
+                )
+            ):
+                # ``fingerprints: list[tuple[int, int]]``: the sequence
+                # handle's storage is its column-0 arena, whose class is the
+                # annotation's first tuple position.
+                return (record[0], record[1], {
+                    "int": "int64", "float": "float64", "bool": "bool",
+                }[member_classes[0]]), _dtype_producer_cells(
+                    graph, int(value_id),
+                    attributes.get("sequence_element_annotation_cell"),
+                )
+            row_width = _fixed_width_row_width(int(value_id))
             if attributes.get("program_abi_record_identity") or (
                 attributes.get("aggregate_kind") == "dict"
                 and attributes.get("mapping_value_tensor")
+            ) or (
+                # Program: ``fingerprint = fingerprints[i]`` over
+                # ``fingerprints: list[tuple[int, int]]``.  The row of a
+                # fixed-width tuple sequence is a handle onto its columns,
+                # which its ``fingerprint[k]`` reads load; it is no scalar.
+                row_width > 1
             ):
                 # A record value is a handle onto its fields' storage; so is
                 # a ``Mapping[K, Tensor]`` table, whose rows are child-row
@@ -28350,6 +28475,77 @@ def _fold_callsite_structural_values(
             bool(field.get("optional", False)),
         )
 
+    def uniform_tuple_row_width(row_id: int, reader_id: int) -> int | None:
+        """The width every row of ``row_id``'s base has, or None.
+
+        A row read ``xs[i]`` whose base is an immutable aggregate whose
+        members are all tuples of one width, or a formal declared as rows
+        of one width, has that width (and is not None), whichever row the
+        index selects.  The base must be neither loop-carried nor mutated.
+        The row read must keep a consumer other
+        than ``reader_id``, so it still reads its index and an out-of-range
+        index still faults where Python raises.
+        """
+        row = graph.G.nodes.get(int(row_id), {})
+        if str(row.get("type") or row.get("op") or "").casefold() not in {
+            "indexed", "getitem", "subscript",
+        }:
+            return None
+        row_base = next((
+            int(parent)
+            for parent, role in (row.get("parents") or ())
+            if str(role) in {"base", "value", "object"}
+        ), None)
+        if row_base is None or row_base not in graph.G:
+            return None
+        if not ({
+            int(child) for child, _role in (row.get("children") or ())
+        } - {int(reader_id)}):
+            return None
+        base_attributes = graph.G.nodes[row_base].get("attributes") or {}
+        if (
+            base_attributes.get("producer_kind") == "aggregate_parameter"
+            and base_attributes.get("aggregate_kind") in {"list", "tuple"}
+            and str(graph.G.nodes[row_base].get("type") or "") == "Input"
+        ):
+            # A formal whose rows the call edge (``sequence_column_count``)
+            # or the annotation (``tuple[int, int]`` positions) declares
+            # fixed-width is resident rows of exactly that width: a row of
+            # any other width is refused at insertion, so every row read
+            # has it, before or after an append to the formal.
+            declared = max(
+                int(base_attributes.get("sequence_column_count", 1) or 1),
+                len(tuple(base_attributes.get(
+                    "sequence_member_class_refs", ()
+                ))),
+            )
+            return declared if declared > 1 else None
+        if (
+            row_base in loop_carried_initial_ids
+            or row_base in loop_carried_updated_ids
+            or row_base in mutated_sequence_ids
+        ):
+            return None
+        if (
+            base_attributes.get("producer_kind") != "aggregate"
+            or base_attributes.get("aggregate_kind") != "tuple"
+        ):
+            return None
+        widths = set()
+        for leaf in base_attributes.get("aggregate_leaf_value_ids", ()):
+            leaf_attributes = (
+                graph.G.nodes[int(leaf)].get("attributes") or {}
+                if int(leaf) in graph.G else {}
+            )
+            if leaf_attributes.get("aggregate_kind") != "tuple":
+                return None
+            widths.add(len(tuple(
+                leaf_attributes.get("aggregate_leaf_value_ids", ())
+            )))
+        if len(widths) != 1:
+            return None
+        return min(widths)
+
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
         if (data.get("attributes") or {}).get("bound_method_ref") is not None:
             return unresolved
@@ -28947,6 +29143,20 @@ def _fold_callsite_structural_values(
             }
             left = known.get(parents.get("lhs", parents.get("left")), unresolved)
             right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            if (
+                isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+                and left is unresolved
+                and right is None
+                and parents.get("lhs", parents.get("left")) is not None
+                and uniform_tuple_row_width(
+                    int(parents.get("lhs", parents.get("left"))),
+                    int(node_id),
+                ) is not None
+            ):
+                # ``fingerprint is None`` over a row of ``[(1, n), (3,
+                # 4)]`` read by a loop-carried index: every row is a tuple,
+                # so none is None (``uniform_tuple_row_width``).
+                return isinstance(expression.ops[0], ast.IsNot)
             if left is unresolved or right is unresolved:
                 return unresolved
             comparison_node = expression.ops[0]
@@ -29075,6 +29285,22 @@ def _fold_callsite_structural_values(
                     str(program_abi_records[record_name]["identity"]),
                     "record", None,
                 )
+        if (
+            name == "len"
+            and len(arguments) == 1
+            and values[0] is unresolved
+            and (data.get("attributes") or {}).get("extraction_identity")
+            == "builtins.len"
+        ):
+            # Program: ``fingerprint = fingerprints[i]`` inside ``while i <
+            # count`` over ``[(1, n), (3, 4)]``, then ``len(fingerprint) !=
+            # 2``.  Wrong record: the row's index is loop-carried, so the row
+            # had no value here and ``len`` became a formal of the callee no
+            # caller fills (native raised the guard's ValueError for every
+            # row).  Rule: ``uniform_tuple_row_width``.
+            width = uniform_tuple_row_width(int(arguments[0]), int(node_id))
+            if width is not None:
+                return width
         if (name == "callable" and len(arguments) == 1
                 and (data.get("attributes") or {}).get("extraction_identity") == "builtins.callable"
                 and (graph.G.nodes[arguments[0]].get("attributes") or {}).get("bound_method_ref") is not None):
@@ -31957,7 +32183,24 @@ def _apply_callsite_aggregate_descriptors(
                 "aggregate_leaf_value_ids": leaves,
                 "tensor_output_descriptors": copy.deepcopy(tuple(members)),
                 "sequence_key_columns": (),
-                "sequence_column_count": 1,
+                # Program: ``commit(((1, n), (3, 4)), 2)`` reading
+                # ``fingerprints[i][0]``.  Wrong record: the formal kept a
+                # width of one while every member is a two-value row, so
+                # the row read was taken as a nested handle.  Rule: an
+                # aggregate whose members are all rows of one width has
+                # resident rows of that width, as the caller's display does.
+                "sequence_column_count": (
+                    len(members[0])
+                    if members
+                    and all(isinstance(member, tuple) for member in members)
+                    and len({len(member) for member in members}) == 1
+                    and len(members[0]) > 1
+                    and not any(
+                        isinstance(item, tuple)
+                        for member in members for item in member
+                    )
+                    else 1
+                ),
                 "sequence_writable": False,
             })
             formal = graph.G.nodes[input_id]
@@ -32734,6 +32977,29 @@ def _callsite_specialized_shell_type(
             caller, int(node_id), int(parent),
         ) and not _formal_is_mutated_in_place(original.G, parameter)
         leaves = _authored_aggregate_leaves(caller, int(parent))
+        if static_argument and leaves:
+            # Program: ``commit([(1, 2), (3, 4)], 2)`` reading
+            # ``fingerprints[i]`` with a loop-carried ``i``.  Wrong record:
+            # the all-literal rows became the callee's structural constant,
+            # which the planner reads as a 2x2 tensor while the resident
+            # sequence is two-column rows (rank 2 against rank 1, refused).
+            # Rule: rows of fixed-width tuples bind by member, exactly as
+            # the same display with one runtime element does.
+            try:
+                literal = _source_static_literal(caller, int(parent))
+            except ValueError:
+                literal = None
+            if (
+                isinstance(literal, (list, tuple))
+                and literal
+                and all(isinstance(row, tuple) for row in literal)
+                and len({len(row) for row in literal}) == 1
+                and len(literal[0]) > 1
+                and _aggregate_binds_by_member(
+                    caller.G, int(parent), original.G, parameter, int(node_id),
+                )
+            ):
+                static_argument = False
         if leaves and not static_argument and _aggregate_binds_by_member(
             caller.G, int(parent), original.G, parameter, int(node_id),
         ):

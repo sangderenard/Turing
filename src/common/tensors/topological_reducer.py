@@ -12724,6 +12724,58 @@ def _normalize_lexical_values(
                     base_class_cell.row, base_class_cell.column,
                 )
             )
+            row_data = (
+                graph.G.nodes[base_id]
+                if isinstance(base_id, int) and base_id in graph.G else {}
+            )
+            row_expression = row_data.get("expr_obj")
+            table_id = (
+                resolve_expression(row_expression.value)
+                if isinstance(row_expression, ast.Subscript)
+                and not isinstance(row_expression.slice, ast.Slice)
+                else None
+            )
+            table_attributes = (
+                graph.G.nodes[table_id].get("attributes") or {}
+                if isinstance(table_id, int) and table_id in graph.G else {}
+            )
+            table_members = tuple(
+                table_attributes.get("sequence_member_class_refs") or ()
+            )
+            table_cell = table_attributes.get("sequence_element_annotation_cell")
+            column = (
+                expression.slice.value
+                if isinstance(expression.slice, ast.Constant) else None
+            )
+            if (
+                type(column) is int
+                and len(table_members) > 1
+                and -len(table_members) <= column < len(table_members)
+                and table_cell is not None
+            ):
+                # Program: ``fingerprint = fingerprints[i]`` then
+                # ``fingerprint[0] * 100`` over ``fingerprints: list[tuple[
+                # int, int]]``.  Wrong record: only a destructuring loop
+                # target took its tuple position's class, so the indexed
+                # column read had none and its arithmetic no dtype.  Rule:
+                # a literal column of a row of the annotated sequence takes
+                # that position's class from the same annotation cell, as
+                # ``for a, b in ps`` does.
+                member_class = str(table_members[column])
+                graph.G.nodes[node_id].setdefault(
+                    "attributes", {}
+                )["result_class_ref"] = member_class
+                _concord_source_value_class(
+                    value_class_scope,
+                    int(node_id),
+                    member_class,
+                    source="declared sequence tuple-member column read",
+                    provenance=_Derived(tuple(dict.fromkeys(filter(None, (
+                        table_cell,
+                        node_identity_cell(graph, int(table_id)),
+                        node_identity_cell(graph, int(node_id)),
+                    ))))),
+                )
             if (
                 isinstance(expression.slice, ast.Slice)
                 and base_attributes.get("aggregate_kind") in {
@@ -13054,6 +13106,31 @@ def _normalize_lexical_values(
                 parent for _role, _ordinal, parent
                 in aggregate_member_positions
             )
+            if aggregate_kind in {"list", "tuple"} and aggregate_member_positions:
+                # Program: ``commit([(1, n), (3, 4)], 2)`` (string-core
+                # ``intern_preflighted_batch`` fingerprints).  Wrong record:
+                # the display kept the default width of one, so each
+                # two-value tuple row was an impossible insertion into a
+                # scalar arena.  Rule: as for a comprehension over a tuple
+                # expression, a display whose every element is a tuple
+                # display of one width authors fixed-width resident rows.
+                row_widths = {
+                    len(tuple(
+                        (graph.G.nodes[parent].get("attributes") or {}).get(
+                            "aggregate_leaf_value_ids", ()
+                        )
+                    ))
+                    if (
+                        parent in graph.G
+                        and (graph.G.nodes[parent].get("attributes") or {})
+                        .get("aggregate_kind") == "tuple"
+                    ) else 0
+                    for _role, _ordinal, parent in aggregate_member_positions
+                }
+                if len(row_widths) == 1 and min(row_widths) > 1:
+                    aggregate_attributes["sequence_column_count"] = min(
+                        row_widths
+                    )
             if aggregate_kind == "dict":
                 # A display whose every value is a list is a mapping of child
                 # lists: the value column holds child-pool row handles, as a
