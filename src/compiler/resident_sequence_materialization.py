@@ -3576,6 +3576,43 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         nodes_by_value.setdefault(
             int(candidate.get("value_id", candidate_id)), []
         ).append(candidate_id)
+    mutated_ids = {
+        int(record["sequence_value_id"])
+        for record in (
+            graph_obj.graph.get("source_sequence_mutation_records") or {}
+        ).values()
+    }
+    output_ids = {
+        int(value_id)
+        for name in tuple(graph_obj.graph.get("function_outputs") or ())
+        for value_id in tuple(
+            (graph_obj.graph.get("identity_table") or {}).get(str(name), ())
+        )
+    }
+    # Unread: no successor except other unread collections, its identity
+    # held by this node alone, never mutated and never an output.  A
+    # replication read by nothing leaves its row display unread too.
+    unread_candidates = {
+        int(node_id)
+        for node_id, data in graph_obj.nodes(data=True)
+        if (data.get("attributes") or {}).get("aggregate_kind") in {"list", "set"}
+        and nodes_by_value.get(int(data.get("value_id", node_id))) == [node_id]
+        and int(data.get("value_id", node_id)) not in mutated_ids
+        and int(data.get("value_id", node_id)) not in output_ids
+    }
+    unread_collections: set[int] = set()
+    grew = True
+    while grew:
+        grew = False
+        for candidate in unread_candidates - unread_collections:
+            readers = {int(reader) for reader in graph_obj.successors(candidate)}
+            readers.update(
+                int(child) for child, _role in
+                graph_obj.nodes[candidate].get("children") or ()
+            )
+            if readers <= unread_collections:
+                unread_collections.add(candidate)
+                grew = True
     for node_id, data in graph_obj.nodes(data=True):
         sequence_id = int(data.get("value_id", node_id))
         expression = data.get("expr_obj")
@@ -3599,6 +3636,16 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         # appends would give one member producer several control blocks,
         # which the control book cannot own (as ``[n, n]`` is refused
         # below).  Rule: refuse such a replication by name.
+        # Program: the tire's ``vector_cross`` (``left[..., 1]``; corpus
+        # c970), whose indexing builds ``[slice(None)] * rank``.  Wrong
+        # record: the index folded, so nothing reads the replication or
+        # its row display ``[slice(None)]``; the replication was still
+        # refused for its row operand (when folded too), and the display
+        # was still born, appending a slice selector as a row of no native
+        # dtype (C emission refused it, later crashed on dtype ``none``).
+        # Rule: an unread collection has no birth to lower or refuse.
+        if int(node_id) in unread_collections:
+            continue
         if attributes.get("producer_kind") == "sequence_replication":
             operands = [
                 int(parent) for parent, role in data.get("parents") or ()
