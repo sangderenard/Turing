@@ -1291,6 +1291,27 @@ SOURCE_EXCEPTION_SSA_CHECKPOINT = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSAReturnFinalizerFact:
+    """One pending source return crossing its exact Try finalbody."""
+
+    return_site: Ref
+    try_control: Ref
+    before_block: Ref
+    after_block: Ref
+    pending_values: tuple[Ref | None, ...]
+
+
+SOURCE_EXCEPTION_SSA_RETURN_FINALIZER = declare_page(
+    "source_exception_ssa_return_finalizer", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("return_site", K.PAGE_REF),
+        RowField("try_control", K.PAGE_REF),
+        RowField("before_block", K.PAGE_REF),
+    ), ExceptionSSAReturnFinalizerFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionSSARouteFact:
     """One native code comparison for a source-selected handler."""
 

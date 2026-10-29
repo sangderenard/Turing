@@ -1558,6 +1558,7 @@ class CorrelationTable:
         found.extend(self._source_exception_region_site_findings(module))
         found.extend(self._source_exception_region_state_findings(module))
         found.extend(self._source_exception_ssa_checkpoint_findings(module))
+        found.extend(self._source_exception_ssa_return_finalizer_findings(module))
         found.extend(self._source_exception_ssa_route_findings(module))
         found.extend(self._source_exception_ssa_handler_arm_findings(module))
         found.extend(self._source_exception_ssa_handler_state_findings(module))
@@ -2600,6 +2601,66 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-ssa-checkpoint-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_return_finalizer_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """A pending return cites its source site, Try, blocks and slots."""
+        from .concordance_declarations import (
+            CONTROL_BLOCK, SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
+            SSA_BLOCK, SSA_VALUE, ControlBlockKind,
+            ExceptionSSAReturnFinalizerFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_EXCEPTION_SSA_RETURN_FINALIZER)
+        found = []
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_RETURN_FINALIZER, row)
+            problem = None
+            if not isinstance(fact, ExceptionSSAReturnFinalizerFact):
+                problem = "pending return has no finalizer fact"
+            elif (
+                row[1:] != (
+                    fact.return_site, fact.try_control, fact.before_block,
+                )
+                or fact.try_control.page != CONTROL_BLOCK
+                or fact.try_control.row[1] is not ControlBlockKind.NATIVE_TRY
+                or any(
+                    cell.page != SSA_BLOCK or cell.row[0] != row[0]
+                    or book.latest_ref(SSA_BLOCK, cell.row) != cell
+                    for cell in (fact.before_block, fact.after_block)
+                )
+                or any(
+                    cell is not None and (
+                        cell.page != SSA_VALUE or cell.row[0] != row[0]
+                        or book.latest_ref(SSA_VALUE, cell.row) != cell
+                    ) for cell in fact.pending_values
+                )
+                or any(
+                    book.latest_ref(cell.page, cell.row) != cell
+                    for cell in (fact.return_site, fact.try_control)
+                )
+            ):
+                problem = "pending return disagrees with source or SSA cells"
+            elif receipt is None or {
+                cause for cause, _stage in book.edges_into(receipt)
+            } != {
+                fact.return_site, fact.try_control, fact.before_block,
+                fact.after_block,
+                *(cell for cell in fact.pending_values if cell is not None),
+            }:
+                problem = "pending return finalizer provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-return-finalizer-disagreement",
                     str(row), None, problem,
                 ))
         return found

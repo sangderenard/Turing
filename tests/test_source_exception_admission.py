@@ -18,6 +18,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_REGION_SITE,
     SOURCE_EXCEPTION_REGION_STATE,
     SOURCE_EXCEPTION_SSA_CHECKPOINT,
+    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
     SOURCE_EXCEPTION_SSA_ROUTE,
     SOURCE_EXCEPTION_SSA_HANDLER_ARM,
     SOURCE_EXCEPTION_SSA_HANDLER_STATE,
@@ -934,6 +935,149 @@ def root(x: int) -> int:
             for child in retained_try.handlers[0].body.blocks
         )
         assert program.region_indices == ()
+    finally:
+        end_identity_book(token)
+
+
+def test_return_in_try_reaches_finally_return_before_function_exit(monkeypatch):
+    source = """\
+def root(x: float) -> int:
+    try:
+        y = int(x)
+        return 1
+    finally:
+        return 2
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+    observed = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append((program, args[0], tuple(kwargs["dispatch_subgraphs"])))
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired) as refusal:
+            _lower(source, "exception_finally_override", identity_book=book)
+        assert observed, str(refusal.value)
+        (program, graph, subgraphs), = observed
+        try_row, = tuple(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        constants = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("op")).casefold() == "const"
+        )
+        lowered, shortfalls = lower_control_program_to_ssa(
+            program, function_name="exception_finally_override_probe",
+            first_value_id=1000, lexical_read_scope=try_row[0],
+            planning_scope=graph.G.graph.get("planning_scope"),
+            constant_value_ids=constants,
+        )
+        assert any(
+            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
+        )
+        returns = tuple(
+            (block.name, instruction)
+            for block in lowered.blocks.values()
+            for instruction in block.instrs
+            if instruction.attributes.get("source_control") == "return"
+        )
+        assert len(returns) >= 2
+        pending_row, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+        ).rows())
+        pending = book.page(SOURCE_EXCEPTION_SSA_RETURN_FINALIZER).latest(
+            pending_row
+        )
+        assert pending.before_block.row[2] == "entry"
+        assert returns[0][1].attributes["return_site_cell"] != pending.return_site
+        assert returns[1][1].attributes["return_site_cell"] == pending.return_site
+        assert not any(
+            pending.after_block.row[2] in block.successors
+            for block in lowered.blocks.values()
+        )
+        assert CorrelationTable._source_exception_ssa_return_finalizer_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    finally:
+        end_identity_book(token)
+
+
+def test_handler_return_refuses_finalizer_without_exceptional_entry_phi(monkeypatch):
+    source = """\
+def root(x: float) -> float:
+    y = 0.0
+    try:
+        y = int(x)
+    except ValueError:
+        return 1.0
+    finally:
+        y = y + 1.0
+    return y
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+    observed = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append((program, args[0], tuple(kwargs["dispatch_subgraphs"])))
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_handler_finally_return", identity_book=book)
+        (program, graph, subgraphs), = observed
+        site_row, = tuple(book.page(SOURCE_EXCEPTION_REGION_SITE).rows())
+        assert len(program.region_indices) == 2, program.region_indices
+        finalizer_node, = tuple(subgraphs[1].G.graph["deployment_nodes"])
+        try_row, = tuple(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        constants = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("op")).casefold() == "const"
+        )
+        state_constants = tuple(
+            int(book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
+                row
+            ).canonical_value.row[1])
+            for row in book.page(SOURCE_EXCEPTION_REGION_STATE).rows()
+        )
+        with pytest.raises(ValueError, match=(
+            "pending return finalizer lacks source exceptional entry Phi"
+        )):
+            lower_control_program_to_ssa(
+                program,
+                function_name="exception_handler_finally_return_probe",
+                first_value_id=1000, lexical_read_scope=try_row[0],
+                planning_scope=site_row[0],
+                region_signatures={
+                    0: ((0,), (int(site_row[2]),)),
+                    1: (tuple(map(
+                        int, graph.G.predecessors(finalizer_node)
+                    )), (int(finalizer_node),)),
+                },
+                constant_value_ids=(*constants, *state_constants),
+            )
     finally:
         end_identity_book(token)
 

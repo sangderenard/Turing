@@ -12029,6 +12029,102 @@ class _ControlSSABuilder(TiledObject):
         })
         self.current = resume
 
+    def _emit_native_return_finalizers(
+        self, block: LoopControlBlock, edge_values: tuple[SSAValue | None, ...],
+        path: str,
+    ) -> None:
+        """Run each active source Try finalbody with return slots pending."""
+        if not self._native_try_frames:
+            return
+        if self.resource_scopes:
+            raise ValueError(
+                "pending return finalizer lacks resource cleanup ordering: "
+                f"{path}"
+            )
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
+            ExceptionSSAReturnFinalizerFact,
+        )
+
+        if block.return_site_cell is None:
+            raise ValueError(
+                "native Try return has no exact authored return site: "
+                f"{path}"
+            )
+        book = self._book()
+        frames = tuple(self._native_try_frames)
+        pending = tuple(
+            self._value_cell(value) if value is not None else None
+            for value in edge_values
+        )
+        for index in range(len(frames) - 1, -1, -1):
+            frame = frames[index]
+            before = self.current
+            for child in getattr(frame["block"].finalbody, "blocks", ()):
+                if not isinstance(child, StatementBlock):
+                    continue
+                for line in child.lines:
+                    marker = _REGION_MARKER.fullmatch(str(line))
+                    if marker is None:
+                        continue
+                    region = int(marker.group(1))
+                    # Program: `y=0; try:y=int(x); except ValueError:
+                    # return 1; finally:y=y+1`. The finalizer region's
+                    # authored feed is the successful cast, while the
+                    # handler return needs failed-site y=0. An SSA argument
+                    # stand-in can even make the cast appear to dominate.
+                    # Until a source finalizer-entry Phi correlates these
+                    # identities, no data-bearing finalizer is executable
+                    # on a pending return path.
+                    raise ValueError(
+                        "pending return finalizer lacks source exceptional "
+                        f"entry Phi: region={region}, path={path}"
+                    )
+            before_cell = book.latest_ref(
+                SSA_BLOCK, (self._scope(), self.function_name, before.name),
+            )
+            if before_cell is None:
+                raise ValueError(
+                    f"native return finalizer lacks entry block: {path}"
+                )
+            # Program: `try: y=int(x); return 1; finally: return 2`.
+            # The source return's slot 1 is evaluated before finalbody; its
+            # function-exit branch must wait. Hide only this Try while its
+            # finalbody runs, so a return there overrides the pending one
+            # and any enclosing Try still runs its own finalbody.
+            saved_frames = self._native_try_frames
+            self._native_try_frames = list(frames[:index])
+            try:
+                self.lower(
+                    frame["block"].finalbody,
+                    path=f"{path}.pending_finally[{index}]",
+                )
+            finally:
+                self._native_try_frames = saved_frames
+            after_cell = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, self.current.name),
+            )
+            if after_cell is None:
+                raise ValueError(
+                    f"native return finalizer lacks exit block: {path}"
+                )
+            causes = (
+                block.return_site_cell, frame["owner"], before_cell,
+                after_cell, *(cell for cell in pending if cell is not None),
+            )
+            book.post(
+                SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
+                (self._scope(), block.return_site_cell,
+                 frame["owner"], before_cell),
+                ExceptionSSAReturnFinalizerFact(
+                    block.return_site_cell, frame["owner"], before_cell,
+                    after_cell, pending,
+                ),
+                stage=self._stage(), provenance=Derived(causes),
+                mode=Mode.CONCORD,
+            )
+
     def lower_native_try(
         self, block: NativeTryBlock, *, path: str,
     ) -> None:
@@ -12091,7 +12187,11 @@ class _ControlSSABuilder(TiledObject):
         finally:
             self._native_try_frames.pop()
         if block.orelse is not None:
-            self.lower(block.orelse, path=f"{path}.try_else")
+            self._native_try_frames.append(frame)
+            try:
+                self.lower(block.orelse, path=f"{path}.try_else")
+            finally:
+                self._native_try_frames.pop()
         normal = self.current
         continuation_sources = {}
         for source_phi in block.continuation_phi_cells:
@@ -12755,10 +12855,14 @@ class _ControlSSABuilder(TiledObject):
                         "native handler differing name has no exact Phi: "
                         f"handler={source_handler!r}, name={name!r}"
                     )
-            self.lower(
-                block.handlers[handler_ordinals[source_handler]].body,
-                path=f"{path}.try_handler[{handler_ordinals[source_handler]}]",
-            )
+            self._native_try_frames.append(frame)
+            try:
+                self.lower(
+                    block.handlers[handler_ordinals[source_handler]].body,
+                    path=f"{path}.try_handler[{handler_ordinals[source_handler]}]",
+                )
+            finally:
+                self._native_try_frames.pop()
             handled = tuple(
                 any(
                     fact.arm_kind == "handler"
@@ -13072,6 +13176,9 @@ class _ControlSSABuilder(TiledObject):
             if block.predicate_value_id is None and (
                 block.predicate_expression is None
             ):
+                self._emit_native_return_finalizers(
+                    block, edge_values, path,
+                )
                 self._emit_resource_cleanup("return", path)
                 self.function_return_edges.append((self.current, edge_values))
                 self.branch(exit_block)
@@ -13101,6 +13208,9 @@ class _ControlSSABuilder(TiledObject):
                 )
                 self.current.instrs[-1].attributes["source_control"] = "return"
                 self.current = returning
+                self._emit_native_return_finalizers(
+                    block, edge_values, path,
+                )
                 self._emit_resource_cleanup("return", path)
                 self.function_return_edges.append((self.current, edge_values))
                 self.branch(exit_block)
