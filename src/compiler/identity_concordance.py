@@ -1931,7 +1931,9 @@ class CorrelationTable:
         appear on the edge in inner-to-outer order.
         """
 
-        from .concordance_declarations import SOURCE_EXCEPTION_TRANSFER
+        from .concordance_declarations import (
+            CANONICAL_VALUE, SOURCE_EXCEPTION_TRANSFER,
+        )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None or SOURCE_EXCEPTION_TRANSFER.name not in book.pages:
@@ -1971,6 +1973,32 @@ class CorrelationTable:
                     str(row[0]), int(row[1]),
                     f"source cell {fact.source!r} names another node",
                 ))
+            entry = tuple(fact.entry_bindings)
+            names = tuple(name for name, _cell in entry)
+            transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+            causes = {
+                source for source, _stage in (
+                    () if transfer_cell is None
+                    else book.edges_into(transfer_cell)
+                )
+            }
+            if len(names) != len(set(names)) or names != tuple(sorted(names)):
+                found.append(Finding(
+                    "source-exception-entry-bindings-disagree", str(row[0]),
+                    int(row[1]), f"binding names={names!r}",
+                ))
+            for name, value_cell in entry:
+                if (
+                    value_cell.page != CANONICAL_VALUE
+                    or value_cell.row[0] != row[0]
+                    or value_cell not in causes
+                ):
+                    found.append(Finding(
+                        "source-exception-entry-value-disagree", str(row[0]),
+                        int(row[1]),
+                        f"{name!r} has no same-scope canonical cause: "
+                        f"{value_cell!r}",
+                    ))
         return found
 
     @staticmethod

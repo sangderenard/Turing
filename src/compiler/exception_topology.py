@@ -28,6 +28,7 @@ class ExceptionTransfer:
     catch_try_node_id: int | None
     scopes: tuple[ExceptionScope, ...]
     unwind_finally_node_ids: tuple[int, ...]
+    entry_bindings: tuple[tuple[str, int], ...]
 
 
 def resolved_handler_declarations(
@@ -116,7 +117,8 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
 
     from ..common.tensors.topological_reducer import node_identity_cell
     from .concordance_declarations import (
-        EXCEPTION_TOPOLOGY, SOURCE_EXCEPTION_TRANSFER,
+        EXCEPTION_TOPOLOGY, SOURCE_CONTROL_SPECIALIZATION,
+        SOURCE_EXCEPTION_TRANSFER,
         ExceptionTransferFact,
     )
     from .identity_concordance import Derived, Mode, current_identity_book
@@ -133,6 +135,51 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
         expression = data.get("expr_obj")
         if isinstance(expression, ast.AST):
             by_expression.setdefault(id(expression), []).append(int(node_id))
+    book = current_identity_book()
+    # Structural specialization may retire a whole If arm before exception
+    # topology is posted.  Program: the codec's impossible
+    # `if not isinstance(octets, AbstractTensor)` body owns a TypeError Raise
+    # whose graph node is correctly gone.  The source control record retains
+    # the exact If occurrence and SOURCE_CONTROL_SPECIALIZATION records which
+    # arm was rejected.  Skip only that proven arm; every other missing Raise
+    # or Try remains a compiler error.
+    selected_if_arms: dict[int, str] = {}
+    control_records = G.graph.get("source_control_records") or {}
+    function_name = G.graph.get("function_name")
+    for row in book.page(SOURCE_CONTROL_SPECIALIZATION).rows():
+        if function_name is not None and str(row[0]) != str(function_name):
+            continue
+        selection = book.page(SOURCE_CONTROL_SPECIALIZATION).latest(row)
+        if not isinstance(selection, dict):
+            continue
+        control_id = selection.get("graph_control_id")
+        record = control_records.get(control_id)
+        if not isinstance(record, dict):
+            continue
+        expression = record.get("expression")
+        if not isinstance(expression, ast.If):
+            continue
+        if selection.get("proof") != "structural_constant_predicate":
+            raise ValueError(
+                "exception topology has unsupported If specialization "
+                f"proof: control={control_id}, proof={selection.get('proof')!r}"
+            )
+        selected = str(selection.get("selected_role"))
+        rejected = str(selection.get("rejected_role"))
+        if (selected, rejected) not in {
+            ("body", "orelse"), ("orelse", "body"),
+        }:
+            raise ValueError(
+                "exception topology has inconsistent If arm selection: "
+                f"control={control_id}, selected={selected!r}, "
+                f"rejected={rejected!r}"
+            )
+        previous = selected_if_arms.setdefault(id(expression), selected)
+        if previous != selected:
+            raise ValueError(
+                "one authored If has conflicting specialized arms: "
+                f"control={control_id}"
+            )
 
     def source_node(expression: ast.AST, *, required: bool = True) -> int | None:
         candidates = tuple(by_expression.get(id(expression), ()))
@@ -154,12 +201,13 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
         # authored Raise always has one, including at function scope.
         if isinstance(expression, ast.Call) and not scopes:
             return
-        source_id = source_node(expression, required=False)
+        source_id = source_node(
+            expression, required=isinstance(expression, ast.Raise),
+        )
         if source_id is None:
-            # Structural specialization has removed this source operation
-            # from the active value graph.  No live execution can transfer
-            # from it; retained source syntax still supplies nesting for
-            # operations that remain represented.
+            # Structural specialization may remove a Call.  An authored
+            # Raise and its Try owner are required above: their missing
+            # graph identities are compiler errors, never silent skips.
             return
         destination_index = next((
             index for index in range(len(scopes) - 1, -1, -1)
@@ -178,12 +226,19 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             for item in reversed(crossed)
             if item.has_finally and item.arm != "finalbody"
         ))
+        site_states = G.graph.get("source_exception_site_bindings") or {}
+        if source_id not in site_states:
+            raise ValueError(
+                "live exception operation has no exact lexical entry state: "
+                f"source={source_id}, kind={type(expression).__name__}"
+            )
         transfer = ExceptionTransfer(
             source_node_id=source_id,
             source_kind="raise" if isinstance(expression, ast.Raise) else "call",
             catch_try_node_id=destination,
             scopes=scopes,
             unwind_finally_node_ids=unwind,
+            entry_bindings=tuple(site_states[source_id]),
         )
         if source_id in transfers and transfers[source_id] != transfer:
             raise ValueError(
@@ -196,14 +251,13 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             # A nested definition has its own function exception boundary.
             return
+        if isinstance(node, ast.If) and id(node) in selected_if_arms:
+            selected = selected_if_arms[id(node)]
+            for member in (node.body if selected == "body" else node.orelse):
+                walk(member, scopes)
+            return
         if isinstance(node, ast.Try):
-            try_id = source_node(node, required=False)
-            if try_id is None:
-                if any(id(member) in by_expression for member in ast.walk(node)):
-                    raise ValueError(
-                        "live exception operation has no exact Try owner"
-                    )
-                return
+            try_id = source_node(node)
             has_finally = bool(node.finalbody)
 
             def arm(name: str, handler_id: int | None = None):
@@ -236,7 +290,6 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
     for statement in body:
         walk(statement, ())
 
-    book = current_identity_book()
     for source_id, transfer in sorted(transfers.items()):
         source_cell = node_identity_cell(graph, source_id)
         target_cell = (
@@ -256,9 +309,13 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             node_identity_cell(graph, node_id)
             for node_id in transfer.unwind_finally_node_ids
         )
+        entry_bindings = tuple(
+            (name, node_identity_cell(graph, value_id))
+            for name, value_id in transfer.entry_bindings
+        )
         fact = ExceptionTransferFact(
             source_cell, transfer.source_kind, target_cell,
-            scope_cells, finalizer_cells,
+            scope_cells, finalizer_cells, entry_bindings,
         )
         dependencies = tuple(dict.fromkeys((
             source_cell,
@@ -266,6 +323,7 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             *(item for owner, _arm, handler, _has_finally in scope_cells
               for item in (owner, handler) if item is not None),
             *finalizer_cells,
+            *(cell for _name, cell in entry_bindings),
         )))
         row = (scope, source_id)
         previous = book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)

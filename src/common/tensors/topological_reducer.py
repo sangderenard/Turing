@@ -6718,6 +6718,28 @@ def _normalize_lexical_values(
     )
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
+    # The source exception-transfer fact owns the execution state at each
+    # fallible source operation.  Keep exact authored occurrences until the
+    # topology pass can correlate them with their source graph cells.  In
+    # particular, the second conversion in tensor_octets_to_bytes sees the
+    # first conversion's binding, while the first does not.
+    exception_site_bindings: dict[int, tuple[tuple[str, int], ...]] = {}
+    graph.G.graph["source_exception_site_bindings"] = exception_site_bindings
+
+    def capture_exception_site(expression: ast.AST) -> None:
+        if id(expression) not in graph.G:
+            return
+        bindings = tuple(sorted(
+            (str(name), int(value))
+            for name, value in environment.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        ))
+        prior = exception_site_bindings.setdefault(id(expression), bindings)
+        if prior != bindings:
+            raise ValueError(
+                "one source exception site has conflicting lexical states: "
+                f"node={id(expression)}, before={prior!r}, after={bindings!r}"
+            )
     deleted_names: set[str] = set()
     identity_bindings: dict[str, list[int]] = {}
     # Exact AST ownership of assignment sites, not a source-line containment
@@ -9820,6 +9842,7 @@ def _normalize_lexical_values(
     def resolve_expression(expression: ast.AST | None) -> int | None:
         result = resolve_expression_value(expression)
         if isinstance(expression, ast.Call):
+            capture_exception_site(expression)
             # IdentityBook.project_cells evaluates clock=projected.clock
             # before IdentityPage(..., book=projected) can touch the book.
             # Publish possible call stores only after resolving that call's
@@ -18333,6 +18356,8 @@ def _normalize_lexical_values(
         for child in source_child_nodes(body_statement):
             if isinstance(child, ast.expr):
                 resolve_expression(child)
+        if isinstance(body_statement, ast.Raise):
+            capture_exception_site(body_statement)
         return id(body_statement) if id(body_statement) in graph.G else None
 
     def post_return_output_arms() -> None:
@@ -18793,6 +18818,31 @@ def _normalize_lexical_values(
     ordered_graph = ordered_memory_graph.G
     ordered_graph.graph.update(graph.G.graph)
     ordered_graph.graph["canonical_value_ids"] = True
+    # The authored exception occurrence keeps its AST identity, but its
+    # lexical values must cross the same canonical relabel as every operand.
+    # A live failure edge may not carry an ingestion id into canonical SSA.
+    canonical_exception_states = {}
+    for site_id, bindings in (
+        graph.G.graph.get("source_exception_site_bindings") or {}
+    ).items():
+        if int(site_id) not in mapping:
+            continue
+        missing = tuple(
+            (name, int(value_id)) for name, value_id in bindings
+            if int(value_id) not in mapping
+        )
+        if missing:
+            raise ValueError(
+                "live exception site has lexical values without canonical "
+                f"identities: site={site_id}, missing={missing!r}"
+            )
+        canonical_exception_states[int(mapping[int(site_id)])] = tuple(
+            (name, int(mapping[int(value_id)]))
+            for name, value_id in bindings
+        )
+    ordered_graph.graph["source_exception_site_bindings"] = (
+        canonical_exception_states
+    )
     # Renumbering changes the id space; a watermark from the AST-id
     # ingestion graph must not leak into canonical allocation.  Seed a new
     # watermark at the top of the canonical id space, though: planner passes

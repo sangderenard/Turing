@@ -1154,6 +1154,9 @@ class ExceptionTransferFact:
     catch_try: Ref | None
     scopes: tuple[tuple[Ref, str, Ref | None, bool], ...]
     unwind_finally: tuple[Ref, ...]
+    # The exact lexical values live before this source operation completes.
+    # A handler entry selects only the exceptional predecessors reaching it.
+    entry_bindings: tuple[tuple[str, Ref], ...]
 
 
 SOURCE_EXCEPTION_TRANSFER = declare_page(
