@@ -973,6 +973,20 @@ def specialize_python_precision_widths(graph: Any) -> bool:
     ) + tuple(
         (("iterated_class", identity), domain)
         for identity, domain in sorted(iterable_domains.items(), key=lambda item: repr(item[0]))
+    ) + tuple(
+        # Program: ``check(1 + seed % 2, n)`` and ``check(1 << 64, n)``
+        # (string-core ``validate_batch_envelope(1 << 64, ...)`` beside
+        # ``intern(1, ...)``).  Wrong record: the two callsite copies differ
+        # only by their actual's proven interval, which the receipt left
+        # out, so both shared one numeric scope and the second copy's
+        # formal range ((2**64, 2**64)) disagreed with the first's ((1, 2)):
+        # ``source_int_range_concordance disagreement``.  Rule: the interval
+        # a copy is minted for (``planner_parameter_int_ranges``) is part of
+        # its numeric identity.
+        (f"int_range:{name}", (int(interval[0]), int(interval[1])))
+        for name, interval in sorted(
+            dict(metadata.get("planner_parameter_int_ranges") or {}).items()
+        )
     )
     digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
     scope = (authored_scope, "specialization", digest)
