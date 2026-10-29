@@ -1,0 +1,4 @@
+2026-10-29 Precision ABI spelling join (MEASURED, tests/test_complex_precision.py::test_source_compiler_lowers_complex_precision_as_two_real_expansions):
+- Removed: `_canonical_program_abi_type_identity` folded the string `src.common.tensors.extended_precision.Precision` to `Precision` by name.
+- Now: a class with no ProgramABI record is looked up in the `source_record_class` row that retain ingestion already posts (defining identity -> the retained ClassDef), and canonicalized to that ClassDef's schema identity (`class_schema_identity`, the same key `_class_schema_from_ast` uses). Without it the contract's qualified name and the annotation's row became two union alternatives (12 formals instead of 8).
+- Unchanged baseline: the two complex-rational-precision tests in test_rational_compiler still error as on main; test_value_union_abi has the same 4 failures as main.
