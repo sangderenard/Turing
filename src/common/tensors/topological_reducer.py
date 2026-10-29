@@ -11504,13 +11504,29 @@ def _normalize_lexical_values(
                         "tuple", "frozenset", "bytes"
                     },
                 })
+                constructor_arguments = tuple(
+                    int(parent)
+                    for parent, role in constructor.get("parents") or ()
+                    if str(role).startswith(("arg", "kw:"))
+                )
+                # Program: ``rows = list(self.values[b : b + 2]); rows[0]``
+                # and ``for x in list(xs)`` (string core ``expand``/``cover``).
+                # Wrong record: the one argument of ``list(x)`` was recorded
+                # as the result's sole member, so ``rows[0]`` read the whole
+                # slice and the loop ran once over ``xs`` itself.  Rule:
+                # ``list``/``tuple``/``set``/``frozenset`` of one iterable
+                # copy its ROWS; the iterable is no member.  (``bytes([v])``
+                # keeps its argument edge: its lowering reads that list's
+                # own leaves.)
+                if (
+                    aggregate_kind in {"list", "tuple", "set", "frozenset"}
+                    and len(expression.args) == 1
+                    and not expression.keywords
+                    and not isinstance(expression.args[0], ast.Starred)
+                ):
+                    constructor_arguments = ()
                 constructor_attributes.setdefault(
-                    "aggregate_leaf_value_ids",
-                    tuple(
-                        int(parent)
-                        for parent, role in constructor.get("parents") or ()
-                        if str(role).startswith(("arg", "kw:"))
-                    ),
+                    "aggregate_leaf_value_ids", constructor_arguments,
                 )
                 # The admitted builtin constructor is the semantic source
                 # declaration for its result.  Publish that declaration to
@@ -12474,13 +12490,19 @@ def _normalize_lexical_values(
             if (
                 isinstance(expression.slice, ast.Slice)
                 and base_attributes.get("aggregate_kind") in {
-                    "list", "set", "frozenset", "tuple",
+                    "list", "set", "frozenset", "tuple", "array",
                 }
             ):
                 # A sequence slice preserves the declared row contract.  In
                 # ``for line in items[1:]`` the iterator is this slice, not
                 # the parameter Input, so dropping the element-class edge
                 # here made the loop target an untyped int64 token.
+                # Program: Token Orchard ``Vocabulary.expand`` --
+                # ``list(self.exact_atoms[begin : begin + count])`` on an
+                # ``array("I")``.  Wrong record: an array base was not a
+                # sequence here, so the slice had no row contract and every
+                # read of its rows refused ("has no settled dtype").  Rule:
+                # ``a[i:j]`` of an array is an array of the same typecode.
                 projected = graph.G.nodes[node_id].setdefault(
                     "attributes", {}
                 )

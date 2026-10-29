@@ -1486,7 +1486,12 @@ def _source_sequence_snapshots(graph_obj: Any):
         if len(sources) != 1:
             continue
         source = sources[0]
-        if (graph_obj.nodes.get(source, {}).get("attributes") or {}).get("aggregate_kind") not in {"list", "tuple"}:
+        # ``list(a)`` of an ``array`` copies its rows exactly as ``list(xs)``
+        # does (Token Orchard ``list(self.exact_atoms[b : b + n])``); without
+        # the copy the result read its argument as a one-member display.
+        if (graph_obj.nodes.get(source, {}).get("attributes") or {}).get(
+            "aggregate_kind"
+        ) not in {"list", "tuple", "array"}:
             continue
         mutations.append(ControlSequenceMutation(
             int(node_id), "replace", (source,), int(node_id), policy="duplicates",
@@ -1530,7 +1535,13 @@ def _source_sequence_slices(graph_obj: Any):
 
     for node_id, data in graph_obj.nodes(data=True):
         attrs = data.get("attributes") or {}
-        if (attrs.get("aggregate_kind") != "list"
+        # Program: Token Orchard ``list(self.exact_atoms[b : b + n])`` on an
+        # ``array("I")`` field.  Wrong record: only list slices were filled,
+        # so an array slice's own arena was never written and its value was
+        # defined after the loop reading it.  Rule: ``a[i:j]`` of an array
+        # is a new array of the same typecode, filled exactly as a list
+        # slice is.
+        if (attrs.get("aggregate_kind") not in {"list", "array"}
                 or attrs.get("producer_kind") != "sequence_slice"):
             continue
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
@@ -1553,7 +1564,9 @@ def _source_sequence_slices(graph_obj: Any):
         if len(storage_nodes) != 1:
             continue
         storage_node = graph_obj.nodes[storage_nodes[0]]
-        if (storage_node.get("attributes") or {}).get("aggregate_kind") != "list":
+        if (storage_node.get("attributes") or {}).get("aggregate_kind") != attrs.get(
+            "aggregate_kind"
+        ):
             continue
         selector_data = graph_obj.nodes[selector]
         folded, selector_literal = literal_of(selector)
