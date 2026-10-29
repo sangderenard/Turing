@@ -406,12 +406,38 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         static method only.  ``Ops.m(obj, x)`` on an instance method passes
         ``obj`` as ``self``, which a receiver edge cannot state, so it stays
         unlinked.
+
+        Program: ``CorrelationTable.build(module)`` with ``build`` a class
+        method (bootstrap, c940).  A class method binds the class object as
+        ``cls``: the receiver edge states exactly that binding, so it is
+        admitted with the static methods.
         """
 
         node = graph.G.nodes.get(int(receiver_id), {})
         if class_object_binding(node.get("attributes") or {}) is None:
             return True
-        return method_bindings.get(int(reference)) == "static"
+        return method_bindings.get(int(reference)) in {"static", "class"}
+
+    def own_instance_receiver(argument: ast.AST) -> bool:
+        """``argument`` is this instance method's never-rebound ``self``:
+        an instance of its authored owner class."""
+
+        if graph.G.graph.get("method_binding") != "instance":
+            return False
+        from .call_argument_binding import _method_parameter_layout
+
+        receiver_name = _method_parameter_layout(graph.G)[0]
+        return (
+            receiver_name is not None
+            and isinstance(argument, ast.Name)
+            and argument.id == receiver_name
+            and str(graph.G.graph.get("method_owner") or "") in class_table
+            and len(tuple(
+                (graph.G.graph.get("identity_table") or {}).get(
+                    receiver_name, ()
+                )
+            )) <= 1
+        )
 
     def receiver_class(value_id: int) -> str | None:
         pending = [int(value_id)]
@@ -588,6 +614,58 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                 expression.func.value.id,
                 expression.func.attr,
             )
+        if (
+            reference is not None
+            and not class_object_call_admits(receiver_id, reference)
+            and method_bindings.get(int(reference)) == "instance"
+            and expression.args
+            and not isinstance(expression.args[0], ast.Starred)
+            and any(
+                str(role) == "arg:0" and (
+                    receiver_class(int(parent)) in class_table
+                    or own_instance_receiver(expression.args[0])
+                )
+                for parent, role in (data.get("parents") or ())
+            )
+        ):
+            # Program: ``IdentityBook._page(self, name)`` in a subclass's
+            # ``_page`` (bootstrap ``_ConcurrentIdentityBook``, c941).  Wrong
+            # record: the explicit first argument is the instance method's
+            # ``self``, which the receiver edge (the class object) could not
+            # state, so the call was refused.  Rule: ``Cls.m(obj, *rest)``
+            # binds ``obj`` (an instance of an authored class) as the
+            # receiver of ``Cls.m`` itself, never a receiver-class dispatch,
+            # and ``rest`` shifts down one place.  Any other ``obj`` keeps
+            # the refusal below.
+            rewritten = _syntax_copy(expression)
+            rewritten.func = ast.copy_location(ast.Attribute(
+                value=_syntax_copy(expression.args[0]),
+                attr=expression.func.attr, ctx=ast.Load(),
+            ), expression.func)
+            rewritten.args = [
+                _syntax_copy(argument) for argument in expression.args[1:]
+            ]
+            data.setdefault("authored_expr_obj", expression)
+            data["expr_obj"] = rewritten
+            parents = []
+            for parent, role in data.get("parents") or ():
+                role = str(role)
+                if role in {"operand", "receiver"}:
+                    continue
+                if role == "arg:0":
+                    role = "operand"
+                elif role.startswith("arg:") and role[4:].isdigit():
+                    role = f"arg:{int(role[4:]) - 1}"
+                parents.append((int(parent), role))
+            _set_operands(graph, int(_node_id), parents, cause=_BOUND_RECEIVER)
+            attributes = dict(data.get("attributes") or {})
+            attributes.update({
+                "method_ref": int(reference),
+                "method_resolution": "explicit-class-ref",
+                "receiver_class_ref": class_identity,
+            })
+            data["attributes"] = attributes
+            continue
         if reference is not None and not class_object_call_admits(
             receiver_id, reference,
         ):
