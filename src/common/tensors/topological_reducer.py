@@ -21623,7 +21623,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                     and keyword.value.value is True
                     for keyword in decorator.keywords
                 )
-                for decorator in definition.decorator_list
+                for decorator in getattr(
+                    definition, "_turing_declared_decorators",
+                    definition.decorator_list,
+                )
             ),
         }
         for class_name, definition in class_definitions.items()
