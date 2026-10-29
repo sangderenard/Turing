@@ -19,6 +19,8 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_SSA_CHECKPOINT,
     SOURCE_EXCEPTION_SSA_ROUTE,
     SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+    SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
+    SOURCE_EXCEPTION_SSA_HANDLER_PHI,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
     SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
@@ -180,6 +182,9 @@ def root(x: float) -> int:
         )
         assert native_route.selected_handler == nan_route.selected_handler
         assert CorrelationTable._source_exception_ssa_route_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert CorrelationTable._source_exception_ssa_handler_entry_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
     finally:
@@ -563,6 +568,45 @@ def root(x: float) -> int:
             for site_row, arm_row in zip(site_rows, arm_rows)
         }
         assert CorrelationTable._source_exception_ssa_handler_arm_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        entry_row, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_HANDLER_ENTRY
+        ).rows())
+        entry = book.page(SOURCE_EXCEPTION_SSA_HANDLER_ENTRY).latest(entry_row)
+        phi_row, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_HANDLER_PHI
+        ).rows())
+        native_phi = book.page(SOURCE_EXCEPTION_SSA_HANDLER_PHI).latest(
+            phi_row
+        )
+        assert native_phi.handler_entry == book.latest_ref(
+            SOURCE_EXCEPTION_SSA_HANDLER_ENTRY, entry_row,
+        )
+        assert native_phi.source_phi == phi_cell
+        assert tuple(
+            book.page(SOURCE_EXCEPTION_SSA_HANDLER_ARM).latest(
+                cell.row
+            ).incoming_value.row[1]
+            for cell in native_phi.incoming_arms
+        ) == tuple(
+            instruction.args[index].id
+            for instruction in lowered.blocks[
+                entry.entry_block.row[2]
+            ].instrs
+            if instruction.attributes.get("binding")
+            == "native_exception_handler_phi"
+            for index in range(len(instruction.args))
+        )
+        assert all(
+            entry.entry_block.row[2] in lowered.blocks[
+                book.page(SOURCE_EXCEPTION_SSA_ROUTE).latest(
+                    route_cell.row
+                ).match_block.row[2]
+            ].successors
+            for route_cell in entry.incoming_routes
+        )
+        assert CorrelationTable._source_exception_ssa_handler_entry_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
     finally:

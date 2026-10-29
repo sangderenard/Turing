@@ -12037,11 +12037,14 @@ class _ControlSSABuilder(TiledObject):
             CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
             SOURCE_EXCEPTION_HANDLER_CLASS, SOURCE_EXCEPTION_HANDLER_PHI,
             SOURCE_EXCEPTION_REGION_STATE, SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+            SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
+            SOURCE_EXCEPTION_SSA_HANDLER_PHI,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_ROUTE, SOURCE_EXCEPTION_STATUS_ROUTE,
             ExceptionHandlerArmValueFact, ExceptionHandlerClassFact,
             ExceptionHandlerPhiFact, ExceptionRegionStateFact,
-            ExceptionSSAHandlerArmFact, ExceptionSSARouteFact,
+            ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
+            ExceptionSSAHandlerPhiFact, ExceptionSSARouteFact,
             ExceptionStatusRouteFact,
         )
 
@@ -12079,6 +12082,9 @@ class _ControlSSABuilder(TiledObject):
             self.lower(block.orelse, path=f"{path}.try_else")
         self.lower(block.finalbody, path=f"{path}.try_finally")
         normal = self.current
+        handler_entries: dict[Ref, BasicBlock] = {}
+        handler_incoming: dict[Ref, list[Ref]] = {}
+        handler_ordinals: dict[Ref, int] = {}
 
         def propagate(edge: dict[str, Any]) -> None:
             self.emit(
@@ -12310,9 +12316,207 @@ class _ControlSSABuilder(TiledObject):
                         )),
                         mode=Mode.CONCORD,
                     )
-                propagate(edge)
+                entry = handler_entries.get(route.selected_handler)
+                if entry is None:
+                    entry = self.new_block(
+                        "exception_handler",
+                        also=(route.selected_handler,), owner=frame["owner"],
+                    )
+                    handler_entries[route.selected_handler] = entry
+                    handler_incoming[route.selected_handler] = []
+                    handler_ordinals[route.selected_handler] = (
+                        selected_facts[0].ordinal
+                    )
+                elif handler_ordinals[route.selected_handler] != (
+                    selected_facts[0].ordinal
+                ):
+                    raise ValueError(
+                        "native Try handler identity has two control arms: "
+                        f"handler={route.selected_handler!r}"
+                    )
+                # A selected route reaches its handler entry. The entry
+                # still propagates until the authored body and finalizer
+                # have executable pending-outcome control.
+                self.branch(entry)
+                handler_incoming[route.selected_handler].append(
+                    ssa_route_cell
+                )
                 self.current = remainder
             propagate(edge)
+
+        for source_handler, entry in handler_entries.items():
+            self.current = entry
+            route_cells = tuple(handler_incoming[source_handler])
+            route_facts = tuple(
+                book.page(SOURCE_EXCEPTION_SSA_ROUTE).cell(
+                    cell.row, cell.column,
+                ) for cell in route_cells
+            )
+            if any(not isinstance(fact, ExceptionSSARouteFact)
+                   for fact in route_facts):
+                raise ValueError(
+                    "native handler entry has a missing selected route: "
+                    f"handler={source_handler!r}"
+                )
+            incoming_blocks = tuple(
+                str(fact.match_block.row[2]) for fact in route_facts
+            )
+            status_values = tuple(
+                self.ssa_value_objects[int(fact.status_value.row[1])]
+                for fact in route_facts
+            )
+            status_phi = self.fresh_value(
+                dtype="int64", transform=PHI_CONDITIONAL,
+                operands=(*route_cells, *status_values),
+            )
+            self.emit(
+                Handler.Phi, list(status_values), status_phi,
+                attributes={
+                    "incoming_blocks": incoming_blocks,
+                    "binding": "native_exception_handler_status",
+                },
+            )
+            entry_cell = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, entry.name),
+            )
+            status_phi_cell = self._value_cell(status_phi)
+            if entry_cell is None:
+                raise ValueError(
+                    "native handler entry has no SSA block cell: "
+                    f"handler={source_handler!r}"
+                )
+            entry_fact_cell = book.post(
+                SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
+                (self._scope(), int(block.handlers[
+                    handler_ordinals[source_handler]
+                ].source_handler_node_id)),
+                ExceptionSSAHandlerEntryFact(
+                    source_handler, entry_cell, status_phi_cell,
+                    route_cells,
+                ),
+                stage=self._stage(),
+                provenance=Derived((
+                    source_handler, entry_cell, status_phi_cell,
+                    *route_cells,
+                )),
+                mode=Mode.CONCORD,
+            )
+            for source_phi in block.handlers[
+                handler_ordinals[source_handler]
+            ].entry_phi_cells:
+                source_phi_fact = book.page(
+                    SOURCE_EXCEPTION_HANDLER_PHI
+                ).cell(source_phi.row, source_phi.column)
+                if not isinstance(source_phi_fact, ExceptionHandlerPhiFact):
+                    raise ValueError(
+                        "native handler entry lacks its source Phi: "
+                        f"phi={source_phi!r}"
+                    )
+                arm_cells = []
+                for route_cell in route_cells:
+                    candidates = tuple(
+                        (row, book.page(
+                            SOURCE_EXCEPTION_SSA_HANDLER_ARM
+                        ).latest(row))
+                        for row in book.page(
+                            SOURCE_EXCEPTION_SSA_HANDLER_ARM
+                        ).rows()
+                        if row[:4] == route_cell.row
+                    )
+                    selected = tuple(
+                        row for row, fact in candidates
+                        if isinstance(fact, ExceptionSSAHandlerArmFact)
+                        and book.page(
+                            SOURCE_EXCEPTION_HANDLER_ARM_VALUE
+                        ).cell(
+                            fact.source_arm.row,
+                            fact.source_arm.column,
+                        ).source_phi == source_phi
+                    )
+                    if len(selected) != 1:
+                        raise ValueError(
+                            "native handler Phi lacks one exact matched arm: "
+                            f"route={route_cell!r}, phi={source_phi!r}"
+                        )
+                    arm_cells.append(book.latest_ref(
+                        SOURCE_EXCEPTION_SSA_HANDLER_ARM, selected[0],
+                    ))
+                arm_cells = tuple(arm_cells)
+                arm_facts = tuple(
+                    book.page(SOURCE_EXCEPTION_SSA_HANDLER_ARM).cell(
+                        cell.row, cell.column,
+                    ) for cell in arm_cells
+                )
+                canonical_phis = {
+                    book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).cell(
+                        fact.source_arm.row, fact.source_arm.column,
+                    ).canonical_phi
+                    for fact in arm_facts
+                }
+                if len(canonical_phis) != 1:
+                    raise ValueError(
+                        "native handler Phi arms disagree on canonical Phi: "
+                        f"phi={source_phi!r}"
+                    )
+                values = tuple(
+                    self.ssa_value_objects[
+                        int(fact.incoming_value.row[1])
+                    ] for fact in arm_facts
+                )
+                if len({str(value.dtype) for value in values}) != 1:
+                    raise ValueError(
+                        "native handler Phi has unsettled arm classes: "
+                        f"phi={source_phi!r}"
+                    )
+                # Program: y=1; a=int(x); y=2; b=int(x).
+                # Reading the last lexical y for both failures would lose
+                # the first site's y=1. This Phi reads only the exact
+                # incoming SSA arm recorded for each matching route.
+                merged = self.fresh_value(
+                    dtype=values[0].dtype,
+                    transform=PHI_CONDITIONAL,
+                    operands=(source_phi, *arm_cells, *values),
+                )
+                self.emit(
+                    Handler.Phi, list(values), merged,
+                    attributes={
+                        "incoming_blocks": incoming_blocks,
+                        "binding": "native_exception_handler_phi",
+                        "source_exception_handler_phi_cell": source_phi,
+                    },
+                )
+                canonical_phi = int(next(iter(canonical_phis)).row[1])
+                self._bind(
+                    canonical_phi, merged, BindingKind.CONDITIONAL_MERGE,
+                    source_phi, *arm_cells,
+                )
+                book.post(
+                    SOURCE_EXCEPTION_SSA_HANDLER_PHI,
+                    (self._scope(), canonical_phi),
+                    ExceptionSSAHandlerPhiFact(
+                        source_phi, entry_fact_cell,
+                        self._value_cell(merged), arm_cells,
+                    ),
+                    stage=self._stage(),
+                    provenance=Derived((
+                        source_phi, entry_fact_cell,
+                        self._value_cell(merged), *arm_cells,
+                    )),
+                    mode=Mode.CONCORD,
+                )
+            self.emit(
+                Handler.Call, [status_phi],
+                attributes={
+                    "callee": "turing_validation_error",
+                    "source_exception_handler_cell": source_handler,
+                },
+            )
+            if self._fault_exit is None:
+                raise ValueError(
+                    "native handler entry has no fault exit"
+                )
+            self.branch(self._fault_exit)
         self.current = normal
         # The status is taken on the exact protected edge and restored
         # before the existing fault exit. Until dispatch, joins and pending

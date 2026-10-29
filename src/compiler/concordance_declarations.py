@@ -1336,6 +1336,42 @@ SOURCE_EXCEPTION_SSA_HANDLER_ARM = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSAHandlerEntryFact:
+    """Selected routes entering one native handler block."""
+
+    source_handler: Ref
+    entry_block: Ref
+    status_value: Ref
+    incoming_routes: tuple[Ref, ...]
+
+
+SOURCE_EXCEPTION_SSA_HANDLER_ENTRY = declare_page(
+    "source_exception_ssa_handler_entry", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("canonical_handler", K.VALUE_ID),
+    ), ExceptionSSAHandlerEntryFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionSSAHandlerPhiFact:
+    """One source handler Phi with exact matched native predecessors."""
+
+    source_phi: Ref
+    handler_entry: Ref
+    result_value: Ref
+    incoming_arms: tuple[Ref, ...]
+
+
+SOURCE_EXCEPTION_SSA_HANDLER_PHI = declare_page(
+    "source_exception_ssa_handler_phi", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("canonical_phi", K.VALUE_ID),
+    ), ExceptionSSAHandlerPhiFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionHandlerEntryFact:
     """Candidate failure edges and binding versions at one handler entry."""
 

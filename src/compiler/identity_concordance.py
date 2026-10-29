@@ -1560,6 +1560,7 @@ class CorrelationTable:
         found.extend(self._source_exception_ssa_checkpoint_findings(module))
         found.extend(self._source_exception_ssa_route_findings(module))
         found.extend(self._source_exception_ssa_handler_arm_findings(module))
+        found.extend(self._source_exception_ssa_handler_entry_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_handler_arm_value_findings(module))
@@ -2851,6 +2852,225 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-ssa-handler-arm-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_handler_entry_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Selected routes and their exact SSA operands meet at one entry."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PHI_CONDITIONAL,
+            SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+            SOURCE_EXCEPTION_HANDLER_PHI,
+            SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+            SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
+            SOURCE_EXCEPTION_SSA_HANDLER_PHI,
+            SOURCE_EXCEPTION_SSA_ROUTE, SSA_BLOCK, SSA_VALUE,
+            ExceptionHandlerArmValueFact, ExceptionHandlerPhiFact,
+            ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
+            ExceptionSSAHandlerPhiFact, ExceptionSSARouteFact,
+            SSABlockKind,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or (
+            SOURCE_EXCEPTION_SSA_HANDLER_ENTRY.name not in book.pages
+        ):
+            return []
+        entries = book.page(SOURCE_EXCEPTION_SSA_HANDLER_ENTRY)
+        phis = book.page(SOURCE_EXCEPTION_SSA_HANDLER_PHI)
+        routes = book.page(SOURCE_EXCEPTION_SSA_ROUTE)
+        found = []
+        canonical_successors = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for cause, _stage in book.edges_into(canonical):
+                canonical_successors.setdefault(cause, set()).add(canonical)
+
+        def reaches_canonical(source: Ref, target: Ref) -> bool:
+            pending = [source]
+            seen = set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                pending.extend(canonical_successors.get(cell, ()))
+            return target in seen
+
+        selected_by_handler = {}
+        for route_row in routes.rows():
+            fact = routes.latest(route_row)
+            if isinstance(fact, ExceptionSSARouteFact):
+                selected_by_handler.setdefault(
+                    fact.selected_handler, set(),
+                ).add(book.latest_ref(SOURCE_EXCEPTION_SSA_ROUTE, route_row))
+        for row in entries.rows():
+            fact = entries.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_HANDLER_ENTRY, row)
+            problem = None
+            if not isinstance(fact, ExceptionSSAHandlerEntryFact) or not all(
+                isinstance(cell, Ref) for cell in (
+                    fact.source_handler, fact.entry_block,
+                    fact.status_value, *fact.incoming_routes,
+                )
+            ):
+                problem = "native handler entry lacks exact cells"
+            elif (
+                fact.entry_block.page != SSA_BLOCK
+                or fact.entry_block.row[0] != row[0]
+                or book.page(SSA_BLOCK).latest(
+                    fact.entry_block.row
+                ) is not SSABlockKind.EXCEPTION_HANDLER
+                or fact.status_value.page != SSA_VALUE
+                or fact.status_value.row[0] != row[0]
+                or not any(
+                    canonical_row[1] == row[1]
+                    and reaches_canonical(
+                        fact.source_handler,
+                        book.latest_ref(CANONICAL_VALUE, canonical_row),
+                    )
+                    for canonical_row in book.page(CANONICAL_VALUE).rows()
+                )
+                or {
+                    cell for cell in fact.incoming_routes
+                } != selected_by_handler.get(fact.source_handler, set())
+                or any(
+                    cell.page != SOURCE_EXCEPTION_SSA_ROUTE
+                    or book.latest_ref(cell.page, cell.row) != cell
+                    or routes.latest(cell.row).selected_handler
+                    != fact.source_handler
+                    for cell in fact.incoming_routes
+                )
+                or any(
+                    book.latest_ref(cell.page, cell.row) != cell
+                    for cell in (fact.entry_block, fact.status_value)
+                )
+            ):
+                problem = "native handler entry disagrees with selected routes"
+            elif receipt is None or {
+                cause for cause, _stage in book.edges_into(receipt)
+            } != {
+                fact.source_handler, fact.entry_block,
+                fact.status_value, *fact.incoming_routes,
+            }:
+                problem = "native handler entry provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-handler-entry-disagreement",
+                    str(row), None, problem,
+                ))
+            if isinstance(fact, ExceptionSSAHandlerEntryFact):
+                for source_phi_row in book.page(
+                    SOURCE_EXCEPTION_HANDLER_PHI
+                ).rows():
+                    source_phi = book.page(
+                        SOURCE_EXCEPTION_HANDLER_PHI
+                    ).latest(source_phi_row)
+                    if not isinstance(source_phi, ExceptionHandlerPhiFact) or (
+                        source_phi.handler != fact.source_handler
+                    ):
+                        continue
+                    canonical_ids = {
+                        int(arm.canonical_phi.row[1])
+                        for arm_row in book.page(
+                            SOURCE_EXCEPTION_HANDLER_ARM_VALUE
+                        ).rows()
+                        for arm in (
+                            book.page(
+                                SOURCE_EXCEPTION_HANDLER_ARM_VALUE
+                            ).latest(arm_row),
+                        )
+                        if isinstance(arm, ExceptionHandlerArmValueFact)
+                        and arm.source_phi == book.latest_ref(
+                            SOURCE_EXCEPTION_HANDLER_PHI, source_phi_row,
+                        )
+                    }
+                    if len(canonical_ids) != 1 or phis.latest((
+                        row[0], next(iter(canonical_ids), -1),
+                    )) is None:
+                        found.append(Finding(
+                            "source-exception-ssa-handler-phi-disagreement",
+                            str(source_phi_row), None,
+                            "selected handler has no exact SSA Phi",
+                        ))
+        for handler, selected in selected_by_handler.items():
+            if not any(
+                isinstance(entries.latest(row), ExceptionSSAHandlerEntryFact)
+                and entries.latest(row).source_handler == handler
+                and set(entries.latest(row).incoming_routes) == selected
+                for row in entries.rows()
+            ):
+                found.append(Finding(
+                    "source-exception-ssa-handler-entry-disagreement",
+                    repr(handler), None,
+                    "selected native routes have no complete handler entry",
+                ))
+        for row in phis.rows():
+            fact = phis.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_HANDLER_PHI, row)
+            problem = None
+            if not isinstance(fact, ExceptionSSAHandlerPhiFact) or not all(
+                isinstance(cell, Ref) for cell in (
+                    fact.source_phi, fact.handler_entry,
+                    fact.result_value, *fact.incoming_arms,
+                )
+            ):
+                problem = "native handler Phi lacks exact cells"
+            else:
+                entry = entries.latest(fact.handler_entry.row)
+                source_phi = book.page(SOURCE_EXCEPTION_HANDLER_PHI).latest(
+                    fact.source_phi.row,
+                )
+                arms = tuple(
+                    book.page(SOURCE_EXCEPTION_SSA_HANDLER_ARM).latest(
+                        cell.row,
+                    ) for cell in fact.incoming_arms
+                )
+                canonical_phis = tuple(
+                    book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).latest(
+                        arm.source_arm.row,
+                    ).canonical_phi
+                    for arm in arms
+                    if isinstance(arm, ExceptionSSAHandlerArmFact)
+                )
+                mint = book.mint_of(fact.result_value)
+                if (
+                    fact.handler_entry.page != SOURCE_EXCEPTION_SSA_HANDLER_ENTRY
+                    or not isinstance(entry, ExceptionSSAHandlerEntryFact)
+                    or not isinstance(source_phi, ExceptionHandlerPhiFact)
+                    or source_phi.handler != entry.source_handler
+                    or fact.source_phi.page != SOURCE_EXCEPTION_HANDLER_PHI
+                    or fact.result_value.page != SSA_VALUE
+                    or fact.result_value.row[0] != row[0]
+                    or len(arms) != len(entry.incoming_routes)
+                    or len(canonical_phis) != len(arms)
+                    or any(cell.row[:4] != route.row
+                           for cell, route in zip(
+                               fact.incoming_arms, entry.incoming_routes,
+                           ))
+                    or any(phi.row[1] != row[1] for phi in canonical_phis)
+                    or mint is None or mint[0] != PHI_CONDITIONAL
+                    or any(book.latest_ref(cell.page, cell.row) != cell
+                           for cell in (
+                               fact.source_phi, fact.handler_entry,
+                               fact.result_value, *fact.incoming_arms,
+                           ))
+                ):
+                    problem = "native handler Phi disagrees with source arms"
+                elif receipt is None or {
+                    cause for cause, _stage in book.edges_into(receipt)
+                } != {
+                    fact.source_phi, fact.handler_entry,
+                    fact.result_value, *fact.incoming_arms,
+                }:
+                    problem = "native handler Phi provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-handler-phi-disagreement",
                     str(row), None, problem,
                 ))
         return found
