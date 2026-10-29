@@ -23867,6 +23867,44 @@ def _class_surface_ssa_program(
                     str(contract.get("storage") or ""),
                 ))
 
+        # Program: ``v.batch(n, [97, 98, 2], [0, 2, 3])`` beside
+        # ``self.batch(d, atoms, [0, len(atoms)])`` (b27).  Wrong record:
+        # the copy whose ``offsets`` formal folded to the literal
+        # ``[0, 2, 3]`` has no call edge stating its extent, so the other
+        # copy's (2,) stood alone on the authored row and was compared
+        # against this copy's (3,) (refused as a shape disagreement).
+        # Rule: a formal a copy folded to a flat literal sequence states
+        # that literal's extent for the copy, as its own SSA does; two
+        # copies stating different extents are polymorphic.
+        for parameter_name in sorted(map(str, (
+            planned_graph.graph.get("function_parameters") or ()
+        ))):
+            for value_id in identities.get(parameter_name, ()):
+                literal_data = planned_graph.nodes.get(int(value_id)) or {}
+                literal_attributes = literal_data.get("attributes") or {}
+                literal = literal_attributes.get("value")
+                if not (
+                    literal_attributes.get("structural_specialization")
+                    and literal_attributes.get("aggregate_kind") in {
+                        "list", "tuple",
+                    }
+                    and isinstance(literal, (list, tuple))
+                    and literal
+                    and all(
+                        isinstance(item, (bool, int, float)) for item in literal
+                    )
+                ):
+                    continue
+                note_shape(planned_graph, int(value_id), (
+                    "folded literal formal",
+                    (len(literal),),
+                    "bool" if all(isinstance(item, bool) for item in literal)
+                    else "float64" if any(
+                        isinstance(item, float) for item in literal
+                    ) else "int64",
+                    "span",
+                ))
+
         # Concrete source annotations also declare semantic class identity.
         # Physical parameter ABI is established by the existing scalar/span/
         # record faculties above; this only supplies the exact class arm that
