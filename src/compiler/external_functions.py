@@ -12,8 +12,9 @@ buffer ABI ``void (void **buffers, int32_t *extents)`` -- tagged
 (``ExternalFunction``).  The C and LLVM lanes call it through a function
 pointer slot table the program exports; the host fills the table at load
 (``bind_external_slots``) with a C-callable piece: an ``LLVMPiece``'s own
-entry, a native function, or a Python callable wrapped once over the buffer
-ABI.  A slot left unfilled at call time records a fault the execution raises
+entry, a native function, or -- only when the execution contract the
+module was lowered under has ``python_callbacks: contract_only`` -- a Python
+callable wrapped once over the buffer ABI.  A slot left unfilled at call time records a fault the execution raises
 on; it is never a silent zero.
 
 The external's signature (argument and result dtype and shape) is declared
@@ -877,8 +878,17 @@ def runtime_slot_functions(module: Any, names: Sequence[str]) -> tuple[str, ...]
 
 
 def external_slot_rows(module: Any, slot_functions: Sequence[str]) -> tuple[dict, ...]:
-    """The artifact's declared slots: slot index, external name and ABI."""
+    """The artifact's declared slots: slot index, external name and ABI.
 
+    Each row carries ``python_callbacks`` from the execution contract the
+    module was lowered under: it is what decides, at load, whether a slot may
+    call back into the host's Python interpreter."""
+
+    python_callbacks = (
+        dict(dict(module.metadata.get("extraction_contract") or {}).get(
+            "execution"
+        ) or {}).get("python_callbacks")
+    )
     rows = []
     for slot, name in enumerate(slot_functions):
         record = module.functions[name].metadata["llvm_piece"]
@@ -891,6 +901,7 @@ def external_slot_rows(module: Any, slot_functions: Sequence[str]) -> tuple[dict
             "output_slots": tuple(record["output_slots"]),
             "buffer_shapes": tuple(record["buffer_shapes"]),
             "derivative": record.get("derivative"),
+            "python_callbacks": python_callbacks,
         })
     return tuple(rows)
 
@@ -1082,6 +1093,17 @@ def _slot_address(row: Mapping[str, Any], implementation: Any, keep: list,
         keep.append(piece.artifact)
         return int(ctypes.cast(entry, ctypes.c_void_p).value)
     if callable(implementation):
+        # A Python callable in a slot is native code calling back into the
+        # live host interpreter: only an execution contract that allows
+        # Python callbacks admits it.
+        if row.get("python_callbacks") != "contract_only":
+            raise ValueError(
+                f"external {row['external']!r}: a Python callable would make "
+                "native code call back into the host interpreter, and the "
+                "execution contract this artifact was lowered under has "
+                f"python_callbacks={row.get('python_callbacks')!r}; bind a "
+                "native piece or address instead"
+            )
         wrapped = _python_slot(row, implementation, errors)
         keep.append(wrapped)
         return int(ctypes.cast(wrapped, ctypes.c_void_p).value)
