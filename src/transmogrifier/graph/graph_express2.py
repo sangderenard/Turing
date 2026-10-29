@@ -6806,6 +6806,12 @@ class ProcessGraph(TiledObject):
             )
             build_started = time.perf_counter()
         root = self.build_graph(tree, *args, progress=progress, **kwargs)
+        # Capture the authored exception relationships while every source
+        # node and operand edge still exists. Reduction can dissolve wrappers
+        # and canonicalize IDs; this source graph remains their exact receipt.
+        from ...compiler.source_exception_graph import publish_source_exception_graph
+
+        publish_source_exception_graph(self)
         if profile_verbose:
             print(
                 "[ast-build-profile] complete build_graph "

@@ -66174,9 +66174,9 @@ def _lower_ast_source_to_ssa_impl(
                 *function.metadata["loop_interchange_decisions"], decision,
             )
     _report_unmaterialised_record_parameters(module, extraction_contract)
-    from .source_exception_graph import publish_ssa_exception_topology
-
-    publish_ssa_exception_topology(module, graph)
+    module.metadata["source_exception_graph_scope"] = (
+        graph.G.graph.get("ingestion_value_scope")
+    )
     if (
         extraction_policy is not None
         and extraction_policy.execution.require_full_native
@@ -66548,6 +66548,12 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
         _loop_scope_reconciliations = concord_loop_scope_latch_residents(
             module
         )
+        if module is not None:
+            from .source_exception_graph import publish_ssa_exception_topology
+
+            publish_ssa_exception_topology(
+                module, module.metadata.get("source_exception_graph_scope"),
+            )
         _program_abi_frame_transitions = (
             concord_program_abi_frame_transitions(module)
         )

@@ -1,4 +1,4 @@
-"""Exception-related edges projected from the completed source ProcessGraphs."""
+"""Exception-related edges held before source graph reduction removes nodes."""
 
 from __future__ import annotations
 
@@ -13,23 +13,15 @@ def publish_source_exception_graph(source_graph):
     """
 
     from .concordance_declarations import (
-        REDUCTION, SOURCE_EXCEPTION_GRAPH, SourceExceptionGraph,
+        INGESTION, SOURCE_EXCEPTION_GRAPH, SourceExceptionGraph,
     )
     from .identity_concordance import Derived, Mode, current_identity_book
     from ..common.tensors.topological_reducer import node_identity_cell
 
     book = current_identity_book()
-    wrappers = [source_graph]
-    table = getattr(source_graph, "function_table", None)
-    if table is not None:
-        wrappers.extend(
-            entry.graph for entry in table
-            if getattr(entry, "graph", None) is not None
-        )
-
     nodes = set()
     edges = set()
-    for wrapper in wrappers:
+    for wrapper in (source_graph,):
         process = wrapper.G
         # ProcessGraph stores a child's authored operand in its parent's
         # ``parents`` list.  The directed exception view runs from owner to
@@ -117,7 +109,7 @@ def publish_source_exception_graph(source_graph):
         raise ValueError("source exception graph has no ingestion scope")
     if nodes:
         book.post(
-            SOURCE_EXCEPTION_GRAPH, (scope,), fact, stage=REDUCTION,
+            SOURCE_EXCEPTION_GRAPH, (scope,), fact, stage=INGESTION,
             provenance=Derived(fact.nodes),
             mode=Mode.CONCORD,
         )
@@ -125,7 +117,7 @@ def publish_source_exception_graph(source_graph):
     return fact
 
 
-def publish_ssa_exception_topology(module, source_graph):
+def publish_ssa_exception_topology(module, source_scope):
     """Expose the existing exception graph as one SSA module object.
 
     The SSA row points to the source graph cell.  Neither the projection nor
@@ -139,16 +131,15 @@ def publish_ssa_exception_topology(module, source_graph):
     from .identity_concordance import Derived, Mode, current_identity_book
     from ..transmogrifier.ssa import SSAExceptionTopology
 
-    scope = source_graph.G.graph.get("ingestion_value_scope")
-    if scope is None:
+    if source_scope is None:
         raise ValueError("SSA exception topology has no source scope")
     book = current_identity_book()
-    source_cell = book.latest_ref(SOURCE_EXCEPTION_GRAPH, (scope,))
+    source_cell = book.latest_ref(SOURCE_EXCEPTION_GRAPH, (source_scope,))
     if source_cell is None:
         return None
-    graph = book.page(SOURCE_EXCEPTION_GRAPH).latest((scope,))
+    graph = book.page(SOURCE_EXCEPTION_GRAPH).latest((source_scope,))
     ssa_cell = book.post(
-        SSA_EXCEPTION_TOPOLOGY, (scope,), source_cell,
+        SSA_EXCEPTION_TOPOLOGY, (source_scope,), source_cell,
         stage=SSA_EXCEPTION_TOPOLOGY_STAGE,
         provenance=Derived((source_cell,)), mode=Mode.CONCORD,
     )

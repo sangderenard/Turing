@@ -27511,9 +27511,6 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             expression._python_bindings = canonicalize_python_static_bindings(
                 bindings
             )
-    from ...compiler.source_exception_graph import publish_source_exception_graph
-
-    publish_source_exception_graph(graph)
     return graph
 
 
