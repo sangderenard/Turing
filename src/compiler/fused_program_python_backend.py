@@ -250,6 +250,16 @@ def _step_expression(dialect: Dialect, step: OpStep, names: dict[int, str]) -> s
         raise PythonLoweringShortfall(
             f"matmul has no {dialect.name} spelling registered"
         )
+    if op in {"reshape", "view"}:
+        # The extents are the step's remaining operands (``x.reshape(2, 3)``
+        # captures 2 and 3 as values), else a recorded ``shape``.
+        if len(step.input_ids) > 1:
+            extents = [f"int({names[i]})" for i in step.input_ids[1:]]
+        elif "shape" in step.attrs:
+            extents = [repr(int(e)) for e in step.attrs["shape"]]
+        else:
+            raise PythonLoweringShortfall(f"{op} has no target shape: {step!r}")
+        return f"{a}.reshape({', '.join(extents)})"
     reduce_numpy = _REDUCE_NUMPY.get(op)
     if reduce_numpy is not None:
         axis = step.attrs.get("axis")
