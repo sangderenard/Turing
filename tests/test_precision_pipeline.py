@@ -132,6 +132,22 @@ def _evaluate_scalar_block(function, arguments):
             result = math.copysign(
                 math.floor(abs(operands[0]) + 0.5), operands[0]
             )
+        elif operation in {"Lt", "Le", "Gt", "Ge", "Eq", "Ne"}:
+            # exp/log range decisions: exact compares and a true select.
+            result = {
+                "Lt": operands[0] < operands[1],
+                "Le": operands[0] <= operands[1],
+                "Gt": operands[0] > operands[1],
+                "Ge": operands[0] >= operands[1],
+                "Eq": operands[0] == operands[1],
+                "Ne": operands[0] != operands[1],
+            }[operation]
+        elif operation == "Select":
+            result = operands[1] if operands[0] else operands[2]
+        elif operation == "Fma" and not all(map(math.isfinite, operands)):
+            # IEEE fma of a non-finite operand: the same inf/NaN class as
+            # the unfused spelling (an unselected exp lane meets these).
+            result = operands[0] * operands[1] + operands[2]
         elif operation == "Fma":
             result = float(
                 Fraction.from_float(operands[0])
@@ -213,6 +229,50 @@ def test_precision_transcendentals_lower_registered_proof_cores(
     }.intersection(PRECISION_SINGULAR_NAMES.values())
     assert environment[result.id] == eager
     assert abs(environment[result.id] - reference) <= math.ulp(reference)
+
+
+@pytest.mark.parametrize(
+    ("operation", "argument"),
+    (
+        # exp: NaN at k >= 1024 (2**k overflowed inside the expansion), 0
+        # for subnormal results, 1 ulp off where the scaled tail rounded.
+        ("Exp", 709.782712893384), ("Exp", 709.7827128933841),
+        ("Exp", 1000.0), ("Exp", -706.2225020067164), ("Exp", -740.0),
+        ("Exp", -745.0), ("Exp", -745.1332191019412), ("Exp", -1.0e300),
+        # log: NaN for subnormal inputs; m - 1 near 1 kept exact.
+        ("Log", 5.0e-324), ("Log", 1.0e-310), ("Log", 1.7976931348623157e308),
+        ("Log", 1.0 - 2.0 ** -53), ("Log", 1.0 + 2.0 ** -52),
+    ),
+)
+def test_precision_exp_log_range_decisions_are_exact_and_library_free(
+    operation, argument, book,
+):
+    """The binade and the rescale are compares, selects and exact multiplies.
+
+    No ``Pow``/``Log``/``Exp`` survives for the backend to spell as libm, and
+    the range ends -- overflow to inf, gradual underflow, subnormal inputs --
+    are correctly rounded (each expected value here is CPython's, checked
+    equal to the mpmath correctly rounded one).
+    """
+
+    x, result = value(1), value(2)
+    function = Function("f", [x], {"entry": BasicBlock("entry", [Instr(
+        PRECISION_SINGULAR_NAMES[operation], [x], result,
+        attributes={"precision_limbs": 2},
+    )])})
+    module = _authored(IRModule({"f": function}))
+    assert apply_precision_pipeline(module)["status"] == "lowered"
+    operations = {
+        str(instruction.op) for instruction in function.blocks["entry"].instrs
+    }
+    assert not operations & {"Pow", "Log", "Exp", "Round"}
+
+    environment = _evaluate_scalar_block(function, [argument, 0.0])
+    try:
+        expected = (math.exp if operation == "Exp" else math.log)(argument)
+    except OverflowError:
+        expected = math.inf  # CPython raises; the IEEE value is inf
+    assert environment[result.id] == expected
 
 
 @pytest.mark.parametrize("operation", ("Exp", "Log"))

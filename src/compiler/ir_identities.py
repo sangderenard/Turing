@@ -2355,7 +2355,7 @@ class WideExpansionEmitter:
 
     # -- value and instruction minting --------------------------------------
 
-    def fresh(self, like, extent_like=None):
+    def fresh(self, like, extent_like=None, *, element=None):
         declared = self.element
         extent_like = like if extent_like is None else extent_like
         like_dtype = str(like.dtype or "")
@@ -2375,6 +2375,10 @@ class WideExpansionEmitter:
             )
             else like.dtype
         )
+        if element is not None:
+            # A compare's result: its element is ``bool`` whatever the limb
+            # element is; only the extent still comes from ``extent_like``.
+            dtype = element
         logical_shape = tuple(
             (extent_like.accounting or {}).get(
                 "precision_logical_shape"
@@ -2711,23 +2715,208 @@ class WideExpansionEmitter:
 
         return self.scalar_constant(constant_limbs("ln2", 1)[0], like)
 
-    def exp_expansion(self, source, width: int):
-        """Precision.exp's ln(2) reduction plus the proof core."""
+    # -- library-free range decisions --------------------------------------
+    #
+    # exp and log choose a binade and rescale by it. Those decisions used to
+    # be spelled ``Pow(2, k)`` and ``Log`` -- host libm in every backend --
+    # and ``2**k`` multiplied inside the expansion overflowed for k >= 1024
+    # and flushed subnormal results. Everything below is compares, ``Select``
+    # and multiplies by power-of-two constants, all exact in IEEE binary64.
+    # Measured on ~20k arguments each against mpmath: exp 99.12% -> 100%
+    # correctly rounded (it returned 0 for subnormal results and was 1 ulp
+    # off below 2**-968), log 80.8% -> 100% (NaN for every subnormal
+    # input). The edge points are pinned by
+    # test_precision_exp_log_range_decisions_are_exact_and_library_free.
 
-        from ..common.tensors.signal_symbolic import constant_limbs
+    def compare(self, op, left, right):
+        """``op`` in Lt/Le/Gt/Ge/Eq/Ne: a bool value shaped like ``left``."""
+
+        result = self.fresh(left, left, element="bool")
+        self.emitted.append(Instr(op, [left, right], result, attributes={
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.range_decision",
+        }))
+        return result
+
+    def select(self, condition, when_true, when_false):
+        """A true select -- never an arithmetic blend, which is inexact."""
+
+        result = self.fresh(when_true, when_false)
+        self.emitted.append(Instr(
+            "Select", [condition, when_true, when_false], result,
+            attributes={
+                PRECISION_SECTION_ATTRIBUTE: True,
+                "lowered_from": "precision.range_decision",
+            },
+        ))
+        return result
+
+    def power_of_two_factors(self, count, like):
+        """Exact factors whose product is ``2**count``, all on one side of 1.
+
+        ``count`` is an integer-valued float with ``|count| < 2048``. Its
+        magnitude is peeled bit by bit with compares against power-of-two
+        constants; bit ``i`` selects ``2**(+-2**i)`` or 1. Every factor is a
+        representable power of two (bit 10 is two ``2**+-512``), so a value
+        multiplied by them in turn is exact for as long as it stays in the
+        normal range, and rounds exactly once when the last one leaves it.
+        Bits 0..8 are folded into one factor (at most ``2**+-511``).
+        """
 
         put = self.put
+        constant = self.scalar_constant
+        zero = constant(0.0, like)
+        one = constant(1.0, like)
+        negative = self.compare("Lt", count, zero)
+        remaining = self.select(
+            negative, put("Neg", (count,), count), count,
+        )
+        factors = []
+        low = None
+        for bit in range(10, -1, -1):
+            step = float(2 ** bit)
+            taken = self.compare("Ge", remaining, constant(step, like))
+            remaining = put(
+                "Sub",
+                (remaining, self.select(taken, constant(step, like), zero)),
+                remaining,
+            )
+            exponent = min(2 ** bit, 512)
+            factor = self.select(
+                taken,
+                self.select(
+                    negative,
+                    constant(2.0 ** -exponent, like),
+                    constant(2.0 ** exponent, like),
+                ),
+                one,
+            )
+            if bit == 10:
+                factors.extend((factor, factor))
+            elif bit == 9:
+                factors.append(factor)
+            else:
+                low = factor if low is None else put(
+                    "Mul", (low, factor), factor,
+                )
+        factors.append(low)
+        return factors
+
+    def scale_by_factors(self, value, factors):
+        for factor in factors:
+            value = self.put("Mul", (value, factor), value)
+        return value
+
+    def binade(self, collapsed):
+        """``(e, factors)`` with ``collapsed * 2**-e`` in ``[0.75, 1.5)``.
+
+        For a positive finite ``collapsed`` only; the factors rescale any
+        limb exactly (applied in order). Subnormal inputs are first lifted by
+        ``2**600``; then a greedy ladder divides by ``2**s`` while the value
+        is ``>= 2**s`` and multiplies by ``2**s`` while it is ``< 2**(1-s)``
+        (s = 512 ... 1), leaving ``[1, 2)``; a last halving above 1.5
+        centres the mantissa on 1 so ``log`` near 1 loses nothing to
+        ``m - 1``. Every step is a compare, a ``Select`` and an exact
+        power-of-two multiply.
+        """
+
+        put = self.put
+        constant = self.scalar_constant
+        like = collapsed
+        one = constant(1.0, like)
+        zero = constant(0.0, like)
+        tiny = self.compare("Lt", collapsed, constant(2.0 ** -1000, like))
+        lift = self.select(tiny, constant(2.0 ** 600, like), one)
+        exponent = self.select(tiny, constant(-600.0, like), zero)
+        current = put("Mul", (collapsed, lift), collapsed)
+        down = None
+        up = None
+        for bit in range(9, -1, -1):
+            step = 2 ** bit
+            taken = self.compare(
+                "Ge", current, constant(2.0 ** step, like),
+            )
+            factor = self.select(taken, constant(2.0 ** -step, like), one)
+            current = put("Mul", (current, factor), current)
+            exponent = put(
+                "Add",
+                (exponent, self.select(taken, constant(float(step), like), zero)),
+                exponent,
+            )
+            down = factor if down is None else put(
+                "Mul", (down, factor), factor,
+            )
+        for bit in range(9, -1, -1):
+            step = 2 ** bit
+            taken = self.compare(
+                "Lt", current, constant(2.0 ** (1 - step), like),
+            )
+            factor = self.select(taken, constant(2.0 ** step, like), one)
+            current = put("Mul", (current, factor), current)
+            exponent = put(
+                "Sub",
+                (exponent, self.select(taken, constant(float(step), like), zero)),
+                exponent,
+            )
+            up = factor if up is None else put("Mul", (up, factor), factor)
+        high = self.compare("Ge", current, constant(1.5, like))
+        half = self.select(high, constant(0.5, like), one)
+        exponent = put(
+            "Add", (exponent, self.select(high, one, zero)), exponent,
+        )
+        return exponent, (lift, up, down, half)
+
+    def exp_expansion(self, source, width: int):
+        """exp by Cody-Waite ln(2) reduction, the proof core, exact rescale.
+
+        ``k = nearest(x / ln2)`` on the collapsed value (clamped to
+        ``[-746, 710]``, beyond which exp is 0 or inf), ``r = x - k*ln2``
+        with ``ln2`` as ``constant_limbs`` limbs, ``exp(r)`` from the proof
+        core, then ``* 2**k`` by exact power-of-two factors -- after the core
+        is canonicalised to ``(s, t)``, ``s = fl(s + t)``. A normal result is
+        ``s*2**k + t*2**k``, exact until it overflows to inf (the tail is
+        dropped below ``2**-968``, where it could itself round). A subnormal
+        result is rounded ONCE to the ``2**-1074`` grid: ``H = s*2**(k+1074)``
+        (``< 2**52``) is rounded to an integer by ``2**52`` and the tie the
+        exact tail ``t`` breaks is fixed up, then scaled back exactly.
+        """
+
+        from ..common.tensors.signal_symbolic import (
+            INTEGER_SHIFTER, constant_limbs,
+        )
+
+        put = self.put
+        constant = self.scalar_constant
         collapsed = self.sum_expansion(source)
+        like = collapsed
+        zero = constant(0.0, like)
+        one = constant(1.0, like)
+        upper = constant(710.0, like)
+        lower = constant(-746.0, like)
+        overflow = self.compare("Gt", collapsed, upper)
+        underflow = self.compare("Lt", collapsed, lower)
+        clamped = self.select(
+            overflow, upper, self.select(underflow, lower, collapsed),
+        )
         ln2_parts = self.constant_expansion(
-            constant_limbs(
-                "ln2", width, element=self.element,
-            ),
+            constant_limbs("ln2", width, element=self.element),
             source[0],
         )
         ln2_head = self._ln2_head(source[0])
+        # Nearest integer by the shifter (``signal_symbolic``'s own
+        # ``INTEGER_SHIFTER``): two IEEE adds every backend spells. ``Round``
+        # has no Fortran spelling and its tie rule differs between C
+        # (``nearbyint``) and LLVM (``roundeven``); any integer within one
+        # of x/ln2 keeps the remainder inside the core's interval.
+        shifter = constant(INTEGER_SHIFTER, like)
         binade = put(
-            "Round", (put("Div", (collapsed, ln2_head), collapsed),),
-            collapsed,
+            "Sub",
+            (put(
+                "Add",
+                (put("Div", (clamped, ln2_head), clamped), shifter),
+                clamped,
+            ), shifter),
+            clamped,
         )
         remainder = self.add_expansions(
             source,
@@ -2740,62 +2929,163 @@ class WideExpansionEmitter:
             width,
         )
         core = self.proof_core("exp", remainder, width)
-        scale = put(
-            "Pow",
-            (self.scalar_constant(2.0, collapsed), binade),
-            collapsed,
+        head, tail = self.two_sum(core[0], self.sum_expansion(core[1:]))
+        # exp(r) lies in [0.70, 1.42]: the result is below 2**-1022 exactly
+        # when k < -1022, or k == -1022 with s < 1.
+        floor_binade = constant(-1022.0, like)
+        subnormal = self.select(
+            self.compare("Lt", binade, floor_binade),
+            one,
+            self.select(
+                self.compare("Eq", binade, floor_binade),
+                self.select(self.compare("Lt", head, one), one, zero),
+                zero,
+            ),
         )
-        return self.multiply_expansions(core, [scale], width)
+        subnormal = self.compare("Eq", subnormal, one)
+        shift = self.select(
+            subnormal,
+            put("Add", (binade, constant(1074.0, like)), binade),
+            binade,
+        )
+        factors = self.power_of_two_factors(shift, like)
+        scaled_head = self.scale_by_factors(head, factors)
+        scaled_tail = self.scale_by_factors(tail, factors)
+        # Subnormal: scaled_head = H in [0, 2**52), scaled_tail = L exact.
+        grid = constant(2.0 ** 52, like)
+        integral = put(
+            "Sub", (put("Add", (scaled_head, grid), scaled_head), grid),
+            scaled_head,
+        )
+        fraction = put("Sub", (scaled_head, integral), scaled_head)
+        half = constant(0.5, like)
+        adjust = self.select(
+            self.compare("Eq", fraction, half),
+            self.select(self.compare("Gt", scaled_tail, zero), one, zero),
+            self.select(
+                self.compare("Eq", fraction, put("Neg", (half,), half)),
+                self.select(
+                    self.compare("Lt", scaled_tail, zero),
+                    put("Neg", (one,), one),
+                    zero,
+                ),
+                zero,
+            ),
+        )
+        back = constant(2.0 ** -537, like)
+        rounded = put(
+            "Mul",
+            (put("Mul", (put("Add", (integral, adjust), integral), back),
+                 integral), back),
+            integral,
+        )
+        # Below 2**-968 the scaled tail can itself be subnormal, so it is
+        # rounded to the 2**-1074 grid and can land exactly on half an ulp
+        # of the head, where the collapse's tie-to-even then moves the
+        # correctly rounded head by one ulp (x = -706.2225020067164 gave
+        # 1.9564303102951204e-307, want ...121e-307). There the head alone
+        # is the correctly rounded result -- ``s = fl(s + t)`` scaled
+        # exactly -- and a tail under 2**-1021 cannot be carried anyway.
+        low = self.compare("Lt", scaled_head, constant(2.0 ** -968, like))
+        result = [
+            self.select(subnormal, rounded, scaled_head),
+            self.select(
+                subnormal, zero, self.select(low, zero, scaled_tail),
+            ),
+        ]
+        result.extend(zero for _ in range(int(width) - 2))
+        infinity = constant(float("inf"), like)
+        return [
+            self.select(
+                overflow, infinity if index == 0 else zero,
+                self.select(underflow, zero, limb),
+            )
+            for index, limb in enumerate(result)
+        ]
+
+    def log_domain_predicate(self, source):
+        """True where ``log`` has no real value: ``x <= 0`` (incl. -0, -inf).
+
+        Python raises ``ValueError`` there. The emitter does not choose
+        between a fault and an IEEE value: ``log_expansion`` leaves the IEEE
+        limit (-inf at zero, NaN below) in the limbs, and the pass lowering a
+        Python ``math.log`` guards on this predicate. NaN is not in it.
+        """
+
+        collapsed = self.sum_expansion(source)
+        return self.compare(
+            "Le", collapsed, self.scalar_constant(0.0, collapsed),
+        )
 
     def log_expansion(self, source, width: int):
-        """Precision.log's binade law plus the log1p proof core."""
+        """log by an exact binade ladder plus the log1p proof core.
+
+        ``x = m * 2**e`` with ``m`` in ``[0.75, 1.5)`` (``binade``), the
+        limbs rescaled exactly. Near 1 (``m <= 1.25``) the core takes
+        ``m - 1`` directly, so ``log(1 - 2**-53)`` keeps every bit; above
+        it two wide square roots bring the mantissa into the core's
+        interval and the core is scaled by 4. ``e*ln2`` is restored with
+        ``constant_limbs`` limbs. ``+inf`` gives ``+inf``; ``x <= 0`` gives
+        the IEEE limit (see ``log_domain_predicate``); NaN propagates.
+        """
 
         from ..common.tensors.signal_symbolic import constant_limbs
 
         put = self.put
+        constant = self.scalar_constant
         collapsed = self.sum_expansion(source)
-        ln2_head = self._ln2_head(source[0])
-        binade = put(
-            "Floor",
-            (put(
-                "Div",
-                (put("Log", (collapsed,), collapsed), ln2_head),
-                collapsed,
-            ),),
-            collapsed,
-        )
-        scale = put(
-            "Pow",
-            (
-                self.scalar_constant(2.0, collapsed),
-                put("Neg", (binade,), binade),
-            ),
-            collapsed,
-        )
-        mantissa = self.multiply_expansions(source, [scale], width)
-        reduced = self.sqrt_expansion(
-            self.sqrt_expansion(mantissa, width), width,
-        )
+        like = collapsed
+        exponent, factors = self.binade(collapsed)
+        mantissa = [self.scale_by_factors(limb, factors) for limb in source]
         one = self.constant_expansion(
             (1.0, *((0.0,) * (int(width) - 1))), source[0],
         )
-        offset = self.add_expansions(
-            reduced, [put("Neg", (term,), term) for term in one],
-            width,
+        minus_one = [put("Neg", (term,), term) for term in one]
+        reduced = self.sqrt_expansion(
+            self.sqrt_expansion(mantissa, width), width,
         )
+        near = self.compare(
+            "Le", self.sum_expansion(mantissa), constant(1.25, like),
+        )
+        direct = self.add_expansions(mantissa, minus_one, width)
+        rooted = self.add_expansions(reduced, minus_one, width)
+        offset = [
+            self.select(near, each, other)
+            for each, other in zip(direct, rooted)
+        ]
         core = self.proof_core("log1p", offset, width)
-        four = self.scalar_constant(4.0, source[0])
-        core = [put("Mul", (term, four), term) for term in core]
+        multiplier = self.select(near, constant(1.0, like), constant(4.0, like))
+        core = [put("Mul", (term, multiplier), term) for term in core]
         ln2_parts = self.constant_expansion(
-            constant_limbs(
-                "ln2", width, element=self.element,
-            ),
+            constant_limbs("ln2", width, element=self.element),
             source[0],
         )
-        restored = self.multiply_expansions(
-            ln2_parts, [binade], width,
+        restored = self.multiply_expansions(ln2_parts, [exponent], width)
+        result = self.add_expansions(core, restored, width)
+        zero = constant(0.0, like)
+        infinity = constant(float("inf"), like)
+        nan = constant(float("nan"), like)
+        positive_infinity = self.compare("Eq", collapsed, infinity)
+        at_zero = self.compare("Eq", collapsed, zero)
+        negative = self.compare("Lt", collapsed, zero)
+        head_special = self.select(
+            positive_infinity, infinity,
+            self.select(
+                at_zero, put("Neg", (infinity,), infinity),
+                self.select(negative, nan, result[0]),
+            ),
         )
-        return self.add_expansions(core, restored, width)
+        special = self.select(
+            positive_infinity, constant(1.0, like),
+            self.select(
+                at_zero, constant(1.0, like),
+                self.select(negative, constant(1.0, like), zero),
+            ),
+        )
+        special = self.compare("Eq", special, constant(1.0, like))
+        return [head_special, *(
+            self.select(special, zero, limb) for limb in result[1:]
+        )]
 
 
 def lower_precision_operations(
