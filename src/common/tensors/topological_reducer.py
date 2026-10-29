@@ -6335,6 +6335,66 @@ def _return_display_flattens(definition: Any, returned: Any) -> bool:
     )
 
 
+def _is_source_array_allocation(
+    expression: Any, static_bindings: Mapping[str, Any],
+) -> bool:
+    """Whether ``expression`` is ``array(typecode)`` of the stdlib ``array``.
+
+    The callee is read through the function's lexical bindings
+    (``from array import array`` or ``import array``); only the one-argument
+    form (an empty array of that typecode) is an allocation.
+    """
+
+    from array import array as source_array
+    import array as source_array_module
+
+    if not (
+        isinstance(expression, ast.Call)
+        and len(expression.args) == 1 and not expression.keywords
+    ):
+        return False
+    callee = expression.func
+    if isinstance(callee, ast.Name):
+        return static_bindings.get(callee.id) is source_array
+    return (
+        isinstance(callee, ast.Attribute)
+        and callee.attr == "array"
+        and isinstance(callee.value, ast.Name)
+        and static_bindings.get(callee.value.id) is source_array_module
+    )
+
+
+def _stamp_source_array_allocation(wrapper: Any, data: dict) -> None:
+    """Declare one ``array(typecode)`` call node an array allocation.
+
+    The typecode literal is the array's authored element layout
+    (``array("Q")`` holds uint64 rows).  It is posted on the allocation
+    itself, the same column contract a typed record field's constructor
+    edge stamps, so an element read of a local array is typed by its
+    typecode and not by its append operands.
+    """
+
+    from ...transmogrifier.dtype_layout import array_typecode_dtype
+
+    data.setdefault("attributes", {}).update({
+        "aggregate_kind": "array",
+        "producer_kind": "sequence_materialization",
+        "sequence_column_count": 1,
+        "sequence_key_columns": (),
+        "sequence_writable": True,
+    })
+    typecode_dtype = next((
+        array_typecode_dtype(
+            (wrapper.G.nodes[int(parent)].get("attributes") or {})
+            .get("value", wrapper.G.nodes[int(parent)].get("constant"))
+        )
+        for parent, role in data.get("parents") or ()
+        if role == "arg:0" and int(parent) in wrapper.G
+    ), None)
+    if typecode_dtype is not None:
+        data["attributes"]["sequence_column_dtypes"] = (typecode_dtype,)
+
+
 def _normalize_lexical_values(
     function_graph: Any,
     statement: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -25470,6 +25530,23 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         # exact static environment on the function graph consumed by compiled
         # shells; otherwise those globals reappear as missing runtime inputs.
         function_graph.python_bindings = definition_static_bindings
+        # Program: ``values = array("Q")`` then ``while ...:
+        # values.append(v)`` (string-core repro r5d).  Wrong record: an
+        # array allocation was declared only at graph finalization, after
+        # this function's body walk classified its loop effects, so a local
+        # array appended in a loop stayed the default opaque native effect
+        # and the loop was refused ("opaque-state-effect").
+        # Rule: a call of the static ``array.array`` with one argument (the
+        # typecode) is an array allocation from the moment the function's
+        # lexical bindings are known, which is now.
+        for _member_id, member_data in function_graph.G.nodes(data=True):
+            if _is_source_array_allocation(
+                member_data.get("expr_obj"), definition_static_bindings,
+            ) and len(tuple(
+                role for _parent, role in member_data.get("parents") or ()
+                if role != "callee"
+            )) == 1:
+                _stamp_source_array_allocation(function_graph, member_data)
         function_graph.levels = {
             member: level
             for member, level in graph.levels.items()
@@ -26766,32 +26843,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             if tuple(role for _parent, role in source_data.get("parents") or ()
                      if role != "callee") != ("arg:0",):
                 continue
-            source_data.setdefault("attributes", {}).update({
-                "aggregate_kind": "array",
-                "producer_kind": "sequence_materialization",
-                "sequence_column_count": 1,
-                "sequence_key_columns": (),
-                "sequence_writable": True,
-            })
-            # The typecode literal is the array's authored element layout
-            # (``array("Q")`` holds uint64 rows).  Post it on the allocation
-            # itself, the same column contract a typed record field's
-            # constructor edge stamps, so an element read of a local array
-            # is typed by its typecode and not by its append operands.
-            from ...transmogrifier.dtype_layout import array_typecode_dtype
-
-            typecode_dtype = next((
-                array_typecode_dtype(
-                    (source_wrapper.G.nodes[int(parent)].get("attributes") or {})
-                    .get("value", source_wrapper.G.nodes[int(parent)].get("constant"))
-                )
-                for parent, role in source_data.get("parents") or ()
-                if role == "arg:0" and int(parent) in source_wrapper.G
-            ), None)
-            if typecode_dtype is not None:
-                source_data["attributes"]["sequence_column_dtypes"] = (
-                    typecode_dtype,
-                )
+            _stamp_source_array_allocation(source_wrapper, source_data)
     graph.python_bindings = canonicalize_python_static_bindings(
         graph.python_bindings
     )
