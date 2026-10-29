@@ -26473,6 +26473,18 @@ def _tensor_descriptor_rule(
             # and folded ``distribution is not None`` the wrong way.
             if boundary.get("python_type"):
                 tensor["python_type"] = str(boundary["python_type"])
+            # Program: ``_require_tensor(self.codes, "codes")`` (huffman.py),
+            # an identity on an unannotated formal, called with a rank-1
+            # runtime-sized span.  Wrong record: only shape and dtype were
+            # read off the boundary, so the formal's empty runtime shape read
+            # as rank 0 and the callee returned a scalar.  The call's declared
+            # rank-1 descriptor and that scalar replaced each other every
+            # specialization round.  Rule: the rank and metadata state that
+            # the boundary states travel with the shape.
+            if boundary.get("rank") is not None:
+                tensor["rank"] = int(boundary["rank"])
+            if boundary.get("metadata_state") is not None:
+                tensor["metadata_state"] = str(boundary["metadata_state"])
         if "shape" not in tensor:
             # Program: ``sum(i * k for i in range(6))`` with ``k: int``.
             # Wrong record: an Input with no planner/ProgramABI boundary had
