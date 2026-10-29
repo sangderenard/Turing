@@ -6263,6 +6263,33 @@ def _build_shell_hierarchy_plan(
                 node.get("op") or node.get("type") or "?"
             )
             binding = attributes.get("binding_name")
+            # Program: ``def entry(seed, n)`` lowered with no call record.
+            # An unannotated formal of the entry is typed by the classes its
+            # callers pass (the called inventory); the host that feeds the
+            # entry is its caller, so its calls are the records
+            # (``root_calls=``).  With none posted the formal has no class
+            # and this is the refusal, named as the missing record rather
+            # than as an unread dtype.
+            missing_record = ""
+            if (
+                source.casefold() == "input"
+                and attributes.get("binding_kind") == "parameter"
+                and binding is not None
+                and function_name is not None
+            ):
+                from .concordance_declarations import CALLED_INVENTORY
+                from .identity_concordance import current_identity_book
+
+                if current_identity_book().page(CALLED_INVENTORY).latest(
+                    (str(function_name), str(binding))
+                ) is None:
+                    missing_record = (
+                        f"; no call record reaches formal {binding!r} of "
+                        f"{function_name!r}: an unannotated formal is typed "
+                        "by the classes its callers pass, and an entry's "
+                        "caller is its host, so lower the entry with the "
+                        "host's calls as root_calls"
+                    )
             raise ValueError(
                 f"region value {int(value_id)} "
                 f"({source}"
@@ -6270,6 +6297,7 @@ def _build_shell_hierarchy_plan(
                 + f" in function {function_name!r}) has no settled dtype "
                 "in the tensor, specialization, node, descriptor, planned "
                 "scalar types, its operands, its call actuals or domain"
+                + missing_record
             )
 
         def _typed_value_shape(value_id):
