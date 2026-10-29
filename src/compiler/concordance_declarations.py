@@ -464,6 +464,49 @@ METHOD_RETURN_ANNOTATION = declare_page("method_return_annotation", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
     RowField("method", K.NAME),
 ), str)
+#: One known call of a function, supplied from outside the source (the
+#: root-call contract: a harness or host is the caller).  Fact: a tuple of
+#: ``(formal, class)`` pairs, the exact Python class of each argument.
+#: Novel(CONTRACT_DEMAND): the contract row is the only source.  Mode CONCORD.
+ROOT_CALL_RECORD = declare_page("root_call_record", (
+    RowField("function_identity", K.NAME), RowField("ordinal", K.INDEX),
+), tuple)
+#: What the CALLERS of a function pass for one formal.  The compiler takes
+#: this inventory itself: every call record (an internal call edge's actual,
+#: or a root-call contract row a caller of the entry supplies) that reaches
+#: the formal contributes the exact Python class of its argument.  The fact
+#: is exactly the classes found -- never wider; an empty inventory is a
+#: named refusal at the reader, never a default.  ``selected`` is the one
+#: class this lowering's specialized copy of the function is built for
+#: (None while the inventory has a single class).  Mode REVISE.
+@dataclass(frozen=True)
+class CalledInventoryFact:
+    classes: tuple          # exact class spellings, sorted, e.g. ("float", "int")
+    selected: str | None    # the class this specialized copy lowers
+    root: bool = False      # a root-call contract fed it: ingestion may type
+                            # the formal from it (internal-edge inventories are
+                            # provenance; callsite specialization types those)
+
+
+#: One internal call edge's actual for one callee formal: the exact class the
+#: caller's SOURCE_VALUE_CLASS cell states for the argument.  Derived from
+#: that cell.  Mode REVISE.
+CALL_EDGE_ACTUAL = declare_page("call_edge_actual", (
+    RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("formal", K.NAME),
+), str)
+#: ``called_inventory.post_call_edge_range``: the interval one internal call
+#: edge's actual is proven to lie in, ``(caller scope, callsite id, formal)``
+#: -> ``(low, high)``.  DERIVED from the actual's ``source_int_range`` (or
+#: ``guarded_call_actual_range``) cell.  A callsite-specialized copy minted
+#: for that interval reads it as its formal's interval.
+CALL_EDGE_INT_RANGE = declare_page("call_edge_int_range", (
+    RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("formal", K.NAME),
+), tuple)
+CALLED_INVENTORY = declare_page("called_inventory", (
+    RowField("function_identity", K.NAME), RowField("formal", K.NAME),
+), CalledInventoryFact)
 SCALAR_PARAMETER = declare_page("scalar_parameter", (
     RowField("scope", K.SCOPE), RowField("input_id", K.VALUE_ID),
 ), ValueKind)
@@ -500,6 +543,27 @@ CALLABLE_IDENTITY = declare_page("callable_identity_concordance", (
 ), int)
 SOURCE_VALUE_CLASS = declare_page("source_value_class_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), tuple)
+#: ``_propagate_builtin_int_ranges``: the closed interval a builtin ``int``
+#: value is proven to lie in, ``(numeric scope, value id)`` -> ``(low,
+#: high)``, CONCORD, DERIVED from the value's ``source_value_class`` cell, its
+#: node identity, and the operand range cells the operator rule read.  A
+#: value with no proof has no row.  The native width of a Python ``int`` is
+#: the narrowest declared layout holding this interval
+#: (``dtype_layout.python_int_range_dtype``), exactly as a literal's is.
+SOURCE_INT_RANGE = declare_page("source_int_range_concordance", (
+    RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), tuple)
+#: ``_solve_int_ranges``: the interval a call actual is proven to lie in AT
+#: one callsite, ``(numeric scope, callsite id, value id)`` -> ``(low,
+#: high)``, where a raising guard dominating the call (``if v < 0 or v >
+#: U64_MAX: raise``) narrows a value whose own row is wider or absent.
+#: CONCORD, DERIVED from the guard constants' range cells, the actual's own
+#: range cell when it has one, and the callsite's node identity.  The call
+#: edge reads it to convert the actual into a wider formal losing nothing.
+GUARDED_CALL_ACTUAL_RANGE = declare_page("guarded_call_actual_range", (
+    RowField("numeric_scope", K.SCOPE), RowField("callsite_id", K.VALUE_ID),
+    RowField("value_id", K.VALUE_ID),
 ), tuple)
 
 # ============================================================================
@@ -722,6 +786,14 @@ CALLEE_UNRESOLVED = declare_reason("callee_unresolved")
 #: ``place_loop_carried_region_producers.owned_regions``' marker-region
 #: fallback.
 REGION_OWNERSHIP_UNKNOWN = declare_reason("region_ownership_unknown")
+#: A region value whose dtype no record settled when the hierarchy plan was
+#: frozen BEFORE callsite planning / actual-to-formal binding / linked-ABI
+#: settlement.  The structure is frozen; the type is an outstanding
+#: obligation until the strict (post-settlement) freeze settles or refuses it.
+REGION_VALUE_DTYPE_AWAITS_SETTLEMENT = declare_reason(
+    "region_value_dtype_awaits_settlement"
+)
+HIERARCHY_PLAN_FREEZE = declare_stage("hierarchy_plan_freeze")
 
 
 # -- facts -------------------------------------------------------------------
@@ -739,6 +811,96 @@ class SpecializationFact:
 
     value: Any
     source: SpecializationSource
+
+    def __eq__(self, other: object) -> bool:
+        # A bound tensor literal (an array, an AbstractTensor) answers ``==``
+        # elementwise, and ``bool`` of that refuses: the fixed-point re-post
+        # check raised "truth value ... ambiguous" on every tensor binding.
+        # Two literals are the same fact when their class, dtype, shape and
+        # element bytes agree.
+        if not isinstance(other, SpecializationFact):
+            return NotImplemented
+        return self.source == other.source and (
+            literal_identity(self.value) == literal_identity(other.value)
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.source, literal_identity(self.value)))
+
+
+def is_array_literal(value: Any) -> bool:
+    """An ndarray, or a tensor that exposes its shape and its elements."""
+
+    if isinstance(value, (str, bytes, bool, int, float, complex)):
+        return False
+    return hasattr(value, "shape") and callable(getattr(value, "tolist", None))
+
+
+def literal_identity(value: Any) -> Any:
+    """``value`` itself, or for an array-like literal a key of its class,
+    dtype, shape and element bytes.  A tuple, list, dict or dataclass record
+    that holds an array literal is keyed field by field the same way, so a
+    record of tensors compares by content instead of by tensor ``==``."""
+
+    key, holds_array = _literal_identity(value, 0)
+    return key if holds_array else value
+
+
+def _literal_identity(value: Any, depth: int) -> tuple[Any, bool]:
+    import dataclasses
+
+    if is_array_literal(value):
+        import numpy as np
+
+        data = value.tolist() if not isinstance(value, np.ndarray) and hasattr(
+            value, "tolist"
+        ) else value
+        array = np.asarray(data)
+        return (
+            f"{type(value).__module__}.{type(value).__qualname__}",
+            str(getattr(value, "dtype", array.dtype)),
+            tuple(int(extent) for extent in array.shape),
+            array.tobytes(),
+        ), True
+    if depth >= 16:
+        return value, False
+    if isinstance(value, (tuple, list)):
+        parts = [_literal_identity(item, depth + 1) for item in value]
+        children = tuple(part[0] for part in parts)
+    elif isinstance(value, dict):
+        parts = [_literal_identity(item, depth + 1) for item in value.values()]
+        children = tuple(zip(value.keys(), (part[0] for part in parts)))
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = dataclasses.fields(value)
+        parts = [
+            _literal_identity(getattr(value, field.name), depth + 1)
+            for field in fields
+        ]
+        children = tuple(
+            zip((field.name for field in fields), (part[0] for part in parts))
+        )
+    elif (
+        type(value).__eq__ is object.__eq__
+        and isinstance(getattr(value, "__dict__", None), dict)
+        and not isinstance(value, type)
+        and not callable(value)
+        and type(value).__module__ != "builtins"
+    ):
+        # A plain authored object (``X86TensorReadHead``) compares by
+        # identity in Python, and the compiler's own copy of a bound
+        # receiver is another object with the same fields.  Holding a
+        # tensor, it is keyed by its fields like a record.
+        names = sorted(vars(value))
+        parts = [
+            _literal_identity(vars(value)[name], depth + 1) for name in names
+        ]
+        children = tuple(zip(names, (part[0] for part in parts)))
+    else:
+        return value, False
+    if not any(part[1] for part in parts):
+        return value, False
+    kind = f"{type(value).__module__}.{type(value).__qualname__}"
+    return (kind, children), True
 
 
 class ExecutionKind(Enum):
@@ -886,6 +1048,12 @@ LOOP_CARRIED_BINDING = declare_page("loop_carried_binding", (
 LOOP_REGION_MEMBERSHIP = declare_page("loop_region_membership", (
     RowField("read_scope", K.SCOPE), RowField("loop", K.VALUE_ID),
 ), tuple)                              # mode REVISE
+#: Fact: the dtype a hierarchy-plan freeze settled for a region value, or
+#: ``Unresolved(REGION_VALUE_DTYPE_AWAITS_SETTLEMENT)`` while the freeze was
+#: non-terminal and nothing had settled it.  Mode REVISE.
+PLAN_REGION_VALUE_DTYPE = declare_page("plan_region_value_dtype", (
+    RowField("read_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), str)                                # str | Unresolved; mode REVISE
 LOOP_RESULT_PORT_BINDING = declare_page("loop_result_port_binding", (
     RowField("read_scope", K.SCOPE), RowField("port", K.VALUE_ID),
 ), str)                                # mode CONCORD
@@ -1199,6 +1367,12 @@ REVOKE_PHYSICAL = _PhysicalSentinel("REVOKE_PHYSICAL")
 SSA_VALUE_PHYSICAL_STORAGES = frozenset({
     "scalar", "span", "reference", "record", "sequence", "table", "keyed",
 })
+#: ``keyed``/``table`` are ProgramABI access policies over descriptor-backed
+#: resident ``sequence`` storage.  The SSA row keeps the declared policy; a
+#: ValueTypeABI arm states only the physical kind.  This is the one place that
+#: maps one to the other (``_physical_type_arms`` and the physical view both
+#: read it).
+POLICY_PHYSICAL_KIND = {"keyed": "sequence", "table": "sequence"}
 SSA_VALUE_PHYSICAL_FIELDS = (
     "physical_dtype", "storage", "rank", "arena", "device",
 )
@@ -1626,7 +1800,7 @@ PHYSICAL_CALL_INPUT_ADAPTATION_ROUND = declare_page(
 CALL_INPUT_CONVERSION = declare_page("call_input_conversion", (
     RowField("caller", K.SCOPE), RowField("actual", K.VALUE_ID),
     RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
-), tuple)                              # mode REVISE
+), tuple)                              # (converted,source dtype,target dtype,kind[,source callsite,block]); REVISE
 CALL_INPUT_STORAGE = declare_page("call_input_storage_concordance", (
     RowField("caller", K.SCOPE), RowField("actual", K.VALUE_ID),
 ), str)                                # mode CONCORD
@@ -2198,17 +2372,19 @@ SEQUENCE_RESIDENCY = declare_page("sequence_residency", (
 ), ResidencyFact)
 
 # -- pages: re-declared (census 75, step 7) ----------------------------------
-#: The callsite moves from the column into the row: one row per binding.
-#: Fact ``ArgumentBindingFact`` or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``.
-#: CONCORD; rows written raw before this step keep ``"binding"`` as their
-#: third element with the callsite as the column.
+#: One row per binding, qualified by the caller as well as the call-local
+#: site. Distinct specialized callers reuse local site IDs and can bind the
+#: same callee shell formal to different literals. Fact ``ArgumentBindingFact``
+#: or ``Unresolved(STORAGE_MINTED_FROM_ABSENCE)``. Legacy rows written before
+#: this step keep ``"binding"`` as their third element with callsite in column.
 ARGUMENT_BINDING = declare_page("argument_binding", (
-    RowField("callee", K.NAME), RowField("formal", K.VALUE_ID),
+    RowField("callee", K.NAME), RowField("caller", K.NAME),
+    RowField("formal", K.VALUE_ID),
     RowField("callsite", K.LABEL),
 ), ArgumentBindingFact)
 ARGUMENT_BINDING_RESOLUTION = declare_page("argument_binding_resolution", (
-    RowField("callee", K.SCOPE), RowField("formal", K.VALUE_ID),
-    RowField("source", K.VALUE_ID),
+    RowField("callee", K.SCOPE), RowField("caller", K.SCOPE),
+    RowField("formal", K.VALUE_ID), RowField("source", K.VALUE_ID),
 ), tuple)                              # REVISE (next column)
 #: (callsite, callee, formal); CONCORD, DERIVED(the slot's cell, the formal's cell).
 FRAME_LEASE = declare_page("frame_lease_link", (
@@ -2309,7 +2485,7 @@ FORMAL_ACTUAL_OCCURRENCE = declare_page("formal_actual_occurrence_concordance", 
     RowField("caller", K.NAME), RowField("block", K.NAME),
     RowField("instruction", K.INDEX), RowField("position", K.INDEX),
     RowField("caller_scope", K.SCOPE),
-), int)                                # DERIVED(actual ssa_value); CONCORD
+), int)                                # DERIVED(actual SSA); exact control rebind REVISE
 FORMAL_STORAGE_RESOLUTION = declare_page("formal_storage_resolution", (
     RowField("function", K.SCOPE), RowField("formal", K.VALUE_ID),
 ), tuple)                              # DERIVED(incoming occurrences); REVISE
@@ -2811,6 +2987,7 @@ class SSABlockKind(Enum):
     STATE_NEXT = "state_next"
     STATE_MERGE = "state_merge"
     CHILD_TABLE_LIVE = "child_table_live"
+    TABLE_ROW_LIVE = "table_row_live"
     MAPPING_SETDEFAULT_FOUND = "mapping_setdefault_found"
     MAPPING_SETDEFAULT_MISSING = "mapping_setdefault_missing"
     MAPPING_SETDEFAULT_MERGE = "mapping_setdefault_merge"
@@ -2848,6 +3025,8 @@ class SSABlockKind(Enum):
     SEQUENCE_QUERY_MERGE = "sequence_query_merge"
     SEQUENCE_POP_SELECTED = "sequence_pop_selected"
     SEQUENCE_POP_EMPTY = "sequence_pop_empty"
+    SEQUENCE_INDEX_IN_RANGE = "sequence_index_in_range"
+    SEQUENCE_INDEX_OUT_OF_RANGE = "sequence_index_out_of_range"
     SEQUENCE_REMOVE_SCAN = "sequence_remove_scan"
     SEQUENCE_REMOVE_COMPARE = "sequence_remove_compare"
     SEQUENCE_REMOVE_NEXT = "sequence_remove_next"
@@ -3167,6 +3346,24 @@ class ParameterAbiKind(Enum):
     REFERENCE = "reference"
 
 
+#: Whether the execution contract admits a call through a stored callable
+#: field as a host callback (``turing-host-callback-v1``).  A host callback
+#: calls code the host process owns -- a live Python interpreter, when the
+#: host is Python -- through a pointer handed in at run time, so only a
+#: field the contract names in ``python_callback_whitelist``, under a
+#: Python-hosted contract that keeps callbacks (``host_runtime: python``,
+#: ``python_callbacks: contract_only``, ``require_full_native: false``), is
+#: admitted.  Row: the field, the contract's three deciding fields and
+#: whether the whitelist names the field.
+#: Fact: ``"admit"`` or the refusal.  NOVEL(HOST_CALLBACK_ADMISSION_DECISION);
+#: CONCORD.  Writer and reader: ``fortran_c_shell._host_callback_admission``.
+HOST_CALLBACK_ADMISSION_DECISION = declare_transform("host_callback_admission", 0)
+HOST_CALLBACK_ADMISSION = declare_page("host_callback_admission", (
+    RowField("owner", K.NAME), RowField("field", K.NAME),
+    RowField("host_runtime", K.LABEL), RowField("python_callbacks", K.LABEL),
+    RowField("require_full_native", K.LABEL), RowField("whitelisted", K.LABEL),
+), str)
+
 #: The extraction contract declares a parameter's ABI kind at the function
 #: signature.  Operand: the parameter's version-0 ``name_binding`` cell.
 PARAMETER_ABI_DECLARATION = declare_transform("parameter_abi_declaration", 1)
@@ -3461,6 +3658,20 @@ class ValueTypeABIFact:
 VALUE_TYPE_ABI = declare_page("value_type_abi", (
     RowField("copy_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), ValueTypeABIFact)                   # DERIVED(the value identity / incoming value_type_abi); REVISE
+
+#: How many times a ``For`` loop's carried update, computed in the body
+#: itself (not in a branch), runs before the loop exits, proven from the
+#: loop's own record: ``(copy scope, update value id)`` -> int >= 1.  Program: ``xs = [2.5,
+#: t * 1.5]; s = 0; for v in xs: s += v``.  The carried ``s`` is the seed's
+#: class (int) only when the loop runs zero times; a display of two members
+#: never mutated runs twice, so after the loop ``s`` is exactly the update's
+#: class (float).  Posted only for a loop with no break or continue site
+#: whose iterable is a non-empty, unmutated list/tuple display or a range of
+#: literal ints; an update with no proof has no row.  DERIVED from the
+#: loop's and the update's value identities; CONCORD.
+LOOP_UPDATE_MINIMUM_TRIPS = declare_page("loop_update_minimum_trips", (
+    RowField("copy_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), int)
 
 
 SEQUENCE_COLUMN_TYPE_ABI = declare_page("sequence_column_type_abi", (
@@ -4072,9 +4283,10 @@ ASSIGNMENT_PROJECTION_SOURCE = declare_page(
 )
 
 # -- operation-owned result domains and scalar kernel operands ---------------
-#: ``plan_region_to_ssa_instrs``: the truth type a predicate operation owns,
-#: ``(function scope, closure, region name, output value)`` -> ``(opcode,
-#: "bool")``, CONCORD, DERIVED(the output's ``canonical_value`` cell).
+#: ``plan_region_to_ssa_instrs``: the domain an operation owns after the
+#: existing numeric promotion/conversion law. ``(function scope, closure,
+#: region name, output value)`` -> ``(opcode, dtype)``, CONCORD, DERIVED
+#: from the exact output identity and consumed operand/conversion identities.
 OPERATOR_RESULT_TYPE = declare_page("operator_result_type_concordance", (
     RowField("function_scope", K.SCOPE), RowField("closure", K.INDEX),
     RowField("region", K.NAME), RowField("output", K.VALUE_ID),
@@ -4167,10 +4379,14 @@ TENSOR_SHAPE_ENRICHMENT = declare_page("tensor_shape_enrichment", (
     RowField("field", K.LABEL),
 ), tuple)
 #: ``_call_result_bindings``: the Indexed projection node of one output path
-#: of a call, ``(call node, projection node)`` -> path; CONCORD, DERIVED(the
-#: call node's cell, the projection node's cell).
+#: of a call, ``(calling function, call node, projection node)`` -> path;
+#: CONCORD, DERIVED(the call node's cell, the projection node's cell).  Node
+#: ids are local to one function's graph, so the calling function is part of
+#: the row: two functions' calls of one callee share node ids and differ in
+#: what each projection reads.
 CALL_RESULT_PROJECTION = declare_page("call_result_projection_concordance", (
-    RowField("call", K.VALUE_ID), RowField("projection", K.VALUE_ID),
+    RowField("function", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("projection", K.VALUE_ID),
 ), tuple)
 #: A call-result aggregate projection that was replaced after specialization
 #: or structural folding, ``(callsite copy, slot, stale projection)`` -> the

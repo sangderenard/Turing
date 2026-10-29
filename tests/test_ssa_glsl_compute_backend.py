@@ -79,6 +79,17 @@ def _run_glsl(core, wrapper: str, x: np.ndarray) -> np.ndarray:
 def _run_c(core, wrapper: str, x: np.ndarray, directory) -> np.ndarray:
     artifact = emit_ssa_module_to_c(core.module, wrapper)
     assert not artifact.shortfalls, artifact.shortfalls
+    # A wrapper formal the C lane does not publish as a buffer is passed to
+    # the native entry unallocated, and running it corrupts this process's
+    # heap. Refuse here, by name, instead of aborting the whole session.
+    missing = [
+        int(value.id) for value in core.module.functions[wrapper].args
+        if int(value.id) not in set(artifact.buffer_order)
+    ]
+    assert not missing, (
+        f"the C lane publishes no buffer for wrapper formals {missing}; "
+        "running it would write through unallocated pointers"
+    )
     native = artifact.compile(directory)
     y = np.zeros(COUNT * WIDTH, dtype=np.float64)
     execution = native.prepare_execution(
@@ -171,7 +182,20 @@ def test_gpu_matches_c_lane_fma_flavour(gl, fma_core, tmp_path):
     # A kernel that ran but wrote nothing would compare zeros against zeros
     # in the low limbs and could still slip through; demand real signal.
     assert np.count_nonzero(gpu[::WIDTH]) > COUNT // 2
-    _assert_matches_c("sin w2 fma", gpu, cpu)
+    # C99 fma() rounds once, so the C lane is the once-rounded evaluation of
+    # the module, bit for bit, and computes the double-double sine.
+    feeds = m._feeds(core, WIDTH, x.copy(), np.zeros(COUNT * WIDTH), COUNT)
+    once = _evaluate_reference(core, wrapper, feeds)
+    assert cpu.tobytes() == once.tobytes()
+    _assert_two_limb_sine(x, cpu)
+    # GLSL fma() may round twice (Mesa does), and then the low limbs carry
+    # no exact product error: the GPU equals the C lane only where its fma
+    # rounded once. Each element must be one rule or the other.
+    twice = _evaluate_reference(core, wrapper, feeds, fma_rounds_once=False)
+    assert np.all((gpu == cpu) | (gpu == twice))
+    if not np.array_equal(gpu, cpu):
+        print("[sin w2 fma] GPU fma() rounds twice; it matches the C lane "
+              f"in {int(np.count_nonzero(gpu == cpu))} of {gpu.size} values")
 
 
 def test_gpu_matches_c_lane_split_flavour(gl, split_core, tmp_path):
@@ -180,4 +204,146 @@ def test_gpu_matches_c_lane_split_flavour(gl, split_core, tmp_path):
     gpu = _run_glsl(core, wrapper, x)
     cpu = _run_c(core, wrapper, x, tmp_path)
     assert np.count_nonzero(gpu[::WIDTH]) > COUNT // 2
+    _assert_two_limb_sine(x, cpu)
     _assert_matches_c("sin w2 split", gpu, cpu)
+
+
+# ---------------------------------------------------------------------------
+# reference evaluation -- the lowered module itself, interpreted in Python
+# ---------------------------------------------------------------------------
+
+def _evaluate_reference(core, wrapper: str, feeds, *, fma_rounds_once=True):
+    """Run the wrapper's counted loop over the module's own SSA in Python.
+
+    Independent of the shader emitter: each region call is evaluated as a
+    call (its result is the list of its Ret operands, projected by
+    GetElementPtr/Load), every float operation is one IEEE binary64
+    operation, and Fma is ``math.fma`` (one rounding) or, with
+    ``fma_rounds_once=False``, a multiply then an add (two roundings).
+    """
+
+    import math
+
+    module = core.module
+    function = module.functions[wrapper]
+    arrays = {key: np.array(value, dtype=np.float64, copy=True)
+              for key, value in feeds.items() if np.ndim(value)}
+    scalars = {key: value for key, value in feeds.items() if not np.ndim(value)}
+    binary = {
+        "Add": lambda a, b: a + b, "Sub": lambda a, b: a - b,
+        "Mul": lambda a, b: a * b, "Div": lambda a, b: a / b,
+    }
+
+    def run_block(instructions, env):
+        returned = None
+        for instruction in instructions:
+            op = str(instruction.op)
+            args = [env.get(int(value.id), None) for value in instruction.args]
+            result = None
+            if op == "Const":
+                result = instruction.attributes.get(
+                    "constant", instruction.attributes.get("value")
+                )
+            elif op == "Cast":
+                result = args[0]
+            elif op == "GetElementPtr":
+                result = (args[0], int(args[1]))
+            elif op == "Load":
+                base, index = args[0]
+                result = base[index]
+            elif op == "Store":
+                base, index = args[1]
+                base[index] = args[0]
+            elif op in binary:
+                result = np.float64(binary[op](np.float64(args[0]), np.float64(args[1])))
+            elif op == "Neg":
+                result = np.float64(-np.float64(args[0]))
+            elif op == "Fma":
+                a, b, c = (float(value) for value in args)
+                result = np.float64(
+                    math.fma(a, b, c) if fma_rounds_once
+                    else np.float64(np.float64(a) * np.float64(b)) + np.float64(c)
+                )
+            elif op == "Call":
+                region = module.functions[str(instruction.attributes["callee"])]
+                inner = {int(formal.id): value for formal, value in zip(region.args, args)}
+                result = run_block(region.blocks["entry"].instrs, inner)
+            elif op == "Ret":
+                returned = args
+            elif op in ("Br", "Phi", "Lt", "CondBr"):
+                continue
+            else:
+                raise AssertionError(f"reference evaluation has no rule for {op}")
+            if instruction.res is not None:
+                env[int(instruction.res.id)] = result
+        return returned
+
+    phi = next(
+        instruction for block in function.blocks.values()
+        for instruction in block.instrs if str(instruction.op) == "Phi"
+    )
+    env = {}
+    for value in function.args:
+        identity = int(value.id)
+        env[identity] = arrays.get(identity, scalars.get(identity))
+    run_block(function.blocks["entry"].instrs, env)
+    count = int(np.asarray(feeds[int(core.roles["count"].id)]))
+    for index in range(count):
+        env[int(phi.res.id)] = index
+        run_block(function.blocks["loop_body"].instrs, env)
+    return arrays[int(core.roles["output"].id)]
+
+
+def _assert_two_limb_sine(x: np.ndarray, y: np.ndarray):
+    """y holds sin(x) per element to far better than one double."""
+
+    import mpmath
+
+    with mpmath.workdps(60):
+        for index in range(COUNT):
+            point = mpmath.mpf(float(x[WIDTH * index])) + mpmath.mpf(
+                float(x[WIDTH * index + 1])
+            )
+            truth = mpmath.sin(point)
+            got = mpmath.mpf(float(y[WIDTH * index])) + mpmath.mpf(
+                float(y[WIDTH * index + 1])
+            )
+            assert abs(got - truth) <= abs(truth) * mpmath.mpf(2) ** -95, (
+                index, float(x[WIDTH * index]), float(y[WIDTH * index]),
+                float(y[WIDTH * index + 1]),
+            )
+
+
+@pytest.mark.parametrize("flavour", ["fma", "split"])
+def test_gpu_matches_reference_evaluation_of_the_lowered_core(gl, flavour, fma_core, split_core):
+    """The current lowering: a Cast bound and a load/compute/store body."""
+
+    core, wrapper = fma_core if flavour == "fma" else split_core
+    wrapper_function = core.module.functions[wrapper]
+    body_calls = [
+        instruction for instruction in wrapper_function.blocks["loop_body"].instrs
+        if instruction.op == "Call"
+    ]
+    assert len(body_calls) > 1  # the shape this lane used to refuse
+    x = _sample_x(WIDTH, COUNT)
+    gpu = _run_glsl(core, wrapper, x)
+    feeds = m._feeds(core, WIDTH, x.copy(), np.zeros(COUNT * WIDTH), COUNT)
+    once = _evaluate_reference(core, wrapper, feeds)
+    # It is a two-limb sine core: element i is limbs 2i and 2i+1 of x and
+    # of y, and both of y's limbs are written.
+    assert np.count_nonzero(gpu[1::WIDTH]) > COUNT // 2
+    _assert_two_limb_sine(x, once)
+    if flavour == "split":
+        _assert_two_limb_sine(x, gpu)
+        # No fma anywhere: every operation is one IEEE operation in a
+        # precise variable, so the GPU must agree bit for bit.
+        assert gpu.tobytes() == once.tobytes()
+        return
+    twice = _evaluate_reference(core, wrapper, feeds, fma_rounds_once=False)
+    # GLSL lets fma() round twice; each element must be one rule or the
+    # other, never anything else. Twice-rounded, fma no longer yields a
+    # product's exact error, so a device that rounds twice (Mesa does)
+    # computes this flavour to about one double -- which is why fma use
+    # is a precision obligation the record states.
+    assert np.all((gpu == once) | (gpu == twice))
+

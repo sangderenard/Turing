@@ -7,9 +7,10 @@ of course retain the values they request. A tile contains at most ``tile_rows``
 entries; a single large fact is indivisible, so this is not a byte/RSS cap.
 
 Tables are read-only snapshots. Writers must explicitly obtain a mutable view;
-ordinary reads, select/map/reduce and budget recompression never do so. Pickle
-is internal same-process storage, never an untrusted interchange format. A
-codec supplied by the owner preserves registry references in concordance facts.
+ordinary reads, select/map/reduce and budget recompression never do so. A
+tile's rows are a ``tile_row_codec`` stream; its entropy coding, in RAM and on
+disk, is AbstractTensor LZ77 + canonical Huffman (``octet_codec``).  The owner's
+reducers and loader preserve registry references in concordance facts.
 """
 from __future__ import annotations
 
@@ -17,10 +18,7 @@ from array import array
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-import io
-import lzma
 import os
-import pickle
 import shutil
 import struct
 import sys
@@ -28,7 +26,19 @@ import tempfile
 import weakref
 from threading import RLock
 from typing import Any, Callable
-import zlib
+
+from .tile_row_codec import (
+    compress_octets, decode_rows, decompress_octets, encode_rows, train_codebook,
+)
+
+
+def _checksum(data: bytes) -> int:
+    """FNV-1a, 32 bits: the tile header's corruption check."""
+
+    value = 0x811C9DC5
+    for octet in data:
+        value = ((value ^ octet) * 0x01000193) & 0xFFFFFFFF
+    return value
 
 
 def _close_tile_directory(path):
@@ -38,10 +48,8 @@ def _close_tile_directory(path):
 class DiskTileStore:
     """Independently replaceable compressed artifacts owned by one tile set.
 
-    Each record is independently compressed. No table/page pickle is rebuilt.
-    LZMA2 uses a dictionary bounded to 1 MiB, rather than preset 9's large
-    compression workspace precisely when RAM is scarce. Small records that
-    compress better with zlib9 retain that encoding instead.
+    Each record is independently compressed (``octet_codec``); a record
+    that would not shrink is stored raw. No table/page image is rebuilt.
     """
 
     def __init__(self, directory=None):
@@ -60,17 +68,28 @@ class DiskTileStore:
         )
         return os.path.join(self.path, f"{offset:016x}.tile")
 
-    def write(self, data, rows, *, heavy=True):
-        dictionary = min(1 << 20, max(1 << 16, len(data)))
-        # Stronger than the RAM tier, with bounded encoder working memory.
-        strong = lzma.compress(data, filters=[{
-            "id": lzma.FILTER_LZMA2, "preset": 6, "dict_size": dictionary,
-        }]) if heavy else None
-        fast = zlib.compress(data, 9)
-        codec, payload = ("lzma", strong) if strong is not None and len(strong) < len(fast) else ("zlib", fast)
-        if len(data) < len(payload):
+    def write(self, data, rows, *, heavy=True, compress=True):
+        # ``heavy`` asked for the stronger disk codec; there is one codec now.
+        # ``compress=False`` stores raw: a chunk of hashes does not shrink.
+        if not compress:
+            return self._append(data, len(data), rows, "raw", _checksum(data))
+        codec, payload = "lz-huffman", compress_octets(data)
+        if len(data) <= len(payload):
             codec, payload = "raw", data
-        return self._append(payload, len(data), rows, codec, zlib.crc32(data))
+        return self._append(payload, len(data), rows, codec, _checksum(data))
+
+    def write_tile(self, tile):
+        """A resident ``CompressedTile`` on disk.  RAM and disk share one
+        codec, so a compressed payload is written as it is, not re-encoded;
+        decoding it only computes the header checksum."""
+
+        data = tile.decode()
+        if not tile.compressed or tile.codebook is not None:
+            # A disk tile decodes alone: one coded against its table's
+            # shared codebook is coded again without it.
+            return self.write(data, tile.rows)
+        return self._append(tile.payload, len(data), tile.rows, "lz-huffman",
+                            _checksum(data))
 
     def copy_strong_tile(self, tile):
         """Relocate an already strong-compressed tile without encoding it again.
@@ -79,8 +98,8 @@ class DiskTileStore:
         This is an explicit single-tile copy operation; storage maintenance
         never invokes it for unaffected tiles. Workspace is bounded to one tile.
         """
-        if tile.codec != "lzma":
-            raise ValueError("only an already strong-compressed tile can be copied")
+        if tile.codec != "lz-huffman":
+            raise ValueError("only an already compressed tile can be copied")
         tile.decode()  # Retain the compaction corruption/length check.
         with open(tile.store.tile_path(tile), "rb") as stream:
             payload = stream.read()
@@ -122,13 +141,8 @@ class DiskTileStore:
             self.reads += 1
         if len(payload) != tile.stored_bytes:
             raise OSError("truncated compressed tile")
-        if tile.codec == "lzma":
-            data = lzma.decompress(payload, memlimit=16 << 20)
-        elif tile.codec == "zlib":
-            data = zlib.decompress(payload)
-        else:
-            data = payload
-        if len(data) != tile.raw_bytes or zlib.crc32(data) != tile.checksum:
+        data = decompress_octets(payload) if tile.codec == "lz-huffman" else payload
+        if len(data) != tile.raw_bytes or _checksum(data) != tile.checksum:
             raise ValueError("disk tile checksum/length disagrees with its header")
         return data
 
@@ -168,7 +182,7 @@ class DiskTileDirectory:
     """
     _entry = struct.Struct("<QQQIBIB6x")
     window_items = (64 << 10) // _entry.size
-    _codecs = ("raw", "zlib", "lzma")
+    _codecs = ("raw", "lz-huffman")
 
     def __init__(self, store, directory=None, *, window_items=None, exclusive=False):
         if window_items is not None:
@@ -300,7 +314,8 @@ class DiskPackedIndex:
                                                                DiskTileDirectory.window_items))
         for start in range(0, self._count, self.chunk_items):
             self._tiles.append(store.write(values[start:start + self.chunk_items].tobytes(),
-                                           min(self.chunk_items, self._count - start)))
+                                           min(self.chunk_items, self._count - start),
+                                           compress=False))
         self._tiles.flush()
         self._cache_index = -1
         self._cache = b""
@@ -336,16 +351,24 @@ class CompressedTile:
     raw_bytes: int
     rows: int
     compressed: bool
+    #: The table's shared ``OctetCodebook`` the payload is coded against.
+    codebook: Any = None
 
     @classmethod
-    def encode(cls, data: bytes, rows: int, level: int) -> CompressedTile:
-        compressed = zlib.compress(data, level)
+    def encode(
+        cls, data: bytes, rows: int, level: int, codebook: Any = None,
+    ) -> CompressedTile:
+        # Level 0 stores raw; every other level is the one octet codec.
+        compressed = compress_octets(data, codebook) if level else data
         if len(compressed) < len(data):
-            return cls(compressed, len(data), rows, True)
+            return cls(compressed, len(data), rows, True, codebook)
         return cls(data, len(data), rows, False)
 
     def decode(self) -> bytes:
-        data = zlib.decompress(self.payload) if self.compressed else self.payload
+        data = (
+            decompress_octets(self.payload, self.codebook)
+            if self.compressed else self.payload
+        )
         if len(data) != self.raw_bytes:
             raise ValueError("compressed tile length disagrees with its header")
         return data
@@ -368,6 +391,10 @@ class CompressionStats:
         return self.raw_bytes / max(1, self.resident_bytes)
 
 
+#: Tiles coded alone before a table trains its shared codebook from them.
+CODEBOOK_AFTER_TILES = 3
+
+
 @dataclass(frozen=True, slots=True)
 class BudgetFit:
     available_bytes: int
@@ -388,7 +415,7 @@ class CompressedTable(Mapping):
     def __init__(
         self, items: Iterable[tuple[Any, Any]], *, tile_rows: int = 128,
         level: int = 1, dispatch_table: dict | None = None,
-        loader: Callable[[bytes], Any] = pickle.loads,
+        loader: Callable[[bytes], Any] = decode_rows,
     ) -> None:
         if type(tile_rows) is not int or tile_rows <= 0:
             raise ValueError("tile_rows must be a positive integer")
@@ -398,6 +425,8 @@ class CompressedTable(Mapping):
         self.level = level
         self._dispatch = dispatch_table
         self._loader = loader
+        # Trained on the first tile; every tile is coded against it.
+        self._codebook = None
         self._lock = RLock()
         self._decoded_tiles = 0
         self._tiles: list[CompressedTile] = []
@@ -440,17 +469,24 @@ class CompressedTable(Mapping):
         self._tiles.append(self._pack(chunk, level))
 
     def _pack(self, chunk, level):
-        stream = io.BytesIO()
-        pickler = pickle.Pickler(stream, protocol=pickle.HIGHEST_PROTOCOL)
-        if self._dispatch is not None:
-            pickler.dispatch_table = self._dispatch
-        pickler.dump(tuple(chunk))
-        data = stream.getvalue()
+        data = encode_rows(tuple(chunk), self._dispatch)
+        if (
+            level and self.__dict__.get("_codebook") is None
+            and len(self._tiles) == CODEBOOK_AFTER_TILES
+        ):
+            # A shared codebook costs its dictionary once; it pays only on
+            # a table of several tiles, so the first ones are coded alone
+            # and train it.
+            self._codebook = train_codebook(b"".join(
+                tile.decode() for tile in self._tiles[:CODEBOOK_AFTER_TILES]
+            ))
         restored = self._loader(data)
         for (original, _), (key, _) in zip(chunk, restored):
             if hash(original) != hash(key) or original != key:
                 raise TypeError("compressed key does not preserve hash/equality on round trip")
-        return CompressedTile.encode(data, len(chunk), level)
+        return CompressedTile.encode(
+            data, len(chunk), level, self.__dict__.get("_codebook"),
+        )
 
     def _entries(self, tile: int) -> tuple:
         with self._lock:
@@ -556,6 +592,11 @@ class CompressedTable(Mapping):
                            else sys.getsizeof(self._tiles)) + sys.getsizeof(self._lock))
             resident += sum(index.resident_bytes() if isinstance(index, DiskPackedIndex)
                             else sys.getsizeof(index) for index in (self._hashes, self._ordinals))
+            codebook = self.__dict__.get("_codebook")
+            if codebook is not None:
+                resident += (sys.getsizeof(codebook) + sys.getsizeof(codebook.dictionary)
+                             + sys.getsizeof(codebook.command_lengths)
+                             + sys.getsizeof(codebook.literal_lengths))
             if not isinstance(self._tiles, DiskTileDirectory):
                 resident += sum(sys.getsizeof(t) + (sys.getsizeof(t.payload)
                                                    if isinstance(t, CompressedTile) else 0)
@@ -590,7 +631,7 @@ class CompressedTable(Mapping):
                     break
                 if isinstance(tile, DiskTile):
                     continue
-                disk = store.write(tile.decode(), tile.rows)
+                disk = store.write_tile(tile)
                 self._tiles[index] = disk
                 resident -= sys.getsizeof(tile) + sys.getsizeof(tile.payload) - sys.getsizeof(disk)
             if resident > target_bytes:
@@ -598,6 +639,10 @@ class CompressedTable(Mapping):
                     index = getattr(self, name)
                     if not isinstance(index, DiskPackedIndex) and len(index):
                         setattr(self, name, DiskPackedIndex(index, store))
+            if all(isinstance(tile, DiskTile) for tile in self._tiles):
+                # Disk tiles decode alone; a codebook no resident tile is
+                # coded against is resident for nothing.
+                self._codebook = None
             if (not isinstance(self._tiles, DiskTileDirectory)
                     and all(isinstance(tile, DiskTile) and tile.store is store for tile in self._tiles)):
                 directory = DiskTileDirectory(store, directory,
@@ -629,9 +674,13 @@ class CompressedTable(Mapping):
                 continue
             with self._lock:
                 for index, tile in enumerate(self._tiles):
-                    if isinstance(tile, DiskTile):
+                    # Every nonzero level is the same codec: only a tile
+                    # stored raw can shrink.
+                    if isinstance(tile, DiskTile) or tile.compressed:
                         continue
-                    candidate = CompressedTile.encode(tile.decode(), tile.rows, level)
+                    candidate = CompressedTile.encode(
+                        tile.decode(), tile.rows, level, self._codebook,
+                    )
                     if len(candidate.payload) < len(tile.payload):
                         self._tiles[index] = candidate
                 self.level = level

@@ -96,7 +96,11 @@ def _authored_source_sequence_ids(
                 records = schemas.get(str(receiver_attributes.get("program_abi_record_identity") or ""), ())
                 if len(records) == 1:
                     field = (records[0].get("fields") or {}).get(str(attributes.get("attribute") or "")) or {}
-                    if field.get("storage") in {"span", "table", "keyed"}:
+                    if field.get("storage") in {"span", "table", "keyed"} or field.get("aggregate_kind") in {"dict", "list", "set", "array", "bytearray"}:
+                        # An inferred builtin collection field still arrives
+                        # populated on this exact caller-owned receiver. Its
+                        # reference receipt is not a local constructor: read
+                        # methods must not reset the resident length to zero.
                         source_ids.add(value_id)
         if (
             operation == "getattr"
@@ -225,6 +229,18 @@ def _bind_sequence_storage_members(
             caller_sequence.column_shapes or ((),) * len(caller_sequence.column_value_ids)
         ):
             return False
+        # One heap arena is one hash-index contract: a view that disagrees
+        # about the carrier would size the arena without the index, or write
+        # rows the other view's index never sees (``hash_index_carrier``).
+        from .ir_sequence_tables import hash_index_carrier
+        if hash_index_carrier(callee_sequence) != hash_index_carrier(caller_sequence):
+            raise ValueError(
+                "bound heap sequence views disagree about their hash index: "
+                f"callee sequence={int(callee_sequence.sequence_id)} "
+                f"carrier={hash_index_carrier(callee_sequence)!r}, "
+                f"caller sequence={int(caller_sequence.sequence_id)} "
+                f"carrier={hash_index_carrier(caller_sequence)!r}"
+            )
     provisional_targets = set(map(int, provisional_targets))
 
     def bind(callee_id: int, caller_id: int) -> None:

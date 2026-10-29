@@ -1,0 +1,5 @@
+2026-10-28 Complex-rational-precision division: three record reads (MEASURED, tests/test_rational_compiler.py on top of #993):
+- Fixed: `x / y` on a record numeric class is an activation of its dunder (the reducer marks the BinOp `class_operator_dispatch` with its callee_ref), but `plan_callsites` only planned `ast.Call` nodes. The root lowered to an empty Ret ("call-result-unavailable"); this is why no `_binary_same` function was ever emitted (also seen at #897).
+- Fixed: `isinstance(d, Precision)` on a Precision[k] value folded False, because its ABI fact reads `builtins.float` (Precision is physically a float64 scalar). The fold now reads the class from the value's numeric descriptor, so `head = d.term(0) if isinstance(d, Precision) else d` selects the right arm.
+- Fixed: Precision width flowed into every descendant, so `d.term(0)`, `abs(...)` of it and `d > band` became Precision and `-shift` lowered as precision_neg. A call or a comparison now decides its own class.
+- STILL FAILING (with #993): `power_scale._exp(value)` from `_shift_raw(x, -shift)`, where `shift = AbstractTensor.where(...)`. That actual carries no type at the call edge yet.

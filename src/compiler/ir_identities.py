@@ -27,6 +27,7 @@ correctly rounded ``pow`` rounds once.
 from __future__ import annotations
 
 import contextlib as _contextlib
+import functools as _functools
 import dataclasses
 from collections.abc import Mapping
 
@@ -209,6 +210,657 @@ def reduce_constant_exponent_pow(functions, inexact: bool | None = None) -> dict
     return counts
 
 
+def _python_int_dtype(dtype) -> bool:
+    return str(dtype) == "int64"
+
+
+def _integer_constant(instruction) -> int | None:
+    """The exact int payload of an integer ``Const``, else ``None``."""
+
+    for key in ("constant", "values", "value"):
+        payload = instruction.attributes.get(key)
+        if payload is not None:
+            break
+    if isinstance(payload, bool) or not isinstance(payload, int):
+        return None
+    return int(payload)
+
+
+def _integer_pow_site(instruction) -> str | None:
+    """Which exact power reduction an instruction takes, else ``None``.
+
+    ``"int"``: ``a ** b`` / ``pow(a, b)`` on int64 with an int64 result.
+    ``"modular"``: ``pow(a, b, m)`` on int64.
+    """
+
+    canonical = str(
+        instruction.attributes.get("tensor_operation")
+        or instruction.attributes.get("tensor")
+        or instruction.op
+    )
+    result = instruction.res
+    if (
+        canonical not in _POW or result is None
+        or tuple(getattr(result, "shape", None) or ())
+        or len(instruction.args) not in (2, 3)
+        or not all(_python_int_dtype(value.dtype) for value in instruction.args)
+        or any(tuple(value.shape or ()) for value in instruction.args)
+        or not _python_int_dtype(result.dtype)
+    ):
+        return None
+    return "int" if len(instruction.args) == 2 else "modular"
+
+
+def reduce_integer_pow(functions) -> dict:
+    """The shared exact power reduction: Python ``int`` powers, in place.
+
+    Program: ``a ** b``, ``pow(a, b)``, ``pow(a, b, m)`` on ints.  Wrong
+    record: C and LLVM refused every int power but ``x ** 2``, and a float
+    ``pow`` of an int is not Python's exact int.  Rule: square-and-multiply
+    in ordinary repository SSA, so every backend inherits it -- each
+    multiply is Python ``int`` arithmetic (``source_type`` ``BinOp``),
+    which C and LLVM overflow-check (``native_faults.INT_OVERFLOW``).
+    A constant exponent unrolls straight-line; a variable one becomes a
+    loop over its bits (at most 63 trips).  ``pow(a, b, m)`` reduces each
+    product by Python's floored ``%``, so intermediates stay below ``m**2``.
+
+    Python's other outcomes are named faults: ``0 ** -n`` raises
+    ``ZeroDivisionError`` (``INT_ZERO_DIVISION``), ``pow(a, b, 0)``
+    ``ValueError`` (``POW_MODULUS_ZERO``).  ``a ** -n`` is a float in
+    Python and ``pow(a, -n, m)`` a modular inverse; an int-typed power
+    reaching a negative exponent reports ``INT_POWER_NEGATIVE_EXPONENT``
+    rather than return an int Python never computes: the frontend types
+    every int ** int as int (``a ** -2`` too), and a float arm would need
+    an int | float result.
+    """
+
+    from .concordance_declarations import (
+        PRECISION_IDENTITIES, PRECISION_IDENTITY_VALUE, SSA_BLOCK,
+        SSABlockKind,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import function_scope_of, identity_cells
+    from .native_faults import (
+        INT_POWER_NEGATIVE_EXPONENT, INT_ZERO_DIVISION, POW_MODULUS_ZERO,
+    )
+    from .ssa_record_return_state import mint_ssa_value
+    from ..transmogrifier.ssa import BasicBlock
+
+    counts = {"int_pow_unrolled": 0, "int_pow_loop": 0, "int_pow_modular": 0}
+
+    def rewrite(function, block_name: str, index: int) -> None:
+        block = function.blocks[block_name]
+        power = block.instrs[index]
+        site = _integer_pow_site(power)
+        post = block.instrs[index + 1:]
+        old_successors = list(block.successors)
+        block.instrs = block.instrs[:index]
+        anchor = power.args[0]
+        constants = {
+            int(instruction.res.id): _integer_constant(instruction)
+            for candidate in function.blocks.values()
+            for instruction in candidate.instrs
+            if instruction.op == "Const" and instruction.res is not None
+        }
+        added: list[BasicBlock] = []
+        taken = set(function.blocks)
+        state = {"current": block}
+
+        def new_block(stem: str, kind) -> BasicBlock:
+            serial = 0
+            name = f"{block_name}.{stem}"
+            while name in taken:
+                serial += 1
+                name = f"{block_name}.{stem}.{serial}"
+            taken.add(name)
+            created = BasicBlock(name)
+            added.append(created)
+            # The block's ``ssa_block`` row, from the power it spells.
+            owners = identity_cells(function, power.res, *power.args)
+            book = current_identity_book()
+            row = (function_scope_of(function), str(function.name), name)
+            if owners and book.latest_ref(SSA_BLOCK, row) is None:
+                book.post(
+                    SSA_BLOCK, row, kind, stage=PRECISION_IDENTITIES,
+                    provenance=Derived(owners), mode=Mode.CONCORD,
+                )
+            return created
+
+        def mint(dtype: str) -> SSAValue:
+            return SSAValue(mint_ssa_value(
+                function, PRECISION_IDENTITY_VALUE, (anchor,),
+                dtype=dtype, shape=(), stage=PRECISION_IDENTITIES,
+            ), dtype=dtype)
+
+        def put(op, args, dtype="int64", attributes=None, res=None) -> SSAValue:
+            res = mint(dtype) if res is None else res
+            state["current"].instrs.append(
+                Instr(op, list(args), res, attributes=dict(attributes or {}))
+            )
+            return res
+
+        def arithmetic(op, args, res=None) -> SSAValue:
+            # Python ``int`` arithmetic: the backends' checked spelling.
+            return put(op, args, attributes={
+                "source_type": "BinOp", "integer_power": True,
+            }, res=res)
+
+        def const(value: int) -> SSAValue:
+            return put("Const", [], attributes={"value": int(value)})
+
+        def jump(target: BasicBlock) -> None:
+            current = state["current"]
+            current.instrs.append(
+                Instr("Br", [], None, attributes={"target": target.name})
+            )
+            current.successors = [target.name]
+
+        def guard(condition: SSAValue, code: int, failure: str) -> None:
+            fault = new_block("pow_fault", SSABlockKind.VALIDATION_FAIL)
+            passing = new_block("pow_checked", SSABlockKind.VALIDATION_PASS)
+            current = state["current"]
+            current.instrs.append(Instr("CondBr", [condition], None, attributes={
+                "true_target": fault.name, "false_target": passing.name,
+            }))
+            current.successors = [fault.name, passing.name]
+            fault.instrs.append(Instr("Call", [], None, attributes={
+                "callee": "turing_validation_error", "error_code": int(code),
+                "failure": failure,
+            }))
+            state["current"] = fault
+            jump(passing)
+            state["current"] = passing
+
+        base, exponent = power.args[0], power.args[1]
+        literal = constants.get(int(exponent.id))
+        zero, one = const(0), const(1)
+        unrolled = site == "int" and literal is not None and literal >= 0
+        negative = None if unrolled else put("Lt", [exponent, zero], "bool")
+        modulus = None
+        if site == "modular":
+            modulus = power.args[2]
+            modulus_zero = put("Eq", [modulus, zero], "bool")
+            guard(modulus_zero, POW_MODULUS_ZERO, "pow_modulus_zero")
+            guard(negative, INT_POWER_NEGATIVE_EXPONENT,
+                  "pow_negative_exponent")
+            modulus = put("Select", [modulus_zero, one, modulus])
+        elif not unrolled:
+            zero_base = put("Eq", [base, zero], "bool")
+            guard(put("And", [negative, zero_base], "bool"),
+                  INT_ZERO_DIVISION, "zero_to_negative_power")
+            guard(negative, INT_POWER_NEGATIVE_EXPONENT,
+                  "pow_negative_exponent")
+        if unrolled:
+            # Straight-line square-and-multiply over the literal's bits.
+            square, result, bits = base, None, int(literal)
+            if bits == 0:
+                put("Const", [], attributes={"value": 1}, res=power.res)
+            while bits:
+                last_bit = bits == 1
+                if bits & 1:
+                    result = square if result is None else arithmetic(
+                        "Mul", [result, square],
+                        res=power.res if last_bit else None,
+                    )
+                    if result is square and last_bit:
+                        arithmetic("Mul", [square, one], res=power.res)
+                bits >>= 1
+                if bits:
+                    square = arithmetic("Mul", [square, square])
+            counts["int_pow_unrolled"] += 1
+        else:
+            count = put("Select", [negative, zero, exponent])
+            if modulus is not None:
+                start = arithmetic("Mod", [base, modulus])
+                first = arithmetic("Mod", [one, modulus])
+            else:
+                start, first = base, one
+            entry = state["current"]
+            header = new_block("pow_loop", SSABlockKind.LOOP_HEADER)
+            step = new_block("pow_step", SSABlockKind.LOOP_BODY)
+            done = new_block("pow_done", SSABlockKind.LOOP_EXIT)
+            jump(header)
+            result, square, remaining = power.res, mint("int64"), mint("int64")
+            next_result, next_square, next_remaining = (
+                mint("int64"), mint("int64"), mint("int64"),
+            )
+            incoming = {"incoming_blocks": (entry.name, step.name)}
+            state["current"] = header
+            put("Phi", [first, next_result], attributes=incoming, res=result)
+            put("Phi", [start, next_square], attributes=incoming, res=square)
+            put("Phi", [count, next_remaining], attributes=incoming,
+                res=remaining)
+            going = put("Gt", [remaining, zero], "bool")
+            header.instrs.append(Instr("CondBr", [going], None, attributes={
+                "true_target": step.name, "false_target": done.name,
+            }))
+            header.successors = [step.name, done.name]
+            state["current"] = step
+            odd = put("Ne", [put("BitAnd", [remaining, one]), zero], "bool")
+            factor = put("Select", [odd, square, one])
+            put("Shr", [remaining, one], res=next_remaining)
+            more = put("Gt", [next_remaining, zero], "bool")
+            # The square is taken only while bits remain, so it
+            # overflows only where the power itself does.
+            kept = put("Select", [more, square, one])
+            if modulus is None:
+                arithmetic("Mul", [result, factor], res=next_result)
+                arithmetic("Mul", [kept, kept], res=next_square)
+            else:
+                arithmetic("Mod", [arithmetic("Mul", [result, factor]),
+                                   modulus], res=next_result)
+                arithmetic("Mod", [arithmetic("Mul", [kept, kept]),
+                                   modulus], res=next_square)
+            jump(header)
+            state["current"] = done
+            counts["int_pow_modular" if modulus is not None
+                   else "int_pow_loop"] += 1
+
+        tail = state["current"]
+        tail.instrs.extend(post)
+        tail.successors = old_successors
+        if tail is not block:
+            # Successor Phis now enter from the block holding the tail.
+            for successor in old_successors:
+                target = function.blocks.get(successor)
+                for instruction in (target.instrs if target else ()):
+                    blocks = instruction.attributes.get("incoming_blocks")
+                    if str(instruction.op) == "Phi" and blocks:
+                        instruction.attributes["incoming_blocks"] = tuple(
+                            tail.name if str(origin) == block_name else origin
+                            for origin in blocks
+                        )
+        ordered = []
+        for name, existing in function.blocks.items():
+            ordered.append((name, existing))
+            if name == block_name:
+                ordered.extend((created.name, created) for created in added)
+        function.blocks.clear()
+        function.blocks.update(ordered)
+
+    for function in functions.values():
+        while True:
+            site = next(
+                (
+                    (name, position)
+                    for name, candidate in function.blocks.items()
+                    for position, instruction in enumerate(candidate.instrs)
+                    if _integer_pow_site(instruction) is not None
+                ),
+                None,
+            )
+            if site is None:
+                break
+            rewrite(function, *site)
+    return counts
+
+
+#: The scalar float64 transcendental SSA ops the signal cores route, by the
+#: name the planner leaves on them: ``hierarchical_plan``'s
+#: ``TENSOR_OPERATION_SCALAR_SPELLING`` respells ``exp``/``log``/``pow`` to
+#: ``Exp``/``Log``/``Pow``; every other ``math`` name keeps its lowercase
+#: tensor-vocabulary spelling.  ``Sqrt`` is not here: IEEE square root is
+#: correctly rounded in every backend and stays native.
+TRANSCENDENTAL_OPS = frozenset({
+    "Exp", "Log", "Pow",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh",
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class SignalCoreRoute:
+    """One row of ``TRANSCENDENTAL_SIGNAL_CORES``: how an op reaches its core.
+
+    ``method`` names a ``WideExpansionEmitter`` method, called as
+    ``method(*leading, *operands, **dict(keywords))`` with the op's float64
+    operands, or is a function ``method(emitter, instruction)`` for a core
+    that reads the op's own record (``Pow``'s operator/``math.pow`` form).
+    The cores answer in three shapes, and the pass reads each one:
+
+    * an expansion (a list of limbs, high first) -- collapsed to one double;
+    * ``(value, faults)`` -- ``value`` a double or an expansion, ``faults``
+      a sequence of ``(predicate, code, name)`` rows: a ``bool`` SSA value
+      true exactly where Python raises, the ``native_faults`` code it
+      reports, and the failure's name;
+    * ``(value, predicate)`` -- one bare ``bool`` predicate, reported as
+      this row's ``fault`` (a ``(code, name)`` pair).
+
+    A predicate of ``None`` is a fault the core proves cannot happen.
+    """
+
+    method: object
+    leading: tuple = ()
+    keywords: tuple = ()
+    fault: tuple | None = None
+
+
+def _exp_signal_core(emitter, instruction):
+    """``math.exp``: the full-range core, plus Python's ``OverflowError``.
+
+    The predicate is read from the limbs the core returned
+    (``exp_overflow_predicate``), so the fault and the value agree at the
+    last finite binade (709.782712893384 finite, 709.7827128933841 raises).
+    """
+
+    from .native_faults import FLOAT_MATH_RANGE
+
+    source = emitter.expanded(instruction.args[0], 2)
+    result = emitter.exp_expansion(source, 2)
+    return result, ((
+        emitter.exp_overflow_predicate(source, result),
+        FLOAT_MATH_RANGE, "math_exp_overflow",
+    ),)
+
+
+def _log_signal_core(emitter, instruction):
+    """``math.log``: the full-range core; ``x <= 0`` raises ``ValueError``."""
+
+    from .native_faults import FLOAT_MATH_DOMAIN
+
+    source = emitter.expanded(instruction.args[0], 2)
+    return emitter.log_expansion(source, 2), ((
+        emitter.log_domain_predicate(source),
+        FLOAT_MATH_DOMAIN, "math_log_domain",
+    ),)
+
+
+def _pow_signal_core(emitter, instruction):
+    """``x ** y`` or ``math.pow(x, y)``, by the record that wrote the op.
+
+    The planner spells both ``Pow``; Python faults them differently
+    (``0.0 ** -1`` is ``ZeroDivisionError``, ``math.pow(0.0, -1)`` is
+    ``ValueError``), and ``pow_expansion`` returns the rows for the form it
+    is told.  The extraction contract names ``math.pow`` on the call; the
+    operator carries ``source_type`` ``BinOp``.  Neither is a refusal by
+    name rather than a guessed form.
+    """
+
+    attributes = instruction.attributes or {}
+    contract = attributes.get("extraction_contract") or {}
+    identity = (
+        contract.get("identity") if isinstance(contract, Mapping) else None
+    )
+    if identity == "math.pow":
+        form = "math"
+    elif attributes.get("source_type") == "BinOp":
+        form = "operator"
+    else:
+        raise ValueError(
+            "float Pow carries neither a math.pow extraction contract nor "
+            f"an operator source_type ({dict(attributes)!r}); its Python "
+            "faults cannot be chosen"
+        )
+    return emitter.pow_expansion(*instruction.args, 2, form=form)
+
+
+def _circular_route(name: str) -> SignalCoreRoute:
+    from .native_faults import FLOAT_MATH_DOMAIN
+
+    # sin/cos/tan(+-inf): Python raises ValueError('math domain error').
+    return SignalCoreRoute(
+        "circular_double", (name,),
+        fault=(FLOAT_MATH_DOMAIN, f"math_{name}_infinite"),
+    )
+
+
+#: SSA op -> its signal core, for ``transcendentals: signal_cores``.  Every
+#: other op in ``TRANSCENDENTAL_OPS`` (``asin``, ``acos``, ``sinh``,
+#: ``cosh``) has no core yet and is refused by name under that policy.
+#: c22, c913-c915 and c925 hold these on C, LLVM and Fortran.
+TRANSCENDENTAL_SIGNAL_CORES: dict[str, SignalCoreRoute] = {
+    "Exp": SignalCoreRoute(_exp_signal_core),
+    "Log": SignalCoreRoute(_log_signal_core),
+    "Pow": SignalCoreRoute(_pow_signal_core),
+    "sin": _circular_route("sin"),
+    "cos": _circular_route("cos"),
+    "tan": _circular_route("tan"),
+    "atan": SignalCoreRoute("atan_expansion"),
+    "atan2": SignalCoreRoute("atan2_expansion"),
+    "tanh": SignalCoreRoute("tanh_expansion"),
+}
+
+_TRANSCENDENTAL_FLOAT64 = frozenset({"float64", "float", "double", "f64"})
+
+
+def _scalar_float64(value) -> bool:
+    return (
+        value is not None
+        and str(value.dtype or "").casefold() in _TRANSCENDENTAL_FLOAT64
+        and not tuple(value.shape or ())
+    )
+
+
+def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
+    """Route scalar float64 ``math`` transcendentals through the signal cores.
+
+    Program: any ``math.exp``/``math.log``/``math.sin``/... on a float.
+    Wrong record: each backend spelled the op through its own table -- C
+    libm, ``llvm.*`` intrinsics (``atan``/``asin`` refused), Fortran
+    intrinsics and a 1e-6 sine LUT -- so the native value depended on the
+    host library, not on the repository.  Rule: the numeric contract's
+    ``transcendentals`` (``ssa_call_input_adapters.transcendental_policy``)
+    names the route; ``signal_cores`` rewrites each op that has a row in
+    ``TRANSCENDENTAL_SIGNAL_CORES`` into that ``WideExpansionEmitter``
+    method's instructions, in place, so C, LLVM and Fortran all compile the
+    same exact primitive ops (Add/Sub/Mul/Div/Fma/Floor/compare/Select).
+
+    Python's raising outcomes are named faults: each predicate the core
+    returns is guarded with ``CondBr`` to a ``turing_validation_error``
+    block, as ``reduce_integer_pow`` guards its own.  A scalar
+    transcendental with no core is refused by name: under ``signal_cores``
+    it is never left on host math.
+
+    ``backend_intrinsic`` (the ``compute`` mode) rewrites nothing: each
+    backend spells the op with its own math library (C libm, ``llvm.*`` or
+    libm calls, gfortran intrinsics).  The receipt names those ops
+    (``left_native``).
+    """
+
+    from .concordance_declarations import (
+        PRECISION_IDENTITIES, SSA_BLOCK, SSABlockKind,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_call_input_adapters import transcendental_policy
+    from .ssa_record_return_state import function_scope_of, identity_cells
+    from ..transmogrifier.ssa import BasicBlock
+
+    policy = transcendental_policy(mode)
+    receipt = {"policy": policy, "lowered": {}, "left_native": {}}
+    flavor = active_two_product_flavor()
+
+    def scalar(instruction) -> bool:
+        return (
+            str(instruction.op) in TRANSCENDENTAL_OPS
+            and _scalar_float64(instruction.res)
+            and bool(instruction.args)
+            and all(_scalar_float64(value) for value in instruction.args)
+        )
+
+    def routed(instruction) -> bool:
+        if policy != "signal_cores" or not scalar(instruction):
+            return False
+        if str(instruction.op) not in TRANSCENDENTAL_SIGNAL_CORES:
+            raise ValueError(
+                f"scalar float {instruction.op} has no signal core; the "
+                "numeric contract's transcendentals is 'signal_cores', "
+                "which never leaves a math function on the host library "
+                "(numeric mode 'compute' selects backend_intrinsic)"
+            )
+        return True
+
+    def rewrite(function, block_name: str, index: int) -> None:
+        block = function.blocks[block_name]
+        call = block.instrs[index]
+        op = str(call.op)
+        row = TRANSCENDENTAL_SIGNAL_CORES[op]
+        method = row.method
+        post = block.instrs[index + 1:]
+        old_successors = list(block.successors)
+        emitted: list = []
+        emitter = WideExpansionEmitter(
+            function, emitted, two_product_flavor=flavor,
+        )
+        answer = (
+            method(emitter, call) if callable(method)
+            else getattr(emitter, method)(
+                *row.leading, *call.args, **dict(row.keywords)
+            )
+        )
+        faults = ()
+        if isinstance(answer, tuple):
+            answer, faults = answer
+        if not isinstance(answer, (SSAValue, list, tuple)):
+            raise ValueError(
+                f"signal core {method!r} for {op} answered {answer!r}; "
+                "expected a double, an expansion, or (value, faults)"
+            )
+        # An expansion is renormalised (|low| <= ulp(high)/2), so one
+        # rounded add of its two leading limbs is its correctly rounded
+        # double.
+        result = (
+            emitter.lead(list(answer)) if isinstance(answer, (list, tuple))
+            else answer
+        )
+        if isinstance(faults, SSAValue):
+            if row.fault is None:
+                raise ValueError(
+                    f"signal core {method!r} for {op} returned a fault "
+                    "predicate and its route names no fault code for it"
+                )
+            faults = ((faults, *row.fault),)
+        faults = [
+            (predicate, int(code), str(name))
+            for predicate, code, name in faults
+            if predicate is not None
+        ]
+        producer = next(
+            (
+                instruction for instruction in emitted
+                if instruction.res is not None
+                and int(instruction.res.id) == int(result.id)
+            ),
+            None,
+        )
+        if producer is None:
+            raise ValueError(
+                f"signal core {method!r} for {op} returned a value it did "
+                "not compute; the rewrite has no instruction to bind the "
+                "op's result to"
+            )
+        # The op's own result id becomes the core's final value, so every
+        # reader of the op reads the collapsed signal-core double.
+        producer.res = call.res
+
+        def bound(value):
+            return call.res if int(value.id) == int(result.id) else value
+
+        for instruction in emitted:
+            instruction.args = [bound(value) for value in instruction.args]
+            instruction.attributes["lowered_from"] = f"signal_core.{op}"
+        faults = [
+            (bound(predicate), code, name)
+            for predicate, code, name in faults
+        ]
+        block.instrs = block.instrs[:index] + emitted
+        added: list[BasicBlock] = []
+        taken = set(function.blocks)
+        current = block
+
+        def new_block(stem: str, kind) -> BasicBlock:
+            serial = 0
+            name = f"{block_name}.{stem}"
+            while name in taken:
+                serial += 1
+                name = f"{block_name}.{stem}.{serial}"
+            taken.add(name)
+            created = BasicBlock(name)
+            added.append(created)
+            # The block's ``ssa_block`` row, from the op it spells.
+            owners = identity_cells(function, call.res, *call.args)
+            book = current_identity_book()
+            row = (function_scope_of(function), str(function.name), name)
+            if owners and book.latest_ref(SSA_BLOCK, row) is None:
+                book.post(
+                    SSA_BLOCK, row, kind, stage=PRECISION_IDENTITIES,
+                    provenance=Derived(owners), mode=Mode.CONCORD,
+                )
+            return created
+
+        for predicate, code, name in faults:
+            fault = new_block("math_fault", SSABlockKind.VALIDATION_FAIL)
+            passing = new_block("math_checked", SSABlockKind.VALIDATION_PASS)
+            current.instrs.append(Instr("CondBr", [predicate], None, attributes={
+                "true_target": fault.name, "false_target": passing.name,
+            }))
+            current.successors = [fault.name, passing.name]
+            fault.instrs.append(Instr("Call", [], None, attributes={
+                "callee": "turing_validation_error", "error_code": code,
+                "failure": name,
+            }))
+            fault.instrs.append(
+                Instr("Br", [], None, attributes={"target": passing.name})
+            )
+            fault.successors = [passing.name]
+            current = passing
+        current.instrs.extend(post)
+        current.successors = old_successors
+        if current is not block:
+            # Successor Phis now enter from the block holding the tail.
+            for successor in old_successors:
+                target = function.blocks.get(successor)
+                for instruction in (target.instrs if target else ()):
+                    blocks = instruction.attributes.get("incoming_blocks")
+                    if str(instruction.op) == "Phi" and blocks:
+                        instruction.attributes["incoming_blocks"] = tuple(
+                            current.name if str(origin) == block_name
+                            else origin
+                            for origin in blocks
+                        )
+            ordered = []
+            for name, existing in function.blocks.items():
+                ordered.append((name, existing))
+                if name == block_name:
+                    ordered.extend((made.name, made) for made in added)
+            function.blocks.clear()
+            function.blocks.update(ordered)
+        lowered = receipt["lowered"].setdefault(str(function.name), {})
+        lowered[op] = lowered.get(op, 0) + 1
+
+    for function in functions.values():
+        while True:
+            site = next(
+                (
+                    (name, position)
+                    for name, candidate in function.blocks.items()
+                    for position, instruction in enumerate(candidate.instrs)
+                    if routed(instruction)
+                ),
+                None,
+            )
+            if site is None:
+                break
+            rewrite(function, *site)
+        left = sorted({
+            str(instruction.op)
+            for candidate in function.blocks.values()
+            for instruction in candidate.instrs
+            if str(instruction.op) in TRANSCENDENTAL_OPS
+            and not str(
+                instruction.attributes.get("lowered_from") or ""
+            ).startswith("signal_core.")
+        })
+        if left:
+            receipt["left_native"][str(function.name)] = left
+        if str(function.name) in receipt["lowered"] or left:
+            function.metadata["transcendental_pipeline"] = {
+                "policy": policy,
+                "lowered": dict(receipt["lowered"].get(str(function.name), {})),
+                "left_native": tuple(left),
+            }
+    return receipt
+
+
 # Operations a region may contain and still be removable when nothing reads
 # its results: value construction and arithmetic only -- no stores, no
 # calls, no table traffic.  ``LNot``, ``Select`` and ``isfinite`` are the
@@ -225,7 +877,7 @@ _PURE_REGION_OPS = frozenset({
 })
 
 
-def _post_dead_structural_retirement(function, instruction) -> None:
+def _post_dead_structural_retirement(function, instruction, *, sources=()) -> None:
     """Post one ``dead_structural_retirement`` row for a swept value.
 
     DERIVED(the value's ``ssa_value`` cell; the function's root cell when
@@ -242,7 +894,7 @@ def _post_dead_structural_retirement(function, instruction) -> None:
     from .ssa_record_return_state import function_scope_of, identity_cells
 
     book = current_identity_book()
-    cells = identity_cells(function, instruction.res)
+    cells = tuple(dict.fromkeys((*identity_cells(function, instruction.res), *sources)))
     if not cells:
         root = book.latest_ref(CELL_SET, (function_scope_of(function), 0))
         cells = () if root is None else (root,)
@@ -572,8 +1224,11 @@ def drop_dead_pure_region_calls(functions) -> int:
 #: cannot be allowed to disagree.
 _NARROW_LIMB_ELEMENTS = frozenset({"float32", "f32", "single"})
 
-_FLOAT64_SPELLINGS = frozenset({"float64", "double", "f64"})
-_INT64_SPELLINGS = frozenset({"int64", "i64", "long"})
+#: The largest finite double, for exact finiteness tests (``|v| <= max``).
+_DOUBLE_MAX = 1.7976931348623157e308
+
+_FLOAT64_SPELLINGS = frozenset({"float64"})
+_INT64_SPELLINGS = frozenset({"int64"})
 
 
 def narrow_float64_to_float32(module) -> int:
@@ -612,9 +1267,13 @@ def narrow_float64_to_float32(module) -> int:
             "sections: there are no limbs carrying the precision that "
             "narrowing would rely on, so this would only lose digits"
         )
-    declared = {
-        str(contract.get("element") or "float64") for contract in contracts
-    }
+    for contract in contracts:
+        if not contract.get("element"):
+            raise ValueError(
+                "narrow_float64_to_float32 refuses a precision section "
+                f"contract with no recorded limb element: {contract!r}"
+            )
+    declared = {str(contract["element"]) for contract in contracts}
     unsupported = {
         element for element in declared
         if element not in _NARROW_LIMB_ELEMENTS
@@ -2000,6 +2659,2001 @@ def mark_precision_sections(functions) -> int:
     return marked
 
 
+class WideExpansionEmitter:
+    """Spell width-N expansion arithmetic as repository SSA, one limb per value.
+
+    This is the expansion builder ``lower_precision_operations`` uses, lifted
+    out of that pass so the insertion context is explicit: ``function`` is the
+    function values are minted in, ``emitted`` is the instruction list new
+    instructions are appended to, and ``limbs`` maps a value id to its limbs
+    (high first; an absent id is an ordinary one-limb value). Any pass that
+    holds those three can materialise the same ``signal_symbolic`` proofs and
+    Precision arithmetic -- ``proof_core``, ``exp_expansion``,
+    ``log_expansion`` -- outside a Precision section.
+
+    ``element`` is the limb element the section being expanded declared
+    (``None`` for the value's own dtype); a caller moving across instructions
+    sets it per instruction. ``known_scalar_ids`` is the set of rank-0
+    constant ids ``put`` reads to choose which operand carries the extent;
+    the emitter adds every constant it mints. ``two_product_flavor`` selects
+    the exact-product spelling (see ``TWO_PRODUCT_FLAVORS``).
+
+    Every instruction it emits is stamped ``PRECISION_SECTION_ATTRIBUTE`` with
+    a ``lowered_from`` naming its origin, exactly as the in-pass closures did,
+    so the SSA ``lower_precision_operations`` produces is unchanged.
+    """
+
+    def __init__(
+        self, function, emitted: list, *, two_product_flavor: str = "fma",
+        limbs: dict | None = None, known_scalar_ids: set | None = None,
+        element=None,
+    ) -> None:
+        if two_product_flavor not in TWO_PRODUCT_FLAVORS:
+            raise ValueError(
+                f"unknown two_product flavour {two_product_flavor!r}; "
+                f"expected one of {TWO_PRODUCT_FLAVORS}"
+            )
+        from .concordance_declarations import (
+            PRECISION_CONSTANT, PRECISION_EXPANSION, PRECISION_LIMB,
+        )
+        from .ssa_record_return_state import mint_ssa_value
+
+        self._mint = mint_ssa_value
+        self._limb_kind = PRECISION_LIMB
+        self._constant_kind = PRECISION_CONSTANT
+        self._stage = PRECISION_EXPANSION
+        self.function = function
+        self.emitted = emitted
+        self.two_product_flavor = two_product_flavor
+        self.limbs = {} if limbs is None else limbs
+        self.known_scalar_ids = (
+            set() if known_scalar_ids is None else known_scalar_ids
+        )
+        # The element the section being expanded declared, when it is
+        # narrower than the value it is expanding. An expansion mints
+        # many values and every one of them is a LIMB, so the element
+        # is what they are -- inheriting the pre-expansion dtype makes
+        # a float32 expansion claim to be float64, which is wrong in
+        # two ways at once. It refuses to emit on a lane that has no
+        # f64 at all, and, worse, ``splitter_for`` reads the same
+        # dtype to choose Veltkamp's constant: a float32 limb split at
+        # 2**27 + 1 instead of 4097 does not halve a 24-bit
+        # significand, so the half products stop being exact and the
+        # residual is quietly wrong rather than loudly absent.
+        self.element = element
+        self._splitters: dict[float, object] = {}
+
+    # -- value and instruction minting --------------------------------------
+
+    def fresh(self, like, extent_like=None):
+        declared = self.element
+        extent_like = like if extent_like is None else extent_like
+        like_dtype = str(like.dtype or "")
+        extent_dtype = str(extent_like.dtype or "")
+        dtype = (
+            declared if declared in _NARROW_LIMB_ELEMENTS
+            else extent_like.dtype
+            if (
+                extent_dtype.casefold() in {
+                    "float", "float16", "float32", "float64",
+                    "double", "f16", "f32", "f64",
+                }
+                and like_dtype.casefold() not in {
+                    "float", "float16", "float32", "float64",
+                    "double", "f16", "f32", "f64",
+                }
+            )
+            else like.dtype
+        )
+        logical_shape = tuple(
+            (extent_like.accounting or {}).get(
+                "precision_logical_shape"
+            )
+            or tuple(extent_like.shape or ())
+        )
+        carried_width = max(int(
+            (extent_like.accounting or {}).get(
+                "precision_limbs"
+            ) or 1
+        ), 1)
+        if (
+            not (extent_like.accounting or {}).get(
+                "precision_logical_shape"
+            )
+            and
+            carried_width > 1
+            and logical_shape
+            and logical_shape[-1] == carried_width
+        ):
+            logical_shape = logical_shape[:-1]
+        # Minted through the book from the cells of the value it is
+        # shaped like and the one whose extent it carries.
+        value = SSAValue(
+            self._mint(
+                self.function, self._limb_kind, (like, extent_like),
+                dtype=dtype, shape=logical_shape,
+                stage=self._stage,
+            ),
+            dtype=dtype,
+            shape=logical_shape,
+            device=like.device,
+            accounting={
+                "precision_extent_source_id": int(extent_like.id),
+            },
+        )
+        return value
+
+    def put(self, op, args, like):
+        known_scalar_ids = self.known_scalar_ids
+
+        def extent_strength(value):
+            accounting = value.accounting or {}
+            shape = tuple(value.shape or ())
+            carried_width = max(int(
+                accounting.get("precision_limbs") or 1
+            ), 1)
+            declared_logical_shape = accounting.get(
+                "precision_logical_shape"
+            )
+            logical_rank = (
+                len(tuple(declared_logical_shape))
+                if declared_logical_shape is not None
+                else len(shape) - int(
+                    carried_width > 1
+                    and bool(shape)
+                    and shape[-1] == carried_width
+                )
+            )
+            declared_rank = max(
+                logical_rank,
+                int(accounting.get("program_abi_rank", 0) or 0),
+                int(accounting.get("ssa_call_rank", 0) or 0),
+            )
+            return (
+                declared_rank,
+                int(value.id) not in known_scalar_ids,
+                bool(shape),
+            )
+
+        extent_like = max(
+            tuple(args) or (like,),
+            key=extent_strength,
+        )
+        result = self.fresh(like, extent_like)
+        self.emitted.append(Instr(op, list(args), result, attributes={
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision",
+        }))
+        return result
+
+    def parts(self, value):
+        return self.limbs.get(int(value.id), [value])
+
+    def zero(self, like):
+        """Materialise an exact low limb for scalar promotion.
+
+        Repeating the high limb would represent ``x + x`` rather
+        than ``x``.  A plain scalar is the expansion ``[x, +0, ...]``;
+        IEEE positive zero is exact in every supported element
+        format and therefore needs no numerical precondition.
+        """
+
+        result = self.fresh(like)
+        self.emitted.append(Instr("Const", [], result, attributes={
+            "constant": 0.0,
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.scalar_promotion",
+        }))
+        self.known_scalar_ids.add(int(result.id))
+        return result
+
+    def scalar_constant(self, number, like):
+        # Minted through the book from the value it is emitted for.
+        result = SSAValue(
+            self._mint(
+                self.function, self._constant_kind, (like,),
+                dtype=like.dtype, shape=(), stage=self._stage,
+            ),
+            dtype=like.dtype,
+            shape=(),
+            device=like.device,
+        )
+        self.emitted.append(Instr("Const", [], result, attributes={
+            "constant": float(number),
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.scalar_constant",
+        }))
+        self.known_scalar_ids.add(int(result.id))
+        return result
+
+    # -- error-free transformations -----------------------------------------
+
+    def two_sum(self, a, b):
+        put = self.put
+        s = put("Add", (a, b), a)
+        bb = put("Sub", (s, a), a)
+        left = put("Sub", (a, put("Sub", (s, bb), a)), a)
+        right = put("Sub", (b, bb), a)
+        return s, put("Add", (left, right), a)
+
+    def splitter_for(self, value):
+        """One Const per emitter per element, not one per product."""
+
+        magnitude = _veltkamp_constant(value.dtype)
+        held = self._splitters.get(magnitude)
+        if held is None:
+            held = self.fresh(value)
+            self.emitted.append(Instr("Const", [], held, attributes={
+                "constant": float(magnitude),
+                PRECISION_SECTION_ATTRIBUTE: True,
+                "lowered_from": "precision.split_constant",
+            }))
+            self._splitters[magnitude] = held
+        return held
+
+    def two_product(self, a, b):
+        put = self.put
+        product = put("Mul", (a, b), a)
+        if self.two_product_flavor == "fma":
+            negated = put("Neg", (product,), a)
+            return product, put(FMA, (a, b, negated), a)
+        # Dekker through Veltkamp splitting: the same exact residual
+        # with no fma anywhere, for destinations that cannot deliver
+        # a single rounding. The eager twin is
+        # ``extended_precision.two_product`` / ``_split``; the
+        # operation order here mirrors it exactly so the two stay
+        # provably the same algorithm.
+        constant = self.splitter_for(a)
+
+        def split(value):
+            scaled = put("Mul", (value, constant), value)
+            high = put(
+                "Sub",
+                (scaled, put("Sub", (scaled, value), value)),
+                value,
+            )
+            return high, put("Sub", (value, high), value)
+
+        a_high, a_low = split(a)
+        b_high, b_low = split(b)
+        error = put(
+            "Sub", (put("Mul", (a_high, b_high), a), product), a
+        )
+        error = put(
+            "Add", (error, put("Mul", (a_high, b_low), a)), a
+        )
+        error = put(
+            "Add", (error, put("Mul", (a_low, b_high), a)), a
+        )
+        return product, put(
+            "Add", (error, put("Mul", (a_low, b_low), a)), a
+        )
+
+    # -- expansion arithmetic -----------------------------------------------
+
+    def expanded(self, value, width: int):
+        held = list(self.parts(value))
+        if len(held) < width:
+            held.extend(self.zero(value) for _ in range(width - len(held)))
+        return held[:width]
+
+    def renormalise(self, terms, width: int):
+        """Distil arbitrary exact terms to ``width`` SSA limbs."""
+
+        rest = list(terms)
+        if not rest:
+            raise ValueError("cannot renormalise an empty expansion")
+        kept = []
+        for _index in range(int(width)):
+            if not rest:
+                break
+            carry = rest[-1]
+            tail = [None] * (len(rest) - 1)
+            for position in range(len(rest) - 2, -1, -1):
+                carry, tail[position] = self.two_sum(
+                    rest[position], carry
+                )
+            kept.append(carry)
+            rest = tail
+        while len(kept) < int(width):
+            kept.append(self.zero(kept[-1]))
+        for leftover in rest:
+            kept[-1] = self.put("Add", (kept[-1], leftover), kept[-1])
+        return kept
+
+    def add_expansions(self, left, right, width: int):
+        return self.renormalise([*left, *right], width)
+
+    def multiply_expansions(self, left, right, width: int):
+        products = []
+        for left_limb in left:
+            for right_limb in right:
+                high, low = self.two_product(left_limb, right_limb)
+                products.extend((high, low))
+        return self.renormalise(products, width)
+
+    def lead(self, expansion):
+        return (
+            expansion[0] if len(expansion) == 1
+            else self.put(
+                "Add", (expansion[0], expansion[1]), expansion[0]
+            )
+        )
+
+    def divide_expansions(self, left, right, width: int):
+        put = self.put
+        remainder = list(left)
+        quotient = []
+        for _index in range(int(width) + 1):
+            digit = put(
+                "Div", (self.lead(remainder), self.lead(right)), left[0]
+            )
+            quotient.append(digit)
+            product = self.multiply_expansions(
+                [digit], right, int(width) + 2
+            )
+            remainder = self.add_expansions(
+                remainder,
+                [put("Neg", (term,), term) for term in product],
+                int(width) + 2,
+            )
+        return self.renormalise(quotient, width)
+
+    def sum_expansion(self, source):
+        """The ordinary value used only for a range/seed decision."""
+
+        total = source[0]
+        for term in source[1:]:
+            total = self.put("Add", (total, term), total)
+        return total
+
+    def constant_expansion(self, parts_, like):
+        return [self.scalar_constant(part, like) for part in parts_]
+
+    # -- transcendental expansions ------------------------------------------
+
+    def sqrt_expansion(self, source, width: int):
+        """The eager Precision Newton law over repository limbs."""
+
+        put = self.put
+        collapsed = self.sum_expansion(source)
+        seed = put("Sqrt", (collapsed,), collapsed)
+        root = self.expanded(seed, width)
+        half = self.scalar_constant(0.5, seed)
+        steps = max(1, (int(width) - 1).bit_length()) + 1
+        for _step in range(steps):
+            quotient = self.divide_expansions(source, root, width)
+            root = self.add_expansions(root, quotient, width)
+            root = [put("Mul", (term, half), term) for term in root]
+        return root
+
+    def proof_core(self, name: str, argument, width: int):
+        """Materialise the registered symbolic proof as wide SSA.
+
+        The identity, interval-derived order, exact rational
+        coefficients, and structural parity all come from
+        signal_symbolic. This pass only spells that already-authored
+        program with the expansion arithmetic above.
+        """
+
+        from ..common.tensors import signal_symbolic as proof
+
+        count = proof.order_for(
+            name, proof.CORE_RADII[name], digits=16 * int(width),
+        )
+        degree = proof.order_to_degree(name, count)
+        coefficients = proof.structured_coefficients(name, degree)
+        element = self.element
+        coefficient_values = [
+            self.constant_expansion(
+                proof.limb_decomposition(
+                    coefficient, width, element=element,
+                ),
+                argument[0],
+            )
+            for coefficient in coefficients
+        ]
+        structure = proof.TRANSCENDENTALS[name]["structure"]
+        base = (
+            self.multiply_expansions(argument, argument, width)
+            if structure in ("odd", "even") else list(argument)
+        )
+        result = coefficient_values[-1]
+        for coefficient in reversed(coefficient_values[:-1]):
+            result = self.add_expansions(
+                coefficient,
+                self.multiply_expansions(base, result, width),
+                width,
+            )
+        if structure in ("odd", "factored"):
+            result = self.multiply_expansions(argument, result, width)
+        return result
+
+    def _ln2_head(self, like):
+        """ln(2) rounded once to a double, from the exact rational.
+
+        ``signal_symbolic.constant_limbs`` derives it from the proof's own
+        constant, so no host library supplies a core constant; it is the
+        same double ``math.log(2.0)`` returns.
+        """
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        return self.scalar_constant(constant_limbs("ln2", 1)[0], like)
+
+    # -- library-free range decisions --------------------------------------
+    #
+    # exp and log choose a binade and rescale by it. Those decisions used to
+    # be spelled ``Pow(2, k)`` and ``Log`` -- host libm in every backend --
+    # and ``2**k`` multiplied inside the expansion overflowed for k >= 1024
+    # and flushed subnormal results. Everything below is compares, ``Select``
+    # and multiplies by power-of-two constants, all exact in IEEE binary64.
+    # Measured on ~20k arguments each against mpmath: exp 99.12% -> 100%
+    # correctly rounded (it returned 0 for subnormal results and was 1 ulp
+    # off below 2**-968), log 80.8% -> 100% (NaN for every subnormal
+    # input). The edge points are pinned by
+    # test_precision_exp_log_range_decisions_are_exact_and_library_free.
+
+    def power_of_two_factors(self, count, like):
+        """Exact factors whose product is ``2**count``, all on one side of 1.
+
+        ``count`` is an integer-valued float with ``|count| < 2048``. Its
+        magnitude is peeled bit by bit with compares against power-of-two
+        constants; bit ``i`` selects ``2**(+-2**i)`` or 1. Every factor is a
+        representable power of two (bit 10 is two ``2**+-512``), so a value
+        multiplied by them in turn is exact for as long as it stays in the
+        normal range, and rounds exactly once when the last one leaves it.
+        Bits 0..8 are folded into one factor (at most ``2**+-511``).
+        """
+
+        put = self.put
+        constant = self.scalar_constant
+        zero = constant(0.0, like)
+        one = constant(1.0, like)
+        negative = self.compare("Lt", count, zero)
+        remaining = self.select(
+            negative, put("Neg", (count,), count), count,
+        )
+        factors = []
+        low = None
+        for bit in range(10, -1, -1):
+            step = float(2 ** bit)
+            taken = self.compare("Ge", remaining, constant(step, like))
+            remaining = put(
+                "Sub",
+                (remaining, self.select(taken, constant(step, like), zero)),
+                remaining,
+            )
+            exponent = min(2 ** bit, 512)
+            factor = self.select(
+                taken,
+                self.select(
+                    negative,
+                    constant(2.0 ** -exponent, like),
+                    constant(2.0 ** exponent, like),
+                ),
+                one,
+            )
+            if bit == 10:
+                factors.extend((factor, factor))
+            elif bit == 9:
+                factors.append(factor)
+            else:
+                low = factor if low is None else put(
+                    "Mul", (low, factor), factor,
+                )
+        factors.append(low)
+        return factors
+
+    def scale_by_factors(self, value, factors):
+        for factor in factors:
+            value = self.put("Mul", (value, factor), value)
+        return value
+
+    def binade(self, collapsed):
+        """``(e, factors)`` with ``collapsed * 2**-e`` in ``[0.75, 1.5)``.
+
+        For a positive finite ``collapsed`` only; the factors rescale any
+        limb exactly (applied in order). Subnormal inputs are first lifted by
+        ``2**600``; then a greedy ladder divides by ``2**s`` while the value
+        is ``>= 2**s`` and multiplies by ``2**s`` while it is ``< 2**(1-s)``
+        (s = 512 ... 1), leaving ``[1, 2)``; a last halving above 1.5
+        centres the mantissa on 1 so ``log`` near 1 loses nothing to
+        ``m - 1``. Every step is a compare, a ``Select`` and an exact
+        power-of-two multiply.
+        """
+
+        put = self.put
+        constant = self.scalar_constant
+        like = collapsed
+        one = constant(1.0, like)
+        zero = constant(0.0, like)
+        tiny = self.compare("Lt", collapsed, constant(2.0 ** -1000, like))
+        lift = self.select(tiny, constant(2.0 ** 600, like), one)
+        exponent = self.select(tiny, constant(-600.0, like), zero)
+        current = put("Mul", (collapsed, lift), collapsed)
+        down = None
+        up = None
+        for bit in range(9, -1, -1):
+            step = 2 ** bit
+            taken = self.compare(
+                "Ge", current, constant(2.0 ** step, like),
+            )
+            factor = self.select(taken, constant(2.0 ** -step, like), one)
+            current = put("Mul", (current, factor), current)
+            exponent = put(
+                "Add",
+                (exponent, self.select(taken, constant(float(step), like), zero)),
+                exponent,
+            )
+            down = factor if down is None else put(
+                "Mul", (down, factor), factor,
+            )
+        for bit in range(9, -1, -1):
+            step = 2 ** bit
+            taken = self.compare(
+                "Lt", current, constant(2.0 ** (1 - step), like),
+            )
+            factor = self.select(taken, constant(2.0 ** step, like), one)
+            current = put("Mul", (current, factor), current)
+            exponent = put(
+                "Sub",
+                (exponent, self.select(taken, constant(float(step), like), zero)),
+                exponent,
+            )
+            up = factor if up is None else put("Mul", (up, factor), factor)
+        high = self.compare("Ge", current, constant(1.5, like))
+        half = self.select(high, constant(0.5, like), one)
+        exponent = put(
+            "Add", (exponent, self.select(high, one, zero)), exponent,
+        )
+        return exponent, (lift, up, down, half)
+
+    def exp_expansion(self, source, width: int):
+        """exp by Cody-Waite ln(2) reduction, the proof core, exact rescale.
+
+        ``k = nearest(x / ln2)`` on the collapsed value (clamped to
+        ``[-746, 710]``, beyond which exp is 0 or inf), ``r = x - k*ln2``
+        with ``ln2`` as ``constant_limbs`` limbs, ``exp(r)`` from the proof
+        core, then ``* 2**k`` by exact power-of-two factors -- after the core
+        is canonicalised to ``(s, t)``, ``s = fl(s + t)``. A normal result is
+        ``s*2**k + t*2**k``, exact until it overflows to inf (the tail is
+        dropped below ``2**-968``, where it could itself round). A subnormal
+        result is rounded ONCE to the ``2**-1074`` grid: ``H = s*2**(k+1074)``
+        (``< 2**52``) is rounded to an integer by ``2**52`` and the tie the
+        exact tail ``t`` breaks is fixed up, then scaled back exactly.
+        """
+
+        from ..common.tensors.signal_symbolic import (
+            INTEGER_SHIFTER, constant_limbs,
+        )
+
+        put = self.put
+        constant = self.scalar_constant
+        collapsed = self.sum_expansion(source)
+        like = collapsed
+        zero = constant(0.0, like)
+        one = constant(1.0, like)
+        upper = constant(710.0, like)
+        lower = constant(-746.0, like)
+        overflow = self.compare("Gt", collapsed, upper)
+        underflow = self.compare("Lt", collapsed, lower)
+        clamped = self.select(
+            overflow, upper, self.select(underflow, lower, collapsed),
+        )
+        ln2_parts = self.constant_expansion(
+            constant_limbs("ln2", width, element=self.element),
+            source[0],
+        )
+        ln2_head = self._ln2_head(source[0])
+        # Nearest integer by the shifter (``signal_symbolic``'s own
+        # ``INTEGER_SHIFTER``): two IEEE adds every backend spells. ``Round``
+        # has no Fortran spelling and its tie rule differs between C
+        # (``nearbyint``) and LLVM (``roundeven``); any integer within one
+        # of x/ln2 keeps the remainder inside the core's interval.
+        shifter = constant(INTEGER_SHIFTER, like)
+        binade = put(
+            "Sub",
+            (put(
+                "Add",
+                (put("Div", (clamped, ln2_head), clamped), shifter),
+                clamped,
+            ), shifter),
+            clamped,
+        )
+        remainder = self.add_expansions(
+            source,
+            [
+                put("Neg", (term,), term)
+                for term in self.multiply_expansions(
+                    ln2_parts, [binade], width,
+                )
+            ],
+            width,
+        )
+        core = self.proof_core("exp", remainder, width)
+        head, tail = self.two_sum(core[0], self.sum_expansion(core[1:]))
+        # exp(r) lies in [0.70, 1.42]: the result is below 2**-1022 exactly
+        # when k < -1022, or k == -1022 with s < 1.
+        floor_binade = constant(-1022.0, like)
+        subnormal = self.select(
+            self.compare("Lt", binade, floor_binade),
+            one,
+            self.select(
+                self.compare("Eq", binade, floor_binade),
+                self.select(self.compare("Lt", head, one), one, zero),
+                zero,
+            ),
+        )
+        subnormal = self.compare("Eq", subnormal, one)
+        shift = self.select(
+            subnormal,
+            put("Add", (binade, constant(1074.0, like)), binade),
+            binade,
+        )
+        factors = self.power_of_two_factors(shift, like)
+        scaled_head = self.scale_by_factors(head, factors)
+        scaled_tail = self.scale_by_factors(tail, factors)
+        # Subnormal: scaled_head = H in [0, 2**52), scaled_tail = L exact.
+        grid = constant(2.0 ** 52, like)
+        integral = put(
+            "Sub", (put("Add", (scaled_head, grid), scaled_head), grid),
+            scaled_head,
+        )
+        fraction = put("Sub", (scaled_head, integral), scaled_head)
+        half = constant(0.5, like)
+        adjust = self.select(
+            self.compare("Eq", fraction, half),
+            self.select(self.compare("Gt", scaled_tail, zero), one, zero),
+            self.select(
+                self.compare("Eq", fraction, put("Neg", (half,), half)),
+                self.select(
+                    self.compare("Lt", scaled_tail, zero),
+                    put("Neg", (one,), one),
+                    zero,
+                ),
+                zero,
+            ),
+        )
+        back = constant(2.0 ** -537, like)
+        rounded = put(
+            "Mul",
+            (put("Mul", (put("Add", (integral, adjust), integral), back),
+                 integral), back),
+            integral,
+        )
+        # Below 2**-968 the scaled tail can itself be subnormal, so it is
+        # rounded to the 2**-1074 grid and can land exactly on half an ulp
+        # of the head, where the collapse's tie-to-even then moves the
+        # correctly rounded head by one ulp (x = -706.2225020067164 gave
+        # 1.9564303102951204e-307, want ...121e-307). There the head alone
+        # is the correctly rounded result -- ``s = fl(s + t)`` scaled
+        # exactly -- and a tail under 2**-1021 cannot be carried anyway.
+        low = self.compare("Lt", scaled_head, constant(2.0 ** -968, like))
+        result = [
+            self.select(subnormal, rounded, scaled_head),
+            self.select(
+                subnormal, zero, self.select(low, zero, scaled_tail),
+            ),
+        ]
+        result.extend(zero for _ in range(int(width) - 2))
+        infinity = constant(float("inf"), like)
+        return [
+            self.select(
+                overflow, infinity if index == 0 else zero,
+                self.select(underflow, zero, limb),
+            )
+            for index, limb in enumerate(result)
+        ]
+
+    def exp_overflow_predicate(self, source, result):
+        """True where Python's ``math.exp`` raises ``OverflowError``.
+
+        That is exactly a finite argument whose correctly rounded exp is
+        inf, read from ``result`` -- the limbs ``exp_expansion`` returned for
+        ``source`` -- rather than from a hand threshold, so the predicate
+        and the value can never disagree (709.782712893384 is finite,
+        709.7827128933841 overflows). ``+inf`` gives inf without raising in
+        Python and is not in it; NaN is not in it. Like
+        ``log_domain_predicate`` the emitter does not fault: the pass
+        lowering a Python ``math.exp`` guards on this.
+        """
+
+        collapsed = self.sum_expansion(source)
+        value = self.sum_expansion(result)
+        infinity = self.scalar_constant(float("inf"), collapsed)
+        finite_value = self.select(
+            self.compare("Lt", collapsed, infinity),
+            value,
+            self.scalar_constant(0.0, collapsed),
+        )
+        return self.compare("Eq", finite_value, infinity)
+
+    def log_domain_predicate(self, source):
+        """True where ``log`` has no real value: ``x <= 0`` (incl. -0, -inf).
+
+        Python raises ``ValueError`` there. The emitter does not choose
+        between a fault and an IEEE value: ``log_expansion`` leaves the IEEE
+        limit (-inf at zero, NaN below) in the limbs, and the pass lowering a
+        Python ``math.log`` guards on this predicate. NaN is not in it.
+        """
+
+        collapsed = self.sum_expansion(source)
+        return self.compare(
+            "Le", collapsed, self.scalar_constant(0.0, collapsed),
+        )
+
+    def log_expansion(self, source, width: int):
+        """log by an exact binade ladder plus the log1p proof core.
+
+        ``x = m * 2**e`` with ``m`` in ``[0.75, 1.5)`` (``binade``), the
+        limbs rescaled exactly. Near 1 (``m <= 1.25``) the core takes
+        ``m - 1`` directly, so ``log(1 - 2**-53)`` keeps every bit; above
+        it two wide square roots bring the mantissa into the core's
+        interval and the core is scaled by 4. ``e*ln2`` is restored with
+        ``constant_limbs`` limbs. ``+inf`` gives ``+inf``; ``x <= 0`` gives
+        the IEEE limit (see ``log_domain_predicate``); NaN propagates.
+        """
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        put = self.put
+        constant = self.scalar_constant
+        collapsed = self.sum_expansion(source)
+        like = collapsed
+        exponent, factors = self.binade(collapsed)
+        mantissa = [self.scale_by_factors(limb, factors) for limb in source]
+        one = self.constant_expansion(
+            (1.0, *((0.0,) * (int(width) - 1))), source[0],
+        )
+        minus_one = [put("Neg", (term,), term) for term in one]
+        reduced = self.sqrt_expansion(
+            self.sqrt_expansion(mantissa, width), width,
+        )
+        near = self.compare(
+            "Le", self.sum_expansion(mantissa), constant(1.25, like),
+        )
+        direct = self.add_expansions(mantissa, minus_one, width)
+        rooted = self.add_expansions(reduced, minus_one, width)
+        offset = [
+            self.select(near, each, other)
+            for each, other in zip(direct, rooted)
+        ]
+        core = self.proof_core("log1p", offset, width)
+        multiplier = self.select(near, constant(1.0, like), constant(4.0, like))
+        core = [put("Mul", (term, multiplier), term) for term in core]
+        ln2_parts = self.constant_expansion(
+            constant_limbs("ln2", width, element=self.element),
+            source[0],
+        )
+        restored = self.multiply_expansions(ln2_parts, [exponent], width)
+        result = self.add_expansions(core, restored, width)
+        zero = constant(0.0, like)
+        infinity = constant(float("inf"), like)
+        nan = constant(float("nan"), like)
+        positive_infinity = self.compare("Eq", collapsed, infinity)
+        at_zero = self.compare("Eq", collapsed, zero)
+        negative = self.compare("Lt", collapsed, zero)
+        head_special = self.select(
+            positive_infinity, infinity,
+            self.select(
+                at_zero, put("Neg", (infinity,), infinity),
+                self.select(negative, nan, result[0]),
+            ),
+        )
+        special = self.select(
+            positive_infinity, constant(1.0, like),
+            self.select(
+                at_zero, constant(1.0, like),
+                self.select(negative, constant(1.0, like), zero),
+            ),
+        )
+        special = self.compare("Eq", special, constant(1.0, like))
+        return [head_special, *(
+            self.select(special, zero, limb) for limb in result[1:]
+        )]
+
+    # -- circular functions over the whole double range ----------------------
+    #
+    # sin, cos and tan of one float64, correctly rounded, as straight-line
+    # SSA: an exact reduction onto [-pi/4, pi/4] carried in limbs, the
+    # ``sin``/``cos`` proof cores, a quadrant ``Select``, and one collapse.
+    # Every op is IEEE-exact or a correctly rounded + - * / fma; the only
+    # constants are exact rationals from ``signal_symbolic``. No host library
+    # makes a value or a range decision. (trig cores, package S2b; the
+    # measurement in route_math_to_signal_cores.md found the Cody-Waite
+    # split refused beyond ~2**40, so large arguments take the windowed
+    # 2/pi reduction below.)
+
+    def compare(self, op: str, left, right):
+        """A ``bool`` predicate over two limbs (``Lt``/``Le``/``Eq``/...)."""
+
+        shape = tuple(
+            (left.accounting or {}).get("precision_logical_shape")
+            or tuple(left.shape or ())
+        )
+        result = SSAValue(
+            self._mint(
+                self.function, self._limb_kind, (left, right),
+                dtype="bool", shape=shape, stage=self._stage,
+            ),
+            dtype="bool", shape=shape, device=left.device,
+        )
+        self.emitted.append(Instr(op, [left, right], result, attributes={
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.compare",
+        }))
+        return result
+
+    def select(self, condition, if_true, if_false):
+        """A true select -- never the arithmetic blend that cancels."""
+
+        return self.put("Select", (condition, if_true, if_false), if_true)
+
+    def _modulo(self, value, modulus: float, centred: bool):
+        """``value`` reduced by an exact multiple of ``modulus`` (a power of 2).
+
+        ``value * (1/modulus)`` is exact, ``Floor``/``Round`` of it is an
+        exact integer and the product back is exact, so the difference is
+        exact whenever it is representable -- and it is: it keeps only bits
+        ``value`` already had, below ``modulus``. The centred form keeps a
+        small NEGATIVE value as it is (a floored one would need
+        ``modulus - tiny``, which rounds).
+        """
+
+        put = self.put
+        scaled = put(
+            "Mul", (value, self.scalar_constant(1.0 / modulus, value)), value,
+        )
+        whole = put("Round" if centred else "Floor", (scaled,), value)
+        return put("Sub", (
+            value,
+            put("Mul", (whole, self.scalar_constant(modulus, value)), value),
+        ), value)
+
+    def _cody_waite_reduction(self, magnitude, width: int):
+        """``|x| - k*pi/2`` for ``|x| < CIRCULAR_CODY_WAITE_LIMIT``.
+
+        The split is ``cody_waite_for`` at the limit, so every ``k*piece`` is
+        exact by construction and the residual accumulates in the limbs;
+        the quotient is the shifter's exact nearest integer, as
+        ``signal_symbolic.reduce_argument`` takes it.
+        """
+
+        from fractions import Fraction
+
+        from ..common.tensors.signal_symbolic import (
+            INTEGER_SHIFTER, cody_waite_for,
+        )
+
+        put = self.put
+        pieces = cody_waite_for(
+            CIRCULAR_CODY_WAITE_LIMIT, "pi", Fraction(1, 2),
+        )
+        whole = sum(Fraction(piece) for piece in pieces)
+        shifter = self.scalar_constant(INTEGER_SHIFTER, magnitude)
+        quotient = put("Sub", (
+            put("Add", (
+                put("Mul", (
+                    magnitude, self.scalar_constant(float(1 / whole), magnitude),
+                ), magnitude),
+                shifter,
+            ), magnitude),
+            shifter,
+        ), magnitude)
+        carried = int(width) + 1
+        reduced = self.expanded(magnitude, carried)
+        for piece in pieces:
+            exact = put(
+                "Mul", (quotient, self.scalar_constant(piece, magnitude)),
+                magnitude,
+            )
+            reduced = self.add_expansions(
+                reduced, [put("Neg", (exact,), exact)], carried,
+            )
+        return (
+            self.renormalise(reduced, width),
+            self._modulo(quotient, 4.0, centred=False),
+        )
+
+    def _payne_hanek_reduction(self, magnitude, width: int):
+        """``|x| - k*pi/2`` for any finite ``|x| >= 1``, from windows of 2/pi.
+
+        ``|x| = m * 2**(24*j)`` with ``1 <= m < 2**24`` (an exact compare /
+        ``Select`` ladder of power-of-two scalings). ``m``'s ulp is at least
+        2**-52, so ``m * I`` is a multiple of 4 for any multiple ``I`` of
+        2**54: of ``2**(24*j) * 2/pi`` only ``F_j = (2**(24*j) * 2/pi) mod
+        2**54`` matters for the quadrant and the fraction. ``F_j`` is an
+        exact rational cut into double limbs at build time
+        (``circular_payne_hanek_windows``) and chosen by ``j`` with
+        ``Select``. Each ``m * f`` is an exact fma product pair, each half
+        is reduced mod 4 exactly, and the sum of those small terms is
+        ``|x| * 2/pi`` mod 4 to far below the ~2**-61 closest approach of a
+        double to a multiple of pi/2.
+        """
+
+        from fractions import Fraction
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        put = self.put
+        step = CIRCULAR_PAYNE_HANEK_STEP
+        windows = circular_payne_hanek_windows()
+        scaled = magnitude
+        window = self.scalar_constant(0.0, magnitude)
+        for bit in range(len(windows).bit_length() - 1, -1, -1):
+            shift = step * (1 << bit)
+            if shift > 1023:
+                continue
+            above = self.compare(
+                "Ge", scaled, self.scalar_constant(2.0 ** shift, magnitude),
+            )
+            scaled = self.select(above, put("Mul", (
+                scaled, self.scalar_constant(2.0 ** -shift, magnitude),
+            ), magnitude), scaled)
+            window = self.select(above, put("Add", (
+                window, self.scalar_constant(float(1 << bit), magnitude),
+            ), magnitude), window)
+        chosen = [
+            self.compare(
+                "Eq", window, self.scalar_constant(float(index), magnitude),
+            )
+            for index in range(1, len(windows))
+        ]
+        terms = []
+        for position in range(len(windows[0])):
+            limb = self.scalar_constant(windows[0][position], magnitude)
+            for index, predicate in enumerate(chosen, start=1):
+                limb = self.select(
+                    predicate,
+                    self.scalar_constant(windows[index][position], magnitude),
+                    limb,
+                )
+            high, low = self.two_product(scaled, limb)
+            terms.append(self._modulo(high, 4.0, centred=True))
+            terms.append(self._modulo(low, 4.0, centred=True))
+        carried = int(width) + 2
+        turns = self.renormalise(terms, carried)
+        quotient = put("Round", (turns[0],), turns[0])
+        fraction = self.add_expansions(
+            turns, [put("Neg", (quotient,), quotient)], carried,
+        )
+        half_pi = self.constant_expansion(
+            constant_limbs("pi", carried, scale=Fraction(1, 2)), magnitude,
+        )
+        return (
+            self.multiply_expansions(fraction, half_pi, width),
+            self._modulo(quotient, 4.0, centred=False),
+        )
+
+    def circular_reduction(self, magnitude, width: int):
+        """``(r, q)``: ``|x| = q*pi/2 + r (mod 2*pi)``, ``r`` in ``width`` limbs.
+
+        ``magnitude`` is ``|x|``. Both reductions are spelled and the exact
+        compare picks one, so the SSA stays one straight-line block.
+        """
+
+        moderate, moderate_quadrant = self._cody_waite_reduction(
+            magnitude, width,
+        )
+        large, large_quadrant = self._payne_hanek_reduction(magnitude, width)
+        beyond = self.compare("Ge", magnitude, self.scalar_constant(
+            CIRCULAR_CODY_WAITE_LIMIT, magnitude,
+        ))
+        reduced = [
+            self.select(beyond, wide, narrow)
+            for wide, narrow in zip(large, moderate)
+        ]
+        return reduced, self.select(beyond, large_quadrant, moderate_quadrant)
+
+    def sin_cos_expansion(self, magnitude, width: int):
+        """``(sin(r), cos(r), q)`` for ``|x| = q*pi/2 + r``: both proof cores."""
+
+        reduced, quadrant = self.circular_reduction(magnitude, width)
+        return (
+            self.proof_core("sin", reduced, width),
+            self.proof_core("cos", reduced, width),
+            quadrant,
+        )
+
+    def circular_double(self, name: str, source, width: int = 2):
+        """Correctly rounded ``sin``/``cos``/``tan`` of one float64 value.
+
+        Returns ``(value, domain_error)``. ``domain_error`` is the ``bool``
+        "``source`` is +-inf": Python raises ``ValueError('math domain
+        error')`` there, which a straight-line emitter cannot spell, so the
+        lowering that places this must guard it; ``value`` is NaN in that
+        lane. NaN in gives NaN out (``x - x`` keeps the payload), and
+        ``sin``/``tan`` return a zero argument itself, so ``-0.0`` stays
+        ``-0.0``. The result is the existing collapse of the limbs (their
+        sum, high first), negated exactly where the symmetry says so.
+        """
+
+        if name not in ("sin", "cos", "tan"):
+            raise ValueError(f"circular_double has no {name!r}")
+        put = self.put
+        magnitude = put("Abs", (source,), source)
+        sine, cosine, quadrant = self.sin_cos_expansion(magnitude, width)
+        if name == "cos":
+            # cos(|x|) = sin(|x| + pi/2): the same table one quadrant on.
+            quadrant = self._modulo(put("Add", (
+                quadrant, self.scalar_constant(1.0, quadrant),
+            ), quadrant), 4.0, centred=False)
+        parity = self._modulo(quadrant, 2.0, centred=False)
+        odd = self.compare(
+            "Eq", parity, self.scalar_constant(1.0, quadrant),
+        )
+        if name == "tan":
+            numerator = [
+                self.select(odd, c, s) for s, c in zip(sine, cosine)
+            ]
+            denominator = [
+                self.select(odd, s, c) for s, c in zip(sine, cosine)
+            ]
+            value = self.sum_expansion(
+                self.divide_expansions(numerator, denominator, width)
+            )
+            negate = odd
+        else:
+            value = self.sum_expansion([
+                self.select(odd, c, s) for s, c in zip(sine, cosine)
+            ])
+            negate = self.compare(
+                "Ge", quadrant, self.scalar_constant(2.0, quadrant),
+            )
+        value = self.select(negate, put("Neg", (value,), value), value)
+        zero = self.scalar_constant(0.0, source)
+        if name != "cos":
+            below = self.compare("Lt", source, zero)
+            value = self.select(below, put("Neg", (value,), value), value)
+            value = self.select(
+                self.compare("Eq", source, zero), source, value,
+            )
+        largest = self.scalar_constant(_FLOAT64_MAX, source)
+        finite = self.compare("Le", magnitude, largest)
+        value = self.select(
+            finite, value, put("Sub", (source, source), source),
+        )
+        return value, self.compare("Gt", magnitude, largest)
+
+    # -- exact lane machinery for the full-range compositions ----------------
+    #
+    # Package S2c (atan, atan2, tanh, pow).  Every range decision below is
+    # an IEEE-exact compare, ``Select``, ``Floor``/``Round``, ``Sqrt`` or a
+    # multiply by a power-of-two constant; no host libm, no ``Pow``/``Log``
+    # spelling.  A lane that is decided by a special value (nan, inf, a
+    # signed zero, a saturated result) carries that IEEE value in its high
+    # limb and ``-0.0`` in every lower limb: ``v + -0.0 == v`` for every v,
+    # so the sum-of-limbs collapse keeps it, sign of zero included.
+
+    def _predicate(self, op: str, args):
+        """A ``bool`` value: comparisons and logical And/Or/Not of tests."""
+
+        like = args[0]
+        shape = tuple(
+            (like.accounting or {}).get("precision_logical_shape")
+            or tuple(like.shape or ())
+        )
+        result = SSAValue(
+            self._mint(
+                self.function, self._limb_kind, tuple(args),
+                dtype="bool", shape=shape, stage=self._stage,
+            ),
+            dtype="bool", shape=shape, device=like.device,
+        )
+        self.emitted.append(Instr(op, list(args), result, attributes={
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.lane_test",
+        }))
+        return result
+
+    def _all(self, *tests):
+        held = tests[0]
+        for test in tests[1:]:
+            held = self._predicate("And", (held, test))
+        return held
+
+    def _any(self, *tests):
+        held = tests[0]
+        for test in tests[1:]:
+            held = self._predicate("Or", (held, test))
+        return held
+
+    def _not(self, test):
+        return self._predicate("Not", (test,))
+
+    def _select(self, test, when_true, when_false):
+        return self.put("Select", (test, when_true, when_false), when_true)
+
+    def _select_expansion(self, test, when_true, when_false):
+        return [
+            self._select(test, high, low)
+            for high, low in zip(when_true, when_false)
+        ]
+
+    def _negated(self, expansion):
+        return [self.put("Neg", (term,), term) for term in expansion]
+
+    def _scaled(self, expansion, factor):
+        """Multiply every limb by an exact power of two (no rounding while
+        the limbs stay normal, which the callers' ranges guarantee)."""
+
+        return [self.put("Mul", (term, factor), term) for term in expansion]
+
+    def _special(self, value, width: int):
+        """A lane whose answer is the IEEE value ``value`` itself."""
+
+        tail = self.scalar_constant(-0.0, value)
+        return [value, *([tail] * (int(width) - 1))]
+
+    def _is_finite(self, value):
+        largest = self.scalar_constant(_DOUBLE_MAX, value)
+        return self._predicate(
+            "Le", (self.put("Abs", (value,), value), largest),
+        )
+
+    def _is_nan(self, value):
+        return self._predicate("Ne", (value, value))
+
+    def _sign_bit(self, value):
+        """IEEE signbit for a non-nan value: ``1/±0`` tells the zeros."""
+
+        zero = self.scalar_constant(0.0, value)
+        one = self.scalar_constant(1.0, value)
+        return self._select_bool(
+            self._predicate("Eq", (value, zero)),
+            self._predicate(
+                "Lt", (self.put("Div", (one, value), value), zero),
+            ),
+            self._predicate("Lt", (value, zero)),
+        )
+
+    def _select_bool(self, test, when_true, when_false):
+        return self._any(
+            self._all(test, when_true),
+            self._all(self._not(test), when_false),
+        )
+
+    def _odd_integer(self, value):
+        """``value`` is an odd integer (finite input; |v| >= 2**53 is even)."""
+
+        integral = self._predicate(
+            "Eq", (value, self.put("Floor", (value,), value)),
+        )
+        half = self.put(
+            "Mul", (value, self.scalar_constant(0.5, value)), value,
+        )
+        return self._all(integral, self._predicate(
+            "Ne", (half, self.put("Floor", (half,), half)),
+        ))
+
+    def _power_of_two(self, exponent, like):
+        """``2**n`` for an integer-valued ``n`` in [-1022, 1023], exactly.
+
+        Ten selected factors ``2**(±2**b)``; every partial product is a
+        normal power of two, so no multiply rounds.
+        """
+
+        zero = self.scalar_constant(0.0, like)
+        negative = self._predicate("Lt", (exponent, zero))
+        remaining = self.put("Abs", (exponent,), exponent)
+        result = self.scalar_constant(1.0, like)
+        for bit in range(9, -1, -1):
+            step = self.scalar_constant(float(2 ** bit), like)
+            take = self._predicate("Ge", (remaining, step))
+            remaining = self._select(
+                take, self.put("Sub", (remaining, step), remaining),
+                remaining,
+            )
+            factor = self._select(
+                negative,
+                self.scalar_constant(2.0 ** -(2 ** bit), like),
+                self.scalar_constant(2.0 ** (2 ** bit), like),
+            )
+            result = self._select(
+                take, self.put("Mul", (result, factor), result), result,
+            )
+        return result
+
+    def _binade(self, value, companions=()):
+        """``value = m * 2**e`` with ``m`` in [1, 2), for finite ``value > 0``.
+
+        A compare ladder over power-of-two constants: every multiply is by
+        an exact power of two, so ``m`` is exact and ``e`` is an exact
+        integer-valued double.  ``companions`` (the lower limbs of an
+        expansion led by ``value``) are scaled by the same factors.
+        """
+
+        like = value
+        mantissa, others = value, list(companions)
+        exponent = self.scalar_constant(0.0, like)
+
+        def apply(test, power: int):
+            nonlocal mantissa, others, exponent
+            factor = self.scalar_constant(2.0 ** power, like)
+            mantissa = self._select(
+                test, self.put("Mul", (mantissa, factor), mantissa),
+                mantissa,
+            )
+            others = [
+                self._select(test, self.put("Mul", (term, factor), term), term)
+                for term in others
+            ]
+            exponent = self._select(
+                test,
+                self.put(
+                    "Sub",
+                    (exponent, self.scalar_constant(float(power), like)),
+                    exponent,
+                ),
+                exponent,
+            )
+
+        apply(self._predicate(
+            "Lt", (mantissa, self.scalar_constant(2.0 ** -1022, like)),
+        ), 64)
+        for bit in range(9, -1, -1):
+            step = 2 ** bit
+            apply(self._predicate(
+                "Ge", (mantissa, self.scalar_constant(2.0 ** step, like)),
+            ), -step)
+        for bit in range(9, -1, -1):
+            step = 2 ** bit
+            apply(self._predicate(
+                "Lt",
+                (mantissa, self.scalar_constant(2.0 ** (1 - step), like)),
+            ), step)
+        return mantissa, exponent, others
+
+    def round_scaled(self, expansion, exponent, sticky: float = 0.0):
+        """One correctly rounded double for ``(sum(expansion) + δ) * 2**K``.
+
+        ``expansion`` is a renormalised expansion with a positive finite
+        high limb; ``exponent`` is the integer-valued double ``K`` (any
+        size); ``δ`` is an infinitesimal of sign ``sticky`` (the part of a
+        value below every limb, e.g. ``atan(v) < v``) that only breaks an
+        exact tie.  The value is normalised to ``m * 2**T`` with ``m`` in
+        [1, 2); ``T > 1023`` is +inf, ``T < -1075`` is +0, and otherwise
+        ``m`` is rounded by one IEEE multiply onto the result grid (the
+        subnormal grid below 2**-1022), after which the exact residual
+        against the high limb, plus the lower limbs, moves the result one
+        grid step when the true value lies past the midpoint -- so a
+        subnormal result is rounded once, not twice.
+        """
+
+        like = expansion[0]
+        tail = expansion[1] if len(expansion) == 2 else (
+            self.sum_expansion(expansion[1:]) if len(expansion) > 2
+            else self.scalar_constant(0.0, like)
+        )
+        mantissa, binade, (low,) = self._binade(expansion[0], (tail,))
+        total = self.put("Add", (exponent, binade), exponent)
+        lowest = self.scalar_constant(-1075.0, like)
+        highest = self.scalar_constant(1023.0, like)
+        clamped = self._select(
+            self._predicate("Lt", (total, lowest)), lowest,
+            self._select(
+                self._predicate("Gt", (total, highest)), highest, total,
+            ),
+        )
+        normal_floor = self.scalar_constant(-1022.0, like)
+        first = self._select(
+            self._predicate("Lt", (clamped, normal_floor)),
+            normal_floor, clamped,
+        )
+        second = self.put("Sub", (clamped, first), clamped)
+        result = self.put("Mul", (
+            self.put(
+                "Mul", (mantissa, self._power_of_two(first, like)), mantissa,
+            ),
+            self._power_of_two(second, like),
+        ), mantissa)
+        back = self.put("Mul", (
+            self.put("Mul", (
+                result,
+                self._power_of_two(self.put("Neg", (second,), second), like),
+            ), result),
+            self._power_of_two(self.put("Neg", (first,), first), like),
+        ), result)
+        residual = self.put("Sub", (mantissa, back), mantissa)
+        grid = self.put("Mul", (
+            self.scalar_constant(2.0 ** -52, like),
+            self._power_of_two(self.put("Neg", (second,), second), like),
+        ), mantissa)
+        half = self.put(
+            "Mul", (grid, self.scalar_constant(0.5, like)), grid,
+        )
+        zero = self.scalar_constant(0.0, like)
+        above = self.put("Add", (
+            self.put("Sub", (residual, half), residual), low,
+        ), residual)
+        below = self.put("Add", (
+            self.put("Add", (residual, half), residual), low,
+        ), residual)
+        up = self._predicate("Gt", (above, zero))
+        down = self._predicate("Lt", (below, zero))
+        if sticky > 0:
+            up = self._any(up, self._predicate("Eq", (above, zero)))
+        elif sticky < 0:
+            down = self._any(down, self._predicate("Eq", (below, zero)))
+        step = self.put("Mul", (
+            self.scalar_constant(2.0 ** -52, like),
+            self._power_of_two(first, like),
+        ), like)
+        result = self._select(
+            up, self.put("Add", (result, step), result),
+            self._select(
+                down, self.put("Sub", (result, step), result), result,
+            ),
+        )
+        largest = self.scalar_constant(_DOUBLE_MAX, like)
+        infinity = self.put("Mul", (largest, largest), largest)
+        result = self._select(
+            self._predicate("Gt", (total, highest)), infinity, result,
+        )
+        return self._select(
+            self._predicate("Lt", (total, lowest)), zero, result,
+        )
+
+    def _pi_multiple(self, scale, like, width: int):
+        from fractions import Fraction
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        return self.constant_expansion(
+            constant_limbs(
+                "pi", width, scale=Fraction(scale), element=self.element,
+            ),
+            like,
+        )
+
+    def _one(self, like, width: int):
+        return self.constant_expansion(
+            (1.0, *((0.0,) * (int(width) - 1))), like,
+        )
+
+    def _exp_reduced(self, source, width: int):
+        """``exp(source) = core * 2**k`` for |source| <= ~760.
+
+        The ln(2) reduction of ``exp_expansion`` (round to the nearest
+        multiple, one-limb-wider ln(2) so ``k*ln2`` is exact to well below
+        the result's last limb) and its ``exp`` proof core, with the scale
+        left to the caller as the integer ``k`` -- the caller applies it
+        exactly (``_scaled``) or with one rounding (``round_scaled``).
+        """
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        put = self.put
+        lead = source[0]
+        ln2_head = self._ln2_head(lead)
+        binade = put(
+            "Round", (put("Div", (lead, ln2_head), lead),), lead,
+        )
+        ln2_parts = self.constant_expansion(
+            constant_limbs("ln2", int(width) + 1, element=self.element),
+            lead,
+        )
+        remainder = self.add_expansions(
+            source,
+            self._negated(self.multiply_expansions(
+                ln2_parts, [binade], int(width) + 1,
+            )),
+            width,
+        )
+        return self.proof_core("exp", remainder, width), binade
+
+    def _log_positive(self, value, width: int):
+        """``log(value)`` for a finite double ``value > 0``, relatively exact.
+
+        ``value = m * 2**e`` with ``m`` in [sqrt(1/2), sqrt(2)) by the exact
+        binade ladder, then ``log(m) = 2*log1p(u)`` with
+        ``u = (m - 1)/(sqrt(m) + 1)`` -- ``m - 1`` is exact (Sterbenz), so
+        ``u`` keeps its relative accuracy as ``m`` approaches 1 and nothing
+        cancels.  ``|u| <= 0.19`` sits inside the ``log1p`` proof radius.
+        (``log_expansion``'s binade law ``Floor(Log(x)/ln2)`` puts x just
+        below 1 at binade -1 and cancels ``4*log1p(...)`` against ``ln2``,
+        which pow's ``y*log(x)`` cannot afford.)
+        """
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        put = self.put
+        mantissa, binade, _ = self._binade(value)
+        fold = self._predicate(
+            "Ge", (mantissa, self.scalar_constant(1.4142135623730951, value)),
+        )
+        mantissa = self._select(fold, put("Mul", (
+            mantissa, self.scalar_constant(0.5, value),
+        ), mantissa), mantissa)
+        binade = self._select(fold, put("Add", (
+            binade, self.scalar_constant(1.0, value),
+        ), binade), binade)
+        one = self._one(value, width)
+        root = self.sqrt_expansion(self.expanded(mantissa, width), width)
+        offset = self.divide_expansions(
+            [put("Sub", (mantissa, one[0]), mantissa)],
+            self.add_expansions(root, one, width),
+            width,
+        )
+        core = self.proof_core("log1p", offset, width)
+        two = self.scalar_constant(2.0, value)
+        core = [put("Mul", (term, two), term) for term in core]
+        ln2_parts = self.constant_expansion(
+            constant_limbs("ln2", int(width) + 1, element=self.element),
+            value,
+        )
+        return self.add_expansions(
+            core,
+            self.multiply_expansions(ln2_parts, [binade], int(width) + 1),
+            width,
+        )
+
+    # -- atan, atan2, tanh ----------------------------------------------------
+
+    def _atan_unit(self, folded, width: int):
+        """``atan(v)`` for an expansion ``v`` in [0, 1].
+
+        Above the proof radius (tan(pi/8)) the identity
+        ``atan(v) = pi/4 + atan((v-1)/(v+1))`` folds ``v`` back inside it
+        (no table).  The decision reads the high limb against the radius
+        itself, so both sides land on the proven interval.
+        """
+
+        from ..common.tensors import signal_symbolic as proof
+
+        like = folded[0]
+        radius = self.scalar_constant(proof.CORE_RADII["atan"], like)
+        middle = self._predicate("Gt", (folded[0], radius))
+        one = self._one(like, width)
+        shifted = self.divide_expansions(
+            self.add_expansions(folded, self._negated(one), width),
+            self.add_expansions(folded, one, width),
+            width,
+        )
+        core = self.proof_core(
+            "atan", self._select_expansion(middle, shifted, folded), width,
+        )
+        return self._select_expansion(
+            middle,
+            self.add_expansions(
+                core, self._pi_multiple("1/4", like, width), width,
+            ),
+            core,
+        )
+
+    def atan_expansion(self, value, width: int = 2):
+        """Correctly rounded ``math.atan`` of the double ``value``, as limbs.
+
+        ``|x| > 1`` reflects through ``atan(x) = pi/2 - atan(1/x)``
+        (``1/x`` as an expansion quotient), then ``_atan_unit``; the sign
+        is restored by negating limbs (atan is odd).  nan, ±inf and ±0 are
+        decided lanes.
+        """
+
+        like = value
+        magnitude = self.put("Abs", (value,), value)
+        one = self.scalar_constant(1.0, like)
+        finite = self._is_finite(value)
+        safe = self._select(finite, magnitude, one)
+        large = self._predicate("Gt", (safe, one))
+        inverse = self.divide_expansions(
+            self._one(like, width),
+            self.expanded(self._select(large, safe, one), width),
+            width,
+        )
+        folded = self._select_expansion(
+            large, inverse, self.expanded(safe, width),
+        )
+        core = self._atan_unit(folded, width)
+        half_pi = self._pi_multiple("1/2", like, width)
+        result = self._select_expansion(
+            large,
+            self.add_expansions(half_pi, self._negated(core), width),
+            core,
+        )
+        zero = self.scalar_constant(0.0, like)
+        result = self._select_expansion(
+            self._predicate("Lt", (value, zero)), self._negated(result),
+            result,
+        )
+        # ±inf -> ±pi/2 (the half-pi limbs, signed); nan and ±0 -> value.
+        signed_half_pi = self._select_expansion(
+            self._predicate("Lt", (value, zero)),
+            self._negated(half_pi), half_pi,
+        )
+        result = self._select_expansion(
+            self._any(self._is_nan(value), self._predicate("Eq", (value, zero))),
+            self._special(value, width),
+            self._select_expansion(finite, result, signed_half_pi),
+        )
+        return result
+
+    def atan2_expansion(self, y, x, width: int = 2):
+        """Correctly rounded ``math.atan2(y, x)``, as limbs.
+
+        The ratio is formed as ``min/max`` of the magnitudes from their
+        exact binade mantissas (``q = m_num/m_den`` in (1/2, 2), scale
+        ``2**(e_num - e_den)``), so it neither overflows nor loses limbs to
+        the subnormal range; ``_atan_unit`` takes it, ``pi/2 - ...`` undoes
+        the swap and ``pi - ...`` the negative ``x`` (signbit, so -0.0
+        counts).  A ratio below ``2**-600`` with ``x > 0`` and no swap is
+        the result itself: ``atan(v) = v - v**3/3`` lies just under ``v``,
+        so it is rounded once by ``round_scaled`` with a negative sticky
+        (a subnormal quotient exactly on a midpoint rounds down, not to
+        even).  C99/Python special cases are decided lanes.
+        """
+
+        like = y
+        zero = self.scalar_constant(0.0, like)
+        one = self.scalar_constant(1.0, like)
+        y_magnitude = self.put("Abs", (y,), y)
+        x_magnitude = self.put("Abs", (x,), x)
+        y_finite, x_finite = self._is_finite(y), self._is_finite(x)
+        y_zero = self._predicate("Eq", (y, zero))
+        x_zero = self._predicate("Eq", (x, zero))
+        y_safe = self._select(
+            self._all(y_finite, self._not(y_zero)), y_magnitude, one,
+        )
+        x_safe = self._select(
+            self._all(x_finite, self._not(x_zero)), x_magnitude, one,
+        )
+        swap = self._predicate("Gt", (y_safe, x_safe))
+        numerator = self._select(swap, x_safe, y_safe)
+        denominator = self._select(swap, y_safe, x_safe)
+        top, top_binade, _ = self._binade(numerator)
+        bottom, bottom_binade, _ = self._binade(denominator)
+        quotient = self.divide_expansions(
+            self.expanded(top, width), self.expanded(bottom, width), width,
+        )
+        shift = self.put("Sub", (top_binade, bottom_binade), top_binade)
+        tiny = self._predicate(
+            "Lt", (shift, self.scalar_constant(-600.0, like)),
+        )
+        ratio = self._scaled(
+            quotient,
+            self._power_of_two(self._select(tiny, zero, shift), like),
+        )
+        ratio = self._select_expansion(
+            tiny, self.expanded(zero, width), ratio,
+        )
+        angle = self._atan_unit(ratio, width)
+        half_pi = self._pi_multiple("1/2", like, width)
+        pi = self._pi_multiple(1, like, width)
+        angle = self._select_expansion(
+            swap, self.add_expansions(half_pi, self._negated(angle), width),
+            angle,
+        )
+        x_negative = self._sign_bit(x)
+        angle = self._select_expansion(
+            x_negative, self.add_expansions(pi, self._negated(angle), width),
+            angle,
+        )
+        # Special lanes, lowest priority first (the later select wins).
+        quarter_pi = self._pi_multiple("1/4", like, width)
+        three_quarter_pi = self._pi_multiple("3/4", like, width)
+        y_infinite = self._not(self._any(y_finite, self._is_nan(y)))
+        x_infinite = self._not(self._any(x_finite, self._is_nan(x)))
+        angle = self._select_expansion(
+            self._all(x_zero, self._not(y_zero)), half_pi, angle,
+        )
+        angle = self._select_expansion(
+            x_infinite,
+            self._select_expansion(
+                x_negative, pi, self.expanded(zero, width),
+            ),
+            angle,
+        )
+        angle = self._select_expansion(
+            y_infinite,
+            self._select_expansion(
+                x_infinite,
+                self._select_expansion(
+                    x_negative, three_quarter_pi, quarter_pi,
+                ),
+                half_pi,
+            ),
+            angle,
+        )
+        y_negative = self._sign_bit(y)
+        angle = self._select_expansion(
+            y_negative, self._negated(angle), angle,
+        )
+        # The tiny direct lane is signed before it becomes a special lane:
+        # negating ``[v, -0.0]`` would turn the tail into +0.0 and lose -0.
+        direct = self.round_scaled(quotient, shift, sticky=-1.0)
+        direct = self._select(
+            y_negative, self.put("Neg", (direct,), direct), direct,
+        )
+        angle = self._select_expansion(
+            self._all(
+                tiny, self._not(swap), self._not(x_negative),
+                y_finite, x_finite, self._not(y_zero), self._not(x_zero),
+            ),
+            self._special(direct, width), angle,
+        )
+        # y = ±0 (x not nan): ±0 for x >= +0, ±pi for x <= -0.
+        signed_pi = self._select_expansion(
+            y_negative, self._negated(pi), pi,
+        )
+        angle = self._select_expansion(
+            y_zero,
+            self._select_expansion(
+                x_negative, signed_pi, self._special(y, width),
+            ),
+            angle,
+        )
+        either_nan = self._any(self._is_nan(y), self._is_nan(x))
+        return self._select_expansion(
+            either_nan,
+            self._special(self.put("Add", (y, x), y), width),
+            angle,
+        )
+
+    def tanh_expansion(self, value, width: int = 2):
+        """Correctly rounded ``math.tanh`` of the double ``value``, as limbs.
+
+        |x| <= 1/2 is the ``tanh`` proof core on x itself (odd series, so
+        tiny x keeps its relative accuracy -- the expm1-free route, nothing
+        cancels).  1/2 < |x| <= 22 is ``1 - 2/(exp(2|x|) + 1)`` with
+        ``exp`` reduced exactly (``2|x|`` is exact, the 2**k scale is an
+        exact power-of-two multiply); there tanh >= 0.46, so the
+        subtraction cannot cancel.  Beyond 22, 1 - tanh < 2**-62 and the
+        result is ±1 (inf included).  nan and ±0 are the value itself.
+        """
+
+        like = value
+        zero = self.scalar_constant(0.0, like)
+        half = self.scalar_constant(0.5, like)
+        saturation = self.scalar_constant(22.0, like)
+        magnitude = self.put("Abs", (value,), value)
+        small = self._predicate("Le", (magnitude, half))
+        saturated = self._predicate("Gt", (magnitude, saturation))
+        core = self.proof_core(
+            "tanh", self.expanded(self._select(small, value, zero), width),
+            width,
+        )
+        doubled = self.put("Add", (magnitude, magnitude), magnitude)
+        middle_argument = self._select(
+            self._any(small, saturated, self._is_nan(value)),
+            self.scalar_constant(1.0, like), doubled,
+        )
+        scaled_core, binade = self._exp_reduced(
+            self.expanded(middle_argument, width), width,
+        )
+        grown = self._scaled(scaled_core, self._power_of_two(binade, like))
+        one = self._one(like, width)
+        two = self.constant_expansion(
+            (2.0, *((0.0,) * (int(width) - 1))), like,
+        )
+        middle = self.add_expansions(
+            one,
+            self._negated(self.divide_expansions(
+                two, self.add_expansions(grown, one, width), width,
+            )),
+            width,
+        )
+        unit = self.expanded(self.scalar_constant(1.0, like), width)
+        positive = self._select_expansion(saturated, unit, middle)
+        positive = self._select_expansion(
+            self._predicate("Lt", (value, zero)),
+            self._negated(positive), positive,
+        )
+        result = self._select_expansion(small, core, positive)
+        return self._select_expansion(
+            self._any(self._is_nan(value), self._predicate("Eq", (value, zero))),
+            self._special(value, width), result,
+        )
+
+    # -- pow ------------------------------------------------------------------
+
+    def _exact_power(self, base, exponent, width: int):
+        """``(m, n, e)`` with ``base**exponent == m**n * 2**(e*n)`` exactly
+        when ``exponent * 2**j`` is an integer ``n`` for some j <= 5 and
+        ``base`` is a perfect ``2**j``-th power (the smallest such j).
+
+        ``base`` is a finite double > 0.  Each level takes ``Sqrt`` of a
+        mantissa in [1, 4) (the exponent made even first), so the root is a
+        normal double in [1, 2) and its exactness is an exact test: the
+        two-product of the root with itself is the mantissa with a zero
+        residual.  Returns ``(mantissa, exponent_n, binade, usable)``.
+        """
+
+        like = base
+        two = self.scalar_constant(2.0, like)
+        half = self.scalar_constant(0.5, like)
+        mantissa, binade, _ = self._binade(base)
+        exact = self._predicate("Eq", (two, two))
+        scaled = exponent
+        levels = []
+        for level in range(6):
+            if level:
+                halved = self.put("Mul", (binade, half), binade)
+                odd = self._predicate(
+                    "Ne", (halved, self.put("Floor", (halved,), halved)),
+                )
+                widened = self._select(
+                    odd, self.put("Mul", (mantissa, two), mantissa), mantissa,
+                )
+                binade = self.put("Floor", (halved,), halved)
+                root = self.put("Sqrt", (widened,), widened)
+                square, residual = self.two_product(root, root)
+                exact = self._all(
+                    exact,
+                    self._predicate("Eq", (square, widened)),
+                    self._predicate(
+                        "Eq", (residual, self.scalar_constant(0.0, like)),
+                    ),
+                )
+                mantissa = root
+                scaled = self.put("Mul", (scaled, two), scaled)
+            integral = self._predicate(
+                "Eq", (scaled, self.put("Floor", (scaled,), scaled)),
+            )
+            levels.append((integral, mantissa, binade, exact, scaled))
+        found, mantissa, binade, exact, count = levels[-1]
+        for integral, level_mantissa, level_binade, level_exact, level_count in (
+            reversed(levels[:-1])
+        ):
+            mantissa = self._select(integral, level_mantissa, mantissa)
+            binade = self._select(integral, level_binade, binade)
+            exact = self._select_bool(integral, level_exact, exact)
+            count = self._select(integral, level_count, count)
+            found = self._any(found, integral)
+        one = self.scalar_constant(1.0, like)
+        in_range = self._all(
+            self._predicate("Ge", (count, one)),
+            self._predicate(
+                "Le", (count, self.scalar_constant(64.0, like)),
+            ),
+        )
+        usable = self._all(found, exact, self._any(
+            in_range, self._predicate("Eq", (mantissa, one)),
+        ))
+        return mantissa, count, binade, usable
+
+    def pow_expansion(self, x, y, width: int = 2, *, form: str = "operator"):
+        """Correctly rounded float ``x ** y`` (``form="operator"``) or
+        ``math.pow(x, y)`` (``form="math"``), as limbs, plus its faults.
+
+        Returns ``(limbs, faults)``; ``faults`` is a tuple of
+        ``(predicate, native_faults code, failure name)`` rows for the
+        lowering pass to guard (a validation-fail block calling
+        ``turing_validation_error``, as ``reduce_integer_pow`` does).  The
+        rows are: ``0.0 ** negative`` (ZeroDivisionError for ``**``,
+        ValueError for ``math.pow``), negative ``**`` non-integer (complex
+        in Python: refused by name as ``FLOAT_POW_COMPLEX_RESULT`` for
+        ``**``, ValueError for ``math.pow``) and overflow (OverflowError).
+
+        The general lane is ``exp(y*log|x|)``: ``_log_positive`` (exact
+        binade, relatively exact near 1), the product by ``y`` in limbs,
+        ``_exp_reduced`` and one rounding by ``round_scaled`` (overflow to
+        inf and subnormal results rounded once).  A result that may be
+        exactly representable or exactly a rounding midpoint
+        (``3.0**34``, ``(m*m)**1.5``, ``2.0**-1075``) is a dyadic power: when
+        ``_exact_power`` finds ``y*2**j = n`` with ``|x|`` a perfect
+        ``2**j``-th power and ``1 <= n <= 64`` (or a power-of-two mantissa),
+        ``m**n`` is formed by square-and-multiply in limbs -- exact for every
+        such result that fits a double -- and rounded by ``round_scaled``
+        with scale ``2**(e*n)``, so ties go to even exactly as Python's.
+        Python's special cases (nan, inf, signed zeros, odd integers) are
+        decided lanes in Python's own order.
+        """
+
+        from .native_faults import (
+            FLOAT_MATH_DOMAIN, FLOAT_MATH_RANGE, FLOAT_POW_COMPLEX_RESULT,
+            FLOAT_POW_OVERFLOW, FLOAT_POW_ZERO_NEGATIVE,
+        )
+
+        if form not in ("operator", "math"):
+            raise ValueError(
+                f"pow form {form!r}: expected 'operator' (x ** y) or "
+                "'math' (math.pow)"
+            )
+        like = x
+        put = self.put
+        zero = self.scalar_constant(0.0, like)
+        one = self.scalar_constant(1.0, like)
+        largest = self.scalar_constant(_DOUBLE_MAX, like)
+        infinity = put("Mul", (largest, largest), largest)
+        not_a_number = put("Mul", (zero, infinity), zero)
+        x_nan, y_nan = self._is_nan(x), self._is_nan(y)
+        x_finite, y_finite = self._is_finite(x), self._is_finite(y)
+        x_zero = self._predicate("Eq", (x, zero))
+        y_zero = self._predicate("Eq", (y, zero))
+        x_negative = self._predicate("Lt", (x, zero))
+        y_negative = self._predicate("Lt", (y, zero))
+        y_positive = self._predicate("Gt", (y, zero))
+        y_safe = self._select(y_finite, y, one)
+        y_odd = self._all(y_finite, self._odd_integer(y_safe))
+        y_integral = self._predicate(
+            "Eq", (y_safe, put("Floor", (y_safe,), y_safe)),
+        )
+        magnitude = put("Abs", (x,), x)
+        general = self._all(
+            x_finite, y_finite, self._not(x_zero), self._not(y_zero),
+        )
+        base = self._select(general, magnitude, one)
+        exponent = self._select(general, y, one)
+        # Approximation lane: exp(y * log|x|).
+        logarithm = self._log_positive(base, width)
+        product = self.multiply_expansions(logarithm, [exponent], width)
+        # The range decision reads the one-double product: it is ±inf, never
+        # nan, where the limb product overflows (|y| near the largest double).
+        estimate = put("Mul", (logarithm[0], exponent), exponent)
+        over = self._predicate(
+            "Gt", (estimate, self.scalar_constant(720.0, like)),
+        )
+        under = self._predicate(
+            "Lt", (estimate, self.scalar_constant(-760.0, like)),
+        )
+        product = self._select_expansion(
+            self._any(over, under), self.expanded(zero, width), product,
+        )
+        grown, binade = self._exp_reduced(product, width)
+        # Exact-power lane: m**n * 2**(e*n).
+        mantissa, count, level_binade, usable = self._exact_power(
+            base, exponent, width,
+        )
+        steps = self._select(usable, count, one)
+        steps = self._select(
+            self._predicate("Eq", (mantissa, one)), one, steps,
+        )
+        power = self._one(like, width)
+        for bit in range(6, -1, -1):
+            power = self.multiply_expansions(power, power, width)
+            step = self.scalar_constant(float(2 ** bit), like)
+            take = self._predicate("Ge", (steps, step))
+            steps = self._select(take, put("Sub", (steps, step), steps), steps)
+            power = self._select_expansion(
+                take, self.multiply_expansions(power, [mantissa], width),
+                power,
+            )
+        scale = self._select(
+            usable, put("Mul", (level_binade, count), level_binade), binade,
+        )
+        rounded = self.round_scaled(
+            self._select_expansion(usable, power, grown), scale,
+        )
+        rounded = self._select(
+            usable, rounded,
+            self._select(over, infinity, self._select(under, zero, rounded)),
+        )
+        negate = self._all(x_negative, y_odd)
+        value = self._select(negate, put("Neg", (rounded,), rounded), rounded)
+        # Python's float_pow order; the later select wins.
+        negative_fraction = self._all(
+            x_finite, x_negative, y_finite, self._not(y_integral),
+        )
+        value = self._select(negative_fraction, not_a_number, value)
+        reciprocal = put("Div", (one, x), x)
+        zero_value = self._select(
+            y_negative,
+            self._select(y_odd, reciprocal, infinity),
+            self._select(y_odd, x, zero),
+        )
+        value = self._select(
+            self._all(x_zero, y_finite, self._not(y_zero)), zero_value, value,
+        )
+        negative_zero = put("Neg", (zero,), zero)
+        infinite_value = self._select(
+            y_positive,
+            self._select(y_odd, x, magnitude),
+            self._select(
+                y_odd,
+                self._select(x_negative, negative_zero, zero),
+                zero,
+            ),
+        )
+        x_infinite = self._not(self._any(x_finite, x_nan))
+        y_infinite = self._not(self._any(y_finite, y_nan))
+        value = self._select(
+            self._all(x_infinite, y_finite, self._not(y_zero)),
+            infinite_value, value,
+        )
+        unit = self._predicate("Eq", (magnitude, one))
+        beyond = self._select_bool(
+            y_positive,
+            self._predicate("Gt", (magnitude, one)),
+            self._predicate("Lt", (magnitude, one)),
+        )
+        value = self._select(
+            y_infinite,
+            self._select(
+                unit, one,
+                self._select(beyond, put("Abs", (y,), y), zero),
+            ),
+            value,
+        )
+        value = self._select(
+            y_nan, self._select(self._predicate("Eq", (x, one)), one, y),
+            value,
+        )
+        value = self._select(x_nan, x, value)
+        value = self._select(y_zero, one, value)
+        operator = form == "operator"
+        faults = (
+            (
+                self._all(x_zero, y_finite, y_negative),
+                FLOAT_POW_ZERO_NEGATIVE if operator else FLOAT_MATH_DOMAIN,
+                "float_pow_zero_to_negative_power",
+            ),
+            (
+                negative_fraction,
+                FLOAT_POW_COMPLEX_RESULT if operator else FLOAT_MATH_DOMAIN,
+                "float_pow_negative_base_fractional_exponent",
+            ),
+            (
+                self._all(
+                    general, self._not(negative_fraction),
+                    self._predicate(
+                        "Gt", (put("Abs", (rounded,), rounded), largest),
+                    ),
+                ),
+                FLOAT_POW_OVERFLOW if operator else FLOAT_MATH_RANGE,
+                "float_pow_overflow",
+            ),
+        )
+        return self._special(value, width), faults
+
+
+#: Below this ``|x|`` the circular reduction is Cody-Waite (the split
+#: ``cody_waite_for`` derives for it); at and above it, the windowed 2/pi
+#: reduction. The split's own precision falls as its reach grows (each
+#: piece keeps ``53 - log2(k) - guard`` bits), so the limit stays where
+#: ``k * (pi/2)`` carries ~150 bits; the windowed reduction has no such
+#: limit and covers everything above. (trig cores, package S2b)
+CIRCULAR_CODY_WAITE_LIMIT = 2.0 ** 10
+
+#: Exponent step between the 2/pi windows: ``|x| = m * 2**(24*j)``.
+CIRCULAR_PAYNE_HANEK_STEP = 24
+
+#: Double limbs per window of ``(2**(24*j) * 2/pi) mod 2**54``.
+CIRCULAR_PAYNE_HANEK_LIMBS = 6
+
+#: The largest finite binary64, spelled exactly (``(2 - 2**-52) * 2**1023``).
+_FLOAT64_MAX = (2.0 - 2.0 ** -52) * 2.0 ** 1023
+
+
+@_functools.lru_cache(maxsize=1)
+def circular_payne_hanek_windows() -> tuple:
+    """``(2**(24*j) * 2/pi) mod 2**54`` as exact double limbs, per window.
+
+    One row per ``j`` with ``24*j <= 1023``. 2/pi is the exact rational
+    ``signal_symbolic.constant_rational('pi')`` gives, to enough digits that
+    the deepest window's last limb is still exact; each row is cut by
+    nearest-double heads with the remainder carried, as
+    ``limb_decomposition`` cuts any rational.
+    """
+
+    from fractions import Fraction
+
+    from ..common.tensors.signal_symbolic import constant_rational
+
+    step = CIRCULAR_PAYNE_HANEK_STEP
+    count = 1023 // step + 1
+    # Bits wanted: the deepest window's shift, the 54 kept above the
+    # point, the limbs' own ~53 bits each, and a margin.
+    bits = step * (count - 1) + 54 + 53 * CIRCULAR_PAYNE_HANEK_LIMBS + 64
+    two_over_pi = Fraction(2) / constant_rational(
+        "pi", int(bits * 0.30103) + 20,
+    )
+    modulus = 1 << 54
+    rows = []
+    for index in range(count):
+        window = two_over_pi * (1 << (step * index))
+        rest = window - modulus * (window.numerator // (
+            window.denominator * modulus
+        ))
+        row = []
+        for _ in range(CIRCULAR_PAYNE_HANEK_LIMBS):
+            head = float(rest)
+            row.append(head)
+            rest -= Fraction(head)
+        rows.append(tuple(row))
+    return tuple(rows)
+
+
 def lower_precision_operations(
     functions, two_product_flavor: str = "fma",
 ) -> dict:
@@ -2219,6 +4873,71 @@ def lower_precision_operations(
         if bases:
             precision_arrays[str(name)] = bases
 
+    # -- declared precision arrays, across the planned-region seam ---------
+    #
+    # Recognition by use stops at a call. The planner puts a pack loop's
+    # ``z = x[i]`` and ``y[i] = ...`` in regions of their own, so the load
+    # of x feeds only a Ret and the store into y stores a formal: neither
+    # region holds a precision operation, and both indexed element i as one
+    # double -- x[i] read element i/2's limbs as two elements, and y[i]
+    # kept only the leading limb. The parameter's declaration says what
+    # the array IS: a ``Precision[k]`` array parameter of the authored
+    # function is limb-strided at width k wherever it is addressed, and a
+    # region formal bound to it by position is the same array.
+    declared_arrays: dict[str, dict[int, int]] = {}
+    for name, function in functions.items():
+        for row in (
+            function.metadata.get("numeric_parameter_descriptors", ()) or ()
+        ):
+            if not isinstance(row, Mapping):
+                continue
+            descriptor = dict(row.get("descriptor") or {})
+            limbs_declared = int(descriptor.get("limbs") or 1)
+            if (
+                limbs_declared > 1
+                and "precision" in tuple(descriptor.get("features") or ())
+                and row.get("value_id") is not None
+            ):
+                declared_arrays.setdefault(str(name), {})[
+                    int(row["value_id"])
+                ] = limbs_declared
+    changed = True
+    while changed:
+        changed = False
+        for name, function in functions.items():
+            known = declared_arrays.get(str(name)) or {}
+            if not known:
+                continue
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op not in ("Call", "call"):
+                        continue
+                    callee = str(instruction.attributes.get("callee") or "")
+                    formals = original_formals.get(callee)
+                    if not formals:
+                        continue
+                    there = declared_arrays.setdefault(callee, {})
+                    for formal, actual in zip(formals, instruction.args):
+                        width = known.get(int(actual.id), 1)
+                        if width > there.get(int(formal.id), 1):
+                            there[int(formal.id)] = width
+                            changed = True
+    for name, function in functions.items():
+        known = declared_arrays.get(str(name)) or {}
+        if not known:
+            continue
+        for block in function.blocks.values():
+            for instruction in block.instrs:
+                if (
+                    str(instruction.op) == "GetElementPtr" and instruction.args
+                    and int(instruction.args[0].id) in known
+                    and int(instruction.args[0].id)
+                    not in promoted_scalar_formals[str(name)]
+                ):
+                    base = int(instruction.args[0].id)
+                    bases = precision_arrays.setdefault(str(name), {})
+                    bases[base] = max(bases.get(base, 1), known[base])
+
     parameter_widths: dict[str, dict[int, int]] = {}
     for name, function in functions.items():
         formal_ids = {int(value.id) for value in function.args}
@@ -2273,6 +4992,29 @@ def lower_precision_operations(
                         widths[int(argument.id)] = max(
                             widths.get(int(argument.id), 1), width
                         )
+        # A formal stored into a precision array is an element of it: the
+        # store region of a pack loop receives the value to write as a
+        # formal, and keeping it one scalar wrote only the leading limb.
+        arrays_here = precision_arrays.get(str(name)) or {}
+        for block in function.blocks.values():
+            pointers = {
+                int(instruction.res.id): int(instruction.args[0].id)
+                for instruction in block.instrs
+                if str(instruction.op) == "GetElementPtr"
+                and instruction.args and instruction.res is not None
+            }
+            for instruction in block.instrs:
+                if str(instruction.op) != "Store" or len(instruction.args) < 2:
+                    continue
+                stored = int(instruction.args[0].id)
+                width = arrays_here.get(
+                    pointers.get(int(instruction.args[1].id), -1), 1
+                )
+                if (
+                    width > 1 and stored in formal_ids
+                    and stored not in promoted_scalar_formals[str(name)]
+                ):
+                    widths[stored] = max(widths.get(stored, 1), width)
         if widths:
             parameter_widths[str(name)] = widths
 
@@ -2366,7 +5108,37 @@ def lower_precision_operations(
             )
         seeded[str(name)] = rows
 
-    for function_name, function in functions.items():
+    # Callees first: a caller reading a region's result needs to know which
+    # aggregate fields the region appended for that result's limbs.
+    callee_first: list[str] = []
+
+    def visit(name: str, seen: set[str]) -> None:
+        if name in seen or name not in functions:
+            return
+        seen.add(name)
+        for block in functions[name].blocks.values():
+            for instruction in block.instrs:
+                if instruction.op in ("Call", "call"):
+                    visit(str(instruction.attributes.get("callee") or ""), seen)
+        callee_first.append(name)
+
+    aggregate_callees = {
+        str(instruction.attributes.get("callee") or "")
+        for function in functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op in ("Call", "call")
+        and instruction.res is not None
+        and instruction.attributes.get("result_convention") == "ssa.aggregate"
+    }
+    visited: set[str] = set()
+    for name in functions:
+        visit(str(name), visited)
+    # result field -> the fields appended for its limbs, per region
+    returned_limb_fields: dict[str, dict[int, tuple[tuple[int, object], ...]]] = {}
+
+    for function_name in callee_first:
+        function = functions[function_name]
         # value id -> its limbs, high first. Absent means an ordinary value,
         # which is simply a one-limb expansion whose low limb is zero.
         limbs: dict[int, list] = {}
@@ -2391,436 +5163,24 @@ def lower_precision_operations(
                 ) or 0)
             }
 
-            # The element the section being expanded declared, when it is
-            # narrower than the value it is expanding. An expansion mints
-            # many values and every one of them is a LIMB, so the element
-            # is what they are -- inheriting the pre-expansion dtype makes
-            # a float32 expansion claim to be float64, which is wrong in
-            # two ways at once. It refuses to emit on a lane that has no
-            # f64 at all, and, worse, ``splitter_for`` reads the same
-            # dtype to choose Veltkamp's constant: a float32 limb split at
-            # 2**27 + 1 instead of 4097 does not halve a 24-bit
-            # significand, so the half products stop being exact and the
-            # residual is quietly wrong rather than loudly absent.
-            section_element: list = [None]
-
-            def fresh(like, extent_like=None):
-                declared = section_element[0]
-                extent_like = like if extent_like is None else extent_like
-                like_dtype = str(like.dtype or "")
-                extent_dtype = str(extent_like.dtype or "")
-                dtype = (
-                    declared if declared in _NARROW_LIMB_ELEMENTS
-                    else extent_like.dtype
-                    if (
-                        extent_dtype.casefold() in {
-                            "float", "float16", "float32", "float64",
-                            "double", "f16", "f32", "f64",
-                        }
-                        and like_dtype.casefold() not in {
-                            "float", "float16", "float32", "float64",
-                            "double", "f16", "f32", "f64",
-                        }
-                    )
-                    else like.dtype
-                )
-                logical_shape = tuple(
-                    (extent_like.accounting or {}).get(
-                        "precision_logical_shape"
-                    )
-                    or tuple(extent_like.shape or ())
-                )
-                carried_width = max(int(
-                    (extent_like.accounting or {}).get(
-                        "precision_limbs"
-                    ) or 1
-                ), 1)
-                if (
-                    not (extent_like.accounting or {}).get(
-                        "precision_logical_shape"
-                    )
-                    and
-                    carried_width > 1
-                    and logical_shape
-                    and logical_shape[-1] == carried_width
-                ):
-                    logical_shape = logical_shape[:-1]
-                # Minted through the book from the cells of the value it is
-                # shaped like and the one whose extent it carries.
-                value = SSAValue(
-                    mint_ssa_value(
-                        function, PRECISION_LIMB, (like, extent_like),
-                        dtype=dtype, shape=logical_shape,
-                        stage=PRECISION_EXPANSION,
-                    ),
-                    dtype=dtype,
-                    shape=logical_shape,
-                    device=like.device,
-                    accounting={
-                        "precision_extent_source_id": int(extent_like.id),
-                    },
-                )
-                return value
-
-            def put(op, args, like):
-                def extent_strength(value):
-                    accounting = value.accounting or {}
-                    shape = tuple(value.shape or ())
-                    carried_width = max(int(
-                        accounting.get("precision_limbs") or 1
-                    ), 1)
-                    declared_logical_shape = accounting.get(
-                        "precision_logical_shape"
-                    )
-                    logical_rank = (
-                        len(tuple(declared_logical_shape))
-                        if declared_logical_shape is not None
-                        else len(shape) - int(
-                            carried_width > 1
-                            and bool(shape)
-                            and shape[-1] == carried_width
-                        )
-                    )
-                    declared_rank = max(
-                        logical_rank,
-                        int(accounting.get("program_abi_rank", 0) or 0),
-                        int(accounting.get("ssa_call_rank", 0) or 0),
-                    )
-                    return (
-                        declared_rank,
-                        int(value.id) not in known_scalar_ids,
-                        bool(shape),
-                    )
-
-                extent_like = max(
-                    tuple(args) or (like,),
-                    key=extent_strength,
-                )
-                result = fresh(like, extent_like)
-                emitted.append(Instr(op, list(args), result, attributes={
-                    PRECISION_SECTION_ATTRIBUTE: True,
-                    "lowered_from": "precision",
-                }))
-                return result
-
-            def parts(value):
-                return limbs.get(int(value.id), [value])
-
-            def zero(like):
-                """Materialise an exact low limb for scalar promotion.
-
-                Repeating the high limb would represent ``x + x`` rather
-                than ``x``.  A plain scalar is the expansion ``[x, +0, ...]``;
-                IEEE positive zero is exact in every supported element
-                format and therefore needs no numerical precondition.
-                """
-
-                result = fresh(like)
-                emitted.append(Instr("Const", [], result, attributes={
-                    "constant": 0.0,
-                    PRECISION_SECTION_ATTRIBUTE: True,
-                    "lowered_from": "precision.scalar_promotion",
-                }))
-                known_scalar_ids.add(int(result.id))
-                return result
-
-            def scalar_constant(number, like):
-                # Minted through the book from the value it is emitted for.
-                result = SSAValue(
-                    mint_ssa_value(
-                        function, PRECISION_CONSTANT, (like,),
-                        dtype=like.dtype, shape=(), stage=PRECISION_EXPANSION,
-                    ),
-                    dtype=like.dtype,
-                    shape=(),
-                    device=like.device,
-                )
-                emitted.append(Instr("Const", [], result, attributes={
-                    "constant": float(number),
-                    PRECISION_SECTION_ATTRIBUTE: True,
-                    "lowered_from": "precision.scalar_constant",
-                }))
-                known_scalar_ids.add(int(result.id))
-                return result
-
-            def two_sum(a, b):
-                s = put("Add", (a, b), a)
-                bb = put("Sub", (s, a), a)
-                left = put("Sub", (a, put("Sub", (s, bb), a)), a)
-                right = put("Sub", (b, bb), a)
-                return s, put("Add", (left, right), a)
-
-            splitters: dict[float, object] = {}
-
-            def splitter_for(value):
-                """One Const per block per element, not one per product."""
-
-                magnitude = _veltkamp_constant(value.dtype)
-                held = splitters.get(magnitude)
-                if held is None:
-                    held = fresh(value)
-                    emitted.append(Instr("Const", [], held, attributes={
-                        "constant": float(magnitude),
-                        PRECISION_SECTION_ATTRIBUTE: True,
-                        "lowered_from": "precision.split_constant",
-                    }))
-                    splitters[magnitude] = held
-                return held
-
-            def two_product(a, b):
-                product = put("Mul", (a, b), a)
-                if two_product_flavor == "fma":
-                    negated = put("Neg", (product,), a)
-                    return product, put(FMA, (a, b, negated), a)
-                # Dekker through Veltkamp splitting: the same exact residual
-                # with no fma anywhere, for destinations that cannot deliver
-                # a single rounding. The eager twin is
-                # ``extended_precision.two_product`` / ``_split``; the
-                # operation order here mirrors it exactly so the two stay
-                # provably the same algorithm.
-                constant = splitter_for(a)
-
-                def split(value):
-                    scaled = put("Mul", (value, constant), value)
-                    high = put(
-                        "Sub",
-                        (scaled, put("Sub", (scaled, value), value)),
-                        value,
-                    )
-                    return high, put("Sub", (value, high), value)
-
-                a_high, a_low = split(a)
-                b_high, b_low = split(b)
-                error = put(
-                    "Sub", (put("Mul", (a_high, b_high), a), product), a
-                )
-                error = put(
-                    "Add", (error, put("Mul", (a_high, b_low), a)), a
-                )
-                error = put(
-                    "Add", (error, put("Mul", (a_low, b_high), a)), a
-                )
-                return product, put(
-                    "Add", (error, put("Mul", (a_low, b_low), a)), a
-                )
-
-            def expanded(value, width: int):
-                held = list(parts(value))
-                if len(held) < width:
-                    held.extend(zero(value) for _ in range(width - len(held)))
-                return held[:width]
-
-            def renormalise(terms, width: int):
-                """Distil arbitrary exact terms to ``width`` SSA limbs."""
-
-                rest = list(terms)
-                if not rest:
-                    raise ValueError("cannot renormalise an empty expansion")
-                kept = []
-                for _index in range(int(width)):
-                    if not rest:
-                        break
-                    carry = rest[-1]
-                    tail = [None] * (len(rest) - 1)
-                    for position in range(len(rest) - 2, -1, -1):
-                        carry, tail[position] = two_sum(
-                            rest[position], carry
-                        )
-                    kept.append(carry)
-                    rest = tail
-                while len(kept) < int(width):
-                    kept.append(zero(kept[-1]))
-                for leftover in rest:
-                    kept[-1] = put("Add", (kept[-1], leftover), kept[-1])
-                return kept
-
-            def add_expansions(left, right, width: int):
-                return renormalise([*left, *right], width)
-
-            def multiply_expansions(left, right, width: int):
-                products = []
-                for left_limb in left:
-                    for right_limb in right:
-                        high, low = two_product(left_limb, right_limb)
-                        products.extend((high, low))
-                return renormalise(products, width)
-
-            def lead(expansion):
-                return (
-                    expansion[0] if len(expansion) == 1
-                    else put("Add", (expansion[0], expansion[1]), expansion[0])
-                )
-
-            def divide_expansions(left, right, width: int):
-                remainder = list(left)
-                quotient = []
-                for _index in range(int(width) + 1):
-                    digit = put("Div", (lead(remainder), lead(right)), left[0])
-                    quotient.append(digit)
-                    product = multiply_expansions(
-                        [digit], right, int(width) + 2
-                    )
-                    remainder = add_expansions(
-                        remainder,
-                        [put("Neg", (term,), term) for term in product],
-                        int(width) + 2,
-                    )
-                return renormalise(quotient, width)
-
-            def sum_expansion(source):
-                """The ordinary value used only for a range/seed decision."""
-
-                total = source[0]
-                for term in source[1:]:
-                    total = put("Add", (total, term), total)
-                return total
-
-            def constant_expansion(parts_, like):
-                return [scalar_constant(part, like) for part in parts_]
-
-            def sqrt_expansion(source, width: int):
-                """The eager Precision Newton law over repository limbs."""
-
-                collapsed = sum_expansion(source)
-                seed = put("Sqrt", (collapsed,), collapsed)
-                root = expanded(seed, width)
-                half = scalar_constant(0.5, seed)
-                steps = max(1, (int(width) - 1).bit_length()) + 1
-                for _step in range(steps):
-                    quotient = divide_expansions(source, root, width)
-                    root = add_expansions(root, quotient, width)
-                    root = [put("Mul", (term, half), term) for term in root]
-                return root
-
-            def proof_core(name: str, argument, width: int):
-                """Materialise the registered symbolic proof as wide SSA.
-
-                The identity, interval-derived order, exact rational
-                coefficients, and structural parity all come from
-                signal_symbolic. This pass only spells that already-authored
-                program with the expansion arithmetic above.
-                """
-
-                from ..common.tensors import signal_symbolic as proof
-
-                count = proof.order_for(
-                    name, proof.CORE_RADII[name], digits=16 * int(width),
-                )
-                degree = proof.order_to_degree(name, count)
-                coefficients = proof.structured_coefficients(name, degree)
-                element = section_element[0]
-                coefficient_values = [
-                    constant_expansion(
-                        proof.limb_decomposition(
-                            coefficient, width, element=element,
-                        ),
-                        argument[0],
-                    )
-                    for coefficient in coefficients
-                ]
-                structure = proof.TRANSCENDENTALS[name]["structure"]
-                base = (
-                    multiply_expansions(argument, argument, width)
-                    if structure in ("odd", "even") else list(argument)
-                )
-                result = coefficient_values[-1]
-                for coefficient in reversed(coefficient_values[:-1]):
-                    result = add_expansions(
-                        coefficient,
-                        multiply_expansions(base, result, width),
-                        width,
-                    )
-                if structure in ("odd", "factored"):
-                    result = multiply_expansions(argument, result, width)
-                return result
-
-            def exp_expansion(source, width: int):
-                """Precision.exp's ln(2) reduction plus the proof core."""
-
-                import math
-
-                from ..common.tensors.signal_symbolic import constant_limbs
-
-                collapsed = sum_expansion(source)
-                ln2_parts = constant_expansion(
-                    constant_limbs(
-                        "ln2", width, element=section_element[0],
-                    ),
-                    source[0],
-                )
-                ln2_head = scalar_constant(float(math.log(2.0)), source[0])
-                binade = put(
-                    "Round", (put("Div", (collapsed, ln2_head), collapsed),),
-                    collapsed,
-                )
-                remainder = add_expansions(
-                    source,
-                    [
-                        put("Neg", (term,), term)
-                        for term in multiply_expansions(
-                            ln2_parts, [binade], width,
-                        )
-                    ],
-                    width,
-                )
-                core = proof_core("exp", remainder, width)
-                scale = put(
-                    "Pow",
-                    (scalar_constant(2.0, collapsed), binade),
-                    collapsed,
-                )
-                return multiply_expansions(core, [scale], width)
-
-            def log_expansion(source, width: int):
-                """Precision.log's binade law plus the log1p proof core."""
-
-                import math
-
-                from ..common.tensors.signal_symbolic import constant_limbs
-
-                collapsed = sum_expansion(source)
-                ln2_head = scalar_constant(float(math.log(2.0)), source[0])
-                binade = put(
-                    "Floor",
-                    (put(
-                        "Div",
-                        (put("Log", (collapsed,), collapsed), ln2_head),
-                        collapsed,
-                    ),),
-                    collapsed,
-                )
-                scale = put(
-                    "Pow",
-                    (
-                        scalar_constant(2.0, collapsed),
-                        put("Neg", (binade,), binade),
-                    ),
-                    collapsed,
-                )
-                mantissa = multiply_expansions(source, [scale], width)
-                reduced = sqrt_expansion(
-                    sqrt_expansion(mantissa, width), width,
-                )
-                one = constant_expansion(
-                    (1.0, *((0.0,) * (int(width) - 1))), source[0],
-                )
-                offset = add_expansions(
-                    reduced, [put("Neg", (term,), term) for term in one],
-                    width,
-                )
-                core = proof_core("log1p", offset, width)
-                four = scalar_constant(4.0, source[0])
-                core = [put("Mul", (term, four), term) for term in core]
-                ln2_parts = constant_expansion(
-                    constant_limbs(
-                        "ln2", width, element=section_element[0],
-                    ),
-                    source[0],
-                )
-                restored = multiply_expansions(
-                    ln2_parts, [binade], width,
-                )
-                return add_expansions(core, restored, width)
+            # The expansion builder, with this block as its insertion point.
+            # ``element`` is set per instruction below, from the section the
+            # instruction belongs to.
+            emitter = WideExpansionEmitter(
+                function, emitted, two_product_flavor=two_product_flavor,
+                limbs=limbs, known_scalar_ids=known_scalar_ids,
+            )
+            fresh = emitter.fresh
+            put = emitter.put
+            parts = emitter.parts
+            zero = emitter.zero
+            expanded = emitter.expanded
+            add_expansions = emitter.add_expansions
+            multiply_expansions = emitter.multiply_expansions
+            divide_expansions = emitter.divide_expansions
+            sqrt_expansion = emitter.sqrt_expansion
+            exp_expansion = emitter.exp_expansion
+            log_expansion = emitter.log_expansion
 
             def collapse(parts_of, original):
                 """Define the ORIGINAL value as the sum of its limbs.
@@ -2906,6 +5266,10 @@ def lower_precision_operations(
             arrays = precision_arrays.get(str(function_name)) or {}
             # pointer value id -> (base array id, index value)
             addressed: dict[int, tuple] = {}
+            # aggregate value id -> the region that returned it, and a field
+            # pointer's id -> (its GetElementPtr, the field it addresses)
+            aggregates: dict[int, str] = {}
+            fields_of: dict[int, tuple] = {}
 
             def constant(number: int, like):
                 # Minted through the book from the index it strides.
@@ -2941,7 +5305,7 @@ def lower_precision_operations(
 
             for instruction in block.instrs:
                 operation = str(instruction.op)
-                section_element[0] = instruction.attributes.get(
+                emitter.element = instruction.attributes.get(
                     "precision_element"
                 )
 
@@ -2992,6 +5356,28 @@ def lower_precision_operations(
                         instruction.attributes[
                             "precision_actual_formal_ids"
                         ] = tuple(added_formal_ids)
+                    appended = returned_limb_fields.get(callee)
+                    if appended and instruction.res is not None:
+                        aggregates[int(instruction.res.id)] = callee
+                        if (
+                            "output_ids" in instruction.attributes
+                            and not instruction.attributes.get(
+                                "precision_result_limbs_bound"
+                            )
+                        ):
+                            instruction.attributes["output_ids"] = (
+                                *tuple(instruction.attributes["output_ids"]),
+                                *(
+                                    int(limb.id)
+                                    for _field, fields in sorted(
+                                        appended.items()
+                                    )
+                                    for _index, limb in fields
+                                ),
+                            )
+                            instruction.attributes[
+                                "precision_result_limbs_bound"
+                            ] = True
                     emitted.append(instruction)
                     continue
 
@@ -3002,6 +5388,11 @@ def lower_precision_operations(
                     addressed[int(instruction.res.id)] = (
                         instruction.args[0], instruction.args[1],
                     )
+                    if instruction.attributes.get("aggregate_index") is not None:
+                        fields_of[int(instruction.res.id)] = (
+                            instruction,
+                            int(instruction.attributes["aggregate_index"]),
+                        )
                     emitted.append(instruction)
                     continue
 
@@ -3032,6 +5423,61 @@ def lower_precision_operations(
                         # instruction read whatever the slot happened to hold.
                         collapse(loaded_limbs, instruction.res)
                         continue
+                    field = fields_of.get(int(instruction.args[0].id))
+                    callee = aggregates.get(int(where[0].id)) if where else None
+                    appended = (
+                        returned_limb_fields.get(callee, {}).get(field[1])
+                        if callee and field else None
+                    )
+                    if appended:
+                        # The region returned this result's limbs in fields
+                        # of their own; read each one back under the id the
+                        # region gave it, as the head field already is.
+                        emitted.append(instruction)
+                        pointer_instruction = field[0]
+                        received = []
+                        for index, limb in appended:
+                            pointer = fresh(pointer_instruction.res)
+                            pointer.dtype = pointer_instruction.res.dtype
+                            pointer.shape = tuple(
+                                pointer_instruction.res.shape or ()
+                            )
+                            emitted.append(Instr(
+                                "GetElementPtr",
+                                [where[0], constant(index, where[1])],
+                                pointer,
+                                attributes={
+                                    **dict(pointer_instruction.attributes),
+                                    "aggregate_index": int(index),
+                                    "source_output_id": int(limb.id),
+                                    PRECISION_SECTION_ATTRIBUTE: True,
+                                },
+                            ))
+                            value = SSAValue(
+                                int(limb.id), dtype=limb.dtype,
+                                shape=tuple(limb.shape or ()),
+                                device=limb.device,
+                                accounting={
+                                    "ssa_call_result_from": (
+                                        callee, int(limb.id),
+                                    ),
+                                },
+                            )
+                            emitted.append(Instr(
+                                "Load", [pointer], value,
+                                attributes={
+                                    **dict(instruction.attributes),
+                                    "aggregate_index": int(index),
+                                    "source_output_id": int(limb.id),
+                                    PRECISION_SECTION_ATTRIBUTE: True,
+                                },
+                            ))
+                            received.append(value)
+                        limbs[int(instruction.res.id)] = received
+                        lowered_limb_records[int(instruction.res.id)] = tuple(
+                            int(value.id) for value in received
+                        )
+                        continue
                     emitted.append(instruction)
                     continue
 
@@ -3056,6 +5502,48 @@ def lower_precision_operations(
                                 },
                             ))
                         continue
+                    emitted.append(instruction)
+                    continue
+
+                if (
+                    operation in ("Ret", "ret")
+                    and str(function_name) in aggregate_callees
+                    and not instruction.attributes.get(
+                        "precision_result_limbs_bound"
+                    )
+                    and any(
+                        len(limbs.get(int(value.id), ())) > 1
+                        for value in instruction.args
+                    )
+                ):
+                    # A region hands its results back as an aggregate the
+                    # caller takes apart field by field. A limbed result
+                    # keeps its collapsed head in its own field, for any
+                    # reader that wants one number, and its limbs follow in
+                    # fields appended after every existing one -- so no
+                    # existing field moves.
+                    appended: dict[int, tuple] = {}
+                    extra = []
+                    for position, value in enumerate(list(instruction.args)):
+                        held = limbs.get(int(value.id), ())
+                        if len(held) <= 1:
+                            continue
+                        rows = []
+                        for limb in held:
+                            rows.append((
+                                len(instruction.args) + len(extra), limb,
+                            ))
+                            extra.append(limb)
+                        appended[position] = tuple(rows)
+                    instruction.args.extend(extra)
+                    instruction.attributes["precision_result_limbs_bound"] = True
+                    returned_limb_fields[str(function_name)] = appended
+                    function.metadata["precision_returned_limb_fields"] = tuple(
+                        (position, tuple(
+                            (index, int(limb.id)) for index, limb in rows
+                        ))
+                        for position, rows in sorted(appended.items())
+                    )
                     emitted.append(instruction)
                     continue
 

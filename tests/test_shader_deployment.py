@@ -310,16 +310,16 @@ def test_deployable_spirv_refuses_what_one_invocation_cannot_carry():
     reduced = Function("reduced", [u], {"entry": BasicBlock("entry", [
         Instr("sum", [u], total, attributes={"axis": 0}), Instr("Ret", [], None),
     ])})
-    (w,) = _spans(1, 0)
-    first, second = SSAValue(1, "float32", ()), SSAValue(2, "float32", ())
+    (w, second) = _spans(1, 0, 2)
+    first = SSAValue(1, "float32", ())
     twice = Function("twice", [w], {"entry": BasicBlock("entry", [
-        Instr("sum", [w], first), Instr("add", [first, first], second),
+        Instr("sum", [w], first), Instr("sub", [w, first], second),
         Instr("Ret", [], None),
     ])})
     for function, outputs, reason in (
         (mixed, [z], "one rank"),
         (reduced, [total], "over an axis"),
-        (twice, [second], "is a scalar beside"),
+        (twice, [second], "only scalars may follow it"),
     ):
         refused = emit_deployable_compute_shader(function, outputs=outputs)
         assert not refused.complete and refused.source == ""
@@ -551,6 +551,77 @@ def _reducing():
     return function, results
 
 
+def _axis_reducing(axis):
+    """``sum``/``prod``/``max``/``min``/``mean`` over ``axis`` of one (2, 3, 4)
+    instance."""
+
+    shape = (2, 3, 4)
+    kept = shape[:axis % 3] + shape[axis % 3 + 1:]
+    x = SSAValue(0, "float32", shape)
+    results = [SSAValue(1 + i, "float32", kept) for i in range(5)]
+    ops = ("sum", "prod", "max", "min", "mean")
+    instructions = []
+    for op, value in zip(ops, results):
+        instr = Instr(op, [x], value)
+        instr.attributes["axis"] = axis
+        if op in ("max", "min"):
+            instr.attributes["max_semantics"] = "reduce_axis"
+        instructions.append(instr)
+    function = Function("axis_reducing", [x], {"entry": BasicBlock("entry", [
+        *instructions, Instr("Ret", [], None),
+    ])})
+    return function, results, kept
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2, -1])
+def test_axis_reductions_over_instances_match_python_on_vulkan(tmp_path, axis):
+    probe = _vulkan_probe(tmp_path)
+    function, outputs, kept = _axis_reducing(axis)
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    product = publish_spirv_product(tmp_path / "product", shader)
+    record = product.deployment
+    count = 50
+    lanes = math.prod(kept)
+    rng = np.random.default_rng(9)
+    x = (rng.standard_normal((count, 2, 3, 4)) * 0.5 + 0.8).astype(np.float32)
+    x[7, 1, 2, 3] = np.nan  # one lane of instance 7 reads NaN
+    buffers = {}
+    for resource in record["resources"]:
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = x
+        else:
+            buffers[resource["binding"]] = np.full(
+                (count + 8) * lanes, 12345, dtype=np.float32,
+            )
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    group = record["launch"]["group_count"]["invocations_per_group"]
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(math.ceil(count / group) + 1),
+         "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    got = {
+        item["name"]: np.fromfile(paths[item["binding"]], dtype=np.float32)
+        for item in record["resources"] if item["access"] == "read_write"
+    }
+    reduced_axis = 1 + axis % 3
+    for position, op in enumerate(("sum", "prod", "max", "min", "mean")):
+        want = getattr(np, op)(x, axis=reduced_axis).reshape(count, lanes)
+        have = got[f"output_{position}"][:count * lanes].reshape(count, lanes)
+        np.testing.assert_allclose(have, want, rtol=1e-5, atol=1e-6)
+        assert (got[f"output_{position}"][count * lanes:] == 12345).all()
+
+
 def test_reductions_over_instances_match_python_on_vulkan(tmp_path):
     probe = _vulkan_probe(tmp_path)
     function, outputs = _reducing()
@@ -726,6 +797,105 @@ def test_runtime_sized_reduction_matches_python_on_vulkan(
     np.testing.assert_allclose(got[0], want, rtol=1e-5, atol=1e-5)
 
 
+def _map_reduce(op, dtype="float32"):
+    """``op((x * y) - s) * 2 + s``: x, y runtime-sized rank-2, s a scalar."""
+
+    x, y, product, shifted = _spans(2, 0, 1, 3, 4, dtype=dtype)
+    s = SSAValue(2, dtype, ())
+    result_dtype = "float32" if op == "mean" else dtype
+    total, two, doubled, last = (
+        SSAValue(i, result_dtype, ()) for i in (5, 6, 7, 8)
+    )
+    function = Function(f"map_{op}", [x, y, s], {"entry": BasicBlock("entry", [
+        Instr("mul", [x, y], product), Instr("sub", [product, s], shifted),
+        Instr(op, [shifted], total),
+        Instr("Const", [], two, attributes={"value": 2}),
+        Instr("mul", [total, two], doubled), Instr("add", [doubled, s], last),
+        Instr("Ret", [], None),
+    ])})
+    return function, [last]
+
+
+@pytest.mark.parametrize("op,dtype", [
+    ("sum", "float32"), ("prod", "float32"), ("max", "float32"),
+    ("min", "float32"), ("mean", "float32"), ("sum", "int32"), ("max", "int32"),
+])
+@pytest.mark.parametrize("extents", [(7, 5), (0, 3)])
+def test_runtime_sized_map_reduce_matches_python_on_vulkan(
+    tmp_path, op, dtype, extents,
+):
+    """Program: ``((x * y) - s).sum() * 2 + s`` over runtime-sized x, y.
+
+    The product never becomes a buffer: invocation 0 forms it per element
+    inside the reduction loop, then finishes the total with the scalar
+    operations after it.
+    """
+
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _map_reduce(op, dtype)
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    assert shader.reduction == op
+    product = publish_spirv_product(tmp_path / "product", shader)
+    record = product.deployment
+    rng = np.random.default_rng(5)
+    if dtype == "int32":
+        x = rng.integers(-3, 4, extents).astype(np.int32)
+        y = rng.integers(-3, 4, extents).astype(np.int32)
+        s = np.array([2], dtype=np.int32)
+    else:
+        x = (rng.standard_normal(extents) * 0.5 + 1.0).astype(np.float32)
+        y = (rng.standard_normal(extents) * 0.5 + 1.0).astype(np.float32)
+        s = np.array([0.25], dtype=np.float32)
+        if op in ("max", "min") and x.size:
+            x[2, 3] = np.nan
+    result_dtype = "float32" if op == "mean" else dtype
+    sentinel = 12345
+    fed = {0: x, 1: y, 2: s}
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        if resource["access"] == "read":
+            fed_value = fed[view["value_id"]].reshape(-1)
+            buffers[resource["binding"]] = (
+                fed_value if fed_value.size else np.zeros(1, dtype=dtype)
+            )
+        else:
+            buffers[resource["binding"]] = np.full(4, sentinel, dtype=result_dtype)
+    (control,) = record["launch"]["controls"]
+    buffers[control["binding"]] = np.array([x.size], dtype=np.uint32)
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), "1", "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    output = next(
+        item for item in record["resources"] if item["access"] == "read_write"
+    )
+    got = np.fromfile(paths[output["binding"]], dtype=result_dtype)
+    assert (got[1:] == sentinel).all()
+    shifted = (x.astype(np.float64) * y - s[0]).reshape(-1)
+    if not shifted.size and op in ("max", "min", "mean"):
+        assert got[0] == sentinel
+        return
+    if op == "sum":
+        total = shifted.sum()
+    elif op == "prod":
+        total = np.prod(shifted)
+    elif op in ("max", "min"):
+        total = getattr(np, op)(shifted)
+    else:
+        total = shifted.mean()
+    np.testing.assert_allclose(got[0], total * 2 + s[0], rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parametrize("dtype", ["float32", "int32"])
 def test_glsl_arena_product_runs_on_vulkan_from_its_record(tmp_path, dtype):
     """The same GLSL arena source, compiled for Vulkan, launched only from
@@ -843,3 +1013,101 @@ def test_runtime_sized_deployable_spirv_matches_python_on_vulkan(tmp_path):
     got = np.fromfile(paths[output["binding"]], dtype=np.float32)
     np.testing.assert_allclose(got[:count], ((a + b) * s[0]).reshape(-1), rtol=1e-6)
     assert (got[count:] == 12345).all()
+
+
+def _run_record(tmp_path, probe, product, fed, count, groups, written=None):
+    """Bind ``fed`` (by value id) and a sentinel output, run, return the
+    ``written`` (default ``count``) output elements."""
+
+    written = count if written is None else written
+    record = product.deployment
+    buffers = {}
+    for resource in record["resources"]:
+        view = resource["realizes"][0]
+        if resource["access"] == "read":
+            buffers[resource["binding"]] = fed[view["value_id"]].reshape(-1)
+        else:
+            buffers[resource["binding"]] = np.full(count + 4, 12345, dtype=np.float32)
+    for control in record["launch"]["controls"]:
+        buffers[control["binding"]] = np.array([count], dtype=np.uint32)
+    paths = []
+    for binding in range(len(buffers)):
+        path = tmp_path / f"binding{binding}.bin"
+        np.ascontiguousarray(buffers[binding]).tofile(path)
+        paths.append(str(path))
+    ran = subprocess.run(
+        [str(probe), str(product.module_path), str(groups), "1", "1", *paths],
+        capture_output=True, text=True,
+    )
+    if ran.returncode in (2, 3):
+        pytest.skip(f"no usable Vulkan device: {ran.stderr.strip()[:200]}")
+    assert ran.returncode == 0, ran.stderr
+    output = next(item for item in record["resources"] if item["access"] == "read_write")
+    got = np.fromfile(paths[output["binding"]], dtype=np.float32)
+    assert (got[written:] == 12345).all()
+    return got[:written]
+
+
+def _same_floats(got, want):
+    got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+    return bool(np.all(
+        (np.isnan(got) & np.isnan(want))
+        | ((got == want) & (np.signbit(got) == np.signbit(want)))
+    ))
+
+
+_NAN = float("nan")
+
+
+@pytest.mark.parametrize("semantics", ["scan", "reduce"])
+@pytest.mark.parametrize("op", ["max", "min"])
+@pytest.mark.parametrize("row", [
+    [_NAN, 1.0, 5.0], [1.0, _NAN, 5.0], [1.0, 5.0, _NAN], [0.0, -0.0, 0.0],
+])
+def test_runtime_sized_max_follows_its_stamped_rule_on_vulkan(
+    tmp_path, semantics, op, row,
+):
+    """``max(x)`` (scan: Python's builtin over the elements) and ``x.max()``
+    (reduce: numpy's NaN propagation) fold differently on the device."""
+
+    probe = _vulkan_probe(tmp_path)
+    function, outputs = _runtime_reduction(op)
+    function.blocks["entry"].instrs[0].attributes["max_semantics"] = semantics
+    shader = emit_deployable_compute_shader(function, outputs=outputs)
+    assert shader.complete, shader.shortfalls
+    product = publish_spirv_product(tmp_path / "product", shader)
+    x = np.array(row, dtype=np.float32).reshape(1, 3)
+    (got,) = _run_record(tmp_path, probe, product, {0: x}, 3, 1, written=1)
+    if semantics == "scan":
+        want = (max if op == "max" else min)(x.reshape(-1).tolist())
+    else:
+        want = getattr(np, op)(x)
+    assert _same_floats(got, want), (got, want)
+
+
+@pytest.mark.parametrize("method", ["emax", "emin", "maximum", "minimum"])
+def test_runtime_sized_elementwise_max_follows_its_name_on_vulkan(tmp_path, method):
+    """``x.emax(y)`` is the builtin rule per element; ``x.maximum(y)``
+    is numpy's."""
+
+    probe = _vulkan_probe(tmp_path)
+    a, b, r = _spans(1, 0, 1, 2)
+    op = "max" if method in ("emax", "maximum") else "min"
+    instr = Instr(op, [a, b], r)
+    instr.attributes["max_semantics"] = "emax" if method.startswith("e") else "elementwise"
+    function = Function(method, [a, b], {"entry": BasicBlock("entry", [
+        instr, Instr("Ret", [], None),
+    ])})
+    shader = emit_deployable_compute_shader(function, outputs=[r])
+    assert shader.complete, shader.shortfalls
+    product = publish_spirv_product(tmp_path / "product", shader)
+    x = np.array([_NAN, 1.0, 2.0, _NAN, 0.0, -0.0], dtype=np.float32)
+    y = np.array([1.0, _NAN, 3.0, _NAN, -0.0, 0.0], dtype=np.float32)
+    got = _run_record(tmp_path, probe, product, {0: x, 1: y}, 6, 1)
+    if method.startswith("e"):
+        pick = max if method == "emax" else min
+        # x.emax(y) == max(x, y) per element: y replaces x only when better.
+        want = [pick(float(p), float(q)) for p, q in zip(x, y)]
+    else:
+        want = getattr(np, method)(x, y)
+    assert _same_floats(got, want), (got, want)

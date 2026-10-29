@@ -14,6 +14,7 @@ from .concordance_declarations import (
     SCALAR_INTRINSIC_RECEIVER as _SCALAR_INTRINSIC_RECEIVER,
 )
 from ..transmogrifier.function_table import FunctionReference
+from .loop_ir import SEQUENCE_MUTATION_OPERATORS
 
 
 def _syntax_copy(node: Any) -> Any:
@@ -176,6 +177,76 @@ def _resolve_bound_function_references(graph: Any) -> None:
         attributes["callee_ref"] = int(bound.address)
         attributes["callee_resolution"] = "bound-function-parameter"
         data["attributes"] = attributes
+        _post_bound_call_reachability(graph, int(_node_id), bound)
+
+
+def _post_bound_call_reachability(graph: Any, call_id: int, bound: Any) -> None:
+    """Record that this call reaches the function its parameter is bound to.
+
+    Program: ``def drive(step, t): return step(t)`` called as
+    ``drive(advance, t)`` with ``advance`` returning a tensor (the managed
+    tire's ``run_superstep`` -> ``balloon_tire_managed_advance`` ->
+    ``vector_cross``; corpus c971).  Wrong record: the reducer posts a
+    ``source_function_reachability`` row for each call that already names
+    its callee, but this call is linked to its callee only here, after
+    that pass, so the callsite return-shape reader found no reachability
+    authority and refused the selected return.  Rule: the pass that links
+    a bound-parameter call is the pass that proves it reaches the callee,
+    so it posts the row the reader keys on, DERIVED from the call node's
+    cell and the callee's function address.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope, node_identity_cell,
+    )
+    from ..transmogrifier.function_table import function_address_identity
+    from .concordance_declarations import (
+        FUNCTION_ADDRESS, PLANNER_CALL_BINDING, SOURCE_FUNCTION_REACHABILITY,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        return
+    callee_entry = function_table.entry(bound)
+    callee_graph = getattr(callee_entry, "graph", None)
+    if callee_graph is None:
+        return
+    caller_scope = (
+        graph.G.graph.get("authored_function_identity")
+        or _source_numeric_scope(graph.G)
+    )
+    callee_scope = (
+        callee_graph.G.graph.get("authored_function_identity")
+        or _source_numeric_scope(callee_graph.G)
+    )
+    call_value = int(graph.G.nodes[call_id].get("value_id", call_id))
+    row = (caller_scope, call_value, callee_scope)
+    book = current_identity_book()
+    incumbent = book.page(SOURCE_FUNCTION_REACHABILITY).latest(row)
+    if incumbent is True:
+        return
+    if incumbent is not None:
+        raise ValueError(
+            "source function reachability concordance disagreement for "
+            f"{row!r}: recorded={incumbent!r}, proposed=True"
+        )
+    cells = tuple(
+        cell for cell in (
+            node_identity_cell(graph, call_id),
+            book.latest_ref(
+                FUNCTION_ADDRESS, (function_address_identity(callee_entry),),
+            ),
+        )
+        if cell is not None
+    )
+    book.post(
+        SOURCE_FUNCTION_REACHABILITY, row, True,
+        stage=PLANNER_CALL_BINDING,
+        provenance=Derived(cells), mode=Mode.CONCORD,
+    )
 
 
 def _resolve_grounded_method_references(graph: Any) -> None:
@@ -405,12 +476,38 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         static method only.  ``Ops.m(obj, x)`` on an instance method passes
         ``obj`` as ``self``, which a receiver edge cannot state, so it stays
         unlinked.
+
+        Program: ``CorrelationTable.build(module)`` with ``build`` a class
+        method (bootstrap, c940).  A class method binds the class object as
+        ``cls``: the receiver edge states exactly that binding, so it is
+        admitted with the static methods.
         """
 
         node = graph.G.nodes.get(int(receiver_id), {})
         if class_object_binding(node.get("attributes") or {}) is None:
             return True
-        return method_bindings.get(int(reference)) == "static"
+        return method_bindings.get(int(reference)) in {"static", "class"}
+
+    def own_instance_receiver(argument: ast.AST) -> bool:
+        """``argument`` is this instance method's never-rebound ``self``:
+        an instance of its authored owner class."""
+
+        if graph.G.graph.get("method_binding") != "instance":
+            return False
+        from .call_argument_binding import _method_parameter_layout
+
+        receiver_name = _method_parameter_layout(graph.G)[0]
+        return (
+            receiver_name is not None
+            and isinstance(argument, ast.Name)
+            and argument.id == receiver_name
+            and str(graph.G.graph.get("method_owner") or "") in class_table
+            and len(tuple(
+                (graph.G.graph.get("identity_table") or {}).get(
+                    receiver_name, ()
+                )
+            )) <= 1
+        )
 
     def receiver_class(value_id: int) -> str | None:
         pending = [int(value_id)]
@@ -587,6 +684,58 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                 expression.func.value.id,
                 expression.func.attr,
             )
+        if (
+            reference is not None
+            and not class_object_call_admits(receiver_id, reference)
+            and method_bindings.get(int(reference)) == "instance"
+            and expression.args
+            and not isinstance(expression.args[0], ast.Starred)
+            and any(
+                str(role) == "arg:0" and (
+                    receiver_class(int(parent)) in class_table
+                    or own_instance_receiver(expression.args[0])
+                )
+                for parent, role in (data.get("parents") or ())
+            )
+        ):
+            # Program: ``IdentityBook._page(self, name)`` in a subclass's
+            # ``_page`` (bootstrap ``_ConcurrentIdentityBook``, c941).  Wrong
+            # record: the explicit first argument is the instance method's
+            # ``self``, which the receiver edge (the class object) could not
+            # state, so the call was refused.  Rule: ``Cls.m(obj, *rest)``
+            # binds ``obj`` (an instance of an authored class) as the
+            # receiver of ``Cls.m`` itself, never a receiver-class dispatch,
+            # and ``rest`` shifts down one place.  Any other ``obj`` keeps
+            # the refusal below.
+            rewritten = _syntax_copy(expression)
+            rewritten.func = ast.copy_location(ast.Attribute(
+                value=_syntax_copy(expression.args[0]),
+                attr=expression.func.attr, ctx=ast.Load(),
+            ), expression.func)
+            rewritten.args = [
+                _syntax_copy(argument) for argument in expression.args[1:]
+            ]
+            data.setdefault("authored_expr_obj", expression)
+            data["expr_obj"] = rewritten
+            parents = []
+            for parent, role in data.get("parents") or ():
+                role = str(role)
+                if role in {"operand", "receiver"}:
+                    continue
+                if role == "arg:0":
+                    role = "operand"
+                elif role.startswith("arg:") and role[4:].isdigit():
+                    role = f"arg:{int(role[4:]) - 1}"
+                parents.append((int(parent), role))
+            _set_operands(graph, int(_node_id), parents, cause=_BOUND_RECEIVER)
+            attributes = dict(data.get("attributes") or {})
+            attributes.update({
+                "method_ref": int(reference),
+                "method_resolution": "explicit-class-ref",
+                "receiver_class_ref": class_identity,
+            })
+            data["attributes"] = attributes
+            continue
         if reference is not None and not class_object_call_admits(
             receiver_id, reference,
         ):
@@ -634,20 +783,150 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                ))
         or host_callback_call(data)
     }
+    # Program: ``t = same(a)`` (``def same(a: list[int]): return a``) then
+    # ``for i in range(n): t.append(i)``.  Wrong record: the reducer saw a
+    # call result with no collection kind, so the append was an OPAQUE state
+    # effect on ``t`` and the loop minted a value-carried port (LoopResult)
+    # for it, a second identity for ``a``'s list that no region could type.
+    # Rule 8: a call whose callee returns its formal IS the actual's storage,
+    # so the effect is the actual's sequence mutation (one owner, no port).
+    from .resident_sequence_materialization import (
+        _identity_return_aliases, _receiver_collection_kind,
+    )
+
+    returned_actuals = {
+        int(call_id): int(actual_id)
+        for call_id, actual_id in _identity_return_aliases(
+            graph.G, getattr(graph, "function_table", None),
+        ).items()
+        if (graph.G.nodes[int(call_id)].get("attributes") or {}).get(
+            "callee_ref"
+        ) is not None
+        and _receiver_collection_kind(graph.G.nodes.get(int(actual_id), {}))
+        == "list"
+        and (graph.G.nodes[int(actual_id)].get("attributes") or {}).get(
+            "sequence_writable", True
+        )
+    }
+
+    # Program: ``def _trim(out): while len(out) > 1: out.pop()`` called
+    # with ``[1, n, 0, 0]`` (``out`` unannotated).  Wrong record: the
+    # reducer classified the loop's ``pop`` before the call actual gave the
+    # formal its class, so the effect stayed OPAQUE and the loop refused
+    # ("receiver's class is unresolved").  Rule: as for any receiver, a
+    # state whose class is now a builtin list is that list, and its
+    # in-place method is the list's own sequence mutation.
+    def resolved_list(state_id: int) -> bool:
+        data = graph.G.nodes.get(int(state_id), {})
+        return (
+            _receiver_collection_kind(data) == "list"
+            and (data.get("attributes") or {}).get("sequence_writable", True)
+        )
+
+    def forwarded_effect(effect):
+        actual = returned_actuals.get(int(effect["state_input_id"]))
+        if (
+            actual is None
+            and effect.get("effect_mode", "opaque") == "opaque"
+            and str(effect["operator"]) in SEQUENCE_MUTATION_OPERATORS
+            and resolved_list(int(effect["state_input_id"]))
+        ):
+            return {
+                **effect,
+                "effect_mode": "sequence_mutation",
+                "sequence_policy": "duplicates",
+            }
+        if (
+            actual is None
+            or effect.get("effect_mode", "opaque") != "opaque"
+            or str(effect["operator"]) not in SEQUENCE_MUTATION_OPERATORS
+        ):
+            return effect
+        return {
+            **effect,
+            "state_input_id": actual,
+            "effect_mode": "sequence_mutation",
+            "sequence_policy": "duplicates",
+        }
+
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
         effects = attributes.get("loop_state_effects")
         if not effects:
             continue
+        forwarded = tuple(forwarded_effect(effect) for effect in effects)
         retained = tuple(
-            effect for effect in effects
+            effect for effect in forwarded
             if not (
                 effect.get("effect_mode", "opaque") == "opaque"
                 and int(effect["effect_node_id"]) in linked_calls
             )
         )
-        if len(retained) != len(effects):
+        if retained != tuple(effects):
             data["attributes"] = {**attributes, "loop_state_effects": retained}
+
+
+#: ``max_semantics`` values (docs: "What max means in Turing").  Each names
+#: one authored meaning of ``max``/``min``; backends spell exactly that one.
+MAX_SEMANTICS = (
+    "select", "scan", "reduce", "reduce_axis", "elementwise", "emax",
+)
+
+
+def max_semantics_of_call(expression: Any) -> str | None:
+    """The meaning of ``max``/``min`` the authored call states, or ``None``.
+
+    Program: ``max(x, y)``, ``max(xs)``, ``y.max()``, ``y.max(axis=0)`` and
+    ``x.maximum(y)`` all reach the backends as one op name, and each backend
+    guessed between them from the operand count and shapes.  Rule: the call
+    FORM decides, never a name or a shape.  A builtin ``max`` with two or
+    more positional arguments is Python's ``select`` scan over them; with
+    one it is a ``scan`` over that iterable; a ``.max()``/``.amax()`` method
+    with no positional argument is a whole ``reduce``, or ``reduce_axis``
+    when an axis is named; ``maximum``/``minimum`` is ``elementwise`` (numpy's
+    rule) and ``emax``/``emin`` is ``emax`` (the builtin's rule per element).
+    Any other form is left unstamped.
+    """
+
+    if not isinstance(expression, ast.Call):
+        return None
+    function = expression.func
+    keywords = {str(item.arg) for item in expression.keywords if item.arg}
+    positional = [item for item in expression.args if not isinstance(item, ast.Starred)]
+    if len(positional) != len(expression.args):
+        return None
+    if isinstance(function, ast.Name) and function.id in {"max", "min"}:
+        if keywords:  # ``key=``/``default=`` are not spelled
+            return None
+        if len(positional) >= 2:
+            return "select"
+        if len(positional) == 1:
+            return "scan"
+        return None
+    if not isinstance(function, ast.Attribute):
+        return None
+    if function.attr in {"maximum", "minimum"}:
+        return "elementwise"
+    if function.attr in {"emax", "emin"}:
+        return "emax"
+    if function.attr in {"max", "min", "amax", "amin"} and not positional:
+        if keywords & {"axis", "dim"}:
+            return "reduce_axis"
+        if not keywords - {"keepdims", "keepdim"}:
+            return "reduce"
+    return None
+
+
+def _stamp_max_semantics(graph: Any) -> None:
+    """Post ``max_semantics`` on every ``max``/``min`` call node it states."""
+
+    for _node_id, data in graph.G.nodes(data=True):
+        semantics = max_semantics_of_call(data.get("expr_obj"))
+        if semantics is None:
+            continue
+        attributes = dict(data.get("attributes") or {})
+        attributes["max_semantics"] = semantics
+        data["attributes"] = attributes
 
 
 def _resolve_grounded_tensor_operations(graph: Any) -> None:

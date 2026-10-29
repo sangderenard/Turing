@@ -301,6 +301,41 @@ def _source_dependency_is_not_tensor_primitive(value: Any) -> bool:
     return True
 
 
+def _entry_actual_source_classes(
+    feeds: Mapping[str, Any] | None,
+    python_bindings: Mapping[str, Any] | None,
+) -> dict[str, type]:
+    """The authored class of each entry actual, keyed by its formal.
+
+    The entry's caller is its host, and the host's actuals are the call
+    record: ``transition(self=head, ...)`` names ``self``'s class exactly as
+    an internal call edge does (``_ast_call_argument_bindings``), so source
+    pursuit follows ``self._peek`` into ``X86TensorReadHead._peek``.  Only a
+    class whose source can be read is named; a tensor, a builtin value or a
+    formal that shadows a supplied global is not.
+    """
+
+    from ..topological_reducer import _reference_has_pursuable_source
+
+    supplied = dict(python_bindings or {})
+    classes: dict[str, type] = {}
+    for name, actual in dict(feeds or {}).items():
+        if str(name) in supplied or actual is None:
+            continue
+        owner = type(actual)
+        if owner.__module__ == "builtins" or not (
+            _source_dependency_is_not_tensor_primitive(owner)
+        ):
+            continue
+        if getattr(actual, "shape", None) is not None and callable(
+            getattr(actual, "tolist", None)
+        ):
+            continue
+        if _reference_has_pursuable_source(owner):
+            classes[str(name)] = owner
+    return classes
+
+
 def _expand_python_static_bindings(
     bindings: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -508,6 +543,27 @@ def _apply_parameter_constant_map(
     return module
 
 
+# The AST node a parameter-derived feed may be: the parameter's own input
+# (no AST node), the bare name, or an access whose base is the name.
+_PARAMETER_ACCESS_HEADS = frozenset({"NoneType", "Name", "Subscript"})
+
+
+def _feed_ast_head(row: Sequence[Any]) -> str | None:
+    """Return the AST node class a feed's identity tokens describe."""
+
+    tokens = [str(token) for token in row]
+    try:
+        start = tokens.index("field:node.ast")
+    except ValueError:
+        return None
+    for text in tokens[start + 1:]:
+        if text.startswith("field:"):
+            return None
+        if text.startswith("value:"):
+            return text[len("value:"):]
+    return None
+
+
 def _feed_origins_from_ssa_identity(
     program: Any,
     parameters: Sequence[str],
@@ -534,6 +590,12 @@ def _feed_origins_from_ssa_identity(
     its index: ``theta[index]`` names ``theta`` before ``index``, and the
     feed belongs to ``theta``. Feeds already named by id keep those names --
     an exact match is better evidence than a token scan.
+
+    Only a feed that IS a parameter or an access of one is named this way.
+    A feed computed upstream -- ``(px - ex) * (px - ex)`` handed on to a
+    reduction region -- also names ``px`` first in its tokens, and labelling
+    it ``px`` made the projected program read the raw parameter in place of
+    the computed value: a silent wrong answer.
     """
 
     tokens = (getattr(program, "extras", None) or {}).get(
@@ -548,6 +610,8 @@ def _feed_origins_from_ssa_identity(
             continue
         row = tokens.get(feed_id)
         if not row:
+            continue
+        if _feed_ast_head(row) not in _PARAMETER_ACCESS_HEADS:
             continue
         for token in row:
             text = str(token)
@@ -601,36 +665,77 @@ def project_public_numerical_program(compilation: AOTCompilation) -> Any:
         return fallback
 
     program = selected[0]
+    feeds = set(map(int, program.feeds))
+    meta = None if program.meta is None else dict(program.meta)
+    extras = dict(program.extras or {})
+    # A region may feed on values another region computes: a reduction is
+    # cut into its own region and reads the elementwise product before it.
+    # Those feeds are not public inputs, so carry the producing regions'
+    # straight-line steps in ahead of the selected one (in region order)
+    # and the program reads the parameters they read instead.
+    producers: dict[int, Any] = {}
+    for region in compilation.region_programs.values():
+        if region is program or region.state_in:
+            continue
+        for step in region.steps:
+            producers.setdefault(int(step.result_id), region)
+    needed: list[Any] = []
+    pending = [feed for feed in feeds if feed in producers]
+    while pending:
+        region = producers[pending.pop()]
+        if any(region is seen for seen in needed):
+            continue
+        needed.append(region)
+        pending.extend(int(feed) for feed in region.feeds if int(feed) in producers)
+    ordered = [
+        region for region in compilation.region_programs.values()
+        if any(region is seen for seen in needed)
+    ]
+    if ordered:
+        produced = {int(step.result_id) for region in ordered for step in region.steps}
+        tokens = {}
+        for region in ordered:
+            feeds.update(map(int, region.feeds))
+            tokens.update((region.extras or {}).get("ssa_identity_tokens") or {})
+        tokens.update(extras.get("ssa_identity_tokens") or {})
+        feeds -= produced
+        extras["ssa_identity_tokens"] = tokens
+        if program.meta is not None:
+            meta = {}
+            for region in ordered:
+                meta.update(region.meta or {})
+            meta.update(program.meta)
     # Region assembly can encounter the same captured literal through more
     # than one returned expression.  Both references deliberately retain the
     # same identity, so collapse only byte-for-byte-equivalent definitions;
     # a differing redefinition remains visible to downstream validation.
     steps = []
     definitions: dict[int, Any] = {}
-    for step in program.steps:
+    for step in [*(step for region in ordered for step in region.steps), *program.steps]:
         result_id = int(step.result_id)
         previous = definitions.get(result_id)
         if previous is not None and previous == step:
             continue
         definitions[result_id] = step
         steps.append(step)
-    extras = dict(program.extras or {})
     origins = dict(extras.get("capture_feed_origins", {}) or {})
     for name in compilation.function_parameters:
         history = tuple(compilation.identity_table.get(name, ()))
-        if history and int(history[0]) in program.feeds:
+        if history and int(history[0]) in feeds:
             origins[int(history[0])] = {"binding_name": name}
     origins.update(_feed_origins_from_ssa_identity(
-        program, compilation.function_parameters, origins,
+        types.SimpleNamespace(feeds=feeds, extras=extras),
+        compilation.function_parameters,
+        origins,
     ))
     extras["capture_feed_origins"] = origins
     return FusedProgram(
         version=program.version,
-        feeds=set(program.feeds),
+        feeds=feeds,
         steps=steps,
         outputs=outputs,
         state_in=None if program.state_in is None else set(program.state_in),
-        meta=None if program.meta is None else dict(program.meta),
+        meta=meta,
         extras=extras,
     )
 
@@ -1212,6 +1317,9 @@ def compile_ast_aot(
                 # authored targets still cause the exact source-pursuit
                 # activation cells consumed by deployment.
                 activation_roots=tuple(dict.fromkeys((*targets, *dependency_seeds))),
+                parent_bindings=_entry_actual_source_classes(
+                    feeds, expanded_python_bindings,
+                ),
                 tensor_code_references=tensor_code_references,
                 retain=retain,
                 progress=_report,

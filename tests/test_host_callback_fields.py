@@ -22,6 +22,18 @@ from src.compiler.fortran_c_shell import host_callback_signature
 from src.compiler.runtime_abi import HOST_CALLBACK_SCHEMA
 
 
+CONTRACTS = Path(__file__).resolve().parents[1] / "extraction_contracts"
+
+
+def _whitelisting(*fields):
+    from src.compiler.extraction_contract import ExtractionContract
+
+    contract = ExtractionContract(CONTRACTS / "program_extraction.yaml")
+    return contract.with_execution({
+        **contract.execution.receipt(), "python_callback_whitelist": list(fields),
+    })
+
+
 WALKER = '''
 from typing import Callable, Optional
 
@@ -61,6 +73,7 @@ def walker(tmp_path_factory):
     compile_class_to_dll(
         WALKER, "Walker", str(output / "class_route"),
         progress=lambda _message: None,
+        extraction_contract=_whitelisting("Walker.log", "Walker.score"),
     )
     route = output / "class_route"
     api = yaml.safe_load((route / "Walker.api.yaml").read_text())
@@ -228,3 +241,118 @@ def test_a_callable_field_used_as_a_value_refuses(tmp_path):
             ESCAPE, "Escape", str(tmp_path / "class_route"),
             progress=lambda _message: None,
         )
+
+
+BYTES_LOADER = '''
+from typing import Any, Callable
+
+
+class Table:
+    def __init__(self, k: int, loader: Callable[[bytes], Any]) -> None:
+        self.k = k
+        self._loader = loader
+
+    def size(self) -> int:
+        return self.k * 2
+
+    def load(self, data: bytes) -> Any:
+        return self._loader(data)
+'''
+
+
+def _lower_root(source: str):
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    return lower_ast_source_to_ssa(
+        source, "root", name="bytes_loader",
+        extraction_contract=_whitelisting("Table._loader"),
+        progress=lambda _message: None,
+    )
+
+
+def test_an_uncarried_callback_refuses_only_the_method_that_uses_it():
+    # ``Callable[[bytes], Any]`` has no native callback argument yet (doc
+    # 41).  The catalogue pass refused the whole program for it, though
+    # ``root`` never reaches ``Table.load`` (bootstrap: CompressedTable).
+    _lower_root(BYTES_LOADER + "\n\ndef root(n: int) -> int:\n    return n + 1\n")
+    with pytest.raises(ValueError, match="no native callback representation"):
+        _lower_root(
+            BYTES_LOADER
+            + "\n\ndef root(n: int) -> int:\n"
+            "    t = Table(n, lambda b: 0)\n"
+            "    t.load(b'')\n"
+            "    return t.size()\n"
+        )
+
+
+COUNTER = '''
+from typing import Callable
+
+
+class Counter:
+    def __init__(self, log: Callable[[int], None]) -> None:
+        self.log = log
+
+    def bump(self, n: int) -> int:
+        self.log(n)
+        return n + 1
+
+
+def root(n: int) -> int:
+    return Counter(print).bump(n)
+'''
+
+
+def test_a_full_native_contract_admits_no_host_callback():
+    # Bootstrap (``CompressedTable._loader``): the lowering planned the call
+    # as a pointer the host hands in at run time -- a live interpreter --
+    # without reading the full-native contract that forbids it.
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    root = Path(__file__).resolve().parents[1] / "extraction_contracts"
+    contract = ExtractionContract(
+        root / "program_extraction.yaml",
+    ).with_execution_file(root / "vehicle_full_native_execution.yaml")
+    with pytest.raises(ValueError, match="admits no host callback") as refused:
+        lower_ast_source_to_ssa(
+            COUNTER, "root", name="counter", extraction_contract=contract,
+            progress=lambda _message: None,
+        )
+    assert "Counter.log" in str(refused.value)
+    assert "python_callbacks: reject" in str(refused.value)
+
+
+def test_only_a_whitelisted_field_is_a_python_callback():
+    # The Python-hosted program contract keeps callbacks, but admits only
+    # the fields it names.
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    with pytest.raises(
+        ValueError, match="not in execution.python_callback_whitelist",
+    ):
+        lower_ast_source_to_ssa(
+            COUNTER, "root", name="counter",
+            extraction_contract=_whitelisting("Counter.other"),
+            progress=lambda _message: None,
+        )
+
+
+def test_a_whitelist_is_refused_where_no_python_host_runs():
+    from src.compiler.extraction_contract import (
+        ExtractionContract, ExtractionContractError,
+    )
+
+    contract = ExtractionContract(CONTRACTS / "program_extraction.yaml")
+    native = contract.with_execution_file(
+        CONTRACTS / "vehicle_full_native_execution.yaml",
+    )
+    with pytest.raises(ExtractionContractError, match="python_callback_whitelist"):
+        native.with_execution({
+            **native.execution.receipt(),
+            "python_callback_whitelist": ["Counter.log"],
+        })
+    with pytest.raises(ExtractionContractError, match="Class.field"):
+        _whitelisting("log")
+    assert _whitelisting("Counter.log").execution.python_callback_whitelist == (
+        "Counter.log",
+    )

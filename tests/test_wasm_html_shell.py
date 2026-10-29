@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from src.common.tensors.fused_ir import FusedProgram, OpStep
+from tests.wasm_captured_programs import captured_floats
 from src.compiler.machine_targets import emit
 from src.compiler.wasm_html_shell import emit_html_shell, shell_for_artifact
 from src.compiler.compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
@@ -18,19 +18,11 @@ from src.compiler.shell_io import (
 
 
 def _artifact(name="demo"):
-    left, right, s0, s1, s2 = 1, 2, 3, 4, 5
-    program = FusedProgram(
-        version=1,
-        feeds={left, right},
-        steps=[
-            OpStep(step_id=0, op_name="sub", input_ids=[left, right], attrs={}, result_id=s0),
-            OpStep(step_id=1, op_name="abs", input_ids=[s0], attrs={}, result_id=s1),
-            OpStep(
-                step_id=2, op_name="add", input_ids=[s1],
-                attrs={"right_scalar": 1.0}, result_id=s2,
-            ),
-        ],
-        outputs={"result": s2},
+    # Captured from source, so the program carries the capture's dtype and
+    # feed-origin records; the parameters are the names the page shows.
+    program = captured_floats(
+        "def demo(feed0, feed1):\n    return abs(feed0 - feed1) + 1.0\n",
+        "feed0", "feed1",
     )
     return emit(program, "wasm", name=name)
 
@@ -779,11 +771,8 @@ def test_wasm_tile_worker_executes_kernel_and_crosses_join_in_browser(tmp_path):
     from src.compiler.wasm_binary import WasmImport
     from src.compiler.wasm_html_shell import _JS
 
-    program = FusedProgram(
-        version=1,
-        feeds={1},
-        steps=[OpStep(0, "mul", [1], {"right_scalar": 2.0}, 2)],
-        outputs={"result": 2},
+    program = captured_floats(
+        "def tile_kernel(feed0):\n    return feed0 * 2.0\n", "feed0",
     )
     module = emit_wasm_module(
         program,

@@ -122,7 +122,13 @@ def _publish_formal_shape(
     )
 
     extents = tuple(int(e) for e in (descriptor.get("shape") or ()))
-    dtype = str(descriptor.get("dtype") or "float64")
+    if not descriptor.get("dtype"):
+        raise ValueError(
+            f"formal shape ledger: caller {caller!r} proved a shape for "
+            f"{function}.{parameter} but its argument descriptor records no "
+            "dtype; the formal's element type was never settled"
+        )
+    dtype = str(descriptor["dtype"])
     book = current_identity_book()
     row = (authored_function_name(function), str(parameter))
     previous = book.latest_ref(FORMAL_SHAPE, row)
@@ -186,20 +192,17 @@ def _proven_formal_shape(graph: Any, name: Any) -> Any:
 
     if not name:
         return None
-    try:
-        from .identity_concordance import (
-            authored_function_name,
-            current_identity_book,
-        )
+    from .identity_concordance import (
+        authored_function_name,
+        current_identity_book,
+    )
 
-        page = current_identity_book().page("formal_shape")
-        row = (
-            authored_function_name(graph.G.graph.get("function_name")),
-            str(name),
-        )
-        proven = page.latest(row)
-    except Exception:
-        return None
+    page = current_identity_book().page("formal_shape")
+    row = (
+        authored_function_name(graph.G.graph.get("function_name")),
+        str(name),
+    )
+    proven = page.latest(row)
     # ``Unresolved(FORMAL_SHAPE_CONFLICT)`` is the conflicting fact.
     if not isinstance(proven, tuple) or proven[0] != "proven":
         return None
@@ -215,14 +218,11 @@ def _proven_formal_literal(graph: Any, name: Any) -> Any:
 
     if not name:
         return _FORMAL_LITERAL_CONFLICT
-    try:
-        from .identity_concordance import current_identity_book
+    from .identity_concordance import current_identity_book
 
-        page = current_identity_book().page("formal_literal")
-        row = (str(graph.G.graph.get("function_name")), str(name))
-        proven = page.latest(row)
-    except Exception:
-        return _FORMAL_LITERAL_CONFLICT
+    page = current_identity_book().page("formal_literal")
+    row = (str(graph.G.graph.get("function_name")), str(name))
+    proven = page.latest(row)
     # ``Unresolved(FORMAL_LITERAL_CONFLICT)`` is the conflicting fact.
     if not isinstance(proven, tuple) or proven[0] != "proven":
         return _FORMAL_LITERAL_CONFLICT

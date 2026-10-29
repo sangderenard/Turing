@@ -170,6 +170,31 @@ def build(name: str, width: int, root: pathlib.Path):
     )
 
 
+def _loop_bound(function):
+    """The value the counted loop's ``Lt`` compares against, through Casts."""
+
+    casts = {}
+    phis = set()
+    bound = None
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            if instruction.res is None and str(instruction.op) != "Lt":
+                continue
+            if str(instruction.op) == "Cast" and instruction.args:
+                casts[int(instruction.res.id)] = int(instruction.args[0].id)
+            elif str(instruction.op) == "Phi":
+                phis.add(int(instruction.res.id))
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            if str(instruction.op) == "Lt" and len(instruction.args) == 2:
+                left, right = (int(value.id) for value in instruction.args)
+                if left in phis:
+                    bound = right
+    while bound in casts:
+        bound = casts[bound]
+    return bound
+
+
 def _roles(functions, wrapper) -> dict:
     """Which formal is the input array, which the output, which the count.
 
@@ -209,10 +234,18 @@ def _roles(functions, wrapper) -> dict:
 
     formals = list(functions[wrapper].args)
     roles = {"coefficients": [], "extras": []}
+    bound = _loop_bound(functions[wrapper])
+    integers = [value for value in formals if str(value.dtype or "").startswith("int")]
     for value in formals:
         identity = int(value.id)
         if str(value.dtype or "").startswith("int"):
-            roles["count"] = value
+            # The lowering can append integer formals of its own (an
+            # array's limb extent, for one); the count is the integer the
+            # loop condition compares against.
+            if len(integers) == 1 or identity == bound:
+                roles["count"] = value
+            else:
+                roles["extras"].append(value)
         elif identity in written:
             roles["output"] = value
         elif identity in read:

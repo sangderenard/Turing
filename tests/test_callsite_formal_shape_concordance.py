@@ -548,3 +548,31 @@ def test_dependency_change_invalidates_and_then_reproves_concordance_shape():
         assert proven_shape_of(shape_scope_of(graph), 2) == (1,)
     finally:
         end_identity_book(token)
+
+
+def test_a_callsite_boundary_keeps_its_runtime_rank_on_an_untyped_formal():
+    # ``_require_tensor(self.codes, "codes")``: an unannotated formal bound
+    # at the callsite to a rank-1 runtime-sized span.  Its empty shape is
+    # runtime extents, not rank 0.
+    graph = ProcessGraph(materialize_memory=False)
+    graph.G.graph["function_name"] = "_require_tensor"
+    span = {
+        "shape": (), "dtype": "int64", "rank": 1, "metadata_state": "dynamic",
+    }
+    graph.G.graph["planner_tensor_descriptors"] = {"value": dict(span)}
+    graph.G.add_node(
+        1, type="Input", op="input", value_id=1,
+        attributes={
+            "binding_name": "value", "binding_kind": "parameter",
+            "program_abi_storage": "scalar", "program_abi_rank": 0,
+        },
+        parents=[], children=[],
+    )
+
+    _book, token = begin_identity_book()
+    try:
+        descriptor = _tensor_descriptor(graph, 1)
+        assert descriptor["rank"] == 1
+        assert descriptor["metadata_state"] == "dynamic"
+    finally:
+        end_identity_book(token)

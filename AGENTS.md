@@ -222,6 +222,12 @@ per-test timeout; never baseline with stash or `checkout -- <path>`).
 
 ---
 
+## Mandatory: everything goes through the concordance
+
+> How much of a work goes in to a concordance? Some? Enough to keep track? NO. EVERYTHING IN A WORK IS IN A CONCORDANCE. IT IS A COMPLETE DATA STRUCTURE THAT HAS BEEN ORGANIZED IN A CORRELATORY SENSE. YOU CANNOT MAKE ALTERATIONS IN COMPILING THAT ARE NOT GOING THROUGH THE CONCORDANCE BECAUSE THEN IT'S NOT A CONCORDANCE
+
+> The concordance is not an auxiliary record of compilation. It is the authoritative, complete correlational model of the compilation work. Any compiler transformation that cannot be accounted for within that model is an architectural defect, regardless of whether the generated program appears correct.
+
 ## Agents: you will not out-design what is already here
 
 Read this before touching anything.

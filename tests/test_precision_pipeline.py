@@ -132,6 +132,22 @@ def _evaluate_scalar_block(function, arguments):
             result = math.copysign(
                 math.floor(abs(operands[0]) + 0.5), operands[0]
             )
+        elif operation in {"Lt", "Le", "Gt", "Ge", "Eq", "Ne"}:
+            # exp/log range decisions: exact compares and a true select.
+            result = {
+                "Lt": operands[0] < operands[1],
+                "Le": operands[0] <= operands[1],
+                "Gt": operands[0] > operands[1],
+                "Ge": operands[0] >= operands[1],
+                "Eq": operands[0] == operands[1],
+                "Ne": operands[0] != operands[1],
+            }[operation]
+        elif operation == "Select":
+            result = operands[1] if operands[0] else operands[2]
+        elif operation == "Fma" and not all(map(math.isfinite, operands)):
+            # IEEE fma of a non-finite operand: the same inf/NaN class as
+            # the unfused spelling (an unselected exp lane meets these).
+            result = operands[0] * operands[1] + operands[2]
         elif operation == "Fma":
             result = float(
                 Fraction.from_float(operands[0])
@@ -213,6 +229,107 @@ def test_precision_transcendentals_lower_registered_proof_cores(
     }.intersection(PRECISION_SINGULAR_NAMES.values())
     assert environment[result.id] == eager
     assert abs(environment[result.id] - reference) <= math.ulp(reference)
+
+
+@pytest.mark.parametrize(
+    ("operation", "argument"),
+    (
+        # exp: NaN at k >= 1024 (2**k overflowed inside the expansion), 0
+        # for subnormal results, 1 ulp off where the scaled tail rounded.
+        ("Exp", 709.782712893384), ("Exp", 709.7827128933841),
+        ("Exp", 1000.0), ("Exp", -706.2225020067164), ("Exp", -740.0),
+        ("Exp", -745.0), ("Exp", -745.1332191019412), ("Exp", -1.0e300),
+        # log: NaN for subnormal inputs; m - 1 near 1 kept exact.
+        ("Log", 5.0e-324), ("Log", 1.0e-310), ("Log", 1.7976931348623157e308),
+        ("Log", 1.0 - 2.0 ** -53), ("Log", 1.0 + 2.0 ** -52),
+    ),
+)
+def test_precision_exp_log_range_decisions_are_exact_and_library_free(
+    operation, argument, book,
+):
+    """The binade and the rescale are compares, selects and exact multiplies.
+
+    No ``Pow``/``Log``/``Exp`` survives for the backend to spell as libm, and
+    the range ends -- overflow to inf, gradual underflow, subnormal inputs --
+    are correctly rounded (each expected value here is CPython's, checked
+    equal to the mpmath correctly rounded one).
+    """
+
+    x, result = value(1), value(2)
+    function = Function("f", [x], {"entry": BasicBlock("entry", [Instr(
+        PRECISION_SINGULAR_NAMES[operation], [x], result,
+        attributes={"precision_limbs": 2},
+    )])})
+    module = _authored(IRModule({"f": function}))
+    assert apply_precision_pipeline(module)["status"] == "lowered"
+    operations = {
+        str(instruction.op) for instruction in function.blocks["entry"].instrs
+    }
+    assert not operations & {"Pow", "Log", "Exp", "Round"}
+
+    environment = _evaluate_scalar_block(function, [argument, 0.0])
+    try:
+        expected = (math.exp if operation == "Exp" else math.log)(argument)
+    except OverflowError:
+        expected = math.inf  # CPython raises; the IEEE value is inf
+    assert environment[result.id] == expected
+
+
+@pytest.mark.parametrize(
+    ("argument", "overflows", "outside_domain"),
+    (
+        # The largest double whose exp is finite, and the next one up.
+        (709.782712893384, False, False),
+        (709.7827128933841, True, False),
+        (1.0e300, True, False),
+        (1.0, False, False),
+        (-1000.0, False, True),
+        (0.0, False, True),
+        (-0.0, False, True),
+        (5.0e-324, False, False),
+        (math.inf, False, False),
+        (-math.inf, False, True),
+        (math.nan, False, False),
+    ),
+)
+def test_precision_exp_overflow_and_log_domain_predicates(
+    argument, overflows, outside_domain, book,
+):
+    """The predicates a Python-faithful lowering guards on.
+
+    ``math.exp`` raises OverflowError exactly where the predicate says (it
+    is read off the correctly rounded result, not a threshold), and
+    ``math.log`` raises ValueError exactly where the domain predicate says.
+    """
+
+    from src.compiler.ir_identities import WideExpansionEmitter
+
+    x = value(1)
+    function = Function("f", [x], {"entry": BasicBlock("entry", [])})
+    _authored(IRModule({"f": function}))
+    emitted = []
+    emitter = WideExpansionEmitter(function, emitted)
+    source = emitter.expanded(x, 2)
+    result = emitter.exp_expansion(source, 2)
+    overflow = emitter.exp_overflow_predicate(source, result)
+    domain = emitter.log_domain_predicate(source)
+    function.blocks["entry"].instrs = emitted
+    environment = _evaluate_scalar_block(function, [argument])
+
+    assert environment[overflow.id] is overflows
+    assert environment[domain.id] is outside_domain
+    try:
+        math.exp(argument)
+    except OverflowError:
+        assert overflows
+    else:
+        assert not overflows
+    try:
+        math.log(argument)
+    except ValueError:
+        assert outside_domain
+    else:
+        assert not outside_domain
 
 
 @pytest.mark.parametrize("operation", ("Exp", "Log"))
@@ -659,6 +776,55 @@ def test_source_compiler_runs_precision_pipeline_at_completed_module_seam(width)
     artifact = emit_ssa_function_to_llvm(module, wrapper.name)
     assert artifact.shortfalls == ()
     assert "llvm.fma.f64" in artifact.llvm_ir
+
+
+def test_c621_precision_span_limbs_cross_regions_and_write_output(tmp_path):
+    from pathlib import Path
+
+    import numpy as np
+
+    from src.compiler.extraction_contract import ExtractionContract
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_c_backend import emit_ssa_module_to_c
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm,
+        prepare_artifact_execution,
+    )
+    from tools.benchmark_precision_cores import _feeds, _roles
+
+    source = (
+        Path(__file__).parent / "precision_corpus" /
+        "c621_precision_span_square.py"
+    ).read_text(encoding="utf-8")
+    contract = ExtractionContract(
+        Path("extraction_contracts/program_extraction.yaml")
+    ).with_program_abi({"records": {}, "bindings": [], "values": []})
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "f", extraction_contract=contract, progress=lambda _: None,
+    )
+    wrapper = next(name for name in module.functions if name.endswith("__f"))
+    roles = _roles(module.functions, wrapper)
+    assert sum(bool(function.metadata.get("precision_returned_limb_fields"))
+               for function in module.functions.values()) >= 2
+
+    artifact = emit_ssa_module_to_c(module, wrapper)
+    assert not artifact.shortfalls, artifact.shortfalls
+    assert {roles["input"].id, roles["output"].id} <= set(artifact.buffer_order)
+    x = np.array([1.0, 2.0 ** -54, 2.0, 2.0 ** -53])
+    y = np.zeros(4)
+    feeds = _feeds(roles, 2, [], x, y, 2)
+    native = artifact.compile(tmp_path)
+    c_result = native.prepare_execution(feeds).run()
+    llvm_artifact = emit_ssa_function_to_llvm(module, wrapper)
+    assert not llvm_artifact.shortfalls, llvm_artifact.shortfalls
+    llvm_result = prepare_artifact_execution(
+        compile_artifact(llvm_artifact), feeds,
+    ).run()
+    expected = np.array([1.0, 2.0 ** -53, 4.0, 2.0 ** -51])
+    for execution in (c_result, llvm_result):
+        np.testing.assert_array_equal(
+            np.asarray(execution.buffers[roles["output"].id]), expected,
+        )
 
 
 def test_split_two_product_flavour_matches_fma_bit_for_bit_and_frees_wasm():

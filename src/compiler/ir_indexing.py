@@ -15,6 +15,7 @@ carrying a fresh SSA name for the same storage.
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 from ..transmogrifier.ssa import Instr, SSAValue
 
@@ -88,10 +89,13 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     # The energy audit's four raw GEP ids had no mint edge.
                     # This address is made from the exact indexing operands,
                     # not an unrelated global-counter identity.
+                    # An address is a ``ptr``, as every other minted
+                    # address is; left untyped, the backends now refuse it
+                    # (``y[0]`` in a planned region, c411/c412).
                     address = SSAValue(mint_ssa_value(
                         function, ADDRESS, (base, *indices, instruction.res),
-                        stage=CONTROL_SSA_FINISH,
-                    ))
+                        dtype="ptr", stage=CONTROL_SSA_FINISH,
+                    ), dtype="ptr")
                     lowered_attributes = {
                         **dict(instruction.attributes or {}),
                         "lowered_from": str(canonical_op),
@@ -112,8 +116,8 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
                     indices = instruction.args[1:-1]
                     address = SSAValue(mint_ssa_value(
                         function, ADDRESS, (base, *indices, instruction.res),
-                        stage=CONTROL_SSA_FINISH,
-                    ))
+                        dtype="ptr", stage=CONTROL_SSA_FINISH,
+                    ), dtype="ptr")
                     # The store has no result in address SSA, but the source
                     # IndexedStore result is the exact identity of this
                     # resident-memory effect.  Carry that identity across the
@@ -176,11 +180,18 @@ def lower_indexing_to_ssa_addressing(functions) -> None:
 
 
 #: Scalar dtypes a ``Const`` may declare; a declared one is kept as stated.
+from ..transmogrifier.dtype_layout import DTYPES as _DTYPE_LAYOUTS
+from ..transmogrifier.dtype_layout import python_float_result_dtype
+
+_CANONICAL_INTEGER_DTYPES = frozenset(
+    name for name, layout in _DTYPE_LAYOUTS.items()
+    if layout.kind in {"int", "uint"}
+)
 _DECLARED_LITERAL_DTYPES = frozenset({
     "bool",
     "int", "int8", "int16", "int32", "int64", "i32", "i64",
     "float", "float16", "float32", "float64", "double", "f32", "f64",
-})
+}) | _CANONICAL_INTEGER_DTYPES
 
 
 def _propagate_scalar_dtypes(functions) -> None:
@@ -195,7 +206,9 @@ def _propagate_scalar_dtypes(functions) -> None:
     order are unchanged.
     """
 
-    integers = {"int", "int8", "int16", "int32", "int64", "i32", "i64"}
+    integers = {
+        "int", "int8", "int16", "int32", "int64", "i32", "i64",
+    } | set(_CANONICAL_INTEGER_DTYPES)
     floats = {"float", "float16", "float32", "float64", "double", "f32", "f64"}
     preserving = {
         "Add", "Sub", "Mul", "FloorDiv", "Mod", "Pow", "Min", "Max",
@@ -210,6 +223,7 @@ def _propagate_scalar_dtypes(functions) -> None:
         INFERRED_INTEGER_WIDEN,
         IntegerWidthDecision, IntegerWidthFact, SCALAR_DTYPE_SETTLEMENT,
         SCALAR_INTEGER_WIDTH, SSA_VALUE, SSAValueFact,
+        OPERATOR_RESULT_TYPE,
     )
     from .identity_concordance import (
         Derived, Mode, Novel, current_identity_book,
@@ -280,6 +294,58 @@ def _propagate_scalar_dtypes(functions) -> None:
             return ref, book.pages[SSA_VALUE.name].cells.get(
                 (ref.row, ref.column)
             )
+
+        operator_page = book.pages.get(OPERATOR_RESULT_TYPE.name)
+        operation_domain_cells: dict[int, Any] = {}
+
+        def operation_domain(instruction, result_id: int):
+            """Read the exact operation claim from its operand identity edges."""
+            if operator_page is None or not instruction.args:
+                return None
+            operand_refs = tuple(
+                ref for operand in instruction.args
+                for ref, _fact in (value_cell(int(operand.id)),)
+                if ref is not None
+            )
+            if len(operand_refs) != len(instruction.args):
+                return None
+            matches = []
+            for row in operator_page.rows():
+                if not (isinstance(row, tuple) and row and int(row[-1]) == result_id):
+                    continue
+                cell = book.latest_ref(OPERATOR_RESULT_TYPE, row)
+                fact = None if cell is None else operator_page.cell(
+                    cell.row, cell.column,
+                )
+                if not (isinstance(fact, tuple) and len(fact) == 2):
+                    continue
+                incoming = tuple(
+                    source for source, _stage in book.edges_into(cell)
+                )
+                if all(ref in incoming for ref in operand_refs):
+                    matches.append((str(fact[1]), cell))
+            distinct = tuple(dict.fromkeys(dtype for dtype, _cell in matches))
+            if len(distinct) > 1:
+                from .identity_concordance import ConcordanceRefusal
+
+                raise ConcordanceRefusal(
+                    "one SSA operator result has multiple exact numeric "
+                    f"domains: scope={scope!r}, value={result_id}, "
+                    f"domains={distinct!r}"
+                )
+            if len(distinct) != 1:
+                return None
+            exact_cells = tuple(dict.fromkeys(
+                cell for dtype, cell in matches if dtype == distinct[0]
+            ))
+            if len(exact_cells) != 1:
+                from .identity_concordance import ConcordanceRefusal
+
+                raise ConcordanceRefusal(
+                    "one SSA operator result has multiple exact operation "
+                    f"owners: scope={scope!r}, value={result_id}"
+                )
+            return distinct[0], exact_cells[0]
 
         # The keep/widen statement for each result the integer-width rule
         # applied to, posted on ``scalar_integer_width`` once the fixed point
@@ -401,24 +467,29 @@ def _propagate_scalar_dtypes(functions) -> None:
                 if instruction.op == "Const":
                     literal = instruction.attributes.get("value")
                     declared = dtype_of.get(result_id, "")
-                    inferred = (
-                        # A typed pointer literal (including null) is an
-                        # address value, not an integer inferred from its
-                        # Python spelling. Preserve that physical contract.
-                        declared if "ptr" in declared.casefold()
-                        # A declared scalar dtype is the literal's identity;
-                        # the Python spelling is only evidence when nothing
-                        # was declared.  ``Metrics.advanced_dt: float |
-                        # None = None`` mints its absent payload as a
-                        # float64 ``Const 0``; retyping it int64 from the
-                        # ``0`` left the callee returning an int64 slot the
-                        # caller's declared field projection reads as float64.
-                        else declared if declared in _DECLARED_LITERAL_DTYPES
-                        else "bool" if isinstance(literal, bool)
-                        else "int64" if isinstance(literal, int)
-                        else "float64" if isinstance(literal, float)
-                        else None
-                    )
+                    # A typed pointer literal (including null) is an address
+                    # value, not an integer inferred from its Python
+                    # spelling. Preserve that physical contract.
+                    if "ptr" in declared.casefold():
+                        inferred = declared
+                    # A declared scalar dtype is the literal's identity; the
+                    # Python spelling is evidence only when nothing was
+                    # declared.  ``Metrics.advanced_dt: float | None = None``
+                    # mints its absent payload as float64 ``Const 0``.
+                    elif declared in _DECLARED_LITERAL_DTYPES:
+                        inferred = declared
+                    elif isinstance(literal, bool):
+                        inferred = "bool"
+                    elif type(literal) is int:
+                        from ..transmogrifier.dtype_layout import (
+                            python_int_literal_dtype,
+                        )
+
+                        inferred = python_int_literal_dtype(literal)
+                    elif isinstance(literal, float):
+                        inferred = "float64"
+                    else:
+                        inferred = None
                 elif instruction.op == "Cast":
                     inferred = instruction.attributes.get("target_dtype")
                 elif instruction.op in {"Phi", "phi"}:
@@ -477,13 +548,21 @@ def _propagate_scalar_dtypes(functions) -> None:
                     candidate is not None for candidate in operand_dtypes
                 ):
                     if any(candidate in floats for candidate in operand_dtypes):
-                        inferred = declared_float(instruction) or "float64"
-                    elif all(
-                        candidate in integers for candidate in operand_dtypes
-                    ):
-                        inferred = "int64"
+                        # Non-literal widths first; else the float operand's
+                        # own record (a literal ``2.5`` is binary64).
+                        inferred = (
+                            declared_float(instruction)
+                            or python_float_result_dtype(operand_dtypes)
+                        )
+                operation_claim = operation_domain(instruction, result_id)
+                if operation_claim is not None:
+                    inferred, operation_cell = operation_claim
+                    operation_domain_cells[result_id] = operation_cell
                 elif instruction.op in {"Div", "Sqrt", "Exp", "Log"}:
-                    inferred = declared_float(instruction) or "float64"
+                    inferred = (
+                        declared_float(instruction)
+                        or python_float_result_dtype(operand_dtypes)
+                    )
                 # A Const's DECLARED integer width is its identity (rule
                 # above) and survives; only an inferred integer widens to
                 # int64.  tensor_ssa_lowering mints kernel shape vectors as
@@ -506,7 +585,11 @@ def _propagate_scalar_dtypes(functions) -> None:
                 # WIDENED is NOVEL(INFERRED_INTEGER_WIDEN) from the value's
                 # own ``ssa_value`` cell.  The book and the instruction
                 # disagreeing about a declared width is a missing edge: raise.
-                if inferred in narrow_integers and instruction.op not in {"Phi", "phi"}:
+                if (
+                    operation_claim is None
+                    and inferred in narrow_integers
+                    and instruction.op not in {"Phi", "phi"}
+                ):
                     declared = dtype_of.get(result_id, "")
                     if (
                         (instruction.op == "Const" or result_id in declared_load_ids)
@@ -582,6 +665,7 @@ def _propagate_scalar_dtypes(functions) -> None:
                 for cell in (value_cell(int(operand.id))[0],) if cell is not None
             )
             width_cell = book.latest_ref(SCALAR_INTEGER_WIDTH, (scope, int(value_id)))
+            operation_cell = operation_domain_cells.get(int(value_id))
             if previous is None or fact is None:
                 raise ValueError(f"scalar settlement lacks SSA identity: {(scope, value_id)!r}")
             if fact.dtype != dtype:
@@ -590,7 +674,10 @@ def _propagate_scalar_dtypes(functions) -> None:
                           dataclasses.replace(fact, dtype=dtype),
                           stage=SCALAR_DTYPE_SETTLEMENT,
                           provenance=Derived(tuple(dict.fromkeys(
-                              cell for cell in (previous, *operand_cells, width_cell)
+                              cell for cell in (
+                                  previous, *operand_cells, width_cell,
+                                  operation_cell,
+                              )
                               if cell is not None))),
                           mode=Mode.REVISE)
             for value in scope_occurrences.get(

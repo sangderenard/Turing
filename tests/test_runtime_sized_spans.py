@@ -120,6 +120,149 @@ def _backends():
 
 BACKENDS = _backends()
 
+
+def _lower_integer_span(tmp_path, source, name, shape=None):
+    raw = yaml.safe_load(BASE_CONTRACT.read_text(encoding="utf-8"))
+    span = {"function": "f", "parameter": "x", "storage": "span",
+            "dtype": "int64", "rank": 1, "python_type": TENSOR_TYPE}
+    if shape is not None:
+        span["shape"] = list(shape)
+    raw["program_abi"] = {"records": {}, "bindings": [], "values": [
+        span,
+        {"function": "f", "parameter": "n", "storage": "scalar",
+         "dtype": "int64", "rank": 0, "shape": [],
+         "python_type": "builtins.int"},
+    ]}
+    path = tmp_path / f"{name}.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            source, "f", name=name,
+            extraction_contract=ExtractionContract(path),
+            progress=lambda _: None,
+        )
+    entry = exports[0]
+    root = module.functions[entry]
+    parameters = dict(root.metadata["parameter_names"])
+    returned = next(
+        instruction.args[0] for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    )
+    return module, entry, parameters, returned
+
+
+@pytest.mark.parametrize("expression,expected", [
+    ("x * n", [10, -15, 20, 25]),
+    ("x - n", [-3, -8, -1, 0]),
+    ("x % n", [2, 2, 4, 0]),
+])
+@pytest.mark.parametrize("shape", [None, (4,)])
+def test_integer_span_scalar_arithmetic_matches_c_and_llvm(
+    tmp_path, expression, expected, shape,
+):
+    module, entry, parameters, result = _lower_integer_span(
+        tmp_path, f"def f(x, n):\n    return {expression}\n",
+        "integer_span_arithmetic", shape,
+    )
+    assert result.dtype == "int64"
+    feeds = {parameters["x"]: np.array([2, -3, 4, 5], dtype=np.int64),
+             parameters["n"]: np.array([5], dtype=np.int64)}
+    for backend in ("c", "llvm"):
+        artifact, execution = _run(backend, module, entry, feeds, tmp_path)
+        assert np.asarray(execution.buffers[result.id]).reshape(-1).tolist() == expected
+        if backend == "llvm":
+            # Integer domain, never ``fmul double``.  Python ``int`` lanes
+            # (``python_int_lane_overflow_checked``) spell * and - with the
+            # signed overflow intrinsics.
+            spellings = {"x * n": ("mul i64", "smul.with.overflow.i64"),
+                         "x - n": ("sub i64", "ssub.with.overflow.i64"),
+                         "x % n": ("srem i64",)}[expression]
+            assert any(spelling in artifact.llvm_ir for spelling in spellings)
+        abi = artifact.runtime_abi()
+        assert abi["schema"] == "turing-runtime-abi-v1"
+        buffers = {item["value_id"]: item for item in abi["buffers"]}
+        output = buffers[result.id]
+        assert (output["dtype"], output["rank"]) == ("int64", 1)
+        if shape is None:
+            assert output["shape"] is None
+            assert output["extents_from"] == buffers[parameters["x"]]["index"]
+
+
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+def test_indexed_python_integer_keeps_scalar_storage_across_calls(tmp_path, backend):
+    from src.compiler.structural_concordance import function_value_structure
+
+    source = (
+        REPO / "tests" / "record_view_corpus" / "c629_indexed_scalar_call.py"
+    ).read_text(encoding="utf-8")
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        source, "root", name="indexed_scalar_call",
+        extraction_contract=BASE_CONTRACT,
+        progress=lambda _message: None, progress_bars=False,
+    )
+    count = next(
+        function for function in module.functions.values()
+        if "begin" in dict(function.metadata.get("parameter_names", ()))
+    )
+    parameters = dict(count.metadata["parameter_names"])
+    for name in ("begin", "end"):
+        structure, _cell = function_value_structure(
+            count, parameters[name], book=module.metadata["identity_book"],
+        )
+        assert (structure.kind, structure.dtype, structure.rank) == (
+            "scalar", "int64", 0,
+        )
+    root = module.functions[exports[0]]
+    parameters = dict(root.metadata["parameter_names"])
+    feeds = {
+        parameters["offsets"]: np.array([2, 5, 8], dtype=np.int64),
+        parameters["index"]: np.array([1], dtype=np.int64),
+    }
+    _artifact, execution = _run(backend, module, exports[0], feeds, tmp_path)
+    result = next(
+        instruction.args[0] for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+    )
+    assert np.asarray(execution.buffers[result.id]).reshape(-1).tolist() == [18]
+
+
+def test_c620_integer_mask_arithmetic_uses_the_span_dtype(tmp_path):
+    source = (
+        REPO / "tests" / "integer_span_corpus" /
+        "c620_integer_mask_arithmetic.py"
+    ).read_text(encoding="utf-8")
+    module, entry, parameters, result = _lower_integer_span(
+        tmp_path, source, "c620_integer_mask_arithmetic",
+    )
+    feeds = {parameters["x"]: np.array([2, -3, 4, 5], dtype=np.int64),
+             parameters["n"]: np.array([5], dtype=np.int64)}
+    for backend in ("c", "llvm"):
+        _artifact, execution = _run(backend, module, entry, feeds, tmp_path)
+        assert np.asarray(execution.buffers[result.id]).reshape(-1).tolist() == [1, 0, 1, 2]
+
+
+@pytest.mark.parametrize(
+    "program,expected",
+    (("c411_rank_two_first_row.py", 7.0),
+     ("c412_rank_two_last_row.py", 4.0)),
+)
+def test_fortran_rank_two_span_reads_the_authored_cell(
+    tmp_path, program, expected,
+):
+    source = (
+        REPO / "tests" / "fortran_span_corpus" / program
+    ).read_text(encoding="utf-8")
+    module, entry, parameters, result = _lower(
+        tmp_path, source, program.removesuffix(".py"), 2, shape=(2, 3),
+    )
+    values = np.asarray([[1.0, 7.0, 3.0], [4.0, 2.0, 9.0]])
+    feeds = {parameters["x"]: values}
+    for backend in BACKENDS:
+        _artifact, execution = _run(backend, module, entry, feeds, tmp_path)
+        got = np.asarray(execution.buffers[result.id]).reshape(-1).tolist()
+        assert got == [expected], (backend, program, got)
+
 #: A representative AbstractTensor operation: several elementwise steps,
 #: a broadcast scalar constant, and an intermediate that is not an output.
 REPRESENTATIVE = "def f(x, y):\n    return (x - y) * (x + y) * 0.5\n"
@@ -446,12 +589,11 @@ def test_builtin_max_of_one_static_tensor_is_its_largest_element(
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("source", [
     "def f(x, y):\n    return max(y)\n",
-    "def f(x, y):\n    return y.max(axis=0)\n",
 ])
 def test_rank_two_max_reductions_are_refused_not_guessed(tmp_path, backend, source):
-    """``max(y)`` of a (2, 3) tensor raises in Python, and no backend spells
-    ``y.max(axis=0)`` yet: each is refused by name, never one row or a
-    broadcast whole-array maximum."""
+    """``max(y)`` of a (2, 3) tensor raises in Python: it is refused by
+    name, never one row or a broadcast whole-array maximum. (``y.max(axis=0)``
+    is now spelled; tests/test_axis_reductions.py checks it.)"""
 
     module, entry, parameters, _result = _lower(
         tmp_path, source, f"two_max_{backend}", 2, shape=(2, 3),

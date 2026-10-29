@@ -63,6 +63,7 @@ from .wasm_binary import (
     OP_I32_TRUNC_F64_S,
     OP_I32_AND,
     OP_I32_OR,
+    OP_I32_XOR,
     OP_I64_AND,
     OP_I64_OR,
     OP_I64_SHL,
@@ -110,6 +111,17 @@ _I64_BITWISE_OPCODE = {
     "shl": OP_I64_SHL,
     "shr": OP_I64_SHR_S,
 }
+
+
+def _settled_dtype(dtype, value_id, record):
+    """Return a dtype the pipeline settled, or refuse by name."""
+
+    if dtype is None or str(dtype) == "":
+        raise ValueError(
+            f"backend: value {value_id} has no settled dtype; missing "
+            f"record: {record}"
+        )
+    return dtype
 
 
 class WasmEmissionError(ValueError):
@@ -1039,7 +1051,7 @@ def _value_type(program: FusedProgram, dtype: str | None) -> tuple[str, int, str
             if entry is not None and entry.dtype:
                 dtype = str(entry.dtype)
                 break
-    resolved = _TYPES.get(str(dtype or "float64"))
+    resolved = _TYPES.get(str(_settled_dtype(dtype, "?", "fused program dtype")))
     if resolved is None:
         raise WasmEmissionError(
             f"no WebAssembly value type for dtype {dtype!r}; "
@@ -2492,6 +2504,28 @@ def _step_instructions(
 
     if integral:
         instruction = _INTEGER_BINARY_INSTRUCTION.get(op)
+        if op in ("mod", "floordiv"):
+            # Python floors where rem_s/div_s truncate: a nonzero remainder
+            # whose sign differs from the divisor's steps back one divisor
+            # (the binary emitter does the same with locals).
+            remainder = [*operands, f"      {value_type}.rem_s"]
+            quotient = [*operands, f"      {value_type}.div_s"]
+            stepped = (
+                [*remainder, operands[1], f"      {value_type}.add"]
+                if op == "mod"
+                else [*quotient, f"      {value_type}.const 1",
+                      f"      {value_type}.sub"]
+            )
+            return [
+                *stepped,
+                *(remainder if op == "mod" else quotient),
+                *remainder, f"      {value_type}.const 0",
+                f"      {value_type}.ne",
+                *remainder, operands[1], f"      {value_type}.xor",
+                f"      {value_type}.const 0", f"      {value_type}.lt_s",
+                "      i32.and",
+                "      select",
+            ]
         if instruction is not None:
             return [*operands, f"      {value_type}.{instruction}"]
         if op in _INTEGER_LOGICAL_BINARY:
@@ -2539,7 +2573,7 @@ def _step_instructions(
         # which WebAssembly has -- no approximation. operands = [a-push, b-push]
         # (already swapped for ``reverse``); a and b are local.get/const pushes,
         # safe to repeat.
-        return [
+        truncated = [
             operands[0],
             operands[0],
             operands[1],
@@ -2548,6 +2582,26 @@ def _step_instructions(
             operands[1],
             f"      {value_type}.mul",
             f"      {value_type}.sub",
+        ]
+        # Python's float % takes the divisor's sign: a nonzero truncated
+        # remainder of the other sign steps by one divisor, and a zero is
+        # signed like the divisor.
+        zero = f"      {value_type}.const 0"
+        floored = [
+            *truncated, operands[1], f"      {value_type}.add",
+            *truncated,
+            *truncated, zero, f"      {value_type}.ne",
+            *truncated, zero, f"      {value_type}.lt",
+            operands[1], zero, f"      {value_type}.lt",
+            "      i32.xor",
+            "      i32.and",
+            "      select",
+        ]
+        return [
+            *floored, operands[1], f"      {value_type}.copysign",
+            *floored,
+            *floored, zero, f"      {value_type}.eq",
+            "      select",
         ]
     if op == "floordiv":
         # floor(a/b): the floored quotient, exact from div + floor.
@@ -3031,7 +3085,30 @@ def _assemble(
         if step.op_name in ELEMENTWISE_BINARY:
             if integral:
                 instruction = _INTEGER_BINARY_INSTRUCTION.get(step.op_name)
-                if instruction is not None:
+                if step.op_name in ("mod", "floordiv"):
+                    # Python floors: rem_s/div_s truncate toward zero, so a
+                    # nonzero remainder whose sign differs from the divisor's
+                    # steps back one divisor (-7 % 3 == 2, -7 // 3 == -3).
+                    second = builder.declare_local(value_type)
+                    builder.local_set(second)   # b
+                    first = builder.declare_local(value_type)
+                    builder.local_set(first)    # a
+                    remainder = builder.declare_local(value_type)
+                    builder.local_get(first).local_get(second).op("rem_s")
+                    builder.local_set(remainder)
+                    if step.op_name == "mod":
+                        builder.local_get(remainder).local_get(second).op("add")
+                        builder.local_get(remainder)
+                    else:
+                        builder.local_get(first).local_get(second).op("div_s")
+                        builder.value_const(1).op("sub")
+                        builder.local_get(first).local_get(second).op("div_s")
+                    builder.local_get(remainder).value_const(0).op("ne")
+                    builder.local_get(remainder).local_get(second).op("xor")
+                    builder.value_const(0).op("lt_s")
+                    builder.raw(OP_I32_AND)
+                    builder.select()
+                elif instruction is not None:
                     builder.op(instruction)
                 elif step.op_name in _INTEGER_LOGICAL_BINARY:
                     # Operands are already on the stack in order; reduce each
@@ -3084,6 +3161,23 @@ def _assemble(
                     builder.local_get(second)
                     builder.op("mul")
                     builder.op("sub")
+                    # Python's float % takes the divisor's sign: a nonzero
+                    # truncated remainder of the other sign steps by one
+                    # divisor, and a zero is signed like the divisor.
+                    remainder = builder.declare_local(value_type)
+                    builder.local_set(remainder)
+                    builder.local_get(remainder).local_get(second).op("add")
+                    builder.local_get(remainder)
+                    builder.local_get(remainder).value_const(0.0).op("ne")
+                    builder.local_get(remainder).value_const(0.0).op("lt")
+                    builder.local_get(second).value_const(0.0).op("lt")
+                    builder.raw(OP_I32_XOR, OP_I32_AND)
+                    builder.select()
+                    builder.local_set(remainder)
+                    builder.local_get(remainder).local_get(second).op("copysign")
+                    builder.local_get(remainder)
+                    builder.local_get(remainder).value_const(0.0).op("eq")
+                    builder.select()
                 else:
                     builder.local_get(first)
                     builder.local_get(second)

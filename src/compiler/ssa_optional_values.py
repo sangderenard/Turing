@@ -190,6 +190,20 @@ def _lower_record_covered_call(
         )
         for item in payload_presence
     )
+    # Program: ``f = maybe_pair(n, m) if m > 0 else None`` (corpus c306).
+    # Wrong record: the call's aggregate resident was widened to the
+    # interleaved ``(p0, q0, p1, q1)`` width while its ``ssa_value`` row kept
+    # the cut-time ``()``, so the resident disagreed with its own identity.
+    # Rule: post first -- the row is revised DERIVED from the aggregate's
+    # cell and each interleaved member's cell, the resident follows.
+    from .concordance_declarations import STRUCTURAL_CONCORDANCE
+    from .ssa_record_return_state import identity_cells, revise_ssa_value
+
+    revise_ssa_value(
+        caller, int(aggregate.id), dtype="ssa.aggregate",
+        shape=(len(interleaved),), stage=STRUCTURAL_CONCORDANCE,
+        sources=identity_cells(caller, aggregate, *interleaved),
+    )
     aggregate.dtype = "ssa.aggregate"
     aggregate.shape = (len(interleaved),)
     aggregate.accounting = {
@@ -1327,4 +1341,299 @@ def lower_optional_scalar_returns(module: Any) -> tuple[dict[str, Any], ...]:
     return tuple(receipts)
 
 
-__all__ = ["lower_optional_scalar_returns"]
+def lower_optional_scalar_arguments(module: Any) -> tuple[dict[str, Any], ...]:
+    """Carry the presence of a scalar-or-None actual into its callee.
+
+    Program: ``y = None; if n > 2: y = n; return f(y)`` where ``f`` tests
+    ``x is None``.  Wrong record: the call passed only the payload, so the
+    callee's ``Eq(x, None)`` compared an int64 with None and read False --
+    f(None) returned 0 instead of 7.  Rule: a scalar formal that its
+    function compares with ``None`` gains a Boolean presence formal; every
+    call feeds the presence its actual carries (the caller's optional
+    presence, False for a literal None, True for any other value), and the
+    callee's identity tests read that presence.  Run after
+    :func:`lower_optional_scalar_returns`, so optional call results and
+    optional merges already name their presence.
+    """
+
+    functions = _functions(module)
+    receipts: list[dict[str, Any]] = []
+    from .concordance_declarations import (
+        CONTROL_CONST, OPTIONAL_INACTIVE_PAYLOAD, OPTIONAL_PRESENCE,
+        RECORD_RETURN_REPAIR,
+    )
+    from .ssa_record_return_state import accepted_ssa_component, mint_ssa_value
+
+    calls_by_callee: dict[str, list[tuple[str, Any, Any]]] = {}
+    for caller_name, caller in functions.items():
+        for block in caller.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op in {"Call", "call"}:
+                    calls_by_callee.setdefault(
+                        str(instruction.attributes.get("callee") or ""), [],
+                    ).append((str(caller_name), caller, instruction))
+
+    def none_producers(function: Any) -> set[int]:
+        return {
+            int(instruction.res.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None and instruction.op in _NONE_OPS
+        }
+
+    def caller_presence(caller: Any, actual: Any) -> Any | None:
+        declared = (actual.accounting or {}).get("ssa_optional_presence_id")
+        candidates = []
+        for value in (
+            *caller.args,
+            *(
+                instruction.res
+                for block in caller.blocks.values()
+                for instruction in block.instrs
+                if instruction.res is not None
+            ),
+        ):
+            accounting = value.accounting or {}
+            if str(value.dtype or "").casefold() != "bool":
+                continue
+            if declared is not None and int(value.id) == int(declared):
+                return value
+            if (
+                accounting.get("ssa_optional_presence")
+                and accounting.get("ssa_optional_payload_id") is not None
+                and int(accounting["ssa_optional_payload_id"]) == int(actual.id)
+            ):
+                candidates.append(value)
+        unique = {int(value.id): value for value in candidates}
+        return next(iter(unique.values())) if len(unique) == 1 else None
+
+    def scalar_formal(formal: Any) -> bool:
+        return not tuple(formal.shape or ()) and str(
+            formal.dtype or ""
+        ).casefold() not in {"", "none", "unknown", "ptr", "ssa.aggregate"} and not (
+            formal.accounting or {}
+        ).get("ssa_optional_presence")
+
+    def call_index(caller_name, call, function_name, function, formal):
+        declared = call.attributes.get("callee_input_ids")
+        if declared is not None:
+            declared = tuple(map(int, declared))
+            if int(formal.id) not in declared:
+                raise ValueError(
+                    "optional argument has no call operand: "
+                    f"{caller_name} -> {function_name} formal "
+                    f"{int(formal.id)}"
+                )
+            index = declared.index(int(formal.id))
+        else:
+            index = [int(value.id) for value in function.args].index(
+                int(formal.id)
+            )
+        if index >= len(call.args):
+            raise ValueError(
+                "optional argument has no call operand: "
+                f"{caller_name} -> {function_name} position {index}"
+            )
+        return index
+
+    # Which formals carry a presence: those a function compares with None,
+    # and, to a fixed point, the caller formals forwarded into one of those
+    # (``f(x)`` passing ``x`` on to ``h(x)``, which tests it).
+    needs: dict[tuple[str, int], list[Any]] = {}
+    for function_name, function in functions.items():
+        if accepted_ssa_component(function):
+            continue
+        if not calls_by_callee.get(str(function_name)):
+            continue
+        nones = none_producers(function)
+        for formal in function.args:
+            if not scalar_formal(formal):
+                continue
+            tests = [
+                instruction
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op in (_EQ_OPS | _NE_OPS)
+                and len(instruction.args) == 2
+                and any(int(value.id) == int(formal.id) for value in instruction.args)
+                and any(int(value.id) in nones for value in instruction.args)
+            ]
+            if tests:
+                needs[(str(function_name), int(formal.id))] = tests
+    changed = True
+    while changed:
+        changed = False
+        for (function_name, formal_id) in tuple(needs):
+            function = functions[function_name]
+            formal = next(
+                value for value in function.args if int(value.id) == formal_id
+            )
+            for caller_name, caller, call in calls_by_callee.get(function_name, []):
+                if accepted_ssa_component(caller):
+                    continue
+                actual = call.args[call_index(
+                    caller_name, call, function_name, function, formal,
+                )]
+                key = (str(caller_name), int(actual.id))
+                if (
+                    key not in needs
+                    and calls_by_callee.get(str(caller_name))
+                    and any(
+                        int(value.id) == int(actual.id) and scalar_formal(value)
+                        for value in caller.args
+                    )
+                    and caller_presence(caller, actual) is None
+                ):
+                    needs[key] = []
+                    changed = True
+
+    # Mint every presence formal first, so a forwarding caller's own
+    # presence formal is found when its calls are wired below.
+    presence_formals: dict[tuple[str, int], Any] = {}
+    for function_name, function in functions.items():
+        for formal in tuple(function.args):
+            key = (str(function_name), int(formal.id))
+            if key not in needs:
+                continue
+            presence_formal = SSAValue(
+                mint_ssa_value(
+                    function, OPTIONAL_PRESENCE, (formal,),
+                    dtype="bool", stage=RECORD_RETURN_REPAIR,
+                ),
+                dtype="bool",
+                accounting={
+                    "ssa_optional_presence": True,
+                    "ssa_optional_payload_id": int(formal.id),
+                    "ssa_optional_argument_presence": True,
+                },
+            )
+            # Named after its payload's parameter, as an optional record
+            # field's presence is ``field.__present``.
+            declared_names = function.metadata.get("parameter_names") or ()
+            if isinstance(declared_names, dict):
+                declared_names = tuple(declared_names.items())
+            payload_name = next((
+                str(name) for name, value_id in declared_names
+                if int(value_id) == int(formal.id)
+            ), None)
+            if payload_name is None:
+                raise ValueError(
+                    "optional argument formal has no parameter name: "
+                    f"{function_name} formal {int(formal.id)}"
+                )
+            function.metadata["parameter_names"] = (
+                *tuple(declared_names),
+                (f"{payload_name}.__present", int(presence_formal.id)),
+            )
+            presence_formal.accounting["source_parameter"] = payload_name
+            presence_formals[key] = (formal, presence_formal)
+
+    for function_name, function in functions.items():
+        ordered = [
+            presence_formals[(str(function_name), int(formal.id))]
+            for formal in tuple(function.args)
+            if (str(function_name), int(formal.id)) in presence_formals
+        ]
+        if not ordered:
+            continue
+        for caller_name, caller, call in calls_by_callee.get(str(function_name), []):
+            caller_nones = none_producers(caller)
+            indices = [
+                call_index(caller_name, call, function_name, function, formal)
+                for formal, _presence in ordered
+            ]
+            for (formal, presence_formal), index in zip(ordered, indices):
+                actual = call.args[index]
+                block = next(
+                    candidate for candidate in caller.blocks.values()
+                    if any(item is call for item in candidate.instrs)
+                )
+                at = next(
+                    offset for offset, item in enumerate(block.instrs)
+                    if item is call
+                )
+                inserted: list[Instr] = []
+                if (
+                    int(actual.id) in caller_nones
+                    or str(actual.dtype or "").casefold() == "none"
+                ):
+                    payload = SSAValue(
+                        mint_ssa_value(
+                            caller, OPTIONAL_INACTIVE_PAYLOAD, (actual,),
+                            dtype=formal.dtype, shape=(),
+                            stage=RECORD_RETURN_REPAIR,
+                        ),
+                        dtype=formal.dtype, shape=(), device=formal.device,
+                        accounting={"optional_inactive_payload": True},
+                    )
+                    inserted.append(Instr("Const", [], payload, attributes={
+                        "value": (
+                            False if str(formal.dtype).casefold() == "bool"
+                            else 0
+                        ),
+                        "optional_inactive_payload": True,
+                    }))
+                    call.args[index] = payload
+                    present = None
+                    present_value = False
+                else:
+                    forwarded = presence_formals.get(
+                        (str(caller_name), int(actual.id))
+                    )
+                    present = (
+                        forwarded[1] if forwarded is not None
+                        else caller_presence(caller, actual)
+                    )
+                    present_value = True
+                if present is None:
+                    present = SSAValue(
+                        mint_ssa_value(
+                            caller, CONTROL_CONST, (actual,),
+                            dtype="bool", stage=RECORD_RETURN_REPAIR,
+                        ),
+                        dtype="bool",
+                        accounting={"ssa_optional_presence_edge": True},
+                    )
+                    inserted.append(Instr("Const", [], present, attributes={
+                        "value": present_value,
+                        "ssa_optional_presence_edge": True,
+                    }))
+                block.instrs[at:at] = inserted
+                call.args = [*call.args, present]
+                if call.attributes.get("callee_input_ids") is not None:
+                    call.attributes["callee_input_ids"] = (
+                        *tuple(call.attributes["callee_input_ids"]),
+                        int(presence_formal.id),
+                    )
+                receipts.append({
+                    "function": str(function_name),
+                    "caller": str(caller_name),
+                    "payload_formal_id": int(formal.id),
+                    "presence_formal_id": int(presence_formal.id),
+                    "presence_value_id": int(present.id),
+                })
+        function.args = [
+            *function.args, *(presence for _formal, presence in ordered),
+        ]
+        for formal, presence_formal in ordered:
+            for consumer in needs[(str(function_name), int(formal.id))]:
+                consumer.args = [presence_formal]
+                consumer.op = "LNot" if consumer.op in _EQ_OPS else "Cast"
+                consumer.attributes.update({
+                    "target_dtype": "bool",
+                    "optional_presence_test": True,
+                    "payload_value_id": int(formal.id),
+                    "presence_value_id": int(presence_formal.id),
+                    "priority": "exact_optional_argument",
+                    "tie_policy": "incumbent",
+                })
+    if receipts:
+        metadata = getattr(module, "metadata", None)
+        if metadata is None:
+            module.metadata = {}
+            metadata = module.metadata
+        metadata["optional_scalar_argument_receipts"] = tuple(receipts)
+    return tuple(receipts)
+
+
+__all__ = ["lower_optional_scalar_arguments", "lower_optional_scalar_returns"]

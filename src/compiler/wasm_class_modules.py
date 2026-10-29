@@ -48,10 +48,11 @@ chunk is a numbered prerequisite of it.
 from __future__ import annotations
 
 import hashlib
+import dataclasses
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
-from ..common.tensors.fused_ir import FusedProgram, ordered_feed_ids
+from ..common.tensors.fused_ir import FusedProgram, Meta, ordered_feed_ids
 from .process_graph_fusion import (
     DispatchRegion, dispatch_region_to_fused_program,
     fused_program_to_process_graph,
@@ -796,6 +797,23 @@ def _boundary_region(
     return DispatchRegion(window, input_ids, outputs, score=0.0)
 
 
+def _carry_working_dtype(
+    chunk: FusedProgram, working_dtype: str | None,
+) -> FusedProgram:
+    """Record the parent's working dtype on a chunk's undescribed feeds."""
+
+    if working_dtype is None:
+        return chunk
+    meta = dict(chunk.meta or {})
+    for feed_id in chunk.feeds:
+        entry = meta.get(feed_id)
+        if entry is None:
+            meta[feed_id] = Meta(dtype=working_dtype)
+        elif not entry.dtype:
+            meta[feed_id] = dataclasses.replace(entry, dtype=working_dtype)
+    return dataclasses.replace(chunk, meta=meta)
+
+
 def partition_reduced_program(
     program: FusedProgram, *, chunk_size: int, owner_name: str
 ) -> list[ClassModuleSpec]:
@@ -863,10 +881,26 @@ def partition_reduced_program(
         len(windows) - 1,
     )
 
+    # Every chunk is a cut of one module family and runs in the parent's
+    # working type. A boundary feed is an intermediate the parent never gave
+    # a record of its own, so the chunk would otherwise arrive with no dtype.
+    working_dtype = next(
+        (
+            str(entry.dtype)
+            for entry in (
+                (program.meta or {}).get(feed_id)
+                for feed_id in ordered_feed_ids(program)
+            )
+            if entry is not None and entry.dtype
+        ),
+        None,
+    )
     specs: list[ClassModuleSpec] = []
     for index, window in enumerate(windows):
         region = _boundary_region(graph, window, topological)
-        chunk_program = dispatch_region_to_fused_program(graph, region)
+        chunk_program = _carry_working_dtype(
+            dispatch_region_to_fused_program(graph, region), working_dtype,
+        )
         depends_on = sorted({
             chunk_of[value_id]
             for value_id in region.input_ids
@@ -985,24 +1019,66 @@ def build_module_process_graph(specs: Sequence[ClassModuleSpec]):
     is exactly the grouping a schedule visualization (modules as nodes that
     light up together, level by level) needs.
 
-    Nodes are keyed by ``ClassModuleSpec.module_name``.
+    Node ids are integers, as the memory graph requires (a module name used
+    as a node id raised in ``NodeEntry``: "'str' object cannot be
+    interpreted as an integer").  Each node's ``module_name`` attribute is
+    its ``ClassModuleSpec.module_name``; ``module_node_names`` reads them.
     """
 
     from ..transmogrifier.graph.graph_express2 import ProcessGraph
+    from .concordance_declarations import (
+        INGESTION, INGESTION_VALUE, INGEST_SOURCE, NodeFact, SOURCE_SPAN,
+        SpanFact,
+    )
+    from .identity_concordance import (
+        Derived, Mode, Novel, current_identity_book,
+    )
 
     graph = ProcessGraph(materialize_memory=False)
+    # An authored edge is an operand rewrite the identity book records under
+    # the graph's operand-position scope, and each endpoint needs its
+    # ingestion row.  This graph is built here, not by ``build_from_ast``,
+    # so it mints its own ingestion scope and posts each module node from
+    # its spec, as the JavaScript ingestion does for an ESTree construct.
+    book = current_identity_book()
+    scope = book.mint_scope("wasm-class-module-schedule", stage=INGESTION)
+    graph.G.graph["ingestion_value_scope"] = scope
+    node_of = {spec.module_name: index for index, spec in enumerate(specs)}
     for spec in specs:
+        node_id = node_of[spec.module_name]
         graph.G.add_node(
-            spec.module_name, label=spec.module_name, type="WasmClassModule",
+            node_id, label=spec.module_name,
+            module_name=spec.module_name, type="WasmClassModule",
             parents=[], children=[],
+        )
+        span = book.post(
+            SOURCE_SPAN,
+            ("wasm-class-modules", spec.module_name, f"module:{spec.module_name}"),
+            SpanFact("WasmClassModule", -1, -1, -1, -1, spec.module_name),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        book.post(
+            INGESTION_VALUE, (tuple(scope), node_id),
+            NodeFact("WasmClassModule", "module", spec.module_name),
+            stage=INGESTION, provenance=Derived((span,)), mode=Mode.CONCORD,
         )
     for spec in specs:
         for call in spec.calls:
             graph.connect(
-                call.callee_module_name, spec.module_name,
+                node_of[call.callee_module_name], node_of[spec.module_name],
                 "result", f"call#{call.callsite_id}",
             )
     return graph
+
+
+def module_node_names(graph) -> dict[int, str]:
+    """Node id -> module name for a ``build_module_process_graph`` graph."""
+
+    return {
+        node_id: graph.G.nodes[node_id]["module_name"]
+        for node_id in graph.G.nodes
+    }
 
 
 def schedule_module_levels(
@@ -1034,10 +1110,15 @@ def schedule_module_levels(
 
     specs_by_name = {spec.module_name: spec for spec in specs}
     graph = build_module_process_graph(specs)
-    raw_levels = dict(graph.scheduler.compute_levels(method, "dependency"))
+    names = module_node_names(graph)
+    raw_levels = {
+        names[node_id]: level for node_id, level in
+        dict(graph.scheduler.compute_levels(method, "dependency")).items()
+    }
 
     shift_by_node: dict[str, int] = {}
     for component in nx.weakly_connected_components(graph.G):
+        component = {names[node_id] for node_id in component}
         roots = [
             name for name in component if specs_by_name[name].is_root
         ]
@@ -1590,6 +1671,7 @@ __all__ = [
     "build_hued_process_graph_views",
     "build_manifest",
     "build_module_process_graph",
+    "module_node_names",
     "describe_process_graph_api",
     "emit_class_modules",
     "emit_control_region_modules",

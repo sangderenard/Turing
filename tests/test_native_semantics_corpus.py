@@ -32,20 +32,48 @@ _RUNNER = r'''
 import pickle, sys
 import numpy as np
 artifact, parameters, outputs, cases = pickle.load(open(sys.argv[1], "rb"))
+classes = {"builtins.int": int, "builtins.float": float, "builtins.bool": bool,
+           "builtins.NoneType": type(None)}
 for feeds, expected in cases:
     execution = artifact.prepare_execution({
         parameters[name]: np.array([value]) for name, value in feeds.items()
     }).run()
-    got = [
-        float(item)
-        for value_id in outputs
-        for item in execution.buffers[value_id].reshape(-1).tolist()
-    ]
-    want = [float(item) for item in expected]
-    assert len(got) == len(want), (feeds, got, want)
-    for left, right in zip(got, want):
-        assert abs(left - right) <= 1e-12 * max(1.0, abs(right)), (feeds, got, want)
+    got = []
+    for output in outputs:
+        if isinstance(output, tuple):
+            # A value union's frame: the tag names the live arm, and only
+            # that arm's payload is the value, with that arm's class.
+            tag_id, arms = output
+            name, payload_id = arms[int(execution.buffers[tag_id].reshape(-1)[0])]
+            got.append((name, None if payload_id is None
+                        else execution.buffers[payload_id].reshape(-1)[0].item()))
+            continue
+        got.extend(float(item) for item in execution.buffers[output].reshape(-1).tolist())
+    assert len(got) == len(expected), (feeds, got, expected)
+    for left, right in zip(got, expected):
+        if isinstance(left, tuple):
+            name, payload = left
+            assert classes.get(name) is type(right), (feeds, got, expected)
+            left = None if right is None else float(payload)
+            if right is None:
+                continue
+        right = float(right)
+        assert abs(left - right) <= 1e-12 * max(1.0, abs(right)), (feeds, got, expected)
 '''
+
+
+def _unannotated_formals(source: str) -> list[str]:
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "root":
+            arguments = node.args
+            return [
+                argument.arg
+                for argument in (
+                    *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                )
+                if argument.annotation is None
+            ]
+    return []
 
 
 def _inputs(source: str) -> list[dict]:
@@ -65,38 +93,96 @@ def test_native_program_matches_python(program, tmp_path):
     # must not turn the program's annotations into strings.
     namespace: dict = {"__name__": f"corpus_{program.stem}"}
     exec(compile(source, str(program), "exec", dont_inherit=True), namespace)
+    inputs = _inputs(source)
     cases = []
-    for feeds in _inputs(source):
+    for feeds in inputs:
         expected = namespace["root"](**feeds)
         cases.append((feeds, list(expected) if isinstance(expected, tuple) else [expected]))
 
-    module, _outputs, exports = lower_ast_source_to_ssa(
-        source, "root", name=f"corpus_{program.stem}",
-        extraction_contract=str(CONTRACT), progress=lambda _message: None,
-    )
-    findings = CorrelationTable.build(module).findings(module)
-    assert findings == [], findings
+    # The test IS the caller: for formals the program leaves unannotated,
+    # each INPUTS row is a root call record whose argument classes feed the
+    # compiler's called inventory, and one exact-typed copy of the entry is
+    # lowered per distinct class signature (as tools/native_corpus_typed_check
+    # does).  Annotated formals are untouched.
+    free = _unannotated_formals(source)
+    if free:
+        from src.compiler.called_inventory import class_spelling
 
-    root = module.functions[exports[0]]
-    parameters = dict(root.metadata["parameter_names"])
-    returns = [
-        instruction.args
-        for block in root.blocks.values()
-        for instruction in block.instrs
-        if instruction.op == "Ret"
-    ]
-    assert len(returns) == 1
-    outputs = [int(value.id) for value in returns[0]]
-    artifact = emit_ssa_to_c(module, exports[0])
-    assert artifact.complete, artifact.shortfalls
-    artifact.compile(tmp_path / "native")
-    saved = tmp_path / "artifact.pkl"
-    saved.write_bytes(pickle.dumps((artifact, parameters, outputs, cases)))
-    result = subprocess.run(
-        [sys.executable, "-c", _RUNNER, str(saved)],
-        capture_output=True, text=True, timeout=120,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+        groups: dict = {}
+        for feeds, case in zip(inputs, cases):
+            signature = tuple((name, class_spelling(feeds[name])) for name in sorted(free))
+            groups.setdefault(signature, []).append(case)
+        calls = [{name: feeds[name] for name in free} for feeds in inputs]
+        runs = [
+            (group, dict(calls=calls, signature=dict(signature)))
+            for signature, group in groups.items()
+        ]
+    else:
+        runs = [(cases, None)]
+
+    for index, (group, inventory) in enumerate(runs):
+        extra = (
+            {} if inventory is None
+            else dict(root_calls=inventory["calls"], root_signature=inventory["signature"])
+        )
+        module, _outputs, exports = lower_ast_source_to_ssa(
+            source, "root", name=f"corpus_{program.stem}_{index}",
+            extraction_contract=str(CONTRACT), progress=lambda _message: None,
+            **extra,
+        )
+        findings = CorrelationTable.build(module).findings(module)
+        assert findings == [], findings
+
+        root = module.functions[exports[0]]
+        parameters = dict(root.metadata["parameter_names"])
+        returns = [
+            instruction.args
+            for block in root.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Ret"
+        ]
+        # A bounds check or an absent key leaves through a fault-exit return
+        # that carries the same output identities as the program's own.
+        assert len([
+            instruction for block in root.blocks.values()
+            for instruction in block.instrs
+            if instruction.op == "Ret" and not instruction.attributes.get("fault_exit")
+        ]) == 1
+        ids = [int(value.id) for value in returns[0]]
+        # A value union leaves the program as its frame (an int64 tag and one
+        # payload cell per arm, ``module.value_union_tables``); it is read as
+        # one value at its first member's position.
+        table = getattr(module, "value_union_tables", {}).get(exports[0])
+        frames = {}
+        for union in ([] if table is None else dict(table.unions).values()):
+            members = {int(union.tag_value_id)} | {
+                int(value_id) for arm in union.alternatives for value_id in arm.value_ids
+            }
+            if members <= set(ids):
+                frames[min(ids.index(member) for member in members)] = (union, members)
+        covered = {member for _union, members in frames.values() for member in members}
+        outputs = []
+        for position, value_id in enumerate(ids):
+            if position in frames:
+                union, _members = frames[position]
+                outputs.append((int(union.tag_value_id), [
+                    (str(arm.name), int(arm.value_ids[0]) if arm.value_ids else None)
+                    for arm in union.alternatives
+                ]))
+            elif value_id not in covered:
+                outputs.append(value_id)
+        artifact = emit_ssa_to_c(module, exports[0])
+        assert artifact.complete, artifact.shortfalls
+        run_dir = tmp_path / f"run{index}"
+        run_dir.mkdir()
+        artifact.compile(run_dir / "native")
+        saved = run_dir / "artifact.pkl"
+        saved.write_bytes(pickle.dumps((artifact, parameters, outputs, group)))
+        result = subprocess.run(
+            [sys.executable, "-c", _RUNNER, str(saved)],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_unbounded_local_list_is_an_explicit_boundary():

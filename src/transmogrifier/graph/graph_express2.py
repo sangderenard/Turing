@@ -13,6 +13,7 @@ import os
 import pickle
 import textwrap
 import types
+import array
 from typing import Any
 from sympy import Sum, IndexedBase, Idx, symbols, Function
 from ...compiler.bitops import BitTensorMemoryGraph
@@ -37,6 +38,7 @@ from .python_special_cases import (
     is_python_static_literal,
     lower_python_shell_file_contexts,
     lower_python_threading,
+    method_receiver_formal,
     python_dispatch_entry_expressions,
 )
 from .python_identity_programs import resolve_python_identity
@@ -377,7 +379,8 @@ def _ast_aggregate_kind(value):
     proves the same kind.
     """
 
-    aggregate_types = {list, set, dict, tuple, bytes, bytearray}
+    aggregate_types = {list, set, dict, tuple, array.array, bytes, bytearray}
+    
     if isinstance(value, _ASTReferenceAlternatives):
         kinds = {_ast_aggregate_kind(option) for option in value.values}
         kinds.discard(None)
@@ -1004,7 +1007,29 @@ def _filter_discovered_definition(definition, module):
         decorator_list=[],
         type_params=list(getattr(definition, "type_params", ())),
     )
+    _carry_declared_decorators(filtered, definition)
     return ast.copy_location(filtered, definition)
+
+
+def _carry_declared_decorators(shell, definition):
+    """Keep a class declaration's decorators on its shell as a receipt.
+
+    Program: ``@dataclass(frozen=True) class SSAObjectContext`` (bootstrap
+    ``validate_context_function``, corpus c936).  Wrong record: the shell
+    dropped ``decorator_list``, so the class table read the frozen record
+    as mutable and a field read after a call refused.  Rule: a shell is a
+    declaration view; it keeps the declaration's decorators as data (never
+    in ``decorator_list``, which ingestion would walk as code).
+    """
+
+    shell._turing_declared_decorators = tuple(
+        copy.deepcopy(decorator)
+        for decorator in getattr(
+            definition, "_turing_declared_decorators",
+            definition.decorator_list,
+        )
+    )
+    return shell
 
 
 def _source_owner_declaration_shell(value):
@@ -1052,6 +1077,7 @@ def _source_owner_declaration_shell(value):
         type_params=list(getattr(definition, "type_params", ())),
     )
     shell = ast.copy_location(shell, definition)
+    _carry_declared_decorators(shell, definition)
     # This node is a source-declaration view of ``owner``, not a second
     # authored class.  Source pursuit can later retain an executable method
     # (or the class itself) from the same declaration.  The map-IR publisher
@@ -1065,8 +1091,8 @@ def _source_owner_declaration_shell(value):
     return shell
 
 
-def _source_owner_annotation_declaration_shells(value):
-    """Declaration-only source classes named by an owner's field API."""
+def _source_owner_annotation_declaration_shells(value, *, source_definition=None, record_identities=()):
+    """Declaration-only source classes named by an admitted callable API."""
 
     if inspect.ismethod(value):
         value = value.__func__
@@ -1075,21 +1101,38 @@ def _source_owner_annotation_declaration_shells(value):
     module = inspect.getmodule(value)
     owner = module
     owner_parts = str(getattr(value, "__qualname__", "")).split(".")[:-1]
-    if module is None or not owner_parts or "<locals>" in owner_parts:
+    if module is None:
         return ()
     for component in owner_parts:
-        owner = getattr(owner, component, None)
+        owner = None if component == "<locals>" else getattr(owner, component, None)
         if owner is None:
-            return ()
+            break
     owner_definition = _source_ast_definition(owner)
-    if not isinstance(owner_definition, ast.ClassDef):
-        return ()
-
-    referenced_names = set()
-    for member in owner_definition.body:
-        if not isinstance(member, ast.AnnAssign):
-            continue
-        annotation = member.annotation
+    annotation_items = [
+        (member.annotation, None, None)
+        for member in (() if not isinstance(owner_definition, ast.ClassDef) else owner_definition.body)
+        if isinstance(member, ast.AnnAssign)
+    ]
+    # Imported _propose_dt_pen names Targets only in its quoted annotation.
+    # The admitted callable and exact ProgramABI identity authorize that
+    # declaration; a bare class name never does. Reuse the owner's existing
+    # quoted-annotation/reference resolution, without adding executable methods.
+    allowed_records = frozenset(map(str, record_identities))
+    callable_definition = source_definition
+    if allowed_records and isinstance(callable_definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        parameters = (
+            *callable_definition.args.posonlyargs, *callable_definition.args.args,
+            *callable_definition.args.kwonlyargs,
+            *((callable_definition.args.vararg,) if callable_definition.args.vararg else ()),
+            *((callable_definition.args.kwarg,) if callable_definition.args.kwarg else ()),
+        )
+        annotation_items.extend((parameter.annotation, parameter, parameter.arg)
+                                for parameter in parameters if parameter.annotation is not None)
+        if callable_definition.returns is not None:
+            annotation_items.append((callable_definition.returns, callable_definition.returns, "return"))
+    references = {}
+    field_api_references = set()
+    for annotation, occurrence, parameter in annotation_items:
         if isinstance(annotation, ast.Constant) and isinstance(
             annotation.value, str
         ):
@@ -1097,16 +1140,26 @@ def _source_owner_annotation_declaration_shells(value):
                 annotation = ast.parse(annotation.value, mode="eval").body
             except SyntaxError:
                 continue
-        referenced_names.update(
-            node.id for node in ast.walk(annotation)
-            if isinstance(node, ast.Name)
-        )
+        names = tuple(dict.fromkeys(node.id for node in ast.walk(annotation) if isinstance(node, ast.Name)))
+        bindings = _ast_definition_bindings(value, callable_definition)
+        bindings.update({name: getattr(module, name) for name in names if hasattr(module, name)})
+        for expression in ast.walk(annotation):
+            if not isinstance(expression, (ast.Name, ast.Attribute)):
+                continue
+            referenced = _resolve_ast_parent_reference(expression, bindings)
+            if not inspect.isclass(referenced) or referenced is owner:
+                continue
+            identity = f"{referenced.__module__}.{referenced.__qualname__}"
+            if occurrence is not None and identity not in allowed_records:
+                continue
+            evidence = references.setdefault(referenced, [])
+            if occurrence is not None:
+                evidence.append((occurrence, parameter))
+            else:
+                field_api_references.add(referenced)
 
     shells = []
-    for name in sorted(referenced_names):
-        referenced = getattr(module, name, None)
-        if not inspect.isclass(referenced) or referenced is owner:
-            continue
+    for referenced, annotation_evidence in references.items():
         definition = _source_ast_definition(referenced)
         if not isinstance(definition, ast.ClassDef):
             continue
@@ -1114,7 +1167,7 @@ def _source_owner_annotation_declaration_shells(value):
         # Publish the class surface through the ordinary declaration path.
         # This records method signatures (including their return annotations)
         # without adding any method body to the executable source closure.
-        ingest_class_declaration_by_reference(referenced)
+        admitted_schema = ingest_class_declaration_by_reference(referenced)
         # A referenced field class contributes an API declaration even when
         # none of its method bodies is admitted for compilation.  Preserve
         # each authored return annotation in the concordance before reducing
@@ -1135,8 +1188,9 @@ def _source_owner_annotation_declaration_shells(value):
             f"{getattr(referenced, '__qualname__', referenced.__name__)}"
         ).strip(".")
         class_row = (
-            str(getattr(referenced, "__module__", "")),
-            str(class_identity),
+            (admitted_schema["class_node_id"][0], admitted_schema["class_identity"])
+            if admitted_schema is not None else
+            (str(getattr(referenced, "__module__", "")), str(class_identity))
         )
         class_cell = book.latest_ref(CLASS_DECLARATION, class_row)
         if class_cell is None:
@@ -1149,6 +1203,34 @@ def _source_owner_annotation_declaration_shells(value):
                     provenance=Derived((class_span,)),
                     mode=Mode.CONCORD,
                 )
+        if annotation_evidence and admitted_schema is not None:
+            from ...common.tensors.topological_reducer import _static_symbol_definition_cell
+            from ...compiler.concordance_declarations import CLASS_FIELD_DECLARATION, PARAMETER_ANNOTATION, FUNCTION_RETURN_ANNOTATION
+            callable_cell = _static_symbol_definition_cell(value)
+            callable_span = post_source_span(callable_definition, callable_definition)
+            declaration_row = (admitted_schema["class_node_id"][0], admitted_schema["class_identity"])
+            declaration_cell = book.latest_ref(CLASS_DECLARATION, declaration_row)
+            if callable_cell is None or callable_span is None or declaration_cell is None:
+                raise ValueError("admitted annotation class lacks its exact callable/declaration cells")
+            for occurrence, parameter in annotation_evidence:
+                annotation_span = post_source_span(callable_definition, occurrence)
+                if annotation_span is None:
+                    raise ValueError("admitted annotation class lacks its annotation source cell")
+                book.post(CLASS_DECLARATION, declaration_row,
+                          book.page(CLASS_DECLARATION).latest(declaration_row), stage=INGESTION,
+                          provenance=Derived((callable_cell, annotation_span)), mode=Mode.CONCORD)
+                annotation_page = FUNCTION_RETURN_ANNOTATION if parameter == "return" else PARAMETER_ANNOTATION
+                annotation_row = (callable_span.row[:2] if parameter == "return" else (*callable_span.row[:2], parameter))
+                annotation = callable_definition.returns if parameter == "return" else occurrence.annotation
+                book.post(annotation_page, annotation_row, ast.unparse(annotation), stage=INGESTION,
+                          provenance=Derived((callable_cell, annotation_span, declaration_cell)), mode=Mode.CONCORD)
+            for field in admitted_schema.get("attributes", ()):
+                field_row = (*declaration_row, field["name"])
+                field_cell = book.latest_ref(CLASS_FIELD_DECLARATION, field_row)
+                if field_cell is not None:
+                    book.post(CLASS_FIELD_DECLARATION, field_row,
+                              book.page(CLASS_FIELD_DECLARATION).latest(field_row), stage=INGESTION,
+                              provenance=Derived((declaration_cell,)), mode=Mode.CONCORD)
         for method in definition.body:
             if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -1171,6 +1253,12 @@ def _source_owner_annotation_declaration_shells(value):
                 )),
                 mode=Mode.CONCORD,
             )
+        # Callable-only annotation admission is already complete on the
+        # book. Appending another graph class shell would re-key that same
+        # class through _python_source_identity and duplicate its fields.
+        # Preserve the incumbent owner-field executable-navigation surface.
+        if referenced not in field_api_references:
+            continue
         declarations = [
             copy.deepcopy(member)
             for member in definition.body
@@ -1189,6 +1277,7 @@ def _source_owner_annotation_declaration_shells(value):
             type_params=list(getattr(definition, "type_params", ())),
         )
         shell = ast.copy_location(shell, definition)
+        _carry_declared_decorators(shell, definition)
         shell._turing_declaration_fragment = True
         shell._python_source_identity = (
             str(getattr(referenced, "__module__", "")),
@@ -1500,13 +1589,14 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
                 if isinstance(target, ast.Name):
                     add_attribute(target.id, None, "class", member, definition)
     for method in methods:
+        receiver = method_receiver_formal(method)
         for statement in ast.walk(method):
             if isinstance(statement, ast.Assign):
                 for target in statement.targets:
                     if (
                         isinstance(target, ast.Attribute)
                         and isinstance(target.value, ast.Name)
-                        and target.value.id == "self"
+                        and target.value.id == receiver
                     ):
                         add_attribute(
                             target.attr, None, "instance", statement, method,
@@ -1516,7 +1606,7 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
                 if (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
+                    and target.value.id == receiver
                 ):
                     add_attribute(
                         target.attr,
@@ -1553,7 +1643,14 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         "attributes": tuple(attributes),
         "methods": tuple({
             "name": method.name,
-            "graph_identity": f"{definition.name}.{method.name}",
+            "graph_identity": (
+                    ".".join(
+                        str(part)
+                        for part in (getattr(method, "_python_source_identity", None) or ())
+                        if part
+                    )
+                    or f"{definition.name}.{method.name}"
+                ),
             "ast_node_id": source_span_row(definition, method),
             "parameters": tuple(
                 argument.arg for argument in (
@@ -2518,12 +2615,16 @@ def _import_ast_bindings(tree, bindings, package=None):
     """Make imports and literal module constants visible to source discovery."""
 
     resolved = dict(bindings)
+    # ``ast.walk`` sees every import, guarded ones included: a backend module
+    # imported under ``try`` can fail with any error when its library is
+    # absent (``torch_backend``: ``torch.Tensor`` on ``torch = None``).  A
+    # module that does not import here binds nothing here.
     for statement in ast.walk(tree):
         if isinstance(statement, ast.Import):
             for imported in statement.names:
                 try:
                     value = importlib.import_module(imported.name)
-                except ImportError:
+                except Exception:
                     continue
                 resolved[imported.asname or imported.name.split(".")[0]] = value
         elif isinstance(statement, ast.ImportFrom):
@@ -2533,7 +2634,7 @@ def _import_ast_bindings(tree, bindings, package=None):
             )
             try:
                 module = importlib.import_module(module_name, package=package)
-            except (ImportError, TypeError, ValueError):
+            except Exception:
                 continue
             for imported in statement.names:
                 try:
@@ -3423,6 +3524,17 @@ def _expand_unresolved_ast_parents(
     # stamped as they are appended.
     _annotate_visual_source_owners(module)
     root_bindings = _import_ast_bindings(module, bindings, package=package)
+    # A module-level ``def max``/``class sum`` shadows the builtin of that
+    # name, as in Python.  Without its definition here the builtin fallback
+    # below bound the name, and the call was classified ``builtins.max``
+    # while reduction resolved it to the program's own function.
+    for statement in module.body:
+        if (
+            isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                   ast.ClassDef))
+            and hasattr(builtins, statement.name)
+        ):
+            root_bindings.setdefault(statement.name, statement)
     # Built-ins are ordinary lexical fallback bindings in Python.  Put them
     # through the same source/host-code implementation resolver as imports and
     # globals so a source-less builtin can be decompiled rather than becoming
@@ -4559,7 +4671,11 @@ def _expand_unresolved_ast_parents(
         owner_declaration = _source_owner_declaration_shell(source_target)
         owner_declarations = tuple(filter(None, (
             owner_declaration,
-            *_source_owner_annotation_declaration_shells(source_target),
+            *_source_owner_annotation_declaration_shells(
+                source_target, source_definition=source_definition,
+                record_identities=tuple(str(record.identity) for record in
+                    (getattr(getattr(include, "program_abi", None), "records", {}) or {}).values()),
+            ),
         )))
         for owner_declaration in owner_declarations:
             owner_identity = _source_definition_identity(owner_declaration)
@@ -6411,6 +6527,14 @@ class ProcessGraph(TiledObject):
             # source itself (``from .machine_path_forest import
             # MachinePathHeadStatus``) was real and resolved, just
             # discarded before reduction could ever see it.
+            # ``parent_bindings`` name the classes of the entry's formals
+            # (the host's actuals): lookup context for pursuit only.  A
+            # formal is a parameter, never a static global of the program.
+            for name, value in (parent_bindings or {}).items():
+                if root_bindings.get(name) is value and name not in (
+                    getattr(self, "python_bindings", {}) or {}
+                ):
+                    root_bindings.pop(name)
             self.python_bindings = root_bindings
             # Source pursuit is what resolves ``open``/``Path.open`` to the
             # extraction contract's shell-file boundary. Lower the lexical
@@ -6528,15 +6652,59 @@ class ProcessGraph(TiledObject):
                             mode=Mode.CONCORD,
                         )
                 for parameter in parameters:
+                    # The called inventory (compiler/called_inventory.py): the
+                    # class the callers pass for this formal is the formal's
+                    # evidence where no annotation states one.  An annotation
+                    # that does not admit the inventory's class is a named
+                    # refusal, never a silent preference.
+                    from ...compiler.called_inventory import called_class
+                    inventory = called_class(
+                        book, str(identity), str(parameter.arg),
+                    )
+                    inventory_cell = None
+                    annotation_node = parameter.annotation
                     if parameter.annotation is None:
-                        continue
+                        if inventory is None:
+                            continue
+                    else:
+                        if inventory is not None:
+                            inventory_cell = inventory[1]
+                            admitted = {
+                                node.id for node in ast.walk(parameter.annotation)
+                                if isinstance(node, ast.Name)
+                            }
+                            # ``list[int]`` is admitted by an annotation that
+                            # names the container and admits the element class.
+                            head, _, element = inventory[0].partition("[")
+                            element = element.rstrip("]")
+                            if element:
+                                spelled_ok = head in admitted and (
+                                    element in admitted
+                                    or (element == "bool" and "int" in admitted)
+                                    or (element in ("bool", "int")
+                                        and "float" in admitted)
+                                )
+                            else:
+                                spelled_ok = inventory[0] in admitted or (
+                                    (inventory[0] == "bool" and "int" in admitted)
+                                    or (inventory[0] in ("bool", "int")
+                                        and "float" in admitted)
+                                )
+                            if not spelled_ok:
+                                raise ValueError(
+                                    f"formal {parameter.arg} of {identity} is "
+                                    f"annotated {ast.unparse(parameter.annotation)} "
+                                    f"but its call records pass {inventory[0]}"
+                                )
                     row = (module_name, str(identity), str(parameter.arg))
                     parameter_span = post_source_span(function, parameter)
                     if parameter_span is None:
                         continue
                     parameter_sources = [parameter_span]
+                    if inventory_cell is not None:
+                        parameter_sources.append(inventory_cell)
                     for name in dict.fromkeys(
-                        node.id for node in ast.walk(parameter.annotation)
+                        node.id for node in ast.walk(annotation_node)
                         if isinstance(node, ast.Name)
                     ):
                         declared_class = book.latest_ref(
@@ -6547,7 +6715,7 @@ class ProcessGraph(TiledObject):
                             parameter_sources.append(declared_class)
                     book.post(
                         PARAMETER_ANNOTATION, row,
-                        ast.unparse(parameter.annotation),
+                        ast.unparse(annotation_node),
                         stage=INGESTION,
                         provenance=Derived(tuple(dict.fromkeys(
                             parameter_sources
