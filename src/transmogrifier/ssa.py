@@ -91,6 +91,23 @@ class BasicBlock(TiledObject):
     instrs: List[Instr] = field(default_factory=list)
     successors: List[str] = field(default_factory=list)  # for CFG edges
 
+
+@dataclass(frozen=True)
+class SSAExceptionTopology(TiledObject):
+    """SSA-level reference to the source exception graph.
+
+    The graph still describes authored relationships, not CFG successors.
+    Exception operations can be added here without changing source nodes or
+    claiming a control transfer before one has been lowered.
+    """
+
+    concordance_cell: Any
+    source_graph_cell: Any
+    nodes: tuple[Any, ...]
+    edges: tuple[tuple[Any, Any], ...]
+    roles: tuple[str, ...]
+
+
 @dataclass
 class Function(TiledObject):
     name: str
@@ -3065,6 +3082,7 @@ class IRModule(TiledObject):
     # relationship among several lowered functions and must remain observable
     # even when a backend selects only one function for emission.
     metadata: Dict[str, Any] = field(default_factory=dict)
+    exception_topology: SSAExceptionTopology | None = None
 
     def __setattr__(self, name: str, value: Any) -> None:
         # The module's call table is stored on the identity book whatever a

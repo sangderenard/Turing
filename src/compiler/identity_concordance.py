@@ -1553,6 +1553,7 @@ class CorrelationTable:
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_page_declaration_findings(module))
         found.extend(self._source_exception_graph_findings(module))
+        found.extend(self._ssa_exception_topology_findings(module))
         found.extend(self._graph_work_publication_findings(module))
         found.extend(self._tile_storage_findings(module))
         found.extend(self._source_field_identity_findings(module))
@@ -1919,6 +1920,45 @@ class CorrelationTable:
                 found.append(Finding(
                     "value-type-tag-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _ssa_exception_topology_findings(module: Any) -> list[Finding]:
+        """The SSA view must point to the source graph's sole exact cell."""
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_GRAPH, SSA_EXCEPTION_TOPOLOGY,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SSA_EXCEPTION_TOPOLOGY.name not in book.pages:
+            return []
+        found = []
+        view = getattr(module, "exception_topology", None)
+        page = book.page(SSA_EXCEPTION_TOPOLOGY)
+        for row in page.rows():
+            source_cell = book.latest_ref(SOURCE_EXCEPTION_GRAPH, row)
+            ssa_cell = book.latest_ref(SSA_EXCEPTION_TOPOLOGY, row)
+            actual = page.latest(row)
+            sources = {
+                source for source, _stage in book.edges_into(ssa_cell)
+            }
+            if (
+                source_cell is None or actual != source_cell
+                or sources != {source_cell} or view is None
+                or view.concordance_cell != ssa_cell
+                or view.source_graph_cell != source_cell
+                or (
+                    view.nodes, view.edges, view.roles
+                ) != (
+                    book.page(SOURCE_EXCEPTION_GRAPH).latest(row).nodes,
+                    book.page(SOURCE_EXCEPTION_GRAPH).latest(row).edges,
+                    book.page(SOURCE_EXCEPTION_GRAPH).latest(row).roles,
+                )
+            ):
+                found.append(Finding(
+                    "ssa-exception-topology-disagreement", str(row[0]), None,
+                    "SSA exception view disagrees with its source graph cell",
                 ))
         return found
 

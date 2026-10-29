@@ -428,6 +428,10 @@ INGESTION_VALUE = declare_page("ingestion_value", (
 SOURCE_EXCEPTION_GRAPH = declare_page("source_exception_graph", (
     RowField("source_scope", K.SCOPE),
 ), SourceExceptionGraph)
+SSA_EXCEPTION_TOPOLOGY = declare_page("ssa_exception_topology", (
+    RowField("source_scope", K.SCOPE),
+), Ref)
+SSA_EXCEPTION_TOPOLOGY_STAGE = declare_stage("ssa_exception_topology")
 CANONICAL_VALUE = declare_page("canonical_value", (
     RowField("read_scope", K.SCOPE), RowField("canonical_id", K.VALUE_ID),
 ), tuple, rows_level=IdentityLogLevel.FULL)

@@ -66174,6 +66174,9 @@ def _lower_ast_source_to_ssa_impl(
                 *function.metadata["loop_interchange_decisions"], decision,
             )
     _report_unmaterialised_record_parameters(module, extraction_contract)
+    from .source_exception_graph import publish_ssa_exception_topology
+
+    publish_ssa_exception_topology(module, graph)
     if (
         extraction_policy is not None
         and extraction_policy.execution.require_full_native

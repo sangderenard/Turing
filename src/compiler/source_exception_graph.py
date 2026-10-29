@@ -123,3 +123,37 @@ def publish_source_exception_graph(source_graph):
         )
     source_graph.G.graph["source_exception_graph"] = fact
     return fact
+
+
+def publish_ssa_exception_topology(module, source_graph):
+    """Expose the existing exception graph as one SSA module object.
+
+    The SSA row points to the source graph cell.  Neither the projection nor
+    the module object creates a second copy of any node or edge identity.
+    """
+
+    from .concordance_declarations import (
+        SOURCE_EXCEPTION_GRAPH, SSA_EXCEPTION_TOPOLOGY,
+        SSA_EXCEPTION_TOPOLOGY_STAGE,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from ..transmogrifier.ssa import SSAExceptionTopology
+
+    scope = source_graph.G.graph.get("ingestion_value_scope")
+    if scope is None:
+        raise ValueError("SSA exception topology has no source scope")
+    book = current_identity_book()
+    source_cell = book.latest_ref(SOURCE_EXCEPTION_GRAPH, (scope,))
+    if source_cell is None:
+        return None
+    graph = book.page(SOURCE_EXCEPTION_GRAPH).latest((scope,))
+    ssa_cell = book.post(
+        SSA_EXCEPTION_TOPOLOGY, (scope,), source_cell,
+        stage=SSA_EXCEPTION_TOPOLOGY_STAGE,
+        provenance=Derived((source_cell,)), mode=Mode.CONCORD,
+    )
+    topology = SSAExceptionTopology(
+        ssa_cell, source_cell, graph.nodes, graph.edges, graph.roles,
+    )
+    module.exception_topology = topology
+    return topology
