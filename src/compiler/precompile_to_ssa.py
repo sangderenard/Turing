@@ -5578,6 +5578,46 @@ class _ControlSSABuilder(TiledObject):
             if refined is None:
                 return
             destination = refined
+        # A whole-sequence extend (``resident += other``) has no authored
+        # bounds: 0 and a beyond-any-length constant span the source, and
+        # the helper's Python-slice clipping does the rest.
+        source_cell = self._sequence_contract_cell(int(source_id))
+        unsigned_layouts = {"uint8", "uint16", "uint32", "uint64"}
+
+        def bound_dtype(value_id) -> str:
+            # An authored bound keeps its settled layout: a uint64 ``begin``
+            # read from an ``array("Q")`` row is clipped by the helper in
+            # its own domain, never bound to an int64 formal.
+            meta = self.region_value_meta.get(int(value_id))
+            dtype = str(getattr(meta, "dtype", None) or "")
+            return dtype if dtype in unsigned_layouts else "int64"
+
+        if lower_id is None:
+            lower_value = self.fresh_value(
+                dtype="int64", transform=CONTROL_CONST, operands=(source_cell,),
+            )
+            self.emit(
+                Handler.Const, [], lower_value, attributes={
+                    "value": 0 if lower_literal is None else int(lower_literal)
+                },
+            )
+        else:
+            lower_value = self.external_value(
+                int(lower_id), dtype=bound_dtype(lower_id),
+            )
+        if upper_id is None:
+            upper_value = self.fresh_value(
+                dtype="int64", transform=CONTROL_CONST, operands=(source_cell,),
+            )
+            self.emit(
+                Handler.Const, [], upper_value,
+                attributes={"value": 2 ** 31 - 1 if upper_literal is None
+                            else int(upper_literal)},
+            )
+        else:
+            upper_value = self.external_value(
+                int(upper_id), dtype=bound_dtype(upper_id),
+            )
         from .ir_sequence_tables import lower_sequence_append_slice
 
         helper_name = self._sequence_helper_name(
@@ -5588,6 +5628,13 @@ class _ControlSSABuilder(TiledObject):
             source,
             function_name=helper_name,
             first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+            # An unsigned bound (``begin`` read from an ``array("Q")`` row)
+            # is clipped in its own domain by the helper.
+            bound_dtypes=tuple(
+                str(value.dtype)
+                if str(value.dtype or "") in unsigned_layouts else "int64"
+                for value in (lower_value, upper_value)
+            ),
         )
         if not lowering.complete:
             self.shortfalls.extend(
@@ -5606,32 +5653,6 @@ class _ControlSSABuilder(TiledObject):
                 *self.sequence_storage_values[int(source_id)],
             )
         }.values())
-        # A whole-sequence extend (``resident += other``) has no authored
-        # bounds: 0 and a beyond-any-length constant span the source, and
-        # the helper's Python-slice clipping does the rest.
-        source_cell = self._sequence_contract_cell(int(source_id))
-        if lower_id is None:
-            lower_value = self.fresh_value(
-                dtype="int64", transform=CONTROL_CONST, operands=(source_cell,),
-            )
-            self.emit(
-                Handler.Const, [], lower_value, attributes={
-                    "value": 0 if lower_literal is None else int(lower_literal)
-                },
-            )
-        else:
-            lower_value = self.external_value(int(lower_id), dtype="int64")
-        if upper_id is None:
-            upper_value = self.fresh_value(
-                dtype="int64", transform=CONTROL_CONST, operands=(source_cell,),
-            )
-            self.emit(
-                Handler.Const, [], upper_value,
-                attributes={"value": 2 ** 31 - 1 if upper_literal is None
-                            else int(upper_literal)},
-            )
-        else:
-            upper_value = self.external_value(int(upper_id), dtype="int64")
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
             operands=(*storage, lower_value, upper_value),

@@ -972,6 +972,17 @@ def specialize_python_precision_widths(graph: Any) -> bool:
     ) + tuple(
         (("iterated_class", identity), domain)
         for identity, domain in sorted(iterable_domains.items(), key=lambda item: repr(item[0]))
+    ) + tuple(
+        # Program: ``v.cover(n % 7 + 3)`` and ``v.cover(BASE + n % 2)``:
+        # two copies of one method minted for different actual intervals.
+        # Wrong record: the receipt omitted the intervals, so both copies
+        # shared one numeric scope and its formal's interval row disagreed
+        # ((3, 9) against (1000, 1001)).  Rule: the interval a copy was
+        # minted for is part of what the copy is.
+        (f"range:{name}", (int(interval[0]), int(interval[1])))
+        for name, interval in sorted(dict(
+            metadata.get("planner_parameter_int_ranges") or {}
+        ).items())
     )
     digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
     scope = (authored_scope, "specialization", digest)

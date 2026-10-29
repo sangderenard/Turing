@@ -2229,6 +2229,7 @@ def lower_sequence_append_slice(
     *,
     function_name: str | None = None,
     first_value_id: int | None = None,
+    bound_dtypes: tuple[str, str] = ("int64", "int64"),
 ) -> SSASequenceLowering:
     """Append a unit-stride source slice to resident destination storage.
 
@@ -2236,6 +2237,16 @@ def lower_sequence_append_slice(
     bounds are relative to the source length and both bounds are clipped into
     ``[0, source_length]``.  The slice is copied directly between caller-owned
     arenas; no temporary sequence or runtime iterator is materialized.
+
+    ``bound_dtypes`` are the authored bounds' layouts.  Program: Token
+    Orchard ``list(self.cover_tokens[begin : begin + count])`` with
+    ``begin`` and ``count`` read from ``array("Q")`` rows.  Wrong record:
+    the uint64 bounds were bound to the helper's int64 formals, so its
+    sign tests mixed signed and unsigned operands and no backend could emit
+    it.  Rule: an unsigned bound is never negative; it is clipped to the
+    source length in its own domain (the length, a count, is exact there),
+    and only a bound at most that length, hence within int64, is taken into
+    the int64 index domain.
     """
 
     # Program: ``values=[]; for i in range(n): values.append(i); selected=values[:end]``.
@@ -2304,9 +2315,79 @@ def lower_sequence_append_slice(
     builder = _Builder(_first_fresh_identity(
         destination, source, values=all_storage, minimum=first_value_id
     ))
-    lower = builder.fresh("int64")
-    upper = builder.fresh("int64")
-    entry = builder.block("entry")
+    from ..transmogrifier.dtype_layout import resolve as resolve_layout
+
+    unsigned_bounds = tuple(
+        (layout is not None and layout.kind == "uint")
+        for layout in map(resolve_layout, bound_dtypes)
+    )
+    for dtype, layout in zip(bound_dtypes, map(resolve_layout, bound_dtypes)):
+        if layout is None or layout.kind not in {"int", "uint"} or (
+            layout.kind == "int" and str(layout.name) != "int64"
+        ) or int(layout.byte_size) > 8:
+            raise ValueError(
+                f"sequence append-slice bound has no index layout: {dtype!r}"
+            )
+    lower_formal = builder.fresh(
+        str(bound_dtypes[0]) if unsigned_bounds[0] else "int64"
+    )
+    upper_formal = builder.fresh(
+        str(bound_dtypes[1]) if unsigned_bounds[1] else "int64"
+    )
+    lower, upper = lower_formal, upper_formal
+    if any(unsigned_bounds):
+        prologue = builder.block("entry")
+        prologue_zero = builder.const(prologue, 0, dtype="int64")
+        prologue_length_slot = builder.fresh("ptr")
+        prologue_length = builder.fresh("int64")
+        builder.emit(prologue, "GetElementPtr", [SSAValue(
+            source.length_address_id, dtype="int64", shape=(1,)
+        ), prologue_zero], prologue_length_slot)
+        builder.emit(
+            prologue, "Load", [prologue_length_slot], prologue_length,
+        )
+        current = prologue
+        clipped = []
+        for position, (formal, unsigned) in enumerate(
+            zip((lower_formal, upper_formal), unsigned_bounds)
+        ):
+            if not unsigned:
+                clipped.append(formal)
+                continue
+            unsigned_dtype = str(formal.dtype)
+            length_unsigned = builder.fresh(unsigned_dtype)
+            builder.emit(current, "Cast", [prologue_length], length_unsigned,
+                         attributes={
+                             "target_dtype": unsigned_dtype,
+                             "source_dtype": "int64",
+                             "binding": "ssa_sequence_slice_length_domain",
+                         })
+            beyond = builder.fresh("bool")
+            builder.emit(current, "Gt", [formal, length_unsigned], beyond)
+            at_length = builder.block(f"unsigned_bound_{position}_length")
+            within = builder.block(f"unsigned_bound_{position}_within")
+            joined = builder.block(f"unsigned_bound_{position}_joined")
+            builder.cond(current, beyond, at_length, within)
+            builder.branch(at_length, joined)
+            index_value = builder.fresh("int64")
+            builder.emit(within, "Cast", [formal], index_value, attributes={
+                "target_dtype": "int64",
+                "source_dtype": unsigned_dtype,
+                "binding": "ssa_sequence_slice_bound_domain",
+            })
+            builder.branch(within, joined)
+            normalized = builder.fresh("int64")
+            builder.emit(
+                joined, "Phi", [prologue_length, index_value], normalized,
+                attributes={"incoming_blocks": (at_length.name, within.name)},
+            )
+            clipped.append(normalized)
+            current = joined
+        lower, upper = clipped
+        entry = builder.block("bounds_entry")
+        builder.branch(current, entry)
+    else:
+        entry = builder.block("entry")
     lower_negative = builder.block("lower_negative")
     lower_negative_zero = builder.block("lower_negative_zero")
     lower_negative_value = builder.block("lower_negative_value")
@@ -2512,7 +2593,7 @@ def lower_sequence_append_slice(
     builder.emit(result, "Ret", [status])
     function = Function(
         name,
-        [*all_storage, lower, upper],
+        [*all_storage, lower_formal, upper_formal],
         builder.blocks,
         metadata={
             "ssa_sequence_operation": "append_slice",
