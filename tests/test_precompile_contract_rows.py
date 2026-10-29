@@ -305,6 +305,7 @@ def test_field_slot_columns_post_their_physical_view():
         ControlProgram(SequenceBlock(())),
         identity_table={"self": (5,)},
         self_value_id=5,
+        receiver_parameter="self",
         field_ops=(("write", 11, 0), ("write", 12, 1)),
         field_const_sources={
             11: {

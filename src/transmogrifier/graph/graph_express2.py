@@ -38,6 +38,7 @@ from .python_special_cases import (
     is_python_static_literal,
     lower_python_shell_file_contexts,
     lower_python_threading,
+    method_receiver_formal,
     python_dispatch_entry_expressions,
 )
 from .python_identity_programs import resolve_python_identity
@@ -1006,7 +1007,29 @@ def _filter_discovered_definition(definition, module):
         decorator_list=[],
         type_params=list(getattr(definition, "type_params", ())),
     )
+    _carry_declared_decorators(filtered, definition)
     return ast.copy_location(filtered, definition)
+
+
+def _carry_declared_decorators(shell, definition):
+    """Keep a class declaration's decorators on its shell as a receipt.
+
+    Program: ``@dataclass(frozen=True) class SSAObjectContext`` (bootstrap
+    ``validate_context_function``, corpus c936).  Wrong record: the shell
+    dropped ``decorator_list``, so the class table read the frozen record
+    as mutable and a field read after a call refused.  Rule: a shell is a
+    declaration view; it keeps the declaration's decorators as data (never
+    in ``decorator_list``, which ingestion would walk as code).
+    """
+
+    shell._turing_declared_decorators = tuple(
+        copy.deepcopy(decorator)
+        for decorator in getattr(
+            definition, "_turing_declared_decorators",
+            definition.decorator_list,
+        )
+    )
+    return shell
 
 
 def _source_owner_declaration_shell(value):
@@ -1054,6 +1077,7 @@ def _source_owner_declaration_shell(value):
         type_params=list(getattr(definition, "type_params", ())),
     )
     shell = ast.copy_location(shell, definition)
+    _carry_declared_decorators(shell, definition)
     # This node is a source-declaration view of ``owner``, not a second
     # authored class.  Source pursuit can later retain an executable method
     # (or the class itself) from the same declaration.  The map-IR publisher
@@ -1253,6 +1277,7 @@ def _source_owner_annotation_declaration_shells(value, *, source_definition=None
             type_params=list(getattr(definition, "type_params", ())),
         )
         shell = ast.copy_location(shell, definition)
+        _carry_declared_decorators(shell, definition)
         shell._turing_declaration_fragment = True
         shell._python_source_identity = (
             str(getattr(referenced, "__module__", "")),
@@ -1564,13 +1589,14 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
                 if isinstance(target, ast.Name):
                     add_attribute(target.id, None, "class", member, definition)
     for method in methods:
+        receiver = method_receiver_formal(method)
         for statement in ast.walk(method):
             if isinstance(statement, ast.Assign):
                 for target in statement.targets:
                     if (
                         isinstance(target, ast.Attribute)
                         and isinstance(target.value, ast.Name)
-                        and target.value.id == "self"
+                        and target.value.id == receiver
                     ):
                         add_attribute(
                             target.attr, None, "instance", statement, method,
@@ -1580,7 +1606,7 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
                 if (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
+                    and target.value.id == receiver
                 ):
                     add_attribute(
                         target.attr,

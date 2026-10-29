@@ -1890,6 +1890,7 @@ def test_declared_reference_read_never_requires_scalar_dtype():
         identity_table={"self": (5,), "result": (11,)},
         function_outputs=("result",),
         self_value_id=5,
+        receiver_parameter="self",
         field_ops=(("read", 11, 0),),
         field_count=1,
         field_names=("last_metrics",),

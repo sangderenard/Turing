@@ -76,7 +76,8 @@ def _reduction_module(source=SOURCE):
         "ex": np.asarray([[0.5, 2.5, 5.5]]),
     }
     aot = compile_ast_aot(
-        source, "reduce_kernel", named_feeds, precompile_only=True, remove_loops=True
+        source, "reduce_kernel", named_feeds, precompile_only=True, remove_loops=True,
+        mutable_parameters=tuple(named_feeds),
     )
     program = project_public_numerical_program(aot)
     module = emit_wasm_module(program, name="reduce_kernel", dtype="float64")
