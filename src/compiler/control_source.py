@@ -544,10 +544,6 @@ class NativeExceptionHandler(TiledObject):
     # The source graph identities of the exception class declarations.  A
     # bare except has no declarations and therefore an empty tuple.
     exception_type_value_ids: tuple[int, ...] = ()
-    # Resolved declarations for native status matching.  Each identity is
-    # derived from the corresponding source value, never from a handler's
-    # spelling or position.
-    exception_type_identities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -566,17 +562,6 @@ class NativeTryBlock(TiledObject):
     orelse: "ControlBlock | None"
     finalbody: "ControlBlock"
     source_try_node_id: int
-    # Source Call nodes actually scheduled as numerical work in the
-    # protected body. Each has a SOURCE_EXCEPTION_TRANSFER cell; SSA must
-    # either lower its exceptional edge or refuse the control program.
-    protected_call_node_ids: tuple[int, ...] = ()
-    # Exact placement of those calls in the scheduled region markers.
-    # (region_index, source_call_node_id) is a view of source graph
-    # membership, not a new matching heuristic in SSA.
-    protected_region_calls: tuple[tuple[int, int], ...] = ()
-    # Linked PlanCall markers placed in this body by the lexical scheduler.
-    # These calls have source transfers but no numerical region marker.
-    protected_marker_calls: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -591,112 +576,6 @@ class ValidationBlock(TiledObject):
     # Exact source values consumed only by the authored exception diagnostic.
     # Native validation reports ``error_code`` and does not materialize them.
     diagnostic_value_ids: tuple[int, ...] = ()
-    # The exact authored Raise node, when this validation is an exceptional
-    # transfer. Generic validations have no Raise and keep their own status.
-    source_raise_node_id: int | None = None
-
-
-def validation_raise_class_cell(
-    graph: Any,
-    statement: ast.Raise,
-    node_for_expression: Callable[[ast.AST], int | None],
-) -> Any:
-    """Read the raise constructor's exact static definition cell.
-
-    Program: ``raise ValueError(...)`` in tensor_octets_to_bytes. Wrong
-    record: a matching AST spelling plus the compiler host's ``builtins``
-    decided the raised class, while the handler side read the concordance.
-    The authored constructor occurrence's static-use edge is the one class
-    authority for both sides. A shadowed name has no builtin definition
-    edge, even when it is spelled ``ValueError``.
-    """
-
-    from .concordance_declarations import (
-        SCOPE_ORIGIN, STATIC_REFERENCE_USE, STATIC_SYMBOL_DEFINITION,
-    )
-    from .identity_concordance import current_identity_book
-
-    raised = statement.exc
-    if not isinstance(raised, ast.Call):
-        return None
-    graph_obj = getattr(graph, "G", graph)
-    node_id = node_for_expression(raised)
-    if node_id is None or int(node_id) not in graph_obj:
-        return None
-    scope = graph_obj.graph.get("lexical_read_scope")
-    occurrence = id(raised.func)
-    book = current_identity_book()
-    # Source call composition works on a forked read scope. The static-use
-    # occurrence was posted when the authored graph was reduced. Follow the
-    # book's scope_origin facts back to that ingestion scope, rather than
-    # parsing the fork name or accepting a use from another specialization.
-    ingestion_scopes = None
-    if scope is not None:
-        source_scopes = {scope}
-        cursor = scope
-        while True:
-            origin = book.page(SCOPE_ORIGIN).latest((cursor,))
-            if origin is None:
-                break
-            cursor = origin.source_scope
-            if cursor in source_scopes:
-                raise ValueError("source raise read-scope origin has a cycle")
-            source_scopes.add(cursor)
-        ingestion_scopes = {(item, "ingestion") for item in source_scopes}
-    # The aggregate source graph has no function-local read scope.  Program:
-    # tensor_octets_to_bytes's entry TypeError guard.  Its Call still has an
-    # exact callee edge to the static reference node; the static-use row
-    # names both that node and the authored occurrence.  Require that pair
-    # instead of reconstructing a scope from a function name.
-    callee_ids = {
-        int(parent) for parent, role in (
-            graph_obj.nodes[int(node_id)].get("parents") or ()
-        ) if str(role) == "callee"
-    }
-    if len(callee_ids) != 1:
-        raise ValueError(
-            "source raise constructor has no unique callee value edge: "
-            f"raise={id(statement)}, callees={callee_ids!r}"
-        )
-    callee_id = next(iter(callee_ids))
-    definitions = set()
-    for row in book.page(STATIC_REFERENCE_USE).rows():
-        if (
-            (ingestion_scopes is not None and row[0] not in ingestion_scopes)
-            or int(row[1]) != occurrence
-            or (ingestion_scopes is None and int(row[2]) != callee_id)
-        ):
-            continue
-        use_cell = book.latest_ref(STATIC_REFERENCE_USE, row)
-        if use_cell is None:
-            continue
-        definitions.update(
-            source
-            for source, _stage in book.edges_into(use_cell)
-            if source.page == STATIC_SYMBOL_DEFINITION
-            and len(source.row) == 3 and not source.row[2]
-        )
-    if len(definitions) > 1:
-        raise ValueError(
-            "source raise constructor has multiple static identities: "
-            f"raise={id(statement)}, definitions={definitions!r}"
-        )
-    if not definitions:
-        return None
-    return definitions.pop()
-
-
-def validation_raise_identity(
-    graph: Any,
-    statement: ast.Raise,
-    node_for_expression: Callable[[ast.AST], int | None],
-) -> str | None:
-    """Render the class identity from the same static definition cell."""
-
-    cell = validation_raise_class_cell(
-        graph, statement, node_for_expression,
-    )
-    return None if cell is None else f"{cell.row[0]}.{cell.row[1]}"
 
 
 def validation_diagnostic_value_ids(
@@ -1356,33 +1235,16 @@ def _describe_control_block(
             for handler in block.handlers
             for value_id in handler.exception_type_value_ids
         )
-        sites = cells(block.protected_call_node_ids)
-        regions = tuple(
-            region_ref for region_index, _call_id in block.protected_region_calls
-            for region_ref in (region_cell(region_index),)
-            if region_ref is not None
-        )
         extra = tuple(
-            (
-                int(handler.source_handler_node_id),
-                tuple(handler.exception_type_identities),
-            )
+            int(handler.source_handler_node_id)
             for handler in block.handlers
-        ) + (
-            tuple(block.protected_marker_calls),
-            tuple(block.protected_region_calls),
         )
     elif isinstance(block, ValidationBlock):
-        owner = cell(
-            block.source_raise_node_id
-            if block.source_raise_node_id is not None
-            else block.predicate_value_id
-        )
-        predicate = cell(block.predicate_value_id)
+        owner = predicate = cell(block.predicate_value_id)
         diagnostics = cells(block.diagnostic_value_ids)
         extra = (
             int(block.error_code), bool(block.expect_true),
-            block.extraction_identity, block.source_raise_node_id,
+            block.extraction_identity,
         )
     elif isinstance(block, SequenceMutationBlock):
         # The step cell of a composition step, else the effect node's cell,

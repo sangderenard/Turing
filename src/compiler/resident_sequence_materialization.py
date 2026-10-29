@@ -1797,16 +1797,6 @@ def _identity_return_aliases(
             actual = actuals.get(f"arg:{parameters.index(name)}")
             if actual is None:
                 continue
-            # Program: root's loop calls fail_if_zero(i), which returns its
-            # formal on success. The old caller alias was call 3 -> loop
-            # input 0, but that input is defined by each loop iteration's
-            # control Phi, not as a function-wide SSA value 0. A global
-            # identity-return alias cannot stand for that changing value.
-            # Leave the call result as its own value for control SSA to bind.
-            if (
-                graph_obj.nodes.get(actual, {}).get("attributes") or {}
-            ).get("binding_kind") == "loop":
-                continue
             if len(sites[0]) == 1:
                 result[int(call_id)] = actual
             # A subscript of the call result selects a return SLOT only when

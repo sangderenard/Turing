@@ -77,7 +77,6 @@ from .control_source import (
     place_validations_after_region_producers,
     project_control_regions,
     validation_diagnostic_value_ids,
-    validation_raise_identity,
 )
 from .hierarchical_control import compose_hierarchical_control
 from .process_graph_value_ids import next_process_value_id
@@ -674,12 +673,6 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
     """
 
     graph = shell.process_graph.G
-    from .concordance_declarations import SOURCE_CONTROL_SPECIALIZATION
-    from .identity_concordance import current_identity_book
-
-    specialization_page = current_identity_book().page(
-        SOURCE_CONTROL_SPECIALIZATION
-    )
     expression_nodes = {
         id(data.get("expr_obj")): int(node_id)
         for node_id, data in graph.nodes(data=True)
@@ -802,6 +795,12 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             raise ValueError(
                 "terminal function raise has no exact source node"
             )
+        raised = direct_raise.exc
+        raised_name = (
+            raised.func.id
+            if isinstance(raised, ast.Call) and isinstance(raised.func, ast.Name)
+            else raised.id if isinstance(raised, ast.Name) else None
+        )
         blocks.append(ValidationBlock(
             int(raise_id),
             int(raise_id),
@@ -809,13 +808,12 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             predicate_expression=ControlExpression(
                 "const", value_id=int(raise_id), literal=False,
             ),
-            extraction_identity=validation_raise_identity(
-                graph, direct_raise, node_for_expression,
+            extraction_identity=(
+                f"builtins.{raised_name}" if raised_name else None
             ),
             diagnostic_value_ids=validation_diagnostic_value_ids(
                 direct_raise, node_for_expression,
             ),
-            source_raise_node_id=int(raise_id),
         ))
 
     # A guard nested inside a conditional arm of a retained loop's body is
@@ -843,32 +841,11 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
         if body_raise is not None and not statement.orelse:
             raised_statement = body_raise
             raises_when_true = True
-            raised_arm = "body"
         elif orelse_raise is not None and body_raise is None:
             raised_statement = orelse_raise
             raises_when_true = False
-            raised_arm = "orelse"
         else:
             continue
-        selection = specialization_page.latest((
-            str(graph.graph.get("function_name")), int(node_id),
-        ))
-        if selection is not None:
-            if (
-                selection.get("graph_control_id") != int(node_id)
-                or selection.get("proof") != "structural_constant_predicate"
-                or selection.get("rejected_role") not in {"body", "orelse"}
-            ):
-                raise ValueError(
-                    "guard validation has no exact specialized arm proof: "
-                    f"guard={node_id}, selection={selection!r}"
-                )
-            if selection["rejected_role"] == raised_arm:
-                # Program: tensor_octets_to_bytes's `octets.ndims() != 1`
-                # guard is proven false after the rank-1 boundary enters.
-                # Its Raise node is absent because this exact body arm was
-                # rejected; asking for that node is not a runtime guard.
-                continue
         test = statement.test
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
             test = test.operand
@@ -911,24 +888,23 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             ), predicate_id)
         elif predicate_expression is None:
             continue
-        raised_node_id = node_for_expression(raised_statement)
-        if raised_node_id is None:
-            raise ValueError(
-                "guard raise has no exact source graph node: "
-                f"guard={node_id}"
-            )
+        raised = raised_statement.exc
+        raised_name = (
+            raised.func.id
+            if isinstance(raised, ast.Call) and isinstance(raised.func, ast.Name)
+            else raised.id if isinstance(raised, ast.Name) else None
+        )
         blocks.append(ValidationBlock(
             predicate_id,
             int(node_id),
             expect_true=not raises_when_true,
             predicate_expression=predicate_expression,
-            extraction_identity=validation_raise_identity(
-                graph, raised_statement, node_for_expression,
+            extraction_identity=(
+                f"builtins.{raised_name}" if raised_name else None
             ),
             diagnostic_value_ids=validation_diagnostic_value_ids(
                 raised_statement, node_for_expression,
             ),
-            source_raise_node_id=int(raised_node_id),
         ))
     return tuple(blocks)
 
@@ -3091,7 +3067,6 @@ def _planned_scalar_dtypes_from_graph(
     from ..common.tensors.topological_reducer import (
         _int_range_scopes as _range_scopes,
         _int_range_cell as _range_cell,
-        _resolved_source_value_class,
     )
 
     range_scopes = _range_scopes(G)
@@ -3371,38 +3346,6 @@ def _planned_scalar_dtypes_from_graph(
             concatenation = concatenated_empty_display(node_id)
             if concatenation is not None and element.get(concatenation):
                 settle(element, node_id, element[concatenation])
-                continue
-            # Program: tensor_octets_to_bytes iterates
-            # `octets[:limit].tolist()`. The ProgramABI settles the
-            # tensor's rank-1 element dtype. A slice keeps that row type,
-            # and AbstractTensor.tolist exposes those rows as a list.
-            # Both steps require the reducer's exact source-value class;
-            # spelling `tolist` on an unrelated object proves nothing.
-            if (
-                op == "indexed"
-                and isinstance(expression, ast.Subscript)
-                and isinstance(expression.slice, ast.Slice)
-                and _resolved_source_value_class(G, node_id)[0]
-                == "src.common.tensors.abstraction.AbstractTensor"
-            ):
-                bases = parents(data, "base")
-                if len(bases) == 1:
-                    settle(element, node_id, element.get(bases[0]))
-                continue
-            if (
-                op == "tolist"
-                and isinstance(expression, ast.Call)
-                and isinstance(expression.func, ast.Attribute)
-                and expression.func.attr == "tolist"
-                and attributes.get("tensor_candidate") == "tolist"
-            ):
-                receivers = parents(data, "operand")
-                if (
-                    len(receivers) == 1
-                    and _resolved_source_value_class(G, receivers[0])[0]
-                    == "src.common.tensors.abstraction.AbstractTensor"
-                ):
-                    settle(element, node_id, element.get(receivers[0]))
                 continue
             # Program: ``k.mul(x) + k.scale`` with ``def mul(self, x: int) ->
             # int`` (corpus c426).  Wrong record: a method call is named by
@@ -12065,20 +12008,6 @@ def _retain_source_control_records(graph_obj: Any) -> None:
         }
     if records:
         graph_obj.graph["source_control_records"] = records
-    if any(
-        isinstance(record["expression"], ast.Try)
-        for record in records.values()
-    ) or any(
-        isinstance(data.get("expr_obj"), ast.Raise)
-        for _node_id, data in graph_obj.nodes(data=True)
-    ):
-        # Program: a protected call enters fail_if_zero(), whose callee has
-        # an authored Raise but no Try. The old trigger posted no transfer
-        # for that Raise, so SSA had no class definition for its native
-        # fault. Post the topology while the exact source nodes are live.
-        from .exception_topology import build_exception_topology
-
-        build_exception_topology(graph_obj)
 
 
 def _retain_source_sequence_mutation_records(
@@ -12565,24 +12494,9 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
                 "orelse": (expression.orelse,),
             }
         elif isinstance(expression, ast.Try):
-            # Program: two ``except`` arms of one Try each raise a different
-            # exception. Wrong record: both raises had the same ``handlers``
-            # membership, so control composition could not tell which
-            # handler owned either exceptional edge. The authored handler's
-            # exact graph node is the arm key; its index or source span is
-            # insufficient once source controls are cloned or specialized.
-            handler_arms = {}
-            for handler in expression.handlers:
-                handler_id = expression_nodes.get(id(handler))
-                if handler_id is None:
-                    raise ValueError(
-                        "source Try handler has no exact graph identity: "
-                        f"try={control_id}, handler={id(handler)}"
-                    )
-                handler_arms[f"handler:{int(handler_id)}"] = (handler,)
             branches = {
                 "body": tuple(expression.body),
-                **handler_arms,
+                "handlers": tuple(expression.handlers),
                 "orelse": tuple(expression.orelse),
                 "finalbody": tuple(expression.finalbody),
             }
@@ -26600,30 +26514,15 @@ def _tensor_descriptor_rule(
             # successive callsite specializations.  Requiring an explicit
             # shape silently lost scalar type/non-None facts at the first call
             # edge (dt_init -> ref_dt -> ref).
-            # The octet codec's validate() passes self.codes to
-            # _require_tensor(value), which returns that same Input. Its
-            # callsite descriptor says shape=(), rank=1, dynamic; copying
-            # only shape and dtype made the returned value rank 0 and sent
-            # call-result specialization around a repeated-state cycle.
-            # Keep the complete boundary descriptor as this value's one
-            # record; an empty shape does not erase a runtime span's rank.
-            tensor = dict(boundary)
-            tensor["shape"] = tuple(
-                int(extent) for extent in (boundary.get("shape") or ())
-            )
-            tensor["dtype"] = _recorded_dtype(
-                boundary.get("dtype"), "ProgramABI boundary",
-                data.get("value_id", node_id),
-            )
-            if tensor.get("rank") is None:
-                if str(boundary.get("storage") or "").casefold() != "scalar":
-                    raise ValueError(
-                        "ProgramABI span boundary has no declared rank: "
-                        f"value={data.get('value_id', node_id)}"
-                    )
-                tensor["rank"] = 0
-            else:
-                tensor["rank"] = int(tensor["rank"])
+            tensor = {
+                "shape": tuple(
+                    int(extent) for extent in (boundary.get("shape") or ())
+                ),
+                "dtype": _recorded_dtype(
+                    boundary.get("dtype"), "ProgramABI boundary",
+                    data.get("value_id", node_id),
+                ),
+            }
             # The declared Python type travels with the descriptor.  A
             # callee re-deriving the type from the dtype alone turned a
             # declared ``builtins.NoneType`` scalar into ``builtins.int``
@@ -26638,6 +26537,8 @@ def _tensor_descriptor_rule(
             # rank-1 descriptor and that scalar replaced each other every
             # specialization round.  Rule: the rank and metadata state that
             # the boundary states travel with the shape.
+            if boundary.get("rank") is not None:
+                tensor["rank"] = int(boundary["rank"])
             if boundary.get("metadata_state") is not None:
                 tensor["metadata_state"] = str(boundary["metadata_state"])
         if "shape" not in tensor:

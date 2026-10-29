@@ -14,8 +14,6 @@ from .control_source import (
     ControlUniform,
     LoopControlBlock,
     LoopBlock,
-    NativeExceptionHandler,
-    NativeTryBlock,
     ParallelDeployment,
     RecursionRegion,
     SequenceBlock,
@@ -601,25 +599,6 @@ def compose_hierarchical_control(
                     block.argument_bindings,
                     block.result_bindings,
                 )
-            if isinstance(block, NativeTryBlock):
-                return NativeTryBlock(
-                    body=rewrite(block.body),
-                    handlers=tuple(NativeExceptionHandler(
-                        body=rewrite(handler.body),
-                        source_handler_node_id=handler.source_handler_node_id,
-                        exception_type_value_ids=tuple(
-                            value(item) for item in handler.exception_type_value_ids
-                        ),
-                        exception_type_identities=handler.exception_type_identities,
-                    ) for handler in block.handlers),
-                    orelse=(
-                        None if block.orelse is None else rewrite(block.orelse)
-                    ),
-                    finalbody=rewrite(block.finalbody),
-                    source_try_node_id=block.source_try_node_id,
-                    protected_call_node_ids=block.protected_call_node_ids,
-                    protected_region_calls=block.protected_region_calls,
-                )
             if isinstance(block, ValidationBlock):
                 return ValidationBlock(
                     value(block.predicate_value_id),
@@ -628,7 +607,6 @@ def compose_hierarchical_control(
                     rewrite_expression(block.predicate_expression),
                     block.extraction_identity,
                     block.diagnostic_value_ids,
-                    block.source_raise_node_id,
                 )
             if isinstance(block, StreamPublishBlock):
                 publication = StreamPublishBlock(

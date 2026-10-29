@@ -5530,28 +5530,6 @@ def emit_ssa_module_to_c(
                                 f"        turing_heap_release({owner_cell});"
                             )
                         continue
-                    if callee == "turing_validation_error_take":
-                        if (
-                            instruction.args or instruction.res is None
-                            or instruction.res.dtype != "int64"
-                        ):
-                            shortfalls.append(CEmissionShortfall(
-                                op, "validation status take returns one int64 "
-                                "and takes no arguments",
-                            ))
-                            continue
-                        prototype = "uint32_t turing_validation_error_take(void);"
-                        if prototype not in prototypes:
-                            prototypes.append(prototype)
-                        needs_validation_runtime = True
-                        status_id = int(instruction.res.id)
-                        body.append(
-                            f"        const int64_t t{status_id} = "
-                            "(int64_t)turing_validation_error_take();"
-                        )
-                        expressions[status_id] = f"t{status_id}"
-                        integer_ids.add(status_id)
-                        continue
                     if callee == "turing_validation_error":
                         # Program: ``xs = [5, n, 2]; xs.pop()`` (scratch
                         # c150).  Wrong record: the sequence pop's empty
@@ -5561,13 +5539,13 @@ def emit_ssa_module_to_c(
                         # (``needs_validation_runtime``); execution takes
                         # the code after the run and raises on it.
                         error_code = instruction.attributes.get("error_code")
-                        if instruction.res is not None or not (
-                            (not instruction.args and isinstance(error_code, int))
-                            or (len(instruction.args) == 1 and error_code is None)
+                        if (
+                            instruction.args or instruction.res is not None
+                            or not isinstance(error_code, int)
                         ):
                             shortfalls.append(CEmissionShortfall(
                                 op, "validation error call takes one literal "
-                                "code or one SSA code and returns nothing",
+                                "error code and returns nothing",
                             ))
                             continue
                         prototype = (
@@ -5576,12 +5554,9 @@ def emit_ssa_module_to_c(
                         if prototype not in prototypes:
                             prototypes.append(prototype)
                         needs_validation_runtime = True
-                        code = (
-                            f"{int(error_code)}u" if not instruction.args
-                            else scalar_operand(instruction.args[0])
+                        body.append(
+                            f"        turing_validation_error({int(error_code)}u);"
                         )
-                        if code is not None:
-                            body.append(f"        turing_validation_error({code});")
                         continue
                     if target is None or callee not in reachable:
                         shortfalls.append(CEmissionShortfall(
@@ -6538,55 +6513,10 @@ def emit_ssa_module_to_c(
                     if _is_integer_dtype(instruction.res.dtype):
                         integer_ids.add(result_id)
                     cast_source = f"(({args[0]}) != 0)" if instruction.res.dtype == "bool" else args[0]
-                    if (
-                        instruction.attributes.get("extraction_identity")
-                        == "builtins.int"
-                        and str(instruction.args[0].dtype) in {
-                            "float32", "float64",
-                        }
-                        and str(instruction.res.dtype) == "int64"
-                    ):
-                        from .native_faults import (
-                            FLOAT_TO_INT_INFINITY, FLOAT_TO_INT_NAN,
-                            INT_OVERFLOW,
-                        )
-
-                        # Program: int(float('nan')) inside a protected
-                        # Try. A raw C float-to-int conversion is undefined
-                        # for NaN, infinity and out-of-range values. Record
-                        # Python's class before conversion; the enclosing
-                        # region status edge consumes it before any output
-                        # load, and a failed cast gets an inert result.
-                        prototype = (
-                            "void turing_validation_error(uint32_t error_code);"
-                        )
-                        if prototype not in prototypes:
-                            prototypes.append(prototype)
-                        needs_validation_runtime = True
-                        body.extend((
-                            f"        const double int_source_{result_id} = "
-                            f"(double)({args[0]});",
-                            f"        uint32_t int_fault_{result_id} = 0u;",
-                            f"        if (isnan(int_source_{result_id})) "
-                            f"int_fault_{result_id} = {FLOAT_TO_INT_NAN}u;",
-                            f"        else if (isinf(int_source_{result_id})) "
-                            f"int_fault_{result_id} = {FLOAT_TO_INT_INFINITY}u;",
-                            f"        else if (int_source_{result_id} < -0x1p63 "
-                            f"|| int_source_{result_id} >= 0x1p63) "
-                            f"int_fault_{result_id} = {INT_OVERFLOW}u;",
-                            f"        if (int_fault_{result_id} != 0u) "
-                            f"turing_validation_error(int_fault_{result_id});",
-                        ))
-                        declared = (
-                            f"const int64_t t{result_id} = "
-                            f"int_fault_{result_id} ? 0 : "
-                            f"(int64_t)int_source_{result_id};"
-                        )
-                    else:
-                        declared = (
-                            f"const {result_type} t{result_id} = "
-                            f"({result_type})({cast_source});"
-                        )
+                    declared = (
+                        f"const {result_type} t{result_id} = "
+                        f"({result_type})({cast_source});"
+                    )
                     narrowing = (
                         integer_narrowing_c_check(
                             instruction.args[0].dtype, instruction.res.dtype,

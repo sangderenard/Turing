@@ -57,8 +57,6 @@ from ...compiler.concordance_declarations import (
     SCALAR_PARAMETER as _SCALAR_PARAMETER,
     SCHEMA_NODE as _SCHEMA_NODE,
     SOURCE_CALL_RESULT_IDENTITY as _SOURCE_CALL_RESULT_IDENTITY,
-    SOURCE_EXCEPTION_SITE_STATE as _SOURCE_EXCEPTION_SITE_STATE,
-    ExceptionSiteStateFact as _ExceptionSiteStateFact,
     SOURCE_AGGREGATE_LAYOUT as _SOURCE_AGGREGATE_LAYOUT,
     SOURCE_GLYPH_SEQUENCE as _SOURCE_GLYPH_SEQUENCE,
     SOURCE_ENUM_GLYPH_TABLE as _SOURCE_ENUM_GLYPH_TABLE,
@@ -5145,16 +5143,6 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             isinstance(expression, ast.IfExp)
             and str(data.get("type") or "") == "IfExp"
         )
-        exception_phi = (
-            str(data.get("type") or data.get("op") or "").casefold() == "phi"
-            and any(
-                (data.get("attributes") or {}).get(key) is not None
-                for key in (
-                    "source_exception_finally_id",
-                    "source_exception_handler_id",
-                )
-            )
-        )
         loop_attributes = data.get("attributes") or {}
         if (
             isinstance(expression, ast.For)
@@ -5303,12 +5291,7 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
                         )
                         changed = True
             continue
-        if exception_phi:
-            roles = tuple(
-                f"entry:{index}"
-                for index, _parent in enumerate(data.get("parents") or ())
-            )
-        elif conditional_phi:
+        if conditional_phi:
             roles = ("body", "orelse")
         elif isinstance(expression, (ast.BinOp, ast.AugAssign, ast.Compare)):
             roles = ("lhs", "rhs")
@@ -5341,7 +5324,7 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             for cell in operand_cells
         )
         result_limbs = 1
-        if conditional_phi or exception_phi:
+        if conditional_phi:
             # The optional fingerprint's present and computed arms both
             # prove int, but their control-owned merge previously lost that
             # class. A merge inherits a scalar class only when EVERY exact
@@ -5361,11 +5344,7 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
         _concord_source_value_class(
             scope, value_id, result_class,
             precision_limbs=result_limbs,
-            source=(
-                "exceptional finalizer arm classes" if exception_phi
-                else "conditional scalar arm classes" if conditional_phi
-                else "builtin scalar operator result"
-            ),
+            source="conditional scalar arm classes" if conditional_phi else "builtin scalar operator result",
             provenance=_Derived(tuple(dict.fromkeys(
                 cell for cell in (node_cell, *operand_cells, *(
                     (node_identity_cell(graph, parents["test"]),) if conditional_phi else ()
@@ -6901,58 +6880,6 @@ def _normalize_lexical_values(
     )
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
-    # The ingestion SOURCE_EXCEPTION_SITE_STATE page owns the lexical values
-    # at each fallible source operation. The later transfer derives its
-    # canonical state from that page. In the codec, the second conversion
-    # sees the first conversion's binding while the first does not.
-    handler_entry_receipts: dict[int, dict[str, Any]] = {}
-    graph.G.graph["source_exception_handler_entries"] = (
-        handler_entry_receipts
-    )
-
-    def capture_exception_site(expression: ast.AST) -> None:
-        if id(expression) not in graph.G:
-            return
-        source_cell = node_identity_cell(graph, id(expression))
-        bindings = tuple(sorted(
-            (str(name), node_identity_cell(graph, int(value)))
-            for name, value in environment.items()
-            if isinstance(value, int) and not isinstance(value, bool)
-        ))
-        if source_cell is None or any(cell is None for _name, cell in bindings):
-            raise ValueError(
-                "exception site has no concordance identity for its "
-                f"lexical state: site={id(expression)}"
-            )
-        fact = _ExceptionSiteStateFact(source_cell, bindings)
-        book = current_identity_book()
-        row = (ingestion_read_scope, id(expression))
-        prior_fact = book.page(_SOURCE_EXCEPTION_SITE_STATE).latest(row)
-        if prior_fact is not None and prior_fact != fact:
-            raise ValueError(
-                "one source exception site has conflicting lexical states: "
-                f"node={id(expression)}, before={prior_fact!r}, after={fact!r}"
-            )
-        if prior_fact is None:
-            book.post(
-                _SOURCE_EXCEPTION_SITE_STATE, row, fact,
-                stage=_REDUCTION,
-                provenance=_Derived(tuple(dict.fromkeys((
-                    source_cell, *(cell for _name, cell in bindings),
-                )))),
-                mode=_Mode.CONCORD,
-            )
-
-    def exception_site_state(site_id: int) -> dict[str, int] | None:
-        fact = current_identity_book().page(
-            _SOURCE_EXCEPTION_SITE_STATE
-        ).latest((ingestion_read_scope, int(site_id)))
-        if fact is None:
-            return None
-        return {
-            str(name): int(cell.row[1])
-            for name, cell in fact.bindings
-        }
     deleted_names: set[str] = set()
     identity_bindings: dict[str, list[int]] = {}
     # Exact AST ownership of assignment sites, not a source-line containment
@@ -10055,7 +9982,6 @@ def _normalize_lexical_values(
     def resolve_expression(expression: ast.AST | None) -> int | None:
         result = resolve_expression_value(expression)
         if isinstance(expression, ast.Call):
-            capture_exception_site(expression)
             # IdentityBook.project_cells evaluates clock=projected.clock
             # before IdentityPage(..., book=projected) can touch the book.
             # Publish possible call stores only after resolving that call's
@@ -12981,27 +12907,6 @@ def _normalize_lexical_values(
                     base_class_cell.row, base_class_cell.column,
                 )
             )
-            if (
-                isinstance(expression.slice, ast.Slice)
-                and isinstance(base_class_fact, tuple)
-                and base_class_fact
-                and _canonical_source_class_identity(base_class_fact[0])
-                == "src.common.tensors.abstraction.AbstractTensor"
-            ):
-                # Program: tensor_octets_to_bytes reads
-                # `octets[:limit].tolist()`. The slice is still an
-                # AbstractTensor: __getitem__ wraps a native tensor slice
-                # in type(self). Without this exact class edge, the tolist
-                # call loses its receiver class before sequence typing.
-                _concord_source_value_class(
-                    value_class_scope, int(node_id), str(base_class_fact[0]),
-                    source="AbstractTensor slice",
-                    provenance=_Derived(tuple(dict.fromkeys(filter(None, (
-                        base_class_cell,
-                        node_identity_cell(graph, int(base_id)),
-                        node_identity_cell(graph, int(node_id)),
-                    ))))),
-                )
             row_data = (
                 graph.G.nodes[base_id]
                 if isinstance(base_id, int) and base_id in graph.G else {}
@@ -17378,156 +17283,11 @@ def _normalize_lexical_values(
             for nested in body_statement.body:
                 reduce_statement(nested)
             body_environment = dict(environment)
-            # Every call or raise in the protected suite can enter a handler
-            # at the lexical state captured immediately before that site's
-            # operation.  The codec's `int(value)` edge has `numeric` from
-            # `float(value)`, while the first conversion's edge does not.
-            # A handler can read a name without a Phi only when every
-            # candidate exceptional predecessor names the same value.
-            body_exception_sites = tuple(dict.fromkeys(
-                id(member)
-                for statement in body_statement.body
-                for member in ast.walk(statement)
-                if isinstance(member, (ast.Call, ast.Raise))
-                and exception_site_state(id(member)) is not None
-            ))
-            body_exception_states = tuple(
-                exception_site_state(site_id)
-                for site_id in body_exception_sites
-            )
-            if any(state is None for state in body_exception_states):
-                raise ValueError(
-                    "protected source operation has no concorded "
-                    f"entry state: try={id(body_statement)}"
-                )
-            body_ends_in_raise = bool(
-                body_statement.body
-                and isinstance(body_statement.body[-1], ast.Raise)
-            )
 
             handler_environments = []
             for handler in body_statement.handlers:
                 environment.clear()
-                # Program: root updates x, then raises ValueError inside a
-                # loop Try; its handler computes x + 2.  The old pre-Try
-                # snapshot made that handler read the pre-update x.  A
-                # terminal authored Raise transfers the current lexical
-                # bindings to its handler edge, and has no success edge.
-                environment.update(
-                    body_environment if body_ends_in_raise else before
-                )
-                selected_entry_bindings: dict[str, int] = {}
-                merged_entry_bindings: dict[str, int] = {}
-                if body_exception_states:
-                    entry_names = set().union(*(
-                        set(candidate) for candidate in body_exception_states
-                    ))
-                    handler_reads = set().union(*(
-                        _source_read_names(statement)
-                        for statement in handler.body
-                    )) if handler.body else set()
-                    if handler.name:
-                        handler_reads.discard(str(handler.name))
-                    for name in sorted(entry_names):
-                        incoming = {
-                            candidate.get(name)
-                            for candidate in body_exception_states
-                        }
-                        if len(incoming) == 1 and None not in incoming:
-                            selected_entry_bindings[name] = int(next(iter(incoming)))
-                            environment[name] = selected_entry_bindings[name]
-                        else:
-                            environment.pop(name, None)
-                            if name in handler_reads:
-                                if None in incoming:
-                                    raise ValueError(
-                                        "handler reads a name absent from an "
-                                        "exceptional predecessor: "
-                                        f"try={id(body_statement)}, "
-                                        f"handler={id(handler)}, name={name!r}, "
-                                        f"sites={body_exception_sites!r}"
-                                    )
-                                parents = tuple(
-                                    (int(candidate[name]), f"entry:{index}")
-                                    for index, candidate in enumerate(
-                                        body_exception_states
-                                    )
-                                )
-                                entry_phi = new_node(
-                                    "Phi", name,
-                                    attributes={
-                                        "source_exception_handler_id": id(handler),
-                                        "source_exception_handler_name": name,
-                                        "source_exception_handler_sites": (
-                                            body_exception_sites
-                                        ),
-                                    },
-                                    parents=parents,
-                                    source=handler,
-                                    source_cell=tuple(dict.fromkeys((
-                                        node_identity_cell(graph, id(handler)),
-                                        *(current_identity_book().latest_ref(
-                                            _SOURCE_EXCEPTION_SITE_STATE,
-                                            (ingestion_read_scope, site_id),
-                                        ) for site_id in body_exception_sites),
-                                        *(node_identity_cell(graph, value_id)
-                                          for value_id, _role in parents),
-                                    ))),
-                                )
-                                environment[name] = entry_phi
-                                merged_entry_bindings[name] = entry_phi
-                                identity_bindings.setdefault(name, []).append(
-                                    entry_phi
-                                )
-                handler_entry_receipts[id(handler)] = {
-                    "try_id": id(body_statement),
-                    "sites": body_exception_sites,
-                    "selected": tuple(sorted(selected_entry_bindings.items())),
-                    "merged": tuple(sorted(merged_entry_bindings.items())),
-                }
-                # Program: tensor_octets_to_bytes catches
-                # (TypeError, ValueError, OverflowError) and then raises a
-                # new ValueError.  Wrong record: the handler's exception
-                # declarations remained unbound Name nodes, so native
-                # control had no source identity for matching the raised
-                # class to this handler.  Resolve the authored type in the
-                # handler's lexical environment before reducing its body;
-                # each static reference use is posted to the concordance.
-                if handler.type is not None:
-                    declarations = (
-                        tuple(handler.type.elts)
-                        if isinstance(handler.type, ast.Tuple)
-                        else (handler.type,)
-                    )
-                    resolved_types = []
-                    for declaration in declarations:
-                        resolved = resolve_expression(declaration)
-                        if isinstance(resolved, _StaticPythonReference):
-                            resolved = static_reference_node(resolved)
-                        if isinstance(resolved, int) and resolved in graph.G:
-                            resolved_types.append(int(resolved))
-                    type_node_id = id(handler.type)
-                    if (
-                        isinstance(handler.type, ast.Tuple)
-                        and type_node_id in graph.G
-                        and len(resolved_types) == len(declarations)
-                    ):
-                        _replace_inputs(graph, type_node_id, tuple(
-                            (value_id, f"elt:{index}")
-                            for index, value_id in enumerate(resolved_types)
-                        ))
-                    elif (
-                        not isinstance(handler.type, ast.Tuple)
-                        and len(resolved_types) == 1
-                        and id(handler) in graph.G
-                    ):
-                        _replace_inputs(graph, id(handler), (
-                            *((int(parent), str(role))
-                              for parent, role in (
-                                  graph.G.nodes[id(handler)].get("parents") or ()
-                              ) if str(role) != "type"),
-                            (resolved_types[0], "type"),
-                        ))
+                environment.update(before)
                 if handler.name:
                     input_value(
                         handler.name,
@@ -17570,7 +17330,7 @@ def _normalize_lexical_values(
             # cannot turn values assigned by the successful body into
             # invented external inputs.
             environments = [
-                *(() if body_ends_in_raise else (successful_environment,)),
+                successful_environment,
                 *continuing_handler_environments,
             ]
             environment.clear()
@@ -17598,83 +17358,6 @@ def _normalize_lexical_values(
                         # resolution a Phi would, without inventing a second
                         # node or a synthetic "did-raise" boolean.
                         environment[name] = id(body_statement)
-            if body_statement.finalbody:
-                # Program: z = int(x) in a loop Try, whose handler raises,
-                # followed by finally: z = z + 1. The success arm binds z to
-                # the int Call, but that Call has no result on its failure
-                # edge. The exceptional transfer records the earlier z.
-                # A finalbody read needs a control-owned join of those exact
-                # values; reducing it under the success-only environment
-                # would give the error edge a non-dominating Call operand.
-                finalbody_reads = set().union(*(
-                    _source_read_names(final_statement)
-                    for final_statement in body_statement.finalbody
-                ))
-                finalbody_states = (
-                    [(("success", id(body_statement)), successful_environment)]
-                    if not body_ends_in_raise else []
-                )
-                finalbody_states.extend(
-                    (("handler", id(handler)), candidate)
-                    for handler, candidate in zip(
-                        body_statement.handlers, handler_environments,
-                    )
-                )
-                for exception_statement in (
-                    *body_statement.body,
-                    *(item for handler in body_statement.handlers
-                      for item in handler.body),
-                    *body_statement.orelse,
-                ):
-                    for member in ast.walk(exception_statement):
-                        site_state = exception_site_state(id(member))
-                        if site_state is not None:
-                            finalbody_states.append((
-                                ("exception", id(member)), dict(site_state),
-                            ))
-                for name in sorted(finalbody_reads):
-                    incoming = tuple(
-                        (edge, state.get(name))
-                        for edge, state in finalbody_states
-                    )
-                    values = {value for _edge, value in incoming}
-                    if values == {None}:
-                        # A name absent from every lexical state may be a
-                        # static exception class; the ordinary resolver owns
-                        # that identity when it reduces finalbody below.
-                        continue
-                    if None in values:
-                        raise ValueError(
-                            "finalbody reads a name missing from an entry: "
-                            f"try={id(body_statement)}, name={name!r}, "
-                            f"incoming={incoming!r}"
-                        )
-                    if len(values) == 1:
-                        environment[name] = int(next(iter(values)))
-                    elif values:
-                        parents = tuple(
-                            (int(value), f"entry:{index}")
-                            for index, (_edge, value) in enumerate(incoming)
-                        )
-                        entry_phi = new_node(
-                            "Phi", name,
-                            attributes={
-                                "source_exception_finally_id": id(body_statement),
-                                "source_exception_finally_name": name,
-                                "source_exception_finally_entries": tuple(
-                                    edge for edge, _value in incoming
-                                ),
-                            },
-                            parents=parents,
-                            source=body_statement,
-                            source_cell=tuple(dict.fromkeys((
-                                node_identity_cell(graph, id(body_statement)),
-                                *(node_identity_cell(graph, int(value))
-                                  for _edge, value in incoming),
-                            ))),
-                        )
-                        environment[name] = entry_phi
-                        identity_bindings.setdefault(name, []).append(entry_phi)
             for nested in body_statement.finalbody:
                 reduce_statement(nested)
             return id(body_statement)
@@ -18758,8 +18441,6 @@ def _normalize_lexical_values(
         for child in source_child_nodes(body_statement):
             if isinstance(child, ast.expr):
                 resolve_expression(child)
-        if isinstance(body_statement, ast.Raise):
-            capture_exception_site(body_statement)
         return id(body_statement) if id(body_statement) in graph.G else None
 
     def post_return_output_arms() -> None:
@@ -19220,69 +18901,6 @@ def _normalize_lexical_values(
     ordered_graph = ordered_memory_graph.G
     ordered_graph.graph.update(graph.G.graph)
     ordered_graph.graph["canonical_value_ids"] = True
-    # The authored exception occurrence keeps its AST identity, but its
-    # lexical values must cross the same canonical relabel as every operand.
-    # A live failure edge may not carry an ingestion id into canonical SSA.
-    canonical_exception_states = {}
-    site_page = current_identity_book().page(_SOURCE_EXCEPTION_SITE_STATE)
-    for site_row in site_page.scope_rows(ingestion_read_scope):
-        site_id = int(site_row[1])
-        site_fact = site_page.latest(site_row)
-        bindings = tuple(
-            (name, int(cell.row[1]))
-            for name, cell in site_fact.bindings
-        )
-        if int(site_id) not in mapping:
-            continue
-        missing = tuple(
-            (name, int(value_id)) for name, value_id in bindings
-            if int(value_id) not in mapping
-        )
-        if missing:
-            raise ValueError(
-                "live exception site has lexical values without canonical "
-                f"identities: site={site_id}, missing={missing!r}"
-            )
-        canonical_exception_states[int(mapping[int(site_id)])] = tuple(
-            (name, int(mapping[int(value_id)]))
-            for name, value_id in bindings
-        )
-    canonical_handler_entries = {}
-    for handler_id, receipt in (
-        graph.G.graph.get("source_exception_handler_entries") or {}
-    ).items():
-        if int(handler_id) not in mapping:
-            continue
-        source_ids = tuple(map(int, receipt["sites"]))
-        selected = tuple(receipt["selected"])
-        merged = tuple(receipt.get("merged", ()))
-        missing = tuple(
-            value_id for value_id in (
-                *source_ids,
-                *(int(value_id) for _name, value_id in selected),
-                *(int(value_id) for _name, value_id in merged),
-            ) if value_id not in mapping
-        )
-        if missing:
-            raise ValueError(
-                "live handler entry has identities without canonical "
-                f"values: handler={handler_id}, missing={missing!r}"
-            )
-        canonical_handler_entries[int(mapping[int(handler_id)])] = {
-            "try_id": int(mapping[int(receipt["try_id"])]),
-            "sites": tuple(int(mapping[value_id]) for value_id in source_ids),
-            "selected": tuple(
-                (name, int(mapping[int(value_id)]))
-                for name, value_id in selected
-            ),
-            "merged": tuple(
-                (name, int(mapping[int(value_id)]))
-                for name, value_id in merged
-            ),
-        }
-    ordered_graph.graph["source_exception_handler_entries"] = (
-        canonical_handler_entries
-    )
     # Renumbering changes the id space; a watermark from the AST-id
     # ingestion graph must not leak into canonical allocation.  Seed a new
     # watermark at the top of the canonical id space, though: planner passes
@@ -19306,41 +18924,6 @@ def _normalize_lexical_values(
             tuple(node_token_chains[node_id]),
             stage=_CANONICAL_RELABEL_STAGE,
             provenance=_Derived((node_identity_cell(graph, node_id),)),
-            mode=_Mode.CONCORD,
-        )
-    ingestion_id_for_canonical = {
-        int(canonical_id): int(raw_id)
-        for raw_id, canonical_id in mapping.items()
-    }
-    for site_id, bindings in canonical_exception_states.items():
-        source_cell = book.latest_ref(
-            _CANONICAL_VALUE, (read_scope, int(site_id)),
-        )
-        binding_cells = tuple(
-            (name, book.latest_ref(
-                _CANONICAL_VALUE, (read_scope, int(value_id)),
-            )) for name, value_id in bindings
-        )
-        if source_cell is None or any(
-            cell is None for _name, cell in binding_cells
-        ):
-            raise ValueError(
-                "canonical exception state lost a source or value cell: "
-                f"site={site_id}"
-            )
-        ingestion_site_id = ingestion_id_for_canonical[int(site_id)]
-        ingestion_cell = book.latest_ref(
-            _SOURCE_EXCEPTION_SITE_STATE,
-            (ingestion_read_scope, int(ingestion_site_id)),
-        )
-        book.post(
-            _SOURCE_EXCEPTION_SITE_STATE, (read_scope, int(site_id)),
-            _ExceptionSiteStateFact(source_cell, binding_cells),
-            stage=_CANONICAL_RELABEL_STAGE,
-            provenance=_Derived(tuple(dict.fromkeys((
-                ingestion_cell, source_cell,
-                *(cell for _name, cell in binding_cells),
-            )))),
             mode=_Mode.CONCORD,
         )
     canonical_page = book.page(_CANONICAL_VALUE)
@@ -20141,52 +19724,6 @@ def _normalize_lexical_values(
                 attributes["source_conditional_id"] = mapping[
                     source_conditional_id
                 ]
-        if "source_exception_finally_id" in attributes:
-            source_finally_id = int(attributes["source_exception_finally_id"])
-            if source_finally_id not in mapping:
-                raise ValueError(
-                    "finalbody Phi lost its exact source Try identity: "
-                    f"phi={node_id}, try={source_finally_id}"
-                )
-            attributes["source_exception_finally_id"] = int(
-                mapping[source_finally_id]
-            )
-            predecessors = tuple(attributes.get(
-                "source_exception_finally_entries", (),
-            ))
-            missing = tuple(
-                (kind, source_id) for kind, source_id in predecessors
-                if int(source_id) not in mapping
-            )
-            if missing:
-                raise ValueError(
-                    "finalbody Phi lost predecessor identities: "
-                    f"phi={node_id}, missing={missing!r}"
-                )
-            attributes["source_exception_finally_entries"] = tuple(
-                (str(kind), int(mapping[int(source_id)]))
-                for kind, source_id in predecessors
-            )
-        if "source_exception_handler_id" in attributes:
-            handler_id = int(attributes["source_exception_handler_id"])
-            site_ids = tuple(map(
-                int, attributes["source_exception_handler_sites"],
-            ))
-            missing = tuple(
-                source_id for source_id in (handler_id, *site_ids)
-                if source_id not in mapping
-            )
-            if missing:
-                raise ValueError(
-                    "handler Phi lost exact source identities: "
-                    f"phi={node_id}, missing={missing!r}"
-                )
-            attributes["source_exception_handler_id"] = int(
-                mapping[handler_id]
-            )
-            attributes["source_exception_handler_sites"] = tuple(
-                int(mapping[source_id]) for source_id in site_ids
-            )
         if "initial_value_id" in attributes:
             initial_value_id = attributes["initial_value_id"]
             if initial_value_id in mapping:

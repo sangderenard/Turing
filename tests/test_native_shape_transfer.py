@@ -8,7 +8,6 @@ import subprocess
 import sys
 
 import numpy as np
-import pytest
 
 from src.compiler.native_compiler_accelerators import (
     BROADCAST_SHAPES, CompilerAcceleratorRegistry, _python_broadcast_shapes,
@@ -123,77 +122,3 @@ def test_descriptor_keeps_unknown_guard_and_original_shape_publication(monkeypat
                 assert proven_shape_of(shape_scope_of(graph), 3) == (2, 3)
         finally:
             end_identity_book(token)
-
-
-def test_callsite_input_keeps_runtime_span_rank_in_concordance():
-    """The codec's `_require_tensor(value)` returns its rank-one Input."""
-    from src.compiler.glsl_deployment_strategy import _tensor_descriptor
-    from src.compiler.identity_concordance import (
-        begin_identity_book, end_identity_book,
-    )
-    from src.transmogrifier.graph.graph_express2 import ProcessGraph
-
-    descriptor = {
-        "shape": (), "dtype": "unknown", "rank": 1,
-        "metadata_state": "dynamic",
-    }
-    graph = ProcessGraph(materialize_memory=False)
-    graph.G.graph["function_name"] = "_require_tensor"
-    graph.G.graph["planner_tensor_descriptors"] = {"value": descriptor}
-    graph.G.add_node(
-        1, type="Input", op="Input", value_id=1, tensor=dict(descriptor),
-        attributes={"binding_name": "value", "binding_kind": "parameter"},
-        parents=[],
-    )
-    _book, token = begin_identity_book()
-    try:
-        assert _tensor_descriptor(graph, 1) == descriptor
-    finally:
-        end_identity_book(token)
-
-
-def test_octet_codec_callsite_shapes_reach_a_fixed_point(monkeypatch):
-    """The real codec closure must settle before native region planning."""
-    import contextlib
-    import os
-
-    from src.compiler import glsl_deployment_strategy as strategy
-    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
-
-    class ReachedFixedPoint(Exception):
-        pass
-
-    original = strategy._propagate_callsite_tensor_specializations
-    rounds = []
-
-    def observed(graph, **kwargs):
-        progress = kwargs.get("_progress")
-
-        def receipt(facts):
-            if facts.get("specialization_state") == "round-end":
-                rounds.append((facts["round"], facts["changed"]))
-            if progress is not None:
-                progress(facts)
-
-        kwargs["_progress"] = receipt
-        original(graph, **kwargs)
-        raise ReachedFixedPoint
-
-    monkeypatch.setattr(strategy, "_propagate_callsite_tensor_specializations", observed)
-    source = (
-        "from src.common.tensors.compression.octet_codec "
-        "import compress_octets, decompress_octets\n"
-        "def root(data: bytes):\n"
-        "    return decompress_octets(compress_octets(data))\n"
-    )
-    with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet):
-        with pytest.raises(ReachedFixedPoint):
-            lower_ast_source_to_ssa(
-                source, "root", name="codec_rank_fixed_point",
-                extraction_contract=(
-                    Path(__file__).resolve().parents[1]
-                    / "extraction_contracts/program_extraction.yaml"
-                ),
-                progress=lambda _message: None, progress_bars=False,
-            )
-    assert rounds and rounds[-1][1] is False, rounds

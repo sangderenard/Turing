@@ -1140,138 +1140,6 @@ SOURCE_CONTROL_SPECIALIZATION = declare_page(
         RowField("function", K.NAME), RowField("control", K.VALUE_ID),
     ), dict,                           # dict | Unresolved(PREDICATE_NOT_KNOWN)
 )
-
-# An exceptional transfer belongs to its exact source node and lexical read
-# scope.  Its fact carries the eligible catch scope and every finally scope
-# crossed on the way there; it is not inferred from line numbers or names.
-EXCEPTION_TOPOLOGY = declare_stage("exception_topology")
-
-
-@dataclass(frozen=True)
-class ExceptionSiteStateFact:
-    source: Ref
-    bindings: tuple[tuple[str, Ref], ...]
-
-
-SOURCE_EXCEPTION_SITE_STATE = declare_page(
-    "source_exception_site_state", (
-        RowField("ingestion_scope", K.SCOPE),
-        RowField("source_node", K.VALUE_ID),
-    ), ExceptionSiteStateFact,
-)
-
-
-@dataclass(frozen=True)
-class ExceptionTransferFact:
-    source: Ref
-    source_kind: str
-    catch_try: Ref | None
-    scopes: tuple[tuple[Ref, str, Ref | None, bool], ...]
-    unwind_finally: tuple[Ref, ...]
-    # A Raise constructor's exact STATIC_SYMBOL_DEFINITION cell. A protected
-    # Call has no fixed raised class and keeps this None.
-    raised_class_definition: Ref | None
-    # The exact lexical values live before this source operation completes.
-    # A handler entry selects only the exceptional predecessors reaching it.
-    entry_bindings: tuple[tuple[str, Ref], ...]
-
-
-SOURCE_EXCEPTION_TRANSFER = declare_page(
-    "source_exception_transfer", (
-        RowField("source_scope", K.SCOPE),
-        RowField("source_node", K.VALUE_ID),
-    ), ExceptionTransferFact,
-)
-
-
-@dataclass(frozen=True)
-class ExceptionHandlerEntryFact:
-    owner: Ref
-    handler: Ref
-    incoming_transfers: tuple[Ref, ...]
-    unanimous_bindings: tuple[tuple[str, Ref], ...]
-    merged_bindings: tuple[tuple[str, Ref], ...] = ()
-
-
-SOURCE_EXCEPTION_HANDLER_ENTRY = declare_page(
-    "source_exception_handler_entry", (
-        RowField("source_scope", K.SCOPE),
-        RowField("handler_node", K.VALUE_ID),
-    ), ExceptionHandlerEntryFact,
-)
-
-
-@dataclass(frozen=True)
-class ExceptionHandlerPhiFact:
-    owner: Ref
-    handler: Ref
-    phi: Ref
-    name: str
-    entries: tuple[tuple[Ref, Ref], ...]
-
-
-SOURCE_EXCEPTION_HANDLER_PHI = declare_page(
-    "source_exception_handler_phi", (
-        RowField("source_scope", K.SCOPE),
-        RowField("phi_node", K.VALUE_ID),
-    ), ExceptionHandlerPhiFact,
-)
-
-
-@dataclass(frozen=True)
-class ExceptionFinalizerPhiFact:
-    owner: Ref
-    phi: Ref
-    name: str
-    # In graph operand order: source edge kind, exact source control or
-    # transfer cell, and the canonical value entering from that edge.
-    entries: tuple[tuple[str, Ref, Ref], ...]
-
-
-SOURCE_EXCEPTION_FINALIZER_PHI = declare_page(
-    "source_exception_finalizer_phi", (
-        RowField("source_scope", K.SCOPE),
-        RowField("phi_node", K.VALUE_ID),
-    ), ExceptionFinalizerPhiFact,
-)
-# Native validation status to Python-semantic exception class. The fact is
-# the static definition cell of that class; native-width limitations have
-# no row and therefore cannot enter an authored handler.
-NATIVE_STATUS_CLASS = declare_page(
-    "native_status_class", (
-        RowField("status", K.INDEX),
-    ), object,
-)
-
-
-def concorded_native_status_classes(book: object) -> dict[int, str]:
-    """Read native exception classes from their static definition cells."""
-
-    from .identity_concordance import Derived, Mode
-    from .native_faults import NATIVE_STATUS_CLASS_IDENTITIES
-
-    ensure_builtin_class_topology(book)
-    page = book.page(NATIVE_STATUS_CLASS)
-    for code, identity in sorted(NATIVE_STATUS_CLASS_IDENTITIES.items()):
-        module, name = identity.rsplit(".", 1)
-        class_cell = book.latest_ref(
-            STATIC_SYMBOL_DEFINITION, (module, name, ""),
-        )
-        if class_cell is None:
-            raise ValueError(
-                f"native status {code} has no concorded class {identity}"
-            )
-        if page.latest((int(code),)) is None:
-            book.post(
-                NATIVE_STATUS_CLASS, (int(code),), class_cell,
-                stage=CONTROL_SSA_REGION, provenance=Derived((class_cell,)),
-                mode=Mode.CONCORD,
-            )
-    return {
-        int(row[0]): ".".join(page.latest(row).row[:2])
-        for row in page.rows()
-        if page.latest(row) is not None
-    }
 STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
     "structural_specialization_fixed_point", (
         RowField("invocation", K.SCOPE), RowField("round", K.INDEX),
@@ -1416,8 +1284,6 @@ CONTROL_PREDICATE = declare_transform("control_predicate", 1)
 CONTROL_EXPRESSION = declare_transform("control_expression", 1)
 CONTROL_CAST = declare_transform("control_cast", 1)
 PHI_CONDITIONAL = declare_transform("phi_conditional", 1)
-PHI_EXCEPTION_FINALIZER = declare_transform("phi_exception_finalizer", 1)
-PHI_EXCEPTION_HANDLER = declare_transform("phi_exception_handler", 1)
 PHI_LOOP_HEADER = declare_transform("phi_loop_header", 1)
 PHI_LOOP_EXIT = declare_transform("phi_loop_exit", 1)
 PHI_RETURN_MERGE = declare_transform("phi_return_merge", 1)
@@ -1597,8 +1463,6 @@ class BindingKind(Enum):
     SEQUENCE_RESULT = "sequence_result"
     RESTORED = "restored"
     CONDITIONAL_MERGE = "conditional_merge"
-    EXCEPTION_FINALIZER_MERGE = "exception_finalizer_merge"
-    EXCEPTION_HANDLER_MERGE = "exception_handler_merge"
     LOOP_RESULT_PORT = "loop_result_port"
     LOOP_SEED = "loop_seed"
     LOOP_HEADER = "loop_header"
@@ -3119,13 +2983,6 @@ class SSABlockKind(Enum):
     RESOURCE_EXIT_NEXT = "resource_exit_next"
     VALIDATION_PASS = "validation_pass"
     VALIDATION_FAIL = "validation_fail"
-    VALIDATION_FAULT_EXIT = "validation_fault_exit"
-    NATIVE_TRY_HANDLER = "native_try_handler"
-    NATIVE_TRY_EXIT = "native_try_exit"
-    NATIVE_TRY_CALL_SUCCESS = "native_try_call_success"
-    NATIVE_TRY_CALL_FAILURE = "native_try_call_failure"
-    NATIVE_TRY_EXCEPTION_FINALLY = "native_try_exception_finally"
-    UNREACHABLE_RAISE = "unreachable_raise"
     STATE_CASE = "state_case"
     STATE_NEXT = "state_next"
     STATE_MERGE = "state_merge"
@@ -4609,23 +4466,11 @@ def ensure_builtin_class_topology(book: object) -> None:
         (builtins.str, builtins.object),
         (builtins.tuple, builtins.object),
     )
-    # Exception dispatch reads CLASS_SUBTYPE just like ordinary class
-    # settlement.  Ingest the builtin exception declarations and their
-    # declared direct bases here, once, so a native handler never decides
-    # catchability by reflecting on the compiler host during SSA lowering.
-    exception_declarations = tuple(sorted((
-        (candidate, base)
-        for candidate in vars(builtins).values()
-        if isinstance(candidate, type)
-        and candidate.__module__ == "builtins"
-        and issubclass(candidate, BaseException)
-        for base in candidate.__bases__
-    ), key=lambda pair: (pair[0].__name__, pair[1].__name__)))
     page = book.page(CLASS_SUBTYPE)
-    for derived, base in (*declarations, *exception_declarations):
+    for derived, base in declarations:
         row = (
-            f"{derived.__module__}.{derived.__qualname__}",
-            f"{base.__module__}.{base.__qualname__}",
+            canonical_python_type_identity(derived.__name__),
+            canonical_python_type_identity(base.__name__),
         )
         if page.latest(row) is None:
             book.post(

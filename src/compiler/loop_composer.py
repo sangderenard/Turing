@@ -29,8 +29,6 @@ from .control_source import (
     ControlUniform,
     LoopControlBlock,
     LoopBlock,
-    NativeExceptionHandler,
-    NativeTryBlock,
     RecursionRegion,
     SequenceBlock,
     StatementBlock,
@@ -38,7 +36,6 @@ from .control_source import (
     ValidationBlock,
     WhileBlock,
     validation_diagnostic_value_ids,
-    validation_raise_identity,
 )
 from .loop_ir import (
     ConditionDomain,
@@ -5736,27 +5733,6 @@ def analyze_shader_loop_reductions(
             validated_raise_signatures.update(
                 expression_signature(item) for item in raise_items
             )
-        # A direct, unconditional raise is an exit of this loop body, just
-        # as a direct guard whose raising arm is selected is an exit.  The
-        # source statement owns the position; a raise inside a Try handler
-        # does not belong to this rule because its handler owns execution.
-        # The codec's handler raise must therefore retain its Try owner.
-        if isinstance(loop_syntax, (ast.For, ast.While)):
-            for statement in loop_syntax.body:
-                if not isinstance(statement, ast.Raise):
-                    continue
-                raise_node_id = node_for_expression(statement)
-                if raise_node_id is None:
-                    continue
-                validations.append((
-                    int(raise_node_id), int(raise_node_id), True,
-                    validation_diagnostic_value_ids(
-                        statement, node_for_expression,
-                    ),
-                ))
-                validated_raise_signatures.add(
-                    expression_signature(statement)
-                )
         def earliest_member(index: int) -> int:
             return min(
                 lexical_position[node_id]
@@ -6453,7 +6429,7 @@ def analyze_shader_loop_reductions(
         # as region-less and dropped with its authored return; the function
         # always fell through (silent 0 for 70 in a dict-of-lists ``.get``
         # read).  Rule: a source ``return`` edge is loop work too.
-        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings and not loop.return_controls and not validations:
+        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings and not loop.return_controls:
             blockers.append("no-shader-region")
         if (
             loop.source_type == "While"
@@ -6480,7 +6456,6 @@ def analyze_shader_loop_reductions(
             and loop.iterable_constant is None
         ):
             blockers.append("unresolved-loop-bound")
-        pending_raise_ids = set()
         for node_id in loop.body_nodes:
             if node_id not in graph.G:
                 continue
@@ -6491,11 +6466,9 @@ def analyze_shader_loop_reductions(
                 in validated_raise_signatures
             ):
                 continue
-            if isinstance(expression, ast.Raise):
-                pending_raise_ids.add(int(node_id))
-                continue
             if isinstance(expression, forbidden):
                 blockers.append(type(expression).__name__)
+        blockers = list(dict.fromkeys(blockers))
 
         # ``identity_table`` groups every value ever correlated with a source
         # name.  That class is scope-free: for one carried name it holds the
@@ -6715,28 +6688,21 @@ def analyze_shader_loop_reductions(
             node_id, predicate_value_id, expect_true, diagnostic_value_ids,
         ):
             expression = graph.G.nodes[node_id].get("expr_obj")
-            predicate_expression = (
-                ControlExpression(
-                    "const", value_id=int(node_id), literal=False,
-                )
-                if int(node_id) == int(predicate_value_id)
-                and isinstance(expression, ast.Raise)
-                else structured_control_expression(predicate_value_id)
-            )
             return ValidationBlock(
                 predicate_value_id,
                 error_code=node_id,
                 expect_true=expect_true,
-                predicate_expression=predicate_expression,
+                predicate_expression=structured_control_expression(
+                    predicate_value_id
+                ),
                 extraction_identity=(
-                    validation_raise_identity(
-                        graph.G, expression, node_for_expression,
-                    ) if isinstance(expression, ast.Raise) else None
+                    f"builtins.{expression.exc.func.id}"
+                    if isinstance(expression, ast.Raise)
+                    and isinstance(expression.exc, ast.Call)
+                    and isinstance(expression.exc.func, ast.Name)
+                    else None
                 ),
                 diagnostic_value_ids=diagnostic_value_ids,
-                source_raise_node_id=(
-                    int(node_id) if isinstance(expression, ast.Raise) else None
-                ),
             )
 
         # Program: ``for i in range(n): if i == 6: if i > 20 or not allow:
@@ -6756,10 +6722,27 @@ def analyze_shader_loop_reductions(
                 handed[int(item[0])] = validation_block(*item)
             graph.G.graph["arm_nested_loop_validations"] = handed
         body_items.extend(
-            (lexical_position[node_id], validation_block(
-                node_id, predicate_value_id, expect_true,
-                diagnostic_value_ids,
-            ))
+            (
+                lexical_position[node_id],
+                ValidationBlock(
+                    predicate_value_id,
+                    error_code=node_id,
+                    expect_true=expect_true,
+                    predicate_expression=structured_control_expression(
+                        predicate_value_id
+                    ),
+                    extraction_identity=(
+                        f"builtins.{expression.exc.func.id}"
+                        if isinstance((expression := graph.G.nodes[node_id].get(
+                            "expr_obj"
+                        )), ast.Raise)
+                        and isinstance(expression.exc, ast.Call)
+                        and isinstance(expression.exc.func, ast.Name)
+                        else None
+                    ),
+                    diagnostic_value_ids=diagnostic_value_ids,
+                ),
+            )
             for (
                 node_id, predicate_value_id, expect_true,
                 diagnostic_value_ids,
@@ -6793,273 +6776,6 @@ def analyze_shader_loop_reductions(
                     predicate_value_id=predicate,
                 ),
             ))
-        # Program: tensor_octets_to_bytes has two protected conversions in
-        # its loop and a handler that raises a new ValueError. Wrong record:
-        # the conversions stayed in the flat loop schedule while the handler
-        # Raise was a forbidden orphan; the authored Try never became a
-        # control owner. Move only work whose source AST belongs to one exact
-        # Try arm. A region crossing arm boundaries is refused, never split
-        # or guessed from its line number.
-        try_syntax = tuple(
-            statement for statement in getattr(loop_syntax, "body", ())
-            if isinstance(statement, ast.Try)
-        )
-        try_owned_raise_ids: set[int] = set()
-        for try_statement in try_syntax:
-            try_id = expression_nodes.get(id(try_statement))
-            if try_id is None or try_id not in graph.G:
-                blockers.append("try-without-exact-source-node")
-                continue
-            # The reducer and exception-transfer page now record the exact
-            # entry state of each protected Call or Raise.  A handler that
-            # continues still needs a success/exception value join unless
-            # the protected body ends in Raise; a handler ending in Raise
-            # cannot contribute a value to that join.  Other joins and
-            # nested control remain explicit blockers until SSA owns them.
-            # Program: root's loop Try converts x, its handler raises
-            # TypeError, and its else increments y. The old gate rejected
-            # the else even though the control builder already lowers it
-            # only from the protected body's success edge. Keep that arm
-            # source-owned and let the existing native Try lower it.
-            if (
-                not try_statement.body
-                or not (
-                    isinstance(try_statement.body[-1], ast.Raise)
-                    or (
-                        try_statement.handlers
-                        and all(
-                            handler.body
-                            and isinstance(handler.body[-1], ast.Raise)
-                            for handler in try_statement.handlers
-                        )
-                    )
-                )
-                or any(
-                    isinstance(member, (
-                        ast.Return, ast.If, ast.For, ast.While,
-                        ast.Try, ast.TryStar,
-                    ))
-                    for statement in (
-                        *try_statement.body[:-1],
-                        *(item for handler in try_statement.handlers
-                          for item in handler.body),
-                    )
-                    for member in ast.walk(statement)
-                )
-                or any(
-                    isinstance(member, (
-                        ast.Return, ast.Break, ast.Continue, ast.If,
-                        ast.For, ast.While, ast.Try, ast.TryStar,
-                        ast.Yield, ast.YieldFrom, ast.Await,
-                    ))
-                    for final_statement in try_statement.finalbody
-                    for member in ast.walk(final_statement)
-                )
-            ):
-                blockers.append("try-exception-entry-state-not-composed")
-                continue
-            if any(
-                isinstance(member, (ast.Try, ast.TryStar))
-                for statement in (
-                    *try_statement.body,
-                    *(item for handler in try_statement.handlers
-                      for item in handler.body),
-                    *try_statement.orelse,
-                    *try_statement.finalbody,
-                )
-                for member in ast.walk(statement)
-            ):
-                blockers.append("nested-try-control-not-composed")
-                continue
-            from .exception_topology import resolved_handler_declarations
-
-            arm_members: dict[int, tuple[str, int]] = {}
-            for arm, index, statements in (
-                ("body", 0, try_statement.body),
-                *(("handler", index, handler.body)
-                  for index, handler in enumerate(try_statement.handlers)),
-                ("orelse", 0, try_statement.orelse),
-                ("finalbody", 0, try_statement.finalbody),
-            ):
-                for statement in statements:
-                    for member in ast.walk(statement):
-                        # Load/Store and operator tokens are shared AST
-                        # singletons, not authored occurrences in this arm.
-                        if getattr(member, "lineno", None) is None:
-                            continue
-                        previous = arm_members.setdefault(id(member), (arm, index))
-                        if previous != (arm, index):
-                            raise ValueError(
-                                "source Try expression belongs to two arms: "
-                                f"try={try_id}, occurrence={id(member)}"
-                            )
-
-            def item_source_nodes(item: object) -> tuple[int, ...]:
-                if isinstance(item, StatementBlock) and len(item.lines) == 1:
-                    line = item.lines[0]
-                    if line.startswith("__scheduled_region_") and line.endswith("__"):
-                        index = int(line[len("__scheduled_region_"):-2])
-                        return tuple(map(int, regions[index]))
-                if isinstance(item, ValidationBlock):
-                    return (int(item.error_code),)
-                if isinstance(item, LoopControlBlock) and item.site_node_id is not None:
-                    return (int(item.site_node_id),)
-                if isinstance(item, StreamPublishBlock):
-                    return (int(item.value_id),)
-                return ()
-
-            owned: dict[tuple[str, int], list[tuple[int, object]]] = {}
-            remaining: list[tuple[int, object]] = []
-            invalid = False
-            for position, item in body_items:
-                sources = item_source_nodes(item)
-                arm_keys = {
-                    arm_members[id(expression)]
-                    for source_id in sources
-                    if source_id in graph.G
-                    for expression in (graph.G.nodes[source_id].get("expr_obj"),)
-                    if isinstance(expression, ast.AST)
-                    and id(expression) in arm_members
-                }
-                outside = any(
-                    source_id in graph.G
-                    and isinstance(graph.G.nodes[source_id].get("expr_obj"), ast.AST)
-                    and id(graph.G.nodes[source_id]["expr_obj"]) not in arm_members
-                    for source_id in sources
-                )
-                if len(arm_keys) > 1 or (arm_keys and outside):
-                    blockers.append("try-region-crosses-source-arms")
-                    invalid = True
-                    break
-                if arm_keys:
-                    owned.setdefault(next(iter(arm_keys)), []).append((position, item))
-                else:
-                    remaining.append((position, item))
-            if invalid:
-                continue
-
-            transfers = graph.G.graph.get("source_exception_transfers") or {}
-            for arm, index, statements in (
-                ("body", 0, try_statement.body),
-                *(("handler", index, handler.body)
-                  for index, handler in enumerate(try_statement.handlers)),
-                ("orelse", 0, try_statement.orelse),
-                ("finalbody", 0, try_statement.finalbody),
-            ):
-                for statement in statements:
-                    if not isinstance(statement, ast.Raise):
-                        continue
-                    raise_id = expression_nodes.get(id(statement))
-                    transfer = transfers.get(raise_id)
-                    if (
-                        raise_id is None or transfer is None
-                        or not transfer.scopes
-                        or transfer.scopes[-1].try_node_id != int(try_id)
-                        or transfer.scopes[-1].arm != arm
-                        or (arm == "handler" and
-                            transfer.scopes[-1].handler_node_id !=
-                            expression_nodes.get(id(try_statement.handlers[index])))
-                    ):
-                        blockers.append("try-raise-without-exact-transfer")
-                        invalid = True
-                        continue
-                    owned.setdefault((arm, index), []).append((
-                        lexical_position[int(raise_id)],
-                        validation_block(
-                            int(raise_id), int(raise_id), True,
-                            validation_diagnostic_value_ids(
-                                statement, node_for_expression,
-                            ),
-                        ),
-                    ))
-                    try_owned_raise_ids.add(int(raise_id))
-            if invalid:
-                continue
-
-            handlers = []
-            for index, handler in enumerate(try_statement.handlers):
-                handler_id = expression_nodes.get(id(handler))
-                if handler_id is None:
-                    blockers.append("try-handler-without-exact-source-node")
-                    invalid = True
-                    break
-                declarations = resolved_handler_declarations(graph, int(handler_id))
-                handlers.append(NativeExceptionHandler(
-                    body=SequenceBlock(tuple(
-                        item for _position, item in sorted(
-                            owned.get(("handler", index), ()),
-                            key=lambda pair: pair[0],
-                        )
-                    )),
-                    source_handler_node_id=int(handler_id),
-                    exception_type_value_ids=tuple(
-                        value_id for value_id, _identity in declarations
-                    ),
-                    exception_type_identities=tuple(
-                        identity for _value_id, identity in declarations
-                    ),
-                ))
-            if invalid:
-                continue
-            arm_sequence = lambda arm: SequenceBlock(tuple(
-                item for _position, item in sorted(
-                    owned.get((arm, 0), ()), key=lambda pair: pair[0],
-                )
-            ))
-            protected_calls = tuple(dict.fromkeys(
-                int(source_id)
-                for _position, item in owned.get(("body", 0), ())
-                for source_id in item_source_nodes(item)
-                if source_id in graph.G
-                and isinstance(
-                    graph.G.nodes[source_id].get("expr_obj"), ast.Call,
-                )
-                and source_id in transfers
-                and transfers[source_id].catch_try_node_id == int(try_id)
-            ))
-            protected_regions = []
-            for _position, item in owned.get(("body", 0), ()):
-                if not isinstance(item, StatementBlock) or len(item.lines) != 1:
-                    continue
-                marker = item.lines[0]
-                if not (
-                    marker.startswith("__scheduled_region_")
-                    and marker.endswith("__")
-                ):
-                    continue
-                region_index = int(marker[len("__scheduled_region_"):-2])
-                protected_regions.extend(
-                    (int(region_index), int(source_id))
-                    for source_id in item_source_nodes(item)
-                    if int(source_id) in protected_calls
-                )
-            if (
-                set(source_id for _region, source_id in protected_regions)
-                != set(protected_calls)
-                or len(protected_regions) != len(set(protected_regions))
-                or len({source_id for _region, source_id in protected_regions})
-                != len(protected_regions)
-            ):
-                blockers.append("try-protected-call-has-no-unique-region")
-                continue
-            try_block = NativeTryBlock(
-                body=arm_sequence("body"),
-                handlers=tuple(handlers),
-                orelse=(arm_sequence("orelse") if try_statement.orelse else None),
-                finalbody=arm_sequence("finalbody"),
-                source_try_node_id=int(try_id),
-                protected_call_node_ids=protected_calls,
-                protected_region_calls=tuple(protected_regions),
-            )
-            body_items = [
-                *remaining,
-                (lexical_position[int(try_id)], try_block),
-            ]
-
-        pending_raise_ids.difference_update(try_owned_raise_ids)
-        if pending_raise_ids:
-            blockers.append("Raise")
-        blockers = list(dict.fromkeys(blockers))
         scheduled_body = SequenceBlock(tuple(
             block for _position, block in sorted(
                 body_items, key=lambda item: item[0]

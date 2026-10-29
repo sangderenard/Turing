@@ -1,4 +1,7 @@
-"""A loop must retain its authored raise as a native exit.
+"""A loop with real blockers must refuse to compile rather than silently
+running its body once with no iteration -- and a raise shaped as an
+ordinary guard clause must compile for real instead of being one of
+those blockers.
 
 Regression pin for the fix in ``glsl_deployment_strategy.py``'s
 ``prepare_graph_precompile``: a blocked loop (``control_program is None``)
@@ -6,8 +9,9 @@ used to be silently excluded from the composed schedule while its BODY
 REGIONS remained in it, unwrapped by any loop construct -- the compiler
 reported ``complete: True``, no shortfall, and ran the loop body exactly
 once regardless of the requested iteration count (HANDOFF_SHOAL_AND_RE_TARGETS.md
-section 6i). A direct bare raise now has a native validation and a fault
-exit, so it no longer needs the blocked-loop refusal.
+section 6i). ``test_a_bare_raise_inside_a_loop_still_refuses`` pins that a
+raise shape nothing recognizes still hits this refusal instead of silently
+mis-compiling.
 
 ``test_a_guard_clause_raise_inside_a_loop_compiles_and_validates`` pins the
 follow-up fix (section 6l): `if cond: body else: raise` is a guard clause,
@@ -24,7 +28,12 @@ from __future__ import annotations
 
 import warnings
 
+import pytest
+
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+from src.compiler.glsl_deployment_strategy import (
+    CompilationSubdivisionRequired,
+)
 from pathlib import Path
 
 
@@ -49,13 +58,14 @@ GUARD_CLAUSE_RAISE_SOURCE = (
     "    return total\n"
 )
 
-# A direct raise has no guard predicate. Its authored position still has to
-# terminate the native loop on the first executed iteration.
+# A raise with no enclosing guard `if` at all -- not the recognized guard
+# shape, so it must remain a blocker and hit the orphaned-loop refusal.
 BARE_RAISE_SOURCE = (
-    "def train(n):\n"
-    "    total = 0\n"
+    "def helper(a):\n    return a * 1.0\n\n"
+    "def train(w, n):\n"
+    "    total = helper(w)\n"
     "    for k in range(n):\n"
-    "        total = total + 1\n"
+    "        total = total + 1.0\n"
     "        raise ValueError('boom')\n"
     "    return total\n"
 )
@@ -89,22 +99,21 @@ BENIGN_CONTROL_SOURCE = (
 def _lower(source: str, name: str):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        return lower_ast_source_to_ssa(
-            source, "train", name=name, extraction_contract=CONTRACT,
-            progress=lambda _message: None, progress_bars=False,
-        )
+        return lower_ast_source_to_ssa(source, "train", name=name, extraction_contract=CONTRACT)
 
 
-def test_a_bare_raise_inside_a_loop_has_a_native_fault_exit():
-    module, _outputs, exports = _lower(BARE_RAISE_SOURCE, "bare_raise")
-    fn = module.functions[exports[0]]
-    assert {"loop_header", "loop_body", "validation_fail",
-            "validation_fault_exit"} <= set(fn.blocks)
-    assert any(
-        instruction.attributes.get("fault_exit")
-        for block in fn.blocks.values()
-        for instruction in block.instrs
-    )
+def test_a_bare_raise_inside_a_loop_still_refuses():
+    with pytest.raises(CompilationSubdivisionRequired) as excinfo:
+        _lower(BARE_RAISE_SOURCE, "orphanrefusal")
+
+    message = str(excinfo.value)
+    assert "loop's body regions are scheduled but the loop itself" in message
+    assert "blockers=('Raise',)" in message
+    receipt = excinfo.value.to_failure_mapping()
+    assert receipt["frontier_kind"] == "compilation-subdivision-required"
+    boundary, = receipt["subdivision_boundaries"]
+    assert boundary["kind"] == "loop-control-owner"
+    assert boundary["blockers"] == ["Raise"]
 
 
 def test_a_guard_clause_raise_inside_a_loop_compiles_and_validates():
