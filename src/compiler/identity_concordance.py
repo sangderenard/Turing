@@ -2308,7 +2308,7 @@ class CorrelationTable:
         from .concordance_declarations import (
             CANONICAL_VALUE, DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
             SOURCE_EXCEPTION_REGION_SITE, SOURCE_EXCEPTION_TRANSFER,
-            ExceptionRegionSiteFact, ExceptionTransferFact,
+            ExceptionRegionSiteFact, ExceptionTransferFact, MemberRole,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -2366,6 +2366,26 @@ class CorrelationTable:
                         pending.extend(successors.get(source, ()))
                     if fact.canonical_site not in seen:
                         problem = "region site has no source canonical edge"
+                    # Program: `try: a = int(x) + int(y)`. The two
+                    # casts are separate regions; a status taken after
+                    # a region must name its sole executable source site.
+                    # A second NODE could fail after the protected Call
+                    # and make that boundary select the wrong transfer.
+                    node_members = {
+                        int(member_row[2])
+                        for member_row in book.page(
+                            DEPLOYMENT_REGION_MEMBER
+                        ).rows()
+                        if member_row[:2] == row[:2]
+                        and book.page(DEPLOYMENT_REGION_MEMBER).latest(
+                            member_row
+                        ) in {MemberRole.NODE, MemberRole.OUTPUT}
+                    }
+                    if problem is None and node_members != {int(row[2])}:
+                        problem = (
+                            "protected site is not the region's sole "
+                            "executable node"
+                        )
                 if problem is None and {
                     source for source, _stage in book.edges_into(receipt)
                 } != {

@@ -438,6 +438,12 @@ def root(x: float) -> int:
             binding for _transfer, binding in phi.arms
         )
         assert arm_facts[0].canonical_value != arm_facts[1].canonical_value
+        site_rows = tuple(book.page(SOURCE_EXCEPTION_REGION_SITE).rows())
+        assert len(site_rows) == 2
+        assert len({row[:2] for row in site_rows}) == 2
+        assert CorrelationTable._source_exception_region_site_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
         assert CorrelationTable._source_exception_handler_arm_value_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []

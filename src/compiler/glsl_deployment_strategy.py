@@ -13473,7 +13473,7 @@ def _source_try_control_programs(
         ExceptionHandlerPhiFact, ExceptionRegionSiteFact,
         ExceptionRegionStateFact,
         ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
-        ExceptionTransferFact,
+        ExceptionTransferFact, MemberRole,
     )
     from .control_source import (
         NativeExceptionHandler, NativeTryBlock, post_control_program,
@@ -13882,6 +13882,26 @@ def _source_try_control_programs(
                     raise ValueError(
                         "deployed exception site has no exact region member: "
                         f"transfer={row!r}, region={region}"
+                    )
+                executable_members = {
+                    int(member_row[2])
+                    for member_row in book.page(
+                        DEPLOYMENT_REGION_MEMBER
+                    ).rows()
+                    if member_row[:2] == (planning_scope, region)
+                    and book.page(DEPLOYMENT_REGION_MEMBER).latest(
+                        member_row
+                    ) in {MemberRole.NODE, MemberRole.OUTPUT}
+                }
+                if executable_members != {canonical_id}:
+                    # Program: `try: a = int(x) + int(y)` currently
+                    # gives each cast its own region. A status taken only
+                    # after a region cannot identify the failing Call if
+                    # another executable node shares that region.
+                    raise ValueError(
+                        "deployed exception site is not a sole region node: "
+                        f"transfer={row!r}, region={region}, "
+                        f"members={tuple(sorted(executable_members))!r}"
                     )
                 # Program: `try: y = int(x)`. Its source Call is canonical
                 # node 6 in region 0. A region index alone cannot identify
