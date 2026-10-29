@@ -26385,14 +26385,61 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             # name their callee, so ``advance`` -- reached only through the
             # parameter -- stayed inactive, and its own calls never got
             # reachability rows.  Rule: a source function whose address an
-            # active function takes as a value is reachable from it.
-            for _reference_id, reference_data in caller.nodes(data=True):
+            # active function takes as a value is reachable from it.  The
+            # activation is the pursuit page's row (module, qualname),
+            # DERIVED from the reference node's cell and the function's
+            # address; the graph flag only mirrors that record.
+            for reference_id, reference_data in tuple(caller.nodes(data=True)):
                 address = (reference_data.get("attributes") or {}).get(
                     "first_class_function_ref"
                 )
                 if address is None or int(address) not in entries:
                     continue
-                referenced = entries[int(address)].graph.G
+                referenced_entry = entries[int(address)]
+                referenced = referenced_entry.graph.G
+                activation_row = referenced.graph.get(
+                    "authored_function_identity"
+                )
+                if activation_row is None:
+                    raise ValueError(
+                        f"function {referenced_entry.name!r} is taken as a "
+                        "value by an active function but has no authored "
+                        "identity to record its pursuit activation under"
+                    )
+                activation_row = tuple(map(str, activation_row))
+                activation_book = current_identity_book()
+                from ...compiler.concordance_declarations import (
+                    SOURCE_PURSUIT_ACTIVATION as _SOURCE_PURSUIT_ACTIVATION,
+                )
+                recorded = activation_book.page(
+                    _SOURCE_PURSUIT_ACTIVATION
+                ).latest(activation_row)
+                if recorded is not None and recorded is not True:
+                    raise ValueError(
+                        "source pursuit activation concordance disagreement "
+                        f"for {activation_row!r}: recorded={recorded!r}, "
+                        "proposed=True"
+                    )
+                if recorded is None:
+                    activation_book.post(
+                        _SOURCE_PURSUIT_ACTIVATION, activation_row, True,
+                        stage=_REDUCTION,
+                        provenance=_Derived(tuple(
+                            cell for cell in (
+                                node_identity_cell(
+                                    caller_entry.graph, int(reference_id),
+                                ),
+                                activation_book.latest_ref(
+                                    _FUNCTION_ADDRESS,
+                                    (function_address_identity(
+                                        referenced_entry
+                                    ),),
+                                ),
+                            )
+                            if cell is not None
+                        )),
+                        mode=_Mode.CONCORD,
+                    )
                 if not referenced.graph.get("source_pursuit_active"):
                     referenced.graph["source_pursuit_active"] = True
                     changed = True

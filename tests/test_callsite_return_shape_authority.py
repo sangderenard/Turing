@@ -92,7 +92,7 @@ def test_a_function_passed_as_an_argument_reaches_its_callees(monkeypatch):
     import src.compiler.glsl_deployment_strategy as deployment
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 
-    selected, refused = [], []
+    selected, refused, activated = [], [], {}
     original_sources = deployment._callsite_return_shape_sources
 
     def recording(caller, original, specialized, call_id, return_id, descriptor):
@@ -108,6 +108,13 @@ def test_a_function_passed_as_an_argument_reaches_its_callees(monkeypatch):
             refused.append((pair, str(error)))
             raise
         selected.append(pair)
+        from src.compiler.identity_concordance import current_identity_book
+        from src.compiler.concordance_declarations import (
+            SOURCE_PURSUIT_ACTIVATION,
+        )
+        activation = tuple(map(str, original.G.graph["authored_function_identity"]))
+        activated[pair[1]] = current_identity_book().page(
+            SOURCE_PURSUIT_ACTIVATION).latest(activation)
         return sources
 
     monkeypatch.setattr(deployment, "_callsite_return_shape_sources", recording)
@@ -122,3 +129,5 @@ def test_a_function_passed_as_an_argument_reaches_its_callees(monkeypatch):
     assert not [item for item in refused if "reachability" in item[1]]
     assert ("drive", "advance") in selected
     assert ("advance", "scale") in selected
+    # ``advance`` is active by the pursuit page's record, not a bare flag.
+    assert activated["advance"] is True
