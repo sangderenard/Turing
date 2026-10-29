@@ -15,8 +15,11 @@ and must equal Python exactly:
   ``array("Q")``) is clipped in the bounds' own domain; it could not be
   emitted before (mixed signed/unsigned sign tests).
 
-An unproven token keeps int64's whole domain beside uint64 rows; that join
-has no native row layout, and the lowering refuses it by name.
+* ``cover(n)`` with ``n`` unbounded: ``[token]`` is built only where
+  ``kind == 2`` held, and ``kind`` is ``self.kind(token)``, which returns 2
+  only under ``ATOM_BASE <= token < ATOM_LIMIT``.  That read is proven
+  there (the callee's guarded formal at its returns of 2), so the row is
+  uint64 too.
 """
 
 from __future__ import annotations
@@ -141,6 +144,9 @@ PROGRAMS = {
     "proven_intervals": (PROVEN_INTERVALS, (0, 1, 2, -5, 13)),
     "literal_tokens": (LITERAL_TOKENS, (0, 1)),
     "unsigned_slice_bounds": (UNSIGNED_SLICE_BOUNDS, (0, 1, 2)),
+    "token_proven_by_kind": (
+        UNPROVEN_TOKEN, (0, 1, 5, 299, 300, -4, 1001, 123456789),
+    ),
 }
 
 
@@ -191,7 +197,3 @@ def test_cover_slot_matches_python_natively(name, tmp_path):
         assert int(c_value.reshape(-1)[0]) == expected, (name, "c", n)
         assert int(llvm_value.reshape(-1)[0]) == expected, (name, "llvm", n)
 
-
-def test_unproven_token_beside_uint64_rows_is_refused_by_name():
-    with pytest.raises(ValueError, match="native element storage|row dtype"):
-        _lowered("unproven_token", UNPROVEN_TOKEN)

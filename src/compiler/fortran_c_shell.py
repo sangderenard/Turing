@@ -22287,6 +22287,19 @@ def _callee_accounting_in_caller(
     )
 
 
+def _native_row_dtype(dtype: Any) -> bool:
+    """Whether ``dtype`` is a native scalar row layout (8 bytes at most)."""
+
+    from ..transmogrifier.dtype_layout import resolve as resolve_layout
+
+    layout = resolve_layout(dtype) if dtype is not None else None
+    return (
+        layout is not None
+        and layout.kind in {"int", "uint", "float", "bool"}
+        and int(layout.byte_size) <= 8
+    )
+
+
 def _settle_linked_dynamic_sequences(
     graphs: tuple[Any, ...], edges: tuple[tuple[Any, int, Any, int], ...],
     argument_sites: frozenset[tuple[int, int, int]] = frozenset(),
@@ -22589,10 +22602,25 @@ def _settle_linked_dynamic_sequences(
             planned_by_graph.get(graph_id, {}).get(int(value_id))
         )
     component_element = {}
+    from ..transmogrifier.dtype_layout import common_integer_dtype
+
     for root, dtypes in component_elements.items():
-        known = {dtype for dtype in dtypes if dtype in {"int64", "float64", "bool"}}
+        # Program: ``st, xs = v.expand(n)`` where ``expand`` returns
+        # ``list(self.atoms[0 : t - 1])`` over ``array("I")``, and the caller
+        # reads only ``len(xs)``.  Wrong record: only int64/float64/bool rows
+        # named a component's element, so the callee's uint32 rows named
+        # none, the caller's view was born with an unknown row and FIXED,
+        # and the two views of the one DYNAMIC arena disagreed.  Rule: any
+        # native scalar layout is a row class; several integer layouts join
+        # by exact value domain while that join is native.
+        known = {
+            dtype for dtype in dtypes if _native_row_dtype(dtype)
+        }
         if known <= {"int64", "bool"} and len(known) > 1:
             known = {"int64"}
+        if len(known) > 1:
+            joined = common_integer_dtype(tuple(sorted(known)))
+            known = {joined} if _native_row_dtype(joined) else known
         if len(known) == 1:
             component_element[root] = next(iter(known))
     for graph_obj in graphs:
@@ -30915,7 +30943,7 @@ def _class_surface_ssa_program(
                                 "linked_sequence_element_dtypes"
                             ) or {}).get(int(sequence_id)),
                         )
-                        if planned in {"int64", "float64", "bool"}
+                        if _native_row_dtype(planned)
                     },
                     **_sequence_column_dtype_contracts(
                         graph_obj, sequence_declarations
