@@ -1231,6 +1231,25 @@ SOURCE_EXCEPTION_STATUS_ROUTE = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionRegionSiteFact:
+    """One source transfer whose exact canonical operation is deployed here."""
+
+    transfer: Ref
+    canonical_site: Ref
+    deployment_region: Ref
+    deployment_member: Ref
+
+
+SOURCE_EXCEPTION_REGION_SITE = declare_page(
+    "source_exception_region_site", (
+        RowField("planning_scope", K.SCOPE),
+        RowField("region", K.INDEX),
+        RowField("canonical_node", K.VALUE_ID),
+    ), ExceptionRegionSiteFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionHandlerEntryFact:
     """Candidate failure edges and binding versions at one handler entry."""
 

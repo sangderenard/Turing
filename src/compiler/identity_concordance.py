@@ -1555,6 +1555,7 @@ class CorrelationTable:
         found.extend(self._source_exception_transfer_findings(module))
         found.extend(self._source_exception_handler_class_findings(module))
         found.extend(self._source_exception_status_route_findings(module))
+        found.extend(self._source_exception_region_site_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_continuation_phi_findings(module))
@@ -2259,6 +2260,84 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-status-route-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_region_site_findings(module: Any) -> list[Finding]:
+        """A deployed failure operation has one source-to-region identity."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
+            SOURCE_EXCEPTION_REGION_SITE, SOURCE_EXCEPTION_TRANSFER,
+            ExceptionRegionSiteFact, ExceptionTransferFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_REGION_SITE.name not in book.pages:
+            return []
+        successors = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for cause, _stage in book.edges_into(canonical):
+                successors.setdefault(cause, set()).add(canonical)
+        found = []
+        page = book.page(SOURCE_EXCEPTION_REGION_SITE)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_REGION_SITE, row)
+            problem = None
+            if not isinstance(fact, ExceptionRegionSiteFact):
+                problem = "region site lacks its exact correlation fact"
+            elif (
+                not isinstance(fact.transfer, Ref)
+                or fact.transfer.page != SOURCE_EXCEPTION_TRANSFER
+                or not isinstance(fact.canonical_site, Ref)
+                or fact.canonical_site.page != CANONICAL_VALUE
+                or int(fact.canonical_site.row[1]) != int(row[2])
+                or book.latest_ref(
+                    CANONICAL_VALUE, fact.canonical_site.row,
+                ) != fact.canonical_site
+                or not isinstance(fact.deployment_region, Ref)
+                or not isinstance(fact.deployment_member, Ref)
+                or fact.deployment_region != book.latest_ref(
+                    DEPLOYMENT_REGION, row[:2],
+                )
+                or fact.deployment_member != book.latest_ref(
+                    DEPLOYMENT_REGION_MEMBER, row,
+                )
+                or book.latest_ref(
+                    SOURCE_EXCEPTION_TRANSFER, fact.transfer.row,
+                ) != fact.transfer
+            ):
+                problem = "region site disagrees with canonical or planner member"
+            else:
+                transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(
+                    fact.transfer.row
+                )
+                if not isinstance(transfer, ExceptionTransferFact):
+                    problem = "region site transfer has no source fact"
+                else:
+                    pending = [transfer.source]
+                    seen = set()
+                    while pending:
+                        source = pending.pop()
+                        if source in seen:
+                            continue
+                        seen.add(source)
+                        pending.extend(successors.get(source, ()))
+                    if fact.canonical_site not in seen:
+                        problem = "region site has no source canonical edge"
+                if problem is None and {
+                    source for source, _stage in book.edges_into(receipt)
+                } != {
+                    fact.transfer, fact.canonical_site,
+                    fact.deployment_region, fact.deployment_member,
+                }:
+                    problem = "region site provenance disagrees with members"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-region-site-disagreement",
                     str(row), None, problem,
                 ))
         return found

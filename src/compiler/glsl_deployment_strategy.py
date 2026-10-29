@@ -13459,16 +13459,19 @@ def _source_try_control_programs(
 
     from .concordance_declarations import (
         CANONICAL_VALUE, CONTROL_PROGRAM_BUILD,
+        DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
         SOURCE_EXCEPTION_CONTINUATION_PHI,
         SOURCE_EXCEPTION_HANDLER_CLASS,
+        SOURCE_EXCEPTION_REGION_SITE,
         SOURCE_EXCEPTION_TRANSFER,
+        ExceptionRegionSiteFact,
         ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
         ExceptionTransferFact,
     )
     from .control_source import (
         NativeExceptionHandler, NativeTryBlock, post_control_program,
     )
-    from .identity_concordance import current_identity_book
+    from .identity_concordance import Derived, Mode, current_identity_book
     from ..common.tensors.topological_reducer import node_identity_cell
 
     book = current_identity_book()
@@ -13509,6 +13512,8 @@ def _source_try_control_programs(
             )
         return next(iter(matches))
     subgraphs = tuple(dispatch_subgraphs)
+    retained_regions = tuple(map(int, retained_regions))
+    planning_scope = graph.G.graph.get("planning_scope")
     memberships = _branch_compartments(graph)
     programs = []
     for try_id, record in _source_control_records(graph.G).items():
@@ -13672,6 +13677,54 @@ def _source_try_control_programs(
                     f"source exception transfer has no fact cell: {row!r}"
                 )
             protected_transfers.append(transfer_cell)
+            canonical_id = canonical_from_source(transfer.source)
+            canonical_site = book.latest_ref(
+                CANONICAL_VALUE, (canonical_scope, canonical_id),
+            )
+            if canonical_site is None:
+                raise ValueError(
+                    "source exception transfer has no forked canonical cell: "
+                    f"transfer={row!r}"
+                )
+            for region in retained_regions:
+                region = int(region)
+                if canonical_id not in tuple(map(
+                    int, subgraphs[region].G.graph.get("deployment_nodes", ()),
+                )):
+                    continue
+                if planning_scope is None:
+                    raise ValueError(
+                        "deployed exception site has no planning scope: "
+                        f"transfer={row!r}, region={region}"
+                    )
+                region_cell = book.latest_ref(
+                    DEPLOYMENT_REGION, (planning_scope, region),
+                )
+                member_cell = book.latest_ref(
+                    DEPLOYMENT_REGION_MEMBER,
+                    (planning_scope, region, canonical_id),
+                )
+                if region_cell is None or member_cell is None:
+                    raise ValueError(
+                        "deployed exception site has no exact region member: "
+                        f"transfer={row!r}, region={region}"
+                    )
+                # Program: `try: y = int(x)`. Its source Call is canonical
+                # node 6 in region 0. A region index alone cannot identify
+                # the failure operation; the region member and source
+                # transfer must meet at this one canonical value cell.
+                book.post(
+                    SOURCE_EXCEPTION_REGION_SITE,
+                    (planning_scope, region, canonical_id),
+                    ExceptionRegionSiteFact(
+                        transfer_cell, canonical_site, region_cell, member_cell,
+                    ),
+                    stage=CONTROL_PROGRAM_BUILD,
+                    provenance=Derived((
+                        transfer_cell, canonical_site, region_cell, member_cell,
+                    )),
+                    mode=Mode.CONCORD,
+                )
         program = ControlProgram(
             NativeTryBlock(
                 arm_body(("body", 0)), tuple(handlers),

@@ -14,6 +14,7 @@ from src.compiler.concordance_declarations import (
     NAME_BINDING, SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_SITE_STATE,
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
+    SOURCE_EXCEPTION_REGION_SITE,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
     SOURCE_EXCEPTION_CONTINUATION_PHI,
@@ -98,10 +99,19 @@ def root(x: float) -> int:
         assert try_fact.carried[1].page == SOURCE_EXCEPTION_CONTINUATION_PHI
         assert len(try_fact.sites) == 1
         assert try_fact.sites[0].page == SOURCE_EXCEPTION_TRANSFER
+        region_rows = tuple(book.page(SOURCE_EXCEPTION_REGION_SITE).rows())
+        assert len(region_rows) == 1
+        region_site = book.page(SOURCE_EXCEPTION_REGION_SITE).latest(
+            region_rows[0]
+        )
+        assert region_site.transfer == try_fact.sites[0]
+        assert region_site.canonical_site.row[1] == region_rows[0][2]
+        assert region_site.deployment_member.row == region_rows[0]
         source_module = SimpleNamespace(metadata={"identity_book": book})
         for check in (
             CorrelationTable._source_exception_site_state_findings,
             CorrelationTable._source_exception_transfer_findings,
+            CorrelationTable._source_exception_region_site_findings,
             CorrelationTable._source_exception_handler_class_findings,
             CorrelationTable._source_exception_handler_entry_findings,
             CorrelationTable._source_exception_handler_phi_findings,
