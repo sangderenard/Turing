@@ -157,6 +157,7 @@ from .control_source import (
     ExternalReferenceCallBlock,
     LoopControlBlock,
     LoopBlock,
+    NativeTryBlock,
     ParallelDeployment,
     SequenceBlock,
     SequenceMutationBlock,
@@ -2424,6 +2425,7 @@ class _ControlSSABuilder(TiledObject):
         #: owner every ``ssa_block`` row ``new_block`` posts derives from.
         self._control_cells: list[Ref | None] = []
         self.shortfalls: list[SSALoweringShortfall] = []
+        self._native_try_frames: list[dict[str, Any]] = []
         self.region_callees = dict(region_callees or {})
         # A region with a recorded signature is schedulable by definition; its
         # callee name follows the one convention every consumer already uses
@@ -10186,7 +10188,9 @@ class _ControlSSABuilder(TiledObject):
                     f"unknown post-region table operation {kind!r}"
                 )
 
-    def new_block(self, stem: str, *, also: tuple = ()) -> BasicBlock:
+    def new_block(
+        self, stem: str, *, also: tuple = (), owner: Ref | None = None,
+    ) -> BasicBlock:
         """A new block.  ``also`` names cells beyond the owning control
         block's that the block is made from (a tick's case literal)."""
 
@@ -10195,11 +10199,12 @@ class _ControlSSABuilder(TiledObject):
         name = stem if count == 0 else f"{stem}.{count}"
         block = BasicBlock(name)
         self.blocks[name] = block
-        self._post_ssa_block(name, stem, also=also)
+        self._post_ssa_block(name, stem, also=also, owner=owner)
         return block
 
     def _post_ssa_block(
         self, label: str, stem: str, *, also: tuple = (),
+        owner: Ref | None = None,
     ) -> Ref:
         """``ssa_block`` row ``(scope, function, label)`` (plan 100, 2.6),
         CONCORD.  ENTRY / FUNCTION_EXIT belong to the function: DERIVED
@@ -10227,7 +10232,9 @@ class _ControlSSABuilder(TiledObject):
             cell for cell in (program, self._function_root()) if cell is not None
         )
         fact: Any = kind
-        if kind in {_Kind.ENTRY, _Kind.FUNCTION_EXIT}:
+        if owner is not None:
+            sources = (owner,)
+        elif kind in {_Kind.ENTRY, _Kind.FUNCTION_EXIT}:
             sources = function_cells
         elif self._control_cells and self._control_cells[-1] is not None:
             sources = (self._control_cells[-1],)
@@ -11890,6 +11897,185 @@ class _ControlSSABuilder(TiledObject):
         flush()
         return ordered
 
+    def _checkpoint_native_exception_region(
+        self, region_index: int,
+    ) -> None:
+        """Take a sole protected operation's status at its region boundary."""
+        if not self._native_try_frames:
+            return
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_REGION_SITE, SOURCE_EXCEPTION_REGION_STATE,
+            SOURCE_EXCEPTION_SSA_CHECKPOINT, ExceptionRegionSiteFact,
+            ExceptionRegionStateFact, ExceptionSSACheckpointFact,
+        )
+
+        book = self._book()
+        candidates = tuple(
+            (row, book.page(SOURCE_EXCEPTION_REGION_SITE).latest(row))
+            for row in book.page(SOURCE_EXCEPTION_REGION_SITE).rows()
+            if row[:2] == (self.planning_scope, int(region_index))
+        )
+        selected = None
+        for frame in reversed(self._native_try_frames):
+            owned = tuple(
+                (row, site) for row, site in candidates
+                if isinstance(site, ExceptionRegionSiteFact)
+                and site.transfer in frame["block"].protected_transfer_cells
+            )
+            if len(owned) > 1:
+                raise ValueError(
+                    "native Try region has multiple protected source sites: "
+                    f"region={region_index}, sites={owned!r}"
+                )
+            if owned:
+                selected = (frame, *owned[0])
+                break
+        if selected is None:
+            return
+        frame, site_row, site = selected
+        site_cell = book.latest_ref(SOURCE_EXCEPTION_REGION_SITE, site_row)
+        if site_cell is None:
+            raise ValueError(
+                f"native Try checkpoint has no site cell: {site_row!r}"
+            )
+        captured = {}
+        for state_row in book.page(SOURCE_EXCEPTION_REGION_STATE).rows():
+            if state_row[:3] != site_row:
+                continue
+            state = book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
+                state_row
+            )
+            if not isinstance(state, ExceptionRegionStateFact) or (
+                state.region_site != site_cell
+            ):
+                raise ValueError(
+                    f"native Try checkpoint has foreign state: {state_row!r}"
+                )
+            value_id = int(state.canonical_value.row[1])
+            value = self.external_values.get(value_id)
+            if value is None and value_id in self.constant_value_ids:
+                value = self.external_value(value_id)
+            if value is None or not self._value_dominates_current_edge(value):
+                raise ValueError(
+                    "native Try checkpoint has no live SSA value: "
+                    f"site={site_row!r}, name={state_row[3]!r}"
+                )
+            captured[str(state_row[3])] = value
+        status = self.fresh_value(
+            dtype="int64", transform=CONTROL_EXPRESSION,
+            operands=(site_cell,),
+        )
+        self.emit(
+            Handler.Call, [], status,
+            attributes={
+                "callee": "turing_validation_error_take",
+                "source_exception_site_cell": site_cell,
+            },
+        )
+        failed = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(site_cell, status),
+        )
+        self.emit(
+            Handler.Ne, [status, self.constant_value(0, status)], failed,
+            attributes={"source_exception_site_cell": site_cell},
+        )
+        failure = self.new_block(
+            "exception_site_failure", also=(site_cell,),
+            owner=frame["owner"],
+        )
+        resume = self.new_block(
+            "exception_site_resume", also=(site_cell,),
+            owner=frame["owner"],
+        )
+        self.conditional_branch(failed, failure, resume)
+        self.current.instrs[-1].attributes[
+            "source_exception_site_cell"
+        ] = site_cell
+        status_cell = book.latest_ref(SSA_VALUE, (self._scope(), int(status.id)))
+        predicate_cell = book.latest_ref(
+            SSA_VALUE, (self._scope(), int(failed.id)),
+        )
+        failure_cell = book.latest_ref(
+            SSA_BLOCK, (self._scope(), self.function_name, failure.name),
+        )
+        resume_cell = book.latest_ref(
+            SSA_BLOCK, (self._scope(), self.function_name, resume.name),
+        )
+        if any(cell is None for cell in (
+            status_cell, predicate_cell, failure_cell, resume_cell,
+        )):
+            raise ValueError(
+                f"native Try checkpoint has incomplete SSA cells: {site_row!r}"
+            )
+        book.post(
+            SOURCE_EXCEPTION_SSA_CHECKPOINT,
+            (self._scope(), int(region_index), int(site_row[2])),
+            ExceptionSSACheckpointFact(
+                site_cell, status_cell, predicate_cell,
+                failure_cell, resume_cell,
+            ),
+            stage=self._stage(),
+            provenance=Derived((
+                site_cell, status_cell, predicate_cell,
+                failure_cell, resume_cell,
+            )),
+            mode=Mode.CONCORD,
+        )
+        frame["edges"].append({
+            "site": site_cell, "transfer": site.transfer,
+            "status": status, "failure": failure,
+            "state": captured,
+        })
+        self.current = resume
+
+    def lower_native_try(
+        self, block: NativeTryBlock, *, path: str,
+    ) -> None:
+        """Lower protected region checkpoints while admission remains shut."""
+        owner = self._control_cells[-1]
+        if owner is None:
+            raise ValueError(
+                f"native Try has no exact control owner: {path}"
+            )
+        frame: dict[str, Any] = {
+            "block": block, "edges": [], "owner": owner,
+        }
+        self._native_try_frames.append(frame)
+        try:
+            self.lower(block.body, path=f"{path}.try_body")
+        finally:
+            self._native_try_frames.pop()
+        if block.orelse is not None:
+            self.lower(block.orelse, path=f"{path}.try_else")
+        self.lower(block.finalbody, path=f"{path}.try_finally")
+        normal = self.current
+        for edge in frame["edges"]:
+            self.current = edge["failure"]
+            self.emit(
+                Handler.Call, [edge["status"]],
+                attributes={
+                    "callee": "turing_validation_error",
+                    "source_exception_site_cell": edge["site"],
+                },
+            )
+            if self._fault_exit is None:
+                self._fault_exit = self.new_block(
+                    "exception_unmatched", also=(edge["site"],),
+                    owner=frame["owner"],
+                )
+            self.branch(self._fault_exit)
+        self.current = normal
+        # The status is taken on the exact protected edge and restored
+        # before the existing fault exit. Until dispatch, joins and pending
+        # finalizer outcomes consume the route facts, no artifact may claim
+        # this Try is executable.
+        self.shortfalls.append(SSALoweringShortfall(
+            "control", "native_try_dispatch", path,
+            "authored Try has a source-owned status checkpoint but no "
+            "executable handler/finalizer dispatch",
+        ))
+
     def _lower(self, block: ControlBlock, *, path: str = "root") -> None:
         if isinstance(block, SequenceBlock):
             # Reordering is confined to straight-line context. Inside a loop
@@ -11926,6 +12112,9 @@ class _ControlSSABuilder(TiledObject):
                         self.emit_region_call(
                             region_index,
                             location=location,
+                        )
+                        self._checkpoint_native_exception_region(
+                            region_index,
                         )
                     finally:
                         if memberships:
@@ -11965,6 +12154,9 @@ class _ControlSSABuilder(TiledObject):
                 self.resource_scopes.pop()
             for index, operation in enumerate(block.cleanup):
                 self.lower(operation, path=f"{path}.resource_cleanup[{index}]")
+            return
+        if isinstance(block, NativeTryBlock):
+            self.lower_native_try(block, path=path)
             return
         if isinstance(block, LoopControlBlock) and block.action == "return":
             # Program: ``validate_batch_envelope``'s ``if not

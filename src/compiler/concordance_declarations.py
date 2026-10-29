@@ -1271,6 +1271,26 @@ SOURCE_EXCEPTION_REGION_STATE = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSACheckpointFact:
+    """A deployed source site branches on the status taken at its boundary."""
+
+    region_site: Ref
+    status_value: Ref
+    failure_predicate: Ref
+    failure_block: Ref
+    resume_block: Ref
+
+
+SOURCE_EXCEPTION_SSA_CHECKPOINT = declare_page(
+    "source_exception_ssa_checkpoint", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("region", K.INDEX),
+        RowField("canonical_site", K.VALUE_ID),
+    ), ExceptionSSACheckpointFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionHandlerEntryFact:
     """Candidate failure edges and binding versions at one handler entry."""
 
@@ -3234,6 +3254,12 @@ class SSABlockKind(Enum):
     IF_TRUE = "if_true"
     IF_FALSE = "if_false"
     IF_MERGE = "if_merge"
+    EXCEPTION_SITE_FAILURE = "exception_site_failure"
+    EXCEPTION_SITE_RESUME = "exception_site_resume"
+    EXCEPTION_JOIN = "exception_join"
+    EXCEPTION_HANDLER = "exception_handler"
+    EXCEPTION_ROUTE_NEXT = "exception_route_next"
+    EXCEPTION_UNMATCHED = "exception_unmatched"
     LOOP_HEADER = "loop_header"
     LOOP_BODY = "loop_body"
     LOOP_LATCH = "loop_latch"

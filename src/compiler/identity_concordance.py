@@ -1557,6 +1557,7 @@ class CorrelationTable:
         found.extend(self._source_exception_status_route_findings(module))
         found.extend(self._source_exception_region_site_findings(module))
         found.extend(self._source_exception_region_state_findings(module))
+        found.extend(self._source_exception_ssa_checkpoint_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_handler_arm_value_findings(module))
@@ -2503,6 +2504,97 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-region-state-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_checkpoint_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """A taken status and both successor blocks cite one deployed site."""
+        from .concordance_declarations import (
+            CONTROL_EXPRESSION, CONTROL_PREDICATE,
+            SOURCE_EXCEPTION_REGION_SITE, SOURCE_EXCEPTION_SSA_CHECKPOINT,
+            SSA_BLOCK, SSA_VALUE, ExceptionSSACheckpointFact,
+            SSABlockKind,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_SSA_CHECKPOINT.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_CHECKPOINT, row)
+            problem = None
+            if not isinstance(fact, ExceptionSSACheckpointFact):
+                problem = "exception checkpoint has no SSA fact"
+            elif not all(isinstance(cell, Ref) for cell in (
+                fact.region_site, fact.status_value,
+                fact.failure_predicate, fact.failure_block,
+                fact.resume_block,
+            )):
+                problem = "exception checkpoint lacks exact cells"
+            elif (
+                fact.region_site.page != SOURCE_EXCEPTION_REGION_SITE
+                or fact.region_site.row[1:] != row[1:]
+                or book.latest_ref(
+                    SOURCE_EXCEPTION_REGION_SITE, fact.region_site.row,
+                ) != fact.region_site
+                or any(
+                    cell.page != SSA_VALUE or cell.row[0] != row[0]
+                    or book.latest_ref(SSA_VALUE, cell.row) != cell
+                    for cell in (
+                        fact.status_value, fact.failure_predicate,
+                    )
+                )
+                or any(
+                    cell.page != SSA_BLOCK or cell.row[0] != row[0]
+                    or book.latest_ref(SSA_BLOCK, cell.row) != cell
+                    for cell in (fact.failure_block, fact.resume_block)
+                )
+                or book.page(SSA_BLOCK).latest(fact.failure_block.row)
+                is not SSABlockKind.EXCEPTION_SITE_FAILURE
+                or book.page(SSA_BLOCK).latest(fact.resume_block.row)
+                is not SSABlockKind.EXCEPTION_SITE_RESUME
+            ):
+                problem = "exception checkpoint disagrees with site or SSA cells"
+            elif book.mint_of(fact.status_value) != (
+                CONTROL_EXPRESSION, (fact.region_site,),
+            ):
+                problem = "taken status lacks its exact source site"
+            elif not (
+                (predicate_mint := book.mint_of(
+                    fact.failure_predicate,
+                )) is not None
+                and predicate_mint[0] == CONTROL_PREDICATE
+                and len(predicate_mint[1]) == 1
+                and {
+                    cause for cause, _stage in book.edges_into(
+                        predicate_mint[1][0],
+                    )
+                } == {fact.region_site, fact.status_value}
+            ):
+                problem = "failure predicate lacks site and taken status"
+            elif any(
+                fact.region_site not in {
+                    cause for cause, _stage in book.edges_into(cell)
+                } for cell in (fact.failure_block, fact.resume_block)
+            ):
+                problem = "exception successor lacks its source site"
+            elif {
+                cause for cause, _stage in book.edges_into(receipt)
+            } != {
+                fact.region_site, fact.status_value,
+                fact.failure_predicate, fact.failure_block,
+                fact.resume_block,
+            }:
+                problem = "exception checkpoint provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-checkpoint-disagreement",
                     str(row), None, problem,
                 ))
         return found

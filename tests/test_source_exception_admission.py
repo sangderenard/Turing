@@ -146,6 +146,28 @@ def root(x: float) -> int:
             CorrelationTable._source_exception_status_route_findings,
         ):
             assert check(source_module) == []
+        from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+        lowered, shortfalls = lower_control_program_to_ssa(
+            overlaid[0], function_name="exception_checkpoint_probe",
+            first_value_id=1000,
+            lexical_read_scope=try_blocks[0][0],
+            planning_scope=region_rows[0][0],
+            region_callees={region_rows[0][1]: "numerical_region_0"},
+            region_signatures={region_rows[0][1]: ((), ())},
+        )
+        assert any(
+            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
+        )
+        assert any(
+            instruction.attributes.get("callee")
+            == "turing_validation_error_take"
+            for block in lowered.blocks.values()
+            for instruction in block.instrs
+        )
+        assert CorrelationTable._source_exception_ssa_checkpoint_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
     finally:
         end_identity_book(token)
     boundary, = error.value.to_failure_mapping()["subdivision_boundaries"]
