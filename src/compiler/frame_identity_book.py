@@ -322,6 +322,7 @@ def _record_field_declaration_cell(
         record.get("identity") if identity is None else identity
     )
     page = book.pages.get(CLASS_FIELD_DECLARATION.name)
+    qualified: set = set()
     for row in () if page is None else page.rows():
         # The declaration row is keyed ``(module, class_identity, field)``.
         # A contract record names its class by the qualified identity
@@ -346,6 +347,21 @@ def _record_field_declaration_cell(
             and page.latest(row) is not None
         ):
             return book.latest_ref(CLASS_FIELD_DECLARATION, row)
+        # Program: the octet codec's ``CanonicalHuffmanTable.symbols``.
+        # Wrong record: a dependency class is declared under its qualified
+        # identity (``('src...huffman', 'src...huffman.CanonicalHuffmanTable',
+        # 'symbols')``) while the method's record names it bare
+        # (``CanonicalHuffmanTable``), so neither spelling above matched.
+        # Rule: a bare record identity names the declaration whose
+        # qualified class ends in it, when exactly one class does.
+        if (
+            "." not in class_identity
+            and str(row[1]).endswith("." + class_identity)
+            and page.latest(row) is not None
+        ):
+            qualified.add((str(row[0]), str(row[1]), row))
+    if len({(module, owner) for module, owner, _row in qualified}) == 1:
+        return book.latest_ref(CLASS_FIELD_DECLARATION, next(iter(qualified))[2])
     return None
 
 
