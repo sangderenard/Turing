@@ -1173,8 +1173,9 @@ def integer_arithmetic_policy(mode=None):
     return policy
 
 
-#: ``transcendentals``: what computes a scalar float ``math.exp``/``log``/
-#: ``sin``/... in native code.  ``signal_cores`` (``scientific``,
+#: ``transcendentals``: what computes a float ``math.exp``/``log``/
+#: ``sin``/... in native code, scalar or elementwise over a tensor/span
+#: (``ir_identities.scalarize_elementwise_transcendentals``).  ``signal_cores`` (``scientific``,
 #: ``stochastic``) -- the repository's own correctly rounded route:
 #: ``signal_symbolic`` proofs materialised as wide SSA by
 #: ``ir_identities.WideExpansionEmitter`` and collapsed to one double

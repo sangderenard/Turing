@@ -5377,6 +5377,28 @@ def emit_ssa_module_to_c(
                         if _is_integer_dtype(instruction.res.dtype):
                             integer_ids.add(result_id)
                         continue
+                    if (
+                        destination is None and count is not None
+                        and result_shape
+                    ):
+                        # A copy no output owns is a value of this frame: it
+                        # gets frame storage of its static extent, as an
+                        # elementwise span result does
+                        # (``emit_elementwise_span``).  Measured on the
+                        # signal-core elementwise loop
+                        # (``ir_identities.scalarize_elementwise_
+                        # transcendentals``), whose intermediate result is a
+                        # clone it then fills: "has no bounded destination".
+                        destination = activation_array(
+                            buffer_type(instruction.res), int(count),
+                        )
+                        expressions[result_id] = destination
+                        addresses[result_id] = destination
+                        object_expressions[id(instruction.res)] = destination
+                        object_addresses[id(instruction.res)] = destination
+                        address_buffer_types[result_id] = buffer_type(
+                            instruction.res
+                        )
                     if destination is None or count is None:
                         shortfalls.append(CEmissionShortfall(
                             op,
