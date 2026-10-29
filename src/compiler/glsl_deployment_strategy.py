@@ -3763,16 +3763,11 @@ def _planned_scalar_dtypes_from_graph(
                         # Program: ``d = {}; d[i * 3] = i * 0.5`` then ``for
                         # k in d``.  Wrong record: the target took the dict's
                         # row class (its values), although iterating a
-                        # mapping yields its keys.  Rule: the target of an
-                        # unannotated mapping is the join of its keys.
-                        held = join([
-                            scalar.get(leaves[0])
-                            for leaves in iterated_keys(iterable[0])
-                            if len(leaves) == 1
-                        ] or [None]) if all(
-                            len(leaves) == 1
-                            for leaves in iterated_keys(iterable[0])
-                        ) else None
+                        # mapping yields its keys.  Rule: the row class is
+                        # no proof of a key; the key's class is projected by
+                        # the class concordance from the store's key operands
+                        # (``_propagate_builtin_scalar_operator_classes``).
+                        held = None
                     for name in target_names:
                         for target_id, target in G.nodes(data=True):
                             if (
@@ -3972,44 +3967,6 @@ def _planned_scalar_dtypes_from_graph(
                                     ) == "loop"
                                 ):
                                     settle(scalar, int(target_id), held)
-                # Program: ``cells[(i % 2, i)] = i`` then ``for row, column
-                # in cells`` (the bootstrap's ``_reindex_in_place``).  Wrong
-                # record: a tuple target over an unannotated mapping had no
-                # rule, so ``row * 10`` reached its region with no dtype.
-                # Rule: iterating a mapping yields its keys; the i-th name of
-                # a tuple target is the join of the i-th column of every key
-                # the mapping stores or displays (a key of another width
-                # leaves the names unknown, as any join does).
-                keyed = iterated_keys(iterable[0]) if iterable else None
-                if (
-                    keyed
-                    and isinstance(loop_expression, ast.For)
-                    and isinstance(loop_expression.target, ast.Tuple)
-                    and all(isinstance(item, ast.Name)
-                            for item in loop_expression.target.elts)
-                    and operation(G.nodes[iterable[0]]) != "items"
-                    and not (G.nodes[iterable[0]].get("attributes") or {}).get(
-                        "mapping_key_class_ref"
-                    )
-                ):
-                    width = len(loop_expression.target.elts)
-                    for position, item in enumerate(loop_expression.target.elts):
-                        held = join([
-                            scalar.get(leaves[position])
-                            if len(leaves) == width else None
-                            for leaves in keyed
-                        ])
-                        for target_id, target in G.nodes(data=True):
-                            if (
-                                operation(target) == "input"
-                                and (target.get("attributes") or {}).get(
-                                    "binding_name"
-                                ) == item.id
-                                and (target.get("attributes") or {}).get(
-                                    "binding_kind"
-                                ) == "loop"
-                            ):
-                                settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
@@ -34325,10 +34282,20 @@ class ProcessGraphGLSLDeployment(TiledObject):
             )
         if self._callsite_planning_deferred:
             self.callsite_function_shells = {}
-        elif self.runtime_closure_only:
+        elif self.runtime_closure_only or self.activation_root_references:
             # The module shell owns the definition catalogue, not another
             # execution of every function body in the source file.  Submitted
             # target shells above are the activation roots in this mode.
+            #
+            # Program: ``def f(x): return g(x, 4)`` through ``compile_ast_aot``
+            # (whole-program retention).  Wrong record: the module shell
+            # planned ``g(x, 4)`` -- a node of ``f``'s body -- as its own
+            # activation, though the book's activation roots
+            # (SOURCE_PURSUIT_ACTIVATION caused by the PURSUIT_ROOT contract
+            # demand) name ``f`` and not the module; the module graph has no
+            # reachability row, so the return was refused.  Rule: retention
+            # and executable-root identity are separate; when the book names
+            # exact activation roots, the module shell is not one of them.
             self.callsite_function_shells = {}
         else:
             plan_callsites(self)
