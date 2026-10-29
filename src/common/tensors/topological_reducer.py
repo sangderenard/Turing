@@ -11411,6 +11411,25 @@ def _normalize_lexical_values(
                 graph.G.nodes[node_id].setdefault(
                     "attributes", {},
                 )["class_ref"] = expression.func.id
+                # Program: ``v = V(); fold_cover(v, ...)`` with ``def
+                # fold_cover(vocabulary, ...): vocabulary.cover(token)``
+                # (string core ``structure_grow``).  Wrong record: the
+                # construction stamped ``class_ref`` but posted no class
+                # row, so the call-actual edge had no class to carry to the
+                # unannotated formal, ``vocabulary.cover`` resolved to no
+                # method and its result members had no class.  Rule: a
+                # construction of a submitted class IS an instance of it.
+                construction_cell = node_identity_cell(graph, int(node_id))
+                _concord_source_value_class(
+                    value_class_scope,
+                    int(node_id),
+                    str(expression.func.id),
+                    source="source class construction",
+                    provenance=(
+                        _Derived((construction_cell,))
+                        if construction_cell is not None else None
+                    ),
+                )
             if (
                 isinstance(expression.func, ast.Attribute)
                 and node_id in graph.G

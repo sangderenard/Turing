@@ -40,6 +40,27 @@ POW_MODULUS_ZERO = 90
 #: quotient is computed on Precision limbs, the native module reports it.
 INT_TRUE_DIVISION_INEXACT = 91
 
+#: ``0.0 ** y`` (``-0.0`` too) with a finite ``y < 0``: Python raises
+#: ``ZeroDivisionError`` ("0.0 cannot be raised to a negative power").
+FLOAT_POW_ZERO_NEGATIVE = 92
+
+#: ``x ** y`` on floats with finite ``x < 0`` and finite non-integer ``y``:
+#: Python returns a ``complex``.  A float-typed native power cannot carry
+#: it, so the module reports it by name rather than return a float Python
+#: never computes (whether to lower it to complex is the user's choice).
+FLOAT_POW_COMPLEX_RESULT = 93
+
+#: ``math.pow`` (and ``math`` functions generally) outside the domain:
+#: ``ValueError("math domain error")``.
+FLOAT_MATH_DOMAIN = 94
+
+#: ``x ** y`` on floats whose finite operands give a result past the
+#: largest double: ``OverflowError((34, 'Numerical result out of range'))``.
+FLOAT_POW_OVERFLOW = 95
+
+#: ``math.pow`` overflow: ``OverflowError("math range error")``.
+FLOAT_MATH_RANGE = 96
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -63,6 +84,14 @@ class NativeIntPowerNegativeExponent(RuntimeError):
     Python returns a float there (or a modular inverse for three-argument
     ``pow``); the program's int type cannot carry it.
     """
+
+
+class NativeFloatOverflow(RuntimeError, OverflowError):
+    """A float result Python reports as ``OverflowError``."""
+
+
+class NativeFloatPowComplexResult(RuntimeError):
+    """A negative float ``**`` a non-integer float: complex in Python."""
 
 
 class NativeKeyError(RuntimeError, KeyError):
@@ -103,4 +132,21 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
         return NativeValueError(
             f"pow() 3rd argument cannot be 0 ({runtime_message})"
         )
+    if int(code) == FLOAT_POW_ZERO_NEGATIVE:
+        return NativeZeroDivisionError(
+            f"0.0 cannot be raised to a negative power ({runtime_message})"
+        )
+    if int(code) == FLOAT_POW_COMPLEX_RESULT:
+        return NativeFloatPowComplexResult(
+            "negative float ** non-integer float is complex in Python "
+            f"({runtime_message})"
+        )
+    if int(code) == FLOAT_MATH_DOMAIN:
+        return NativeValueError(f"math domain error ({runtime_message})")
+    if int(code) == FLOAT_POW_OVERFLOW:
+        return NativeFloatOverflow(
+            f"(34, 'Numerical result out of range') ({runtime_message})"
+        )
+    if int(code) == FLOAT_MATH_RANGE:
+        return NativeFloatOverflow(f"math range error ({runtime_message})")
     return RuntimeError(runtime_message)
