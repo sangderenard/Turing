@@ -23420,6 +23420,38 @@ def propagate_bound_planner_specializations(
     if entry is None:
         return
 
+    # Every binding here -- a planner literal or a mutable feed's Program-ABI
+    # descriptor -- comes from the caller of the compile, so that caller's
+    # record of the call is the cell the rows below derive from: one
+    # ``root_call_record`` naming each bound formal's class, as
+    # ``called_inventory.post_root_calls`` posts for the canonical entry.
+    # Without it both writers refused ("planner_specialization: no source
+    # cell ... the binding came from the caller of the compile"; "post
+    # formal_shape: Derived names no source cell"), and every program the
+    # AOT adapter compiled with feeds stopped (all of wasm_fidelity).
+    caller_cells: tuple = ()
+    entry_scope = entry.G.graph.get("lexical_read_scope")
+    if bindings and entry_scope is not None:
+        from .called_inventory import class_spelling
+        from .concordance_declarations import (
+            CONTRACT_DEMAND, INGESTION, ROOT_CALL_RECORD,
+        )
+        from .identity_concordance import (
+            Mode, Novel, current_identity_book,
+        )
+
+        # Keyed by the entry graph's read scope: each compile of a function
+        # is its own call from its own caller.
+        caller_cells = (current_identity_book().post(
+            ROOT_CALL_RECORD, (repr(tuple(entry_scope)), 0),
+            tuple(sorted(
+                (str(name), class_spelling(value))
+                for name, value in bindings.items()
+            )),
+            stage=INGESTION, provenance=Novel(CONTRACT_DEMAND, ()),
+            mode=Mode.CONCORD,
+        ),)
+
     # Mutable public tensors are values, not planner literals, but their
     # extents and element type are still the fixed Program-ABI contract for
     # this compilation.  Previously the mutable filter below discarded both
@@ -23451,6 +23483,7 @@ def propagate_bound_planner_specializations(
             name,
             descriptor,
             "program-abi",
+            caller_cells,
         )
     if mutable_descriptors:
         _apply_callsite_tensor_descriptors(entry, mutable_descriptors)
@@ -23493,14 +23526,14 @@ def propagate_bound_planner_specializations(
             )
         _materialize_planner_specializations(graph_obj)
 
+    entry_bindings = {
+        str(name): value
+        for name, value in bindings.items()
+        if str(name) not in mutable
+    }
     queue: list[tuple[Any, dict[str, Any], dict[str, tuple]]] = [(
-        entry,
-        {
-            str(name): value
-            for name, value in bindings.items()
-            if str(name) not in mutable
-        },
-        {},
+        entry, entry_bindings,
+        {name: caller_cells for name in entry_bindings} if caller_cells else {},
     )]
     visited: set[tuple[int, tuple[str, ...]]] = set()
     while queue:
