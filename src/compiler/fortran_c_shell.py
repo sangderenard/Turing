@@ -23591,6 +23591,32 @@ def _class_surface_ssa_program(
         read ``value_shape_polymorphism``."""
         row = (str(owner.graph.get("function_name")), int(value_id))
         stated = tuple(fact[1] or ())
+        if not stated and not callsites_disagree:
+            # Program: ``v.batch(n, [97, 98, 2], [0, 2, 3])`` beside
+            # ``self.batch(d, atoms, [0, len(atoms)])`` (b27).  Wrong
+            # record: the copy whose formal is the folded literal
+            # ``[97, 98, 2]`` stated no extent over its call edge, so the
+            # other copy's (2,) stood alone on the authored row and was
+            # restamped over this copy's (3,) (refused as a disagreement).
+            # Rule: a formal a copy folded to a literal sequence states
+            # that literal's extent, as its own SSA does.
+            literal_node = next((
+                data for node_id, data in owner.nodes(data=True)
+                if int(data.get("value_id", node_id)) == int(value_id)
+            ), None)
+            literal_attributes = (literal_node or {}).get("attributes") or {}
+            literal = literal_attributes.get("value")
+            if (
+                literal_attributes.get("structural_specialization")
+                and literal_attributes.get("aggregate_kind") in {
+                    "list", "tuple",
+                }
+                and isinstance(literal, (list, tuple))
+                and literal
+                and not any(isinstance(item, (list, tuple)) for item in literal)
+            ):
+                stated = (len(literal),)
+                fact = (fact[0], stated, *tuple(fact[2:]))
         if callsites_disagree:
             source_owner, source_id = source
             caller_cell = _statement_cell(source_owner, source_id)
