@@ -1184,6 +1184,44 @@ SOURCE_EXCEPTION_HANDLER_ENTRY = declare_page(
         RowField("handler_node", K.VALUE_ID),
     ), ExceptionHandlerEntryFact,
 )
+# Native validation status to Python-semantic exception class. The fact is
+# the static definition cell of that class; native-width limitations have
+# no row and therefore cannot enter an authored handler.
+NATIVE_STATUS_CLASS = declare_page(
+    "native_status_class", (
+        RowField("status", K.INDEX),
+    ), object,
+)
+
+
+def concorded_native_status_classes(book: object) -> dict[int, str]:
+    """Read native exception classes from their static definition cells."""
+
+    from .identity_concordance import Derived, Mode
+    from .native_faults import NATIVE_STATUS_CLASS_IDENTITIES
+
+    ensure_builtin_class_topology(book)
+    page = book.page(NATIVE_STATUS_CLASS)
+    for code, identity in sorted(NATIVE_STATUS_CLASS_IDENTITIES.items()):
+        module, name = identity.rsplit(".", 1)
+        class_cell = book.latest_ref(
+            STATIC_SYMBOL_DEFINITION, (module, name, ""),
+        )
+        if class_cell is None:
+            raise ValueError(
+                f"native status {code} has no concorded class {identity}"
+            )
+        if page.latest((int(code),)) is None:
+            book.post(
+                NATIVE_STATUS_CLASS, (int(code),), class_cell,
+                stage=CONTROL_SSA_REGION, provenance=Derived((class_cell,)),
+                mode=Mode.CONCORD,
+            )
+    return {
+        int(row[0]): ".".join(page.latest(row).row[:2])
+        for row in page.rows()
+        if page.latest(row) is not None
+    }
 STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
     "structural_specialization_fixed_point", (
         RowField("invocation", K.SCOPE), RowField("round", K.INDEX),
@@ -3030,6 +3068,8 @@ class SSABlockKind(Enum):
     VALIDATION_FAULT_EXIT = "validation_fault_exit"
     NATIVE_TRY_HANDLER = "native_try_handler"
     NATIVE_TRY_EXIT = "native_try_exit"
+    NATIVE_TRY_CALL_SUCCESS = "native_try_call_success"
+    NATIVE_TRY_CALL_FAILURE = "native_try_call_failure"
     UNREACHABLE_RAISE = "unreachable_raise"
     STATE_CASE = "state_case"
     STATE_NEXT = "state_next"

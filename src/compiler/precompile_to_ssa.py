@@ -2419,6 +2419,7 @@ class _ControlSSABuilder(TiledObject):
         self._index_fault_blocks: list[tuple[BasicBlock, BasicBlock]] = []
         self._fault_exit: BasicBlock | None = None
         self.native_try_frames: list[_NativeTryFrame] = []
+        self._protected_call_edges: set[tuple[Ref, int]] = set()
         self.named_output_histories = {
             str(name): tuple(map(int, history))
             for name, history in (named_output_histories or {}).items()
@@ -9979,6 +9980,209 @@ class _ControlSSABuilder(TiledObject):
             "numeric_union_arm_result",
         )
 
+    def _emit_protected_region_status(
+        self, region_index: int, *, location: str,
+    ) -> None:
+        """Branch from one failed native region call before reading outputs.
+
+        The Try's region/source pair was composed from deployment membership.
+        The source transfer names its catch owner, and each handler-entry row
+        lists that transfer as an exceptional predecessor. Status values are
+        consumed here, so a caught error cannot leak to the host after the
+        native function returns.
+        """
+
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
+            canonical_python_subtype_identities,
+            concorded_native_status_classes,
+        )
+
+        selected = [
+            (frame, int(source_id))
+            for frame in reversed(self.native_try_frames)
+            if frame.phase == "body"
+            for placed_region, source_id in frame.block.protected_region_calls
+            if int(placed_region) == int(region_index)
+        ]
+        if not selected:
+            return
+        if len(selected) != 1:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "native-try", location,
+                "protected region has no unique source call: "
+                f"region={region_index}, matches={selected!r}",
+            ))
+            return
+        frame, source_id = selected[0]
+        book = self._book()
+        row = (self.lexical_read_scope, source_id)
+        transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+        transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+        if (
+            self.lexical_read_scope is None
+            or frame.owner is None
+            or transfer is None or transfer_cell is None
+            or transfer.source_kind != "call"
+            or transfer.catch_try != frame.owner
+            or transfer.unwind_finally
+        ):
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "native-try", location,
+                "protected call has no directly lowerable concorded "
+                f"exception transfer: call={source_id}, region={region_index}",
+            ))
+            return
+        # A region with more than one protected call cannot identify which
+        # call set the status after the region returns. Its source operation
+        # must be split at the region boundary before dispatch is valid.
+        if sum(
+            int(placed_region) == int(region_index)
+            for placed_region, _source in frame.block.protected_region_calls
+        ) != 1:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "native-try", location,
+                f"region {region_index} contains multiple protected calls",
+            ))
+            return
+        if len(self.native_try_frames) > 1:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "native-try", location,
+                "unmatched protected call status needs outer Try dispatch",
+            ))
+            return
+        for handler in frame.block.handlers:
+            entry = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest((
+                self.lexical_read_scope, int(handler.source_handler_node_id),
+            ))
+            if (
+                entry is None or entry.owner != frame.owner
+                or transfer_cell not in entry.incoming_transfers
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-try", location,
+                    "protected call has no concorded handler predecessor: "
+                    f"call={source_id}, handler={handler.source_handler_node_id}",
+                ))
+                return
+
+        status = self.fresh_value(
+            dtype="int64", transform=CONTROL_EXPRESSION,
+            operands=(transfer_cell,),
+        )
+        self.emit(
+            Handler.Call, [], status,
+            attributes={
+                "callee": "turing_validation_error_take",
+                "source_call_node_id": source_id,
+                "exception_transfer_cell": transfer_cell,
+            },
+        )
+        clear = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(status,),
+        )
+        self.emit(Handler.Eq, [status, self.constant_value(0, status)], clear)
+        passed = self.new_block("native_try_call_success")
+        failed = self.new_block("native_try_call_failure")
+        self.conditional_branch(clear, passed, failed)
+        self.current = failed
+
+        status_classes = concorded_native_status_classes(book)
+        all_known = tuple(sorted(status_classes))
+
+        def status_matches(codes: tuple[int, ...]) -> SSAValue:
+            predicates = []
+            for code in codes:
+                equal = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(status,),
+                )
+                self.emit(
+                    Handler.Eq, [status, self.constant_value(code, status)],
+                    equal,
+                )
+                predicates.append(equal)
+            selected_predicate = predicates[0]
+            for predicate in predicates[1:]:
+                combined = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(selected_predicate, predicate),
+                )
+                self.emit(
+                    Handler.LOr, [selected_predicate, predicate], combined,
+                )
+                selected_predicate = combined
+            return selected_predicate
+
+        for index, handler in enumerate(frame.block.handlers):
+            handler_id = int(handler.source_handler_node_id)
+            if not handler.exception_type_identities:
+                # A catch-all catches every Python exception represented by
+                # this ABI, but a native width/result-class limitation is
+                # not an authored exception. Its status must propagate.
+                unmatched = self.new_block("native_try_call_failure")
+                self.conditional_branch(
+                    status_matches(all_known), frame.handler_entries[index],
+                    unmatched,
+                )
+                self.current.instrs[-1].attributes.update({
+                    "source_control": "protected_call_failure",
+                    "source_call_node_id": source_id,
+                    "source_handler_node_id": handler_id,
+                    "exception_transfer_cell": transfer_cell,
+                    "accepted_statuses": all_known,
+                })
+                self.current = unmatched
+                break
+            if len(handler.exception_type_value_ids) != len(
+                handler.exception_type_identities
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-try", location,
+                    f"handler {handler_id} lacks exact class declarations",
+                ))
+                self.current = passed
+                return
+            accepted_classes = set()
+            for identity in handler.exception_type_identities:
+                accepted_classes.update(canonical_python_subtype_identities(
+                    str(identity), book=book,
+                ))
+            codes = tuple(sorted(
+                code for code, identity in status_classes.items()
+                if identity in accepted_classes
+            ))
+            if not codes:
+                continue
+            next_handler = self.new_block("native_try_call_failure")
+            self.conditional_branch(
+                status_matches(codes), frame.handler_entries[index],
+                next_handler,
+            )
+            self.current.instrs[-1].attributes.update({
+                "source_control": "protected_call_failure",
+                "source_call_node_id": source_id,
+                "source_handler_node_id": handler_id,
+                "exception_transfer_cell": transfer_cell,
+                "accepted_statuses": codes,
+            })
+            self.current = next_handler
+
+        self.emit(
+            Handler.Call, [status],
+            attributes={
+                "callee": "turing_validation_error",
+                "source_call_node_id": source_id,
+                "exception_transfer_cell": transfer_cell,
+            },
+        )
+        if self._fault_exit is None:
+            self._fault_exit = self.new_block("validation_fault_exit")
+        self.branch(self._fault_exit)
+        self._protected_call_edges.add((frame.owner, source_id))
+        self.current = passed
+
     def emit_region_call(self, region_index: int, *, location: str) -> None:
         if self.emit_table_region_operations(region_index):
             return
@@ -10104,6 +10308,9 @@ class _ControlSSABuilder(TiledObject):
                 "output_ids": outputs,
                 "result_convention": "ssa.aggregate",
             },
+        )
+        self._emit_protected_region_status(
+            int(region_index), location=location,
         )
         if aggregate is not None:
             for output_index, output_id in enumerate(outputs):
@@ -12175,12 +12382,6 @@ class _ControlSSABuilder(TiledObject):
                         "protected call has no exact source exception edge: "
                         f"call={source_call_id}, try={block.source_try_node_id}",
                     ))
-                else:
-                    self.shortfalls.append(SSALoweringShortfall(
-                        "control", "native-try", path,
-                        "protected call has no lowered native failure edge: "
-                        f"call={source_call_id}, try={block.source_try_node_id}",
-                    ))
             if _flatten_control_sequence(block.finalbody):
                 self.shortfalls.append(SSALoweringShortfall(
                     "control", "native-try", path,
@@ -12196,6 +12397,16 @@ class _ControlSSABuilder(TiledObject):
             self.native_try_frames.append(frame)
             try:
                 self.lower(block.body, path=f"{path}.try_body")
+                for source_call_id in block.protected_call_node_ids:
+                    if owner is not None and (
+                        owner, int(source_call_id)
+                    ) not in self._protected_call_edges:
+                        self.shortfalls.append(SSALoweringShortfall(
+                            "control", "native-try", path,
+                            "protected call has no lowered native failure "
+                            f"edge: call={source_call_id}, "
+                            f"try={block.source_try_node_id}",
+                        ))
                 frame.phase = "orelse"
                 if block.orelse is not None:
                     self.lower(block.orelse, path=f"{path}.try_orelse")

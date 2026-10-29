@@ -63,6 +63,13 @@ FLOAT_POW_OVERFLOW = 95
 #: ``math.pow`` overflow: ``OverflowError("math range error")``.
 FLOAT_MATH_RANGE = 96
 
+# Python's int(float) raises for NaN and infinities before any integer
+# conversion. A finite value beyond the native int64 slot reports the
+# existing INT_OVERFLOW limitation rather than executing undefined C/LLVM
+# float-to-int conversion.
+FLOAT_TO_INT_NAN = 97
+FLOAT_TO_INT_INFINITY = 98
+
 # An authored ``raise`` retains its source node id in the SSA validation
 # contract.  The native status ABI carries the exception class separately:
 # source node ids are local to functions and can collide with runtime fault
@@ -78,6 +85,26 @@ AUTHORED_RAISE_STATUSES = {
     "builtins.KeyError": 0x7FFF0006,
     "builtins.AssertionError": 0x7FFF0007,
     "builtins.NotImplementedError": 0x7FFF0008,
+}
+
+# The validation runtime transports status codes, while source exception
+# control matches classes. This is the native ABI's class view of every
+# status which represents a Python exception. A native-width or result-class
+# limitation is deliberately absent: Python would have produced a value,
+# so an authored except must never catch that compiler limitation.
+NATIVE_STATUS_CLASS_IDENTITIES = {
+    **{code: identity for identity, code in AUTHORED_RAISE_STATUSES.items()},
+    LIST_INDEX_OUT_OF_RANGE: "builtins.IndexError",
+    MAPPING_KEY_ABSENT: "builtins.KeyError",
+    NEGATIVE_SHIFT_COUNT: "builtins.ValueError",
+    INT_ZERO_DIVISION: "builtins.ZeroDivisionError",
+    POW_MODULUS_ZERO: "builtins.ValueError",
+    FLOAT_POW_ZERO_NEGATIVE: "builtins.ZeroDivisionError",
+    FLOAT_MATH_DOMAIN: "builtins.ValueError",
+    FLOAT_POW_OVERFLOW: "builtins.OverflowError",
+    FLOAT_MATH_RANGE: "builtins.OverflowError",
+    FLOAT_TO_INT_NAN: "builtins.ValueError",
+    FLOAT_TO_INT_INFINITY: "builtins.OverflowError",
 }
 
 
@@ -205,4 +232,12 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
         )
     if int(code) == FLOAT_MATH_RANGE:
         return NativeFloatOverflow(f"math range error ({runtime_message})")
+    if int(code) == FLOAT_TO_INT_NAN:
+        return NativeValueError(
+            f"cannot convert float NaN to integer ({runtime_message})"
+        )
+    if int(code) == FLOAT_TO_INT_INFINITY:
+        return NativeOverflowError(
+            f"cannot convert float infinity to integer ({runtime_message})"
+        )
     return RuntimeError(runtime_message)

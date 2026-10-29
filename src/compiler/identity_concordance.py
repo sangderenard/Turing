@@ -1934,15 +1934,46 @@ class CorrelationTable:
         from .concordance_declarations import (
             CANONICAL_VALUE, CONTROL_BLOCK, ControlBlockKind,
             DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
+            NATIVE_STATUS_CLASS,
             SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
             STATIC_SYMBOL_DEFINITION,
         )
+        from .native_faults import NATIVE_STATUS_CLASS_IDENTITIES
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None or SOURCE_EXCEPTION_TRANSFER.name not in book.pages:
             return []
         page = book.page(SOURCE_EXCEPTION_TRANSFER)
         found: list[Finding] = []
+        status_page = book.page(NATIVE_STATUS_CLASS)
+        status_rows = tuple(status_page.rows())
+        if status_rows and {int(row[0]) for row in status_rows} != set(
+            NATIVE_STATUS_CLASS_IDENTITIES
+        ):
+            found.append(Finding(
+                "native-status-class-set-disagree", "native-status", None,
+                f"rows={status_rows!r}",
+            ))
+        for status_row in status_rows:
+            status_cell = book.latest_ref(NATIVE_STATUS_CLASS, status_row)
+            class_cell = status_page.latest(status_row)
+            expected = NATIVE_STATUS_CLASS_IDENTITIES.get(int(status_row[0]))
+            causes = {
+                source for source, _stage in (
+                    () if status_cell is None else book.edges_into(status_cell)
+                )
+            }
+            if (
+                class_cell is None
+                or class_cell.page != STATIC_SYMBOL_DEFINITION
+                or ".".join(class_cell.row[:2]) != expected
+                or class_cell not in causes
+            ):
+                found.append(Finding(
+                    "native-status-class-disagree", "native-status",
+                    int(status_row[0]),
+                    f"class={class_cell!r}, expected={expected!r}",
+                ))
         for row in page.rows():
             fact = page.latest(row)
             if fact is None:

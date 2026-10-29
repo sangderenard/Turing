@@ -1607,6 +1607,9 @@ exit:
     "turing_validation_error": (
         "declare void @turing_validation_error(i32)"
     ),
+    "turing_validation_error_take": (
+        "declare i32 @turing_validation_error_take()"
+    ),
     # A range loop's induction step saturates (``loop_induction_step``).
     "llvm.sadd.sat.i64": "declare i64 @llvm.sadd.sat.i64(i64, i64)",
     # Python's ``int.bit_length``, the C backend's ``turing_bit_length``
@@ -4516,14 +4519,51 @@ def _emit_repository_call_module(
                     body.append(f"  call void @{HEAP_RELEASE_SYMBOL}(ptr {pointer(instruction.args[0])})")
                     register_cache.clear()
                     continue
-                if symbol == "turing_validation_error":
-                    error_code = int(instruction.attributes.get(
-                        "error_code", 0
+                if symbol == "turing_validation_error_take":
+                    if (
+                        instruction.args or result is None
+                        or result.dtype != "int64"
+                    ):
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, symbol, "validation status take returns "
+                            "one int64 and takes no arguments",
+                        ))
+                        continue
+                    body.extend((
+                        f"  %validation.raw.{tag} = call i32 "
+                        "@turing_validation_error_take()",
+                        f"  %validation.wide.{tag} = zext i32 "
+                        f"%validation.raw.{tag} to i64",
+                        f"  store i64 %validation.wide.{tag}, "
+                        f"ptr {pointer(result)}, align 8",
                     ))
-                    body.append(
-                        "  call void @turing_validation_error"
-                        f"(i32 {error_code})"
-                    )
+                    kernels_used.add(symbol)
+                    continue
+                if symbol == "turing_validation_error":
+                    if instruction.args and len(instruction.args) == 1:
+                        code = load_as(
+                            instruction.args[0], "i64",
+                            f"validation.code.{tag}",
+                        )
+                        body.extend((
+                            f"  %validation.i32.{tag} = trunc i64 {code} to i32",
+                            "  call void @turing_validation_error"
+                            f"(i32 %validation.i32.{tag})",
+                        ))
+                    elif not instruction.args:
+                        error_code = int(instruction.attributes.get(
+                            "error_code", 0
+                        ))
+                        body.append(
+                            "  call void @turing_validation_error"
+                            f"(i32 {error_code})"
+                        )
+                    else:
+                        shortfalls.append(LLVMEmissionShortfall(
+                            name, symbol, "validation error takes one "
+                            "literal code or one SSA code",
+                        ))
+                        continue
                     kernels_used.add(symbol)
                     continue
                 tensor_operation = instruction.attributes.get("tensor_operation")
@@ -5260,6 +5300,65 @@ def _emit_repository_call_module(
 
             if operation in {"Cast", "CastLike", "cast_like"} and result is not None and instruction.args:
                 result_type = _value_llvm_type(result)
+                if (
+                    instruction.attributes.get("extraction_identity")
+                    == "builtins.int"
+                    and str(instruction.args[0].dtype) in {
+                        "float32", "float64",
+                    }
+                    and str(result.dtype) == "int64"
+                ):
+                    from .native_faults import (
+                        FLOAT_TO_INT_INFINITY, FLOAT_TO_INT_NAN,
+                        INT_OVERFLOW,
+                    )
+
+                    source = load_as(
+                        instruction.args[0], "double", f"int.source.{tag}",
+                    )
+                    prefix = f"int.cast.{tag}"
+                    body.extend((
+                        f"  %{prefix}.nan = fcmp uno double {source}, {source}",
+                        f"  %{prefix}.posinf = fcmp oeq double {source}, "
+                        "0x7FF0000000000000",
+                        f"  %{prefix}.neginf = fcmp oeq double {source}, "
+                        "0xFFF0000000000000",
+                        f"  %{prefix}.inf = or i1 %{prefix}.posinf, "
+                        f"%{prefix}.neginf",
+                        f"  %{prefix}.low = fcmp olt double {source}, "
+                        "-9.223372036854776e+18",
+                        f"  %{prefix}.high = fcmp oge double {source}, "
+                        "9.223372036854776e+18",
+                        f"  %{prefix}.range = or i1 %{prefix}.low, "
+                        f"%{prefix}.high",
+                        f"  %{prefix}.fault.range = select i1 %{prefix}.range, "
+                        f"i32 {INT_OVERFLOW}, i32 0",
+                        f"  %{prefix}.fault.inf = select i1 %{prefix}.inf, "
+                        f"i32 {FLOAT_TO_INT_INFINITY}, "
+                        f"i32 %{prefix}.fault.range",
+                        f"  %{prefix}.fault = select i1 %{prefix}.nan, "
+                        f"i32 {FLOAT_TO_INT_NAN}, i32 %{prefix}.fault.inf",
+                        f"  %{prefix}.failed = icmp ne i32 "
+                        f"%{prefix}.fault, 0",
+                        f"  br i1 %{prefix}.failed, label %{prefix}.report, "
+                        f"label %{prefix}.ready",
+                        f"{prefix}.report:",
+                        f"  call void @turing_validation_error(i32 "
+                        f"%{prefix}.fault)",
+                        f"  br label %{prefix}.ready",
+                        f"{prefix}.ready:",
+                        f"  %{prefix}.safe = select i1 %{prefix}.failed, "
+                        f"double 0.0, double {source}",
+                        f"  %{prefix}.value = fptosi double %{prefix}.safe "
+                        "to i64",
+                        f"  store i64 %{prefix}.value, "
+                        f"ptr {pointer(result)}, align 8",
+                    ))
+                    if active_block is not None:
+                        block_exit_label[active_block] = f"{prefix}.ready"
+                    kernels_used.add("turing_validation_error")
+                    register_cache.clear()
+                    continue
                 if contract_integer_narrowing(instruction):
                     own_type = _value_llvm_type(instruction.args[0])
                     body.extend(
