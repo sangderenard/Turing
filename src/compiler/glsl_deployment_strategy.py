@@ -4498,8 +4498,14 @@ def _planned_scalar_dtypes_from_graph(
             # result float64 and an int program returned a float.  Rule:
             # on a proven scalar, ``math.floor``/``ceil``/``trunc`` and
             # one-argument ``round`` return ``int`` in Python.
-            if reference in {
-                "round", "math.floor", "math.ceil", "math.trunc",
+            # Program: ``from math import floor; floor(x)`` (c923).  Wrong
+            # record: this rule read the call's spelling, so the imported
+            # name ``floor`` missed ``math.floor`` and the result took the
+            # float64 operand rule.  Rule: the callee is named by its
+            # resolved extraction identity, whatever the authored spelling.
+            callee_identity = str(attributes.get("extraction_identity") or "")
+            if callee_identity in {
+                "builtins.round", "math.floor", "math.ceil", "math.trunc",
             }:
                 arguments = parents(data, "arg:")
                 if len(arguments) == 1 and scalar.get(arguments[0]) in {
@@ -6572,7 +6578,7 @@ def _build_shell_hierarchy_plan(
                 if operation in {
                     "neg", "abs", "sqrt", "exp", "log", "round", "trunc",
                     "floor", "ceil", "isfinite", "isnan", "isinf",
-                    "logical_not", "tanh", "sin", "cos", "tan", "asin",
+                    "logical_not", "invert", "tanh", "sin", "cos", "tan", "asin",
                     "acos", "atan", "sinh", "cosh", "asinh", "acosh",
                     "atanh", "sign", "add", "sub", "mul", "truediv",
                     "floordiv", "mod", "pow", "less", "less_equal",
@@ -6642,10 +6648,11 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
-                if operation in {"floor", "ceil", "trunc", "round"}:
+                if operation in {"floor", "ceil", "trunc", "round", "invert"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so
                     # (``_planned_scalar_dtypes_from``), the operand does not.
+                    # So is a scalar ``~flag``: Python inverts a bool as int.
                     proven = planned_scalar_dtypes().get(int(current))
                     if proven is not None:
                         dtype = str(proven)

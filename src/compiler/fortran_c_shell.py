@@ -15544,6 +15544,30 @@ def _control_expression_value_ids(expression: Any) -> frozenset[int]:
     ))
 
 
+def _native_boundary_contract(data: Mapping[str, Any]) -> dict:
+    """The extraction contract a call node's native boundary reads."""
+
+    return dict(
+        data.get("extraction_contract")
+        or (data.get("attributes") or {}).get("extraction_contract")
+        or getattr(data.get("expr_obj"), "_extraction_contract", None)
+        or {}
+    )
+
+
+def _installable_native_boundary(data: Mapping[str, Any]) -> bool:
+    """Whether ``_install_external_reference_calls`` retains this node as an
+    ``ExternalReferenceCallBlock``: a ``use_native`` call whose contract
+    records its result dtype.  One without it is left unplaced there."""
+
+    contract = _native_boundary_contract(data)
+    return (
+        isinstance(data.get("expr_obj"), ast.Call)
+        and contract.get("action") == "use_native"
+        and (contract.get("parameters") or {}).get("result_dtype") is not None
+    )
+
+
 def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgraphs):
     """Retain native boundaries and dispatcher operations as lexical control.
 
@@ -15690,12 +15714,7 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
     pending_dispatch = {}
     for node_id, data in sorted(graph_obj.nodes(data=True), key=lambda item: node_position(item[0])):
         expression = data.get("expr_obj")
-        contract = dict(
-            data.get("extraction_contract")
-            or (data.get("attributes") or {}).get("extraction_contract")
-            or getattr(expression, "_extraction_contract", None)
-            or {}
-        )
+        contract = _native_boundary_contract(data)
         dispatch = (data.get("attributes") or {}).get("dispatch_operation")
         if not isinstance(expression, ast.Call) or (
             contract.get("action") != "use_native" and not dispatch
@@ -27420,14 +27439,20 @@ def _class_surface_ssa_program(
                 ),
                 graph=graph,
             )
+        # Program: ``return math.floor(x), int(x)`` (c922).  Wrong record:
+        # every ``use_native`` call node counted as a boundary here, so the
+        # region holding only ``math.floor`` (no ``result_dtype`` in its
+        # contract) was retired as boundary-owned, while
+        # ``_install_external_reference_calls`` left that boundary unplaced:
+        # nothing produced the value and the root returned one value, not
+        # two (``return math.floor(x)`` alone: "returns none").  Rule: a
+        # region is boundary-owned only when every node is a boundary that
+        # installer retains (``_installable_native_boundary``); otherwise
+        # the region computes it, as it does beside other arithmetic (c437).
         external_call_node_ids = {
             int(node_id)
             for node_id, node_data in graph_obj.nodes(data=True)
-            if str((node_data.get("attributes") or {}).get(
-                "extraction_action"
-            ) or (node_data.get("extraction_contract") or {}).get(
-                "action"
-            )) == "use_native"
+            if _installable_native_boundary(node_data)
         }
         external_only_region_indices = {
             int(region_index)

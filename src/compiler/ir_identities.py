@@ -27,6 +27,7 @@ correctly rounded ``pow`` rounds once.
 from __future__ import annotations
 
 import contextlib as _contextlib
+import functools as _functools
 import dataclasses
 from collections.abc import Mapping
 
@@ -2796,6 +2797,326 @@ class WideExpansionEmitter:
             ln2_parts, [binade], width,
         )
         return self.add_expansions(core, restored, width)
+
+    # -- circular functions over the whole double range ----------------------
+    #
+    # sin, cos and tan of one float64, correctly rounded, as straight-line
+    # SSA: an exact reduction onto [-pi/4, pi/4] carried in limbs, the
+    # ``sin``/``cos`` proof cores, a quadrant ``Select``, and one collapse.
+    # Every op is IEEE-exact or a correctly rounded + - * / fma; the only
+    # constants are exact rationals from ``signal_symbolic``. No host library
+    # makes a value or a range decision. (trig cores, package S2b; the
+    # measurement in route_math_to_signal_cores.md found the Cody-Waite
+    # split refused beyond ~2**40, so large arguments take the windowed
+    # 2/pi reduction below.)
+
+    def compare(self, op: str, left, right):
+        """A ``bool`` predicate over two limbs (``Lt``/``Le``/``Eq``/...)."""
+
+        shape = tuple(
+            (left.accounting or {}).get("precision_logical_shape")
+            or tuple(left.shape or ())
+        )
+        result = SSAValue(
+            self._mint(
+                self.function, self._limb_kind, (left, right),
+                dtype="bool", shape=shape, stage=self._stage,
+            ),
+            dtype="bool", shape=shape, device=left.device,
+        )
+        self.emitted.append(Instr(op, [left, right], result, attributes={
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.compare",
+        }))
+        return result
+
+    def select(self, condition, if_true, if_false):
+        """A true select -- never the arithmetic blend that cancels."""
+
+        return self.put("Select", (condition, if_true, if_false), if_true)
+
+    def _modulo(self, value, modulus: float, centred: bool):
+        """``value`` reduced by an exact multiple of ``modulus`` (a power of 2).
+
+        ``value * (1/modulus)`` is exact, ``Floor``/``Round`` of it is an
+        exact integer and the product back is exact, so the difference is
+        exact whenever it is representable -- and it is: it keeps only bits
+        ``value`` already had, below ``modulus``. The centred form keeps a
+        small NEGATIVE value as it is (a floored one would need
+        ``modulus - tiny``, which rounds).
+        """
+
+        put = self.put
+        scaled = put(
+            "Mul", (value, self.scalar_constant(1.0 / modulus, value)), value,
+        )
+        whole = put("Round" if centred else "Floor", (scaled,), value)
+        return put("Sub", (
+            value,
+            put("Mul", (whole, self.scalar_constant(modulus, value)), value),
+        ), value)
+
+    def _cody_waite_reduction(self, magnitude, width: int):
+        """``|x| - k*pi/2`` for ``|x| < CIRCULAR_CODY_WAITE_LIMIT``.
+
+        The split is ``cody_waite_for`` at the limit, so every ``k*piece`` is
+        exact by construction and the residual accumulates in the limbs;
+        the quotient is the shifter's exact nearest integer, as
+        ``signal_symbolic.reduce_argument`` takes it.
+        """
+
+        from fractions import Fraction
+
+        from ..common.tensors.signal_symbolic import (
+            INTEGER_SHIFTER, cody_waite_for,
+        )
+
+        put = self.put
+        pieces = cody_waite_for(
+            CIRCULAR_CODY_WAITE_LIMIT, "pi", Fraction(1, 2),
+        )
+        whole = sum(Fraction(piece) for piece in pieces)
+        shifter = self.scalar_constant(INTEGER_SHIFTER, magnitude)
+        quotient = put("Sub", (
+            put("Add", (
+                put("Mul", (
+                    magnitude, self.scalar_constant(float(1 / whole), magnitude),
+                ), magnitude),
+                shifter,
+            ), magnitude),
+            shifter,
+        ), magnitude)
+        carried = int(width) + 1
+        reduced = self.expanded(magnitude, carried)
+        for piece in pieces:
+            exact = put(
+                "Mul", (quotient, self.scalar_constant(piece, magnitude)),
+                magnitude,
+            )
+            reduced = self.add_expansions(
+                reduced, [put("Neg", (exact,), exact)], carried,
+            )
+        return (
+            self.renormalise(reduced, width),
+            self._modulo(quotient, 4.0, centred=False),
+        )
+
+    def _payne_hanek_reduction(self, magnitude, width: int):
+        """``|x| - k*pi/2`` for any finite ``|x| >= 1``, from windows of 2/pi.
+
+        ``|x| = m * 2**(24*j)`` with ``1 <= m < 2**24`` (an exact compare /
+        ``Select`` ladder of power-of-two scalings). ``m``'s ulp is at least
+        2**-52, so ``m * I`` is a multiple of 4 for any multiple ``I`` of
+        2**54: of ``2**(24*j) * 2/pi`` only ``F_j = (2**(24*j) * 2/pi) mod
+        2**54`` matters for the quadrant and the fraction. ``F_j`` is an
+        exact rational cut into double limbs at build time
+        (``circular_payne_hanek_windows``) and chosen by ``j`` with
+        ``Select``. Each ``m * f`` is an exact fma product pair, each half
+        is reduced mod 4 exactly, and the sum of those small terms is
+        ``|x| * 2/pi`` mod 4 to far below the ~2**-61 closest approach of a
+        double to a multiple of pi/2.
+        """
+
+        from fractions import Fraction
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        put = self.put
+        step = CIRCULAR_PAYNE_HANEK_STEP
+        windows = circular_payne_hanek_windows()
+        scaled = magnitude
+        window = self.scalar_constant(0.0, magnitude)
+        for bit in range(len(windows).bit_length() - 1, -1, -1):
+            shift = step * (1 << bit)
+            if shift > 1023:
+                continue
+            above = self.compare(
+                "Ge", scaled, self.scalar_constant(2.0 ** shift, magnitude),
+            )
+            scaled = self.select(above, put("Mul", (
+                scaled, self.scalar_constant(2.0 ** -shift, magnitude),
+            ), magnitude), scaled)
+            window = self.select(above, put("Add", (
+                window, self.scalar_constant(float(1 << bit), magnitude),
+            ), magnitude), window)
+        chosen = [
+            self.compare(
+                "Eq", window, self.scalar_constant(float(index), magnitude),
+            )
+            for index in range(1, len(windows))
+        ]
+        terms = []
+        for position in range(len(windows[0])):
+            limb = self.scalar_constant(windows[0][position], magnitude)
+            for index, predicate in enumerate(chosen, start=1):
+                limb = self.select(
+                    predicate,
+                    self.scalar_constant(windows[index][position], magnitude),
+                    limb,
+                )
+            high, low = self.two_product(scaled, limb)
+            terms.append(self._modulo(high, 4.0, centred=True))
+            terms.append(self._modulo(low, 4.0, centred=True))
+        carried = int(width) + 2
+        turns = self.renormalise(terms, carried)
+        quotient = put("Round", (turns[0],), turns[0])
+        fraction = self.add_expansions(
+            turns, [put("Neg", (quotient,), quotient)], carried,
+        )
+        half_pi = self.constant_expansion(
+            constant_limbs("pi", carried, scale=Fraction(1, 2)), magnitude,
+        )
+        return (
+            self.multiply_expansions(fraction, half_pi, width),
+            self._modulo(quotient, 4.0, centred=False),
+        )
+
+    def circular_reduction(self, magnitude, width: int):
+        """``(r, q)``: ``|x| = q*pi/2 + r (mod 2*pi)``, ``r`` in ``width`` limbs.
+
+        ``magnitude`` is ``|x|``. Both reductions are spelled and the exact
+        compare picks one, so the SSA stays one straight-line block.
+        """
+
+        moderate, moderate_quadrant = self._cody_waite_reduction(
+            magnitude, width,
+        )
+        large, large_quadrant = self._payne_hanek_reduction(magnitude, width)
+        beyond = self.compare("Ge", magnitude, self.scalar_constant(
+            CIRCULAR_CODY_WAITE_LIMIT, magnitude,
+        ))
+        reduced = [
+            self.select(beyond, wide, narrow)
+            for wide, narrow in zip(large, moderate)
+        ]
+        return reduced, self.select(beyond, large_quadrant, moderate_quadrant)
+
+    def sin_cos_expansion(self, magnitude, width: int):
+        """``(sin(r), cos(r), q)`` for ``|x| = q*pi/2 + r``: both proof cores."""
+
+        reduced, quadrant = self.circular_reduction(magnitude, width)
+        return (
+            self.proof_core("sin", reduced, width),
+            self.proof_core("cos", reduced, width),
+            quadrant,
+        )
+
+    def circular_double(self, name: str, source, width: int = 2):
+        """Correctly rounded ``sin``/``cos``/``tan`` of one float64 value.
+
+        Returns ``(value, domain_error)``. ``domain_error`` is the ``bool``
+        "``source`` is +-inf": Python raises ``ValueError('math domain
+        error')`` there, which a straight-line emitter cannot spell, so the
+        lowering that places this must guard it; ``value`` is NaN in that
+        lane. NaN in gives NaN out (``x - x`` keeps the payload), and
+        ``sin``/``tan`` return a zero argument itself, so ``-0.0`` stays
+        ``-0.0``. The result is the existing collapse of the limbs (their
+        sum, high first), negated exactly where the symmetry says so.
+        """
+
+        if name not in ("sin", "cos", "tan"):
+            raise ValueError(f"circular_double has no {name!r}")
+        put = self.put
+        magnitude = put("Abs", (source,), source)
+        sine, cosine, quadrant = self.sin_cos_expansion(magnitude, width)
+        if name == "cos":
+            # cos(|x|) = sin(|x| + pi/2): the same table one quadrant on.
+            quadrant = self._modulo(put("Add", (
+                quadrant, self.scalar_constant(1.0, quadrant),
+            ), quadrant), 4.0, centred=False)
+        parity = self._modulo(quadrant, 2.0, centred=False)
+        odd = self.compare(
+            "Eq", parity, self.scalar_constant(1.0, quadrant),
+        )
+        if name == "tan":
+            numerator = [
+                self.select(odd, c, s) for s, c in zip(sine, cosine)
+            ]
+            denominator = [
+                self.select(odd, s, c) for s, c in zip(sine, cosine)
+            ]
+            value = self.sum_expansion(
+                self.divide_expansions(numerator, denominator, width)
+            )
+            negate = odd
+        else:
+            value = self.sum_expansion([
+                self.select(odd, c, s) for s, c in zip(sine, cosine)
+            ])
+            negate = self.compare(
+                "Ge", quadrant, self.scalar_constant(2.0, quadrant),
+            )
+        value = self.select(negate, put("Neg", (value,), value), value)
+        zero = self.scalar_constant(0.0, source)
+        if name != "cos":
+            below = self.compare("Lt", source, zero)
+            value = self.select(below, put("Neg", (value,), value), value)
+            value = self.select(
+                self.compare("Eq", source, zero), source, value,
+            )
+        largest = self.scalar_constant(_FLOAT64_MAX, source)
+        finite = self.compare("Le", magnitude, largest)
+        value = self.select(
+            finite, value, put("Sub", (source, source), source),
+        )
+        return value, self.compare("Gt", magnitude, largest)
+
+
+#: Below this ``|x|`` the circular reduction is Cody-Waite (the split
+#: ``cody_waite_for`` derives for it); at and above it, the windowed 2/pi
+#: reduction. The split's own precision falls as its reach grows (each
+#: piece keeps ``53 - log2(k) - guard`` bits), so the limit stays where
+#: ``k * (pi/2)`` carries ~150 bits; the windowed reduction has no such
+#: limit and covers everything above. (trig cores, package S2b)
+CIRCULAR_CODY_WAITE_LIMIT = 2.0 ** 10
+
+#: Exponent step between the 2/pi windows: ``|x| = m * 2**(24*j)``.
+CIRCULAR_PAYNE_HANEK_STEP = 24
+
+#: Double limbs per window of ``(2**(24*j) * 2/pi) mod 2**54``.
+CIRCULAR_PAYNE_HANEK_LIMBS = 6
+
+#: The largest finite binary64, spelled exactly (``(2 - 2**-52) * 2**1023``).
+_FLOAT64_MAX = (2.0 - 2.0 ** -52) * 2.0 ** 1023
+
+
+@_functools.lru_cache(maxsize=1)
+def circular_payne_hanek_windows() -> tuple:
+    """``(2**(24*j) * 2/pi) mod 2**54`` as exact double limbs, per window.
+
+    One row per ``j`` with ``24*j <= 1023``. 2/pi is the exact rational
+    ``signal_symbolic.constant_rational('pi')`` gives, to enough digits that
+    the deepest window's last limb is still exact; each row is cut by
+    nearest-double heads with the remainder carried, as
+    ``limb_decomposition`` cuts any rational.
+    """
+
+    from fractions import Fraction
+
+    from ..common.tensors.signal_symbolic import constant_rational
+
+    step = CIRCULAR_PAYNE_HANEK_STEP
+    count = 1023 // step + 1
+    # Bits wanted: the deepest window's shift, the 54 kept above the
+    # point, the limbs' own ~53 bits each, and a margin.
+    bits = step * (count - 1) + 54 + 53 * CIRCULAR_PAYNE_HANEK_LIMBS + 64
+    two_over_pi = Fraction(2) / constant_rational(
+        "pi", int(bits * 0.30103) + 20,
+    )
+    modulus = 1 << 54
+    rows = []
+    for index in range(count):
+        window = two_over_pi * (1 << (step * index))
+        rest = window - modulus * (window.numerator // (
+            window.denominator * modulus
+        ))
+        row = []
+        for _ in range(CIRCULAR_PAYNE_HANEK_LIMBS):
+            head = float(rest)
+            row.append(head)
+            rest -= Fraction(head)
+        rows.append(tuple(row))
+    return tuple(rows)
 
 
 def lower_precision_operations(
