@@ -5680,14 +5680,23 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             return interval, ()
         if interval is None:
             return None, tuple(read)
+        # Program: Token Orchard ``structure_rebuild``: a read under guards
+        # that cannot all hold (``kind == 2`` on a path where ``kind`` was
+        # proven 3).  Wrong record: the meet was empty (low > high) and was
+        # posted as the value's interval, which no layout holds (TypeError
+        # in the planner).  Rule: a read no path reaches proves nothing
+        # new; it keeps the interval it had before the guards.
         if interval == _INT_RANGE_TOP:
-            if low is None or high is None:
+            if low is None or high is None or low > high:
                 return _INT_RANGE_TOP, ()
             return (low, high), tuple(read)
-        return (
+        met = (
             interval[0] if low is None else max(interval[0], low),
             interval[1] if high is None else min(interval[1], high),
-        ), tuple(read)
+        )
+        if met[0] > met[1]:
+            return interval, ()
+        return met, tuple(read)
 
     # Every callsite's actual for every formal; a callsite that leaves a
     # formal unbound (its default, a ``*args`` spread we cannot place) makes
