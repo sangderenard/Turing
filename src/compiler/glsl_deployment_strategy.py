@@ -1936,9 +1936,19 @@ _MUTABLE_RETURN_KINDS = frozenset({"list", "set", "dict", "bytearray"})
 
 
 def _born_in_callee_list(child_graph: Any, value_id: int) -> bool:
-    """A list this function creates (a display, a materialization or a
-    comprehension), not a parameter's or another object's storage.  A store
-    version (``r[1] = n; return r``) is the list it writes."""
+    """A list this function creates (a display, a materialization, a
+    ``list(iterable)`` call or a comprehension), not a parameter's or another
+    object's storage.  A store version (``r[1] = n; return r``) is the list
+    it writes.
+
+    Program: Token Orchard ``Vocabulary.expand`` -- ``return STATUS_OK, []``
+    on two paths, ``return STATUS_OK, [atom]`` and ``return STATUS_OK,
+    list(self.exact_atoms[begin : begin + count])``.  Wrong record: the
+    ``list(...)`` call (producer ``aggregate_materialization``) was not
+    counted as born here, so the function was refused.  Rule: ``list(x)``
+    always builds a new list, exactly like a display, so it dies at the
+    return and the copy into the one result is unobservable.
+    """
 
     value_id = _indexed_store_source(child_graph, value_id)
     data = child_graph.nodes[value_id] if value_id in child_graph else {}
@@ -1948,7 +1958,10 @@ def _born_in_callee_list(child_graph: Any, value_id: int) -> bool:
         and attributes.get("binding_kind") != "parameter"
         and (
             attributes.get("producer_kind")
-            in {"aggregate", "sequence_materialization", "sequence_replication"}
+            in {
+                "aggregate", "sequence_materialization", "sequence_replication",
+                "aggregate_materialization", "loop_materialization",
+            }
             or data.get("type") == "LoopResult"
             or isinstance(data.get("expr_obj"), ast.ListComp)
         )
@@ -1960,11 +1973,14 @@ def _refuse_divergent_collection_returns(child_graph: Any) -> None:
     collections in one slot, unless each is a list born in the function
     (see the receipt at its caller)."""
 
+    # A site whose value is no longer in the graph was pruned with its
+    # branch (``expand(5)``: a constant argument folds the ``t == 0`` arms
+    # away, but the site table still lists them); it returns no storage.
     sites = child_graph.graph.get("return_slot_values") or {}
     by_slot: dict[int, set[int]] = {}
     for values in sites.values():
         for slot, value_id in enumerate(values or ()):
-            if value_id is not None:
+            if value_id is not None and int(value_id) in child_graph:
                 by_slot.setdefault(slot, set()).add(int(value_id))
     for slot, value_ids in by_slot.items():
         if len(value_ids) < 2:
@@ -2405,6 +2421,36 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
 
 
 _CALLEE_RETURN_ACTIVE: set[int] = set()
+_CALLEE_PLAN_MEMO: dict[tuple[int, frozenset[int]], dict[int, str]] | None = None
+
+
+def _callee_planned_dtypes(callee: Any) -> dict[int, str] | None:
+    """A callee's planned scalar dtypes, or ``None`` inside its own plan.
+
+    Program: the Token Orchard core, whose methods read other methods'
+    returned tuples (``status, atoms = self.expand(token)``) at many sites.
+    Wrong record: every read replanned the callee, and each callee plan
+    replanned ITS callees, so one caller plan cost the product of the call
+    depths (the core's lowering never left callsite specialization).  Rule:
+    within one outermost plan the graphs are only read, so a callee's plan
+    under one set of active (cycle-cut) callees is one value; it is kept
+    until that outermost plan returns.
+    """
+
+    if id(callee) in _CALLEE_RETURN_ACTIVE:
+        return None
+    memo = _CALLEE_PLAN_MEMO
+    key = (id(callee), frozenset(_CALLEE_RETURN_ACTIVE))
+    if memo is not None and key in memo:
+        return memo[key]
+    _CALLEE_RETURN_ACTIVE.add(id(callee))
+    try:
+        planned = _planned_scalar_dtypes_from(callee)
+    finally:
+        _CALLEE_RETURN_ACTIVE.discard(id(callee))
+    if memo is not None:
+        memo[key] = planned
+    return planned
 
 
 def _callee_return_scalar_dtype(
@@ -2430,13 +2476,11 @@ def _callee_return_scalar_dtype(
         site_values = list(sites.values()) if sites is not None else []
     except (AttributeError, KeyError, ValueError, TypeError):
         return None
-    if not site_values or id(callee) in _CALLEE_RETURN_ACTIVE:
+    if not site_values:
         return None
-    _CALLEE_RETURN_ACTIVE.add(id(callee))
-    try:
-        dtypes = _planned_scalar_dtypes_from(callee)
-    finally:
-        _CALLEE_RETURN_ACTIVE.discard(id(callee))
+    dtypes = _callee_planned_dtypes(callee)
+    if dtypes is None:
+        return None
     found: list[str | None] = []
     kinds: set[str] = set()
     for values in site_values:
@@ -2467,7 +2511,118 @@ def _callee_return_scalar_dtype(
     return next(iter(kinds)), found[0]
 
 
+def _callee_return_member_dtype(
+    graph: Any, reference: int, member: int,
+) -> tuple[str, str] | None:
+    """The class of member ``member`` of a callee's returned tuple, or ``None``.
+
+    Program: Token Orchard ``status, atoms = vocabulary.expand(token)`` where
+    ``expand`` returns ``(STATUS_OK, list(self.exact_atoms[b : e]))`` over an
+    ``array("I")``.  Wrong record: the caller typed ``result[1]`` only from
+    the whole tuple's joined class, and int64 joined with uint32 rows is no
+    one class, so ``for a in atoms`` had no settled dtype.  Rule: each
+    member of a returned tuple display is its own value.  ``("scalar",
+    dtype)`` when member ``member`` of every return site is a scalar of one
+    class, ``("element", dtype)`` when it is a list of one element class.
+    Sites that are not tuple displays, or that disagree, prove nothing.
+    """
+
+    try:
+        callee = graph.function_table.entry(int(reference)).graph
+        callee_graph = callee.G
+        sites = callee_graph.graph.get("return_slot_values")
+        site_values = list(sites.values()) if sites is not None else []
+    except (AttributeError, KeyError, ValueError, TypeError):
+        return None
+    if not site_values:
+        return None
+    dtypes = _callee_planned_dtypes(callee)
+    if dtypes is None:
+        return None
+    found: set[str | None] = set()
+    kinds: set[str] = set()
+    for values in site_values:
+        values = tuple(values)
+        # A pruned site (its branch folded away) returns nothing.
+        if values and all(int(value) not in callee_graph for value in values):
+            continue
+        # A returned tuple display is already one slot per member
+        # (``return STATUS_OK, atoms`` is the site ``(status, atoms)``); a
+        # site returning one tuple value names its members as leaves.
+        if len(values) > 1:
+            leaves = values
+        else:
+            if len(values) != 1 or int(values[0]) not in callee_graph:
+                return None
+            node = callee_graph.nodes[int(values[0])]
+            if not isinstance(node.get("expr_obj"), ast.Tuple):
+                return None
+            leaves = tuple(map(int, (node.get("attributes") or {}).get(
+                "aggregate_leaf_value_ids", ()
+            )))
+        if not 0 <= int(member) < len(leaves):
+            return None
+        leaf_id = int(_indexed_store_source(callee_graph, int(leaves[int(member)])))
+        if leaf_id not in callee_graph:
+            return None
+        leaf_attributes = callee_graph.nodes[leaf_id].get("attributes") or {}
+        aggregate_kind = leaf_attributes.get("aggregate_kind")
+        if aggregate_kind is not None and aggregate_kind != "list":
+            return None
+        kinds.add("element" if aggregate_kind == "list" else "scalar")
+        if (
+            aggregate_kind == "list"
+            and dtypes.get(leaf_id) is None
+            and leaf_attributes.get("producer_kind") == "aggregate"
+            and not leaf_attributes.get("aggregate_leaf_value_ids")
+        ):
+            # An empty display states no element class; the other sites'
+            # rows are the member's (as the branch-join rule reads ``[]``).
+            continue
+        found.add(dtypes.get(leaf_id))
+    if not found or None in found or len(kinds) != 1:
+        return None
+    if len(found) > 1:
+        # Python ints of several proven layouts: their exact value-domain
+        # join (``int64`` with ``uint32`` rows is ``int64``), never a guess.
+        from ..transmogrifier.dtype_layout import common_integer_dtype
+
+        joined = common_integer_dtype(tuple(found))
+        if joined is None:
+            return None
+        return next(iter(kinds)), joined
+    return next(iter(kinds)), next(iter(found))
+
+
 def _planned_scalar_dtypes_from(
+    graph: Any,
+    *,
+    assumed_elements: dict[int, str] | None = None,
+    observed_writers: dict[int, str | None] | None = None,
+) -> dict[int, str]:
+    """Scalar dtypes the source proves; callee plans are kept for its span.
+
+    The outermost call owns the callee-plan memo (``_callee_planned_dtypes``);
+    it is dropped when that call returns, so no plan outlives the graphs it
+    read.
+    """
+
+    global _CALLEE_PLAN_MEMO
+    outermost = _CALLEE_PLAN_MEMO is None
+    if outermost:
+        _CALLEE_PLAN_MEMO = {}
+    try:
+        return _planned_scalar_dtypes_from_graph(
+            graph,
+            assumed_elements=assumed_elements,
+            observed_writers=observed_writers,
+        )
+    finally:
+        if outermost:
+            _CALLEE_PLAN_MEMO = None
+
+
+def _planned_scalar_dtypes_from_graph(
     graph: Any,
     *,
     assumed_elements: dict[int, str] | None = None,
@@ -3756,6 +3911,41 @@ def _planned_scalar_dtypes_from(
                 continue
             if op in {"indexed", "getitem", "subscript"}:
                 base = parents(data, "base", "value", "object")
+                # ``status, atoms = v.expand(t)``: a literal member of a
+                # call's returned tuple is that member's own class (see
+                # ``_callee_return_member_dtype``).
+                base_attributes = (
+                    G.nodes[base[0]].get("attributes") or {} if base else {}
+                )
+                base_reference = base_attributes.get(
+                    "callee_ref", base_attributes.get("method_ref")
+                )
+                member_index = None
+                for index_node in parents(data, "index"):
+                    index_data = G.nodes[index_node]
+                    literal = index_data.get("constant")
+                    if literal is None:
+                        literal = (index_data.get("attributes") or {}).get(
+                            "value"
+                        )
+                    if isinstance(literal, int) and not isinstance(literal, bool):
+                        member_index = int(literal)
+                member_dtype = (
+                    _callee_return_member_dtype(
+                        graph, int(base_reference), member_index,
+                    )
+                    # A method call is named by its method (``expand``); its
+                    # resolved reference names the callee either way.
+                    if base and base_reference is not None
+                    and member_index is not None
+                    else None
+                )
+                if member_dtype is not None:
+                    settle(
+                        scalar if member_dtype[0] == "scalar" else element,
+                        node_id, member_dtype[1],
+                    )
+                    continue
                 if base and base[0] in row_element:
                     # A row of a list of lists is a list of the shared class.
                     settle(element, node_id, row_element[base[0]])
@@ -24403,6 +24593,27 @@ def _shape_only_view_operations() -> frozenset[str]:
 _SHAPE_ONLY_VIEW_OPERATIONS = _shape_only_view_operations()
 
 
+def _operand_result_dtype(dtypes) -> str:
+    """The dtype an elementwise result of operands of ``dtypes`` holds.
+
+    Program: the Token Orchard digest ``(d * 1000003 + v + 7) % M``, whose
+    proven-wide sides are the internal ``int128`` layout.  Wrong record:
+    ``np.result_type`` was asked to promote them; NumPy has no ``int128``
+    (the lowering crashed) and promotes ``int64`` with ``uint64`` to
+    ``float64``, which no Python int arithmetic does.  Rule: integer (and
+    bool) operands join by exact value domain (``common_integer_dtype``);
+    only a floating operand promotes the NumPy way.
+    """
+
+    from ..transmogrifier.dtype_layout import common_integer_dtype
+
+    names = tuple(str(dtype) for dtype in dtypes)
+    joined = common_integer_dtype(names)
+    if joined is not None:
+        return joined
+    return str(np.result_type(*(np.dtype(name) for name in names)))
+
+
 def _promoting_sides(
     graph: Any, operands: tuple[int, ...], sides: list[Any],
 ) -> list[Any]:
@@ -24427,12 +24638,24 @@ def _promoting_sides(
             literal, np.generic
         )
 
+    def floating(dtype: str) -> bool:
+        # Program: the Token Orchard digest ``(d * 1000003 + v + 7) % M``.
+        # Wrong record: a proven-wide integer side is the internal ``int128``
+        # layout, which is no NumPy dtype, so asking NumPy its kind crashed
+        # the lowering.  Rule: Turing's declared layout answers first.
+        from ..transmogrifier.dtype_layout import resolve as resolve_layout
+
+        layout = resolve_layout(dtype)
+        if layout is not None:
+            return layout.kind == "float"
+        return np.dtype(dtype).kind in "fc"
+
     strong = [
         side for operand, side in zip(operands, sides)
         if not weak_scalar(operand, side)
     ]
     if strong and len(strong) < len(sides) and any(
-        np.dtype(str(side.get("dtype"))).kind in "fc"
+        floating(str(side.get("dtype")))
         for side in strong
         if str(side.get("dtype") or "unknown") != "unknown"
     ):
@@ -25756,14 +25979,14 @@ def _tensor_descriptor_rule(
                         dtype = (
                             "bool"
                             if operation in _ELEMENTWISE_PREDICATE_OPERATIONS
-                            else str(np.result_type(*(
-                                np.dtype(str(side.get("dtype")))
+                            else _operand_result_dtype(
+                                str(side.get("dtype"))
                                 for side in _promoting_sides(
                                     graph, operands, sides,
                                 )
                                 if str(side.get("dtype") or "unknown")
                                 != "unknown"
-                            )))
+                            )
                         )
                         return {
                             "shape": tuple(broadcast),
@@ -25801,7 +26024,7 @@ def _tensor_descriptor_rule(
                         for side in sides
                     )
                     known_dtypes = tuple(
-                        np.dtype(str(side.get("dtype")))
+                        str(side.get("dtype"))
                         for side in (
                             _promoting_sides(graph, operands, sides)
                             if scalar_sides else ()
@@ -25811,7 +26034,7 @@ def _tensor_descriptor_rule(
                     dtype = (
                         "bool"
                         if operation in _ELEMENTWISE_PREDICATE_OPERATIONS
-                        else str(np.result_type(*known_dtypes))
+                        else _operand_result_dtype(known_dtypes)
                         if known_dtypes else "unknown"
                     )
                     if len(ranks) == 1 and scalar_sides:
@@ -26115,11 +26338,9 @@ def _tensor_descriptor_rule(
                             element = "int64" if dtype in {
                                 "bool", "int", "int32", "int64",
                             } else dtype
-                            dtype = str(np.result_type(
-                                np.dtype(element),
-                                np.dtype(str(
-                                    start_descriptor.get("dtype") or "int64"
-                                )),
+                            dtype = _operand_result_dtype((
+                                element,
+                                str(start_descriptor.get("dtype") or "int64"),
                             ))
                 if reduced is not None:
                     return {

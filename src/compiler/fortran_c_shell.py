@@ -178,6 +178,7 @@ from .resident_sequence_materialization import (
     _compiled_validation_diagnostic_sequence_ids as _compiled_validation_diagnostic_sequence_ids,
     _source_optional_glyph_materializations as _source_optional_glyph_materializations,
     _string_token_glyph_materializations as _string_token_glyph_materializations,
+    _source_sequence_slices as _source_sequence_slices,
     _source_sequence_snapshots as _source_sequence_snapshots,
     _static_mapping_capacity_bounds as _static_mapping_capacity_bounds,
     _static_sequence_capacity_bounds as _static_sequence_capacity_bounds,
@@ -11087,6 +11088,16 @@ def _field_slot_ops(
         )),)
         if len(leaf_ids) == 1
     }
+    # Program: Token Orchard ``list(self.exact_atoms[b : b + n])``.  Wrong
+    # record: the ``list(...)`` materializer records its one argument, the
+    # slice, as its sole leaf, so the slice was taken for a singleton's
+    # scalar and declared no arena; its reset and append_slice then had no
+    # descriptor.  Rule: a sequence a recorded slice operation writes owns
+    # its rows; it is never a scalar leaf.
+    singleton_structural_scalar_ids -= {
+        int(mutation.sequence_value_id)
+        for mutation in _source_sequence_slices(graph_obj)
+    }
     # Program: ``for f in (1, n): r += f`` (fuzz p89_3).  Wrong record: the
     # tuple display stayed a record, so the loop's indexed reads had no
     # arena and the display became an unexplained root input (loud).  Rule:
@@ -11116,7 +11127,12 @@ def _field_slot_ops(
             "list", "set", "frozenset", "dict", "bytes", "bytearray", "array"
         }:
             continue
-        if aggregate_kind == "array" and attributes.get("producer_kind") != "sequence_materialization":
+        # An array is born by ``array(typecode)`` or by slicing one
+        # (``a[i:j]`` is a new array of the same typecode, filled by its
+        # append_slice operation); any other array value is a view.
+        if aggregate_kind == "array" and attributes.get("producer_kind") not in {
+            "sequence_materialization", "sequence_slice",
+        }:
             continue
         if attributes.get("mapping_display_child"):
             # A list value of a dict display is a row of the mapping's child
