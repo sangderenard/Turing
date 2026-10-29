@@ -406,12 +406,17 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         static method only.  ``Ops.m(obj, x)`` on an instance method passes
         ``obj`` as ``self``, which a receiver edge cannot state, so it stays
         unlinked.
+
+        Program: ``CorrelationTable.build(module)`` with ``build`` a class
+        method (bootstrap, c940).  A class method binds the class object as
+        ``cls``: the receiver edge states exactly that binding, so it is
+        admitted with the static methods.
         """
 
         node = graph.G.nodes.get(int(receiver_id), {})
         if class_object_binding(node.get("attributes") or {}) is None:
             return True
-        return method_bindings.get(int(reference)) == "static"
+        return method_bindings.get(int(reference)) in {"static", "class"}
 
     def receiver_class(value_id: int) -> str | None:
         pending = [int(value_id)]
