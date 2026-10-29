@@ -79,28 +79,29 @@ def run_class_route(source_path: Path, class_name: str, output: Path) -> dict:
 
     source = source_path.read_text(encoding="utf-8")
     captured: dict[str, object] = {}
-    lower = shell._class_surface_ssa_program
+    lower = shell.lower_ast_source_to_ssa
 
     def capture(*args, **kwargs):
-        from src.compiler.planned_shell_tree import _walk_planned_shells
-
-        # The executable shells the deployment planned for this object: a
-        # method planned here but absent from the module was dropped after
-        # planning, not left unplanned.
-        captured["planned"] = sorted({
-            str(graph.graph.get("function_name"))
-            for planned in _walk_planned_shells(
-                args[0].deployment, include_function_registry=False,
-            )
-            for graph in (getattr(getattr(planned, "process_graph", None), "G", None),)
-            if graph is not None and graph.graph.get("function_name")
-        })
         result = lower(*args, **kwargs)
-        captured["module"] = result[0]
+        module = result[0]
+        # The units the compiler planned for this object: a method planned
+        # here but absent from the module was dropped after planning, not
+        # left unplanned.
+        plan = (getattr(module, "metadata", {}) or {}).get(
+            "compilation_unit_plan"
+        ) or {}
+        prefix = f"{class_name}."
+        captured["planned"] = sorted({
+            str(name)[len(prefix):]
+            for unit in plan.get("units", ())
+            for name in unit.get("qualified_names", ())
+            if str(name).startswith(prefix)
+        })
+        captured["module"] = module
         captured["exports"] = tuple(result[2])
         return result
 
-    shell._class_surface_ssa_program = capture
+    shell.lower_ast_source_to_ssa = capture
     started = time.monotonic()
     refusal = None
     library = None
@@ -122,7 +123,7 @@ def run_class_route(source_path: Path, class_name: str, output: Path) -> dict:
             ],
         }
     finally:
-        shell._class_surface_ssa_program = lower
+        shell.lower_ast_source_to_ssa = lower
     module = captured.get("module")
     functions = (
         None if module is None else sorted(getattr(module, "functions", {}))
