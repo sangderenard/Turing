@@ -12143,6 +12143,21 @@ class _ControlSSABuilder(TiledObject):
                     "control", "native-try", path,
                     f"Try {block.source_try_node_id} has no exact source cell",
                 ))
+            placed_calls = tuple(
+                int(source_id)
+                for _region, source_id in block.protected_region_calls
+            )
+            if (
+                len(placed_calls) != len(set(placed_calls))
+                or set(placed_calls) != set(block.protected_call_node_ids)
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-try", path,
+                    "protected call sources disagree with their exact "
+                    f"scheduled regions: try={block.source_try_node_id}, "
+                    f"calls={block.protected_call_node_ids!r}, "
+                    f"placements={block.protected_region_calls!r}",
+                ))
             for source_call_id in block.protected_call_node_ids:
                 transfer = (
                     None if self.lexical_read_scope is None else

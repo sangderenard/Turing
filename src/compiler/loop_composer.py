@@ -6994,23 +6994,50 @@ def analyze_shader_loop_reductions(
                     owned.get((arm, 0), ()), key=lambda pair: pair[0],
                 )
             ))
+            protected_calls = tuple(dict.fromkeys(
+                int(source_id)
+                for _position, item in owned.get(("body", 0), ())
+                for source_id in item_source_nodes(item)
+                if source_id in graph.G
+                and isinstance(
+                    graph.G.nodes[source_id].get("expr_obj"), ast.Call,
+                )
+                and source_id in transfers
+                and transfers[source_id].catch_try_node_id == int(try_id)
+            ))
+            protected_regions = []
+            for _position, item in owned.get(("body", 0), ()):
+                if not isinstance(item, StatementBlock) or len(item.lines) != 1:
+                    continue
+                marker = item.lines[0]
+                if not (
+                    marker.startswith("__scheduled_region_")
+                    and marker.endswith("__")
+                ):
+                    continue
+                region_index = int(marker[len("__scheduled_region_"):-2])
+                protected_regions.extend(
+                    (int(region_index), int(source_id))
+                    for source_id in item_source_nodes(item)
+                    if int(source_id) in protected_calls
+                )
+            if (
+                set(source_id for _region, source_id in protected_regions)
+                != set(protected_calls)
+                or len(protected_regions) != len(set(protected_regions))
+                or len({source_id for _region, source_id in protected_regions})
+                != len(protected_regions)
+            ):
+                blockers.append("try-protected-call-has-no-unique-region")
+                continue
             try_block = NativeTryBlock(
                 body=arm_sequence("body"),
                 handlers=tuple(handlers),
                 orelse=(arm_sequence("orelse") if try_statement.orelse else None),
                 finalbody=arm_sequence("finalbody"),
                 source_try_node_id=int(try_id),
-                protected_call_node_ids=tuple(dict.fromkeys(
-                    int(source_id)
-                    for _position, item in owned.get(("body", 0), ())
-                    for source_id in item_source_nodes(item)
-                    if source_id in graph.G
-                    and isinstance(
-                        graph.G.nodes[source_id].get("expr_obj"), ast.Call,
-                    )
-                    and source_id in transfers
-                    and transfers[source_id].catch_try_node_id == int(try_id)
-                )),
+                protected_call_node_ids=protected_calls,
+                protected_region_calls=tuple(protected_regions),
             )
             body_items = [
                 *remaining,

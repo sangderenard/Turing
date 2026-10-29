@@ -570,6 +570,10 @@ class NativeTryBlock(TiledObject):
     # protected body. Each has a SOURCE_EXCEPTION_TRANSFER cell; SSA must
     # either lower its exceptional edge or refuse the control program.
     protected_call_node_ids: tuple[int, ...] = ()
+    # Exact placement of those calls in the scheduled region markers.
+    # (region_index, source_call_node_id) is a view of source graph
+    # membership, not a new matching heuristic in SSA.
+    protected_region_calls: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1349,13 +1353,19 @@ def _describe_control_block(
             for handler in block.handlers
             for value_id in handler.exception_type_value_ids
         )
+        sites = cells(block.protected_call_node_ids)
+        regions = tuple(
+            region_ref for region_index, _call_id in block.protected_region_calls
+            for region_ref in (region_cell(region_index),)
+            if region_ref is not None
+        )
         extra = tuple(
             (
                 int(handler.source_handler_node_id),
                 tuple(handler.exception_type_identities),
             )
             for handler in block.handlers
-        )
+        ) + (tuple(block.protected_region_calls),)
     elif isinstance(block, ValidationBlock):
         owner = cell(
             block.source_raise_node_id

@@ -1932,8 +1932,10 @@ class CorrelationTable:
         """
 
         from .concordance_declarations import (
-            CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ENTRY,
-            SOURCE_EXCEPTION_TRANSFER, STATIC_SYMBOL_DEFINITION,
+            CANONICAL_VALUE, CONTROL_BLOCK, ControlBlockKind,
+            DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
+            SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
+            STATIC_SYMBOL_DEFINITION,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -2069,6 +2071,59 @@ class CorrelationTable:
                             str(row[0]), int(row[1]),
                             f"{name!r} from {transfer_cell!r} "
                             f"is not {value_cell!r}",
+                        ))
+        if CONTROL_BLOCK.name in book.pages:
+            control_page = book.page(CONTROL_BLOCK)
+            for row in control_page.rows():
+                control = control_page.latest(row)
+                if control is None or control.kind is not ControlBlockKind.NATIVE_TRY:
+                    continue
+                placements = (
+                    control.extra[-1] if control.extra
+                    and isinstance(control.extra[-1], tuple) else ()
+                )
+                call_ids = tuple(
+                    int(call_id) for _region, call_id in placements
+                )
+                site_ids = tuple(
+                    int(site.row[1]) for site in control.sites
+                    if site.page == CANONICAL_VALUE
+                )
+                if (
+                    len(site_ids) != len(control.sites)
+                    or call_ids != site_ids
+                    or len(call_ids) != len(set(call_ids))
+                ):
+                    found.append(Finding(
+                        "native-try-protected-calls-disagree", str(row[0]),
+                        None, f"placements={placements!r}, sites={control.sites!r}",
+                    ))
+                    continue
+                region_refs = tuple(control.regions)
+                for region_index, call_id in placements:
+                    matching = tuple(
+                        region for region in region_refs
+                        if region.page == DEPLOYMENT_REGION
+                        and int(region.row[1]) == int(region_index)
+                    )
+                    member = (
+                        None if len(matching) != 1 else book.latest_ref(
+                            DEPLOYMENT_REGION_MEMBER,
+                            (matching[0].row[0], int(region_index), int(call_id)),
+                        )
+                    )
+                    transfer = page.latest((row[0], int(call_id)))
+                    if (
+                        member is None
+                        or transfer is None
+                        or transfer.source_kind != "call"
+                        or transfer.catch_try != row[2]
+                    ):
+                        found.append(Finding(
+                            "native-try-protected-region-disagree",
+                            str(row[0]), int(call_id),
+                            f"region={region_index}, member={member!r}, "
+                            f"transfer={transfer!r}, owner={row[2]!r}",
                         ))
         return found
 
