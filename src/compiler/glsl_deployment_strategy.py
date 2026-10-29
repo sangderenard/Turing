@@ -32753,6 +32753,28 @@ def _callsite_return_shape_sources(caller, original, specialized, call_id, retur
         raise ValueError("selected return belongs to a different source callee")
     call_value = int(caller.G.nodes[int(call_id)].get("value_id", call_id))
     binding = book.latest_ref(SOURCE_FUNCTION_REACHABILITY, (caller_scope, call_value, callee_scope))
+    # Program: ``for b in bits: helper(x, b)`` with ``bits`` a bound tuple.
+    # Wrong record: unrolling copies the call per iteration, and the copy's
+    # own id has no reachability row, so its exact return was refused.  Rule:
+    # an unrolled call (``unrolled_from``) is its authored call, whose row is
+    # the reachability authority.
+    authored = int(call_id)
+    seen_unrolled = {authored}
+    while binding is None:
+        origin = (caller.G.nodes.get(authored, {}).get("attributes") or {}).get(
+            "unrolled_from"
+        )
+        if origin is None or int(origin) in seen_unrolled:
+            break
+        authored = int(origin)
+        seen_unrolled.add(authored)
+        authored_value = int(
+            caller.G.nodes.get(authored, {}).get("value_id", authored)
+        )
+        binding = book.latest_ref(
+            SOURCE_FUNCTION_REACHABILITY,
+            (caller_scope, authored_value, callee_scope),
+        )
     if binding is None or book.page(SOURCE_FUNCTION_REACHABILITY).cell(binding.row, binding.column) is not True:
         raise ValueError("selected return has no exact source call reachability authority")
     outputs = tuple(specialized.G.graph.get("function_outputs") or ())
