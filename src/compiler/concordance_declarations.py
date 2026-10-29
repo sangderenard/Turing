@@ -63,6 +63,7 @@ SOURCE_EXCEPTION_CONTROL_UNLOWERED = declare_reason(
     "source_exception_control_unlowered"
 )
 EXCEPTION_ADMISSION = declare_stage("exception_admission")
+EXCEPTION_TOPOLOGY = declare_stage("exception_topology")
 
 
 # -- facts -------------------------------------------------------------------
@@ -1152,6 +1153,151 @@ SOURCE_CONTROL_SPECIALIZATION = declare_page(
 SOURCE_EXCEPTION_ADMISSION = declare_page("source_exception_admission", (
     RowField("source_try", K.PAGE_REF),
 ), object)
+
+
+@dataclass(frozen=True)
+class ExceptionSiteStateFact:
+    """Exact lexical binding versions needed by an exceptional successor."""
+
+    source: Ref
+    scopes: tuple[tuple[Ref, str, Ref | None], ...]
+    required_names: tuple[str, ...]
+    bindings: tuple[tuple[str, Ref], ...]
+
+
+SOURCE_EXCEPTION_SITE_STATE = declare_page("source_exception_site_state", (
+    RowField("ingestion_scope", K.SCOPE),
+    RowField("source_node", K.VALUE_ID),
+), ExceptionSiteStateFact)
+
+
+@dataclass(frozen=True)
+class ExceptionTransferFact:
+    """Source-owned route and state for one fallible operation."""
+
+    source: Ref
+    source_kind: str
+    catch_try: Ref | None
+    scopes: tuple[tuple[Ref, str, Ref | None, bool], ...]
+    unwind_finally: tuple[Ref, ...]
+    raised_class_definition: Ref | None
+    entry_bindings: tuple[tuple[str, Ref], ...]
+
+
+SOURCE_EXCEPTION_TRANSFER = declare_page("source_exception_transfer", (
+    RowField("ingestion_scope", K.SCOPE),
+    RowField("source_node", K.VALUE_ID),
+), ExceptionTransferFact)
+
+
+@dataclass(frozen=True)
+class ExceptionHandlerClassFact:
+    """The authored except type operands and their exact declarations."""
+
+    owner: Ref
+    handler: Ref
+    declarations: tuple[tuple[Ref, Ref | None], ...]
+
+
+SOURCE_EXCEPTION_HANDLER_CLASS = declare_page(
+    "source_exception_handler_class", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("handler_node", K.VALUE_ID),
+    ), ExceptionHandlerClassFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionHandlerEntryFact:
+    """Candidate failure edges and binding versions at one handler entry."""
+
+    owner: Ref
+    handler: Ref
+    candidate_transfers: tuple[Ref, ...]
+    required_names: tuple[str, ...]
+    incoming_bindings: tuple[
+        tuple[str, tuple[tuple[Ref, Ref | None], ...]], ...
+    ]
+
+
+SOURCE_EXCEPTION_HANDLER_ENTRY = declare_page(
+    "source_exception_handler_entry", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("handler_node", K.VALUE_ID),
+    ), ExceptionHandlerEntryFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionHandlerPhiFact:
+    """One handler name joined from exact exceptional predecessor cells."""
+
+    owner: Ref
+    handler: Ref
+    phi: Ref
+    name: str
+    arms: tuple[tuple[Ref, Ref], ...]
+
+
+SOURCE_EXCEPTION_HANDLER_PHI = declare_page(
+    "source_exception_handler_phi", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("phi_node", K.VALUE_ID),
+    ), ExceptionHandlerPhiFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionContinuationPhiFact:
+    """One post-Try name joined from the successful and handler arms."""
+
+    owner: Ref
+    phi: Ref
+    name: str
+    arms: tuple[tuple[str, Ref, Ref], ...]
+
+
+SOURCE_EXCEPTION_CONTINUATION_PHI = declare_page(
+    "source_exception_continuation_phi", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("phi_node", K.VALUE_ID),
+    ), ExceptionContinuationPhiFact,
+)
+
+# A native status is catchable only when this row points at the exact static
+# class definition. Native width limitations intentionally have no row.
+NATIVE_STATUS_CLASS = declare_page("native_status_class", (
+    RowField("status", K.INDEX),
+), object)
+
+
+def concorded_native_status_classes(book: object) -> dict[int, str]:
+    """Read native exception classes from their concorded declarations."""
+
+    from .identity_concordance import Derived, Mode
+    from .native_faults import NATIVE_STATUS_CLASS_IDENTITIES
+
+    ensure_builtin_class_topology(book)
+    page = book.page(NATIVE_STATUS_CLASS)
+    for code, identity in sorted(NATIVE_STATUS_CLASS_IDENTITIES.items()):
+        module, name = identity.rsplit(".", 1)
+        class_cell = book.latest_ref(
+            STATIC_SYMBOL_DEFINITION, (module, name, ""),
+        )
+        if class_cell is None:
+            raise ValueError(
+                f"native status {code} has no concorded class {identity}"
+            )
+        if page.latest((int(code),)) is None:
+            book.post(
+                NATIVE_STATUS_CLASS, (int(code),), class_cell,
+                stage=CONTROL_SSA_REGION,
+                provenance=Derived((class_cell,)), mode=Mode.CONCORD,
+            )
+    return {
+        int(row[0]): ".".join(page.latest(row).row[:2])
+        for row in page.rows() if page.latest(row) is not None
+    }
 STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
     "structural_specialization_fixed_point", (
         RowField("invocation", K.SCOPE), RowField("round", K.INDEX),
@@ -4478,11 +4624,22 @@ def ensure_builtin_class_topology(book: object) -> None:
         (builtins.str, builtins.object),
         (builtins.tuple, builtins.object),
     )
+    # Native exception matching reads these same class-subtype rows. Ingest
+    # the builtin declarations and their direct bases once; SSA dispatch
+    # must not infer a relationship from a class name or host reflection.
+    exception_declarations = tuple(sorted((
+        (candidate, base)
+        for candidate in vars(builtins).values()
+        if isinstance(candidate, type)
+        and candidate.__module__ == "builtins"
+        and issubclass(candidate, BaseException)
+        for base in candidate.__bases__
+    ), key=lambda pair: (pair[0].__name__, pair[1].__name__)))
     page = book.page(CLASS_SUBTYPE)
-    for derived, base in declarations:
+    for derived, base in (*declarations, *exception_declarations):
         row = (
-            canonical_python_type_identity(derived.__name__),
-            canonical_python_type_identity(base.__name__),
+            f"{derived.__module__}.{derived.__qualname__}",
+            f"{base.__module__}.{base.__qualname__}",
         )
         if page.latest(row) is None:
             book.post(

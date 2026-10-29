@@ -34497,6 +34497,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
             )
 
             book = current_identity_book()
+            pending_source_tries = []
             for node_id, data in graph.G.nodes(data=True):
                 expression = data.get("expr_obj")
                 if not isinstance(expression, (ast.Try, ast.TryStar)) or (
@@ -34525,14 +34526,21 @@ class ProcessGraphGLSLDeployment(TiledObject):
                         "source exception admission disagrees with its "
                         f"source Try: {source_cell!r}"
                     )
+                pending_source_tries.append((int(node_id), source_cell))
+            if pending_source_tries:
+                # Program: two retained Try statements in one function.
+                # Previously the first refusal left the second with no
+                # admission row at all. Every authored Try is an obligation
+                # even when one unresolved owner already stops compilation.
+                boundaries = tuple({
+                    "kind": "source-exception-control-owner",
+                    "source_try_cell": repr(source_cell),
+                    "source_try_node_id": node_id,
+                } for node_id, source_cell in pending_source_tries)
                 raise CompilationSubdivisionRequired(
                     "authored Try has no concorded exceptional control "
-                    f"owner: source_try={source_cell!r}",
-                    boundaries=({
-                        "kind": "source-exception-control-owner",
-                        "source_try_cell": repr(source_cell),
-                        "source_try_node_id": int(node_id),
-                    },),
+                    f"owner: source_tries={tuple(cell for _, cell in pending_source_tries)!r}",
+                    boundaries=boundaries,
                 )
         #
         # ``reduction_cache`` (a ``ReductionArtifactStore``), when given,

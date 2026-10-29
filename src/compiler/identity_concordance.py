@@ -1551,6 +1551,13 @@ class CorrelationTable:
         found.extend(self._binding_kind_findings(module))
         found.extend(self._name_binding_capture_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
+        found.extend(self._source_exception_site_state_findings(module))
+        found.extend(self._source_exception_transfer_findings(module))
+        found.extend(self._source_exception_handler_class_findings(module))
+        found.extend(self._source_exception_handler_entry_findings(module))
+        found.extend(self._source_exception_handler_phi_findings(module))
+        found.extend(self._source_exception_continuation_phi_findings(module))
+        found.extend(self._native_status_class_findings(module))
         found.extend(self._source_exception_admission_findings(module))
         found.extend(self._source_page_declaration_findings(module))
         found.extend(self._graph_work_publication_findings(module))
@@ -1919,6 +1926,479 @@ class CorrelationTable:
                 found.append(Finding(
                     "value-type-tag-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_site_state_findings(module: Any) -> list[Finding]:
+        """A fallible site's demanded names cite exact binding versions."""
+        from .concordance_declarations import (
+            BindingFact, ExceptionSiteStateFact, INGESTION_VALUE,
+            NAME_BINDING, SOURCE_EXCEPTION_SITE_STATE,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_SITE_STATE.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_SITE_STATE)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SITE_STATE, row)
+            source = getattr(fact, "source", None)
+            problem = None
+            if (
+                not isinstance(fact, ExceptionSiteStateFact)
+                or not isinstance(source, Ref)
+                or source.page != INGESTION_VALUE
+                or int(source.row[1]) != int(row[1])
+                or book.page(INGESTION_VALUE).cells.get((
+                    source.row, source.column,
+                )) is None
+            ):
+                problem = "exception site state lacks its exact source value"
+            else:
+                demanded = tuple(fact.required_names)
+                names = tuple(name for name, _cell in fact.bindings)
+                if (
+                    any(
+                        not isinstance(owner, Ref)
+                        or owner.page != INGESTION_VALUE
+                        or book.page(INGESTION_VALUE).cells.get((
+                            owner.row, owner.column,
+                        )) is None
+                        or arm not in {"body", "handler", "orelse", "finalbody"}
+                        or (
+                            (handler is None) != (arm != "handler")
+                            or handler is not None
+                            and (
+                                not isinstance(handler, Ref)
+                                or handler.page != INGESTION_VALUE
+                                or book.page(INGESTION_VALUE).cells.get((
+                                    handler.row, handler.column,
+                                )) is None
+                            )
+                        )
+                        for owner, arm, handler in fact.scopes
+                    )
+                    or len({owner for owner, _arm, _handler in fact.scopes})
+                    != len(fact.scopes)
+                    or demanded != tuple(sorted(set(demanded)))
+                    or names != tuple(sorted(set(names)))
+                    or not set(names).issubset(demanded)
+                ):
+                    problem = "exception site names disagree with demand"
+                else:
+                    for name, binding in fact.bindings:
+                        if (
+                            not isinstance(binding, Ref)
+                            or binding.page != NAME_BINDING
+                            or binding.row[0] != row[0]
+                            or binding.row[1] != name
+                            or not isinstance(
+                                book.page(NAME_BINDING).cells.get((
+                                    binding.row, binding.column,
+                                )), BindingFact
+                            )
+                        ):
+                            problem = "exception site uses a nonexact name binding"
+                            break
+            if problem is None:
+                causes = {
+                    cell for cell, _stage in book.edges_into(receipt)
+                }
+                if causes != {
+                    fact.source,
+                    *(owner for owner, _arm, _handler in fact.scopes),
+                    *(handler for _owner, _arm, handler in fact.scopes
+                      if handler is not None),
+                    *(cell for _name, cell in fact.bindings),
+                }:
+                    problem = "exception site provenance disagrees with bindings"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-site-state-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_transfer_findings(module: Any) -> list[Finding]:
+        """Each route is derived from its site's exact lexical scopes."""
+        from .concordance_declarations import (
+            ExceptionSiteStateFact, ExceptionTransferFact, SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_TRANSFER,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_SITE_STATE.name not in book.pages:
+            return []
+        found = []
+        site_page = book.page(SOURCE_EXCEPTION_SITE_STATE)
+        transfer_page = book.page(SOURCE_EXCEPTION_TRANSFER)
+        for row in site_page.rows():
+            site = site_page.latest(row)
+            site_cell = book.latest_ref(SOURCE_EXCEPTION_SITE_STATE, row)
+            transfer = transfer_page.latest(row)
+            transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+            problem = None
+            if not isinstance(site, ExceptionSiteStateFact):
+                problem = "exception transfer has no exact site state"
+            elif not isinstance(transfer, ExceptionTransferFact):
+                problem = "exception site has no exact transfer"
+            elif (
+                transfer.source != site.source
+                or transfer.entry_bindings != site.bindings
+                or tuple(
+                    (owner, arm, handler)
+                    for owner, arm, handler, _has_finally in transfer.scopes
+                ) != site.scopes
+            ):
+                problem = "exception transfer disagrees with its site state"
+            else:
+                scopes = transfer.scopes
+                catch_index = next((
+                    index for index in range(len(scopes) - 1, -1, -1)
+                    if scopes[index][1] == "body"
+                ), None)
+                catch = (
+                    None if catch_index is None else scopes[catch_index][0]
+                )
+                crossed = (
+                    scopes if catch_index is None
+                    else scopes[catch_index + 1:]
+                )
+                unwind = tuple(dict.fromkeys(
+                    owner for owner, arm, _handler, has_finally
+                    in reversed(crossed)
+                    if has_finally and arm != "finalbody"
+                ))
+                if transfer.catch_try != catch or transfer.unwind_finally != unwind:
+                    problem = "exception catch or unwind disagrees with scopes"
+                elif transfer.source_kind not in {"call", "raise", "reraise"}:
+                    problem = "exception transfer has unknown source kind"
+                else:
+                    causes = {
+                        cell for cell, _stage in book.edges_into(transfer_cell)
+                    }
+                    expected = {
+                        site_cell, transfer.source,
+                        *(owner for owner, _arm, _handler, _final in scopes),
+                        *(handler for _owner, _arm, handler, _final in scopes
+                          if handler is not None),
+                        *transfer.unwind_finally,
+                        *(binding for _name, binding in transfer.entry_bindings),
+                    }
+                    if transfer.raised_class_definition is not None:
+                        expected.add(transfer.raised_class_definition)
+                    if causes != expected:
+                        problem = "exception transfer provenance disagrees with route"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-transfer-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_handler_class_findings(module: Any) -> list[Finding]:
+        """Handler type occurrences must resolve through static definitions."""
+        from .concordance_declarations import (
+            ExceptionHandlerClassFact, INGESTION_VALUE,
+            SOURCE_EXCEPTION_HANDLER_CLASS, STATIC_SYMBOL_DEFINITION,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_HANDLER_CLASS.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_HANDLER_CLASS)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_HANDLER_CLASS, row)
+            problem = None
+            if (
+                not isinstance(fact, ExceptionHandlerClassFact)
+                or not isinstance(fact.handler, Ref)
+                or fact.handler.page != INGESTION_VALUE
+                or int(fact.handler.row[1]) != int(row[1])
+                or book.page(INGESTION_VALUE).cells.get((
+                    fact.handler.row, fact.handler.column,
+                )) is None
+                or not isinstance(fact.owner, Ref)
+                or fact.owner.page != INGESTION_VALUE
+                or book.page(INGESTION_VALUE).cells.get((
+                    fact.owner.row, fact.owner.column,
+                )) is None
+            ):
+                problem = "handler class has no exact owner or handler"
+            elif any(
+                not isinstance(value, Ref)
+                or value.page != INGESTION_VALUE
+                or book.page(INGESTION_VALUE).cells.get((
+                    value.row, value.column,
+                )) is None
+                or definition is None
+                or not isinstance(definition, Ref)
+                or definition.page != STATIC_SYMBOL_DEFINITION
+                for value, definition in fact.declarations
+            ):
+                problem = "handler class occurrence has no static declaration"
+            else:
+                expected = {
+                    fact.owner, fact.handler,
+                    *(cell for value, definition in fact.declarations
+                      for cell in (value, definition)),
+                }
+                causes = {
+                    source for source, _stage in book.edges_into(receipt)
+                }
+                if causes != expected:
+                    problem = "handler class provenance disagrees with declarations"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-handler-class-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_handler_entry_findings(module: Any) -> list[Finding]:
+        """Each candidate edge supplies the exact requested binding cell."""
+        from .concordance_declarations import (
+            ExceptionHandlerEntryFact, ExceptionTransferFact,
+            INGESTION_VALUE, SOURCE_EXCEPTION_HANDLER_ENTRY,
+            SOURCE_EXCEPTION_TRANSFER,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_HANDLER_ENTRY.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY)
+        transfers = book.page(SOURCE_EXCEPTION_TRANSFER)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_HANDLER_ENTRY, row)
+            problem = None
+            if (
+                not isinstance(fact, ExceptionHandlerEntryFact)
+                or not isinstance(fact.handler, Ref)
+                or fact.handler.page != INGESTION_VALUE
+                or int(fact.handler.row[1]) != int(row[1])
+                or book.page(INGESTION_VALUE).cells.get((
+                    fact.handler.row, fact.handler.column,
+                )) is None
+                or not isinstance(fact.owner, Ref)
+                or fact.owner.page != INGESTION_VALUE
+                or book.page(INGESTION_VALUE).cells.get((
+                    fact.owner.row, fact.owner.column,
+                )) is None
+            ):
+                problem = "handler entry has no exact owner or handler"
+            elif (
+                fact.required_names != tuple(sorted(set(fact.required_names)))
+                or tuple(name for name, _arms in fact.incoming_bindings)
+                != fact.required_names
+            ):
+                problem = "handler entry names disagree with demand"
+            else:
+                for candidate in fact.candidate_transfers:
+                    transfer = (
+                        transfers.cells.get((candidate.row, candidate.column))
+                        if isinstance(candidate, Ref)
+                        and candidate.page == SOURCE_EXCEPTION_TRANSFER
+                        else None
+                    )
+                    if (
+                        not isinstance(transfer, ExceptionTransferFact)
+                        or transfer.catch_try != fact.owner
+                    ):
+                        problem = "handler entry has a foreign transfer"
+                        break
+                if problem is None:
+                    for name, arms in fact.incoming_bindings:
+                        if tuple(candidate for candidate, _binding in arms) != (
+                            fact.candidate_transfers
+                        ):
+                            problem = "handler binding arms disagree with transfers"
+                            break
+                        if any(
+                            binding != dict(transfers.cells[(
+                                candidate.row, candidate.column,
+                            )].entry_bindings).get(name)
+                            for candidate, binding in arms
+                        ):
+                            problem = "handler binding has wrong source version"
+                            break
+                if problem is None:
+                    expected = {
+                        fact.owner, fact.handler, *fact.candidate_transfers,
+                        *(binding for _name, arms in fact.incoming_bindings
+                          for _transfer, binding in arms if binding is not None),
+                    }
+                    causes = {
+                        source for source, _stage in book.edges_into(receipt)
+                    }
+                    if causes != expected:
+                        problem = "handler entry provenance disagrees with arms"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-handler-entry-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_handler_phi_findings(module: Any) -> list[Finding]:
+        """A merged handler name cites each transfer and binding version."""
+        from .concordance_declarations import (
+            ExceptionHandlerEntryFact, ExceptionHandlerPhiFact,
+            INGESTION_VALUE, SOURCE_EXCEPTION_HANDLER_ENTRY,
+            SOURCE_EXCEPTION_HANDLER_PHI,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_HANDLER_PHI.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_HANDLER_PHI)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_HANDLER_PHI, row)
+            problem = None
+            if (
+                not isinstance(fact, ExceptionHandlerPhiFact)
+                or not isinstance(fact.phi, Ref)
+                or fact.phi.page != INGESTION_VALUE
+                or int(fact.phi.row[1]) != int(row[1])
+                or book.page(INGESTION_VALUE).cells.get((
+                    fact.phi.row, fact.phi.column,
+                )) is None
+            ):
+                problem = "handler Phi has no exact source value"
+            else:
+                entry = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest((
+                    row[0], int(fact.handler.row[1]),
+                ))
+                if (
+                    not isinstance(entry, ExceptionHandlerEntryFact)
+                    or entry.owner != fact.owner
+                    or entry.handler != fact.handler
+                    or fact.name not in dict(entry.incoming_bindings)
+                    or tuple(fact.arms) != dict(entry.incoming_bindings)[fact.name]
+                ):
+                    problem = "handler Phi arms disagree with entry fact"
+                else:
+                    expected = {
+                        fact.owner, fact.handler, fact.phi,
+                        *(cell for transfer, binding in fact.arms
+                          for cell in (transfer, binding)),
+                    }
+                    causes = {
+                        source for source, _stage in book.edges_into(receipt)
+                    }
+                    if causes != expected:
+                        problem = "handler Phi provenance disagrees with arms"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-handler-phi-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_continuation_phi_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """A post-Try value is one Phi derived from each continuing arm."""
+        from .concordance_declarations import (
+            ExceptionContinuationPhiFact, INGESTION_VALUE, NAME_BINDING,
+            SOURCE_EXCEPTION_CONTINUATION_PHI,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_CONTINUATION_PHI.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_CONTINUATION_PHI)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_CONTINUATION_PHI, row)
+            problem = None
+            if (
+                not isinstance(fact, ExceptionContinuationPhiFact)
+                or not isinstance(fact.owner, Ref)
+                or fact.owner.page != INGESTION_VALUE
+                or not isinstance(fact.phi, Ref)
+                or fact.phi.page != INGESTION_VALUE
+                or int(fact.phi.row[1]) != int(row[1])
+            ):
+                problem = "Try continuation Phi lacks source identities"
+            elif (
+                not fact.arms
+                or fact.arms[0][0] != "success"
+                or fact.arms[0][1] != fact.owner
+                or any(
+                    kind not in {"success", "handler"}
+                    or not isinstance(control, Ref)
+                    or control.page != INGESTION_VALUE
+                    or not isinstance(binding, Ref)
+                    or binding.page != NAME_BINDING
+                    for kind, control, binding in fact.arms
+                )
+            ):
+                problem = "Try continuation Phi has invalid arm cells"
+            else:
+                expected = {
+                    fact.owner, fact.phi,
+                    *(control for _kind, control, _binding in fact.arms),
+                    *(binding for _kind, _control, binding in fact.arms),
+                }
+                if {
+                    source for source, _stage in book.edges_into(receipt)
+                } != expected:
+                    problem = "Try continuation Phi provenance disagrees with arms"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-continuation-phi-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _native_status_class_findings(module: Any) -> list[Finding]:
+        """A catchable native code cites its declared Python class."""
+        from .concordance_declarations import (
+            NATIVE_STATUS_CLASS, STATIC_SYMBOL_DEFINITION,
+        )
+        from .native_faults import NATIVE_STATUS_CLASS_IDENTITIES
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or NATIVE_STATUS_CLASS.name not in book.pages:
+            return []
+        found = []
+        page = book.page(NATIVE_STATUS_CLASS)
+        for row in page.rows():
+            class_cell = page.latest(row)
+            receipt = book.latest_ref(NATIVE_STATUS_CLASS, row)
+            expected_identity = NATIVE_STATUS_CLASS_IDENTITIES.get(int(row[0]))
+            problem = None
+            if (
+                not isinstance(class_cell, Ref)
+                or class_cell.page != STATIC_SYMBOL_DEFINITION
+                or expected_identity is None
+                or ".".join(class_cell.row[:2]) != expected_identity
+            ):
+                problem = "native status lacks its exact Python class"
+            elif {
+                source for source, _stage in book.edges_into(receipt)
+            } != {class_cell}:
+                problem = "native status provenance disagrees with class"
+            if problem is not None:
+                found.append(Finding(
+                    "native-status-class-disagreement",
+                    str(row), None, problem,
                 ))
         return found
 
