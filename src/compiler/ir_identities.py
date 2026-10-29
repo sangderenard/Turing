@@ -2289,6 +2289,515 @@ def mark_precision_sections(functions) -> int:
     return marked
 
 
+class WideExpansionEmitter:
+    """Spell width-N expansion arithmetic as repository SSA, one limb per value.
+
+    This is the expansion builder ``lower_precision_operations`` uses, lifted
+    out of that pass so the insertion context is explicit: ``function`` is the
+    function values are minted in, ``emitted`` is the instruction list new
+    instructions are appended to, and ``limbs`` maps a value id to its limbs
+    (high first; an absent id is an ordinary one-limb value). Any pass that
+    holds those three can materialise the same ``signal_symbolic`` proofs and
+    Precision arithmetic -- ``proof_core``, ``exp_expansion``,
+    ``log_expansion`` -- outside a Precision section.
+
+    ``element`` is the limb element the section being expanded declared
+    (``None`` for the value's own dtype); a caller moving across instructions
+    sets it per instruction. ``known_scalar_ids`` is the set of rank-0
+    constant ids ``put`` reads to choose which operand carries the extent;
+    the emitter adds every constant it mints. ``two_product_flavor`` selects
+    the exact-product spelling (see ``TWO_PRODUCT_FLAVORS``).
+
+    Every instruction it emits is stamped ``PRECISION_SECTION_ATTRIBUTE`` with
+    a ``lowered_from`` naming its origin, exactly as the in-pass closures did,
+    so the SSA ``lower_precision_operations`` produces is unchanged.
+    """
+
+    def __init__(
+        self, function, emitted: list, *, two_product_flavor: str = "fma",
+        limbs: dict | None = None, known_scalar_ids: set | None = None,
+        element=None,
+    ) -> None:
+        if two_product_flavor not in TWO_PRODUCT_FLAVORS:
+            raise ValueError(
+                f"unknown two_product flavour {two_product_flavor!r}; "
+                f"expected one of {TWO_PRODUCT_FLAVORS}"
+            )
+        from .concordance_declarations import (
+            PRECISION_CONSTANT, PRECISION_EXPANSION, PRECISION_LIMB,
+        )
+        from .ssa_record_return_state import mint_ssa_value
+
+        self._mint = mint_ssa_value
+        self._limb_kind = PRECISION_LIMB
+        self._constant_kind = PRECISION_CONSTANT
+        self._stage = PRECISION_EXPANSION
+        self.function = function
+        self.emitted = emitted
+        self.two_product_flavor = two_product_flavor
+        self.limbs = {} if limbs is None else limbs
+        self.known_scalar_ids = (
+            set() if known_scalar_ids is None else known_scalar_ids
+        )
+        # The element the section being expanded declared, when it is
+        # narrower than the value it is expanding. An expansion mints
+        # many values and every one of them is a LIMB, so the element
+        # is what they are -- inheriting the pre-expansion dtype makes
+        # a float32 expansion claim to be float64, which is wrong in
+        # two ways at once. It refuses to emit on a lane that has no
+        # f64 at all, and, worse, ``splitter_for`` reads the same
+        # dtype to choose Veltkamp's constant: a float32 limb split at
+        # 2**27 + 1 instead of 4097 does not halve a 24-bit
+        # significand, so the half products stop being exact and the
+        # residual is quietly wrong rather than loudly absent.
+        self.element = element
+        self._splitters: dict[float, object] = {}
+
+    # -- value and instruction minting --------------------------------------
+
+    def fresh(self, like, extent_like=None):
+        declared = self.element
+        extent_like = like if extent_like is None else extent_like
+        like_dtype = str(like.dtype or "")
+        extent_dtype = str(extent_like.dtype or "")
+        dtype = (
+            declared if declared in _NARROW_LIMB_ELEMENTS
+            else extent_like.dtype
+            if (
+                extent_dtype.casefold() in {
+                    "float", "float16", "float32", "float64",
+                    "double", "f16", "f32", "f64",
+                }
+                and like_dtype.casefold() not in {
+                    "float", "float16", "float32", "float64",
+                    "double", "f16", "f32", "f64",
+                }
+            )
+            else like.dtype
+        )
+        logical_shape = tuple(
+            (extent_like.accounting or {}).get(
+                "precision_logical_shape"
+            )
+            or tuple(extent_like.shape or ())
+        )
+        carried_width = max(int(
+            (extent_like.accounting or {}).get(
+                "precision_limbs"
+            ) or 1
+        ), 1)
+        if (
+            not (extent_like.accounting or {}).get(
+                "precision_logical_shape"
+            )
+            and
+            carried_width > 1
+            and logical_shape
+            and logical_shape[-1] == carried_width
+        ):
+            logical_shape = logical_shape[:-1]
+        # Minted through the book from the cells of the value it is
+        # shaped like and the one whose extent it carries.
+        value = SSAValue(
+            self._mint(
+                self.function, self._limb_kind, (like, extent_like),
+                dtype=dtype, shape=logical_shape,
+                stage=self._stage,
+            ),
+            dtype=dtype,
+            shape=logical_shape,
+            device=like.device,
+            accounting={
+                "precision_extent_source_id": int(extent_like.id),
+            },
+        )
+        return value
+
+    def put(self, op, args, like):
+        known_scalar_ids = self.known_scalar_ids
+
+        def extent_strength(value):
+            accounting = value.accounting or {}
+            shape = tuple(value.shape or ())
+            carried_width = max(int(
+                accounting.get("precision_limbs") or 1
+            ), 1)
+            declared_logical_shape = accounting.get(
+                "precision_logical_shape"
+            )
+            logical_rank = (
+                len(tuple(declared_logical_shape))
+                if declared_logical_shape is not None
+                else len(shape) - int(
+                    carried_width > 1
+                    and bool(shape)
+                    and shape[-1] == carried_width
+                )
+            )
+            declared_rank = max(
+                logical_rank,
+                int(accounting.get("program_abi_rank", 0) or 0),
+                int(accounting.get("ssa_call_rank", 0) or 0),
+            )
+            return (
+                declared_rank,
+                int(value.id) not in known_scalar_ids,
+                bool(shape),
+            )
+
+        extent_like = max(
+            tuple(args) or (like,),
+            key=extent_strength,
+        )
+        result = self.fresh(like, extent_like)
+        self.emitted.append(Instr(op, list(args), result, attributes={
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision",
+        }))
+        return result
+
+    def parts(self, value):
+        return self.limbs.get(int(value.id), [value])
+
+    def zero(self, like):
+        """Materialise an exact low limb for scalar promotion.
+
+        Repeating the high limb would represent ``x + x`` rather
+        than ``x``.  A plain scalar is the expansion ``[x, +0, ...]``;
+        IEEE positive zero is exact in every supported element
+        format and therefore needs no numerical precondition.
+        """
+
+        result = self.fresh(like)
+        self.emitted.append(Instr("Const", [], result, attributes={
+            "constant": 0.0,
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.scalar_promotion",
+        }))
+        self.known_scalar_ids.add(int(result.id))
+        return result
+
+    def scalar_constant(self, number, like):
+        # Minted through the book from the value it is emitted for.
+        result = SSAValue(
+            self._mint(
+                self.function, self._constant_kind, (like,),
+                dtype=like.dtype, shape=(), stage=self._stage,
+            ),
+            dtype=like.dtype,
+            shape=(),
+            device=like.device,
+        )
+        self.emitted.append(Instr("Const", [], result, attributes={
+            "constant": float(number),
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.scalar_constant",
+        }))
+        self.known_scalar_ids.add(int(result.id))
+        return result
+
+    # -- error-free transformations -----------------------------------------
+
+    def two_sum(self, a, b):
+        put = self.put
+        s = put("Add", (a, b), a)
+        bb = put("Sub", (s, a), a)
+        left = put("Sub", (a, put("Sub", (s, bb), a)), a)
+        right = put("Sub", (b, bb), a)
+        return s, put("Add", (left, right), a)
+
+    def splitter_for(self, value):
+        """One Const per emitter per element, not one per product."""
+
+        magnitude = _veltkamp_constant(value.dtype)
+        held = self._splitters.get(magnitude)
+        if held is None:
+            held = self.fresh(value)
+            self.emitted.append(Instr("Const", [], held, attributes={
+                "constant": float(magnitude),
+                PRECISION_SECTION_ATTRIBUTE: True,
+                "lowered_from": "precision.split_constant",
+            }))
+            self._splitters[magnitude] = held
+        return held
+
+    def two_product(self, a, b):
+        put = self.put
+        product = put("Mul", (a, b), a)
+        if self.two_product_flavor == "fma":
+            negated = put("Neg", (product,), a)
+            return product, put(FMA, (a, b, negated), a)
+        # Dekker through Veltkamp splitting: the same exact residual
+        # with no fma anywhere, for destinations that cannot deliver
+        # a single rounding. The eager twin is
+        # ``extended_precision.two_product`` / ``_split``; the
+        # operation order here mirrors it exactly so the two stay
+        # provably the same algorithm.
+        constant = self.splitter_for(a)
+
+        def split(value):
+            scaled = put("Mul", (value, constant), value)
+            high = put(
+                "Sub",
+                (scaled, put("Sub", (scaled, value), value)),
+                value,
+            )
+            return high, put("Sub", (value, high), value)
+
+        a_high, a_low = split(a)
+        b_high, b_low = split(b)
+        error = put(
+            "Sub", (put("Mul", (a_high, b_high), a), product), a
+        )
+        error = put(
+            "Add", (error, put("Mul", (a_high, b_low), a)), a
+        )
+        error = put(
+            "Add", (error, put("Mul", (a_low, b_high), a)), a
+        )
+        return product, put(
+            "Add", (error, put("Mul", (a_low, b_low), a)), a
+        )
+
+    # -- expansion arithmetic -----------------------------------------------
+
+    def expanded(self, value, width: int):
+        held = list(self.parts(value))
+        if len(held) < width:
+            held.extend(self.zero(value) for _ in range(width - len(held)))
+        return held[:width]
+
+    def renormalise(self, terms, width: int):
+        """Distil arbitrary exact terms to ``width`` SSA limbs."""
+
+        rest = list(terms)
+        if not rest:
+            raise ValueError("cannot renormalise an empty expansion")
+        kept = []
+        for _index in range(int(width)):
+            if not rest:
+                break
+            carry = rest[-1]
+            tail = [None] * (len(rest) - 1)
+            for position in range(len(rest) - 2, -1, -1):
+                carry, tail[position] = self.two_sum(
+                    rest[position], carry
+                )
+            kept.append(carry)
+            rest = tail
+        while len(kept) < int(width):
+            kept.append(self.zero(kept[-1]))
+        for leftover in rest:
+            kept[-1] = self.put("Add", (kept[-1], leftover), kept[-1])
+        return kept
+
+    def add_expansions(self, left, right, width: int):
+        return self.renormalise([*left, *right], width)
+
+    def multiply_expansions(self, left, right, width: int):
+        products = []
+        for left_limb in left:
+            for right_limb in right:
+                high, low = self.two_product(left_limb, right_limb)
+                products.extend((high, low))
+        return self.renormalise(products, width)
+
+    def lead(self, expansion):
+        return (
+            expansion[0] if len(expansion) == 1
+            else self.put(
+                "Add", (expansion[0], expansion[1]), expansion[0]
+            )
+        )
+
+    def divide_expansions(self, left, right, width: int):
+        put = self.put
+        remainder = list(left)
+        quotient = []
+        for _index in range(int(width) + 1):
+            digit = put(
+                "Div", (self.lead(remainder), self.lead(right)), left[0]
+            )
+            quotient.append(digit)
+            product = self.multiply_expansions(
+                [digit], right, int(width) + 2
+            )
+            remainder = self.add_expansions(
+                remainder,
+                [put("Neg", (term,), term) for term in product],
+                int(width) + 2,
+            )
+        return self.renormalise(quotient, width)
+
+    def sum_expansion(self, source):
+        """The ordinary value used only for a range/seed decision."""
+
+        total = source[0]
+        for term in source[1:]:
+            total = self.put("Add", (total, term), total)
+        return total
+
+    def constant_expansion(self, parts_, like):
+        return [self.scalar_constant(part, like) for part in parts_]
+
+    # -- transcendental expansions ------------------------------------------
+
+    def sqrt_expansion(self, source, width: int):
+        """The eager Precision Newton law over repository limbs."""
+
+        put = self.put
+        collapsed = self.sum_expansion(source)
+        seed = put("Sqrt", (collapsed,), collapsed)
+        root = self.expanded(seed, width)
+        half = self.scalar_constant(0.5, seed)
+        steps = max(1, (int(width) - 1).bit_length()) + 1
+        for _step in range(steps):
+            quotient = self.divide_expansions(source, root, width)
+            root = self.add_expansions(root, quotient, width)
+            root = [put("Mul", (term, half), term) for term in root]
+        return root
+
+    def proof_core(self, name: str, argument, width: int):
+        """Materialise the registered symbolic proof as wide SSA.
+
+        The identity, interval-derived order, exact rational
+        coefficients, and structural parity all come from
+        signal_symbolic. This pass only spells that already-authored
+        program with the expansion arithmetic above.
+        """
+
+        from ..common.tensors import signal_symbolic as proof
+
+        count = proof.order_for(
+            name, proof.CORE_RADII[name], digits=16 * int(width),
+        )
+        degree = proof.order_to_degree(name, count)
+        coefficients = proof.structured_coefficients(name, degree)
+        element = self.element
+        coefficient_values = [
+            self.constant_expansion(
+                proof.limb_decomposition(
+                    coefficient, width, element=element,
+                ),
+                argument[0],
+            )
+            for coefficient in coefficients
+        ]
+        structure = proof.TRANSCENDENTALS[name]["structure"]
+        base = (
+            self.multiply_expansions(argument, argument, width)
+            if structure in ("odd", "even") else list(argument)
+        )
+        result = coefficient_values[-1]
+        for coefficient in reversed(coefficient_values[:-1]):
+            result = self.add_expansions(
+                coefficient,
+                self.multiply_expansions(base, result, width),
+                width,
+            )
+        if structure in ("odd", "factored"):
+            result = self.multiply_expansions(argument, result, width)
+        return result
+
+    def _ln2_head(self, like):
+        """ln(2) rounded once to a double, from the exact rational.
+
+        ``signal_symbolic.constant_limbs`` derives it from the proof's own
+        constant, so no host library supplies a core constant; it is the
+        same double ``math.log(2.0)`` returns.
+        """
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        return self.scalar_constant(constant_limbs("ln2", 1)[0], like)
+
+    def exp_expansion(self, source, width: int):
+        """Precision.exp's ln(2) reduction plus the proof core."""
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        put = self.put
+        collapsed = self.sum_expansion(source)
+        ln2_parts = self.constant_expansion(
+            constant_limbs(
+                "ln2", width, element=self.element,
+            ),
+            source[0],
+        )
+        ln2_head = self._ln2_head(source[0])
+        binade = put(
+            "Round", (put("Div", (collapsed, ln2_head), collapsed),),
+            collapsed,
+        )
+        remainder = self.add_expansions(
+            source,
+            [
+                put("Neg", (term,), term)
+                for term in self.multiply_expansions(
+                    ln2_parts, [binade], width,
+                )
+            ],
+            width,
+        )
+        core = self.proof_core("exp", remainder, width)
+        scale = put(
+            "Pow",
+            (self.scalar_constant(2.0, collapsed), binade),
+            collapsed,
+        )
+        return self.multiply_expansions(core, [scale], width)
+
+    def log_expansion(self, source, width: int):
+        """Precision.log's binade law plus the log1p proof core."""
+
+        from ..common.tensors.signal_symbolic import constant_limbs
+
+        put = self.put
+        collapsed = self.sum_expansion(source)
+        ln2_head = self._ln2_head(source[0])
+        binade = put(
+            "Floor",
+            (put(
+                "Div",
+                (put("Log", (collapsed,), collapsed), ln2_head),
+                collapsed,
+            ),),
+            collapsed,
+        )
+        scale = put(
+            "Pow",
+            (
+                self.scalar_constant(2.0, collapsed),
+                put("Neg", (binade,), binade),
+            ),
+            collapsed,
+        )
+        mantissa = self.multiply_expansions(source, [scale], width)
+        reduced = self.sqrt_expansion(
+            self.sqrt_expansion(mantissa, width), width,
+        )
+        one = self.constant_expansion(
+            (1.0, *((0.0,) * (int(width) - 1))), source[0],
+        )
+        offset = self.add_expansions(
+            reduced, [put("Neg", (term,), term) for term in one],
+            width,
+        )
+        core = self.proof_core("log1p", offset, width)
+        four = self.scalar_constant(4.0, source[0])
+        core = [put("Mul", (term, four), term) for term in core]
+        ln2_parts = self.constant_expansion(
+            constant_limbs(
+                "ln2", width, element=self.element,
+            ),
+            source[0],
+        )
+        restored = self.multiply_expansions(
+            ln2_parts, [binade], width,
+        )
+        return self.add_expansions(core, restored, width)
+
+
 def lower_precision_operations(
     functions, two_product_flavor: str = "fma",
 ) -> dict:
@@ -2798,436 +3307,24 @@ def lower_precision_operations(
                 ) or 0)
             }
 
-            # The element the section being expanded declared, when it is
-            # narrower than the value it is expanding. An expansion mints
-            # many values and every one of them is a LIMB, so the element
-            # is what they are -- inheriting the pre-expansion dtype makes
-            # a float32 expansion claim to be float64, which is wrong in
-            # two ways at once. It refuses to emit on a lane that has no
-            # f64 at all, and, worse, ``splitter_for`` reads the same
-            # dtype to choose Veltkamp's constant: a float32 limb split at
-            # 2**27 + 1 instead of 4097 does not halve a 24-bit
-            # significand, so the half products stop being exact and the
-            # residual is quietly wrong rather than loudly absent.
-            section_element: list = [None]
-
-            def fresh(like, extent_like=None):
-                declared = section_element[0]
-                extent_like = like if extent_like is None else extent_like
-                like_dtype = str(like.dtype or "")
-                extent_dtype = str(extent_like.dtype or "")
-                dtype = (
-                    declared if declared in _NARROW_LIMB_ELEMENTS
-                    else extent_like.dtype
-                    if (
-                        extent_dtype.casefold() in {
-                            "float", "float16", "float32", "float64",
-                            "double", "f16", "f32", "f64",
-                        }
-                        and like_dtype.casefold() not in {
-                            "float", "float16", "float32", "float64",
-                            "double", "f16", "f32", "f64",
-                        }
-                    )
-                    else like.dtype
-                )
-                logical_shape = tuple(
-                    (extent_like.accounting or {}).get(
-                        "precision_logical_shape"
-                    )
-                    or tuple(extent_like.shape or ())
-                )
-                carried_width = max(int(
-                    (extent_like.accounting or {}).get(
-                        "precision_limbs"
-                    ) or 1
-                ), 1)
-                if (
-                    not (extent_like.accounting or {}).get(
-                        "precision_logical_shape"
-                    )
-                    and
-                    carried_width > 1
-                    and logical_shape
-                    and logical_shape[-1] == carried_width
-                ):
-                    logical_shape = logical_shape[:-1]
-                # Minted through the book from the cells of the value it is
-                # shaped like and the one whose extent it carries.
-                value = SSAValue(
-                    mint_ssa_value(
-                        function, PRECISION_LIMB, (like, extent_like),
-                        dtype=dtype, shape=logical_shape,
-                        stage=PRECISION_EXPANSION,
-                    ),
-                    dtype=dtype,
-                    shape=logical_shape,
-                    device=like.device,
-                    accounting={
-                        "precision_extent_source_id": int(extent_like.id),
-                    },
-                )
-                return value
-
-            def put(op, args, like):
-                def extent_strength(value):
-                    accounting = value.accounting or {}
-                    shape = tuple(value.shape or ())
-                    carried_width = max(int(
-                        accounting.get("precision_limbs") or 1
-                    ), 1)
-                    declared_logical_shape = accounting.get(
-                        "precision_logical_shape"
-                    )
-                    logical_rank = (
-                        len(tuple(declared_logical_shape))
-                        if declared_logical_shape is not None
-                        else len(shape) - int(
-                            carried_width > 1
-                            and bool(shape)
-                            and shape[-1] == carried_width
-                        )
-                    )
-                    declared_rank = max(
-                        logical_rank,
-                        int(accounting.get("program_abi_rank", 0) or 0),
-                        int(accounting.get("ssa_call_rank", 0) or 0),
-                    )
-                    return (
-                        declared_rank,
-                        int(value.id) not in known_scalar_ids,
-                        bool(shape),
-                    )
-
-                extent_like = max(
-                    tuple(args) or (like,),
-                    key=extent_strength,
-                )
-                result = fresh(like, extent_like)
-                emitted.append(Instr(op, list(args), result, attributes={
-                    PRECISION_SECTION_ATTRIBUTE: True,
-                    "lowered_from": "precision",
-                }))
-                return result
-
-            def parts(value):
-                return limbs.get(int(value.id), [value])
-
-            def zero(like):
-                """Materialise an exact low limb for scalar promotion.
-
-                Repeating the high limb would represent ``x + x`` rather
-                than ``x``.  A plain scalar is the expansion ``[x, +0, ...]``;
-                IEEE positive zero is exact in every supported element
-                format and therefore needs no numerical precondition.
-                """
-
-                result = fresh(like)
-                emitted.append(Instr("Const", [], result, attributes={
-                    "constant": 0.0,
-                    PRECISION_SECTION_ATTRIBUTE: True,
-                    "lowered_from": "precision.scalar_promotion",
-                }))
-                known_scalar_ids.add(int(result.id))
-                return result
-
-            def scalar_constant(number, like):
-                # Minted through the book from the value it is emitted for.
-                result = SSAValue(
-                    mint_ssa_value(
-                        function, PRECISION_CONSTANT, (like,),
-                        dtype=like.dtype, shape=(), stage=PRECISION_EXPANSION,
-                    ),
-                    dtype=like.dtype,
-                    shape=(),
-                    device=like.device,
-                )
-                emitted.append(Instr("Const", [], result, attributes={
-                    "constant": float(number),
-                    PRECISION_SECTION_ATTRIBUTE: True,
-                    "lowered_from": "precision.scalar_constant",
-                }))
-                known_scalar_ids.add(int(result.id))
-                return result
-
-            def two_sum(a, b):
-                s = put("Add", (a, b), a)
-                bb = put("Sub", (s, a), a)
-                left = put("Sub", (a, put("Sub", (s, bb), a)), a)
-                right = put("Sub", (b, bb), a)
-                return s, put("Add", (left, right), a)
-
-            splitters: dict[float, object] = {}
-
-            def splitter_for(value):
-                """One Const per block per element, not one per product."""
-
-                magnitude = _veltkamp_constant(value.dtype)
-                held = splitters.get(magnitude)
-                if held is None:
-                    held = fresh(value)
-                    emitted.append(Instr("Const", [], held, attributes={
-                        "constant": float(magnitude),
-                        PRECISION_SECTION_ATTRIBUTE: True,
-                        "lowered_from": "precision.split_constant",
-                    }))
-                    splitters[magnitude] = held
-                return held
-
-            def two_product(a, b):
-                product = put("Mul", (a, b), a)
-                if two_product_flavor == "fma":
-                    negated = put("Neg", (product,), a)
-                    return product, put(FMA, (a, b, negated), a)
-                # Dekker through Veltkamp splitting: the same exact residual
-                # with no fma anywhere, for destinations that cannot deliver
-                # a single rounding. The eager twin is
-                # ``extended_precision.two_product`` / ``_split``; the
-                # operation order here mirrors it exactly so the two stay
-                # provably the same algorithm.
-                constant = splitter_for(a)
-
-                def split(value):
-                    scaled = put("Mul", (value, constant), value)
-                    high = put(
-                        "Sub",
-                        (scaled, put("Sub", (scaled, value), value)),
-                        value,
-                    )
-                    return high, put("Sub", (value, high), value)
-
-                a_high, a_low = split(a)
-                b_high, b_low = split(b)
-                error = put(
-                    "Sub", (put("Mul", (a_high, b_high), a), product), a
-                )
-                error = put(
-                    "Add", (error, put("Mul", (a_high, b_low), a)), a
-                )
-                error = put(
-                    "Add", (error, put("Mul", (a_low, b_high), a)), a
-                )
-                return product, put(
-                    "Add", (error, put("Mul", (a_low, b_low), a)), a
-                )
-
-            def expanded(value, width: int):
-                held = list(parts(value))
-                if len(held) < width:
-                    held.extend(zero(value) for _ in range(width - len(held)))
-                return held[:width]
-
-            def renormalise(terms, width: int):
-                """Distil arbitrary exact terms to ``width`` SSA limbs."""
-
-                rest = list(terms)
-                if not rest:
-                    raise ValueError("cannot renormalise an empty expansion")
-                kept = []
-                for _index in range(int(width)):
-                    if not rest:
-                        break
-                    carry = rest[-1]
-                    tail = [None] * (len(rest) - 1)
-                    for position in range(len(rest) - 2, -1, -1):
-                        carry, tail[position] = two_sum(
-                            rest[position], carry
-                        )
-                    kept.append(carry)
-                    rest = tail
-                while len(kept) < int(width):
-                    kept.append(zero(kept[-1]))
-                for leftover in rest:
-                    kept[-1] = put("Add", (kept[-1], leftover), kept[-1])
-                return kept
-
-            def add_expansions(left, right, width: int):
-                return renormalise([*left, *right], width)
-
-            def multiply_expansions(left, right, width: int):
-                products = []
-                for left_limb in left:
-                    for right_limb in right:
-                        high, low = two_product(left_limb, right_limb)
-                        products.extend((high, low))
-                return renormalise(products, width)
-
-            def lead(expansion):
-                return (
-                    expansion[0] if len(expansion) == 1
-                    else put("Add", (expansion[0], expansion[1]), expansion[0])
-                )
-
-            def divide_expansions(left, right, width: int):
-                remainder = list(left)
-                quotient = []
-                for _index in range(int(width) + 1):
-                    digit = put("Div", (lead(remainder), lead(right)), left[0])
-                    quotient.append(digit)
-                    product = multiply_expansions(
-                        [digit], right, int(width) + 2
-                    )
-                    remainder = add_expansions(
-                        remainder,
-                        [put("Neg", (term,), term) for term in product],
-                        int(width) + 2,
-                    )
-                return renormalise(quotient, width)
-
-            def sum_expansion(source):
-                """The ordinary value used only for a range/seed decision."""
-
-                total = source[0]
-                for term in source[1:]:
-                    total = put("Add", (total, term), total)
-                return total
-
-            def constant_expansion(parts_, like):
-                return [scalar_constant(part, like) for part in parts_]
-
-            def sqrt_expansion(source, width: int):
-                """The eager Precision Newton law over repository limbs."""
-
-                collapsed = sum_expansion(source)
-                seed = put("Sqrt", (collapsed,), collapsed)
-                root = expanded(seed, width)
-                half = scalar_constant(0.5, seed)
-                steps = max(1, (int(width) - 1).bit_length()) + 1
-                for _step in range(steps):
-                    quotient = divide_expansions(source, root, width)
-                    root = add_expansions(root, quotient, width)
-                    root = [put("Mul", (term, half), term) for term in root]
-                return root
-
-            def proof_core(name: str, argument, width: int):
-                """Materialise the registered symbolic proof as wide SSA.
-
-                The identity, interval-derived order, exact rational
-                coefficients, and structural parity all come from
-                signal_symbolic. This pass only spells that already-authored
-                program with the expansion arithmetic above.
-                """
-
-                from ..common.tensors import signal_symbolic as proof
-
-                count = proof.order_for(
-                    name, proof.CORE_RADII[name], digits=16 * int(width),
-                )
-                degree = proof.order_to_degree(name, count)
-                coefficients = proof.structured_coefficients(name, degree)
-                element = section_element[0]
-                coefficient_values = [
-                    constant_expansion(
-                        proof.limb_decomposition(
-                            coefficient, width, element=element,
-                        ),
-                        argument[0],
-                    )
-                    for coefficient in coefficients
-                ]
-                structure = proof.TRANSCENDENTALS[name]["structure"]
-                base = (
-                    multiply_expansions(argument, argument, width)
-                    if structure in ("odd", "even") else list(argument)
-                )
-                result = coefficient_values[-1]
-                for coefficient in reversed(coefficient_values[:-1]):
-                    result = add_expansions(
-                        coefficient,
-                        multiply_expansions(base, result, width),
-                        width,
-                    )
-                if structure in ("odd", "factored"):
-                    result = multiply_expansions(argument, result, width)
-                return result
-
-            def exp_expansion(source, width: int):
-                """Precision.exp's ln(2) reduction plus the proof core."""
-
-                import math
-
-                from ..common.tensors.signal_symbolic import constant_limbs
-
-                collapsed = sum_expansion(source)
-                ln2_parts = constant_expansion(
-                    constant_limbs(
-                        "ln2", width, element=section_element[0],
-                    ),
-                    source[0],
-                )
-                ln2_head = scalar_constant(float(math.log(2.0)), source[0])
-                binade = put(
-                    "Round", (put("Div", (collapsed, ln2_head), collapsed),),
-                    collapsed,
-                )
-                remainder = add_expansions(
-                    source,
-                    [
-                        put("Neg", (term,), term)
-                        for term in multiply_expansions(
-                            ln2_parts, [binade], width,
-                        )
-                    ],
-                    width,
-                )
-                core = proof_core("exp", remainder, width)
-                scale = put(
-                    "Pow",
-                    (scalar_constant(2.0, collapsed), binade),
-                    collapsed,
-                )
-                return multiply_expansions(core, [scale], width)
-
-            def log_expansion(source, width: int):
-                """Precision.log's binade law plus the log1p proof core."""
-
-                import math
-
-                from ..common.tensors.signal_symbolic import constant_limbs
-
-                collapsed = sum_expansion(source)
-                ln2_head = scalar_constant(float(math.log(2.0)), source[0])
-                binade = put(
-                    "Floor",
-                    (put(
-                        "Div",
-                        (put("Log", (collapsed,), collapsed), ln2_head),
-                        collapsed,
-                    ),),
-                    collapsed,
-                )
-                scale = put(
-                    "Pow",
-                    (
-                        scalar_constant(2.0, collapsed),
-                        put("Neg", (binade,), binade),
-                    ),
-                    collapsed,
-                )
-                mantissa = multiply_expansions(source, [scale], width)
-                reduced = sqrt_expansion(
-                    sqrt_expansion(mantissa, width), width,
-                )
-                one = constant_expansion(
-                    (1.0, *((0.0,) * (int(width) - 1))), source[0],
-                )
-                offset = add_expansions(
-                    reduced, [put("Neg", (term,), term) for term in one],
-                    width,
-                )
-                core = proof_core("log1p", offset, width)
-                four = scalar_constant(4.0, source[0])
-                core = [put("Mul", (term, four), term) for term in core]
-                ln2_parts = constant_expansion(
-                    constant_limbs(
-                        "ln2", width, element=section_element[0],
-                    ),
-                    source[0],
-                )
-                restored = multiply_expansions(
-                    ln2_parts, [binade], width,
-                )
-                return add_expansions(core, restored, width)
+            # The expansion builder, with this block as its insertion point.
+            # ``element`` is set per instruction below, from the section the
+            # instruction belongs to.
+            emitter = WideExpansionEmitter(
+                function, emitted, two_product_flavor=two_product_flavor,
+                limbs=limbs, known_scalar_ids=known_scalar_ids,
+            )
+            fresh = emitter.fresh
+            put = emitter.put
+            parts = emitter.parts
+            zero = emitter.zero
+            expanded = emitter.expanded
+            add_expansions = emitter.add_expansions
+            multiply_expansions = emitter.multiply_expansions
+            divide_expansions = emitter.divide_expansions
+            sqrt_expansion = emitter.sqrt_expansion
+            exp_expansion = emitter.exp_expansion
+            log_expansion = emitter.log_expansion
 
             def collapse(parts_of, original):
                 """Define the ORIGINAL value as the sum of its limbs.
@@ -3352,7 +3449,7 @@ def lower_precision_operations(
 
             for instruction in block.instrs:
                 operation = str(instruction.op)
-                section_element[0] = instruction.attributes.get(
+                emitter.element = instruction.attributes.get(
                     "precision_element"
                 )
 
