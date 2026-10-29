@@ -23145,6 +23145,90 @@ def _settle_linked_dynamic_sequences(
         ))
 
 
+def _refuse_dropped_activation_roots(deployment: Any, ssa_module: Any) -> None:
+    """Refuse a lowered module that lost one of its planned activation roots."""
+
+    # Every activation root is a method the library promises to export.  The
+    # surface lowering passes over a planned shell that never received a
+    # control program, so a root with no lowered function was dropped, not
+    # refused: ``SSAReferenceEvaluator`` once shipped a library holding
+    # ``__init__`` alone.  Read the two records against each other here --
+    # the deployment's activation roots and each function's
+    # ``source_function_reference`` -- and refuse by name.  Both the class
+    # route and the canonical source route lower through
+    # ``_class_surface_ssa_program``, so the refusal lives on that seam.
+    lowered_references = {
+        int(function.metadata["source_function_reference"])
+        for function in ssa_module.functions.values()
+        if function.metadata.get("source_function_reference") is not None
+    }
+    dropped_roots = tuple(
+        int(reference)
+        for reference in getattr(deployment, "activation_root_references", ())
+        if int(reference) not in lowered_references
+    )
+    if dropped_roots:
+        function_shells = dict(getattr(deployment, "function_shells", {}) or {})
+        raise FortranEmissionError(
+            "class surface planned activation roots it never lowered: "
+            + ", ".join(
+                f"{reference} "
+                + repr(str(getattr(getattr(getattr(
+                    function_shells.get(reference), "process_graph", None,
+                ), "G", None), "graph", {}).get("function_name") or "?"))
+                for reference in dropped_roots
+            )
+            + "; refusing to emit a library without them"
+        )
+
+
+def _refuse_unlowered_stored_callable_calls(deployment: Any) -> None:
+    """Refuse a planned call through a stored callable field."""
+
+    # A call through a stored callable -- ``self.notify(n)`` where the class
+    # table lists ``notify`` as a FIELD, not a method -- has no lowering: no
+    # method_ref, no callee_ref, no indirect callable record.  As a
+    # statement its result has no consumer, so nothing downstream asked for
+    # it and the library shipped the method with the call removed (the
+    # callable's effects silently gone).  No unresolved-call table holds a
+    # row for it either: ``Walker.poke: self.notify(n)`` shipped through
+    # ``lower_ast_source_to_ssa`` with the call gone.  Read the method
+    # graph's own class-table record, on the seam both routes share.
+    from .glsl_deployment_strategy import (
+        _stored_callable_field_call, _walk_planned_shells,
+    )
+
+    unlowered_field_calls = []
+    for planned in _walk_planned_shells(
+        deployment, include_function_registry=False,
+    ):
+        graph = getattr(getattr(planned, "process_graph", None), "G", None)
+        if graph is None:
+            continue
+        for node_id, data in graph.nodes(data=True):
+            field = _stored_callable_field_call(graph, data)
+            attributes = data.get("attributes") or {}
+            # A call is lowered when a lowering wrote its record: a method or
+            # callee reference, or a host callback.  ``indirect_callable_id``
+            # is the reducer's note of which value was called, and nothing
+            # lowers it (``Walker.poke``: ``self.notify`` read from a
+            # constructor parameter shipped with the call gone).
+            if field is None or any(
+                attributes.get(key) is not None
+                for key in ("method_ref", "callee_ref", "host_callback_field")
+            ):
+                continue
+            unlowered_field_calls.append(
+                f"{field[0]}.{graph.graph.get('function_name')}: "
+                f"{ast.unparse(data['expr_obj'])} (node {int(node_id)})"
+            )
+    if unlowered_field_calls:
+        raise FortranEmissionError(
+            "class surface has a call through a stored callable field with "
+            "no lowered invocation: " + "; ".join(unlowered_field_calls)
+        )
+
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -23174,6 +23258,9 @@ def _class_surface_ssa_program(
     whole-object SSA can be inspected and verified before target emission.
     """
 
+    _refuse_unlowered_stored_callable_calls(
+        getattr(compilation, "deployment", None)
+    )
     from .native_code_retention import (
         host_build_target,
         resolve_build_target,
@@ -23744,9 +23831,11 @@ def _class_surface_ssa_program(
         )
 
     def post_shape_statement(
-        owner: Any, value_id: int, fact: Any, source: Any,
+        owner: Any, value_id: int, fact: Any, source: Any, *, also: tuple = (),
     ) -> Any:
-        """The stating copy's ``copy_value_shape`` cell for ``fact``."""
+        """The stating copy's ``copy_value_shape`` cell for ``fact``;
+        ``also`` names the record cells the statement is read from beyond
+        the value's identity (a copy's ``planner_specialization`` row)."""
         row = (_copy_scope(owner)[0], int(value_id))
         statement = _CopyShapeFact(
             str(fact[0]), tuple(fact[1] or ()), str(fact[2] or ""),
@@ -23755,7 +23844,7 @@ def _class_surface_ssa_program(
         latest = shape_identity_book.latest_ref(_COPY_VALUE_SHAPE, row)
         if latest is not None and _cell_fact(latest) == statement:
             return latest
-        cells = [_identity_cell(owner, value_id)]
+        cells = [_identity_cell(owner, value_id), *also]
         if source is not None:
             source_owner, source_id = source
             cells.append(
@@ -23811,7 +23900,7 @@ def _class_surface_ssa_program(
 
     def note_shape(
         owner: Any, value_id: int, fact: Any, *, source: Any = None,
-        callsites_disagree: bool = False,
+        callsites_disagree: bool = False, also: tuple = (),
     ) -> None:
         """Record one copy's shape statement for ``value_id``.
 
@@ -23819,7 +23908,9 @@ def _class_surface_ssa_program(
         carried over a call edge came from.  ``callsites_disagree`` is the
         within-copy case (two callsites of this copy stated different
         shapes): the polymorphism derives from this copy's standing
-        statement and the new caller's statement.  A row the book proves
+        statement and the new caller's statement.  ``also`` is the record
+        cells a statement is read from (see ``post_shape_statement``).
+        A row the book proves
         polymorphic gets no further ``value_shape`` entries; its readers
         read ``value_shape_polymorphism``."""
         row = (str(owner.graph.get("function_name")), int(value_id))
@@ -23842,7 +23933,7 @@ def _class_surface_ssa_program(
         ) is not None:
             return
         if stated:
-            cell = post_shape_statement(owner, value_id, fact, source)
+            cell = post_shape_statement(owner, value_id, fact, source, also=also)
             disagreeing = tuple(
                 other for other_row in copy_statement_rows.get(row, ())
                 if other_row != cell.row
@@ -24082,37 +24173,52 @@ def _class_surface_ssa_program(
         # ``[0, 2, 3]`` has no call edge stating its extent, so the other
         # copy's (2,) stood alone on the authored row and was compared
         # against this copy's (3,) (refused as a shape disagreement).
-        # Rule: a formal a copy folded to a flat literal sequence states
-        # that literal's extent for the copy, as its own SSA does; two
-        # copies stating different extents are polymorphic.
+        # Rule: the copy's ``planner_specialization`` row names the literal
+        # sequence a formal is for this copy; the copy states that literal's
+        # extent, at the element dtype the literal rules give it
+        # (``_literal_element_dtype``), DERIVED from that row; two copies
+        # stating different extents are polymorphic.  A literal whose
+        # elements share no dtype states nothing.
+        from .concordance_declarations import (
+            PLANNER_SPECIALIZATION_PAGE as _SPECIALIZATION_PAGE,
+            SpecializationFact as _SpecializationFact,
+        )
+        from .glsl_deployment_strategy import _literal_element_dtype
+
+        copy_read_scope = planned_graph.graph.get("lexical_read_scope")
+        specialization_page = shape_identity_book.pages.get(
+            _SPECIALIZATION_PAGE.name
+        )
         for parameter_name in sorted(map(str, (
             planned_graph.graph.get("function_parameters") or ()
         ))):
+            if copy_read_scope is None or specialization_page is None:
+                break
+            specialization_row = (tuple(copy_read_scope), parameter_name)
+            specialization = specialization_page.latest(specialization_row)
+            if not isinstance(specialization, _SpecializationFact):
+                continue
+            literal = specialization.value
+            if not (
+                isinstance(literal, (list, tuple)) and literal
+                and all(
+                    isinstance(item, (bool, int, float)) for item in literal
+                )
+            ):
+                continue
+            literal_dtype = _literal_element_dtype(literal)
+            if literal_dtype is None:
+                continue
+            specialization_cell = shape_identity_book.latest_ref(
+                _SPECIALIZATION_PAGE, specialization_row,
+            )
             for value_id in identities.get(parameter_name, ()):
-                literal_data = planned_graph.nodes.get(int(value_id)) or {}
-                literal_attributes = literal_data.get("attributes") or {}
-                literal = literal_attributes.get("value")
-                if not (
-                    literal_attributes.get("structural_specialization")
-                    and literal_attributes.get("aggregate_kind") in {
-                        "list", "tuple",
-                    }
-                    and isinstance(literal, (list, tuple))
-                    and literal
-                    and all(
-                        isinstance(item, (bool, int, float)) for item in literal
-                    )
-                ):
-                    continue
                 note_shape(planned_graph, int(value_id), (
                     "folded literal formal",
                     (len(literal),),
-                    "bool" if all(isinstance(item, bool) for item in literal)
-                    else "float64" if any(
-                        isinstance(item, float) for item in literal
-                    ) else "int64",
+                    literal_dtype,
                     "span",
-                ))
+                ), also=(specialization_cell,))
 
         # Concrete source annotations also declare semantic class identity.
         # Physical parameter ABI is established by the existing scalar/span/
@@ -28495,6 +28601,16 @@ def _class_surface_ssa_program(
         # generic records and every non-record specialization keep their keys.
         from .identity_concordance import shape_scope_is_variant
         record_specialization = graph_obj.graph.get("parameter_record_abi") or {}
+        # The executable's identity names its record ABI whether or not the
+        # shell is a variant.  Program: a class whose ``twice`` calls
+        # ``self.bump`` twice, lowered whole (every method seeded).  Wrong
+        # record: the public ``bump`` shell (not a variant, so its record ABI
+        # was left out) and ``twice``'s callee copy of it (a variant carrying
+        # the same ``self`` record) were compared by different keys under
+        # one symbol, and the class refused ("names two shells with different
+        # callsite contracts").  Rule: compare shells by their contract AND
+        # their record ABI; only the symbol digest keeps the variant rule.
+        identity_contract = (*specialization_contract, record_specialization)
         if record_specialization and shape_scope_is_variant(graph_obj):
             specialization_contract = (*specialization_contract, record_specialization)
         # Program: ``intern_batch(1, [65, 66, 67], [0, 3])`` beside
@@ -28566,7 +28682,7 @@ def _class_surface_ssa_program(
             if data.get("type") == "Input"
             for attributes in (data.get("attributes") or {},)
         ))
-        shell_contract = (repr(specialization_contract), shell_frame)
+        shell_contract = (repr(identity_contract), shell_frame)
         if symbol in lowered_symbol_contracts:
             if lowered_symbol_contracts[symbol] != shell_contract:
                 from .identity_concordance import ConcordanceRefusal
@@ -30142,28 +30258,6 @@ def _class_surface_ssa_program(
             if not (0 <= int(slot) < len(field_names)):
                 continue
             field = dict(self_record_fields.get(field_names[int(slot)]) or {})
-            if field.get("dtype") is None and _kind == "read" and (
-                int(value_id) in graph_obj
-            ):
-                # Program: the structure driver's ``fold(d,
-                # vocabulary.epoch)`` on a local ``Vocabulary()``.  Wrong
-                # record: only a receiver PARAMETER's record fields were
-                # read here, so a local record's field read, consumed only
-                # as a call actual, reached the slot ABI with no dtype.
-                # Rule: the read carries its class field's declared scalar
-                # storage (stamped at ingestion from the field's storage
-                # contract); that is the slot's dtype.
-                read = graph_obj.nodes[int(value_id)]
-                descriptor = read.get("tensor") or {}
-                if (
-                    str(read.get("op") or read.get("type") or "").casefold()
-                    == "getattr"
-                    and (read.get("attributes") or {}).get("value_kind")
-                    == "scalar"
-                    and not tuple(descriptor.get("shape") or ())
-                    and descriptor.get("dtype") is not None
-                ):
-                    field = {"dtype": str(descriptor["dtype"])}
             if field.get("dtype") is not None:
                 parameter_value_dtypes[int(value_id)] = str(field["dtype"])
             if field.get("shape") is not None:
@@ -62211,6 +62305,9 @@ def _class_surface_ssa_program(
     lowered_module.metadata["build_target"] = (
         resolved_build_target.to_mapping()
     )
+    _refuse_dropped_activation_roots(
+        getattr(compilation, "deployment", None), lowered_module,
+    )
 
     return (
         lowered_module,
@@ -62264,72 +62361,6 @@ def _emit_class_surface_module(
     )
     if ssa_module is None:
         return None, ()
-    # Every activation root is a method the library promises to export.  The
-    # surface lowering passes over a planned shell that never received a
-    # control program, so a root with no lowered function was dropped, not
-    # refused: ``SSAReferenceEvaluator`` once shipped a library holding
-    # ``__init__`` alone.  Read the two records against each other here --
-    # the deployment's activation roots and each function's
-    # ``source_function_reference`` -- and refuse by name.
-    deployment = getattr(compilation, "deployment", None)
-    lowered_references = {
-        int(function.metadata["source_function_reference"])
-        for function in ssa_module.functions.values()
-        if function.metadata.get("source_function_reference") is not None
-    }
-    dropped_roots = tuple(
-        int(reference)
-        for reference in getattr(deployment, "activation_root_references", ())
-        if int(reference) not in lowered_references
-    )
-    if dropped_roots:
-        function_shells = dict(getattr(deployment, "function_shells", {}) or {})
-        raise FortranEmissionError(
-            "class surface planned activation roots it never lowered: "
-            + ", ".join(
-                f"{reference} "
-                + repr(str(getattr(getattr(getattr(
-                    function_shells.get(reference), "process_graph", None,
-                ), "G", None), "graph", {}).get("function_name") or "?"))
-                for reference in dropped_roots
-            )
-            + "; refusing to emit a library without them"
-        )
-    # A call through a stored callable -- ``self.notify(n)`` where the class
-    # table lists ``notify`` as a FIELD, not a method -- has no lowering: no
-    # method_ref, no callee_ref, no indirect callable record.  As a
-    # statement its result has no consumer, so nothing downstream asked for
-    # it and the library shipped the method with the call removed (the
-    # callable's effects silently gone).  The public entry already refuses
-    # this through its unresolved call table; the class surface has no such
-    # table, so read the method graph's own class-table record here.
-    from .glsl_deployment_strategy import (
-        _stored_callable_field_call, _walk_planned_shells,
-    )
-
-    unlowered_field_calls = []
-    for planned in _walk_planned_shells(
-        deployment, include_function_registry=False,
-    ):
-        graph = getattr(getattr(planned, "process_graph", None), "G", None)
-        if graph is None:
-            continue
-        for node_id, data in graph.nodes(data=True):
-            field = _stored_callable_field_call(graph, data)
-            if field is None or any(
-                (data.get("attributes") or {}).get(key) is not None
-                for key in ("method_ref", "callee_ref", "indirect_callable_id")
-            ):
-                continue
-            unlowered_field_calls.append(
-                f"{field[0]}.{graph.graph.get('function_name')}: "
-                f"{ast.unparse(data['expr_obj'])} (node {int(node_id)})"
-            )
-    if unlowered_field_calls:
-        raise FortranEmissionError(
-            "class surface has a call through a stored callable field with "
-            "no lowered invocation: " + "; ".join(unlowered_field_calls)
-        )
     emitted = emit_module(
         ssa_module,
         name=f"{artifact_name}_fortran",
