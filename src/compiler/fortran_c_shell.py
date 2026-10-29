@@ -6903,15 +6903,25 @@ def _canonical_program_abi_type_identity(
     # resolve through the record table.
     if canonical in _BUILTIN_PRIMITIVE_TYPE_IDENTITIES:
         return canonical
-    # ``Precision`` is a numeric value type with no ProgramABI record, so
-    # the record table cannot join its two spellings: an annotation names
-    # it ``Precision`` and a contract ``src.common.tensors.
-    # extended_precision.Precision``. Both are one type, never a union.
-    if canonical == "src.common.tensors.extended_precision.Precision":
-        return "Precision"
+    # A retained external class with no ProgramABI record (``Precision``,
+    # retained for a numeric annotation) is held by its
+    # ``source_record_class`` row: the defining
+    # identity names the ClassDef ingestion admitted, and the class's own
+    # rows are keyed by that ClassDef's schema identity.  One class, one key.
+    from .concordance_declarations import SOURCE_RECORD_CLASS
+    from .identity_concordance import current_identity_book
+    from ..transmogrifier.graph.graph_express2 import class_schema_identity
+
+    record_page = current_identity_book().pages.get(SOURCE_RECORD_CLASS.name)
+    retained = (
+        None if record_page is None else record_page.latest((canonical,))
+    )
     return _program_abi_record_for_type_identity(
         canonical, program_abi,
-    ) or canonical
+    ) or (
+        str(class_schema_identity(retained))
+        if isinstance(retained, ast.ClassDef) else canonical
+    )
 
 
 def _authored_enum_scalar_identities(

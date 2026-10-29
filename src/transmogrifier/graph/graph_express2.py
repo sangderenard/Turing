@@ -1531,6 +1531,20 @@ def _source_enum_declaration(definition):
     return (str(enum_base), members) if members else None
 
 
+def class_schema_identity(definition):
+    """The identity ``_class_schema_from_ast`` keys a ClassDef's record by."""
+
+    source_identity = getattr(definition, "_python_source_identity", None)
+    return (
+        ".".join(part for part in source_identity if part)
+        if source_identity is not None
+        # Owner ingestion has already recorded lexical qualification. Two
+        # Visitor classes in lexical_calls/lexical_return_calls are distinct
+        # declarations, not two records for the bare spelling "Visitor".
+        else getattr(definition, "_turing_source_qualname", definition.name)
+    )
+
+
 def _class_schema_from_ast(definition, *, carried_declarations=False):
     """Record only class syntax already being ingested by ``ProcessGraph``.
 
@@ -1615,15 +1629,7 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
                         statement,
                         method,
                     )
-    source_identity = getattr(definition, "_python_source_identity", None)
-    class_identity = (
-        ".".join(part for part in source_identity if part)
-        if source_identity is not None
-        # Owner ingestion has already recorded lexical qualification. Two
-        # Visitor classes in lexical_calls/lexical_return_calls are distinct
-        # declarations, not two records for the bare spelling "Visitor".
-        else getattr(definition, "_turing_source_qualname", definition.name)
-    )
+    class_identity = class_schema_identity(definition)
     schema = {
         "class_name": definition.name,
         "class_identity": class_identity,
