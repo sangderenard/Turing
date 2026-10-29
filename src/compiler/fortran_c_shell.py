@@ -12335,8 +12335,17 @@ def _field_slot_ops(
             )
 
     key_width_by_sequence: dict[int, int] = {}
-    for _effect_or_result, key_ids, sequence_id, *_rest in (
-        *table_lookups, *table_stores, *table_deletions
+    # Program: ``cells = {}; for i in range(n): cells[(i % 2, i)] = i``.
+    # Wrong record: a store row is (effect, key, value, sequence), but it was
+    # read like a lookup row, (result, key, sequence), so the stored VALUE id
+    # was taken as the sequence.  The two-column key never reached the dict's
+    # declaration, the table was born with one key column, and its store
+    # helper refused a call that passes two.  Rule: each row kind names its
+    # own sequence position.
+    for key_ids, sequence_id in (
+        *((key, sequence) for _result, key, sequence in table_lookups),
+        *((key, sequence) for _effect, key, _value, sequence in table_stores),
+        *((key, sequence) for _effect, key, sequence, *_rest in table_deletions),
     ):
         if sequence_id is None:
             continue
