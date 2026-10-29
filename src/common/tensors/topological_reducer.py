@@ -11434,17 +11434,23 @@ def _normalize_lexical_values(
                 # unannotated formal, ``vocabulary.cover`` resolved to no
                 # method and its result members had no class.  Rule: a
                 # construction of a submitted class IS an instance of it.
+                # A Precision construction's width is its ``limbs``
+                # argument, settled per callsite by the precision
+                # specialization, which posts this row with that width.
                 construction_cell = node_identity_cell(graph, int(node_id))
-                _concord_source_value_class(
-                    value_class_scope,
-                    int(node_id),
-                    str(expression.func.id),
-                    source="source class construction",
-                    provenance=(
-                        _Derived((construction_cell,))
-                        if construction_cell is not None else None
-                    ),
-                )
+                if "precision" not in _NUMERIC_TYPE_FEATURES.get(
+                    str(expression.func.id), frozenset(),
+                ):
+                    _concord_source_value_class(
+                        value_class_scope,
+                        int(node_id),
+                        str(expression.func.id),
+                        source="source class construction",
+                        provenance=(
+                            _Derived((construction_cell,))
+                            if construction_cell is not None else None
+                        ),
+                    )
             if (
                 isinstance(expression.func, ast.Attribute)
                 and node_id in graph.G
