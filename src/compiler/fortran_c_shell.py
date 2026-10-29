@@ -53357,9 +53357,23 @@ def _class_surface_ssa_program(
                             )
                             caller_tensor = caller_node.get("tensor") or {}
                             caller_id = int(caller_id)
+                            # Program: ``env, t = batch(n, 2)`` in ``root``
+                            # beside another call (string-core
+                            # ``intern_batch`` then ``intern``).  Wrong
+                            # record: the callee's sequences were read from
+                            # a table bound by an earlier loop over other
+                            # calls (the last callee it linked), so this
+                            # call's returned list was not recognised as a
+                            # caller arena and was also loaded out of the
+                            # aggregate; the load then retired the arena
+                            # formal and the call read undefined operands.
+                            # Rule: the sequences are this record's callee's.
+                            record_callee_sequences = all_sequence_tables.get(
+                                str(record.callee_symbol)
+                            )
                             if (
-                                callee_result_sequences is not None
-                                and callee_result_sequences.by_id(
+                                record_callee_sequences is not None
+                                and record_callee_sequences.by_id(
                                     int(callee_id)
                                 ) is not None
                                 and any(
