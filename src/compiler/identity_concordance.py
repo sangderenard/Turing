@@ -4498,12 +4498,42 @@ class CorrelationTable:
                 continue
             for block in (getattr(function, "blocks", {}) or {}).values():
                 for instruction in block.instrs:
-                    if instruction.op in {"Ret", "ret", "Return", "return"} and not instruction.args:
+                    if instruction.op not in {"Ret", "ret", "Return", "return"}:
+                        continue
+                    if not instruction.args:
                         found.append(Finding(
                             "source-output-unreturned", name, int(outputs[0]),
                             f"the source returns {len(outputs)} value(s), "
                             "but a Ret in block "
                             f"{getattr(block, 'name', '?')} returns none",
+                        ))
+                        continue
+                    # Program: ``return math.floor(x), int(x)`` (c922).
+                    # Wrong record: the region computing ``math.floor`` was
+                    # retired, and the Ret carried one value for the
+                    # source's two; the root returned a 1-tuple with a
+                    # clean audit.  Every source output occupies at least
+                    # one Ret slot (a None, a union frame or a forwarded
+                    # tuple expands to one or more), so a Ret carrying
+                    # FEWER values than the source returns lost one.  More
+                    # is the ABI's expansion (c306, c699, c807) and is not
+                    # read here.
+                    if len(instruction.args) < len(outputs) and not (
+                        getattr(instruction, "attributes", None) or {}
+                    ).get("fault_exit"):
+                        returned = {int(value.id) for value in instruction.args}
+                        missing = [
+                            int(value_id) for value_id in outputs
+                            if int(value_id) not in returned
+                        ]
+                        found.append(Finding(
+                            "source-output-arity-short", name,
+                            int((missing or outputs)[0]),
+                            f"the source returns {len(outputs)} value(s), "
+                            "but a Ret in block "
+                            f"{getattr(block, 'name', '?')} returns "
+                            f"{len(instruction.args)}; source output(s) "
+                            f"{missing} are not among them",
                         ))
         return found
 
