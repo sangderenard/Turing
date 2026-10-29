@@ -809,6 +809,7 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             diagnostic_value_ids=validation_diagnostic_value_ids(
                 direct_raise, node_for_expression,
             ),
+            source_raise_node_id=int(raise_id),
         ))
 
     # A guard nested inside a conditional arm of a retained loop's body is
@@ -883,6 +884,12 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             ), predicate_id)
         elif predicate_expression is None:
             continue
+        raised_node_id = node_for_expression(raised_statement)
+        if raised_node_id is None:
+            raise ValueError(
+                "guard raise has no exact source graph node: "
+                f"guard={node_id}"
+            )
         blocks.append(ValidationBlock(
             predicate_id,
             int(node_id),
@@ -894,6 +901,7 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             diagnostic_value_ids=validation_diagnostic_value_ids(
                 raised_statement, node_for_expression,
             ),
+            source_raise_node_id=int(raised_node_id),
         ))
     return tuple(blocks)
 

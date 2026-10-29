@@ -580,6 +580,9 @@ class ValidationBlock(TiledObject):
     # Exact source values consumed only by the authored exception diagnostic.
     # Native validation reports ``error_code`` and does not materialize them.
     diagnostic_value_ids: tuple[int, ...] = ()
+    # The exact authored Raise node, when this validation is an exceptional
+    # transfer. Generic validations have no Raise and keep their own status.
+    source_raise_node_id: int | None = None
 
 
 def validation_raise_identity(
@@ -587,36 +590,70 @@ def validation_raise_identity(
     statement: ast.Raise,
     node_for_expression: Callable[[ast.AST], int | None],
 ) -> str | None:
-    """Read a raise constructor's resolved graph identity, not its spelling.
+    """Read a raise constructor's exact static-use definition edge.
 
-    A program may define its own ``ValueError``.  That call has a
-    ``callee_ref`` and is not the builtin constructor even though the AST
-    spells the same name.  Only the graph's static builtin reference can
-    establish the exception class of the native validation status.
+    Program: ``raise ValueError(...)`` in tensor_octets_to_bytes. Wrong
+    record: a matching AST spelling plus the compiler host's ``builtins``
+    decided the raised class, while the handler side read the concordance.
+    The authored constructor occurrence's static-use edge is the one class
+    authority for both sides. A shadowed name has no builtin definition
+    edge, even when it is spelled ``ValueError``.
     """
 
-    raised = statement.exc
-    if isinstance(raised, ast.Call):
-        node_id = node_for_expression(raised)
-        spelling = raised.func.id if isinstance(raised.func, ast.Name) else None
-    elif isinstance(raised, ast.Name):
-        node_id = node_for_expression(raised)
-        spelling = raised.id
-    else:
-        return None
-    if node_id is None or spelling is None or int(node_id) not in graph:
-        return None
-    attributes = graph.nodes[int(node_id)].get("attributes") or {}
-    if attributes.get("callee_ref") is not None:
-        return None
-    if attributes.get("static_python_reference") != spelling:
-        return None
-    import builtins
+    from .concordance_declarations import (
+        SCOPE_ORIGIN, STATIC_REFERENCE_USE, STATIC_SYMBOL_DEFINITION,
+    )
+    from .identity_concordance import current_identity_book
 
-    candidate = getattr(builtins, spelling, None)
-    if not isinstance(candidate, type) or not issubclass(candidate, BaseException):
+    raised = statement.exc
+    if not isinstance(raised, ast.Call):
         return None
-    return f"builtins.{spelling}"
+    graph_obj = getattr(graph, "G", graph)
+    node_id = node_for_expression(raised)
+    if node_id is None or int(node_id) not in graph_obj:
+        return None
+    scope = graph_obj.graph.get("lexical_read_scope")
+    if scope is None:
+        raise ValueError("source raise has no lexical concordance scope")
+    occurrence = id(raised.func)
+    book = current_identity_book()
+    # Source call composition works on a forked read scope. The static-use
+    # occurrence was posted when the authored graph was reduced. Follow the
+    # book's scope_origin facts back to that ingestion scope, rather than
+    # parsing the fork name or accepting a use from another specialization.
+    source_scopes = {scope}
+    cursor = scope
+    while True:
+        origin = book.page(SCOPE_ORIGIN).latest((cursor,))
+        if origin is None:
+            break
+        cursor = origin.source_scope
+        if cursor in source_scopes:
+            raise ValueError("source raise read-scope origin has a cycle")
+        source_scopes.add(cursor)
+    ingestion_scopes = {(item, "ingestion") for item in source_scopes}
+    definitions = set()
+    for row in book.page(STATIC_REFERENCE_USE).rows():
+        if row[0] not in ingestion_scopes or int(row[1]) != occurrence:
+            continue
+        use_cell = book.latest_ref(STATIC_REFERENCE_USE, row)
+        if use_cell is None:
+            continue
+        definitions.update(
+            (str(source.row[0]), str(source.row[1]))
+            for source, _stage in book.edges_into(use_cell)
+            if source.page == STATIC_SYMBOL_DEFINITION
+            and len(source.row) == 3 and not source.row[2]
+        )
+    if len(definitions) > 1:
+        raise ValueError(
+            "source raise constructor has multiple static identities: "
+            f"raise={id(statement)}, definitions={definitions!r}"
+        )
+    if not definitions:
+        return None
+    module, qualname = definitions.pop()
+    return f"{module}.{qualname}"
 
 
 def validation_diagnostic_value_ids(
@@ -1284,11 +1321,16 @@ def _describe_control_block(
             for handler in block.handlers
         )
     elif isinstance(block, ValidationBlock):
-        owner = predicate = cell(block.predicate_value_id)
+        owner = cell(
+            block.source_raise_node_id
+            if block.source_raise_node_id is not None
+            else block.predicate_value_id
+        )
+        predicate = cell(block.predicate_value_id)
         diagnostics = cells(block.diagnostic_value_ids)
         extra = (
             int(block.error_code), bool(block.expect_true),
-            block.extraction_identity,
+            block.extraction_identity, block.source_raise_node_id,
         )
     elif isinstance(block, SequenceMutationBlock):
         # The step cell of a composition step, else the effect node's cell,

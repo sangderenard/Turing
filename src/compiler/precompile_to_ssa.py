@@ -10280,7 +10280,7 @@ class _ControlSSABuilder(TiledObject):
         if not self.native_try_frames:
             return None
         from .concordance_declarations import (
-            CANONICAL_VALUE, SOURCE_EXCEPTION_TRANSFER,
+            SOURCE_EXCEPTION_TRANSFER,
         )
         from .native_faults import authored_raise_status
         import builtins
@@ -10292,13 +10292,15 @@ class _ControlSSABuilder(TiledObject):
             ))
             return None
         book = self._book()
-        row = (self.lexical_read_scope, int(block.error_code))
+        if block.source_raise_node_id is None:
+            return None
+        row = (self.lexical_read_scope, int(block.source_raise_node_id))
         transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
         transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
         if transfer is None or transfer_cell is None or transfer.source_kind != "raise":
             self.shortfalls.append(SSALoweringShortfall(
                 "control", "raise", path,
-                f"source raise {block.error_code} has no exact exception edge",
+                f"source raise {block.source_raise_node_id} has no exact exception edge",
             ))
             return None
         if transfer.unwind_finally:
@@ -12525,6 +12527,13 @@ class _ControlSSABuilder(TiledObject):
             )
 
             native_status = authored_raise_status(block.extraction_identity)
+            if block.source_raise_node_id is not None and native_status is None:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "raise", path,
+                    "authored raise has no concordance-resolved native class: "
+                    f"source={block.source_raise_node_id}",
+                ))
+                return
             if block.extraction_identity is not None and native_status is None:
                 self.shortfalls.append(SSALoweringShortfall(
                     "control", "raise", path,
@@ -12550,6 +12559,7 @@ class _ControlSSABuilder(TiledObject):
                     block.predicate_expression
                 ),
                 "extraction_identity": block.extraction_identity,
+                "source_raise_node_id": block.source_raise_node_id,
             })
             predicate = (
                 self.lower_control_expression(block.predicate_expression)
@@ -12561,7 +12571,23 @@ class _ControlSSABuilder(TiledObject):
             )
             passed = self.new_block("validation_pass")
             failed = self.new_block("validation_fail")
-            if block.expect_true:
+            # Program: a direct Raise in a loop Try has an authored false
+            # validation predicate.  Emitting a two-way branch gave its
+            # impossible success edge a CFG predecessor at the Try exit;
+            # the handler's updated carried value then failed dominance and
+            # the latch silently reused the old value.  A literal predicate
+            # has one control edge, including when its edge is exceptional.
+            literal_predicate = block.predicate_expression
+            if (
+                literal_predicate is not None
+                and literal_predicate.op == "const"
+                and isinstance(literal_predicate.literal, bool)
+            ):
+                self.branch(
+                    passed if bool(literal_predicate.literal) == bool(block.expect_true)
+                    else failed
+                )
+            elif block.expect_true:
                 self.conditional_branch(predicate, passed, failed)
             else:
                 self.conditional_branch(predicate, failed, passed)
@@ -12572,7 +12598,7 @@ class _ControlSSABuilder(TiledObject):
                 self.branch(destination)
                 self.current.instrs[-1].attributes.update({
                     "source_control": "raise",
-                    "source_raise_node_id": int(block.error_code),
+                    "source_raise_node_id": int(block.source_raise_node_id),
                     "source_handler_node_id": int(handler_id),
                     "exception_transfer_cell": transfer_cell,
                 })
@@ -12582,7 +12608,7 @@ class _ControlSSABuilder(TiledObject):
                 Handler.Call, [], attributes={
                     "callee": "turing_validation_error",
                     "error_code": int(native_status or block.error_code),
-                    "source_raise_node_id": int(block.error_code),
+                    "source_raise_node_id": block.source_raise_node_id,
                     "extraction_identity": block.extraction_identity,
                 },
             )

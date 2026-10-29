@@ -17100,11 +17100,22 @@ def _normalize_lexical_values(
             for nested in body_statement.body:
                 reduce_statement(nested)
             body_environment = dict(environment)
+            body_ends_in_raise = bool(
+                body_statement.body
+                and isinstance(body_statement.body[-1], ast.Raise)
+            )
 
             handler_environments = []
             for handler in body_statement.handlers:
                 environment.clear()
-                environment.update(before)
+                # Program: root updates x, then raises ValueError inside a
+                # loop Try; its handler computes x + 2.  The old pre-Try
+                # snapshot made that handler read the pre-update x.  A
+                # terminal authored Raise transfers the current lexical
+                # bindings to its handler edge, and has no success edge.
+                environment.update(
+                    body_environment if body_ends_in_raise else before
+                )
                 # Program: tensor_octets_to_bytes catches
                 # (TypeError, ValueError, OverflowError) and then raises a
                 # new ValueError.  Wrong record: the handler's exception
@@ -17190,7 +17201,7 @@ def _normalize_lexical_values(
             # cannot turn values assigned by the successful body into
             # invented external inputs.
             environments = [
-                successful_environment,
+                *(() if body_ends_in_raise else (successful_environment,)),
                 *continuing_handler_environments,
             ]
             environment.clear()
