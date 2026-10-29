@@ -2356,7 +2356,7 @@ class WideExpansionEmitter:
 
     # -- value and instruction minting --------------------------------------
 
-    def fresh(self, like, extent_like=None, *, element=None):
+    def fresh(self, like, extent_like=None):
         declared = self.element
         extent_like = like if extent_like is None else extent_like
         like_dtype = str(like.dtype or "")
@@ -2376,10 +2376,6 @@ class WideExpansionEmitter:
             )
             else like.dtype
         )
-        if element is not None:
-            # A compare's result: its element is ``bool`` whatever the limb
-            # element is; only the extent still comes from ``extent_like``.
-            dtype = element
         logical_shape = tuple(
             (extent_like.accounting or {}).get(
                 "precision_logical_shape"
@@ -2729,29 +2725,6 @@ class WideExpansionEmitter:
     # input). The edge points are pinned by
     # test_precision_exp_log_range_decisions_are_exact_and_library_free.
 
-    def compare(self, op, left, right):
-        """``op`` in Lt/Le/Gt/Ge/Eq/Ne: a bool value shaped like ``left``."""
-
-        result = self.fresh(left, left, element="bool")
-        self.emitted.append(Instr(op, [left, right], result, attributes={
-            PRECISION_SECTION_ATTRIBUTE: True,
-            "lowered_from": "precision.range_decision",
-        }))
-        return result
-
-    def select(self, condition, when_true, when_false):
-        """A true select -- never an arithmetic blend, which is inexact."""
-
-        result = self.fresh(when_true, when_false)
-        self.emitted.append(Instr(
-            "Select", [condition, when_true, when_false], result,
-            attributes={
-                PRECISION_SECTION_ATTRIBUTE: True,
-                "lowered_from": "precision.range_decision",
-            },
-        ))
-        return result
-
     def power_of_two_factors(self, count, like):
         """Exact factors whose product is ``2**count``, all on one side of 1.
 
@@ -3003,6 +2976,29 @@ class WideExpansionEmitter:
             )
             for index, limb in enumerate(result)
         ]
+
+    def exp_overflow_predicate(self, source, result):
+        """True where Python's ``math.exp`` raises ``OverflowError``.
+
+        That is exactly a finite argument whose correctly rounded exp is
+        inf, read from ``result`` -- the limbs ``exp_expansion`` returned for
+        ``source`` -- rather than from a hand threshold, so the predicate
+        and the value can never disagree (709.782712893384 is finite,
+        709.7827128933841 overflows). ``+inf`` gives inf without raising in
+        Python and is not in it; NaN is not in it. Like
+        ``log_domain_predicate`` the emitter does not fault: the pass
+        lowering a Python ``math.exp`` guards on this.
+        """
+
+        collapsed = self.sum_expansion(source)
+        value = self.sum_expansion(result)
+        infinity = self.scalar_constant(float("inf"), collapsed)
+        finite_value = self.select(
+            self.compare("Lt", collapsed, infinity),
+            value,
+            self.scalar_constant(0.0, collapsed),
+        )
+        return self.compare("Eq", finite_value, infinity)
 
     def log_domain_predicate(self, source):
         """True where ``log`` has no real value: ``x <= 0`` (incl. -0, -inf).

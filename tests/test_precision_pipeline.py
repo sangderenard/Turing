@@ -275,6 +275,63 @@ def test_precision_exp_log_range_decisions_are_exact_and_library_free(
     assert environment[result.id] == expected
 
 
+@pytest.mark.parametrize(
+    ("argument", "overflows", "outside_domain"),
+    (
+        # The largest double whose exp is finite, and the next one up.
+        (709.782712893384, False, False),
+        (709.7827128933841, True, False),
+        (1.0e300, True, False),
+        (1.0, False, False),
+        (-1000.0, False, True),
+        (0.0, False, True),
+        (-0.0, False, True),
+        (5.0e-324, False, False),
+        (math.inf, False, False),
+        (-math.inf, False, True),
+        (math.nan, False, False),
+    ),
+)
+def test_precision_exp_overflow_and_log_domain_predicates(
+    argument, overflows, outside_domain, book,
+):
+    """The predicates a Python-faithful lowering guards on.
+
+    ``math.exp`` raises OverflowError exactly where the predicate says (it
+    is read off the correctly rounded result, not a threshold), and
+    ``math.log`` raises ValueError exactly where the domain predicate says.
+    """
+
+    from src.compiler.ir_identities import WideExpansionEmitter
+
+    x = value(1)
+    function = Function("f", [x], {"entry": BasicBlock("entry", [])})
+    _authored(IRModule({"f": function}))
+    emitted = []
+    emitter = WideExpansionEmitter(function, emitted)
+    source = emitter.expanded(x, 2)
+    result = emitter.exp_expansion(source, 2)
+    overflow = emitter.exp_overflow_predicate(source, result)
+    domain = emitter.log_domain_predicate(source)
+    function.blocks["entry"].instrs = emitted
+    environment = _evaluate_scalar_block(function, [argument])
+
+    assert environment[overflow.id] is overflows
+    assert environment[domain.id] is outside_domain
+    try:
+        math.exp(argument)
+    except OverflowError:
+        assert overflows
+    else:
+        assert not overflows
+    try:
+        math.log(argument)
+    except ValueError:
+        assert outside_domain
+    else:
+        assert not outside_domain
+
+
 @pytest.mark.parametrize("operation", ("Exp", "Log"))
 def test_symbolic_law_compiler_concords_precision_transcendental(operation):
     """The public source compiler keeps the planned wide region indivisible."""
