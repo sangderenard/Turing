@@ -987,6 +987,21 @@ def specialize_python_precision_widths(graph: Any) -> bool:
         for name, interval in sorted(
             dict(metadata.get("planner_parameter_int_ranges") or {}).items()
         )
+    ) + tuple(
+        # Program: the read head's ``_table_2d_flat(flat, table, row, col)``
+        # called with an (8, 8) and a (256, 256) table.  Wrong record: the
+        # copies differ only by a tensor actual's descriptor, which the
+        # receipt left out, so both shared one numeric scope and
+        # ``width = int(table.shape[1])`` disagreed (8 against 256).  Rule:
+        # the tensor descriptors a copy is minted for are part of its
+        # numeric identity, as its int ranges are.
+        (f"tensor:{name}", stable({
+            key: descriptor.get(key) for key in ("shape", "dtype", "rank")
+        }))
+        for name, descriptor in sorted(
+            dict(metadata.get("planner_tensor_descriptors") or {}).items()
+        )
+        if isinstance(descriptor, Mapping)
     )
     digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
     scope = (authored_scope, "specialization", digest)

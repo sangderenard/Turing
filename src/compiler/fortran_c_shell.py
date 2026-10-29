@@ -2667,6 +2667,148 @@ def _resolved_source_literals_by_symbol(
     }
 
 
+def _narrow_public_wide_int_returns(
+    module: Any, outputs: Mapping[str, Any], exports: tuple[str, ...],
+) -> tuple[dict[str, Any], ...]:
+    """An exported int128 scalar return enters the public int64 slot checked.
+
+    Program: ``def f(a, b): d = a % M; return d * 1000003 + b`` returned by
+    the entry.  The sum computes in int128 (an operand proven past int64);
+    the host's return buffer has no 128-bit cell.  Wrong record: every
+    build refused ("no public 128-bit buffer ABI"), though Python's value
+    fits int64 for most inputs.  Rule: the stage-1 rule at the boundary --
+    the returned value converts to int64 through the numeric contract's
+    ``integer_narrowing`` (``trap`` reports ``INT_OVERFLOW`` for a value
+    int64 does not hold), as a store into an int64 slot does.  A value
+    whose proven interval lies wholly outside int64 can never fit: that
+    build is refused by name.
+    """
+
+    from .concordance_declarations import CONTROL_CAST, PHYSICAL_CALL_INPUT_ADAPTATION
+    from .ssa_call_input_adapters import _numeric_conversion_attributes
+    from .ssa_llvm_backend import _INT64_BOUNDS, python_int_proven_range
+    from .ssa_record_return_state import mint_ssa_value
+    from ..transmogrifier.ssa import Instr, SSAValue
+
+    def producers_of(function):
+        return {
+            int(instruction.res.id): instruction
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if instruction.res is not None
+        }
+
+    # A region result keeps its source id across the region, the function
+    # that loads it and the caller of that function, so its proof is read
+    # where the region computed it.
+    region_proofs = {
+        int(instruction.res.id): python_int_proven_range(instruction)
+        for function in module.functions.values()
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.res is not None
+        and python_int_proven_range(instruction) is not None
+    }
+
+    def proven_range(function, value_id, depth=0):
+        """The interval proven for a returned value, through its callees."""
+
+        producer = producers_of(function).get(int(value_id))
+        interval = python_int_proven_range(producer)
+        if interval is not None or producer is None or depth > 8:
+            return interval
+        if producer.op == "Load":
+            return region_proofs.get(int(value_id))
+        callee = module.functions.get(
+            str((producer.attributes or {}).get("callee") or "")
+        )
+        if producer.op != "Call" or callee is None:
+            return None
+        joined = None
+        for block in callee.blocks.values():
+            for instruction in block.instrs:
+                if instruction.op != "Ret" or (
+                    instruction.attributes or {}
+                ).get("fault_exit"):
+                    continue
+                if len(instruction.args) != 1:
+                    return None
+                arm = proven_range(callee, instruction.args[0].id, depth + 1)
+                if arm is None:
+                    return None
+                joined = arm if joined is None else (
+                    min(joined[0], arm[0]), max(joined[1], arm[1]),
+                )
+        return joined
+
+    receipts: list[dict[str, Any]] = []
+    for export in exports:
+        function = module.functions.get(export)
+        if function is None:
+            continue
+        narrowed: dict[int, SSAValue] = {}
+        for block in function.blocks.values():
+            for position in range(len(block.instrs) - 1, -1, -1):
+                ret = block.instrs[position]
+                if ret.op != "Ret" or (ret.attributes or {}).get("fault_exit"):
+                    continue
+                for index, value in enumerate(tuple(ret.args)):
+                    if (
+                        str(value.dtype) != "int128"
+                        or tuple(value.shape or ())
+                    ):
+                        continue
+                    proven = proven_range(function, value.id)
+                    if proven is not None and (
+                        proven[0] > _INT64_BOUNDS[1]
+                        or proven[1] < _INT64_BOUNDS[0]
+                    ):
+                        raise ValueError(
+                            f"{export}: the returned int is proven in "
+                            f"{proven}, wholly outside int64; the public "
+                            "int64 return slot can never hold it"
+                        )
+                    converted = narrowed.get(int(value.id))
+                    if converted is None:
+                        converted_id = mint_ssa_value(
+                            function, CONTROL_CAST, (value,),
+                            dtype="int64", shape=(),
+                            stage=PHYSICAL_CALL_INPUT_ADAPTATION,
+                            physical={
+                                "physical_dtype": "int64",
+                                "device": value.device,
+                            },
+                        )
+                        converted = SSAValue(
+                            converted_id, dtype="int64", shape=(),
+                            device=value.device,
+                        )
+                        block.instrs.insert(position, Instr(
+                            "Cast", [value], converted,
+                            attributes={
+                                "target_dtype": "int64",
+                                "source_dtype": "int128",
+                                "public_return_narrowing": True,
+                                **_numeric_conversion_attributes(
+                                    "int128", "int64",
+                                ),
+                            },
+                        ))
+                        narrowed[int(value.id)] = converted
+                        receipts.append({
+                            "function": export,
+                            "value": int(value.id),
+                            "narrowed": int(converted_id),
+                        })
+                    ret.args[index] = converted
+        if narrowed and export in outputs:
+            outputs[export] = type(outputs[export])(
+                narrowed.get(int(value.id), value)
+                for value in outputs[export]
+            )
+    return tuple(receipts)
+
+
 def _record_unplanned_callable_inputs(module: Any, source_graphs: Mapping[str, Any]) -> None:
     """Retain unresolved invocation edges to surviving callable inputs."""
     from ..transmogrifier.ssa import SSACallRecord
@@ -12335,8 +12477,17 @@ def _field_slot_ops(
             )
 
     key_width_by_sequence: dict[int, int] = {}
-    for _effect_or_result, key_ids, sequence_id, *_rest in (
-        *table_lookups, *table_stores, *table_deletions
+    # Program: ``cells = {}; for i in range(n): cells[(i % 2, i)] = i``.
+    # Wrong record: a store row is (effect, key, value, sequence), but it was
+    # read like a lookup row, (result, key, sequence), so the stored VALUE id
+    # was taken as the sequence.  The two-column key never reached the dict's
+    # declaration, the table was born with one key column, and its store
+    # helper refused a call that passes two.  Rule: each row kind names its
+    # own sequence position.
+    for key_ids, sequence_id in (
+        *((key, sequence) for _result, key, sequence in table_lookups),
+        *((key, sequence) for _effect, key, _value, sequence in table_stores),
+        *((key, sequence) for _effect, key, sequence, *_rest in table_deletions),
     ):
         if sequence_id is None:
             continue
@@ -29970,6 +30121,28 @@ def _class_surface_ssa_program(
             if not (0 <= int(slot) < len(field_names)):
                 continue
             field = dict(self_record_fields.get(field_names[int(slot)]) or {})
+            if field.get("dtype") is None and _kind == "read" and (
+                int(value_id) in graph_obj
+            ):
+                # Program: the structure driver's ``fold(d,
+                # vocabulary.epoch)`` on a local ``Vocabulary()``.  Wrong
+                # record: only a receiver PARAMETER's record fields were
+                # read here, so a local record's field read, consumed only
+                # as a call actual, reached the slot ABI with no dtype.
+                # Rule: the read carries its class field's declared scalar
+                # storage (stamped at ingestion from the field's storage
+                # contract); that is the slot's dtype.
+                read = graph_obj.nodes[int(value_id)]
+                descriptor = read.get("tensor") or {}
+                if (
+                    str(read.get("op") or read.get("type") or "").casefold()
+                    == "getattr"
+                    and (read.get("attributes") or {}).get("value_kind")
+                    == "scalar"
+                    and not tuple(descriptor.get("shape") or ())
+                    and descriptor.get("dtype") is not None
+                ):
+                    field = {"dtype": str(descriptor["dtype"])}
             if field.get("dtype") is not None:
                 parameter_value_dtypes[int(value_id)] = str(field["dtype"])
             if field.get("shape") is not None:
@@ -31311,6 +31484,28 @@ def _class_surface_ssa_program(
                             or dict(graph_obj.graph.get(
                                 "linked_sequence_element_dtypes"
                             ) or {}).get(int(sequence_id)),
+                        )
+                        if _native_row_dtype(planned)
+                    },
+                    # Program: ``rebuilt = []; rebuilt = rebuilt + ca``.
+                    # Wrong record: the folded ``[]`` has no rows to settle
+                    # its column, so its descriptor kept an ``unknown`` row
+                    # the backends cannot lay out.  Rule: an empty list
+                    # constant's rows are of the class the planner settled
+                    # for it (the concatenation it feeds); it is declared
+                    # with that class at birth.
+                    **{
+                        int(sequence_id): (planned,)
+                        for sequence_id, _policy, column_count, _writable
+                        in sequence_declarations
+                        if int(column_count) == 1
+                        and int(sequence_id) in graph_obj
+                        and (
+                            graph_obj.nodes[int(sequence_id)].get("attributes")
+                            or {}
+                        ).get("value") == []
+                        for planned in (
+                            planned_sequence_elements.get(int(sequence_id)),
                         )
                         if _native_row_dtype(planned)
                     },
@@ -35150,6 +35345,25 @@ def _class_surface_ssa_program(
         # consulted: it counts a formal handle as live, so it would keep
         # every unused frame-storage formal -- _reindex_in_place's folded
         # ``{}``/``[]`` defaults came back as unknown-dtype formals.)
+        # Program: ``cells: dict[int, int] = {}`` filled in a loop (corpus
+        # c942; bootstrap ``identity_spill._reindex_in_place``).  Wrong
+        # record: the dict's data arena was refined to its row dtype, which
+        # puts a new SSAValue object in the formals, while the store calls
+        # kept reading the earlier object with the same id.  The unused-
+        # formal test compared objects, so the arena read as unused and was
+        # dropped, and every call then read a value nothing defined.  Rule:
+        # a formal is used when an instruction reads its value id.
+        used_argument_ids = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
+        }
+        used_argument_objects.update(
+            id(argument)
+            for argument in function.args
+            if int(argument.id) in used_argument_ids
+        )
         frame_removable = {
             int(argument.id)
             for argument in function.args
@@ -65129,6 +65343,11 @@ def _lower_ast_source_to_ssa_impl(
     # therefore drops its closure/callable provenance at publication.
     final_source_graphs_by_symbol = _resolved_source_graphs_by_symbol(graph)
     compile_stage("pre-native-repairs")
+    public_return_narrowings = _narrow_public_wide_int_returns(
+        module, outputs, tuple(exports),
+    )
+    if public_return_narrowings:
+        module.metadata["public_return_narrowings"] = public_return_narrowings
     compile_substage("release selected deployment planning state")
     # The deployment (every planned shell, its callsite copies and dispatch
     # subgraphs) was local to that call and is unreachable now; its shell

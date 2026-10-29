@@ -13,9 +13,11 @@ LIST_INDEX_OUT_OF_RANGE = 71
 #: A subscript read of a mapping key it does not hold (``required_key_absent``).
 MAPPING_KEY_ABSENT = 84
 
-#: A Python ``int`` result no interval proves inside int64 left int64.  Python
-#: would have continued exactly; until that result continues as Precision
-#: limbs, the native module reports it rather than return a wrapped value.
+#: A Python ``int`` result no interval proves inside its native width (int64,
+#: or int128 over an operand proven past int64) left that width, or a wider
+#: result did not fit the int64 slot it was declared into.  Python would
+#: have continued exactly; until that result continues as Precision limbs,
+#: the native module reports it rather than return a wrapped value.
 INT_OVERFLOW = 86
 
 #: ``a << b`` or ``a >> b`` with ``b < 0``: Python raises ``ValueError``.
@@ -163,7 +165,8 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
         return NativeKeyError(f"key not in mapping ({runtime_message})")
     if int(code) == INT_OVERFLOW:
         return NativeIntOverflow(
-            f"int result left int64; no interval proves it ({runtime_message})"
+            "int result left its native width (int64, or int128 past a "
+            f"proven-wide operand); no interval proves it ({runtime_message})"
         )
     if int(code) == NEGATIVE_SHIFT_COUNT:
         return NativeValueError(f"negative shift count ({runtime_message})")

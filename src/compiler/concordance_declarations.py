@@ -879,6 +879,22 @@ def _literal_identity(value: Any, depth: int) -> tuple[Any, bool]:
         children = tuple(
             zip((field.name for field in fields), (part[0] for part in parts))
         )
+    elif (
+        type(value).__eq__ is object.__eq__
+        and isinstance(getattr(value, "__dict__", None), dict)
+        and not isinstance(value, type)
+        and not callable(value)
+        and type(value).__module__ != "builtins"
+    ):
+        # A plain authored object (``X86TensorReadHead``) compares by
+        # identity in Python, and the compiler's own copy of a bound
+        # receiver is another object with the same fields.  Holding a
+        # tensor, it is keyed by its fields like a record.
+        names = sorted(vars(value))
+        parts = [
+            _literal_identity(vars(value)[name], depth + 1) for name in names
+        ]
+        children = tuple(zip(names, (part[0] for part in parts)))
     else:
         return value, False
     if not any(part[1] for part in parts):
