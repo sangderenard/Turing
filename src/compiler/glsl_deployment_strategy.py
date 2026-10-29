@@ -13465,8 +13465,10 @@ def _source_try_control_programs(
         SOURCE_EXCEPTION_CONTINUATION_PHI,
         SOURCE_EXCEPTION_HANDLER_CLASS,
         SOURCE_EXCEPTION_REGION_SITE,
+        SOURCE_EXCEPTION_REGION_STATE,
         SOURCE_EXCEPTION_TRANSFER,
         ExceptionContinuationArmValueFact, ExceptionRegionSiteFact,
+        ExceptionRegionStateFact,
         ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
         ExceptionTransferFact,
     )
@@ -13513,6 +13515,35 @@ def _source_try_control_programs(
                 f"source={source_cell!r}, matches={tuple(sorted(matches))!r}"
             )
         return next(iter(matches))
+
+    def source_value_for_binding(binding: Any, name: str) -> Any:
+        binding_fact = book.page(NAME_BINDING).cells.get((
+            binding.row, binding.column,
+        ))
+        if (
+            binding.page != NAME_BINDING
+            or binding.row[1] != name
+            or binding_fact is None
+        ):
+            raise ValueError(
+                "source Try has no exact name binding: "
+                f"name={name!r}, binding={binding!r}"
+            )
+        # Program: the second Try of `try: y = int(x); ...; try:
+        # z = int(y)` reads a Phi for y. Its ingestion cell belongs to
+        # the reducer scope, while the cast belongs to the graph scope.
+        # The binding's provenance names the value's actual source cell.
+        sources = tuple(dict.fromkeys(
+            cause for cause, _stage in book.edges_into(binding)
+            if cause.page == INGESTION_VALUE
+            and int(cause.row[1]) == int(binding_fact.value_id)
+        ))
+        if len(sources) != 1:
+            raise ValueError(
+                "source Try binding has no unique source value: "
+                f"name={name!r}, binding={binding!r}, sources={sources!r}"
+            )
+        return sources[0]
     subgraphs = tuple(dispatch_subgraphs)
     retained_regions = tuple(map(int, retained_regions))
     planning_scope = graph.G.graph.get("planning_scope")
@@ -13683,15 +13714,7 @@ def _source_try_control_programs(
                         "Try continuation arm lacks exact name binding: "
                         f"phi={row!r}, arm={arm_index}"
                     )
-                source_value = book.latest_ref(
-                    INGESTION_VALUE,
-                    (fact.owner.row[0], int(binding_fact.value_id)),
-                )
-                if source_value is None:
-                    raise ValueError(
-                        "Try continuation binding has no source value: "
-                        f"phi={row!r}, arm={arm_index}"
-                    )
+                source_value = source_value_for_binding(binding, fact.name)
                 value_id = canonical_from_source(source_value)
                 control_id = canonical_from_source(control)
                 canonical_value = book.latest_ref(
@@ -13780,7 +13803,7 @@ def _source_try_control_programs(
                 # node 6 in region 0. A region index alone cannot identify
                 # the failure operation; the region member and source
                 # transfer must meet at this one canonical value cell.
-                book.post(
+                region_site_cell = book.post(
                     SOURCE_EXCEPTION_REGION_SITE,
                     (planning_scope, region, canonical_id),
                     ExceptionRegionSiteFact(
@@ -13792,6 +13815,35 @@ def _source_try_control_programs(
                     )),
                     mode=Mode.CONCORD,
                 )
+                for name, binding in transfer.entry_bindings:
+                    source_value = source_value_for_binding(binding, name)
+                    canonical_value = book.latest_ref(
+                        CANONICAL_VALUE,
+                        (canonical_scope, canonical_from_source(source_value)),
+                    )
+                    if canonical_value is None:
+                        raise ValueError(
+                            "deployed exception binding lacks canonical value: "
+                            f"transfer={row!r}, name={name!r}"
+                        )
+                    # Program: `z = 5; try: y = int(x); except ValueError:
+                    # y = z`. The failed cast reads the binding of z at
+                    # that call, not the final environment after the Try.
+                    # Carry that exact source version into its deployed site.
+                    book.post(
+                        SOURCE_EXCEPTION_REGION_STATE,
+                        (planning_scope, region, canonical_id, name),
+                        ExceptionRegionStateFact(
+                            region_site_cell, transfer_cell, binding,
+                            source_value, canonical_value,
+                        ),
+                        stage=CONTROL_PROGRAM_BUILD,
+                        provenance=Derived((
+                            region_site_cell, transfer_cell, binding,
+                            source_value, canonical_value,
+                        )),
+                        mode=Mode.CONCORD,
+                    )
         program = ControlProgram(
             NativeTryBlock(
                 arm_body(("body", 0)), tuple(handlers),

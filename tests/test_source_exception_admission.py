@@ -15,6 +15,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
     SOURCE_EXCEPTION_REGION_SITE,
+    SOURCE_EXCEPTION_REGION_STATE,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
     SOURCE_EXCEPTION_CONTINUATION_PHI,
@@ -167,6 +168,38 @@ def root(x: float) -> int:
     assert boundary["kind"] == "source-exception-control-owner"
 
 
+def test_protected_call_carries_its_exact_live_handler_binding():
+    source = """\
+def root(x: float, z: int) -> int:
+    try:
+        y = int(x)
+    except ValueError:
+        y = z
+    return y
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_live_binding", identity_book=book)
+        site_row, = tuple(book.page(SOURCE_EXCEPTION_REGION_SITE).rows())
+        state_row = (*site_row, "z")
+        state = book.page(SOURCE_EXCEPTION_REGION_STATE).latest(state_row)
+        site = book.page(SOURCE_EXCEPTION_REGION_SITE).latest(site_row)
+        transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(
+            site.transfer.row
+        )
+        assert state.region_site == book.latest_ref(
+            SOURCE_EXCEPTION_REGION_SITE, site_row,
+        )
+        assert state.source_binding == dict(transfer.entry_bindings)["z"]
+        assert state.canonical_value.row[0] == site.canonical_site.row[0]
+        assert CorrelationTable._source_exception_region_state_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    finally:
+        end_identity_book(token)
+
+
 def test_standalone_authored_raise_refuses_wrong_native_class():
     # Before this obligation, the complete native artifact reported code 3.
     # validation_fault(3) is RuntimeError, not the authored ValueError.
@@ -236,6 +269,12 @@ def root(x: float) -> int:
                        Unresolved)
             for row in rows
         )
+        assert CorrelationTable._source_exception_region_state_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert CorrelationTable._source_exception_continuation_arm_value_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
     finally:
         end_identity_book(token)
     boundaries = error.value.to_failure_mapping()["subdivision_boundaries"]
@@ -273,6 +312,16 @@ def root(x: float) -> int:
         transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(sites[0])
         assert transfer.entry_bindings == site.bindings
         assert transfer.catch_try == site.scopes[-1][0]
+        state_rows = tuple(
+            row for row in book.page(SOURCE_EXCEPTION_REGION_STATE).rows()
+            if row[3] == "y"
+        )
+        assert len(state_rows) == 1
+        state = book.page(SOURCE_EXCEPTION_REGION_STATE).latest(state_rows[0])
+        assert state.source_binding == binding
+        assert CorrelationTable._source_exception_region_state_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
         entries = tuple(book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).rows())
         assert len(entries) == 1
         entry = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest(entries[0])

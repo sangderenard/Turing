@@ -1556,6 +1556,7 @@ class CorrelationTable:
         found.extend(self._source_exception_handler_class_findings(module))
         found.extend(self._source_exception_status_route_findings(module))
         found.extend(self._source_exception_region_site_findings(module))
+        found.extend(self._source_exception_region_state_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_continuation_phi_findings(module))
@@ -2379,6 +2380,113 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_exception_region_state_findings(module: Any) -> list[Finding]:
+        """A deployed failure edge carries the binding at that source site."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE, NAME_BINDING,
+            SOURCE_EXCEPTION_REGION_SITE, SOURCE_EXCEPTION_REGION_STATE,
+            SOURCE_EXCEPTION_TRANSFER, ExceptionRegionSiteFact,
+            ExceptionRegionStateFact, ExceptionTransferFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_REGION_STATE.name not in book.pages:
+            return []
+        states = book.page(SOURCE_EXCEPTION_REGION_STATE)
+        sites = book.page(SOURCE_EXCEPTION_REGION_SITE)
+        successors = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for cause, _stage in book.edges_into(canonical):
+                successors.setdefault(cause, set()).add(canonical)
+
+        def reaches(source: Ref, target: Ref) -> bool:
+            pending = [source]
+            seen = set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                pending.extend(successors.get(cell, ()))
+            return target in seen
+
+        found = []
+        for site_row in sites.rows():
+            site = sites.latest(site_row)
+            if not isinstance(site, ExceptionRegionSiteFact):
+                continue
+            transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(
+                site.transfer.row
+            )
+            if not isinstance(transfer, ExceptionTransferFact):
+                continue
+            for name, _binding in transfer.entry_bindings:
+                if states.latest((*site_row, name)) is None:
+                    found.append(Finding(
+                        "source-exception-region-state-disagreement",
+                        str((*site_row, name)), None,
+                        "deployed exception site lacks a required binding",
+                    ))
+        for row in states.rows():
+            fact = states.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_REGION_STATE, row)
+            site = sites.latest(row[:3])
+            site_cell = book.latest_ref(SOURCE_EXCEPTION_REGION_SITE, row[:3])
+            problem = None
+            if not isinstance(fact, ExceptionRegionStateFact):
+                problem = "deployed exception binding has no state fact"
+            elif not isinstance(site, ExceptionRegionSiteFact) or (
+                fact.region_site != site_cell or fact.transfer != site.transfer
+            ):
+                problem = "deployed exception binding has a foreign site"
+            elif not all(isinstance(cell, Ref) for cell in (
+                fact.source_binding, fact.source_value, fact.canonical_value,
+            )):
+                problem = "deployed exception binding lacks exact cells"
+            else:
+                transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(
+                    fact.transfer.row
+                )
+                binding = book.page(NAME_BINDING).cells.get((
+                    fact.source_binding.row, fact.source_binding.column,
+                ))
+                source_causes = () if binding is None else tuple(
+                    cause for cause, _stage in book.edges_into(
+                        fact.source_binding,
+                    ) if cause.page == INGESTION_VALUE
+                    and int(cause.row[1]) == int(binding.value_id)
+                )
+                if (
+                    not isinstance(transfer, ExceptionTransferFact)
+                    or dict(transfer.entry_bindings).get(row[3])
+                    != fact.source_binding
+                    or fact.source_binding.page != NAME_BINDING
+                    or source_causes != (fact.source_value,)
+                    or fact.canonical_value.page != CANONICAL_VALUE
+                    or fact.canonical_value.row[0]
+                    != site.canonical_site.row[0]
+                    or book.latest_ref(
+                        CANONICAL_VALUE, fact.canonical_value.row,
+                    ) != fact.canonical_value
+                    or not reaches(fact.source_value, fact.canonical_value)
+                ):
+                    problem = "deployed exception binding disagrees with source"
+                elif {
+                    cause for cause, _stage in book.edges_into(receipt)
+                } != {
+                    site_cell, fact.transfer, fact.source_binding,
+                    fact.source_value, fact.canonical_value,
+                }:
+                    problem = "deployed exception binding provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-region-state-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
     def _source_exception_handler_entry_findings(module: Any) -> list[Finding]:
         """Each candidate edge supplies the exact requested binding cell."""
         from .concordance_declarations import (
@@ -2643,6 +2751,12 @@ class CorrelationTable:
                 binding = book.page(NAME_BINDING).cells.get((
                     fact.source_binding.row, fact.source_binding.column,
                 ))
+                source_causes = () if binding is None else tuple(
+                    cause for cause, _stage in book.edges_into(
+                        fact.source_binding,
+                    ) if cause.page == INGESTION_VALUE
+                    and int(cause.row[1]) == int(binding.value_id)
+                )
                 if (
                     not isinstance(phi, ExceptionContinuationPhiFact)
                     or fact.source_binding.page != NAME_BINDING
@@ -2655,11 +2769,7 @@ class CorrelationTable:
                     )
                     or binding is None
                     or fact.source_binding.row[1] != phi.name
-                    or fact.source_value != book.latest_ref(
-                        INGESTION_VALUE,
-                        (phi.owner.row[0], int(binding.value_id))
-                        if binding is not None else (None, -1),
-                    )
+                    or source_causes != (fact.source_value,)
                     or int(fact.canonical_phi.row[1]) != int(row[1])
                     or any(
                         cell.row[0] != fact.canonical_phi.row[0]

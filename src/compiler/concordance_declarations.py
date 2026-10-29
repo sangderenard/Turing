@@ -1250,6 +1250,27 @@ SOURCE_EXCEPTION_REGION_SITE = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionRegionStateFact:
+    """One exceptional site's live source binding in its deployed graph."""
+
+    region_site: Ref
+    transfer: Ref
+    source_binding: Ref
+    source_value: Ref
+    canonical_value: Ref
+
+
+SOURCE_EXCEPTION_REGION_STATE = declare_page(
+    "source_exception_region_state", (
+        RowField("planning_scope", K.SCOPE),
+        RowField("region", K.INDEX),
+        RowField("canonical_site", K.VALUE_ID),
+        RowField("name", K.NAME),
+    ), ExceptionRegionStateFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionHandlerEntryFact:
     """Candidate failure edges and binding versions at one handler entry."""
 
