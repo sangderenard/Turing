@@ -4498,8 +4498,14 @@ def _planned_scalar_dtypes_from_graph(
             # result float64 and an int program returned a float.  Rule:
             # on a proven scalar, ``math.floor``/``ceil``/``trunc`` and
             # one-argument ``round`` return ``int`` in Python.
-            if reference in {
-                "round", "math.floor", "math.ceil", "math.trunc",
+            # Program: ``from math import floor; floor(x)`` (c923).  Wrong
+            # record: this rule read the call's spelling, so the imported
+            # name ``floor`` missed ``math.floor`` and the result took the
+            # float64 operand rule.  Rule: the callee is named by its
+            # resolved extraction identity, whatever the authored spelling.
+            callee_identity = str(attributes.get("extraction_identity") or "")
+            if callee_identity in {
+                "builtins.round", "math.floor", "math.ceil", "math.trunc",
             }:
                 arguments = parents(data, "arg:")
                 if len(arguments) == 1 and scalar.get(arguments[0]) in {
