@@ -154,3 +154,70 @@ def test_atan2_quadrants_specials_and_subnormal_quotients(tmp_path_factory):
     cases += [(3 * 2.0 ** -1000, 2.0 ** 75), (-3 * 2.0 ** -1000, 2.0 ** 75)]
     _check(built, cases, mpmath.atan2, math.atan2)
     assert _run(built, 3 * 2.0 ** -1000, 2.0 ** 75) == 5e-324
+
+
+def _python_pow(x, y):
+    try:
+        result = x ** y
+    except (ZeroDivisionError, OverflowError) as error:
+        return type(error)
+    return "complex" if isinstance(result, complex) else result
+
+
+def _native_pow(built, x, y):
+    from src.compiler.native_faults import NativeFloatPowComplexResult
+
+    try:
+        return _run(built, x, y)
+    except NativeFloatPowComplexResult:
+        return "complex"
+    except (ZeroDivisionError, OverflowError, ValueError) as error:
+        return next(kind for kind in (ZeroDivisionError, OverflowError, ValueError)
+                    if isinstance(error, kind))
+
+
+def test_pow_is_correctly_rounded_with_exact_midpoints(tmp_path_factory):
+    built = _built("pow", tmp_path_factory, form="operator")
+    cases = [(a, b) for a in SPECIAL for b in SPECIAL]
+    cases += [
+        (3.0, 34.0),                  # 54-bit odd integer: a tie, to even
+        (68718952449.0, 1.5),         # (2**18-1)**3: a tie through sqrt
+        (2.0, -1075.0), (2.0 ** -25, 43.0),  # 2**-1075: tie to +0
+        (3 * 2.0 ** -215, 5.0),       # 243 * 2**-1075: subnormal tie
+        (0.5, 1074.3), (1.5, -1800.0), (10.0, 308.0), (10.0, 309.0),
+        (0.9999999999, 1e12), (1.0 + 2.0 ** -52, 2.0 ** 60), (1e-310, 0.5),
+        (-2.0, 3.0), (-2.0, 0.5), (-1e-300, 3.0), (0.0, -1.0), (-0.0, -3.0),
+        (-0.0, 3.0), (0.0, -INF), (-1.0, INF), (NAN, 0.0), (1.0, NAN),
+        (1.7976931348623157e308, 1.7976931348623157e308),
+    ]
+    magnitudes = np.exp2(_RNG.uniform(-1074.0, 1023.9, 150))
+    targets = _RNG.uniform(-1110.0, 1060.0, 150)
+    cases += [(float(a), float(t / np.log2(a))) for a, t in zip(magnitudes, targets)]
+    cases += [(float(a), float(b)) for a, b in zip(_RNG.uniform(-20, 20, 100),
+                                                   _RNG.integers(-300, 300, 100))]
+    wrong = []
+    for x, y in cases:
+        got, want = _native_pow(built, x, y), _python_pow(x, y)
+        if isinstance(want, float) and all(math.isfinite(a) and a != 0 for a in (x, y)) \
+                and math.isfinite(want) and want != 0:
+            want = _rounded(mpmath.power(mpmath.mpf(x), mpmath.mpf(y)))
+        if isinstance(got, float) and isinstance(want, float):
+            matches = _same(got, want)
+        else:
+            matches = got == want
+        if not matches:
+            wrong.append(((x, y), got, want))
+    assert not wrong, wrong[:5]
+
+
+def test_math_pow_form_reports_math_faults(tmp_path_factory):
+    from src.compiler.native_faults import NativeFloatOverflow, NativeValueError
+
+    built = _built("pow", tmp_path_factory, form="math")
+    for x, y in ((0.0, -1.0), (-0.0, -3.0), (-8.0, 1.0 / 3.0)):
+        with pytest.raises(NativeValueError, match="math domain error"):
+            _run(built, x, y)
+    with pytest.raises(NativeFloatOverflow, match="math range error"):
+        _run(built, 10.0, 400.0)
+    assert _run(built, 2.0, 10.0) == math.pow(2.0, 10.0)
+    assert _run(built, 0.0, -INF) == math.pow(0.0, -INF)

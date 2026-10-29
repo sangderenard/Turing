@@ -3429,6 +3429,257 @@ class WideExpansionEmitter:
             self._special(value, width), result,
         )
 
+    # -- pow ------------------------------------------------------------------
+
+    def _exact_power(self, base, exponent, width: int):
+        """``(m, n, e)`` with ``base**exponent == m**n * 2**(e*n)`` exactly
+        when ``exponent * 2**j`` is an integer ``n`` for some j <= 5 and
+        ``base`` is a perfect ``2**j``-th power (the smallest such j).
+
+        ``base`` is a finite double > 0.  Each level takes ``Sqrt`` of a
+        mantissa in [1, 4) (the exponent made even first), so the root is a
+        normal double in [1, 2) and its exactness is an exact test: the
+        two-product of the root with itself is the mantissa with a zero
+        residual.  Returns ``(mantissa, exponent_n, binade, usable)``.
+        """
+
+        like = base
+        two = self.scalar_constant(2.0, like)
+        half = self.scalar_constant(0.5, like)
+        mantissa, binade, _ = self._binade(base)
+        exact = self._predicate("Eq", (two, two))
+        scaled = exponent
+        levels = []
+        for level in range(6):
+            if level:
+                halved = self.put("Mul", (binade, half), binade)
+                odd = self._predicate(
+                    "Ne", (halved, self.put("Floor", (halved,), halved)),
+                )
+                widened = self._select(
+                    odd, self.put("Mul", (mantissa, two), mantissa), mantissa,
+                )
+                binade = self.put("Floor", (halved,), halved)
+                root = self.put("Sqrt", (widened,), widened)
+                square, residual = self.two_product(root, root)
+                exact = self._all(
+                    exact,
+                    self._predicate("Eq", (square, widened)),
+                    self._predicate(
+                        "Eq", (residual, self.scalar_constant(0.0, like)),
+                    ),
+                )
+                mantissa = root
+                scaled = self.put("Mul", (scaled, two), scaled)
+            integral = self._predicate(
+                "Eq", (scaled, self.put("Floor", (scaled,), scaled)),
+            )
+            levels.append((integral, mantissa, binade, exact, scaled))
+        found, mantissa, binade, exact, count = levels[-1]
+        for integral, level_mantissa, level_binade, level_exact, level_count in (
+            reversed(levels[:-1])
+        ):
+            mantissa = self._select(integral, level_mantissa, mantissa)
+            binade = self._select(integral, level_binade, binade)
+            exact = self._select_bool(integral, level_exact, exact)
+            count = self._select(integral, level_count, count)
+            found = self._any(found, integral)
+        one = self.scalar_constant(1.0, like)
+        in_range = self._all(
+            self._predicate("Ge", (count, one)),
+            self._predicate(
+                "Le", (count, self.scalar_constant(64.0, like)),
+            ),
+        )
+        usable = self._all(found, exact, self._any(
+            in_range, self._predicate("Eq", (mantissa, one)),
+        ))
+        return mantissa, count, binade, usable
+
+    def pow_expansion(self, x, y, width: int = 2, *, form: str = "operator"):
+        """Correctly rounded float ``x ** y`` (``form="operator"``) or
+        ``math.pow(x, y)`` (``form="math"``), as limbs, plus its faults.
+
+        Returns ``(limbs, faults)``; ``faults`` is a tuple of
+        ``(predicate, native_faults code, failure name)`` rows for the
+        lowering pass to guard (a validation-fail block calling
+        ``turing_validation_error``, as ``reduce_integer_pow`` does).  The
+        rows are: ``0.0 ** negative`` (ZeroDivisionError for ``**``,
+        ValueError for ``math.pow``), negative ``**`` non-integer (complex
+        in Python: refused by name as ``FLOAT_POW_COMPLEX_RESULT`` for
+        ``**``, ValueError for ``math.pow``) and overflow (OverflowError).
+
+        The general lane is ``exp(y*log|x|)``: ``_log_positive`` (exact
+        binade, relatively exact near 1), the product by ``y`` in limbs,
+        ``_exp_reduced`` and one rounding by ``round_scaled`` (overflow to
+        inf and subnormal results rounded once).  A result that may be
+        exactly representable or exactly a rounding midpoint
+        (``3.0**34``, ``(m*m)**1.5``, ``2.0**-1075``) is a dyadic power: when
+        ``_exact_power`` finds ``y*2**j = n`` with ``|x|`` a perfect
+        ``2**j``-th power and ``1 <= n <= 64`` (or a power-of-two mantissa),
+        ``m**n`` is formed by square-and-multiply in limbs -- exact for every
+        such result that fits a double -- and rounded by ``round_scaled``
+        with scale ``2**(e*n)``, so ties go to even exactly as Python's.
+        Python's special cases (nan, inf, signed zeros, odd integers) are
+        decided lanes in Python's own order.
+        """
+
+        from .native_faults import (
+            FLOAT_MATH_DOMAIN, FLOAT_MATH_RANGE, FLOAT_POW_COMPLEX_RESULT,
+            FLOAT_POW_OVERFLOW, FLOAT_POW_ZERO_NEGATIVE,
+        )
+
+        if form not in ("operator", "math"):
+            raise ValueError(
+                f"pow form {form!r}: expected 'operator' (x ** y) or "
+                "'math' (math.pow)"
+            )
+        like = x
+        put = self.put
+        zero = self.scalar_constant(0.0, like)
+        one = self.scalar_constant(1.0, like)
+        largest = self.scalar_constant(_DOUBLE_MAX, like)
+        infinity = put("Mul", (largest, largest), largest)
+        not_a_number = put("Mul", (zero, infinity), zero)
+        x_nan, y_nan = self._is_nan(x), self._is_nan(y)
+        x_finite, y_finite = self._is_finite(x), self._is_finite(y)
+        x_zero = self._predicate("Eq", (x, zero))
+        y_zero = self._predicate("Eq", (y, zero))
+        x_negative = self._predicate("Lt", (x, zero))
+        y_negative = self._predicate("Lt", (y, zero))
+        y_positive = self._predicate("Gt", (y, zero))
+        y_safe = self._select(y_finite, y, one)
+        y_odd = self._all(y_finite, self._odd_integer(y_safe))
+        y_integral = self._predicate(
+            "Eq", (y_safe, put("Floor", (y_safe,), y_safe)),
+        )
+        magnitude = put("Abs", (x,), x)
+        general = self._all(
+            x_finite, y_finite, self._not(x_zero), self._not(y_zero),
+        )
+        base = self._select(general, magnitude, one)
+        exponent = self._select(general, y, one)
+        # Approximation lane: exp(y * log|x|).
+        logarithm = self._log_positive(base, width)
+        product = self.multiply_expansions(logarithm, [exponent], width)
+        # The range decision reads the one-double product: it is ±inf, never
+        # nan, where the limb product overflows (|y| near the largest double).
+        estimate = put("Mul", (logarithm[0], exponent), exponent)
+        over = self._predicate(
+            "Gt", (estimate, self.scalar_constant(720.0, like)),
+        )
+        under = self._predicate(
+            "Lt", (estimate, self.scalar_constant(-760.0, like)),
+        )
+        product = self._select_expansion(
+            self._any(over, under), self.expanded(zero, width), product,
+        )
+        grown, binade = self._exp_reduced(product, width)
+        # Exact-power lane: m**n * 2**(e*n).
+        mantissa, count, level_binade, usable = self._exact_power(
+            base, exponent, width,
+        )
+        steps = self._select(usable, count, one)
+        steps = self._select(
+            self._predicate("Eq", (mantissa, one)), one, steps,
+        )
+        power = self._one(like, width)
+        for bit in range(6, -1, -1):
+            power = self.multiply_expansions(power, power, width)
+            step = self.scalar_constant(float(2 ** bit), like)
+            take = self._predicate("Ge", (steps, step))
+            steps = self._select(take, put("Sub", (steps, step), steps), steps)
+            power = self._select_expansion(
+                take, self.multiply_expansions(power, [mantissa], width),
+                power,
+            )
+        scale = self._select(
+            usable, put("Mul", (level_binade, count), level_binade), binade,
+        )
+        rounded = self.round_scaled(
+            self._select_expansion(usable, power, grown), scale,
+        )
+        rounded = self._select(
+            usable, rounded,
+            self._select(over, infinity, self._select(under, zero, rounded)),
+        )
+        negate = self._all(x_negative, y_odd)
+        value = self._select(negate, put("Neg", (rounded,), rounded), rounded)
+        # Python's float_pow order; the later select wins.
+        negative_fraction = self._all(
+            x_finite, x_negative, y_finite, self._not(y_integral),
+        )
+        value = self._select(negative_fraction, not_a_number, value)
+        reciprocal = put("Div", (one, x), x)
+        zero_value = self._select(
+            y_negative,
+            self._select(y_odd, reciprocal, infinity),
+            self._select(y_odd, x, zero),
+        )
+        value = self._select(
+            self._all(x_zero, y_finite, self._not(y_zero)), zero_value, value,
+        )
+        negative_zero = put("Neg", (zero,), zero)
+        infinite_value = self._select(
+            y_positive,
+            self._select(y_odd, x, magnitude),
+            self._select(
+                y_odd,
+                self._select(x_negative, negative_zero, zero),
+                zero,
+            ),
+        )
+        x_infinite = self._not(self._any(x_finite, x_nan))
+        y_infinite = self._not(self._any(y_finite, y_nan))
+        value = self._select(
+            self._all(x_infinite, y_finite, self._not(y_zero)),
+            infinite_value, value,
+        )
+        unit = self._predicate("Eq", (magnitude, one))
+        beyond = self._select_bool(
+            y_positive,
+            self._predicate("Gt", (magnitude, one)),
+            self._predicate("Lt", (magnitude, one)),
+        )
+        value = self._select(
+            y_infinite,
+            self._select(
+                unit, one,
+                self._select(beyond, put("Abs", (y,), y), zero),
+            ),
+            value,
+        )
+        value = self._select(
+            y_nan, self._select(self._predicate("Eq", (x, one)), one, y),
+            value,
+        )
+        value = self._select(x_nan, x, value)
+        value = self._select(y_zero, one, value)
+        operator = form == "operator"
+        faults = (
+            (
+                self._all(x_zero, y_finite, y_negative),
+                FLOAT_POW_ZERO_NEGATIVE if operator else FLOAT_MATH_DOMAIN,
+                "float_pow_zero_to_negative_power",
+            ),
+            (
+                negative_fraction,
+                FLOAT_POW_COMPLEX_RESULT if operator else FLOAT_MATH_DOMAIN,
+                "float_pow_negative_base_fractional_exponent",
+            ),
+            (
+                self._all(
+                    general, self._not(negative_fraction),
+                    self._predicate(
+                        "Gt", (put("Abs", (rounded,), rounded), largest),
+                    ),
+                ),
+                FLOAT_POW_OVERFLOW if operator else FLOAT_MATH_RANGE,
+                "float_pow_overflow",
+            ),
+        )
+        return self._special(value, width), faults
+
 
 def lower_precision_operations(
     functions, two_product_flavor: str = "fma",
