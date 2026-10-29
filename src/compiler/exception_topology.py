@@ -308,32 +308,32 @@ def post_source_exception_transfers(
                 provenance=Derived(entry_causes), mode=Mode.CONCORD,
             )
 
-    # For `raise ValueError(...)` the constructor Call and the Raise are
-    # separate sites. Only the Raise has this exact static class; dispatch
-    # follows the authored handler ordinals and concorded subtype edges.
+    # A protected Call or reraise can return any catchable native status;
+    # its actual code is selected at runtime. An authored Raise with an
+    # exact static class has only that class's status. Both paths select
+    # handlers through the same ordered declaration cells.
     concorded_native_status_classes(book)
+    status_page = book.page(NATIVE_STATUS_CLASS)
     handler_page = book.page(SOURCE_EXCEPTION_HANDLER_CLASS)
     for transfer_row in transfer_page.scope_rows(ingestion_scope):
         transfer = transfer_page.latest(transfer_row)
-        if (
-            transfer.source_kind != "raise"
-            or transfer.raised_class_definition is None
+        if transfer.source_kind == "raise" and (
+            transfer.raised_class_definition is None
         ):
             continue
-        raised_identity = ".".join(
-            transfer.raised_class_definition.row[:2]
-        )
-        status = authored_raise_status(raised_identity)
-        if status is None:
-            continue
-        status_class = book.latest_ref(NATIVE_STATUS_CLASS, (status,))
-        if (
-            status_class is None
-            or book.page(NATIVE_STATUS_CLASS).latest((status,))
-            != transfer.raised_class_definition
-        ):
+        if transfer.source_kind == "raise":
+            raised_identity = ".".join(
+                transfer.raised_class_definition.row[:2]
+            )
+            status = authored_raise_status(raised_identity)
+            if status is None:
+                continue
+            statuses = (int(status),)
+        elif transfer.source_kind in {"call", "reraise"}:
+            statuses = tuple(int(row[0]) for row in status_page.rows())
+        else:
             raise ValueError(
-                f"authored raise status disagrees with class: {transfer_row!r}"
+                f"exception transfer has unknown kind: {transfer_row!r}"
             )
         handlers = sorted((
             (handler_page.latest(row).ordinal,
@@ -348,47 +348,63 @@ def post_source_exception_transfers(
             raise ValueError(
                 f"catch owner has incomplete authored handler order: {transfer_row!r}"
             )
-        examined = []
-        selected = matched = None
-        for _ordinal, handler_cell, handler in handlers:
-            examined.append(handler_cell)
-            if not handler.declarations:
-                selected = handler.handler
-                break
-            for _value, definition in handler.declarations:
-                if definition is None:
-                    raise ValueError(
-                        f"handler has no exact class declaration: {handler_cell!r}"
-                    )
-                handler_identity = ".".join(definition.row[:2])
-                if raised_identity in canonical_python_subtype_identities(
-                    handler_identity, book=book,
-                ):
-                    selected, matched = handler.handler, definition
+        for status in statuses:
+            status_class = book.latest_ref(NATIVE_STATUS_CLASS, (status,))
+            definition = status_page.latest((status,))
+            if status_class is None or definition is None:
+                raise ValueError(
+                    f"exception status has no class: {transfer_row!r}, {status}"
+                )
+            if transfer.source_kind == "raise" and (
+                definition != transfer.raised_class_definition
+            ):
+                raise ValueError(
+                    "authored raise status disagrees with class: "
+                    f"{transfer_row!r}"
+                )
+            raised_identity = ".".join(definition.row[:2])
+            examined = []
+            selected = matched = None
+            for _ordinal, handler_cell, handler in handlers:
+                examined.append(handler_cell)
+                if not handler.declarations:
+                    selected = handler.handler
                     break
-            if selected is not None:
-                break
-        transfer_cell = book.latest_ref(
-            SOURCE_EXCEPTION_TRANSFER, transfer_row,
-        )
-        route = ExceptionStatusRouteFact(
-            transfer.catch_try, transfer_cell, status_class,
-            tuple(examined), selected, matched, transfer.unwind_finally,
-        )
-        causes = tuple(dict.fromkeys((
-            transfer_cell, status_class,
-            *((transfer.catch_try,) if transfer.catch_try is not None else ()),
-            *examined,
-            *((selected,) if selected is not None else ()),
-            *((matched,) if matched is not None else ()),
-            *transfer.unwind_finally,
-        )))
-        book.post(
-            SOURCE_EXCEPTION_STATUS_ROUTE,
-            (ingestion_scope, transfer_row[1], status), route,
-            stage=EXCEPTION_TOPOLOGY,
-            provenance=Derived(causes), mode=Mode.CONCORD,
-        )
+                for _value, handler_definition in handler.declarations:
+                    if handler_definition is None:
+                        raise ValueError(
+                            "handler has no exact class declaration: "
+                            f"{handler_cell!r}"
+                        )
+                    handler_identity = ".".join(handler_definition.row[:2])
+                    if raised_identity in canonical_python_subtype_identities(
+                        handler_identity, book=book,
+                    ):
+                        selected, matched = handler.handler, handler_definition
+                        break
+                if selected is not None:
+                    break
+            transfer_cell = book.latest_ref(
+                SOURCE_EXCEPTION_TRANSFER, transfer_row,
+            )
+            route = ExceptionStatusRouteFact(
+                transfer.catch_try, transfer_cell, status_class,
+                tuple(examined), selected, matched, transfer.unwind_finally,
+            )
+            causes = tuple(dict.fromkeys((
+                transfer_cell, status_class,
+                *((transfer.catch_try,) if transfer.catch_try is not None else ()),
+                *examined,
+                *((selected,) if selected is not None else ()),
+                *((matched,) if matched is not None else ()),
+                *transfer.unwind_finally,
+            )))
+            book.post(
+                SOURCE_EXCEPTION_STATUS_ROUTE,
+                (ingestion_scope, transfer_row[1], status), route,
+                stage=EXCEPTION_TOPOLOGY,
+                provenance=Derived(causes), mode=Mode.CONCORD,
+            )
 
     binding_page = book.page(NAME_BINDING)
     for phi_id, data in graph.G.nodes(data=True):

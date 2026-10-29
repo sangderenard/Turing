@@ -23,6 +23,7 @@ from src.compiler.concordance_declarations import (
 from src.compiler.identity_concordance import (
     CorrelationTable, Unresolved, begin_identity_book, end_identity_book,
 )
+from src.compiler.native_faults import FLOAT_TO_INT_NAN, FLOAT_TO_INT_INFINITY
 
 
 CONTRACT = (
@@ -108,6 +109,15 @@ def root(x: float) -> int:
         assert region_site.transfer == try_fact.sites[0]
         assert region_site.canonical_site.row[1] == region_rows[0][2]
         assert region_site.deployment_member.row == region_rows[0]
+        transfer_cell = region_site.transfer
+        nan_route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest((
+            *transfer_cell.row, FLOAT_TO_INT_NAN,
+        ))
+        infinity_route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest((
+            *transfer_cell.row, FLOAT_TO_INT_INFINITY,
+        ))
+        assert nan_route.selected_handler is not None
+        assert infinity_route.selected_handler is None
         arm_page = book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE)
         arm_rows = tuple(sorted(arm_page.rows(), key=lambda row: row[2]))
         assert len(arm_rows) == 2
@@ -131,6 +141,7 @@ def root(x: float) -> int:
             CorrelationTable._source_exception_handler_phi_findings,
             CorrelationTable._source_exception_continuation_phi_findings,
             CorrelationTable._source_exception_continuation_arm_value_findings,
+            CorrelationTable._source_exception_status_route_findings,
         ):
             assert check(source_module) == []
     finally:
@@ -376,8 +387,13 @@ def root(x: int) -> int:
         with pytest.raises(CompilationSubdivisionRequired):
             _lower(source, "exception_status_first_match", identity_book=book)
         rows = tuple(book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows())
-        assert len(rows) == 1
-        route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(rows[0])
+        raise_rows = tuple(
+            row for row in rows
+            if book.page(SOURCE_EXCEPTION_TRANSFER).latest(row[:2]).source_kind
+            == "raise"
+        )
+        assert len(raise_rows) == 1
+        route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(raise_rows[0])
         assert route.status_class.page == NATIVE_STATUS_CLASS
         assert len(route.examined_handlers) == 2
         matched = book.page(SOURCE_EXCEPTION_HANDLER_CLASS).latest(

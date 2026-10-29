@@ -2182,6 +2182,35 @@ class CorrelationTable:
         found = []
         routes = book.page(SOURCE_EXCEPTION_STATUS_ROUTE)
         handlers = book.page(SOURCE_EXCEPTION_HANDLER_CLASS)
+        status_page = book.page(NATIVE_STATUS_CLASS)
+        transfers = book.page(SOURCE_EXCEPTION_TRANSFER)
+        route_rows = set(routes.rows())
+        for transfer_row in transfers.rows():
+            transfer = transfers.latest(transfer_row)
+            if not isinstance(transfer, ExceptionTransferFact):
+                continue
+            if transfer.source_kind == "raise":
+                identity = (
+                    None if transfer.raised_class_definition is None
+                    else ".".join(transfer.raised_class_definition.row[:2])
+                )
+                status = authored_raise_status(identity)
+                expected_statuses = () if status is None else (int(status),)
+            elif transfer.source_kind in {"call", "reraise"}:
+                expected_statuses = tuple(
+                    int(status_row[0]) for status_row in status_page.rows()
+                )
+            else:
+                continue
+            if {
+                (transfer_row[0], transfer_row[1], status)
+                for status in expected_statuses
+            } - route_rows:
+                found.append(Finding(
+                    "source-exception-status-route-disagreement",
+                    str(transfer_row), None,
+                    "exception transfer lacks a catchable native status route",
+                ))
         for row in routes.rows():
             route = routes.latest(row)
             receipt = book.latest_ref(SOURCE_EXCEPTION_STATUS_ROUTE, row)
@@ -2194,22 +2223,28 @@ class CorrelationTable:
             if (
                 not isinstance(route, ExceptionStatusRouteFact)
                 or not isinstance(transfer, ExceptionTransferFact)
-                or transfer.source_kind != "raise"
-                or transfer.raised_class_definition is None
+                or transfer.source_kind not in {"call", "raise", "reraise"}
                 or route.transfer != transfer_cell
                 or route.status_class != status_class
-                or book.page(NATIVE_STATUS_CLASS).latest((row[2],))
-                != transfer.raised_class_definition
+                or status_page.latest((row[2],)) is None
                 or route.owner != transfer.catch_try
                 or route.unwind_finally != transfer.unwind_finally
-                or authored_raise_status(".".join(
-                    transfer.raised_class_definition.row[:2]
-                )) != int(row[2])
+                or (
+                    transfer.source_kind == "raise"
+                    and (
+                        transfer.raised_class_definition is None
+                        or status_page.latest((row[2],))
+                        != transfer.raised_class_definition
+                        or authored_raise_status(".".join(
+                            transfer.raised_class_definition.row[:2]
+                        )) != int(row[2])
+                    )
+                )
             ):
                 problem = "status route disagrees with exact transfer or class"
             else:
                 raised_identity = ".".join(
-                    transfer.raised_class_definition.row[:2]
+                    status_page.latest((row[2],)).row[:2]
                 )
                 ordered = sorted((
                     (handlers.latest(handler_row).ordinal,
