@@ -124,6 +124,14 @@ console.log(JSON.stringify(Object.fromEntries(Object.entries(result).map(([key,v
     generated = _load_generated(product.python_loader)
     math = generated.load(product.directory)
     try:
+        # Every native image is resident and every entry bound when the
+        # loader loads, before any call: the first call is already hot.
+        assert len(math.blas.reverse._entries) == len(math.blas.reverse.methods)
+        assert len(math.trigonometry._entries) >= len(math.trigonometry.methods)
+        assert len(math.trigonometry_reverse._entries) == len(
+            math.trigonometry_reverse.methods
+        )
+        hot_entries = dict(math.trigonometry._entries)
         assert math.libraries == ("blas", "trigonometry")
         assert math.blas.methods == (
             "scal", "axpy", "dot", "gemv", "gemm", "rot",
@@ -169,6 +177,8 @@ console.log(JSON.stringify(Object.fromEntries(Object.entries(result).map(([key,v
             "sin", np.ones_like(trig_input), value=trig_input,
         )
         np.testing.assert_allclose(trig_reverse["value"], np.cos(trig_input))
+        # Calls went into the entries bound at load; none was bound late.
+        assert math.trigonometry._entries == hot_entries
         trig_coverage = {
             item["method"]: item
             for item in matrix["products"]["trigonometry"]["coverage"]

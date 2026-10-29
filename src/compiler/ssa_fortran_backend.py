@@ -42,6 +42,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from ..transmogrifier.dtype_layout import fortran_kind_table, resolve as resolve_dtype_layout, DTYPES as DTYPE_LAYOUTS
 from .runtime_abi import HOST_CALLBACK_SCHEMA
+from . import native_residency as _native_residency
 from ..transmogrifier.ssa import (
     BasicBlock,
     Function,
@@ -8735,23 +8736,18 @@ class FortranCoreNative:
     this one too -- nothing here knows the operator, only the records.
     """
 
-    #: Loaded Fortran libraries, kept for the life of the process.
-    #:
-    #: A standalone-linked gfortran artifact carries its own runtime, and
-    #: unloading that runtime at DLL_PROCESS_DETACH takes the process down
-    #: -- observed as an access violation inside garbage collection the
-    #: moment the last reference to a compiled core was dropped, long
-    #: after the kernel itself had run correctly. Holding the handle here
-    #: means a library is loaded once, never unloaded, and re-used by
-    #: every later variant that resolves to the same path: the crash
-    #: cannot happen, and repeated loads of the same artifact stop
-    #: happening too.
-    _LIBRARIES: dict = {}
+    #: Loaded Fortran libraries, kept for the life of the process.  This is
+    #: the process-wide residency table every backend shares
+    #: (``native_residency``): a standalone-linked gfortran artifact carries
+    #: its own runtime, and unloading it takes the process down, so a library
+    #: is loaded once, never unloaded, and re-used by every later variant that
+    #: resolves to the same path.
+    _LIBRARIES: dict = _native_residency._RESIDENT
     # ``os.add_dll_directory`` search handles are active only while the handle
     # lives.  The compiled API already publishes the exact runtime dependency
     # paths selected by the producer; retain one handle per published directory
-    # alongside the process-lifetime library cache.
-    _DLL_DIRECTORIES: dict = {}
+    # alongside the process-lifetime library table.
+    _DLL_DIRECTORIES: dict = _native_residency._DLL_DIRECTORIES
 
     def __init__(self, library_path: Path, entry_record, api=None):
         import ctypes
@@ -8785,8 +8781,7 @@ class FortranCoreNative:
                         FortranCoreNative._DLL_DIRECTORIES[directory] = (
                             os.add_dll_directory(directory)
                         )
-            library = ctypes.CDLL(resolved)
-            FortranCoreNative._LIBRARIES[resolved] = library
+        library = _native_residency.resident_library(resolved)
         self._library = library
         function = getattr(library, symbol)
         function.restype = ctypes.c_int

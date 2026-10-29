@@ -27,7 +27,9 @@ import weakref
 from threading import RLock
 from typing import Any, Callable
 
-from .tile_row_codec import compress_octets, decode_rows, decompress_octets, encode_rows
+from .tile_row_codec import (
+    compress_octets, decode_rows, decompress_octets, encode_rows, train_codebook,
+)
 
 
 def _checksum(data: bytes) -> int:
@@ -82,7 +84,9 @@ class DiskTileStore:
         decoding it only computes the header checksum."""
 
         data = tile.decode()
-        if not tile.compressed:
+        if not tile.compressed or tile.codebook is not None:
+            # A disk tile decodes alone: one coded against its table's
+            # shared codebook is coded again without it.
             return self.write(data, tile.rows)
         return self._append(tile.payload, len(data), tile.rows, "lz-huffman",
                             _checksum(data))
@@ -347,17 +351,24 @@ class CompressedTile:
     raw_bytes: int
     rows: int
     compressed: bool
+    #: The table's shared ``OctetCodebook`` the payload is coded against.
+    codebook: Any = None
 
     @classmethod
-    def encode(cls, data: bytes, rows: int, level: int) -> CompressedTile:
+    def encode(
+        cls, data: bytes, rows: int, level: int, codebook: Any = None,
+    ) -> CompressedTile:
         # Level 0 stores raw; every other level is the one octet codec.
-        compressed = compress_octets(data) if level else data
+        compressed = compress_octets(data, codebook) if level else data
         if len(compressed) < len(data):
-            return cls(compressed, len(data), rows, True)
+            return cls(compressed, len(data), rows, True, codebook)
         return cls(data, len(data), rows, False)
 
     def decode(self) -> bytes:
-        data = decompress_octets(self.payload) if self.compressed else self.payload
+        data = (
+            decompress_octets(self.payload, self.codebook)
+            if self.compressed else self.payload
+        )
         if len(data) != self.raw_bytes:
             raise ValueError("compressed tile length disagrees with its header")
         return data
@@ -378,6 +389,10 @@ class CompressionStats:
     @property
     def ratio(self) -> float:
         return self.raw_bytes / max(1, self.resident_bytes)
+
+
+#: Tiles coded alone before a table trains its shared codebook from them.
+CODEBOOK_AFTER_TILES = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,6 +425,8 @@ class CompressedTable(Mapping):
         self.level = level
         self._dispatch = dispatch_table
         self._loader = loader
+        # Trained on the first tile; every tile is coded against it.
+        self._codebook = None
         self._lock = RLock()
         self._decoded_tiles = 0
         self._tiles: list[CompressedTile] = []
@@ -453,11 +470,23 @@ class CompressedTable(Mapping):
 
     def _pack(self, chunk, level):
         data = encode_rows(tuple(chunk), self._dispatch)
+        if (
+            level and self.__dict__.get("_codebook") is None
+            and len(self._tiles) == CODEBOOK_AFTER_TILES
+        ):
+            # A shared codebook costs its dictionary once; it pays only on
+            # a table of several tiles, so the first ones are coded alone
+            # and train it.
+            self._codebook = train_codebook(b"".join(
+                tile.decode() for tile in self._tiles[:CODEBOOK_AFTER_TILES]
+            ))
         restored = self._loader(data)
         for (original, _), (key, _) in zip(chunk, restored):
             if hash(original) != hash(key) or original != key:
                 raise TypeError("compressed key does not preserve hash/equality on round trip")
-        return CompressedTile.encode(data, len(chunk), level)
+        return CompressedTile.encode(
+            data, len(chunk), level, self.__dict__.get("_codebook"),
+        )
 
     def _entries(self, tile: int) -> tuple:
         with self._lock:
@@ -563,6 +592,11 @@ class CompressedTable(Mapping):
                            else sys.getsizeof(self._tiles)) + sys.getsizeof(self._lock))
             resident += sum(index.resident_bytes() if isinstance(index, DiskPackedIndex)
                             else sys.getsizeof(index) for index in (self._hashes, self._ordinals))
+            codebook = self.__dict__.get("_codebook")
+            if codebook is not None:
+                resident += (sys.getsizeof(codebook) + sys.getsizeof(codebook.dictionary)
+                             + sys.getsizeof(codebook.command_lengths)
+                             + sys.getsizeof(codebook.literal_lengths))
             if not isinstance(self._tiles, DiskTileDirectory):
                 resident += sum(sys.getsizeof(t) + (sys.getsizeof(t.payload)
                                                    if isinstance(t, CompressedTile) else 0)
@@ -605,6 +639,10 @@ class CompressedTable(Mapping):
                     index = getattr(self, name)
                     if not isinstance(index, DiskPackedIndex) and len(index):
                         setattr(self, name, DiskPackedIndex(index, store))
+            if all(isinstance(tile, DiskTile) for tile in self._tiles):
+                # Disk tiles decode alone; a codebook no resident tile is
+                # coded against is resident for nothing.
+                self._codebook = None
             if (not isinstance(self._tiles, DiskTileDirectory)
                     and all(isinstance(tile, DiskTile) and tile.store is store for tile in self._tiles)):
                 directory = DiskTileDirectory(store, directory,
@@ -640,7 +678,9 @@ class CompressedTable(Mapping):
                     # stored raw can shrink.
                     if isinstance(tile, DiskTile) or tile.compressed:
                         continue
-                    candidate = CompressedTile.encode(tile.decode(), tile.rows, level)
+                    candidate = CompressedTile.encode(
+                        tile.decode(), tile.rows, level, self._codebook,
+                    )
                     if len(candidate.payload) < len(tile.payload):
                         self._tiles[index] = candidate
                 self.level = level
