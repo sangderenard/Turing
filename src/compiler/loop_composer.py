@@ -6816,6 +6816,11 @@ def analyze_shader_loop_reductions(
             # the protected body ends in Raise; a handler ending in Raise
             # cannot contribute a value to that join.  Other joins and
             # nested control remain explicit blockers until SSA owns them.
+            # Program: root's loop Try converts x, its handler raises
+            # TypeError, and its else increments y. The old gate rejected
+            # the else even though the control builder already lowers it
+            # only from the protected body's success edge. Keep that arm
+            # source-owned and let the existing native Try lower it.
             if (
                 not try_statement.body
                 or not (
@@ -6829,7 +6834,6 @@ def analyze_shader_loop_reductions(
                         )
                     )
                 )
-                or try_statement.orelse
                 or try_statement.finalbody
                 or any(
                     isinstance(member, (

@@ -35,6 +35,75 @@ def root(n: int) -> int:
     return x
 """
 
+SOURCE_ELSE = """\
+def root(x: float, n: int) -> int:
+    y = 0
+    for i in range(n):
+        try:
+            y = int(x)
+        except (ValueError, OverflowError):
+            raise TypeError("caught")
+        else:
+            y = y + 1
+    return y
+"""
+
+
+@pytest.mark.parametrize("backend", ("c", "llvm"))
+def test_native_try_else_runs_only_after_protected_success(
+    backend: str, tmp_path: Path,
+) -> None:
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_concordance import CorrelationTable
+    from src.compiler.native_faults import NativeTypeError
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm,
+        prepare_artifact_execution,
+    )
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        SOURCE_ELSE, "root", name=f"native_try_else_{backend}",
+        extraction_contract="extraction_contracts/program_extraction.yaml",
+        progress=lambda _message: None,
+    )
+    assert CorrelationTable.build(module).findings(module) == []
+    function = module.functions[exports[0]]
+    parameters = dict(function.metadata["parameter_names"])
+    output = next(
+        int(instruction.args[0].id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    )
+    if backend == "c":
+        artifact = emit_ssa_to_c(module, exports[0])
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "native")
+
+        def execute(value: float, count: int):
+            return artifact.prepare_execution({
+                parameters["x"]: np.array([value]),
+                parameters["n"]: np.array([count]),
+            }).run()
+
+    else:
+        artifact = emit_ssa_function_to_llvm(module, exports[0])
+        assert artifact.complete, artifact.shortfalls
+        artifact = compile_artifact(artifact, directory=tmp_path / "llvm")
+
+        def execute(value: float, count: int):
+            return prepare_artifact_execution(artifact, {
+                parameters["x"]: np.array([value]),
+                parameters["n"]: np.array([count]),
+            }).run()
+
+    assert execute(2.4, 0).buffers[output].reshape(-1).tolist() == [0]
+    assert execute(2.4, 1).buffers[output].reshape(-1).tolist() == [3]
+    assert execute(2.4, 2).buffers[output].reshape(-1).tolist() == [3]
+    with pytest.raises(NativeTypeError):
+        execute(float("nan"), 1)
+
 
 @pytest.mark.parametrize("backend", ("c", "llvm"))
 def test_protected_int_cast_routes_python_fault_and_propagates_width_limit(
