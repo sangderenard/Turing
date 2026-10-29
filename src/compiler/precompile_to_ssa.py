@@ -13798,7 +13798,37 @@ class _ControlSSABuilder(TiledObject):
         length = self.fresh_value(
             dtype="int64", transform=LOAD, operands=(length_address,),
         )
-        self.emit(Handler.Load, [length_address], length, attributes=attributes)
+        if (
+            query.operation in {"length", "truth"}
+            and descriptor.live_flags_value_id is not None
+        ):
+            # A table that retains deleted rows has the length of its live
+            # rows (the region-read rule in ``_read``); the length cell
+            # still counts the tombstones.
+            from .ir_sequence_tables import lower_sequence_live_length
+
+            helper_name = self._sequence_helper_name(
+                sequence_id, "live_length",
+            )
+            self._register_sequence_lowering(lower_sequence_live_length(
+                descriptor,
+                function_name=helper_name,
+                first_value_id=GLOBAL_MONOTONIC_IDS.peek(),
+            ))
+            self.emit(
+                Handler.Call, list(storage), length,
+                attributes={
+                    **attributes,
+                    "callee": helper_name,
+                    "source_linked": True,
+                    "ssa_sequence_operation": "live_length",
+                    "sequence_id": sequence_id,
+                },
+            )
+        else:
+            self.emit(
+                Handler.Load, [length_address], length, attributes=attributes,
+            )
         if query.operation == "any":
             preheader = self.current
             header = self.new_block("sequence_any_header")
@@ -26556,6 +26586,7 @@ def _schedule_loop_callsites(
     table_region_operations: Mapping[int, Any] | None = None,
     table_region_post_operations: Mapping[int, Any] | None = None,
     row_load_reads: Mapping[int, tuple[int, ...]] | None = None,
+    sequence_read_before_effects: tuple[tuple[int, int], ...] = (),
 ) -> tuple[ControlProgram, dict[int, tuple[tuple[int, ...], tuple[int, ...]]]]:
     """Install this closure's PlanCalls as ordinary scheduled statements.
 
@@ -27509,6 +27540,23 @@ def _schedule_loop_callsites(
                     elif isinstance(candidate, SequenceQueryBlock):
                         if candidate.producer_loop_node_id is None:
                             reads.add(int(candidate.sequence_value_id))
+                    elif isinstance(candidate, LoopBlock):
+                        # Program: ``xs0 = [6, n]; xs0[1] = 1; xs0[0] += n;
+                        # xs2 = [n % 3, 3]``, then ``set(xs2)`` twice and
+                        # ``(xs0[0] + xs0[1]) + (len(s2) * 10 + len(t2))``
+                        # (fuzz p145_9).  Wrong record: the loop filling a
+                        # set from ``xs2`` runs to ``__iterable_extent_14__``
+                        # and reads its rows, but listed no read of arena 14,
+                        # so nothing ordered it after the appends building
+                        # ``xs2``.  The region holding ``xs0[0] + n`` and both
+                        # lengths pulled the loops ahead of them: two empty
+                        # sets (7 for 29; clean audit).  Rule: a loop over a
+                        # sequence's extent reads that sequence.
+                        extent = re.fullmatch(
+                            r"__iterable_extent_(\d+)__", str(candidate.stop).strip()
+                        )
+                        if extent is not None:
+                            reads.add(int(extent.group(1)))
                     elif isinstance(candidate, LoopControlBlock):
                         # A return hands its arenas to the caller as they
                         # stand at this edge.
@@ -27558,6 +27606,7 @@ def _schedule_loop_callsites(
                 # The run position of such a query says nothing about it, so
                 # it takes no write-after-read edge to that carrier either.
                 follows: set[tuple[int, int]] = set()
+                precedes: set[tuple[int, int]] = set()
                 deletions_by_position: dict[int, list[tuple[int, int]]] = {}
                 for position, child in enumerate(run):
                     if not isinstance(child, StatementBlock):
@@ -27579,6 +27628,20 @@ def _schedule_loop_callsites(
                             (int(arguments[0]), int(sequence_id))
                             for sequence_id in operation_writes
                         )
+                # Program: ``d = {1: n, 2: 4}; t = len(d); d[7] = 4`` then
+                # ``t * 100 + len(d) * 10 + d[1]`` (silent lane).  Wrong
+                # record: the graph numbers ``t``'s ``len`` after the store
+                # (demand order), so the id rule above ordered the query
+                # after the region carrying the store (327 for 227; clean
+                # audit).  Rule: a query the source reads before a write
+                # (``sequence_read_before_effects``, from authored spans,
+                # loops and branches accounted) precedes that write's
+                # carrier; value-id order decides only the writes the source
+                # does not order.
+                read_before_effect = {
+                    (int(reader), int(effect))
+                    for reader, effect in sequence_read_before_effects
+                }
                 for position, child in enumerate(run):
                     if not (
                         isinstance(child, SequenceQueryBlock)
@@ -27586,6 +27649,18 @@ def _schedule_loop_callsites(
                     ):
                         continue
                     for carrier, deletions in deletions_by_position.items():
+                        if carrier != position and any(
+                            sequence_id == int(child.sequence_value_id)
+                            and (int(child.result_value_id), effect_id)
+                            in read_before_effect
+                            for effect_id, sequence_id in deletions
+                        ):
+                            precedes.add((position, carrier))
+                            require(carrier, position, (
+                                "sequence_read_before_write",
+                                int(child.sequence_value_id),
+                            ))
+                            continue
                         if carrier != position and any(
                             sequence_id == int(child.sequence_value_id)
                             and effect_id < int(child.result_value_id)
@@ -27605,6 +27680,7 @@ def _schedule_loop_callsites(
                 last_access: dict[int, int] = {}
                 last_write: dict[int, int] = {}
                 reads_since_write: dict[int, list[int]] = {}
+                write_history: dict[int, list[int]] = {}
                 last_terminal = None
                 terminal_guard_candidates: list[tuple[int, int]] = []
                 # Program: ``while len(out) > 1 and out[len(out) - 1] == 0:
@@ -27761,8 +27837,15 @@ def _schedule_loop_callsites(
                                     "sequence_birth", int(arena)
                                 ))
                     for arena in reads:
-                        if arena in last_write:
-                            require(position, last_write[arena], (
+                        # A query the source reads before a write reads the
+                        # write before that one.
+                        prior_write = next((
+                            writer
+                            for writer in reversed(write_history.get(arena, ()))
+                            if (position, writer) not in precedes
+                        ), None)
+                        if prior_write is not None:
+                            require(position, prior_write, (
                                 "sequence_raw", int(arena)
                             ))
                     for arena in writes:
@@ -27819,6 +27902,7 @@ def _schedule_loop_callsites(
                         reads_since_write.setdefault(arena, []).append(position)
                     for arena in writes:
                         last_write[arena] = position
+                        write_history.setdefault(arena, []).append(position)
                         reads_since_write[arena] = []
                     # A source-placed call following a guarded continue/return
                     # must not execute on that terminal edge while waiting for
@@ -31860,6 +31944,7 @@ def lower_control_sections_to_ssa(
         ),
         table_region_operations=table_region_operations,
         table_region_post_operations=table_region_post_operations,
+        sequence_read_before_effects=sequence_read_before_effects,
     )
     # Uniform types describe a control use (for example an integer loop
     # bound), not authority to reinterpret an explicitly typed ABI buffer.

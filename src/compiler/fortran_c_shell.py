@@ -16278,7 +16278,7 @@ def _install_lexical_sequence_queries(
         local_list_truth = (
             expression.func.id in {"bool", "len"}
             and len(arguments) == 1
-            and sequence_attributes.get("aggregate_kind") in {"list", "tuple"}
+            and sequence_attributes.get("aggregate_kind") in {"list", "tuple", "dict", "set"}
             and sequence_attributes.get("producer_kind") in {"aggregate", "aggregate_materialization"}
             and (data.get("attributes") or {}).get("extraction_identity")
                 == f"builtins.{expression.func.id}"
