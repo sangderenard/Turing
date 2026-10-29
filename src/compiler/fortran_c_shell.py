@@ -15273,17 +15273,34 @@ def _install_lexical_sequence_mutations(
         graph.G.graph.get("source_sequence_mutation_records") or {}
     )
 
+    # Program: ``if n == 0: return d`` then ``while i < n: env, st, tk =
+    # make([seed % 3, i % 3, 1], [0, 2, 3])`` (string-core intern driver).
+    # Wrong record: the displays' births are guarded by the early return's
+    # implicit ``orelse`` and were ordered among that arm's top-level
+    # children, so they landed after the loop that holds them (in
+    # ``while_exit``) and the loop's call read rows never written there
+    # ("Call reads a value defined at while_body").  Rule: inside its guard's
+    # arm an effect is placed as at any other level -- in the innermost loop
+    # whose per-iteration lines hold it (``insert_in_enclosing_loop``).
+    arm_placement_node: list = [None]
+
+    def insert_in_arm(arm_block, mutation_block):
+        node_id = arm_placement_node[0]
+        if node_id is None or int(node_id) not in graph.G:
+            return insert_ordered(arm_block, mutation_block)
+        return insert_in_enclosing_loop(arm_block, mutation_block, int(node_id))
+
     def insert_in_conditional(block, owner_id, arm, mutation_block):
         if isinstance(block, ConditionalBlock):
             if int(block.source_node_id or -1) == int(owner_id):
                 if str(arm) == "body":
                     return replace(
                         block,
-                        body=insert_ordered(block.body, mutation_block),
+                        body=insert_in_arm(block.body, mutation_block),
                     ), True
                 return replace(
                     block,
-                    orelse=insert_ordered(
+                    orelse=insert_in_arm(
                         block.orelse or SequenceBlock(()), mutation_block,
                     ),
                 ), True
@@ -15556,6 +15573,11 @@ def _install_lexical_sequence_mutations(
 
         inserted = False
         item = mutation_block
+        arm_placement_node[0] = (
+            int(mutation.effect_node_id)
+            if isinstance(mutation, ScalarFieldWriteBlock)
+            else _sequence_mutation_owner_id(mutation)
+        )
         for owner_id, arm in sorted(
             guarded, key=lambda entry: node_position(entry[0]), reverse=True,
         ):
