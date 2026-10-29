@@ -3091,6 +3091,7 @@ def _planned_scalar_dtypes_from_graph(
     from ..common.tensors.topological_reducer import (
         _int_range_scopes as _range_scopes,
         _int_range_cell as _range_cell,
+        _resolved_source_value_class,
     )
 
     range_scopes = _range_scopes(G)
@@ -3370,6 +3371,38 @@ def _planned_scalar_dtypes_from_graph(
             concatenation = concatenated_empty_display(node_id)
             if concatenation is not None and element.get(concatenation):
                 settle(element, node_id, element[concatenation])
+                continue
+            # Program: tensor_octets_to_bytes iterates
+            # `octets[:limit].tolist()`. The ProgramABI settles the
+            # tensor's rank-1 element dtype. A slice keeps that row type,
+            # and AbstractTensor.tolist exposes those rows as a list.
+            # Both steps require the reducer's exact source-value class;
+            # spelling `tolist` on an unrelated object proves nothing.
+            if (
+                op == "indexed"
+                and isinstance(expression, ast.Subscript)
+                and isinstance(expression.slice, ast.Slice)
+                and _resolved_source_value_class(G, node_id)[0]
+                == "src.common.tensors.abstraction.AbstractTensor"
+            ):
+                bases = parents(data, "base")
+                if len(bases) == 1:
+                    settle(element, node_id, element.get(bases[0]))
+                continue
+            if (
+                op == "tolist"
+                and isinstance(expression, ast.Call)
+                and isinstance(expression.func, ast.Attribute)
+                and expression.func.attr == "tolist"
+                and attributes.get("tensor_candidate") == "tolist"
+            ):
+                receivers = parents(data, "operand")
+                if (
+                    len(receivers) == 1
+                    and _resolved_source_value_class(G, receivers[0])[0]
+                    == "src.common.tensors.abstraction.AbstractTensor"
+                ):
+                    settle(element, node_id, element.get(receivers[0]))
                 continue
             # Program: ``k.mul(x) + k.scale`` with ``def mul(self, x: int) ->
             # int`` (corpus c426).  Wrong record: a method call is named by

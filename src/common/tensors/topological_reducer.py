@@ -12784,6 +12784,27 @@ def _normalize_lexical_values(
                     base_class_cell.row, base_class_cell.column,
                 )
             )
+            if (
+                isinstance(expression.slice, ast.Slice)
+                and isinstance(base_class_fact, tuple)
+                and base_class_fact
+                and _canonical_source_class_identity(base_class_fact[0])
+                == "src.common.tensors.abstraction.AbstractTensor"
+            ):
+                # Program: tensor_octets_to_bytes reads
+                # `octets[:limit].tolist()`. The slice is still an
+                # AbstractTensor: __getitem__ wraps a native tensor slice
+                # in type(self). Without this exact class edge, the tolist
+                # call loses its receiver class before sequence typing.
+                _concord_source_value_class(
+                    value_class_scope, int(node_id), str(base_class_fact[0]),
+                    source="AbstractTensor slice",
+                    provenance=_Derived(tuple(dict.fromkeys(filter(None, (
+                        base_class_cell,
+                        node_identity_cell(graph, int(base_id)),
+                        node_identity_cell(graph, int(node_id)),
+                    ))))),
+                )
             row_data = (
                 graph.G.nodes[base_id]
                 if isinstance(base_id, int) and base_id in graph.G else {}
