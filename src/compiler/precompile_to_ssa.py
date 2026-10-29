@@ -5077,30 +5077,20 @@ class _ControlSSABuilder(TiledObject):
             return
         fault_exit = self._fault_exit
         returning = self.current
-        values = None if returned is None else list(returned)
-        # A returned list (``out[0] = x; return out``) is its sequence
-        # handle, typed by its element dtype: a zero is not that list, so
-        # only scalar outputs are zeroed.
-        if values is not None and all(
-            value is not None and str(value.dtype) in {
-                "int", "int8", "int16", "int32", "int64", "bool",
-                "float32", "float64",
-            }
-            and int(value.id) not in self.sequence_descriptors
-            for value in values
-        ):
-            self.current = fault_exit
-            self.emit(Handler.Trap, [], attributes={"fault_exit": True})
-            return
-        # Outputs outside the scalar classes: continue as ``pop`` does.  The
-        # exit block then has no predecessor; drop it rather than leave a
-        # second, unreachable ``Ret`` behind.
-        for failing, continuing in self._index_fault_blocks:
-            failing.instrs.pop()
-            failing.successors.remove(fault_exit.name)
-            self.current = failing
-            self.branch(continuing)
-        self.blocks.pop(fault_exit.name, None)
+        del returned
+        # Program: ``def make(seed, n): xs = [0] * (n + 1); ...; xs[i] =
+        # ...; return 0, xs`` (string-core intern driver: ``intern_batch``
+        # fills and returns its status and token lists).  Wrong record: for
+        # outputs outside the scalar classes the failing edge of a checked
+        # index was rerouted into the in-range block "as pop does", so after
+        # the fault was recorded the store still wrote the element past the
+        # list's storage (C: heap corruption, ``free(): invalid next size``).
+        # Rule: the exit publishes nothing whatever the outputs are (the
+        # validation code is already recorded), so every checked index's
+        # failing edge leaves through the one ``Trap`` and never touches the
+        # element.
+        self.current = fault_exit
+        self.emit(Handler.Trap, [], attributes={"fault_exit": True})
         self.current = returning
 
     def _emit_sequence_row_load(
