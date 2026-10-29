@@ -5496,6 +5496,17 @@ class CorrelationTable:
             # stable ProgramABI field; every other sequence member must keep
             # its compiler-frame owner in the comparison key.
             owner = accounting.get("compiler_frame_storage") or function
+            # Program: ``return 0, statuses, tokens`` bound as ``env,
+            # statuses, tokens = batch(n, 2)``.  Wrong record: the owner was
+            # the callee's frame but the id was the caller's own sequence
+            # id, so the caller's sequence 7 (the callee's 4) keyed as the
+            # callee's sequence 7 (the caller's 8) and one correct binding
+            # was reported as duplicate storage.  Rule: the id is read in
+            # the owner's namespace -- the frame's own sequence id that
+            # the accounting records beside its owner.
+            frame_sequence_id = accounting.get("compiler_frame_sequence_id")
+            if owner != function and frame_sequence_id is not None:
+                sequence_id = int(frame_sequence_id)
             return f"{owner}.seq{sequence_id}.{role}"
         return None
 
