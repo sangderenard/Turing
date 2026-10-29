@@ -177,6 +177,76 @@ def _resolve_bound_function_references(graph: Any) -> None:
         attributes["callee_ref"] = int(bound.address)
         attributes["callee_resolution"] = "bound-function-parameter"
         data["attributes"] = attributes
+        _post_bound_call_reachability(graph, int(_node_id), bound)
+
+
+def _post_bound_call_reachability(graph: Any, call_id: int, bound: Any) -> None:
+    """Record that this call reaches the function its parameter is bound to.
+
+    Program: ``def drive(step, t): return step(t)`` called as
+    ``drive(advance, t)`` with ``advance`` returning a tensor (the managed
+    tire's ``run_superstep`` -> ``balloon_tire_managed_advance`` ->
+    ``vector_cross``; corpus c971).  Wrong record: the reducer posts a
+    ``source_function_reachability`` row for each call that already names
+    its callee, but this call is linked to its callee only here, after
+    that pass, so the callsite return-shape reader found no reachability
+    authority and refused the selected return.  Rule: the pass that links
+    a bound-parameter call is the pass that proves it reaches the callee,
+    so it posts the row the reader keys on, DERIVED from the call node's
+    cell and the callee's function address.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope, node_identity_cell,
+    )
+    from ..transmogrifier.function_table import function_address_identity
+    from .concordance_declarations import (
+        FUNCTION_ADDRESS, PLANNER_CALL_BINDING, SOURCE_FUNCTION_REACHABILITY,
+    )
+    from .identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    function_table = getattr(graph, "function_table", None)
+    if function_table is None:
+        return
+    callee_entry = function_table.entry(bound)
+    callee_graph = getattr(callee_entry, "graph", None)
+    if callee_graph is None:
+        return
+    caller_scope = (
+        graph.G.graph.get("authored_function_identity")
+        or _source_numeric_scope(graph.G)
+    )
+    callee_scope = (
+        callee_graph.G.graph.get("authored_function_identity")
+        or _source_numeric_scope(callee_graph.G)
+    )
+    call_value = int(graph.G.nodes[call_id].get("value_id", call_id))
+    row = (caller_scope, call_value, callee_scope)
+    book = current_identity_book()
+    incumbent = book.page(SOURCE_FUNCTION_REACHABILITY).latest(row)
+    if incumbent is True:
+        return
+    if incumbent is not None:
+        raise ValueError(
+            "source function reachability concordance disagreement for "
+            f"{row!r}: recorded={incumbent!r}, proposed=True"
+        )
+    cells = tuple(
+        cell for cell in (
+            node_identity_cell(graph, call_id),
+            book.latest_ref(
+                FUNCTION_ADDRESS, (function_address_identity(callee_entry),),
+            ),
+        )
+        if cell is not None
+    )
+    book.post(
+        SOURCE_FUNCTION_REACHABILITY, row, True,
+        stage=PLANNER_CALL_BINDING,
+        provenance=Derived(cells), mode=Mode.CONCORD,
+    )
 
 
 def _resolve_grounded_method_references(graph: Any) -> None:

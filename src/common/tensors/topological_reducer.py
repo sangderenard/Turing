@@ -25897,6 +25897,24 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             caller = caller_entry.graph.G
             if not caller.graph.get("source_pursuit_active"):
                 continue
+            # Program: ``drive(advance, t)`` where ``drive`` calls its
+            # ``step`` parameter (the managed tire passes
+            # ``balloon_tire_managed_advance`` to ``run_superstep``;
+            # corpus c971).  Wrong record: pursuit followed only calls that
+            # name their callee, so ``advance`` -- reached only through the
+            # parameter -- stayed inactive, and its own calls never got
+            # reachability rows.  Rule: a source function whose address an
+            # active function takes as a value is reachable from it.
+            for _reference_id, reference_data in caller.nodes(data=True):
+                address = (reference_data.get("attributes") or {}).get(
+                    "first_class_function_ref"
+                )
+                if address is None or int(address) not in entries:
+                    continue
+                referenced = entries[int(address)].graph.G
+                if not referenced.graph.get("source_pursuit_active"):
+                    referenced.graph["source_pursuit_active"] = True
+                    changed = True
             caller_scope = _source_numeric_scope(caller, caller_entry.name)
             for call_id, call_data in tuple(caller.nodes(data=True)):
                 call_attributes = call_data.get("attributes") or {}
