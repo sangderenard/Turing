@@ -4370,6 +4370,26 @@ class _FunctionEmitter:
         batched = self._batched_matmul(instr, operation)
         if batched is not None:
             return batched
+        copied = tuple(instr.res.shape or ())
+        if (
+            operation in {"clone", "copy", "detach"} and len(instr.args) == 1
+            and len(copied) == 1 and isinstance(copied[0], int)
+            and (
+                int(instr.res.id) in self.array_base_ids
+                or int(instr.args[0].id) in self.array_base_ids
+            )
+        ):
+            # An indexed array is declared assumed-size ``t(*)``, and
+            # gfortran refuses a whole-array assignment to or from one
+            # ("The upper bound in the last dimension must appear"),
+            # measured on the signal-core elementwise loop
+            # (``ir_identities.scalarize_elementwise_transcendentals``),
+            # whose result buffer is a clone it then indexes.  The static
+            # extent bounds the section on both sides.
+            return [
+                f"    {_name(instr.res)}(1:{int(copied[0])}) = "
+                f"{self._operand(instr.args[0])}(1:{int(copied[0])})"
+            ]
         if operation not in (
             "cumsum", "gather", "scatter", "index_set", "pad", "stack",
             "concat", "concatenate",

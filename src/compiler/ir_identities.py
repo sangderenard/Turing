@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib as _contextlib
 import functools as _functools
 import dataclasses
+import math
 from collections.abc import Mapping
 
 from ..transmogrifier.ssa import Instr, SSAValue
@@ -631,6 +632,254 @@ def _scalar_float64(value) -> bool:
     )
 
 
+def _shaped(value) -> bool:
+    """A tensor/span value: a static shape, or a declared runtime rank."""
+
+    if value is None:
+        return False
+    if tuple(value.shape or ()):
+        return True
+    accounting = getattr(value, "accounting", None) or {}
+    return any(
+        int(accounting.get(key, 0) or 0) > 0
+        for key in ("program_abi_rank", "ssa_call_rank")
+    )
+
+
+def _elementwise_transcendental(instruction) -> str | None:
+    """The scalar op one element of a shaped transcendental is, else None.
+
+    Read from the records, never from a list kept here: the op's catalogue
+    row (``ssa_numeric_operators.TENSOR_SSA_OPERATOR_BY_NAME``) must be
+    ``elementwise_unary``/``elementwise_binary``; its scalar spelling is the
+    planner's own (``hierarchical_plan.TENSOR_OPERATION_SCALAR_SPELLING``:
+    ``exp`` -> ``Exp``, ``pow`` -> ``Pow``; every other name keeps its
+    spelling); and that scalar op must be one of ``TRANSCENDENTAL_OPS``, the
+    set the scalar route already names (an op already spelled as one of
+    those, shaped, is its own scalar op).  The result must be shaped
+    (a static shape or a declared runtime rank).
+    """
+
+    from .hierarchical_plan import TENSOR_OPERATION_SCALAR_SPELLING
+    from .ssa_numeric_operators import TENSOR_SSA_OPERATOR_BY_NAME
+
+    name = str(
+        instruction.attributes.get("tensor_operation") or instruction.op
+    )
+    if name in TRANSCENDENTAL_OPS:
+        # Already the scalar spelling (the planner writes ``a ** 1.5`` on a
+        # tensor as a shaped ``Pow``); on a shaped value every backend
+        # spells it elementwise (``scalar_likeness``).
+        scalar_op = name
+    else:
+        row = TENSOR_SSA_OPERATOR_BY_NAME.get(name)
+        if row is None or row.category not in {
+            "elementwise_unary", "elementwise_binary",
+        }:
+            return None
+        scalar_op = TENSOR_OPERATION_SCALAR_SPELLING.get(name, name)
+    if scalar_op not in TRANSCENDENTAL_OPS or not _shaped(instruction.res):
+        return None
+    return scalar_op
+
+
+def scalarize_elementwise_transcendentals(function, block_name, index):
+    """One elementwise tensor/span transcendental -> a loop of scalar ops.
+
+    Program: ``np.exp(a)``, ``a.sin()``, ``a ** b`` on a float64 tensor.
+    Wrong record: the planner keeps the lowercase tensor op, and each
+    backend spelled it with host math per element -- C libm in
+    ``emit_elementwise_span``, LLVM's ``unary_double`` kernel (fused to
+    ``llvm.exp.f64``), Fortran's elemental ``exp()`` -- under a contract
+    whose ``transcendentals`` is ``signal_cores``.  Rule: the result is a
+    fresh buffer (a ``clone`` of an operand of the result's shape) filled
+    by an SSA loop over its elements: ``GetElementPtr``/``Load`` each shaped
+    operand's element (a rank-0 operand is the same value for every
+    element), apply the SCALAR op the signal cores route
+    (``_elementwise_transcendental``), ``GetElementPtr``/``Store`` it.  The
+    caller (``lower_transcendentals_to_signal_cores``) then rewrites that
+    scalar op as it does any scalar one, so every element is the core's
+    correctly rounded double and every element carries the core's fault
+    guards (``native_faults``).
+
+    Refused by name: an op with no core, an operand or result that is not
+    float64, operand shapes that differ (a broadcast), a
+    runtime-sized span (no static element count), and a ``Pow`` whose
+    Python form ``_pow_signal_core`` cannot read.  None of these is left
+    on host math.
+    """
+
+    from .concordance_declarations import (
+        PRECISION_IDENTITIES, PRECISION_IDENTITY_VALUE, SSA_BLOCK,
+        SSABlockKind,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_record_return_state import (
+        function_scope_of, identity_cells, mint_ssa_value,
+    )
+    from ..transmogrifier.ssa import BasicBlock
+
+    block = function.blocks[block_name]
+    call = block.instrs[index]
+    scalar_op = _elementwise_transcendental(call)
+    name = str(call.attributes.get("tensor_operation") or call.op)
+    where = f"{call.op} -> %{call.res.id} in {function.name}"
+    contract = (
+        "; the numeric contract's transcendentals is 'signal_cores', which "
+        "never leaves a math function on the host library (numeric mode "
+        "'compute' selects backend_intrinsic)"
+    )
+    if scalar_op not in TRANSCENDENTAL_SIGNAL_CORES:
+        raise ValueError(
+            f"elementwise {name} has no signal core ({where}){contract}"
+        )
+    result = call.res
+    shape = tuple(result.shape or ())
+    if not shape or not all(isinstance(extent, int) for extent in shape):
+        raise ValueError(
+            f"elementwise {name} over a runtime-sized span ({where}) has no "
+            f"static element count for its signal-core loop{contract}"
+        )
+    if not call.args or not all(
+        str(value.dtype or "").casefold() in _TRANSCENDENTAL_FLOAT64
+        for value in (result, *call.args)
+    ):
+        raise ValueError(
+            f"elementwise {name} ({where}) is not float64 on every operand "
+            "and its result "
+            f"({[str(value.dtype) for value in (result, *call.args)]}); the "
+            f"signal cores compute float64{contract}"
+        )
+    for value in call.args:
+        if _shaped(value) and tuple(value.shape or ()) != shape:
+            raise ValueError(
+                f"elementwise {name} ({where}) broadcasts operand %{value.id} "
+                f"of shape {tuple(value.shape or ())!r} to {shape!r}; the "
+                f"signal-core loop spells only equal shapes{contract}"
+            )
+    template = next(value for value in call.args if _shaped(value))
+
+    post = block.instrs[index + 1:]
+    old_successors = list(block.successors)
+    block.instrs = block.instrs[:index]
+    added: list[BasicBlock] = []
+    taken = set(function.blocks)
+    state = {"current": block}
+    owners = identity_cells(function, call.res, *call.args)
+
+    def new_block(stem: str, kind) -> BasicBlock:
+        serial = 0
+        label = f"{block_name}.{stem}"
+        while label in taken:
+            serial += 1
+            label = f"{block_name}.{stem}.{serial}"
+        taken.add(label)
+        created = BasicBlock(label)
+        added.append(created)
+        book = current_identity_book()
+        row = (function_scope_of(function), str(function.name), label)
+        if owners and book.latest_ref(SSA_BLOCK, row) is None:
+            book.post(
+                SSA_BLOCK, row, kind, stage=PRECISION_IDENTITIES,
+                provenance=Derived(owners), mode=Mode.CONCORD,
+            )
+        return created
+
+    def mint(dtype: str) -> SSAValue:
+        return SSAValue(mint_ssa_value(
+            function, PRECISION_IDENTITY_VALUE, (call.res,),
+            dtype=dtype, shape=(), stage=PRECISION_IDENTITIES,
+        ), dtype=dtype, shape=())
+
+    lowered = {"lowered_from": f"elementwise.{name}"}
+
+    def put(op, args, dtype, attributes=None, res=None) -> SSAValue:
+        # ``dtype`` None: an effect (``Store``) with no result.
+        if res is None and dtype is not None:
+            res = mint(dtype)
+        state["current"].instrs.append(Instr(
+            op, list(args), res,
+            attributes={**lowered, **dict(attributes or {})},
+        ))
+        return res
+
+    def jump(target: BasicBlock) -> None:
+        current = state["current"]
+        current.instrs.append(Instr(
+            "Br", [], None, attributes={**lowered, "target": target.name},
+        ))
+        current.successors = [target.name]
+
+    # The result's own id names the fresh buffer the loop fills: a
+    # ``clone`` of an operand of its shape (C and LLVM copy into the
+    # result's storage, Fortran assigns the array), every element of which
+    # the loop overwrites.  ``zeros_like`` has no module-lane C spelling.
+    put("clone", [template], "float64", attributes={
+        "tensor_operation": "clone", "tensor_candidate": "clone",
+    }, res=result)
+    zero = put("Const", [], "int64", attributes={"value": 0})
+    one = put("Const", [], "int64", attributes={"value": 1})
+    count = put("Const", [], "int64", attributes={
+        "value": int(math.prod(shape)),
+    })
+    entry = state["current"]
+    header = new_block("ew_loop", SSABlockKind.LOOP_HEADER)
+    body = new_block("ew_body", SSABlockKind.LOOP_BODY)
+    done = new_block("ew_done", SSABlockKind.LOOP_EXIT)
+    jump(header)
+    position, following = mint("int64"), mint("int64")
+    state["current"] = header
+    put("Phi", [zero, following], "int64", attributes={
+        "incoming_blocks": (entry.name, body.name),
+    }, res=position)
+    going = put("Lt", [position, count], "bool")
+    header.instrs.append(Instr("CondBr", [going], None, attributes={
+        **lowered, "true_target": body.name, "false_target": done.name,
+    }))
+    header.successors = [body.name, done.name]
+    state["current"] = body
+
+    def element(value) -> SSAValue:
+        if not _shaped(value):
+            return value
+        address = put("GetElementPtr", [value, position], "ptr")
+        return put("Load", [address], "float64")
+
+    operands = [element(value) for value in call.args]
+    # The op's own record (``extraction_contract``, ``source_type``) rides
+    # on the element op: ``Pow`` reads its Python form from it.
+    attributes = {
+        key: value for key, value in dict(call.attributes or {}).items()
+        if key not in {"tensor_operation", "tensor_candidate", "tensor"}
+    }
+    computed = put(scalar_op, operands, "float64", attributes=attributes)
+    target = put("GetElementPtr", [result, position], "ptr")
+    put("Store", [computed, target], None)
+    put("Add", [position, one], "int64", res=following)
+    jump(header)
+    state["current"] = done
+    done.instrs.extend(post)
+    done.successors = old_successors
+    # Successor Phis now enter from the block holding the tail.
+    for successor in old_successors:
+        target_block = function.blocks.get(successor)
+        for instruction in (target_block.instrs if target_block else ()):
+            blocks = instruction.attributes.get("incoming_blocks")
+            if str(instruction.op) == "Phi" and blocks:
+                instruction.attributes["incoming_blocks"] = tuple(
+                    done.name if str(origin) == block_name else origin
+                    for origin in blocks
+                )
+    ordered = []
+    for label, existing in function.blocks.items():
+        ordered.append((label, existing))
+        if label == block_name:
+            ordered.extend((made.name, made) for made in added)
+    function.blocks.clear()
+    function.blocks.update(ordered)
+    return name
+
+
 def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
     """Route scalar float64 ``math`` transcendentals through the signal cores.
 
@@ -651,10 +900,16 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
     transcendental with no core is refused by name: under ``signal_cores``
     it is never left on host math.
 
+    Elementwise tensor/span transcendentals take the same route: under
+    ``signal_cores`` each becomes a loop whose body is the scalar op
+    (``scalarize_elementwise_transcendentals``), rewritten here like any
+    other, so every element is the core's double behind the core's guards;
+    the receipt counts them (``elementwise``).
+
     ``backend_intrinsic`` (the ``compute`` mode) rewrites nothing: each
     backend spells the op with its own math library (C libm, ``llvm.*`` or
-    libm calls, gfortran intrinsics).  The receipt names those ops
-    (``left_native``).
+    libm calls, gfortran intrinsics), scalar or elementwise.  The receipt
+    names those ops (``left_native``).
     """
 
     from .concordance_declarations import (
@@ -666,7 +921,9 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
     from ..transmogrifier.ssa import BasicBlock
 
     policy = transcendental_policy(mode)
-    receipt = {"policy": policy, "lowered": {}, "left_native": {}}
+    receipt = {
+        "policy": policy, "lowered": {}, "elementwise": {}, "left_native": {},
+    }
     flavor = active_two_product_flavor()
 
     def scalar(instruction) -> bool:
@@ -828,6 +1085,28 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
         lowered[op] = lowered.get(op, 0) + 1
 
     for function in functions.values():
+        # Elementwise tensor/span transcendentals first: each becomes a loop
+        # whose body holds one scalar op, which the loop below then routes
+        # like any scalar one.  Same contract, same cores, same guards.
+        while policy == "signal_cores":
+            site = next(
+                (
+                    (name, position)
+                    for name, candidate in function.blocks.items()
+                    for position, instruction in enumerate(candidate.instrs)
+                    if _elementwise_transcendental(instruction) is not None
+                ),
+                None,
+            )
+            if site is None:
+                break
+            elementwise = scalarize_elementwise_transcendentals(
+                function, *site,
+            )
+            counted = receipt["elementwise"].setdefault(
+                str(function.name), {},
+            )
+            counted[elementwise] = counted.get(elementwise, 0) + 1
         while True:
             site = next(
                 (
@@ -845,17 +1124,26 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
             str(instruction.op)
             for candidate in function.blocks.values()
             for instruction in candidate.instrs
-            if str(instruction.op) in TRANSCENDENTAL_OPS
+            if (
+                str(instruction.op) in TRANSCENDENTAL_OPS
+                or _elementwise_transcendental(instruction) is not None
+            )
             and not str(
                 instruction.attributes.get("lowered_from") or ""
             ).startswith("signal_core.")
         })
         if left:
             receipt["left_native"][str(function.name)] = left
-        if str(function.name) in receipt["lowered"] or left:
+        if (
+            str(function.name) in receipt["lowered"]
+            or str(function.name) in receipt["elementwise"] or left
+        ):
             function.metadata["transcendental_pipeline"] = {
                 "policy": policy,
                 "lowered": dict(receipt["lowered"].get(str(function.name), {})),
+                "elementwise": dict(
+                    receipt["elementwise"].get(str(function.name), {})
+                ),
                 "left_native": tuple(left),
             }
     return receipt
