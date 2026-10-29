@@ -566,6 +566,10 @@ class NativeTryBlock(TiledObject):
     orelse: "ControlBlock | None"
     finalbody: "ControlBlock"
     source_try_node_id: int
+    # Source Call nodes actually scheduled as numerical work in the
+    # protected body. Each has a SOURCE_EXCEPTION_TRANSFER cell; SSA must
+    # either lower its exceptional edge or refuse the control program.
+    protected_call_node_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

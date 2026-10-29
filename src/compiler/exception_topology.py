@@ -118,8 +118,8 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
     from ..common.tensors.topological_reducer import node_identity_cell
     from .concordance_declarations import (
         EXCEPTION_TOPOLOGY, SOURCE_CONTROL_SPECIALIZATION,
-        SOURCE_EXCEPTION_TRANSFER,
-        ExceptionTransferFact,
+        SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
+        ExceptionHandlerEntryFact, ExceptionTransferFact,
     )
     from .identity_concordance import Derived, Mode, current_identity_book
 
@@ -331,6 +331,65 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             SOURCE_EXCEPTION_TRANSFER, row, fact,
             stage=EXCEPTION_TOPOLOGY,
             provenance=Derived(dependencies),
+            mode=Mode.CONCORD if previous is None or previous == fact
+            else Mode.REVISE,
+        )
+    for handler_id, entry in sorted((
+        G.graph.get("source_exception_handler_entries") or {}
+    ).items()):
+        owner_id = int(entry["try_id"])
+        owner_cell = node_identity_cell(graph, owner_id)
+        handler_cell = node_identity_cell(graph, int(handler_id))
+        incoming = []
+        for source_id in entry["sites"]:
+            transfer = transfers.get(int(source_id))
+            if (
+                transfer is None
+                or transfer.catch_try_node_id != owner_id
+            ):
+                raise ValueError(
+                    "handler entry has a source without an exact caught "
+                    f"transfer: handler={handler_id}, source={source_id}, "
+                    f"try={owner_id}"
+                )
+            transfer_cell = book.latest_ref(
+                SOURCE_EXCEPTION_TRANSFER, (scope, int(source_id)),
+            )
+            if transfer_cell is None:
+                raise ValueError(
+                    "handler entry source transfer has no concordance cell: "
+                    f"handler={handler_id}, source={source_id}"
+                )
+            incoming.append(transfer_cell)
+        selected = tuple(
+            (name, node_identity_cell(graph, int(value_id)))
+            for name, value_id in entry["selected"]
+        )
+        for transfer_cell in incoming:
+            transfer_fact = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                transfer_cell.row, transfer_cell.column,
+            )
+            site_values = dict(transfer_fact.entry_bindings)
+            for name, value_cell in selected:
+                if site_values.get(name) != value_cell:
+                    raise ValueError(
+                        "handler entry selected a value absent from an "
+                        "exceptional predecessor: "
+                        f"handler={handler_id}, name={name!r}, "
+                        f"source={transfer_cell.row[1]}"
+                    )
+        fact = ExceptionHandlerEntryFact(
+            owner_cell, handler_cell, tuple(incoming), selected,
+        )
+        row = (scope, int(handler_id))
+        previous = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest(row)
+        book.post(
+            SOURCE_EXCEPTION_HANDLER_ENTRY, row, fact,
+            stage=EXCEPTION_TOPOLOGY,
+            provenance=Derived(tuple(dict.fromkeys((
+                owner_cell, handler_cell, *incoming,
+                *(cell for _name, cell in selected),
+            )))),
             mode=Mode.CONCORD if previous is None or previous == fact
             else Mode.REVISE,
         )

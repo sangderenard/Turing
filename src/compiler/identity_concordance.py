@@ -1932,7 +1932,8 @@ class CorrelationTable:
         """
 
         from .concordance_declarations import (
-            CANONICAL_VALUE, SOURCE_EXCEPTION_TRANSFER,
+            CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ENTRY,
+            SOURCE_EXCEPTION_TRANSFER,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -1999,6 +2000,63 @@ class CorrelationTable:
                         f"{name!r} has no same-scope canonical cause: "
                         f"{value_cell!r}",
                     ))
+        handler_page = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY)
+        for row in handler_page.rows():
+            fact = handler_page.latest(row)
+            if fact is None:
+                continue
+            entry_cell = book.latest_ref(SOURCE_EXCEPTION_HANDLER_ENTRY, row)
+            causes = {
+                source for source, _stage in (
+                    () if entry_cell is None
+                    else book.edges_into(entry_cell)
+                )
+            }
+            if (
+                fact.handler.row != (row[0], int(row[1]))
+                or fact.owner.row[0] != row[0]
+                or fact.handler not in causes
+                or fact.owner not in causes
+            ):
+                found.append(Finding(
+                    "source-exception-handler-owner-disagree", str(row[0]),
+                    int(row[1]),
+                    f"owner={fact.owner!r}, handler={fact.handler!r}",
+                ))
+            selected = tuple(fact.unanimous_bindings)
+            names = tuple(name for name, _cell in selected)
+            if len(names) != len(set(names)) or names != tuple(sorted(names)):
+                found.append(Finding(
+                    "source-exception-handler-bindings-disagree",
+                    str(row[0]), int(row[1]), f"names={names!r}",
+                ))
+            for transfer_cell in fact.incoming_transfers:
+                transfer = page.cell(
+                    transfer_cell.row, transfer_cell.column,
+                ) if transfer_cell.page == SOURCE_EXCEPTION_TRANSFER else None
+                if (
+                    transfer is None
+                    or transfer.catch_try != fact.owner
+                    or transfer_cell not in causes
+                ):
+                    found.append(Finding(
+                        "source-exception-handler-transfer-disagree",
+                        str(row[0]), int(row[1]),
+                        f"incoming={transfer_cell!r}",
+                    ))
+                    continue
+                site_values = dict(transfer.entry_bindings)
+                for name, value_cell in selected:
+                    if (
+                        site_values.get(name) != value_cell
+                        or value_cell not in causes
+                    ):
+                        found.append(Finding(
+                            "source-exception-handler-value-disagree",
+                            str(row[0]), int(row[1]),
+                            f"{name!r} from {transfer_cell!r} "
+                            f"is not {value_cell!r}",
+                        ))
         return found
 
     @staticmethod

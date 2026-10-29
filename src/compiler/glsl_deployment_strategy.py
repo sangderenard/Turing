@@ -674,6 +674,12 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
     """
 
     graph = shell.process_graph.G
+    from .concordance_declarations import SOURCE_CONTROL_SPECIALIZATION
+    from .identity_concordance import current_identity_book
+
+    specialization_page = current_identity_book().page(
+        SOURCE_CONTROL_SPECIALIZATION
+    )
     expression_nodes = {
         id(data.get("expr_obj")): int(node_id)
         for node_id, data in graph.nodes(data=True)
@@ -837,11 +843,32 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
         if body_raise is not None and not statement.orelse:
             raised_statement = body_raise
             raises_when_true = True
+            raised_arm = "body"
         elif orelse_raise is not None and body_raise is None:
             raised_statement = orelse_raise
             raises_when_true = False
+            raised_arm = "orelse"
         else:
             continue
+        selection = specialization_page.latest((
+            str(graph.graph.get("function_name")), int(node_id),
+        ))
+        if selection is not None:
+            if (
+                selection.get("graph_control_id") != int(node_id)
+                or selection.get("proof") != "structural_constant_predicate"
+                or selection.get("rejected_role") not in {"body", "orelse"}
+            ):
+                raise ValueError(
+                    "guard validation has no exact specialized arm proof: "
+                    f"guard={node_id}, selection={selection!r}"
+                )
+            if selection["rejected_role"] == raised_arm:
+                # Program: tensor_octets_to_bytes's `octets.ndims() != 1`
+                # guard is proven false after the rank-1 boundary enters.
+                # Its Raise node is absent because this exact body arm was
+                # rejected; asking for that node is not a runtime guard.
+                continue
         test = statement.test
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
             test = test.operand

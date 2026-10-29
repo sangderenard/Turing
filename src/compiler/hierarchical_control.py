@@ -617,6 +617,7 @@ def compose_hierarchical_control(
                     ),
                     finalbody=rewrite(block.finalbody),
                     source_try_node_id=block.source_try_node_id,
+                    protected_call_node_ids=block.protected_call_node_ids,
                 )
             if isinstance(block, ValidationBlock):
                 return ValidationBlock(

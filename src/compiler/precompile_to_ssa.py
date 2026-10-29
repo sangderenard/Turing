@@ -10284,7 +10284,7 @@ class _ControlSSABuilder(TiledObject):
         if not self.native_try_frames:
             return None
         from .concordance_declarations import (
-            SOURCE_EXCEPTION_TRANSFER,
+            SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
             canonical_python_subtype_identities,
         )
         from .native_faults import authored_raise_status
@@ -10343,12 +10343,33 @@ class _ControlSSABuilder(TiledObject):
                 f"raised class {raised_name!r} has no concorded exception base",
             ))
             return None
+
+        def authorized_handler_edge(
+            frame: _NativeTryFrame, index: int,
+        ) -> tuple[BasicBlock, int, Ref] | None:
+            handler_id = int(frame.block.handlers[index].source_handler_node_id)
+            entry = book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest((
+                self.lexical_read_scope, handler_id,
+            ))
+            if (
+                entry is None
+                or entry.owner != frame.owner
+                or transfer_cell not in entry.incoming_transfers
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "raise", path,
+                    "handler entry has no concorded exceptional predecessor: "
+                    f"handler={handler_id}, source={block.source_raise_node_id}",
+                ))
+                return None
+            return frame.handler_entries[index], handler_id, transfer_cell
+
         for frame in reversed(self.native_try_frames[:active + 1]):
             if frame.phase != "body":
                 continue
             for index, handler in enumerate(frame.block.handlers):
                 if not handler.exception_type_value_ids and not handler.exception_type_identities:
-                    return frame.handler_entries[index], int(handler.source_handler_node_id), transfer_cell
+                    return authorized_handler_edge(frame, index)
                 if len(handler.exception_type_value_ids) != len(handler.exception_type_identities):
                     self.shortfalls.append(SSALoweringShortfall(
                         "control", "raise", path,
@@ -10365,7 +10386,7 @@ class _ControlSSABuilder(TiledObject):
                     if raised_name in canonical_python_subtype_identities(
                         str(identity), book=book,
                     ):
-                        return frame.handler_entries[index], int(handler.source_handler_node_id), transfer_cell
+                        return authorized_handler_edge(frame, index)
             if frame.block.finalbody != SequenceBlock(()) and frame.owner != target:
                 self.shortfalls.append(SSALoweringShortfall(
                     "control", "raise", path,
@@ -12083,7 +12104,9 @@ class _ControlSSABuilder(TiledObject):
                 self.lower(operation, path=f"{path}.resource_cleanup[{index}]")
             return
         if isinstance(block, NativeTryBlock):
-            from .concordance_declarations import CANONICAL_VALUE
+            from .concordance_declarations import (
+                CANONICAL_VALUE, SOURCE_EXCEPTION_TRANSFER,
+            )
 
             owner = (
                 None if self.lexical_read_scope is None else
@@ -12097,6 +12120,29 @@ class _ControlSSABuilder(TiledObject):
                     "control", "native-try", path,
                     f"Try {block.source_try_node_id} has no exact source cell",
                 ))
+            for source_call_id in block.protected_call_node_ids:
+                transfer = (
+                    None if self.lexical_read_scope is None else
+                    self._book().page(SOURCE_EXCEPTION_TRANSFER).latest((
+                        self.lexical_read_scope, int(source_call_id),
+                    ))
+                )
+                if (
+                    transfer is None
+                    or transfer.source_kind != "call"
+                    or transfer.catch_try != owner
+                ):
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "control", "native-try", path,
+                        "protected call has no exact source exception edge: "
+                        f"call={source_call_id}, try={block.source_try_node_id}",
+                    ))
+                else:
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "control", "native-try", path,
+                        "protected call has no lowered native failure edge: "
+                        f"call={source_call_id}, try={block.source_try_node_id}",
+                    ))
             if _flatten_control_sequence(block.finalbody):
                 self.shortfalls.append(SSALoweringShortfall(
                     "control", "native-try", path,

@@ -6737,6 +6737,10 @@ def _normalize_lexical_values(
     # first conversion's binding, while the first does not.
     exception_site_bindings: dict[int, tuple[tuple[str, int], ...]] = {}
     graph.G.graph["source_exception_site_bindings"] = exception_site_bindings
+    handler_entry_receipts: dict[int, dict[str, Any]] = {}
+    graph.G.graph["source_exception_handler_entries"] = (
+        handler_entry_receipts
+    )
 
     def capture_exception_site(expression: ast.AST) -> None:
         if id(expression) not in graph.G:
@@ -17156,6 +17160,23 @@ def _normalize_lexical_values(
             for nested in body_statement.body:
                 reduce_statement(nested)
             body_environment = dict(environment)
+            # Every call or raise in the protected suite can enter a handler
+            # at the lexical state captured immediately before that site's
+            # operation.  The codec's `int(value)` edge has `numeric` from
+            # `float(value)`, while the first conversion's edge does not.
+            # A handler can read a name without a Phi only when every
+            # candidate exceptional predecessor names the same value.
+            body_exception_sites = tuple(dict.fromkeys(
+                id(member)
+                for statement in body_statement.body
+                for member in ast.walk(statement)
+                if isinstance(member, (ast.Call, ast.Raise))
+                and id(member) in exception_site_bindings
+            ))
+            body_exception_states = tuple(
+                dict(exception_site_bindings[site_id])
+                for site_id in body_exception_sites
+            )
             body_ends_in_raise = bool(
                 body_statement.body
                 and isinstance(body_statement.body[-1], ast.Raise)
@@ -17172,6 +17193,41 @@ def _normalize_lexical_values(
                 environment.update(
                     body_environment if body_ends_in_raise else before
                 )
+                selected_entry_bindings: dict[str, int] = {}
+                if body_exception_states:
+                    entry_names = set().union(*(
+                        set(candidate) for candidate in body_exception_states
+                    ))
+                    handler_reads = set().union(*(
+                        _source_read_names(statement)
+                        for statement in handler.body
+                    )) if handler.body else set()
+                    if handler.name:
+                        handler_reads.discard(str(handler.name))
+                    for name in sorted(entry_names):
+                        incoming = {
+                            candidate.get(name)
+                            for candidate in body_exception_states
+                        }
+                        if len(incoming) == 1 and None not in incoming:
+                            selected_entry_bindings[name] = int(next(iter(incoming)))
+                            environment[name] = selected_entry_bindings[name]
+                        else:
+                            environment.pop(name, None)
+                            if name in handler_reads:
+                                raise ValueError(
+                                    "handler entry requires an exceptional "
+                                    "value Phi before reducing its read: "
+                                    f"try={id(body_statement)}, "
+                                    f"handler={id(handler)}, name={name!r}, "
+                                    f"sites={body_exception_sites!r}, "
+                                    f"incoming={incoming!r}"
+                                )
+                handler_entry_receipts[id(handler)] = {
+                    "try_id": id(body_statement),
+                    "sites": body_exception_sites,
+                    "selected": tuple(sorted(selected_entry_bindings.items())),
+                }
                 # Program: tensor_octets_to_bytes catches
                 # (TypeError, ValueError, OverflowError) and then raises a
                 # new ValueError.  Wrong record: the handler's exception
@@ -18854,6 +18910,36 @@ def _normalize_lexical_values(
         )
     ordered_graph.graph["source_exception_site_bindings"] = (
         canonical_exception_states
+    )
+    canonical_handler_entries = {}
+    for handler_id, receipt in (
+        graph.G.graph.get("source_exception_handler_entries") or {}
+    ).items():
+        if int(handler_id) not in mapping:
+            continue
+        source_ids = tuple(map(int, receipt["sites"]))
+        selected = tuple(receipt["selected"])
+        missing = tuple(
+            value_id for value_id in (
+                *source_ids,
+                *(int(value_id) for _name, value_id in selected),
+            ) if value_id not in mapping
+        )
+        if missing:
+            raise ValueError(
+                "live handler entry has identities without canonical "
+                f"values: handler={handler_id}, missing={missing!r}"
+            )
+        canonical_handler_entries[int(mapping[int(handler_id)])] = {
+            "try_id": int(mapping[int(receipt["try_id"])]),
+            "sites": tuple(int(mapping[value_id]) for value_id in source_ids),
+            "selected": tuple(
+                (name, int(mapping[int(value_id)]))
+                for name, value_id in selected
+            ),
+        }
+    ordered_graph.graph["source_exception_handler_entries"] = (
+        canonical_handler_entries
     )
     # Renumbering changes the id space; a watermark from the AST-id
     # ingestion graph must not leak into canonical allocation.  Seed a new

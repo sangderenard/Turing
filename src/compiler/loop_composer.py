@@ -6810,21 +6810,31 @@ def analyze_shader_loop_reductions(
             if try_id is None or try_id not in graph.G:
                 blockers.append("try-without-exact-source-node")
                 continue
-            # The only source Try admitted by this draft control composer is
-            # one whose protected body ends in an unconditional Raise.  That
-            # edge carries the body's lexical state to its handler.  A call
-            # or conditional raise needs separate exceptional entry states;
-            # allowing it here would make the handler read the pre-Try state
-            # and could silently publish a wrong loop-carried value.
+            # The reducer and exception-transfer page now record the exact
+            # entry state of each protected Call or Raise.  A handler that
+            # continues still needs a success/exception value join unless
+            # the protected body ends in Raise; a handler ending in Raise
+            # cannot contribute a value to that join.  Other joins and
+            # nested control remain explicit blockers until SSA owns them.
             if (
                 not try_statement.body
-                or not isinstance(try_statement.body[-1], ast.Raise)
+                or not (
+                    isinstance(try_statement.body[-1], ast.Raise)
+                    or (
+                        try_statement.handlers
+                        and all(
+                            handler.body
+                            and isinstance(handler.body[-1], ast.Raise)
+                            for handler in try_statement.handlers
+                        )
+                    )
+                )
                 or try_statement.orelse
                 or try_statement.finalbody
                 or any(
                     isinstance(member, (
-                        ast.Call, ast.Raise, ast.Return,
-                        ast.If, ast.For, ast.While, ast.Try, ast.TryStar,
+                        ast.Return, ast.If, ast.For, ast.While,
+                        ast.Try, ast.TryStar,
                     ))
                     for statement in (
                         *try_statement.body[:-1],
@@ -6990,6 +7000,17 @@ def analyze_shader_loop_reductions(
                 orelse=(arm_sequence("orelse") if try_statement.orelse else None),
                 finalbody=arm_sequence("finalbody"),
                 source_try_node_id=int(try_id),
+                protected_call_node_ids=tuple(dict.fromkeys(
+                    int(source_id)
+                    for _position, item in owned.get(("body", 0), ())
+                    for source_id in item_source_nodes(item)
+                    if source_id in graph.G
+                    and isinstance(
+                        graph.G.nodes[source_id].get("expr_obj"), ast.Call,
+                    )
+                    and source_id in transfers
+                    and transfers[source_id].catch_try_node_id == int(try_id)
+                )),
             )
             body_items = [
                 *remaining,

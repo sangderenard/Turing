@@ -1165,6 +1165,22 @@ SOURCE_EXCEPTION_TRANSFER = declare_page(
         RowField("source_node", K.VALUE_ID),
     ), ExceptionTransferFact,
 )
+
+
+@dataclass(frozen=True)
+class ExceptionHandlerEntryFact:
+    owner: Ref
+    handler: Ref
+    incoming_transfers: tuple[Ref, ...]
+    unanimous_bindings: tuple[tuple[str, Ref], ...]
+
+
+SOURCE_EXCEPTION_HANDLER_ENTRY = declare_page(
+    "source_exception_handler_entry", (
+        RowField("source_scope", K.SCOPE),
+        RowField("handler_node", K.VALUE_ID),
+    ), ExceptionHandlerEntryFact,
+)
 STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
     "structural_specialization_fixed_point", (
         RowField("invocation", K.SCOPE), RowField("round", K.INDEX),
