@@ -3154,6 +3154,53 @@ def _planned_scalar_dtypes_from_graph(
 
     collection_kinds = {"list", "tuple", "set", "dict"}
 
+    def iterated_keys(iterable_id):
+        """The key columns an iterated mapping holds, or None.
+
+        The iterable is the mapping or the carried result of the loop that
+        filled it (``d = {}; for ..: d[k] = v`` then ``for k in d``).  Each
+        key is the tuple of the store's index leaves (a tuple key
+        ``d[(a, b)]`` stores two) or one displayed key.
+        """
+
+        current = int(iterable_id)
+        seen = set()
+        stores = []
+        while current in G and current not in seen:
+            seen.add(current)
+            data = G.nodes[current]
+            op = operation(data)
+            if op == "loopresult" and len(parents(data, "value")) == 1:
+                current = parents(data, "value")[0]
+                continue
+            if op in {"indexedstore", "setitem"}:
+                stores.append(current)
+                bases = parents(data, "base")
+                if len(bases) != 1:
+                    return None
+                current = bases[0]
+                continue
+            break
+        data = G.nodes.get(current, {})
+        if (data.get("attributes") or {}).get("aggregate_kind") != "dict":
+            return None
+        if any(str(role).startswith("keys") and int(parent) in G and isinstance(
+            G.nodes[int(parent)].get("expr_obj"), ast.Tuple,
+        ) for parent, role in data.get("parents") or ()):
+            # A displayed tuple key's columns are not separate leaves here.
+            return None
+        stores.extend(
+            int(child) for child in G.successors(current)
+            if operation(G.nodes[child]) in {"indexedstore", "setitem"}
+            and int(child) not in stores
+            and current in parents(G.nodes[child], "base")
+        )
+        keys = [(key,) for key in parents(data, "keys")]
+        keys.extend(
+            tuple(parents(G.nodes[store], "index")) for store in stores
+        )
+        return keys
+
     # ``def put(xs, t): xs.append(t)``: an unannotated parameter that a
     # retained append grows is a collection; its rows are what it appends.
     grown_receivers = {
@@ -3655,6 +3702,20 @@ def _planned_scalar_dtypes_from_graph(
                         # annotation's key class, concorded on the target,
                         # is the dtype, not the value rows' class.
                         held = None
+                    elif iterated_keys(iterable[0]):
+                        # Program: ``d = {}; d[i * 3] = i * 0.5`` then ``for
+                        # k in d``.  Wrong record: the target took the dict's
+                        # row class (its values), although iterating a
+                        # mapping yields its keys.  Rule: the target of an
+                        # unannotated mapping is the join of its keys.
+                        held = join([
+                            scalar.get(leaves[0])
+                            for leaves in iterated_keys(iterable[0])
+                            if len(leaves) == 1
+                        ] or [None]) if all(
+                            len(leaves) == 1
+                            for leaves in iterated_keys(iterable[0])
+                        ) else None
                     for name in target_names:
                         for target_id, target in G.nodes(data=True):
                             if (
@@ -3854,6 +3915,44 @@ def _planned_scalar_dtypes_from_graph(
                                     ) == "loop"
                                 ):
                                     settle(scalar, int(target_id), held)
+                # Program: ``cells[(i % 2, i)] = i`` then ``for row, column
+                # in cells`` (the bootstrap's ``_reindex_in_place``).  Wrong
+                # record: a tuple target over an unannotated mapping had no
+                # rule, so ``row * 10`` reached its region with no dtype.
+                # Rule: iterating a mapping yields its keys; the i-th name of
+                # a tuple target is the join of the i-th column of every key
+                # the mapping stores or displays (a key of another width
+                # leaves the names unknown, as any join does).
+                keyed = iterated_keys(iterable[0]) if iterable else None
+                if (
+                    keyed
+                    and isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and operation(G.nodes[iterable[0]]) != "items"
+                    and not (G.nodes[iterable[0]].get("attributes") or {}).get(
+                        "mapping_key_class_ref"
+                    )
+                ):
+                    width = len(loop_expression.target.elts)
+                    for position, item in enumerate(loop_expression.target.elts):
+                        held = join([
+                            scalar.get(leaves[position])
+                            if len(leaves) == width else None
+                            for leaves in keyed
+                        ])
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == item.id
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
@@ -29296,6 +29395,39 @@ def _fold_callsite_structural_values(
             }
             left = known.get(parents.get("lhs", parents.get("left")), unresolved)
             right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            if isinstance(expression.ops[0], (ast.Is, ast.IsNot)) and (
+                left is None or right is None
+            ):
+                # Program: ``y = None; if n > 2: y = n; return f(y)``.
+                # Wrong record: f's copy bound x to the payload's
+                # descriptor (int64); that fact reads as storage that
+                # cannot be None, so ``x is None`` folded to False and
+                # f(None) returned 0 instead of 7.  Rule: a formal whose
+                # actual at this callsite may be None keeps ``is None`` as
+                # a runtime test of the presence the call carries.
+                optional_actuals = set(
+                    graph.G.graph.get("planner_parameter_optional_actuals")
+                    or ()
+                )
+                subject_id = (
+                    parents.get("lhs", parents.get("left"))
+                    if right is None
+                    else parents.get("rhs", parents.get("right"))
+                )
+                subject = (
+                    graph.G.nodes.get(int(subject_id), {})
+                    if subject_id is not None else {}
+                )
+                subject_name = (subject.get("attributes") or {}).get(
+                    "binding_name"
+                )
+                if (
+                    optional_actuals
+                    and str(subject.get("type") or "") in {"Input", "input"}
+                    and subject_name is not None
+                    and str(subject_name) in optional_actuals
+                ):
+                    return unresolved
             if (
                 isinstance(expression.ops[0], (ast.Is, ast.IsNot))
                 and left is unresolved
@@ -32999,6 +33131,67 @@ def _authored_formal_int_range(original: Any, formal: str):
     return None
 
 
+def _callsite_actual_may_be_none(caller: Any, value_id: int) -> bool:
+    """Whether a caller value may be ``None`` at runtime, structurally.
+
+    A literal ``None``, a merge (Phi) any arm of which may be None, and a
+    call whose callee returns a value that may be None (followed into the
+    callee's own returned identities).  Nothing else is claimed.
+    """
+
+    seen: set[tuple[int, int]] = set()
+    stack = [(caller, int(value_id), 0)]
+    while stack:
+        owner, current, depth = stack.pop()
+        graph = owner.G
+        if (id(graph), current) in seen or current not in graph or depth > 8:
+            continue
+        seen.add((id(graph), current))
+        data = graph.nodes[current]
+        node_type = str(data.get("type") or "")
+        expression = data.get("expr_obj")
+        if node_type in {"Constant", "const", "Const"}:
+            if isinstance(expression, ast.Constant) and expression.value is None:
+                return True
+            continue
+        if node_type in {"Input", "input"}:
+            # A formal this copy was specialized for an optional actual
+            # forwards that optional (``f(x)`` passing ``x`` to ``h(x)``).
+            binding_name = (data.get("attributes") or {}).get("binding_name")
+            if binding_name is not None and str(binding_name) in set(
+                graph.graph.get("planner_parameter_optional_actuals") or ()
+            ):
+                return True
+            continue
+        if node_type in {"Phi", "phi"}:
+            stack.extend(
+                (owner, int(parent), depth)
+                for parent, role in data.get("parents") or ()
+                if str(role) not in {"test", "condition", "predicate"}
+            )
+            continue
+        function_table = getattr(owner, "function_table", None)
+        if node_type in {"Call", "call"} and function_table is not None:
+            reference = (data.get("attributes") or {}).get("callee_ref")
+            if reference is None:
+                continue
+            try:
+                callee = function_table.entry(int(reference)).graph
+            except (KeyError, TypeError, ValueError):
+                continue
+            if callee is None:
+                continue
+            identities = callee.G.graph.get("identity_table") or {}
+            outputs = tuple(callee.G.graph.get("function_outputs") or ())
+            if len(outputs) != 1:
+                continue
+            stack.extend(
+                (callee, int(returned), depth + 1)
+                for returned in identities.get(str(outputs[0]), ())
+            )
+    return False
+
+
 def _callsite_specialized_shell_type(
     owner: Any,
     node_id: int,
@@ -33059,6 +33252,10 @@ def _callsite_specialized_shell_type(
         "source_value_class_concordance"
     )
     bound_parameters: set[str] = set()
+    #: Parameters whose actual at this callsite may be ``None`` (a merge
+    #: with a None arm, an optional call result).  The copy keeps
+    #: ``is None`` tests of them as runtime tests of their presence.
+    parameter_optional_actuals: dict[str, bool] = {}
     data = caller.G.nodes[int(node_id)]
     caller_record_abi = dict(
         caller.G.graph.get("parameter_record_abi") or {}
@@ -33097,6 +33294,8 @@ def _callsite_specialized_shell_type(
         parameter = str(parameter)
         bound_parameters.add(parameter)
         class_fact = caller_class_page.latest((caller_scope, int(parent)))
+        if _callsite_actual_may_be_none(caller, int(parent)):
+            parameter_optional_actuals[parameter] = True
         # The actual's element class (``list[int]`` against ``list[float]``)
         # is part of the signature the copy is built for: the called
         # inventory's classes for the formal are exact.
@@ -33353,6 +33552,7 @@ def _callsite_specialized_shell_type(
         tuple(sorted(parameter_classes.items())),
         tuple(sorted(parameter_element_classes.items())),
         tuple(sorted(parameter_int_ranges.items())),
+        tuple(sorted(parameter_optional_actuals)),
     )
     key = (
         tuple(policy.items()), generation,
@@ -33471,6 +33671,9 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_parameter_element_classes"] = dict(
         parameter_element_classes
+    )
+    specialized.G.graph["planner_parameter_optional_actuals"] = tuple(
+        sorted(parameter_optional_actuals)
     )
     specialized.G.graph["planner_parameter_class_cells"] = dict(
         parameter_class_cells

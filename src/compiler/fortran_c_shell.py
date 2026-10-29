@@ -3580,6 +3580,27 @@ def _linked_caller_member_cell(
     )
 
 
+def _is_call_bound_type_tag_formal(formal: Any) -> bool:
+    """A union formal's native type tag, bound from its subject's actual.
+
+    Program: ``f(y)`` with ``def f(x: int | None)`` and ``y`` None on one
+    path.  Wrong record: x's tag formal was leased as frame storage, so the
+    root grew a tag formal nobody fills (zero, the NoneType tag) and f read
+    None at every call.  A tag is not storage: native call linking binds it
+    from the subject actual (forwarded, remapped or the exact constant).
+    """
+
+    accounting = dict(getattr(formal, "accounting", None) or {})
+    return accounting.get("native_type_tag_for_value_id") is not None and not any(
+        accounting.get(key)
+        for key in (
+            "compiler_frame_storage",
+            "linked_call_frame_storage",
+            "returned_record_storage",
+        )
+    )
+
+
 def _restore_linked_sequence_member(
     caller: Any, values: dict, member_id: int, callee_formal: Any,
     callee_symbol: str, callsite_id: int,
@@ -23124,6 +23145,90 @@ def _settle_linked_dynamic_sequences(
         ))
 
 
+def _refuse_dropped_activation_roots(deployment: Any, ssa_module: Any) -> None:
+    """Refuse a lowered module that lost one of its planned activation roots."""
+
+    # Every activation root is a method the library promises to export.  The
+    # surface lowering passes over a planned shell that never received a
+    # control program, so a root with no lowered function was dropped, not
+    # refused: ``SSAReferenceEvaluator`` once shipped a library holding
+    # ``__init__`` alone.  Read the two records against each other here --
+    # the deployment's activation roots and each function's
+    # ``source_function_reference`` -- and refuse by name.  Both the class
+    # route and the canonical source route lower through
+    # ``_class_surface_ssa_program``, so the refusal lives on that seam.
+    lowered_references = {
+        int(function.metadata["source_function_reference"])
+        for function in ssa_module.functions.values()
+        if function.metadata.get("source_function_reference") is not None
+    }
+    dropped_roots = tuple(
+        int(reference)
+        for reference in getattr(deployment, "activation_root_references", ())
+        if int(reference) not in lowered_references
+    )
+    if dropped_roots:
+        function_shells = dict(getattr(deployment, "function_shells", {}) or {})
+        raise FortranEmissionError(
+            "class surface planned activation roots it never lowered: "
+            + ", ".join(
+                f"{reference} "
+                + repr(str(getattr(getattr(getattr(
+                    function_shells.get(reference), "process_graph", None,
+                ), "G", None), "graph", {}).get("function_name") or "?"))
+                for reference in dropped_roots
+            )
+            + "; refusing to emit a library without them"
+        )
+
+
+def _refuse_unlowered_stored_callable_calls(deployment: Any) -> None:
+    """Refuse a planned call through a stored callable field."""
+
+    # A call through a stored callable -- ``self.notify(n)`` where the class
+    # table lists ``notify`` as a FIELD, not a method -- has no lowering: no
+    # method_ref, no callee_ref, no indirect callable record.  As a
+    # statement its result has no consumer, so nothing downstream asked for
+    # it and the library shipped the method with the call removed (the
+    # callable's effects silently gone).  No unresolved-call table holds a
+    # row for it either: ``Walker.poke: self.notify(n)`` shipped through
+    # ``lower_ast_source_to_ssa`` with the call gone.  Read the method
+    # graph's own class-table record, on the seam both routes share.
+    from .glsl_deployment_strategy import (
+        _stored_callable_field_call, _walk_planned_shells,
+    )
+
+    unlowered_field_calls = []
+    for planned in _walk_planned_shells(
+        deployment, include_function_registry=False,
+    ):
+        graph = getattr(getattr(planned, "process_graph", None), "G", None)
+        if graph is None:
+            continue
+        for node_id, data in graph.nodes(data=True):
+            field = _stored_callable_field_call(graph, data)
+            attributes = data.get("attributes") or {}
+            # A call is lowered when a lowering wrote its record: a method or
+            # callee reference, or a host callback.  ``indirect_callable_id``
+            # is the reducer's note of which value was called, and nothing
+            # lowers it (``Walker.poke``: ``self.notify`` read from a
+            # constructor parameter shipped with the call gone).
+            if field is None or any(
+                attributes.get(key) is not None
+                for key in ("method_ref", "callee_ref", "host_callback_field")
+            ):
+                continue
+            unlowered_field_calls.append(
+                f"{field[0]}.{graph.graph.get('function_name')}: "
+                f"{ast.unparse(data['expr_obj'])} (node {int(node_id)})"
+            )
+    if unlowered_field_calls:
+        raise FortranEmissionError(
+            "class surface has a call through a stored callable field with "
+            "no lowered invocation: " + "; ".join(unlowered_field_calls)
+        )
+
+
 def _class_surface_ssa_program(
     compilation: Any,
     artifact_name: str,
@@ -23153,6 +23258,9 @@ def _class_surface_ssa_program(
     whole-object SSA can be inspected and verified before target emission.
     """
 
+    _refuse_unlowered_stored_callable_calls(
+        getattr(compilation, "deployment", None)
+    )
     from .native_code_retention import (
         host_build_target,
         resolve_build_target,
@@ -28474,6 +28582,16 @@ def _class_surface_ssa_program(
         # generic records and every non-record specialization keep their keys.
         from .identity_concordance import shape_scope_is_variant
         record_specialization = graph_obj.graph.get("parameter_record_abi") or {}
+        # The executable's identity names its record ABI whether or not the
+        # shell is a variant.  Program: a class whose ``twice`` calls
+        # ``self.bump`` twice, lowered whole (every method seeded).  Wrong
+        # record: the public ``bump`` shell (not a variant, so its record ABI
+        # was left out) and ``twice``'s callee copy of it (a variant carrying
+        # the same ``self`` record) were compared by different keys under
+        # one symbol, and the class refused ("names two shells with different
+        # callsite contracts").  Rule: compare shells by their contract AND
+        # their record ABI; only the symbol digest keeps the variant rule.
+        identity_contract = (*specialization_contract, record_specialization)
         if record_specialization and shape_scope_is_variant(graph_obj):
             specialization_contract = (*specialization_contract, record_specialization)
         # Program: ``intern_batch(1, [65, 66, 67], [0, 3])`` beside
@@ -28545,7 +28663,7 @@ def _class_surface_ssa_program(
             if data.get("type") == "Input"
             for attributes in (data.get("attributes") or {},)
         ))
-        shell_contract = (repr(specialization_contract), shell_frame)
+        shell_contract = (repr(identity_contract), shell_frame)
         if symbol in lowered_symbol_contracts:
             if lowered_symbol_contracts[symbol] != shell_contract:
                 from .identity_concordance import ConcordanceRefusal
@@ -48316,6 +48434,16 @@ def _class_surface_ssa_program(
                 frame_bindings.append((
                     value_id, "caller_storage", int(linked_discovery),
                 ))
+            elif _is_call_bound_type_tag_formal(value):
+                # Program: ``f(y)`` with ``def f(x: int | None)`` and ``y``
+                # None on one path.  Wrong record: x's native type tag
+                # formal fell to the storage-from-absence lease below, so
+                # the root grew a tag formal nobody fills (zero, the
+                # NoneType tag) and f read None for every call.  Rule: a
+                # tag formal is not frame storage; the call's tag is the
+                # subject actual's own (forwarded, remapped, or the exact
+                # constant), which native call linking binds.
+                pass
             elif "record_instance" in dict(value.accounting or {}):
                 # Storage introduced while constructing an object remains
                 # part of that function's physical ABI even when it is not a
@@ -50778,6 +50906,12 @@ def _class_surface_ssa_program(
                         for argument in callee.args:
                             argument_id = int(argument.id)
                             if argument_id in bound_frame_ids:
+                                continue
+                            if _is_call_bound_type_tag_formal(argument):
+                                # The tag of a union formal is the subject
+                                # actual's own tag, bound by native call
+                                # linking; leasing it gave the root a tag
+                                # nobody fills (see the frame binding walk).
                                 continue
                             # A callee argument that is a record field
                             # (``program_abi_parameter``/``program_abi_field``
@@ -62062,6 +62196,10 @@ def _class_surface_ssa_program(
     lowered_module.metadata["optional_scalar_return_lowerings"] = len(
         lower_optional_scalar_returns(lowered_module)
     )
+    from .ssa_optional_values import lower_optional_scalar_arguments
+    lowered_module.metadata["optional_scalar_argument_lowerings"] = len(
+        lower_optional_scalar_arguments(lowered_module)
+    )
     # A join of int and float arms is one physical class; refuse it where
     # Python would see each arm's own class (``ssa_numeric_joins``).
     from .ssa_numeric_joins import refuse_type_visible_numeric_joins
@@ -62170,6 +62308,9 @@ def _class_surface_ssa_program(
     lowered_module.metadata["build_target"] = (
         resolved_build_target.to_mapping()
     )
+    _refuse_dropped_activation_roots(
+        getattr(compilation, "deployment", None), lowered_module,
+    )
 
     return (
         lowered_module,
@@ -62223,72 +62364,6 @@ def _emit_class_surface_module(
     )
     if ssa_module is None:
         return None, ()
-    # Every activation root is a method the library promises to export.  The
-    # surface lowering passes over a planned shell that never received a
-    # control program, so a root with no lowered function was dropped, not
-    # refused: ``SSAReferenceEvaluator`` once shipped a library holding
-    # ``__init__`` alone.  Read the two records against each other here --
-    # the deployment's activation roots and each function's
-    # ``source_function_reference`` -- and refuse by name.
-    deployment = getattr(compilation, "deployment", None)
-    lowered_references = {
-        int(function.metadata["source_function_reference"])
-        for function in ssa_module.functions.values()
-        if function.metadata.get("source_function_reference") is not None
-    }
-    dropped_roots = tuple(
-        int(reference)
-        for reference in getattr(deployment, "activation_root_references", ())
-        if int(reference) not in lowered_references
-    )
-    if dropped_roots:
-        function_shells = dict(getattr(deployment, "function_shells", {}) or {})
-        raise FortranEmissionError(
-            "class surface planned activation roots it never lowered: "
-            + ", ".join(
-                f"{reference} "
-                + repr(str(getattr(getattr(getattr(
-                    function_shells.get(reference), "process_graph", None,
-                ), "G", None), "graph", {}).get("function_name") or "?"))
-                for reference in dropped_roots
-            )
-            + "; refusing to emit a library without them"
-        )
-    # A call through a stored callable -- ``self.notify(n)`` where the class
-    # table lists ``notify`` as a FIELD, not a method -- has no lowering: no
-    # method_ref, no callee_ref, no indirect callable record.  As a
-    # statement its result has no consumer, so nothing downstream asked for
-    # it and the library shipped the method with the call removed (the
-    # callable's effects silently gone).  The public entry already refuses
-    # this through its unresolved call table; the class surface has no such
-    # table, so read the method graph's own class-table record here.
-    from .glsl_deployment_strategy import (
-        _stored_callable_field_call, _walk_planned_shells,
-    )
-
-    unlowered_field_calls = []
-    for planned in _walk_planned_shells(
-        deployment, include_function_registry=False,
-    ):
-        graph = getattr(getattr(planned, "process_graph", None), "G", None)
-        if graph is None:
-            continue
-        for node_id, data in graph.nodes(data=True):
-            field = _stored_callable_field_call(graph, data)
-            if field is None or any(
-                (data.get("attributes") or {}).get(key) is not None
-                for key in ("method_ref", "callee_ref", "indirect_callable_id")
-            ):
-                continue
-            unlowered_field_calls.append(
-                f"{field[0]}.{graph.graph.get('function_name')}: "
-                f"{ast.unparse(data['expr_obj'])} (node {int(node_id)})"
-            )
-    if unlowered_field_calls:
-        raise FortranEmissionError(
-            "class surface has a call through a stored callable field with "
-            "no lowered invocation: " + "; ".join(unlowered_field_calls)
-        )
     emitted = emit_module(
         ssa_module,
         name=f"{artifact_name}_fortran",
