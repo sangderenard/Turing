@@ -29855,10 +29855,31 @@ def lower_control_sections_to_ssa(
                     if value_id not in integer_ids:
                         integer_ids.add(value_id)
                         changed = True
+        # Integer evidence says a value is an int, not which width: a value
+        # the planner already typed past int64 (an interval proven wider,
+        # or arithmetic over such an operand) keeps that width.  Program:
+        # ``w = d * 1000003 + b`` with ``d < 2**62``, then ``w >> 3``.
+        # Wrong record: the shift's evidence retyped the int128 ``w`` and
+        # its product int64, so the native product faulted (or wrapped)
+        # where Python's value fits int128.
+        wide_integer_dtypes = {"uint64", "int128"}
+        planned_integer_dtypes = {
+            int(value.id): str(value.dtype)
+            for instruction in semantic_instructions
+            for value in (
+                *instruction.args,
+                *((instruction.res,) if instruction.res is not None else ()),
+            )
+            if str(value.dtype or "") in wide_integer_dtypes
+            and not tuple(value.shape or ())
+        }
         for value_id in integer_ids:
             current = region_value_meta.get(value_id)
+            current_dtype = None if current is None else str(current.dtype)
             region_value_meta[value_id] = Meta(
-                () if current is None else tuple(current.shape), "int64"
+                () if current is None else tuple(current.shape),
+                current_dtype if current_dtype in wide_integer_dtypes
+                else planned_integer_dtypes.get(value_id, "int64"),
             )
     compile_substage(f"SSA section {control_name}: place table and sequence effects")
     report("placing table and sequence effects")

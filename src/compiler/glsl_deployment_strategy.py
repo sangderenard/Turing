@@ -4600,7 +4600,24 @@ def _planned_scalar_dtypes_from_graph(
             if op in REGION_DTYPE_PRESERVING_OPS:
                 operands = parents(data, "lhs", "rhs", "operand", "arg:")
                 operands = [o for o in operands if o not in element]
-                settle(scalar, node_id, promote([scalar.get(o) for o in operands]))
+                joined = promote([scalar.get(o) for o in operands])
+                # Program: ``d = (d * 1000003 + token + 7) % M`` (string-core
+                # intern digest): ``d * 1000003`` is proven int128, ``token``
+                # is unproven.  Wrong record: the ``+`` took the int64 class
+                # seed first, so the native add read the int128 product
+                # truncated to int64 and returned a value Python never
+                # computes, with no fault.  Rule: an op no interval bounds
+                # holds its operands' exact common integer domain; the int64
+                # class seed is no proof against a proven-wide operand (as
+                # for the node's own interval above).
+                if (
+                    proven_width is None
+                    and joined in {"uint64", "int128"}
+                    and scalar.get(node_id) in {"int64", "int"}
+                ):
+                    scalar[node_id] = joined
+                    changed = True
+                settle(scalar, node_id, joined)
                 continue
             # Program: ``if a > b: r = a - b ... else: r = (b - a) * 2;
             # return r + 1`` (corpus c01).  Wrong record: the statement
