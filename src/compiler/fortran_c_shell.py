@@ -5203,6 +5203,55 @@ def host_callback_signature(annotation: str) -> dict[str, Any]:
     }
 
 
+def _host_callback_admission(graph: Any, owner: str, field: str) -> str | None:
+    """The refusal of a host callback for ``owner.field``, or ``None``.
+
+    Reads the execution contract the graph carries and posts the verdict to
+    ``host_callback_admission``; the verdict read back from that page is the
+    decision.  A host callback is a call into code the host process owns,
+    handed in as a pointer at run time -- a live Python interpreter when the
+    host is Python -- so only a Python-hosted contract that keeps callbacks
+    admits one.  A full-native contract never does: its stored callable must
+    compile as native code or refuse.  A graph with no contract refuses.
+    """
+
+    from .concordance_declarations import (
+        HOST_CALLBACK_ADMISSION, HOST_CALLBACK_ADMISSION_DECISION,
+        PLANNER_STRUCTURAL_FOLD,
+    )
+    from .identity_concordance import Mode, Novel, current_identity_book
+
+    execution = graph.graph.get("execution_contract")
+    if not isinstance(execution, Mapping):
+        return (
+            f"{owner}.{field} is a stored callable, and no execution contract "
+            "reached this method to say whether a host callback is admitted"
+        )
+    host = str(execution.get("host_runtime"))
+    callbacks = str(execution.get("python_callbacks"))
+    full_native = str(bool(execution.get("require_full_native"))).lower()
+    if host == "python" and callbacks == "contract_only" and full_native == "false":
+        verdict = "admit"
+    else:
+        verdict = (
+            f"{owner}.{field} is a stored callable; calling it as a host "
+            "callback would call code the host owns at run time, and the "
+            f"execution contract (host_runtime: {host}, python_callbacks: "
+            f"{callbacks}, require_full_native: {full_native}) admits no "
+            "host callback.  The stored callable must compile as native code"
+        )
+    book = current_identity_book()
+    row = (owner, field, host, callbacks, full_native)
+    book.post(
+        HOST_CALLBACK_ADMISSION, row, verdict,
+        stage=PLANNER_STRUCTURAL_FOLD,
+        provenance=Novel(HOST_CALLBACK_ADMISSION_DECISION, ()),
+        mode=Mode.CONCORD,
+    )
+    decided = book.page(HOST_CALLBACK_ADMISSION).latest(row)
+    return None if decided == "admit" else str(decided)
+
+
 def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
     """Lower calls through a host-supplied callable field to a native call.
 
@@ -5258,6 +5307,10 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
                 continue
             field = (data.get("attributes") or {}).get("attribute")
             if field not in callables:
+                continue
+            if _host_callback_admission(graph, owner, str(field)) is not None:
+                # The store stays a store; a method that calls the field
+                # refuses there with the contract's reason.
                 continue
             parents = dict(
                 (str(role), parent)
@@ -5331,6 +5384,9 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
             presence.setdefault(read[2], []).extend(compares)
     records = list(graph.graph.get("host_callback_inputs") or ())
     for name in sorted(set(calls) | set(presence)):
+        refusal = _host_callback_admission(graph, owner, name)
+        if refusal is not None:
+            raise ValueError(refusal)
         signature = host_callback_signature(callables[name])
         if presence.get(name) and not signature["optional"]:
             raise ValueError(
@@ -5817,8 +5873,26 @@ def _lower_optional_record_presence_catalogue(graph: Any) -> int:
             continue
         seen.add(id(graph_obj))
         lowered += _lower_optional_record_presence_graph(graph_obj)
-        lowered += _lower_host_callback_field_calls_graph(graph_obj)
+        try:
+            lowered += _lower_host_callback_field_calls_graph(graph_obj)
+        except ValueError as error:
+            # Program: ``CompressedTable._loader: Callable[[bytes], Any]``
+            # (bootstrap; doc 41 declares no bytes/str callback argument).
+            # Wrong record: the catalogue pass raised for one method's
+            # callback use, so every function of the program was refused.
+            # Rule: the refusal belongs to the method that uses the field.
+            # It is kept on that graph by name and raised when the method
+            # is lowered (``_raise_host_callback_refusal``).
+            graph_obj.graph["host_callback_refusal"] = str(error)
     return lowered
+
+
+def _raise_host_callback_refusal(graph_obj: Any) -> None:
+    """Raise the host-callback refusal the catalogue pass kept on a graph."""
+
+    refusal = graph_obj.graph.get("host_callback_refusal")
+    if refusal is not None:
+        raise ValueError(str(refusal))
 
 
 def _prove_tensor_value_dtypes(contracts: dict) -> None:
@@ -23620,6 +23694,7 @@ def _class_surface_ssa_program(
                     **incumbent_records, **selected,
                 }
         _lower_optional_record_presence_graph(planned_graph)
+        _raise_host_callback_refusal(planned_graph)
         _lower_host_callback_field_calls_graph(planned_graph)
         if program_abi and not planned_graph.graph.get("parameter_value_abi"):
             value_bindings = _contract_input_binding_names(planned_graph)
