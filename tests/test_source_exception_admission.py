@@ -141,6 +141,51 @@ def root(x: float) -> int:
     assert boundary["kind"] == "source-exception-control-owner"
 
 
+def test_standalone_authored_raise_refuses_wrong_native_class():
+    # Before this obligation, the complete native artifact reported code 3.
+    # validation_fault(3) is RuntimeError, not the authored ValueError.
+    source = """\
+def root(x: int) -> int:
+    raise ValueError("bad")
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired) as error:
+            _lower(source, "exception_standalone_raise", identity_book=book)
+        transfers = tuple(
+            book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+        )
+        raise_transfer, = tuple(
+            transfer for transfer in transfers
+            if transfer.source_kind == "raise"
+        )
+        route_row, = tuple(book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows())
+        route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(route_row)
+        assert route.selected_handler is None
+        assert route.status_class.page == NATIVE_STATUS_CLASS
+        source_cell = raise_transfer.source
+        admission = book.page(SOURCE_EXCEPTION_ADMISSION).latest(
+            (source_cell,)
+        )
+        assert isinstance(admission, Unresolved)
+        assert admission.read == (source_cell,)
+        receipt = book.latest_ref(SOURCE_EXCEPTION_ADMISSION, (source_cell,))
+        assert {cell for cell, _stage in book.edges_into(receipt)} == {
+            source_cell,
+        }
+        findings = CorrelationTable._source_exception_admission_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        )
+        assert len(findings) == 1
+        assert "no executable exceptional control" in findings[0].detail
+    finally:
+        end_identity_book(token)
+    boundary, = error.value.to_failure_mapping()["subdivision_boundaries"]
+    assert boundary["kind"] == "source-raise-control-owner"
+    assert boundary["source_raise_cell"] == repr(source_cell)
+
+
 def test_every_retained_try_has_an_admission_obligation():
     source = """\
 def root(x: float) -> int:

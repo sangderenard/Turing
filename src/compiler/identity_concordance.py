@@ -2584,7 +2584,7 @@ class CorrelationTable:
 
     @staticmethod
     def _source_exception_admission_findings(module: Any) -> list[Finding]:
-        """A retained Try needs an exact control owner before artifact emission."""
+        """A retained Try or Raise needs executable control before emission."""
         from .concordance_declarations import (
             CANONICAL_VALUE, INGESTION_VALUE,
             SOURCE_EXCEPTION_ADMISSION,
@@ -2612,7 +2612,7 @@ class CorrelationTable:
                 problem = "exception admission lacks its exact source Try cause"
             elif isinstance(admission, Unresolved):
                 problem = (
-                    "retained source Try has no executable exceptional control"
+                    "retained source Try or Raise has no executable exceptional control"
                     if admission.reason == SOURCE_EXCEPTION_CONTROL_UNLOWERED
                     and admission.read == (source_cell,)
                     else "exception admission has an invalid unresolved fact"

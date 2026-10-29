@@ -34822,11 +34822,13 @@ class ProcessGraphGLSLDeployment(TiledObject):
         # exceptional control cell discharges it, precompile must refuse.
         graph = self.process_graph
         pending_source_tries = []
+        pending_source_raises = []
         if graph is not None:
             from ..common.tensors.topological_reducer import node_identity_cell
             from .concordance_declarations import (
                 EXCEPTION_ADMISSION, SOURCE_EXCEPTION_ADMISSION,
                 SOURCE_EXCEPTION_CONTROL_UNLOWERED,
+                SOURCE_EXCEPTION_TRANSFER, ExceptionTransferFact,
             )
             from .identity_concordance import (
                 Derived, Mode, Unresolved, current_identity_book,
@@ -34862,20 +34864,77 @@ class ProcessGraphGLSLDeployment(TiledObject):
                         f"source Try: {source_cell!r}"
                     )
                 pending_source_tries.append((int(node_id), source_cell))
-        def refuse_unadmitted_source_tries() -> None:
-            if not pending_source_tries:
+            transfer_page = book.page(SOURCE_EXCEPTION_TRANSFER)
+            for row in transfer_page.rows():
+                transfer = transfer_page.latest(row)
+                source_id = int(row[1])
+                if (
+                    not isinstance(transfer, ExceptionTransferFact)
+                    or transfer.source_kind not in {"raise", "reraise"}
+                    or source_id not in graph.G
+                    or not isinstance(
+                        graph.G.nodes[source_id].get("expr_obj"), ast.Raise,
+                    )
+                ):
+                    continue
+                source_cell = node_identity_cell(graph, source_id)
+                if source_cell != transfer.source:
+                    raise ValueError(
+                        "retained Raise disagrees with its source transfer: "
+                        f"raise={source_id}, transfer={row!r}"
+                    )
+                admission_row = (source_cell,)
+                if book.page(SOURCE_EXCEPTION_ADMISSION).latest(
+                    admission_row
+                ) is None:
+                    # Program: `raise ValueError('bad')` without a Try.
+                    # Wrong artifact: the native lane emitted validation
+                    # code 3, which the runtime raised as RuntimeError.
+                    # Rule: an authored Raise needs its own exact executable
+                    # status route before any artifact is admitted.
+                    book.post(
+                        SOURCE_EXCEPTION_ADMISSION, admission_row,
+                        Unresolved(
+                            SOURCE_EXCEPTION_CONTROL_UNLOWERED,
+                            read=(source_cell,),
+                        ),
+                        stage=EXCEPTION_ADMISSION,
+                        provenance=Derived((source_cell,)),
+                        mode=Mode.REVISE,
+                    )
+                admission = book.page(SOURCE_EXCEPTION_ADMISSION).latest(
+                    admission_row
+                )
+                if not isinstance(admission, Unresolved) or (
+                    admission.reason != SOURCE_EXCEPTION_CONTROL_UNLOWERED
+                    or admission.read != (source_cell,)
+                ):
+                    raise ValueError(
+                        "source Raise admission disagrees with its source: "
+                        f"{source_cell!r}"
+                    )
+                pending_source_raises.append((source_id, source_cell))
+        def refuse_unadmitted_source_exceptions() -> None:
+            if not pending_source_tries and not pending_source_raises:
                 return
-            # Every retained Try is posted before this refusal. Planning can
-            # now construct its source control tree, but only an executable
-            # SSA status route may revise SOURCE_EXCEPTION_ADMISSION.
+            # Every retained Try and Raise is posted before this refusal.
+            # Planning can construct the Try control tree, but only an
+            # executable SSA status route may revise the admission rows.
             boundaries = tuple({
                 "kind": "source-exception-control-owner",
                 "source_try_cell": repr(source_cell),
                 "source_try_node_id": node_id,
             } for node_id, source_cell in pending_source_tries)
+            boundaries += tuple({
+                "kind": "source-raise-control-owner",
+                "source_raise_cell": repr(source_cell),
+                "source_raise_node_id": node_id,
+            } for node_id, source_cell in pending_source_raises)
             raise CompilationSubdivisionRequired(
-                "authored Try has no concorded exceptional control "
-                f"owner: source_tries={tuple(cell for _, cell in pending_source_tries)!r}",
+                "authored exceptional control has no executable status "
+                "route: "
+                f"source_tries={tuple(cell for _, cell in pending_source_tries)!r}, "
+                f"source_raises={tuple(cell for _, cell in pending_source_raises)!r}",
                 boundaries=boundaries,
             )
         #
@@ -35340,7 +35399,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 f"{shell_name} structural preparation end in "
                 f"{time.perf_counter() - shell_started:.3f}s"
             )
-        refuse_unadmitted_source_tries()
+        refuse_unadmitted_source_exceptions()
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
