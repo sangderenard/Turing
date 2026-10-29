@@ -98,7 +98,9 @@ The current control pipeline constructs loop programs in
 `NativeTryBlock` for a retained function Try and posts its source control
 fact before the admission refusal. Its region markers have exact arm
 membership, and handler class values follow ingestion-to-canonical edges
-into the forked shell. The block is not yet in the executable overlay, and
+into the forked shell. The control block also cites each exact
+`SOURCE_EXCEPTION_CONTINUATION_PHI` fact for its post-Try value joins.
+The block is not yet in the executable overlay, and
 the SSA lowerer has no branch for it. Folded assignments with no deployment
 region, call placement, and pending outcomes still need control ownership;
 this Try-shaped block does not discharge admission without SSA failure

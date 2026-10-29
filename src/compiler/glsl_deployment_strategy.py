@@ -13459,8 +13459,9 @@ def _source_try_control_programs(
 
     from .concordance_declarations import (
         CANONICAL_VALUE, CONTROL_PROGRAM_BUILD,
+        SOURCE_EXCEPTION_CONTINUATION_PHI,
         SOURCE_EXCEPTION_HANDLER_CLASS,
-        ExceptionHandlerClassFact,
+        ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
     )
     from .control_source import (
         NativeExceptionHandler, NativeTryBlock, post_control_program,
@@ -13622,11 +13623,39 @@ def _source_try_control_programs(
         regions = tuple(dict.fromkeys(
             region for arm_regions in owned.values() for region in arm_regions
         ))
+        continuation_cells = []
+        continuation_page = book.page(SOURCE_EXCEPTION_CONTINUATION_PHI)
+        for row in continuation_page.rows():
+            fact = continuation_page.latest(row)
+            if not isinstance(fact, ExceptionContinuationPhiFact) or (
+                int(fact.owner.row[1]) != id(expression)
+            ):
+                continue
+            if canonical_from_source(fact.owner) != int(try_id):
+                raise ValueError(
+                    "Try continuation owner disagrees with control: "
+                    f"try={try_id}, phi={row!r}"
+                )
+            phi = canonical_from_source(fact.phi)
+            if phi not in graph.G:
+                raise ValueError(
+                    "Try continuation Phi is absent from the forked graph: "
+                    f"try={try_id}, phi={phi}"
+                )
+            continuation_cell = book.latest_ref(
+                SOURCE_EXCEPTION_CONTINUATION_PHI, row,
+            )
+            if continuation_cell is None:
+                raise ValueError(
+                    f"Try continuation Phi has no fact cell: {row!r}"
+                )
+            continuation_cells.append(continuation_cell)
         program = ControlProgram(
             NativeTryBlock(
                 arm_body(("body", 0)), tuple(handlers),
                 arm_body(("orelse", 0)) if expression.orelse else None,
                 arm_body(("finalbody", 0)), int(try_id),
+                continuation_phi_cells=tuple(continuation_cells),
             ),
             region_indices=regions,
         )

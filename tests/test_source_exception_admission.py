@@ -15,6 +15,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
+    SOURCE_EXCEPTION_CONTINUATION_PHI,
 )
 from src.compiler.identity_concordance import (
     CorrelationTable, Unresolved, begin_identity_book, end_identity_book,
@@ -72,7 +73,8 @@ def root(x: float) -> int:
         )
         assert len(try_blocks) == 1
         try_fact = book.page(CONTROL_BLOCK).latest(try_blocks[0])
-        assert len(try_fact.carried) == 1
+        assert len(try_fact.carried) == 2
+        assert try_fact.carried[1].page == SOURCE_EXCEPTION_CONTINUATION_PHI
         source_module = SimpleNamespace(metadata={"identity_book": book})
         for check in (
             CorrelationTable._source_exception_site_state_findings,
