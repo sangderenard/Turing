@@ -1110,6 +1110,7 @@ def _promote_conditional_sequence_aliases(
                 len(block.carried_aliases) - len(block.carried_field_cells)
             )
             sequences = list(block.carried_sequence_aliases)
+            promoted_arm_values: set[int] = set()
             for carried, cells in zip(block.carried_aliases, field_cells):
                 true_id, false_id, initial_id, merged_id = map(int, carried)
                 initial_resident = resident_by_value.get(initial_id)
@@ -1157,6 +1158,7 @@ def _promote_conditional_sequence_aliases(
                     int(true_resident), int(false_resident),
                     destination, merged_id,
                 ))
+                promoted_arm_values.update((true_id, false_id))
                 destination_ids.add(destination)
                 resident_by_value[merged_id] = destination
                 kind_by_value[merged_id] = initial_kind
@@ -1234,6 +1236,24 @@ def _promote_conditional_sequence_aliases(
                 carried_aliases=tuple(scalar),
                 carried_field_cells=tuple(scalar_field_cells),
                 carried_sequence_aliases=tuple(sequences),
+                # Program: ``atoms = []; ...; if seed % 2 == 0: atoms = [];
+                # while ...: atoms.append(...)`` (string-core intern
+                # driver).  Wrong record: the arm value expressions were
+                # attached while the rebound list was still a scalar carry;
+                # promoting the alias left its arm expression behind (a
+                # collection's control expression is its truth test), so
+                # the arm minted ``len(atoms) > 0`` under the list's own
+                # value id and the appends' storage handle became a bool.
+                # Rule: an arm's expressions leave with the alias they
+                # belong to, in lockstep, as its field cells do.
+                body_value_expressions=tuple(
+                    item for item in block.body_value_expressions
+                    if int(item[0]) not in promoted_arm_values
+                ),
+                orelse_value_expressions=tuple(
+                    item for item in block.orelse_value_expressions
+                    if int(item[0]) not in promoted_arm_values
+                ),
             )
         if isinstance(block, SequenceBlock):
             return replace(block, blocks=tuple(promote(x) for x in block.blocks))
@@ -3578,8 +3598,16 @@ def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
     (an ``aggregate_phi`` whose other arm is its initial list) is carried
     by the conditional, which copies the arm into the initial list's
     storage (``carried_sequence_aliases``); the merge names that storage.
-    Both arms rebinding, or an initial empty display (whose rows have no
-    element type before the copy), is not this shape.
+    Both arms rebinding is not this shape.
+
+    Program: ``atoms = []; while ...: atoms.append(a)`` then ``if c: atoms =
+    []; ...append...`` (string-core intern driver).  Wrong record: an
+    initial empty display was refused here as having "no element type
+    before the copy" ("bound to lists of different shapes").  This
+    predicate decides the merge's shape, not its rows' type: the type of
+    the list's rows is its sequence row dtype record
+    (``SEQUENCE_ROW_DTYPE``), posted at its declaration from the rows its
+    writers give it, and refused there by name when no writer gives one.
     """
 
     data = graph_obj.nodes.get(int(node_id)) or {}
@@ -3602,34 +3630,7 @@ def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
         candidate for candidate, candidate_data in graph_obj.nodes(data=True)
         if int(candidate_data.get("value_id", candidate)) == int(initial)
     ]
-    if len(initial_nodes) != 1:
-        return False
-    initial_node = graph_obj.nodes[initial_nodes[0]]
-    literal = initial_node.get("constant")
-    if literal is None:
-        literal = (initial_node.get("attributes") or {}).get("value")
-    expression = initial_node.get("expr_obj")
-    empty_display = (
-        isinstance(literal, list) and not literal
-        or isinstance(expression, ast.List) and not expression.elts
-    )
-    if not empty_display:
-        return True
-    # Program: ``atoms = []; while ...: atoms.append(a)`` then ``if c:
-    # atoms = []; ...append...`` (string-core intern driver).  Wrong record:
-    # the initial list is an empty display, but its retained appends are its
-    # rows, so it has an element type before the copy exactly as a display
-    # with members does; the merge was refused as "bound to lists of
-    # different shapes".  Rule: an empty initial display that retained
-    # appends (or inserts/extends) grow is a typed list; only one nothing
-    # writes stays refused.
-    return any(
-        int(record.get("sequence_value_id", -1)) == int(initial)
-        and str(record.get("operator")) in {"append", "insert", "extend"}
-        for record in (
-            graph_obj.graph.get("source_sequence_mutation_records") or {}
-        ).values()
-    )
+    return len(initial_nodes) == 1
 
 
 def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tuple[Any, ...]:

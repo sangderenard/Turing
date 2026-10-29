@@ -13720,21 +13720,6 @@ def _attach_graph_control_expressions(
                     value_id = int(alias[index])
                     if value_id == int(alias[2]):
                         continue
-                    # Program: ``atoms = []; ...; if seed % 2 == 0: atoms =
-                    # []; while ...: atoms.append(...)`` (string-core intern
-                    # driver).  Wrong record: the rebound arm's list was
-                    # carried as a scalar arm value, and a collection's
-                    # control expression is its truth test, so the arm
-                    # minted ``len(atoms) > 0`` under the list's own value
-                    # id -- the appends' storage handle became a bool.
-                    # Rule: an arm's collection is storage the conditional
-                    # carries (``carried_sequence_aliases``), never a scalar
-                    # arm expression; its truth is a predicate's reading only.
-                    if (
-                        graph_obj.nodes.get(value_id, {}).get("attributes")
-                        or {}
-                    ).get("aggregate_kind") in _TRUTHINESS_AGGREGATE_KINDS:
-                        continue
                     expression = _graph_control_expression(
                         graph_obj, value_id, resident=resident,
                     )
