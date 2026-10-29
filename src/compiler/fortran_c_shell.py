@@ -23217,7 +23217,7 @@ def _refuse_unlowered_stored_callable_calls(deployment: Any) -> None:
             # without it.
             if field is None or any(
                 attributes.get(key) is not None
-                for key in ("method_ref", "callee_ref")
+                for key in ("method_ref", "callee_ref", "host_callback_field")
             ) or (indirect is not None and int(indirect) in graph):
                 continue
             unlowered_field_calls.append(
