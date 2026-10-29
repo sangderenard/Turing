@@ -11113,7 +11113,12 @@ def _field_slot_ops(
             "list", "set", "frozenset", "dict", "bytes", "bytearray", "array"
         }:
             continue
-        if aggregate_kind == "array" and attributes.get("producer_kind") != "sequence_materialization":
+        # An array is born by ``array(typecode)`` or by slicing one
+        # (``a[i:j]`` is a new array of the same typecode, filled by its
+        # append_slice operation); any other array value is a view.
+        if aggregate_kind == "array" and attributes.get("producer_kind") not in {
+            "sequence_materialization", "sequence_slice",
+        }:
             continue
         if attributes.get("mapping_display_child"):
             # A list value of a dict display is a row of the mapping's child

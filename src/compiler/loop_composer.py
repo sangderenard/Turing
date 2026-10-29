@@ -4555,8 +4555,25 @@ class LoopComposer:
             source_value_ids: tuple[int, ...] = ()
             iterable_data = graph.G.nodes[int(loop.iterable_node)]
             iterable_expression = iterable_data.get("expr_obj")
+            # Program: ``xs = [7, 9, 11]; xs.append(n); for x in list(xs):
+            # t = t * 10 + x``.  Wrong record: every materialization was a
+            # closure aggregate whose members are its arguments, so the loop
+            # ran once per ARGUMENT (once, over ``xs`` itself) and returned
+            # 7 (silent, C and LLVM).  Rule: ``list(s)``/``tuple(s)`` of a
+            # sequence is a recorded snapshot -- a resident copy of ``s``'s
+            # rows -- and is iterated as the resident sequence it is.
+            from .resident_sequence_materialization import (
+                _source_sequence_snapshots,
+            )
+
+            snapshot_ids = {
+                int(mutation.sequence_value_id)
+                for mutation in _source_sequence_snapshots(graph.G)
+            }
             if isinstance(iterable_expression, ast.GeneratorExp):
                 access = IterableAccess.GENERATOR
+            elif int(loop.iterable_node) in snapshot_ids:
+                access = IterableAccess.RESIDENT
             elif (
                 (iterable_data.get("attributes") or {}).get("producer_kind")
                 in {
