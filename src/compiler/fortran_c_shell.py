@@ -53159,6 +53159,10 @@ def _class_surface_ssa_program(
                             == f"iteration_{target_loop_id}"
                         ), None)
                         if induction is None:
+                            call_argument_failure = (
+                                "instance_pool_loop_has_no_induction:"
+                                f"{target_loop_id}"
+                            )
                             eligible = False
                         else:
                             destination_sequence_id = int(
@@ -53449,6 +53453,16 @@ def _class_surface_ssa_program(
                                 continue
                         binding = binding_by_callee.get(int(argument.id))
                         if binding is None:
+                            formal_name = callee_value_names.get(
+                                int(argument.id)
+                            )
+                            call_argument_failure = (
+                                f"unbound_callee_formal:{int(argument.id)}"
+                                + (
+                                    f"(name={formal_name!r})"
+                                    if formal_name is not None else ""
+                                )
+                            )
                             eligible = False
                             break
                         kind, source = binding
