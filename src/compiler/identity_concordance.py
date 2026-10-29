@@ -1932,7 +1932,8 @@ class CorrelationTable:
         """
 
         from .concordance_declarations import (
-            CANONICAL_VALUE, CONTROL_BLOCK, ControlBlockKind,
+            Arm, CALL_BINDING, CANONICAL_VALUE, CONTROL_BLOCK,
+            CONTROL_BLOCK_PLACEMENT, ControlBlockKind,
             DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
             NATIVE_STATUS_CLASS,
             SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
@@ -2113,9 +2114,14 @@ class CorrelationTable:
                     control.extra[-1] if control.extra
                     and isinstance(control.extra[-1], tuple) else ()
                 )
+                marker_ids = (
+                    tuple(map(int, control.extra[-2]))
+                    if len(control.extra) >= 2
+                    and isinstance(control.extra[-2], tuple) else ()
+                )
                 call_ids = tuple(
                     int(call_id) for _region, call_id in placements
-                )
+                ) + marker_ids
                 site_ids = tuple(
                     int(site.row[1]) for site in control.sites
                     if site.page == CANONICAL_VALUE
@@ -2127,9 +2133,38 @@ class CorrelationTable:
                 ):
                     found.append(Finding(
                         "native-try-protected-calls-disagree", str(row[0]),
-                        None, f"placements={placements!r}, sites={control.sites!r}",
+                        None, f"placements={placements!r}, markers={marker_ids!r}, "
+                        f"sites={control.sites!r}",
                     ))
                     continue
+                try_cell = book.latest_ref(CONTROL_BLOCK, row)
+                for marker_id in marker_ids:
+                    call_cell = book.latest_ref(
+                        CALL_BINDING, (row[0], int(marker_id)),
+                    )
+                    marker_cell = (
+                        None if call_cell is None else book.latest_ref(
+                            CONTROL_BLOCK,
+                            (row[0], ControlBlockKind.STATEMENT, call_cell),
+                        )
+                    )
+                    placement = (
+                        None if marker_cell is None else
+                        book.page(CONTROL_BLOCK_PLACEMENT).latest((
+                            row[0], marker_cell,
+                        ))
+                    )
+                    if (
+                        placement is None
+                        or placement.parent != try_cell
+                        or placement.arm is not Arm.BODY
+                    ):
+                        found.append(Finding(
+                            "native-try-protected-marker-disagree",
+                            str(row[0]), int(marker_id),
+                            f"marker={marker_cell!r}, placement={placement!r}, "
+                            f"owner={try_cell!r}",
+                        ))
                 region_refs = tuple(control.regions)
                 for region_index, call_id in placements:
                     matching = tuple(

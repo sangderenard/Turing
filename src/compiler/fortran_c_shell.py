@@ -14754,7 +14754,8 @@ def _place_plan_callsites_lexically(
 
     from .control_source import (
         CallBlock, ConditionalBlock, LoopBlock, LoopControlBlock,
-        SequenceBlock, SequenceMutationBlock, StatementBlock, WhileBlock,
+        NativeTryBlock, SequenceBlock, SequenceMutationBlock,
+        StatementBlock, WhileBlock, _callsite_marker,
     )
     from .glsl_deployment_strategy import _branch_compartments
     from .hierarchical_plan import PlanCall
@@ -14834,12 +14835,66 @@ def _place_plan_callsites_lexically(
                 if start is not None and end is not None:
                     loop_spans.append((int(start), int(end), int(source_id)))
             survey(block.body, depth + 1)
+        elif isinstance(block, NativeTryBlock):
+            if block.source_try_node_id is not None:
+                present.add(int(block.source_try_node_id))
+                scope_depths[int(block.source_try_node_id)] = depth
+            survey(block.body, depth + 1)
+            for handler in block.handlers:
+                survey(handler.body, depth + 1)
+            if block.orelse is not None:
+                survey(block.orelse, depth + 1)
+            survey(block.finalbody, depth + 1)
         elif isinstance(block, CallBlock):
             survey(block.callee, depth)
 
     survey(control.root)
 
     def insert_in_conditional(block, owner_id, arm, item):
+        if isinstance(block, NativeTryBlock):
+            if int(block.source_try_node_id or -1) == int(owner_id):
+                if str(arm) == "body":
+                    callsite_id = _callsite_marker(item)
+                    if callsite_id is None:
+                        raise ValueError(
+                            "Try body call placement lacks an exact callsite marker"
+                        )
+                    return replace(
+                        block, body=insert_ordered(block.body, item),
+                        protected_call_node_ids=tuple(dict.fromkeys((
+                            *block.protected_call_node_ids, callsite_id,
+                        ))),
+                        protected_marker_calls=tuple(dict.fromkeys((
+                            *block.protected_marker_calls, callsite_id,
+                        ))),
+                    ), True
+                if str(arm) == "orelse":
+                    return replace(
+                        block,
+                        orelse=insert_ordered(
+                            block.orelse or SequenceBlock(()), item,
+                        ),
+                    ), True
+            body, inserted = insert_in_conditional(
+                block.body, owner_id, arm, item,
+            )
+            if inserted:
+                return replace(block, body=body), True
+            for index, handler in enumerate(block.handlers):
+                body, inserted = insert_in_conditional(
+                    handler.body, owner_id, arm, item,
+                )
+                if inserted:
+                    handlers = list(block.handlers)
+                    handlers[index] = replace(handler, body=body)
+                    return replace(block, handlers=tuple(handlers)), True
+            if block.orelse is not None:
+                orelse, inserted = insert_in_conditional(
+                    block.orelse, owner_id, arm, item,
+                )
+                if inserted:
+                    return replace(block, orelse=orelse), True
+            return block, False
         if isinstance(block, ConditionalBlock):
             if int(block.source_node_id or -1) == int(owner_id):
                 if str(arm) == "body":

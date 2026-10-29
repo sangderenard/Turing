@@ -2420,6 +2420,7 @@ class _ControlSSABuilder(TiledObject):
         self._fault_exit: BasicBlock | None = None
         self.native_try_frames: list[_NativeTryFrame] = []
         self._protected_call_edges: set[tuple[Ref, int]] = set()
+        self._dead_control_blocks: set[str] = set()
         self.named_output_histories = {
             str(name): tuple(map(int, history))
             for name, history in (named_output_histories or {}).items()
@@ -8024,6 +8025,9 @@ class _ControlSSABuilder(TiledObject):
                     "result_convention": "ssa.aggregate",
                 },
             )
+            self._emit_protected_region_status(
+                None, location=location, source_call_id=int(callsite_id),
+            )
             for output_index, output_id in enumerate(result_ids):
                 projection_attributes = {
                     "plan_callsite_marker_projection": True,
@@ -8069,6 +8073,9 @@ class _ControlSSABuilder(TiledObject):
             arguments,
             result,
             attributes=marker_attributes,
+        )
+        self._emit_protected_region_status(
+            None, location=location, source_call_id=int(callsite_id),
         )
         if result is not None:
             self._promote_union_call_result(primary, result)
@@ -9981,7 +9988,8 @@ class _ControlSSABuilder(TiledObject):
         )
 
     def _emit_protected_region_status(
-        self, region_index: int, *, location: str,
+        self, region_index: int | None, *, location: str,
+        source_call_id: int | None = None,
     ) -> None:
         """Branch from one failed native region call before reading outputs.
 
@@ -9998,13 +10006,22 @@ class _ControlSSABuilder(TiledObject):
             concorded_native_status_classes,
         )
 
-        selected = [
-            (frame, int(source_id))
-            for frame in reversed(self.native_try_frames)
-            if frame.phase == "body"
-            for placed_region, source_id in frame.block.protected_region_calls
-            if int(placed_region) == int(region_index)
-        ]
+        selected = (
+            [
+                (frame, int(source_id))
+                for frame in reversed(self.native_try_frames)
+                if frame.phase == "body"
+                for placed_region, source_id
+                in frame.block.protected_region_calls
+                if region_index is not None
+                and int(placed_region) == int(region_index)
+            ] if source_call_id is None else [
+                (frame, int(source_call_id))
+                for frame in reversed(self.native_try_frames)
+                if frame.phase == "body"
+                and int(source_call_id) in frame.block.protected_marker_calls
+            ]
+        )
         if not selected:
             return
         if len(selected) != 1:
@@ -10036,7 +10053,7 @@ class _ControlSSABuilder(TiledObject):
         # A region with more than one protected call cannot identify which
         # call set the status after the region returns. Its source operation
         # must be split at the region boundary before dispatch is valid.
-        if sum(
+        if region_index is not None and sum(
             int(placed_region) == int(region_index)
             for placed_region, _source in frame.block.protected_region_calls
         ) != 1:
@@ -11424,6 +11441,8 @@ class _ControlSSABuilder(TiledObject):
         return site
 
     def branch(self, target: BasicBlock) -> None:
+        if self.current.name in self._dead_control_blocks:
+            return
         self.emit(
             Handler.Br,
             [],
@@ -11437,6 +11456,8 @@ class _ControlSSABuilder(TiledObject):
         if_true: BasicBlock,
         if_false: BasicBlock,
     ) -> None:
+        if self.current.name in self._dead_control_blocks:
+            return
         self.emit(
             Handler.CondBr,
             [condition],
@@ -12120,6 +12141,8 @@ class _ControlSSABuilder(TiledObject):
         )
 
     def lower(self, block: ControlBlock, *, path: str = "root") -> None:
+        if self.current.name in self._dead_control_blocks:
+            return
         if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
             print(
                 f"DEBUG-LOWER fn={self.function_name} path={path} "
@@ -12353,7 +12376,7 @@ class _ControlSSABuilder(TiledObject):
             placed_calls = tuple(
                 int(source_id)
                 for _region, source_id in block.protected_region_calls
-            )
+            ) + tuple(map(int, block.protected_marker_calls))
             if (
                 len(placed_calls) != len(set(placed_calls))
                 or set(placed_calls) != set(block.protected_call_node_ids)
@@ -12361,9 +12384,10 @@ class _ControlSSABuilder(TiledObject):
                 self.shortfalls.append(SSALoweringShortfall(
                     "control", "native-try", path,
                     "protected call sources disagree with their exact "
-                    f"scheduled regions: try={block.source_try_node_id}, "
+                    f"scheduled regions or call markers: try={block.source_try_node_id}, "
                     f"calls={block.protected_call_node_ids!r}, "
-                    f"placements={block.protected_region_calls!r}",
+                    f"placements={block.protected_region_calls!r}, "
+                    f"markers={block.protected_marker_calls!r}",
                 ))
             for source_call_id in block.protected_call_node_ids:
                 transfer = (
@@ -12918,6 +12942,12 @@ class _ControlSSABuilder(TiledObject):
             # the latch silently reused the old value.  A literal predicate
             # has one control edge, including when its edge is exceptional.
             literal_predicate = block.predicate_expression
+            literal_failure = (
+                literal_predicate is not None
+                and literal_predicate.op == "const"
+                and isinstance(literal_predicate.literal, bool)
+                and bool(literal_predicate.literal) != bool(block.expect_true)
+            )
             if (
                 literal_predicate is not None
                 and literal_predicate.op == "const"
@@ -12943,6 +12973,8 @@ class _ControlSSABuilder(TiledObject):
                     "exception_transfer_cell": transfer_cell,
                 })
                 self.current = passed
+                if literal_failure:
+                    self._dead_control_blocks.add(passed.name)
                 return
             self.emit(
                 Handler.Call, [], attributes={
@@ -12961,6 +12993,8 @@ class _ControlSSABuilder(TiledObject):
                 self._fault_exit = self.new_block("validation_fault_exit")
             self.branch(self._fault_exit)
             self.current = passed
+            if literal_failure:
+                self._dead_control_blocks.add(passed.name)
             return
         if isinstance(block, SequenceMutationBlock):
             self.lower_sequence_mutation(block.mutation, path=path)
@@ -27398,6 +27432,13 @@ def _schedule_loop_callsites(
                 discover_arm_callsites(block.orelse)
         elif isinstance(block, (LoopBlock, WhileBlock)):
             discover_arm_callsites(block.body)
+        elif isinstance(block, NativeTryBlock):
+            discover_arm_callsites(block.body)
+            for handler in block.handlers:
+                discover_arm_callsites(handler.body)
+            if block.orelse is not None:
+                discover_arm_callsites(block.orelse)
+            discover_arm_callsites(block.finalbody)
         elif isinstance(block, CallBlock):
             discover_arm_callsites(block.callee)
         elif isinstance(block, StateMachineTick):
@@ -27429,6 +27470,17 @@ def _schedule_loop_callsites(
             if isinstance(block, WhileBlock):
                 discover_placed(block.condition)
             discover_placed(block.body)
+        elif isinstance(block, NativeTryBlock):
+            # A linked call scheduled in an authored Try body is already
+            # placed there. Missing this arm made the loop scheduler emit a
+            # second marker after the Try, where its failure bypassed the
+            # handler and the caller reported the callee's raw status.
+            discover_placed(block.body)
+            for handler in block.handlers:
+                discover_placed(handler.body)
+            if block.orelse is not None:
+                discover_placed(block.orelse)
+            discover_placed(block.finalbody)
         elif isinstance(block, CallBlock):
             discover_placed(block.callee)
         elif isinstance(block, StateMachineTick):

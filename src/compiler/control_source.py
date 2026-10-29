@@ -574,6 +574,9 @@ class NativeTryBlock(TiledObject):
     # (region_index, source_call_node_id) is a view of source graph
     # membership, not a new matching heuristic in SSA.
     protected_region_calls: tuple[tuple[int, int], ...] = ()
+    # Linked PlanCall markers placed in this body by the lexical scheduler.
+    # These calls have source transfers but no numerical region marker.
+    protected_marker_calls: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1365,7 +1368,10 @@ def _describe_control_block(
                 tuple(handler.exception_type_identities),
             )
             for handler in block.handlers
-        ) + (tuple(block.protected_region_calls),)
+        ) + (
+            tuple(block.protected_marker_calls),
+            tuple(block.protected_region_calls),
+        )
     elif isinstance(block, ValidationBlock):
         owner = cell(
             block.source_raise_node_id

@@ -21,7 +21,7 @@ def root(x: float, n: int) -> int:
 
 SOURCE_CALL = """\
 def fail_if_zero(x: int) -> int:
-    if x == 0:
+    if x == 2:
         raise ValueError("bad")
     return x
 
@@ -139,4 +139,58 @@ def test_standalone_helper_raise_has_concorded_transfer(
 
     execute(1)
     with pytest.raises(NativeValueError):
-        execute(0)
+        execute(2)
+
+
+@pytest.mark.parametrize("backend", ("c", "llvm"))
+def test_protected_helper_raise_reaches_caller_handler(
+    backend: str, tmp_path: Path,
+) -> None:
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.identity_concordance import CorrelationTable
+    from src.compiler.native_faults import NativeTypeError
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+    from src.compiler.ssa_llvm_backend import (
+        compile_artifact, emit_ssa_function_to_llvm,
+        prepare_artifact_execution,
+    )
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        SOURCE_CALL, "root", name=f"native_try_helper_call_{backend}",
+        extraction_contract="extraction_contracts/program_extraction.yaml",
+        progress=lambda _message: None,
+    )
+    assert CorrelationTable.build(module).findings(module) == []
+    function = module.functions[exports[0]]
+    parameter = dict(function.metadata["parameter_names"])["n"]
+    output = next(
+        int(instruction.args[0].id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+    )
+    if backend == "c":
+        artifact = emit_ssa_to_c(module, exports[0])
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "native")
+
+        def execute(value: int):
+            return artifact.prepare_execution({
+                parameter: np.array([value]),
+            }).run()
+
+    else:
+        artifact = emit_ssa_function_to_llvm(module, exports[0])
+        assert artifact.complete, artifact.shortfalls
+        artifact = compile_artifact(artifact, directory=tmp_path / "llvm")
+
+        def execute(value: int):
+            return prepare_artifact_execution(artifact, {
+                parameter: np.array([value]),
+            }).run()
+
+    assert execute(0).buffers[output].reshape(-1).tolist() == [0]
+    assert execute(1).buffers[output].reshape(-1).tolist() == [0]
+    assert execute(2).buffers[output].reshape(-1).tolist() == [1]
+    with pytest.raises(NativeTypeError):
+        execute(3)
