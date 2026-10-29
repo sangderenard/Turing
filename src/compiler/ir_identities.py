@@ -512,9 +512,11 @@ TRANSCENDENTAL_OPS = frozenset({
 class SignalCoreRoute:
     """One row of ``TRANSCENDENTAL_SIGNAL_CORES``: how an op reaches its core.
 
-    The pass calls ``getattr(emitter, method)(*leading, *operands,
-    **dict(keywords))`` with the op's float64 operands.  The cores on the
-    emitter answer in three shapes, and the pass reads each one:
+    ``method`` names a ``WideExpansionEmitter`` method, called as
+    ``method(*leading, *operands, **dict(keywords))`` with the op's float64
+    operands, or is a function ``method(emitter, instruction)`` for a core
+    that reads the op's own record (``Pow``'s operator/``math.pow`` form).
+    The cores answer in three shapes, and the pass reads each one:
 
     * an expansion (a list of limbs, high first) -- collapsed to one double;
     * ``(value, faults)`` -- ``value`` a double or an expansion, ``faults``
@@ -522,57 +524,109 @@ class SignalCoreRoute:
       true exactly where Python raises, the ``native_faults`` code it
       reports, and the failure's name;
     * ``(value, predicate)`` -- one bare ``bool`` predicate, reported as
-      this row's ``fault`` (a ``(code, name)`` pair).  A row whose fault
-      code does not exist yet names why in ``unwired`` instead: the
-      predicate is left unguarded (the value there is the core's NaN, as
-      the host libm returned before) and the receipt lists it under
-      ``unwired_faults``.
+      this row's ``fault`` (a ``(code, name)`` pair).
 
     A predicate of ``None`` is a fault the core proves cannot happen.
     """
 
-    method: str
+    method: object
     leading: tuple = ()
     keywords: tuple = ()
     fault: tuple | None = None
-    unwired: str = ""
 
 
-#: ``sin``/``cos``/``tan`` of +-inf: Python raises ``ValueError('math domain
-#: error')``; the math-domain fault code lands with PR #1147.
-_CIRCULAR_UNWIRED = (
-    "math.sin/cos/tan(+-inf) raises ValueError in Python; no math-domain "
-    "native_faults code exists yet (PR #1147 adds it), so the core's NaN "
-    "is returned unguarded"
-)
+def _exp_signal_core(emitter, instruction):
+    """``math.exp``: the full-range core, plus Python's ``OverflowError``.
+
+    The predicate is read from the limbs the core returned
+    (``exp_overflow_predicate``), so the fault and the value agree at the
+    last finite binade (709.782712893384 finite, 709.7827128933841 raises).
+    """
+
+    from .native_faults import FLOAT_MATH_RANGE
+
+    source = emitter.expanded(instruction.args[0], 2)
+    result = emitter.exp_expansion(source, 2)
+    return result, ((
+        emitter.exp_overflow_predicate(source, result),
+        FLOAT_MATH_RANGE, "math_exp_overflow",
+    ),)
 
 
-#: SSA op -> its signal core.  One row per op, added as each core lands on
-#: ``WideExpansionEmitter`` (``atan``/``tanh``/``Pow`` with PR #1147, e.g.
-#: ``"atan": SignalCoreRoute("atan_expansion")``).  ``exp_expansion``/
-#: ``log_expansion`` are not routed: their binade and scale are host
-#: ``Log``/``Pow`` calls, and they return NaN or 0 at the edges of the
-#: double range.  ``sin``/``cos`` hold c22 on all three lanes (Fortran's
-#: 1e-6 sine table was 4.8e-8 off there).
+def _log_signal_core(emitter, instruction):
+    """``math.log``: the full-range core; ``x <= 0`` raises ``ValueError``."""
+
+    from .native_faults import FLOAT_MATH_DOMAIN
+
+    source = emitter.expanded(instruction.args[0], 2)
+    return emitter.log_expansion(source, 2), ((
+        emitter.log_domain_predicate(source),
+        FLOAT_MATH_DOMAIN, "math_log_domain",
+    ),)
+
+
+def _pow_signal_core(emitter, instruction):
+    """``x ** y`` or ``math.pow(x, y)``, by the record that wrote the op.
+
+    The planner spells both ``Pow``; Python faults them differently
+    (``0.0 ** -1`` is ``ZeroDivisionError``, ``math.pow(0.0, -1)`` is
+    ``ValueError``), and ``pow_expansion`` returns the rows for the form it
+    is told.  The extraction contract names ``math.pow`` on the call; the
+    operator carries ``source_type`` ``BinOp``.  Neither is a refusal by
+    name rather than a guessed form.
+    """
+
+    attributes = instruction.attributes or {}
+    contract = attributes.get("extraction_contract") or {}
+    identity = (
+        contract.get("identity") if isinstance(contract, Mapping) else None
+    )
+    if identity == "math.pow":
+        form = "math"
+    elif attributes.get("source_type") == "BinOp":
+        form = "operator"
+    else:
+        raise ValueError(
+            "float Pow carries neither a math.pow extraction contract nor "
+            f"an operator source_type ({dict(attributes)!r}); its Python "
+            "faults cannot be chosen"
+        )
+    return emitter.pow_expansion(*instruction.args, 2, form=form)
+
+
+def _circular_route(name: str) -> SignalCoreRoute:
+    from .native_faults import FLOAT_MATH_DOMAIN
+
+    # sin/cos/tan(+-inf): Python raises ValueError('math domain error').
+    return SignalCoreRoute(
+        "circular_double", (name,),
+        fault=(FLOAT_MATH_DOMAIN, f"math_{name}_infinite"),
+    )
+
+
+#: SSA op -> its signal core, for ``transcendentals: signal_cores``.  Every
+#: other op in ``TRANSCENDENTAL_OPS`` (``asin``, ``acos``, ``sinh``,
+#: ``cosh``) has no core yet and is refused by name under that policy.
+#: c22, c913-c915 and c925 hold these on C, LLVM and Fortran.
 TRANSCENDENTAL_SIGNAL_CORES: dict[str, SignalCoreRoute] = {
-    "sin": SignalCoreRoute(
-        "circular_double", ("sin",), unwired=_CIRCULAR_UNWIRED,
-    ),
-    "cos": SignalCoreRoute(
-        "circular_double", ("cos",), unwired=_CIRCULAR_UNWIRED,
-    ),
-    "tan": SignalCoreRoute(
-        "circular_double", ("tan",), unwired=_CIRCULAR_UNWIRED,
-    ),
+    "Exp": SignalCoreRoute(_exp_signal_core),
+    "Log": SignalCoreRoute(_log_signal_core),
+    "Pow": SignalCoreRoute(_pow_signal_core),
+    "sin": _circular_route("sin"),
+    "cos": _circular_route("cos"),
+    "tan": _circular_route("tan"),
+    "atan": SignalCoreRoute("atan_expansion"),
+    "atan2": SignalCoreRoute("atan2_expansion"),
+    "tanh": SignalCoreRoute("tanh_expansion"),
 }
 
-_FLOAT64_SPELLINGS = frozenset({"float64", "float", "double", "f64"})
+_TRANSCENDENTAL_FLOAT64 = frozenset({"float64", "float", "double", "f64"})
 
 
 def _scalar_float64(value) -> bool:
     return (
         value is not None
-        and str(value.dtype or "").casefold() in _FLOAT64_SPELLINGS
+        and str(value.dtype or "").casefold() in _TRANSCENDENTAL_FLOAT64
         and not tuple(value.shape or ())
     )
 
@@ -591,10 +645,16 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
     method's instructions, in place, so C, LLVM and Fortran all compile the
     same exact primitive ops (Add/Sub/Mul/Div/Fma/Floor/compare/Select).
 
-    Python's raising outcomes are named faults: each predicate the method
+    Python's raising outcomes are named faults: each predicate the core
     returns is guarded with ``CondBr`` to a ``turing_validation_error``
-    block, as ``reduce_integer_pow`` guards its own.  An op with no row yet
-    is left as it is and named in the receipt (``left_native``).
+    block, as ``reduce_integer_pow`` guards its own.  A scalar
+    transcendental with no core is refused by name: under ``signal_cores``
+    it is never left on host math.
+
+    ``backend_intrinsic`` (the ``compute`` mode) rewrites nothing: each
+    backend spells the op with its own math library (C libm, ``llvm.*`` or
+    libm calls, gfortran intrinsics).  The receipt names those ops
+    (``left_native``).
     """
 
     from .concordance_declarations import (
@@ -606,19 +666,28 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
     from ..transmogrifier.ssa import BasicBlock
 
     policy = transcendental_policy(mode)
-    receipt = {
-        "policy": policy, "lowered": {}, "left_native": {},
-        "unwired_faults": {},
-    }
+    receipt = {"policy": policy, "lowered": {}, "left_native": {}}
     flavor = active_two_product_flavor()
 
-    def routed(instruction) -> bool:
+    def scalar(instruction) -> bool:
         return (
-            str(instruction.op) in TRANSCENDENTAL_SIGNAL_CORES
+            str(instruction.op) in TRANSCENDENTAL_OPS
             and _scalar_float64(instruction.res)
             and bool(instruction.args)
             and all(_scalar_float64(value) for value in instruction.args)
         )
+
+    def routed(instruction) -> bool:
+        if policy != "signal_cores" or not scalar(instruction):
+            return False
+        if str(instruction.op) not in TRANSCENDENTAL_SIGNAL_CORES:
+            raise ValueError(
+                f"scalar float {instruction.op} has no signal core; the "
+                "numeric contract's transcendentals is 'signal_cores', "
+                "which never leaves a math function on the host library "
+                "(numeric mode 'compute' selects backend_intrinsic)"
+            )
+        return True
 
     def rewrite(function, block_name: str, index: int) -> None:
         block = function.blocks[block_name]
@@ -632,8 +701,11 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
         emitter = WideExpansionEmitter(
             function, emitted, two_product_flavor=flavor,
         )
-        answer = getattr(emitter, method)(
-            *row.leading, *call.args, **dict(row.keywords)
+        answer = (
+            method(emitter, call) if callable(method)
+            else getattr(emitter, method)(
+                *row.leading, *call.args, **dict(row.keywords)
+            )
         )
         faults = ()
         if isinstance(answer, tuple):
@@ -650,12 +722,6 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
             emitter.lead(list(answer)) if isinstance(answer, (list, tuple))
             else answer
         )
-        if isinstance(faults, SSAValue) and row.fault is None and row.unwired:
-            unwired = receipt["unwired_faults"].setdefault(
-                str(function.name), {},
-            )
-            unwired[op] = row.unwired
-            faults = ()
         if isinstance(faults, SSAValue):
             if row.fault is None:
                 raise ValueError(
@@ -791,9 +857,6 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
                 "policy": policy,
                 "lowered": dict(receipt["lowered"].get(str(function.name), {})),
                 "left_native": tuple(left),
-                "unwired_faults": dict(
-                    receipt["unwired_faults"].get(str(function.name), {})
-                ),
             }
     return receipt
 

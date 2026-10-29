@@ -978,7 +978,7 @@ class _FunctionEmitter:
         callee_inout_pairs: Mapping[
             str, Sequence[tuple[int, int]]
         ] | None = None,
-        trig_solver: str = "lut",
+        trig_solver: str = "intrinsic",
         array_base_ids: Sequence[int] = (),
         mutated_base_ids: Sequence[int] = (),
         dynamic_array_ranks: Mapping[int, int] | None = None,
@@ -992,10 +992,16 @@ class _FunctionEmitter:
         release_heap_owners: bool = False,
         dynamic_extent_aliases: Mapping[int, int] | None = None,
     ):
-        if str(trig_solver) not in {"lut", "continuous"}:
+        # ``intrinsic`` (the default) spells sin/cos with gfortran's own
+        # SIN/COS, as every other transcendental is: the 1e-6 ``lut`` matched
+        # math.sin on 0% of arguments (c22 came back 4.8e-8 off) and
+        # ``continuous`` is a 7e-10 series, so neither is a backend
+        # intrinsic a ``compute`` contract may stand on.  Both stay
+        # available by name.
+        if str(trig_solver) not in {"intrinsic", "lut", "continuous"}:
             raise ValueError(
-                f"unknown trig solver {trig_solver!r}; expected 'lut' or "
-                "'continuous'"
+                f"unknown trig solver {trig_solver!r}; expected 'intrinsic', "
+                "'lut' or 'continuous'"
             )
         self.trig_solver = str(trig_solver)
         self.uses_sin_table = False
@@ -4750,7 +4756,10 @@ class _FunctionEmitter:
             comparator = "==" if op in ("equal", "Eq") else "/="
             return f"({args[0]} {comparator} {args[1]})"
 
-        if op.casefold() in {"sin", "cos"} and len(args) == 1:
+        if (
+            op.casefold() in {"sin", "cos"} and len(args) == 1
+            and self.trig_solver != "intrinsic"
+        ):
             from .bounded_constants import materialize_pi
 
             shift = (
@@ -6026,7 +6035,7 @@ def emit_function(
     callee_inout_pairs: Mapping[
         str, Sequence[tuple[int, int]]
     ] | None = None,
-    trig_solver: str = "lut",
+    trig_solver: str = "intrinsic",
     array_base_ids: Sequence[int] = (),
     mutated_base_ids: Sequence[int] = (),
     dynamic_array_ranks: Mapping[int, int] | None = None,
@@ -6261,7 +6270,7 @@ def emit_module(
     dtype: str = DEFAULT_DTYPE,
     outputs: Mapping[str, Sequence[SSAValue]] | None = None,
     extra_roots: Sequence[str] = (),
-    trig_solver: str = "lut",
+    trig_solver: str = "intrinsic",
     progress: "Callable[[str], None] | None" = None,
 ) -> FortranModule:
     """Translate an SSA module into one Fortran module.

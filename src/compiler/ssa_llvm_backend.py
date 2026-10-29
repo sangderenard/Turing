@@ -45,6 +45,7 @@ _BINARY: dict[str, str] = {
         "{out} = fadd double {out}.rem, {out}.adjust"
     ),
     "Pow": "{out} = call double @llvm.pow.f64(double {0}, double {1})",
+    "Atan2": "{out} = call double @atan2(double {0}, double {1})",
     "FloorDiv": (
         "{out}.q = fdiv double {0}, {1}\n"
         "{out} = call double @llvm.floor.f64(double {out}.q)"
@@ -85,6 +86,18 @@ _UNARY: dict[str, str] = {
     # No LLVM intrinsic exists for tanh; it is the same libm call the C
     # backend makes, declared from this template like the intrinsics are.
     "Tanh": "{out} = call double @tanh(double {0})",
+    # The same for the rest of ``math``'s scalar functions: a ``compute``
+    # contract
+    # (``transcendentals: backend_intrinsic``) spells them as the libm calls
+    # the C backend makes; ``atan``/``asin`` were refused here ("operation
+    # has no repository LLVM emission").  Under ``signal_cores`` none of
+    # these reaches the backend (``lower_transcendentals_to_signal_cores``).
+    "Tan": "{out} = call double @tan(double {0})",
+    "Asin": "{out} = call double @asin(double {0})",
+    "Acos": "{out} = call double @acos(double {0})",
+    "Atan": "{out} = call double @atan(double {0})",
+    "Sinh": "{out} = call double @sinh(double {0})",
+    "Cosh": "{out} = call double @cosh(double {0})",
     "Floor": "{out} = call double @llvm.floor.f64(double {0})",
     "Ceil": "{out} = call double @llvm.ceil.f64(double {0})",
     "Trunc": "{out} = call double @llvm.trunc.f64(double {0})",
