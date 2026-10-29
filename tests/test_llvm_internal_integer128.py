@@ -33,7 +33,12 @@ def test_internal_signed128_add_keeps_full_uint64_and_signed_domain(reverse, tmp
     artifact = emit_ssa_function_to_llvm(module, root)
     assert artifact.complete, artifact.shortfalls
     assert "zext i64" in artifact.llvm_ir and "sext i64" in artifact.llvm_ir
-    assert "add i128" in artifact.llvm_ir
+    # The sum is computed in i128: plain, or overflow-checked as Python int
+    # arithmetic no interval bounds (``python_int_overflow_checked``).
+    assert (
+        "add i128" in artifact.llvm_ir
+        or "@llvm.sadd.with.overflow.i128(" in artifact.llvm_ir
+    )
     native = compile_artifact(artifact, directory=tmp_path)
     arguments = module.functions[root].args
     feeds = {value.id: np.zeros(1, dtype=value.dtype) for value in arguments}
