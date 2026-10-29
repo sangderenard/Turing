@@ -1184,6 +1184,12 @@ def integer_narrowing_c_check(
     low, high = bounds
 
     def literal(bound: int) -> str:
+        # ``INT64_C(-9223372036854775808)`` is the negation of a constant
+        # too large for ``long``: GCC types it unsigned, so the bound read
+        # +2**63 and every int128 -> int64 narrowing reported overflow.
+        # That one bound is spelled ``-INT64_C(2**63 - 1) - 1``.
+        if bound == -(1 << 63):
+            return f"(({c_type})(-INT64_C({(1 << 63) - 1}) - 1))"
         if -(1 << 63) <= bound < (1 << 63):
             return f"(({c_type})INT64_C({bound}))"
         if 0 <= bound < (1 << 64):
