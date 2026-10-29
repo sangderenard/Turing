@@ -7972,6 +7972,17 @@ def emit_ssa_function_to_llvm(
                    for v in (*i.args, *((i.res,) if i.res is not None else ())))))
         or any(str(i.op) == "Alloca" or i.attributes.get("native_heap_abi")
                for b in module.functions[function_name].blocks.values() for i in b.instrs)
+        # The repository emitter owns the native validation ABI. A one-block
+        # status-take program still uses that emitter; the legacy leaf path
+        # otherwise asks the handwritten tensor-kernel table for a runtime
+        # symbol that is provided by turing_validation_runtime.c.
+        or any(
+            i.op in {"Call", "call"}
+            and i.attributes.get("callee") in {
+                "turing_validation_error", "turing_validation_error_take",
+            }
+            for b in function.blocks.values() for i in b.instrs
+        )
     ):
         artifact = _emit_repository_call_module(
             module,

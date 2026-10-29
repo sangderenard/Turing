@@ -5572,6 +5572,11 @@ def emit_ssa_module_to_c(
                             "(int64_t)turing_validation_error_take();"
                         )
                         expressions[status_id] = f"t{status_id}"
+                        # Program: report code 97, take it, return the taken
+                        # value. The local t100 had no address, so Ret's
+                        # output publication left the caller's slot at 0.
+                        # A taken status is a scalar value with an address.
+                        addresses[status_id] = f"&t{status_id}"
                         integer_ids.add(status_id)
                         continue
                     if callee == "turing_validation_error":
