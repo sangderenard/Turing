@@ -75,6 +75,8 @@ def root(x: float) -> int:
         try_fact = book.page(CONTROL_BLOCK).latest(try_blocks[0])
         assert len(try_fact.carried) == 2
         assert try_fact.carried[1].page == SOURCE_EXCEPTION_CONTINUATION_PHI
+        assert len(try_fact.sites) == 1
+        assert try_fact.sites[0].page == SOURCE_EXCEPTION_TRANSFER
         source_module = SimpleNamespace(metadata={"identity_book": book})
         for check in (
             CorrelationTable._source_exception_site_state_findings,
@@ -221,6 +223,19 @@ def root(x: int) -> int:
             len(fact.declarations) == 1
             and fact.declarations[0][1] is not None
             for fact in classes
+        )
+        try_facts = tuple(
+            book.page(CONTROL_BLOCK).latest(row)
+            for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        assert len(try_facts) == 2
+        # Each authored ``raise E(...)`` has a fallible constructor Call and
+        # a subsequent Raise; both sites have their own transfer cell.
+        assert sorted(len(fact.sites) for fact in try_facts) == [2, 2]
+        assert all(
+            site.page == SOURCE_EXCEPTION_TRANSFER
+            for fact in try_facts for site in fact.sites
         )
     finally:
         end_identity_book(token)

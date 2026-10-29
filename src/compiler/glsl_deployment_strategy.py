@@ -13461,7 +13461,9 @@ def _source_try_control_programs(
         CANONICAL_VALUE, CONTROL_PROGRAM_BUILD,
         SOURCE_EXCEPTION_CONTINUATION_PHI,
         SOURCE_EXCEPTION_HANDLER_CLASS,
+        SOURCE_EXCEPTION_TRANSFER,
         ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
+        ExceptionTransferFact,
     )
     from .control_source import (
         NativeExceptionHandler, NativeTryBlock, post_control_program,
@@ -13650,12 +13652,33 @@ def _source_try_control_programs(
                     f"Try continuation Phi has no fact cell: {row!r}"
                 )
             continuation_cells.append(continuation_cell)
+        protected_transfers = []
+        transfer_page = book.page(SOURCE_EXCEPTION_TRANSFER)
+        for row in transfer_page.rows():
+            transfer = transfer_page.latest(row)
+            if not isinstance(transfer, ExceptionTransferFact) or (
+                transfer.catch_try is None
+                or int(transfer.catch_try.row[1]) != id(expression)
+            ):
+                continue
+            if canonical_from_source(transfer.catch_try) != int(try_id):
+                raise ValueError(
+                    "source exception transfer disagrees with Try control "
+                    f"owner: try={try_id}, transfer={row!r}"
+                )
+            transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+            if transfer_cell is None:
+                raise ValueError(
+                    f"source exception transfer has no fact cell: {row!r}"
+                )
+            protected_transfers.append(transfer_cell)
         program = ControlProgram(
             NativeTryBlock(
                 arm_body(("body", 0)), tuple(handlers),
                 arm_body(("orelse", 0)) if expression.orelse else None,
                 arm_body(("finalbody", 0)), int(try_id),
                 continuation_phi_cells=tuple(continuation_cells),
+                protected_transfer_cells=tuple(protected_transfers),
             ),
             region_indices=regions,
         )

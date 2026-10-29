@@ -2794,7 +2794,8 @@ class ControlBlockFact:
     ``predicate``: the predicate value's node cell; ``carried``: the
     carried-alias cells (``control_carried_field`` cells when the block
     carries them, else the carried values' node cells); ``sites``: the
-    break / continue / return site cells; ``regions``: the
+    break / continue / return site cells or a native Try's exact exceptional
+    transfer cells; ``regions``: the
     ``deployment_region`` cells a marker names (empty for a block whose
     region membership is placement, not identity); ``callsite``: the call's
     ``call_binding`` cell; ``extra``: the non-identity payload (``expect_true``,

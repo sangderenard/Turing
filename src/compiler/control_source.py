@@ -565,6 +565,9 @@ class NativeTryBlock(TiledObject):
     # The reducer's exact post-Try value joins. Lowering reads each fact's
     # arm binding cells; it must not rebuild an arm from a final environment.
     continuation_phi_cells: tuple[Any, ...] = ()
+    # Exact source transfers whose nearest eligible body is this Try.
+    # Matching and any unwind path still require executable SSA edges.
+    protected_transfer_cells: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1239,6 +1242,10 @@ def _describe_control_block(
             for value_id in handler.exception_type_value_ids
         ), *(item for item in block.continuation_phi_cells
              if isinstance(item, Ref)))
+        sites = tuple(
+            item for item in block.protected_transfer_cells
+            if isinstance(item, Ref)
+        )
         extra = tuple(
             int(handler.source_handler_node_id)
             for handler in block.handlers

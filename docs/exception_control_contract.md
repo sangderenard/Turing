@@ -100,6 +100,9 @@ fact before the admission refusal. Its region markers have exact arm
 membership, and handler class values follow ingestion-to-canonical edges
 into the forked shell. The control block also cites each exact
 `SOURCE_EXCEPTION_CONTINUATION_PHI` fact for its post-Try value joins.
+It cites each `SOURCE_EXCEPTION_TRANSFER` whose source catch owner maps to
+that same forked Try. An authored `raise E(...)` contributes a constructor
+Call site and a subsequent Raise site when both are fallible.
 The block is not yet in the executable overlay, and
 the SSA lowerer has no branch for it. Folded assignments with no deployment
 region, call placement, and pending outcomes still need control ownership;
