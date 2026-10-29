@@ -30697,7 +30697,9 @@ def _class_surface_ssa_program(
         }
         dynamic_sequence_ids = tuple(sorted(dynamic_sequence_ids))
         from types import SimpleNamespace as _GraphView
-        from .glsl_deployment_strategy import _planned_scalar_dtypes
+        from .glsl_deployment_strategy import (
+            _planned_scalar_dtypes, _returned_list_slot_leaves,
+        )
         planned_sequence_elements = _planned_scalar_dtypes(
             _GraphView(G=graph_obj)
         )
@@ -30918,6 +30920,38 @@ def _class_surface_ssa_program(
                     **_sequence_column_dtype_contracts(
                         graph_obj, sequence_declarations
                     ),
+                    # Program: Token Orchard ``cover``: ``return STATUS_OK,
+                    # [token]`` beside ``return STATUS_OK, list(
+                    # self.cover_tokens[b : e])`` over ``array("Q")``.
+                    # Wrong record: the display was declared with no row
+                    # class and its append of the int64 ``token`` settled
+                    # int64 rows, against the slot's uint64 arena.  Rule: a
+                    # returned display whose rows the planner settled by
+                    # proven range to the slot's class (a class none of its
+                    # members has) is declared with it at birth; its append
+                    # then stores each proven member through the row
+                    # writer's checked conversion.
+                    **{
+                        int(leaf_id): (planned,)
+                        for slot in _returned_list_slot_leaves(graph_obj)
+                        for leaf_id, displayed in slot
+                        if displayed
+                        and any(
+                            int(sequence_id) == int(leaf_id)
+                            and int(column_count) == 1
+                            for sequence_id, _policy, column_count, _writable
+                            in sequence_declarations
+                        )
+                        for planned in (
+                            planned_sequence_elements.get(int(leaf_id)),
+                        )
+                        if planned in {"int64", "uint64"}
+                        and all(
+                            planned_sequence_elements.get(int(item))
+                            not in {None, planned}
+                            for item in displayed
+                        )
+                    },
                     **nested_descriptor_sequence_dtypes,
                 },
                 sequence_record_identities=(

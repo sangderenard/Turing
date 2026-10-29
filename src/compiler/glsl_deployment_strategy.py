@@ -2622,8 +2622,154 @@ def _callee_return_scalar_dtype(
     return next(iter(kinds)), found[0]
 
 
+def _integer_domain(dtype: str) -> tuple[int, int] | None:
+    """The closed value domain of an integer (or bool) layout, else ``None``."""
+
+    from ..transmogrifier.dtype_layout import resolve as resolve_layout
+
+    layout = resolve_layout(dtype)
+    if layout is None or layout.kind not in {"int", "uint", "bool"}:
+        return None
+    if layout.kind == "bool":
+        return 0, 1
+    bits = 8 * int(layout.byte_size)
+    if layout.kind == "uint":
+        return 0, (1 << bits) - 1
+    return -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+
+
+def _join_member_classes(
+    classes: list[tuple[str | None, tuple[int, int] | None]],
+) -> str | None:
+    """One class for a returned member's sites, by proven value range.
+
+    Program: Token Orchard ``cover`` returns ``(STATUS_OK, [token])`` for an
+    atom and ``(STATUS_OK, list(self.cover_tokens[b : e]))`` over
+    ``array("Q")``.  Rule: a site whose values are proven within an interval
+    contributes that interval, not its class's whole domain; the member is
+    the narrowest class among the sites' own classes holding every site's
+    values (a token proven in ``[0, 2**64)`` beside uint64 rows is uint64).
+    A site with no proof contributes its class's domain, so ``int64`` beside
+    ``uint64`` stays their exact join, ``int128``.  ``None`` when a site has
+    no class, or no declared layout holds the join.
+    """
+
+    from ..transmogrifier.dtype_layout import (
+        common_integer_dtype, python_int_range_dtype,
+    )
+
+    if not classes or any(
+        dtype is None and interval is None for dtype, interval in classes
+    ):
+        return None
+    if all(interval is None for _dtype, interval in classes):
+        names = {str(dtype) for dtype, _interval in classes}
+        if len(names) == 1:
+            return next(iter(names))
+        # Python ints of several layouts: their exact value-domain join
+        # (``int64`` with ``uint32`` rows is ``int64``), never a guess.
+        return common_integer_dtype(tuple(sorted(names)))
+    extents = []
+    stated: set[str] = set()
+    for dtype, interval in classes:
+        if interval is not None:
+            extents.append((int(interval[0]), int(interval[1])))
+            continue
+        domain = _integer_domain(str(dtype))
+        if domain is None:
+            return None
+        extents.append(domain)
+        stated.add(str(dtype))
+    low = min(extent[0] for extent in extents)
+    high = max(extent[1] for extent in extents)
+    holding = sorted(
+        (domain[1] - domain[0], name)
+        for name in stated
+        for domain in (_integer_domain(name),)
+        if domain is not None and domain[0] <= low and high <= domain[1]
+    )
+    if holding:
+        return holding[0][1]
+    proven = python_int_range_dtype(low, high)
+    if proven is None:
+        return None
+    return common_integer_dtype((proven, *sorted(stated)))
+
+
+def _returned_list_slot_leaves(G: Any) -> list[list[tuple[int, tuple[int, ...] | None]]]:
+    """Per return slot holding lists at two or more sites, its list leaves.
+
+    Each leaf is ``(value id, displayed members or None)``: the members of a
+    list display (``[token]``, ``[]``), ``None`` for any other list (a copy,
+    a slice, a store version's birth).  Slots with a non-list site are left
+    out: their rows are not one arena.
+    """
+
+    sites = [
+        tuple(values) for values in (
+            G.graph.get("return_slot_values") or {}
+        ).values()
+        if values and not all(int(value) not in G for value in values)
+    ]
+    width = {len(values) for values in sites}
+    if len(sites) < 2 or len(width) != 1:
+        return []
+    slots = []
+    for slot in range(next(iter(width))):
+        leaves = []
+        for values in sites:
+            leaf_id = int(_indexed_store_source(G, int(values[slot])))
+            if leaf_id not in G:
+                leaves = None
+                break
+            attributes = G.nodes[leaf_id].get("attributes") or {}
+            if attributes.get("aggregate_kind") != "list":
+                leaves = None
+                break
+            leaves.append((
+                leaf_id,
+                tuple(map(int, attributes.get("aggregate_leaf_value_ids") or ()))
+                if attributes.get("producer_kind") == "aggregate" else None,
+            ))
+        if leaves:
+            slots.append(leaves)
+    return slots
+
+
+def _call_actual_classes(
+    caller: Any, call_id: int, scalar: dict[int, str],
+) -> dict[str, tuple[str | None, tuple[int, int] | None]]:
+    """Per callee formal: this call's actual's class and proven interval."""
+
+    from .call_argument_binding import (
+        _callsite_parameter_name, _method_parameter_layout,
+    )
+
+    data = caller.G.nodes.get(int(call_id), {})
+    attributes = data.get("attributes") or {}
+    reference = attributes.get("callee_ref", attributes.get("method_ref"))
+    try:
+        callee = caller.function_table.entry(int(reference)).graph.G
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return {}
+    receiver, positional, _all = _method_parameter_layout(callee)
+    classes: dict[str, tuple[str | None, tuple[int, int] | None]] = {}
+    for parent, role in data.get("parents") or ():
+        name = _callsite_parameter_name(str(role), receiver, positional)
+        if name is None or name == receiver:
+            continue
+        proven = _callsite_actual_int_range(caller, int(call_id), int(parent))
+        classes[name] = (
+            scalar.get(int(parent)),
+            None if proven is None else proven[0],
+        )
+    return classes
+
+
 def _callee_return_member_dtype(
     graph: Any, reference: int, member: int,
+    actual_classes: dict[str, tuple[str | None, tuple[int, int] | None]]
+    | None = None,
 ) -> tuple[str, str] | None:
     """The class of member ``member`` of a callee's returned tuple, or ``None``.
 
@@ -2636,7 +2782,15 @@ def _callee_return_member_dtype(
     dtype)`` when member ``member`` of every return site is a scalar of one
     class, ``("element", dtype)`` when it is a list of one element class.
     Sites that are not tuple displays, or that disagree, prove nothing.
+
+    ``actual_classes`` names, per callee formal, the class and proven
+    interval of THIS call's actual: ``return STATUS_OK, [token]`` holds this
+    call's ``token``, which the authored callee leaves unclassed.  Sites join
+    by proven range (``_join_member_classes``).
     """
+
+    from ..common.tensors.topological_reducer import _int_range_cell
+    from .identity_concordance import current_identity_book
 
     try:
         callee = graph.function_table.entry(int(reference)).graph
@@ -2650,7 +2804,37 @@ def _callee_return_member_dtype(
     dtypes = _callee_planned_dtypes(callee)
     if dtypes is None:
         return None
-    found: set[str | None] = set()
+    book = current_identity_book()
+
+    def proven_interval(value_id: int) -> tuple[int, int] | None:
+        data = callee_graph.nodes.get(int(value_id), {})
+        cell = _int_range_cell(callee, int(data.get("value_id", value_id)))
+        if cell is None:
+            attributes = data.get("attributes") or {}
+            if attributes.get("binding_kind") == "parameter":
+                actual = (actual_classes or {}).get(
+                    str(attributes.get("binding_name"))
+                )
+                return None if actual is None else actual[1]
+            return None
+        interval = book.page(cell.page).cell(cell.row, cell.column)
+        return int(interval[0]), int(interval[1])
+
+    def stated_class(value_id: int) -> str | None:
+        dtype = dtypes.get(int(value_id))
+        if dtype is not None:
+            return dtype
+        attributes = callee_graph.nodes.get(int(value_id), {}).get(
+            "attributes"
+        ) or {}
+        if attributes.get("binding_kind") == "parameter":
+            actual = (actual_classes or {}).get(
+                str(attributes.get("binding_name"))
+            )
+            return None if actual is None else actual[0]
+        return None
+
+    classes: list[tuple[str | None, tuple[int, int] | None]] = []
     kinds: set[str] = set()
     for values in site_values:
         values = tuple(values)
@@ -2686,28 +2870,44 @@ def _callee_return_member_dtype(
         if aggregate_kind is not None and aggregate_kind != "list":
             return None
         kinds.add("scalar" if aggregate_kind is None else "element")
-        if (
-            aggregate_kind == "list"
-            and dtypes.get(leaf_id) is None
+        displayed = (
+            tuple(map(int, leaf_attributes.get("aggregate_leaf_value_ids") or ()))
+            if aggregate_kind == "list"
             and leaf_attributes.get("producer_kind") == "aggregate"
-            and not leaf_attributes.get("aggregate_leaf_value_ids")
-        ):
+            else None
+        )
+        if displayed is not None and not displayed and dtypes.get(leaf_id) is None:
             # An empty display states no element class; the other sites'
             # rows are the member's (as the branch-join rule reads ``[]``).
             continue
-        found.add(dtypes.get(leaf_id))
-    if not found or None in found or len(kinds) != 1:
+        if aggregate_kind is None:
+            classes.append((stated_class(leaf_id), proven_interval(leaf_id)))
+            continue
+        if displayed:
+            # ``[token]``: the display's rows are its members' values.
+            intervals = [proven_interval(item) for item in displayed]
+            rows = [stated_class(item) for item in displayed]
+            if all(interval is not None for interval in intervals):
+                classes.append((
+                    dtypes.get(leaf_id),
+                    (
+                        min(interval[0] for interval in intervals),
+                        max(interval[1] for interval in intervals),
+                    ),
+                ))
+                continue
+            row_class = dtypes.get(leaf_id) or _join_member_classes(
+                [(row, None) for row in rows]
+            )
+            classes.append((row_class, None))
+            continue
+        classes.append((dtypes.get(leaf_id), None))
+    if len(kinds) != 1:
         return None
-    if len(found) > 1:
-        # Python ints of several proven layouts: their exact value-domain
-        # join (``int64`` with ``uint32`` rows is ``int64``), never a guess.
-        from ..transmogrifier.dtype_layout import common_integer_dtype
-
-        joined = common_integer_dtype(tuple(found))
-        if joined is None:
-            return None
-        return next(iter(kinds)), joined
-    return next(iter(kinds)), next(iter(found))
+    joined = _join_member_classes(classes)
+    if joined is None:
+        return None
+    return next(iter(kinds)), joined
 
 
 def _planned_scalar_dtypes_from(
@@ -2810,6 +3010,39 @@ def _planned_scalar_dtypes_from_graph(
             return None
         interval = range_page.cell(cell.row, cell.column)
         return python_int_range_dtype(int(interval[0]), int(interval[1]))
+
+    def member_interval(node_id):
+        data = G.nodes.get(int(node_id), {})
+        cell = _range_cell(range_scopes, int(data.get("value_id", node_id)))
+        if cell is None:
+            # A callsite copy's formal is its actual: the interval the
+            # specialization was minted for (``_callsite_actual_int_range``).
+            node_attributes = data.get("attributes") or {}
+            literal = data.get("constant", node_attributes.get("value"))
+            if (
+                operation(data) in {"const", "constant"}
+                and isinstance(literal, int) and not isinstance(literal, bool)
+            ):
+                # A literal is its own interval (a copy minted for a literal
+                # actual, ``v.cover(5)``, holds its formal as a constant).
+                return int(literal), int(literal)
+            if node_attributes.get("binding_kind") != "parameter":
+                return None
+            name = str(node_attributes.get("binding_name"))
+            literal = dict(G.graph.get("planner_specializations") or {}).get(
+                name
+            )
+            if isinstance(literal, int) and not isinstance(literal, bool):
+                # A copy minted for a literal actual (``v.cover(5)``).
+                return int(literal), int(literal)
+            interval = dict(
+                G.graph.get("planner_parameter_int_ranges") or {}
+            ).get(name)
+            return None if interval is None else (
+                int(interval[0]), int(interval[1])
+            )
+        interval = range_page.cell(cell.row, cell.column)
+        return int(interval[0]), int(interval[1])
 
     scalar: dict[int, str] = {}
     element: dict[int, str] = dict(assumed_elements or {})
@@ -4067,6 +4300,7 @@ def _planned_scalar_dtypes_from_graph(
                 member_dtype = (
                     _callee_return_member_dtype(
                         graph, int(base_reference), member_index,
+                        _call_actual_classes(graph, base[0], scalar),
                     )
                     # A method call is named by its method (``expand``); its
                     # resolved reference names the callee either way.
@@ -4345,6 +4579,50 @@ def _planned_scalar_dtypes_from_graph(
             if isinstance(expression, ast.BoolOp):
                 operands = parents(data, "value")
                 settle(scalar, node_id, join([scalar.get(o) for o in operands]))
+        # Program: Token Orchard ``cover`` returns ``(STATUS_OK, [token])``
+        # for an atom and ``(STATUS_OK, list(self.cover_tokens[b : e]))``
+        # over ``array("Q")`` from the same slot.  Wrong record: the display
+        # took its member's class (int64) and the slice copy its typecode
+        # (uint64), so the slot's one arena had two row layouts and was
+        # refused.  Rule: the slot's rows are the join of its sites by proven
+        # range (``_join_member_classes``); a display whose members are
+        # proven inside that class's domain holds rows of that class.  An
+        # unproven member keeps its class's whole domain, and the join (and
+        # any disagreement) stands.
+        for slot_leaves in _returned_list_slot_leaves(G):
+            claims = []
+            proven_displays = []
+            for leaf_id, displayed in slot_leaves:
+                if displayed is not None and not displayed:
+                    if element.get(leaf_id) is None:
+                        continue  # ``[]`` states no row class
+                intervals = [
+                    member_interval(item) for item in (displayed or ())
+                ]
+                if displayed and all(
+                    interval is not None for interval in intervals
+                ):
+                    proven = (
+                        min(interval[0] for interval in intervals),
+                        max(interval[1] for interval in intervals),
+                    )
+                    claims.append((element.get(leaf_id), proven))
+                    proven_displays.append((leaf_id, proven))
+                else:
+                    claims.append((element.get(leaf_id), None))
+            if not proven_displays or len(claims) < 2:
+                continue
+            joined = _join_member_classes(claims)
+            domain = None if joined is None else _integer_domain(joined)
+            if domain is None:
+                continue
+            for leaf_id, (low, high) in proven_displays:
+                if (
+                    element.get(leaf_id) != joined
+                    and domain[0] <= low and high <= domain[1]
+                ):
+                    element[leaf_id] = joined
+                    changed = True
         if not changed:
             if get_default_phase:
                 break
