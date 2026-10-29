@@ -6363,6 +6363,30 @@ class _ControlSSABuilder(TiledObject):
                 value.dtype = str(dtype)
                 revised = self._revise_value(value, *producer)
                 self._bind(value_id, value, BindingKind.REGION_RESULT, *producer, revised)
+            elif (
+                str(value.dtype) in self._INTEGER_WIDTH_BOUNDS
+                and str(dtype) in self._INTEGER_WIDTH_BOUNDS
+                and "bool" not in {str(value.dtype), str(dtype)}
+                and self._INTEGER_WIDTH_BOUNDS[str(value.dtype)]
+                != self._INTEGER_WIDTH_BOUNDS[str(dtype)]
+                and not tuple(value.shape or ())
+                and not self._defines(value)
+                and getattr(self._binding_fact(value_id), "kind", None) is BindingKind.LOOP_SEED
+            ):
+                # Program: ``total = 0; while ...: total = total * 7 +
+                # a[j]`` with ``a = array("Q")``.  The reserved backedge
+                # slot took its seed's width (int64) before the body ran;
+                # its producer (an int64 + uint64 add) writes int128.
+                # Wrong record: the reservation kept int64, so the Load
+                # claimed to read an int64 the region wrote as int128 and
+                # the header Phi joined widths nobody converted (LLVM
+                # refused it; C dropped the high bits).  Rule: the producer
+                # owns the definition's width; the latch converts it into
+                # the header's width explicitly
+                # (``_carried_integer_narrowing``).
+                value.dtype = str(dtype)
+                revised = self._revise_value(value, *producer)
+                self._bind(value_id, value, BindingKind.REGION_RESULT, *producer, revised)
             return value
         value = self._value_from_meta(value_id, dtype=dtype)
         self._bind(value_id, value, BindingKind.REGION_RESULT, *producer)
@@ -10651,6 +10675,49 @@ class _ControlSSABuilder(TiledObject):
                 self.current.instrs.insert(tag_phi_end, emitted_tag)
         return completed
 
+    def _carried_integer_narrowing(
+        self, update: SSAValue, header: SSAValue | None,
+    ) -> SSAValue:
+        """``update`` entering the carried header Phi's integer width.
+
+        Program: ``total = 0; while j < n: total = total * 7 + a[j]`` with
+        ``a = array("Q")``.  The header is minted from its seed (``0``:
+        int64) before the body is lowered; the body's update adds an int64
+        to a uint64, proven to fit int128, so the backedge carried an
+        int128 into an int64 Phi.  Wrong records: LLVM refused the Phi, and
+        C assigned the int128 to the int64 cell, dropping its high bits.
+        Rule: the update enters the header through an explicit integer
+        conversion in the latch, under the numeric contract's
+        ``integer_narrowing`` (``trap`` reports ``INT_OVERFLOW`` for a value
+        the header's width does not hold).  Same width, a non-integer or a
+        shaped value is returned as is.
+        """
+
+        if header is None:
+            return update
+        source, target = str(update.dtype), str(header.dtype)
+        bounds = self._INTEGER_WIDTH_BOUNDS
+        if (
+            source not in bounds or target not in bounds
+            or bounds[source] == bounds[target]
+            or "bool" in {source, target}
+            or tuple(update.shape or ()) or tuple(header.shape or ())
+        ):
+            return update
+        from .ssa_call_input_adapters import _numeric_conversion_attributes
+
+        narrowed = self.fresh_value(
+            dtype=target, transform=CONTROL_CAST, operands=(update,),
+        )
+        self.emit(
+            Handler.Cast, [update], narrowed,
+            attributes={
+                "target_dtype": target,
+                **_numeric_conversion_attributes(source, target),
+            },
+        )
+        return narrowed
+
     def _complete_loop_latch_carried(
         self,
         carried: list[tuple[int, int, SSAValue, SSAValue, SSAValue]],
@@ -10739,6 +10806,9 @@ class _ControlSSABuilder(TiledObject):
                     file=sys.stderr,
                     flush=True,
                 )
+            completed = self._carried_integer_narrowing(
+                completed, carried_phis[index].res,
+            )
             carried_phis[index].args[1] = completed
             carried_updates[index] = completed
             type_source_id = next((
