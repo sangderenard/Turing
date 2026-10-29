@@ -23208,17 +23208,15 @@ def _refuse_unlowered_stored_callable_calls(deployment: Any) -> None:
         for node_id, data in graph.nodes(data=True):
             field = _stored_callable_field_call(graph, data)
             attributes = data.get("attributes") or {}
-            indirect = attributes.get("indirect_callable_id")
-            # An indirect callable record lowers only through a callee value
-            # of THIS graph.  The reducer stamps the authored graph's callee
-            # id on the call (``Walker.poke``: ``self.notify`` read from a
-            # constructor parameter); copied into the method graph it names
-            # no node, nothing lowers the call, and the region emitted
-            # without it.
+            # A call is lowered when a lowering wrote its record: a method or
+            # callee reference, or a host callback.  ``indirect_callable_id``
+            # is the reducer's note of which value was called, and nothing
+            # lowers it (``Walker.poke``: ``self.notify`` read from a
+            # constructor parameter shipped with the call gone).
             if field is None or any(
                 attributes.get(key) is not None
                 for key in ("method_ref", "callee_ref", "host_callback_field")
-            ) or (indirect is not None and int(indirect) in graph):
+            ):
                 continue
             unlowered_field_calls.append(
                 f"{field[0]}.{graph.graph.get('function_name')}: "
