@@ -32817,6 +32817,23 @@ def lower_control_sections_to_ssa(
                         for sequence_id in sequence_ids
                         if control_sequences.by_id(sequence_id) is not None
                     })
+                # Program: ``rep = [1]; if k > 2: rep = [k, 2]``, then
+                # ``rep.append(3); sum(rep)`` (Lane D's report).  Wrong
+                # record: the conditional's merged spelling (11) claims the
+                # same column as the arena it replaces into (2), so two
+                # descriptors matched, the region got no length operand, and
+                # ``sum`` read the display's one row (12 for 42; clean
+                # audit).  Rule: descriptors of one column are one storage;
+                # the argument's own sequence is the descriptor.
+                if (
+                    len(descriptors) > 1
+                    and int(argument.id) in descriptors
+                    and len({
+                        tuple(candidate.column_value_ids)
+                        for candidate in descriptors.values()
+                    }) == 1
+                ):
+                    descriptors = {int(argument.id): descriptors[int(argument.id)]}
                 if len(descriptors) != 1:
                     continue
                 descriptor = next(iter(descriptors.values()))
