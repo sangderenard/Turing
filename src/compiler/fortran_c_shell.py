@@ -60,6 +60,7 @@ from ..transmogrifier.graph.edge_roles import (
     ordered_arguments,
     positional_argument_index,
 )
+from ..transmogrifier.graph.python_special_cases import method_receiver_formal
 from .bounded_fixed_point import BoundedFixedPoint, bound_for
 from .shell_telemetry import (
     compile_count,
@@ -7709,6 +7710,19 @@ def _annotated_parameter_record_identity(
     return identity
 
 
+def _graph_receiver_formal(graph: Any) -> str | None:
+    """The formal a method graph's receiver is bound to, as authored.
+
+    Python binds the instance (or the class, for a classmethod) to the first
+    positional parameter whatever its name; other graphs have no receiver.
+    """
+
+    if graph.graph.get("method_binding") not in {"instance", "class"}:
+        return None
+    positional = tuple(graph.graph.get("positional_parameters") or ())
+    return str(positional[0]) if positional else None
+
+
 def _reduced_initializer_list_fields(graph: Any) -> dict:
     """Read physical list fields from the reducer's existing identity rows."""
 
@@ -7736,7 +7750,7 @@ def _reduced_initializer_list_fields(graph: Any) -> dict:
                          if edge.get("role") == "object"]
             if len(receivers) != 1 or (
                 target.nodes[receivers[0]].get("attributes") or {}
-            ).get("binding_name") != "self":
+            ).get("binding_name") != _graph_receiver_formal(target):
                 continue
             sources = [source for source, _dest, edge in target.in_edges(_node_id, data=True)
                        if edge.get("role") == "value"]
@@ -7933,6 +7947,7 @@ def _authored_dataclass_record_views(
             elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 methods[statement.name] = statement
         initializer = methods.get("__init__")
+        initializer_receiver = method_receiver_formal(initializer)
         if initializer is not None:
             # ``self.scale = scale`` stores the parameter's authored
             # annotation as surely as ``self.scale: int = scale`` does, while
@@ -8001,7 +8016,7 @@ def _authored_dataclass_record_views(
                 if not (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
+                    and target.value.id == initializer_receiver
                     and receipt is not None
                 ):
                     continue
@@ -8034,7 +8049,7 @@ def _authored_dataclass_record_views(
                 if isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Attribute)
                 and isinstance(node.targets[0].value, ast.Name)
-                and node.targets[0].value.id == "self"
+                and node.targets[0].value.id == initializer_receiver
                 and (
                     (isinstance(node.value, ast.List) and not node.value.elts)
                     or (
@@ -8048,6 +8063,7 @@ def _authored_dataclass_record_views(
             }
             appended: dict[str, list[str | None]] = {}
             for method in methods.values():
+                receiver = method_receiver_formal(method)
                 parameter_classes = {
                     argument.arg: scalar_classes.get(
                         argument.annotation.id
@@ -8079,7 +8095,7 @@ def _authored_dataclass_record_views(
                         and node.func.attr in {"append", "insert"}
                         and isinstance(node.func.value, ast.Attribute)
                         and isinstance(node.func.value.value, ast.Name)
-                        and node.func.value.value.id == "self"
+                        and node.func.value.value.id == receiver
                         and node.func.value.attr in empty_list_fields
                         and node.args
                     ):
@@ -8252,6 +8268,7 @@ def _authored_dataclass_record_views(
         method = class_methods.get(class_name, {}).get(method_name)
         if method is None:
             return None
+        receiver = method_receiver_formal(method)
         direct: dict[str, bool] = {}
         nested_calls: set[str] = set()
         for node in ast.walk(method):
@@ -8259,7 +8276,7 @@ def _authored_dataclass_record_views(
                 continue
             if not (
                 isinstance(node.value, ast.Name)
-                and node.value.id in {"self", "cls"}
+                and node.value.id == receiver
             ):
                 continue
             if node.attr in class_methods.get(class_name, {}):
@@ -8291,8 +8308,9 @@ def _authored_dataclass_record_views(
             fields = method_fields(class_name, method_name)
             if fields is None or not fields:
                 continue
+            receiver = method_receiver_formal(methods[method_name])
             views[f"{class_name}.{method_name}"] = {
-                "self": {
+                receiver: {
                     "identity": class_name,
                     "fields": {
                         name: dict(class_fields[class_name][name])
@@ -8301,7 +8319,7 @@ def _authored_dataclass_record_views(
                 }
             }
             for name, mutable in fields.items():
-                views[f"{class_name}.{method_name}"]["self"]["fields"][name][
+                views[f"{class_name}.{method_name}"][receiver]["fields"][name][
                     "mutable"
                 ] = mutable
 
@@ -8315,6 +8333,7 @@ def _authored_dataclass_record_views(
     def add_annotated_parameter_views(
         qualified_name: str,
         method: ast.FunctionDef | ast.AsyncFunctionDef,
+        receiver: str | None,
     ) -> None:
         arguments = (
             *method.args.posonlyargs,
@@ -8322,7 +8341,7 @@ def _authored_dataclass_record_views(
             *method.args.kwonlyargs,
         )
         for argument in arguments:
-            if argument.arg in {"self", "cls"}:
+            if argument.arg == receiver:
                 continue
             record_name = annotation_class_name(argument.annotation)
             if record_name not in class_fields:
@@ -8374,12 +8393,13 @@ def _authored_dataclass_record_views(
 
     for statement in tree.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            add_annotated_parameter_views(statement.name, statement)
+            add_annotated_parameter_views(statement.name, statement, None)
         elif isinstance(statement, ast.ClassDef):
             for member in statement.body:
                 if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     add_annotated_parameter_views(
                         f"{statement.name}.{member.name}", member,
+                        method_receiver_formal(member),
                     )
     return views
 
@@ -10501,8 +10521,10 @@ def _field_slot_ops(
         if owner in class_table
         else (next(iter(class_table.values())) if len(class_table) == 1 else None)
     )
+    receiver = _graph_receiver_formal(graph_obj)
     declared_self_record = dict(
-        (graph_obj.graph.get("parameter_record_abi") or {}).get("self") or {}
+        (graph_obj.graph.get("parameter_record_abi") or {}).get(receiver) or {}
+        if receiver is not None else {}
     )
     declared_fields = tuple(dict(declared_self_record.get("fields") or {}))
     # Once a method receiver has a ProgramABI record, that declaration is its
@@ -10535,7 +10557,7 @@ def _field_slot_ops(
         committed_sequence_contract,
     )
     from .concordance_declarations import PLANNING_VALUE, SHELL_HANDOFF
-    self_history = identity.get("self") or ()
+    self_history = (identity.get(receiver) or ()) if receiver is not None else ()
     self_value_id = int(self_history[-1]) if self_history else None
 
     # Order field ops by SOURCE order (node id), not the data-dependency
@@ -23990,7 +24012,9 @@ def _class_surface_ssa_program(
         # deliberately read from the accepted source cell, not from a live
         # Python class or from the value's eventual dtype.
         method_owner = planned_graph.graph.get("method_owner")
-        receiver_ids = set(map(int, identities.get("self", ())))
+        receiver_ids = set(map(int, identities.get(
+            _graph_receiver_formal(planned_graph), (),
+        )))
         if method_owner is not None and receiver_ids:
             from .concordance_declarations import (
                 CLASS_FIELD_DECLARATION as _ABI_FIELD_DECLARATION,
@@ -29470,7 +29494,9 @@ def _class_surface_ssa_program(
                 )
 
         self_record_fields = dict(
-            (declared_parameter_records.get("self") or {}).get("fields") or {}
+            (declared_parameter_records.get(
+                _graph_receiver_formal(graph_obj)
+            ) or {}).get("fields") or {}
         )
         for _kind, value_id, slot in field_ops:
             if not (0 <= int(slot) < len(field_names)):
@@ -29498,7 +29524,7 @@ def _class_surface_ssa_program(
             for parameter_name in dict(
                 graph_obj.graph.get("parameter_record_abi") or {}
             )
-            if str(parameter_name) != "self"
+            if str(parameter_name) != _graph_receiver_formal(graph_obj)
         }
         record_parameter_value_ids = {
             int(value_id)
@@ -30688,6 +30714,7 @@ def _class_surface_ssa_program(
                     if value_id not in scalar_write_sources
                 )),
                 self_value_id=self_id,
+                receiver_parameter=_graph_receiver_formal(graph_obj),
                 field_ops=field_ops,
                 field_write_state_cells=tuple(
                     graph_obj.graph.get("field_write_state_cells") or ()
@@ -30701,7 +30728,7 @@ def _class_surface_ssa_program(
                     for field_name, field in dict(
                         (
                             (graph_obj.graph.get("parameter_record_abi") or {})
-                            .get("self") or {}
+                            .get(_graph_receiver_formal(graph_obj)) or {}
                         ).get("fields") or {}
                     ).items()
                     if field.get("dtype") is not None
@@ -30711,7 +30738,7 @@ def _class_surface_ssa_program(
                     for field_name, field in dict(
                         (
                             (graph_obj.graph.get("parameter_record_abi") or {})
-                            .get("self") or {}
+                            .get(_graph_receiver_formal(graph_obj)) or {}
                         ).get("fields") or {}
                     ).items()
                 },
@@ -30720,7 +30747,7 @@ def _class_surface_ssa_program(
                     for field_name, field in dict(
                         (
                             (graph_obj.graph.get("parameter_record_abi") or {})
-                            .get("self") or {}
+                            .get(_graph_receiver_formal(graph_obj)) or {}
                         ).get("fields") or {}
                     ).items()
                 },
