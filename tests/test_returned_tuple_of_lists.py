@@ -6,6 +6,10 @@ the duplicate-storage check keyed a caller's frame-leased sequence member by
 the callee frame as owner but the caller's own sequence id, so the caller's
 sequence 7 (the callee's 4) collided with the callee's sequence 7 (the
 caller's 8), and one correct binding was refused as duplicate storage.
+
+Received in a function that is itself called, the unpacked list's row kept
+its ``sequence`` storage but its accounting kept the shape row's ``span``
+default (refused as a storage disagreement); the labels now mirror the row.
 """
 
 from __future__ import annotations
@@ -33,6 +37,25 @@ def root(n: int):
     a = statuses[1]
     b = tokens[0]
     return env + a * 100 + b
+''',
+    "received_in_called_function": '''
+def batch(d, count):
+    statuses = [0] * count
+    tokens = [0] * count
+    statuses[1] = d + 1
+    tokens[0] = d + 2
+    return 0, statuses, tokens
+
+
+def one(d):
+    env, statuses, tokens = batch(d, 2)
+    a = statuses[1]
+    b = tokens[0]
+    return env + a * 100 + b
+
+
+def root(n: int):
+    return one(n) * 10 + 1
 ''',
 }
 

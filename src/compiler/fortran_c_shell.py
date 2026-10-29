@@ -61005,12 +61005,23 @@ def _class_surface_ssa_program(
                 # that concordance row are posted on the value's
                 # ``ssa_value`` row (DERIVED from the row's cell, the
                 # source above) and the accounting labels are set FROM the
-                # posted fact.
+                # posted fact.  Program: ``env, statuses = batch(d, 2)`` in a
+                # function that is itself called (string-core ``intern``
+                # after ``intern_batch``).  Wrong record: the kept
+                # ``sequence`` storage was left out of the fields mirrored
+                # here, so the ``span`` default stood in accounting over a
+                # row that says ``sequence`` (refused as a disagreement).
+                # Rule: the labels mirror the row as it now stands.
+                _now_posted = _frame_physical_fields(_function, int(_value_id))
                 _value.accounting.update(_frame_accounting_from_posted({
                     "program_abi_rank": len(_shape),
                     "program_abi_storage": _storage or "span",
                     "shape_materialized_from_concordance": True,
-                }, _shape_physical))
+                }, {
+                    **_shape_physical,
+                    **({"storage": _posted_storage} if _posted_storage else {}),
+                    **(_now_posted if isinstance(_now_posted, dict) else {}),
+                }))
             _row = (str(_function_name), int(_value_id))
             _proposed = _SSAShapeMaterializationFact(
                 _shape, _dtype, _storage, _owner,
