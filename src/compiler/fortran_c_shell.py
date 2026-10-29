@@ -14069,12 +14069,24 @@ def _member_completion_position(
     # callsite is placed), so ``Q(b=x, a=y).get() + Q(x, y).a`` (corpus
     # c428) placed its ``+`` region at its start, ahead of both calls, and
     # pulled ``get()`` before the ``__init__`` that writes what it reads.
+    # Program: ``env, s = batch(n, 2); return env * 1000 + s[0] * 100 +
+    # s[1]`` (string core ``intern`` after ``intern_batch``).  Wrong record:
+    # the ``+`` region completed at its start (``env``), ahead of the
+    # region reading ``s[1]``, so it consumed that row before it was loaded
+    # (refused: "Call reads a value defined at").  Rule: an operator
+    # executes after all its operands, so a member reading any operand
+    # expression -- a row read as well as a display or a call -- completes
+    # after that operand ends.  The operand lies inside the member's own
+    # expression, so nothing outside it moves past.
     for parent, _role in data.get("parents") or ():
         if int(parent) not in graph_obj:
             continue
         display = graph_obj.nodes[int(parent)].get("expr_obj")
         if (
-            isinstance(display, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Call))
+            isinstance(display, (
+                ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Call,
+                ast.Subscript,
+            ))
             and getattr(display, "end_lineno", None) is not None
         ):
             position = max(position, (
