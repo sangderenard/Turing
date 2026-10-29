@@ -59,3 +59,66 @@ def test_selected_return_shape_proves_exact_call_and_shape(poison):
             assert book.latest_ref(SHAPE_STATE_PAGE, (shape_scope, 3)) in sources
     finally:
         end_identity_book(token)
+
+
+_CALLABLE_ARGUMENT_SOURCE = '''
+from src.common.tensors.abstraction import AbstractTensor
+
+
+def scale(t):
+    return t * 2.0
+
+
+def advance(t):
+    return scale(t) + 0.5
+
+
+def drive(step, t):
+    return step(t)
+
+
+def root(n: float) -> float:
+    t = AbstractTensor.ones((3,)) * n
+    out = drive(advance, t)
+    return float(out.sum().item())
+'''
+
+
+def test_a_function_passed_as_an_argument_reaches_its_callees(monkeypatch):
+    # The managed tire passes ``balloon_tire_managed_advance`` to
+    # ``run_superstep``; ``vector_cross`` below it was refused for lack of
+    # reachability authority.  Both the parameter call (drive -> advance)
+    # and the reached function's own call (advance -> scale) must carry it.
+    import src.compiler.glsl_deployment_strategy as deployment
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    selected, refused = [], []
+    original_sources = deployment._callsite_return_shape_sources
+
+    def recording(caller, original, specialized, call_id, return_id, descriptor):
+        pair = (
+            caller.G.graph.get("function_name"),
+            original.G.graph.get("function_name"),
+        )
+        try:
+            sources = original_sources(
+                caller, original, specialized, call_id, return_id, descriptor,
+            )
+        except ValueError as error:
+            refused.append((pair, str(error)))
+            raise
+        selected.append(pair)
+        return sources
+
+    monkeypatch.setattr(deployment, "_callsite_return_shape_sources", recording)
+    try:
+        lower_ast_source_to_ssa(
+            _CALLABLE_ARGUMENT_SOURCE, "root", name="callable_argument",
+            extraction_contract="extraction_contracts/program_extraction.yaml",
+            progress=lambda _: None,
+        )
+    except ValueError:
+        pass  # later stops are other families; this test reads the authority
+    assert not [item for item in refused if "reachability" in item[1]]
+    assert ("drive", "advance") in selected
+    assert ("advance", "scale") in selected
