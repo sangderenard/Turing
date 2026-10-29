@@ -3609,9 +3609,26 @@ def _list_rebound_on_one_branch(graph_obj: Any, node_id: int) -> bool:
     if literal is None:
         literal = (initial_node.get("attributes") or {}).get("value")
     expression = initial_node.get("expr_obj")
-    return not (
+    empty_display = (
         isinstance(literal, list) and not literal
         or isinstance(expression, ast.List) and not expression.elts
+    )
+    if not empty_display:
+        return True
+    # Program: ``atoms = []; while ...: atoms.append(a)`` then ``if c:
+    # atoms = []; ...append...`` (string-core intern driver).  Wrong record:
+    # the initial list is an empty display, but its retained appends are its
+    # rows, so it has an element type before the copy exactly as a display
+    # with members does; the merge was refused as "bound to lists of
+    # different shapes".  Rule: an empty initial display that retained
+    # appends (or inserts/extends) grow is a typed list; only one nothing
+    # writes stays refused.
+    return any(
+        int(record.get("sequence_value_id", -1)) == int(initial)
+        and str(record.get("operator")) in {"append", "insert", "extend"}
+        for record in (
+            graph_obj.graph.get("source_sequence_mutation_records") or {}
+        ).values()
     )
 
 

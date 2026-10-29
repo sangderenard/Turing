@@ -301,6 +301,41 @@ def _source_dependency_is_not_tensor_primitive(value: Any) -> bool:
     return True
 
 
+def _entry_actual_source_classes(
+    feeds: Mapping[str, Any] | None,
+    python_bindings: Mapping[str, Any] | None,
+) -> dict[str, type]:
+    """The authored class of each entry actual, keyed by its formal.
+
+    The entry's caller is its host, and the host's actuals are the call
+    record: ``transition(self=head, ...)`` names ``self``'s class exactly as
+    an internal call edge does (``_ast_call_argument_bindings``), so source
+    pursuit follows ``self._peek`` into ``X86TensorReadHead._peek``.  Only a
+    class whose source can be read is named; a tensor, a builtin value or a
+    formal that shadows a supplied global is not.
+    """
+
+    from ..topological_reducer import _reference_has_pursuable_source
+
+    supplied = dict(python_bindings or {})
+    classes: dict[str, type] = {}
+    for name, actual in dict(feeds or {}).items():
+        if str(name) in supplied or actual is None:
+            continue
+        owner = type(actual)
+        if owner.__module__ == "builtins" or not (
+            _source_dependency_is_not_tensor_primitive(owner)
+        ):
+            continue
+        if getattr(actual, "shape", None) is not None and callable(
+            getattr(actual, "tolist", None)
+        ):
+            continue
+        if _reference_has_pursuable_source(owner):
+            classes[str(name)] = owner
+    return classes
+
+
 def _expand_python_static_bindings(
     bindings: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
@@ -1282,6 +1317,9 @@ def compile_ast_aot(
                 # authored targets still cause the exact source-pursuit
                 # activation cells consumed by deployment.
                 activation_roots=tuple(dict.fromkeys((*targets, *dependency_seeds))),
+                parent_bindings=_entry_actual_source_classes(
+                    feeds, expanded_python_bindings,
+                ),
                 tensor_code_references=tensor_code_references,
                 retain=retain,
                 progress=_report,

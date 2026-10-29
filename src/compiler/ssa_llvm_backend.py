@@ -6836,7 +6836,9 @@ class LLVMFunctionArtifact:
         if self.library_path is None:
             raise RuntimeError("artifact was not compiled")
         if self._entry is None:
-            self._library = _ctypes.CDLL(str(self.library_path))
+            from .native_residency import resident_library
+
+            self._library = resident_library(self.library_path)
             function = getattr(self._library, self.name)
             function.restype = None
             function.argtypes = [

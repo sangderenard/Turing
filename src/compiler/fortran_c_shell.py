@@ -12477,8 +12477,17 @@ def _field_slot_ops(
             )
 
     key_width_by_sequence: dict[int, int] = {}
-    for _effect_or_result, key_ids, sequence_id, *_rest in (
-        *table_lookups, *table_stores, *table_deletions
+    # Program: ``cells = {}; for i in range(n): cells[(i % 2, i)] = i``.
+    # Wrong record: a store row is (effect, key, value, sequence), but it was
+    # read like a lookup row, (result, key, sequence), so the stored VALUE id
+    # was taken as the sequence.  The two-column key never reached the dict's
+    # declaration, the table was born with one key column, and its store
+    # helper refused a call that passes two.  Rule: each row kind names its
+    # own sequence position.
+    for key_ids, sequence_id in (
+        *((key, sequence) for _result, key, sequence in table_lookups),
+        *((key, sequence) for _effect, key, _value, sequence in table_stores),
+        *((key, sequence) for _effect, key, sequence, *_rest in table_deletions),
     ):
         if sequence_id is None:
             continue
@@ -13689,6 +13698,21 @@ def _attach_graph_control_expressions(
                 for alias in (*block.carried_aliases, *guarded_results):
                     value_id = int(alias[index])
                     if value_id == int(alias[2]):
+                        continue
+                    # Program: ``atoms = []; ...; if seed % 2 == 0: atoms =
+                    # []; while ...: atoms.append(...)`` (string-core intern
+                    # driver).  Wrong record: the rebound arm's list was
+                    # carried as a scalar arm value, and a collection's
+                    # control expression is its truth test, so the arm
+                    # minted ``len(atoms) > 0`` under the list's own value
+                    # id -- the appends' storage handle became a bool.
+                    # Rule: an arm's collection is storage the conditional
+                    # carries (``carried_sequence_aliases``), never a scalar
+                    # arm expression; its truth is a predicate's reading only.
+                    if (
+                        graph_obj.nodes.get(value_id, {}).get("attributes")
+                        or {}
+                    ).get("aggregate_kind") in _TRUTHINESS_AGGREGATE_KINDS:
                         continue
                     expression = _graph_control_expression(
                         graph_obj, value_id, resident=resident,
@@ -15415,17 +15439,34 @@ def _install_lexical_sequence_mutations(
         graph.G.graph.get("source_sequence_mutation_records") or {}
     )
 
+    # Program: ``if n == 0: return d`` then ``while i < n: env, st, tk =
+    # make([seed % 3, i % 3, 1], [0, 2, 3])`` (string-core intern driver).
+    # Wrong record: the displays' births are guarded by the early return's
+    # implicit ``orelse`` and were ordered among that arm's top-level
+    # children, so they landed after the loop that holds them (in
+    # ``while_exit``) and the loop's call read rows never written there
+    # ("Call reads a value defined at while_body").  Rule: inside its guard's
+    # arm an effect is placed as at any other level -- in the innermost loop
+    # whose per-iteration lines hold it (``insert_in_enclosing_loop``).
+    arm_placement_node: list = [None]
+
+    def insert_in_arm(arm_block, mutation_block):
+        node_id = arm_placement_node[0]
+        if node_id is None or int(node_id) not in graph.G:
+            return insert_ordered(arm_block, mutation_block)
+        return insert_in_enclosing_loop(arm_block, mutation_block, int(node_id))
+
     def insert_in_conditional(block, owner_id, arm, mutation_block):
         if isinstance(block, ConditionalBlock):
             if int(block.source_node_id or -1) == int(owner_id):
                 if str(arm) == "body":
                     return replace(
                         block,
-                        body=insert_ordered(block.body, mutation_block),
+                        body=insert_in_arm(block.body, mutation_block),
                     ), True
                 return replace(
                     block,
-                    orelse=insert_ordered(
+                    orelse=insert_in_arm(
                         block.orelse or SequenceBlock(()), mutation_block,
                     ),
                 ), True
@@ -15698,6 +15739,11 @@ def _install_lexical_sequence_mutations(
 
         inserted = False
         item = mutation_block
+        arm_placement_node[0] = (
+            int(mutation.effect_node_id)
+            if isinstance(mutation, ScalarFieldWriteBlock)
+            else _sequence_mutation_owner_id(mutation)
+        )
         for owner_id, arm in sorted(
             guarded, key=lambda entry: node_position(entry[0]), reverse=True,
         ):
@@ -24007,6 +24053,44 @@ def _class_surface_ssa_program(
                     tuple(contract.get("shape") or ()),
                     str(contract.get("dtype") or ""),
                     str(contract.get("storage") or ""),
+                ))
+
+        # Program: ``v.batch(n, [97, 98, 2], [0, 2, 3])`` beside
+        # ``self.batch(d, atoms, [0, len(atoms)])`` (b27).  Wrong record:
+        # the copy whose ``offsets`` formal folded to the literal
+        # ``[0, 2, 3]`` has no call edge stating its extent, so the other
+        # copy's (2,) stood alone on the authored row and was compared
+        # against this copy's (3,) (refused as a shape disagreement).
+        # Rule: a formal a copy folded to a flat literal sequence states
+        # that literal's extent for the copy, as its own SSA does; two
+        # copies stating different extents are polymorphic.
+        for parameter_name in sorted(map(str, (
+            planned_graph.graph.get("function_parameters") or ()
+        ))):
+            for value_id in identities.get(parameter_name, ()):
+                literal_data = planned_graph.nodes.get(int(value_id)) or {}
+                literal_attributes = literal_data.get("attributes") or {}
+                literal = literal_attributes.get("value")
+                if not (
+                    literal_attributes.get("structural_specialization")
+                    and literal_attributes.get("aggregate_kind") in {
+                        "list", "tuple",
+                    }
+                    and isinstance(literal, (list, tuple))
+                    and literal
+                    and all(
+                        isinstance(item, (bool, int, float)) for item in literal
+                    )
+                ):
+                    continue
+                note_shape(planned_graph, int(value_id), (
+                    "folded literal formal",
+                    (len(literal),),
+                    "bool" if all(isinstance(item, bool) for item in literal)
+                    else "float64" if any(
+                        isinstance(item, float) for item in literal
+                    ) else "int64",
+                    "span",
                 ))
 
         # Concrete source annotations also declare semantic class identity.
@@ -35217,6 +35301,25 @@ def _class_surface_ssa_program(
         # consulted: it counts a formal handle as live, so it would keep
         # every unused frame-storage formal -- _reindex_in_place's folded
         # ``{}``/``[]`` defaults came back as unknown-dtype formals.)
+        # Program: ``cells: dict[int, int] = {}`` filled in a loop (corpus
+        # c942; bootstrap ``identity_spill._reindex_in_place``).  Wrong
+        # record: the dict's data arena was refined to its row dtype, which
+        # puts a new SSAValue object in the formals, while the store calls
+        # kept reading the earlier object with the same id.  The unused-
+        # formal test compared objects, so the arena read as unused and was
+        # dropped, and every call then read a value nothing defined.  Rule:
+        # a formal is used when an instruction reads its value id.
+        used_argument_ids = {
+            int(argument.id)
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            for argument in instruction.args
+        }
+        used_argument_objects.update(
+            id(argument)
+            for argument in function.args
+            if int(argument.id) in used_argument_ids
+        )
         frame_removable = {
             int(argument.id)
             for argument in function.args

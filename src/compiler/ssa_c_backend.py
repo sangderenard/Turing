@@ -164,7 +164,9 @@ class CFunctionArtifact:
         if self.library_path is None:
             raise RuntimeError("C artifact was not compiled")
         if self._entry is None:
-            function = getattr(ctypes.CDLL(str(self.library_path)), self.name)
+            from .native_residency import resident_library
+
+            function = getattr(resident_library(self.library_path), self.name)
             function.restype = None
             pointer = ctypes.POINTER(ctypes.c_double)
             function.argtypes = [pointer, pointer]
@@ -1557,7 +1559,9 @@ class CModuleArtifact:
                 import os
 
                 self._dll_handles = [os.add_dll_directory(d) for d in self._dll_directories]
-            self._library = ctypes.CDLL(str(self.library_path))
+            from .native_residency import resident_library
+
+            self._library = resident_library(self.library_path)
             function = getattr(self._library, self.name)
             function.restype = None
             function.argtypes = [

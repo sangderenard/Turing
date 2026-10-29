@@ -100,3 +100,32 @@ def test_a_reducer_writes_a_value_by_name():
     rows = ((Colour.RED, 1),)
     reducers = {Colour: lambda value: (_named, (value.value,))}
     assert decode_rows(encode_rows(rows, reducers)) == rows
+
+
+def test_a_shared_codebook_round_trips_and_shrinks_a_stream_of_tiles():
+    from src.common.tensors.compression.octet_codec import OctetCodebook
+
+    def tile(start):
+        return encode_rows(tuple(
+            (("scope", i), ("repeated fact " * 40 + str(i), i))
+            for i in range(start, start + 32)
+        ))
+
+    codebook = OctetCodebook.train(tile(0) + tile(32) + tile(64))
+    later = tile(96)
+    shared = compress_octets(later, codebook)
+    assert decompress_octets(shared, codebook) == later
+    assert len(shared) < len(compress_octets(later))
+    with pytest.raises(ValueError):
+        decompress_octets(shared)
+
+
+def test_a_table_trains_its_codebook_after_its_first_tiles():
+    from src.compiler.compressed_tiles import CODEBOOK_AFTER_TILES, CompressedTable
+
+    rows = {i: "node %d stage ingest" % i for i in range(32 * (CODEBOOK_AFTER_TILES + 2))}
+    table = CompressedTable(rows.items(), tile_rows=32)
+    tiles = table._tiles
+    assert all(tile.codebook is None for tile in tiles[:CODEBOOK_AFTER_TILES])
+    assert all(tile.codebook is table._codebook for tile in tiles[CODEBOOK_AFTER_TILES:])
+    assert dict(table.items()) == rows
