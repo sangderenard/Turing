@@ -554,6 +554,21 @@ def plan_region_to_ssa_instrs(
         }
         if "int" in kinds and "uint" in kinds:
             return common_integer_dtype(candidates)
+        # Program: the Token Orchard digest ``(d * 1000003 + p + 7) % M``
+        # with ``p`` an ``array("Q")`` row.  Wrong record: ``d * 1000003 +
+        # p`` was int128 but, with no interval proving the sum (``p`` has
+        # none), ``... + 7`` fell to the int64 law below and the result was
+        # truncated to 64 bits with no finding (C and LLVM, silently).
+        # Rule: an operand wider than 64 bits joins by exact value domain.
+        if any(
+            layout is not None and layout.kind in {"int", "uint"}
+            and int(layout.byte_size) > 8
+            for layout in layouts
+        ):
+            return common_integer_dtype(tuple(
+                dtype for dtype, layout in zip(candidates, layouts)
+                if layout is not None
+            ))
         # Preserve the incumbent same-signed source result rules. The new
         # common-domain join is needed when a signed and unsigned source
         # operand meet; it does not replace the established int32/int64 law.
@@ -564,6 +579,37 @@ def plan_region_to_ssa_instrs(
         if candidates == {"bool"}:
             return "bool"
         return None
+
+    def modulus_result_dtype(item: PlanLine, promoted: str) -> str:
+        """``a % b`` of integers lies in ``b``'s domain.
+
+        Python's remainder has the divisor's sign and a smaller magnitude,
+        so it is a value of the divisor's layout.  Program: the Token
+        Orchard digest ``(... ) % 4611686018427387847`` whose dividend is
+        int128 wide: the remainder is int64, as the digest's next step
+        (and the program's int64 result ABI) holds it.  Only a promotion
+        beyond 64 bits is narrowed back; the established laws stand.
+        """
+
+        from ..transmogrifier.dtype_layout import resolve as resolve_dtype
+
+        layout = resolve_dtype(promoted)
+        if layout is None or layout.kind not in {"int", "uint"} or int(
+            layout.byte_size
+        ) <= 8:
+            return promoted
+        roles = tuple(str(role).casefold() for role in item.input_roles)
+        if len(roles) != len(item.inputs) or "rhs" not in roles:
+            return promoted
+        divisor = dtype_of.get(int(item.inputs[roles.index("rhs")]))
+        divisor_layout = resolve_dtype(divisor)
+        if (
+            divisor_layout is None
+            or divisor_layout.kind not in {"int", "uint"}
+            or int(divisor_layout.byte_size) > 8
+        ):
+            return promoted
+        return str(divisor)
 
     # Refine permissive graph-domain defaults using authored scalar operator
     # semantics before constructing any SSAValue.  Iterate because a chain
@@ -637,6 +683,8 @@ def plan_region_to_ssa_instrs(
                     authored_scalar_result_dtype(output_id)
                     or promoted_numeric_dtype(semantic_input_ids(item))
                 )
+                if opcode == "mod" and inferred is not None:
+                    inferred = modulus_result_dtype(item, inferred)
             elif opcode in projection_ops:
                 sources = semantic_input_ids(item)
                 inferred = (
