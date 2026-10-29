@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from src.common.tensors.fused_ir import FusedProgram, OpStep
+from src.common.tensors.fused_ir import FusedProgram, Meta, OpStep
 from src.compiler.machine_targets import emit
 from src.compiler.wasm_html_shell import emit_html_shell, shell_for_artifact
 from src.compiler.compiled_program_api import CompiledProgramAPI, EntryPoint, Parameter
@@ -17,11 +17,17 @@ from src.compiler.shell_io import (
 )
 
 
+def _float64_meta(feeds):
+    """The feeds' dtype record: a hand-built program states its element type."""
+
+    return {int(feed): Meta(dtype="float64") for feed in feeds}
+
+
 def _artifact(name="demo"):
     left, right, s0, s1, s2 = 1, 2, 3, 4, 5
     program = FusedProgram(
         version=1,
-        feeds={left, right},
+        feeds={left, right}, meta=_float64_meta({left, right}),
         steps=[
             OpStep(step_id=0, op_name="sub", input_ids=[left, right], attrs={}, result_id=s0),
             OpStep(step_id=1, op_name="abs", input_ids=[s0], attrs={}, result_id=s1),
@@ -781,7 +787,7 @@ def test_wasm_tile_worker_executes_kernel_and_crosses_join_in_browser(tmp_path):
 
     program = FusedProgram(
         version=1,
-        feeds={1},
+        feeds={1}, meta=_float64_meta({1}),
         steps=[OpStep(0, "mul", [1], {"right_scalar": 2.0}, 2)],
         outputs={"result": 2},
     )
