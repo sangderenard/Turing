@@ -8,13 +8,13 @@ tiles/index chunks to stronger disk compression; there is no second concordance.
 """
 from __future__ import annotations
 
-import pickle
 import sys
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .compressed_tiles import CompressedTable, DiskTileStore
 from .identity_spill import SPILLABLE_ATTRS, _dispatch_table, _LOAD_REGISTRY
+from .tile_row_codec import decode_rows
 
 TABLES = tuple(name for name in SPILLABLE_ATTRS if name != "columns")
 
@@ -33,7 +33,7 @@ def _loader(registry):
     def load(data):
         token = _LOAD_REGISTRY.set(registry)
         try:
-            return pickle.loads(data)
+            return decode_rows(data)
         finally:
             _LOAD_REGISTRY.reset(token)
     return load
@@ -295,7 +295,7 @@ def _compress_one(book, name, tile_rows, dispatch, load, boundary, *, record):
                                       dispatch_table=dispatch, loader=load)
                   for key in TABLES}
         columns = tuple(state["columns"])
-    except (pickle.PickleError, TypeError, AttributeError, ValueError) as error:
+    except (TypeError, AttributeError, ValueError) as error:
         reason = f"{type(error).__name__}: {error}"
         if record:
             _receipt(book, name, "refuse-ram", 0, 0, 0, 0, reason)

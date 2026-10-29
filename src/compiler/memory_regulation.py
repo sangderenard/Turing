@@ -541,9 +541,14 @@ class MemoryRegulator:
         self._activate_live_storage(label)
         if not already_active:
             resident = process_rss_bytes()
-        return self._climb_storage_ladder(
-            label, resident, ceiling=elastic_ceiling,
-        )
+        try:
+            return self._climb_storage_ladder(
+                label, resident, ceiling=elastic_ceiling,
+            )
+        finally:
+            # The throttle spaces checks, so it counts from this one's end:
+            # a climb slower than the interval must not start the next.
+            self._last_pressure_read = time.monotonic()
 
     def spill_cold(self, trigger: str) -> int:
         """Spill the book's pages that the completed stages made cold; the

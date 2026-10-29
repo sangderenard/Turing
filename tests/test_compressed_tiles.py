@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import os
-import lzma
-import pickle
 import sys
-import zlib
 
 import pytest
 
@@ -43,6 +40,10 @@ class CollisionKey:
 
     def __eq__(self, other):
         return type(other) is CollisionKey and self.value == other.value
+
+
+class IdentityKey:
+    """Hashes and compares by identity: no decoded copy equals it."""
 
 
 def test_lookup_decodes_one_tile_not_whole_table():
@@ -134,8 +135,12 @@ def test_point_update_reencodes_only_one_tile(monkeypatch):
 def test_duplicate_and_identity_sensitive_keys_fail_closed():
     with pytest.raises(ValueError, match="duplicate keys"):
         CompressedTable(((1, "first"), (1, "second")), tile_rows=1)
-    with pytest.raises(TypeError, match="hash/equality"):
+    # A key with no row encoding is refused before its tile is written; one
+    # that decodes unequal is refused by the round trip.
+    with pytest.raises(TypeError, match="no row encoding"):
         CompressedTable(((object(), "identity-only key"),))
+    with pytest.raises(TypeError, match="hash/equality"):
+        CompressedTable(((IdentityKey(), "identity-only key"),))
 
 
 def test_disk_tier_moves_tiles_and_indexes_and_lookup_remains_local(tmp_path, monkeypatch):
@@ -178,12 +183,12 @@ def test_cold_table_and_packed_indices_page_their_physical_headers(tmp_path):
 def test_partial_disk_failure_preserves_every_value(tmp_path, monkeypatch):
     table = CompressedTable(((i, str(i)) for i in range(100)), tile_rows=10)
     store = DiskTileStore(str(tmp_path))
-    original = store.write
-    def failing(data, rows):
+    original = store._append
+    def failing(*arguments):
         if store.writes == 3:
             raise OSError("disk full")
-        return original(data, rows)
-    monkeypatch.setattr(store, "write", failing)
+        return original(*arguments)
+    monkeypatch.setattr(store, "_append", failing)
     with pytest.raises(OSError, match="disk full"):
         table.offload_to_disk(store=store)
     assert table.stats().disk_tiles == 3
@@ -208,5 +213,5 @@ def test_disk_shared_view_lifetime_and_corruption_detection(tmp_path):
     tile = store.write(b"abc" * 1000, 1)
     with open(store.tile_path(tile), "r+b") as handle:
         handle.write(b"bad")
-    with pytest.raises((ValueError, lzma.LZMAError, zlib.error)):
+    with pytest.raises(ValueError):
         tile.decode()
