@@ -19,6 +19,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_SSA_CHECKPOINT,
     SOURCE_EXCEPTION_SSA_ROUTE,
     SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+    SOURCE_EXCEPTION_SSA_HANDLER_STATE,
     SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
     SOURCE_EXCEPTION_SSA_HANDLER_PHI,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
@@ -556,6 +557,24 @@ def root(x: float) -> int:
             SOURCE_EXCEPTION_SSA_HANDLER_ARM
         ).rows())
         assert len(incoming_rows) == len(route_rows)
+        state_rows = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_HANDLER_STATE
+        ).rows())
+        assert len(state_rows) == len(route_rows)
+        assert {
+            row[:4]: book.page(SOURCE_EXCEPTION_SSA_HANDLER_STATE).latest(
+                row
+            ).incoming_value
+            for row in state_rows
+        } == {
+            row[:4]: book.page(SOURCE_EXCEPTION_SSA_HANDLER_ARM).latest(
+                row
+            ).incoming_value
+            for row in incoming_rows
+        }
+        assert CorrelationTable._source_exception_ssa_handler_state_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
         assert {
             row[1:3]: book.page(SOURCE_EXCEPTION_SSA_HANDLER_ARM).latest(
                 row

@@ -12039,12 +12039,14 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_REGION_STATE, SOURCE_EXCEPTION_SSA_HANDLER_ARM,
             SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
             SOURCE_EXCEPTION_SSA_HANDLER_PHI,
+            SOURCE_EXCEPTION_SSA_HANDLER_STATE,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_ROUTE, SOURCE_EXCEPTION_STATUS_ROUTE,
             ExceptionHandlerArmValueFact, ExceptionHandlerClassFact,
             ExceptionHandlerPhiFact, ExceptionRegionStateFact,
             ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
-            ExceptionSSAHandlerPhiFact, ExceptionSSARouteFact,
+            ExceptionSSAHandlerPhiFact, ExceptionSSAHandlerStateFact,
+            ExceptionSSARouteFact,
             ExceptionStatusRouteFact,
         )
 
@@ -12238,6 +12240,41 @@ class _ControlSSABuilder(TiledObject):
                     mode=Mode.CONCORD,
                 )
                 self.current = match_block
+                for name, incoming in edge["state"].items():
+                    state_row = (*edge["site"].row, name)
+                    state_cell = book.latest_ref(
+                        SOURCE_EXCEPTION_REGION_STATE, state_row,
+                    )
+                    state = book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
+                        state_row,
+                    )
+                    if not isinstance(state, ExceptionRegionStateFact) or (
+                        state_cell is None
+                        or state.transfer != edge["transfer"]
+                        or not self._value_dominates_current_edge(incoming)
+                    ):
+                        raise ValueError(
+                            "native handler route has no exact live state: "
+                            f"route={route_row!r}, name={name!r}"
+                        )
+                    # Program: y=1; a=int(x); y=2; b=int(x).
+                    # The two failures enter one handler with different
+                    # live y versions. Preserve every source name at each
+                    # matched edge, not the successful path's final map.
+                    book.post(
+                        SOURCE_EXCEPTION_SSA_HANDLER_STATE,
+                        (*ssa_route_cell.row, name),
+                        ExceptionSSAHandlerStateFact(
+                            ssa_route_cell, state_cell, match_cell,
+                            self._value_cell(incoming),
+                        ),
+                        stage=self._stage(),
+                        provenance=Derived((
+                            ssa_route_cell, state_cell, match_cell,
+                            self._value_cell(incoming),
+                        )),
+                        mode=Mode.CONCORD,
+                    )
                 for source_phi in block.handlers[
                     selected_facts[0].ordinal
                 ].entry_phi_cells:

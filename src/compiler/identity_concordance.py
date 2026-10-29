@@ -1560,6 +1560,7 @@ class CorrelationTable:
         found.extend(self._source_exception_ssa_checkpoint_findings(module))
         found.extend(self._source_exception_ssa_route_findings(module))
         found.extend(self._source_exception_ssa_handler_arm_findings(module))
+        found.extend(self._source_exception_ssa_handler_state_findings(module))
         found.extend(self._source_exception_ssa_handler_entry_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
@@ -2852,6 +2853,121 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-ssa-handler-arm-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_handler_state_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Each selected route retains every deployed live source name."""
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_REGION_STATE,
+            SOURCE_EXCEPTION_SSA_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+            SOURCE_EXCEPTION_SSA_HANDLER_STATE,
+            SOURCE_EXCEPTION_SSA_ROUTE, SSA_VALUE,
+            ExceptionRegionStateFact, ExceptionSSACheckpointFact,
+            ExceptionSSAHandlerArmFact, ExceptionSSAHandlerStateFact,
+            ExceptionSSARouteFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or (
+            SOURCE_EXCEPTION_SSA_HANDLER_STATE.name not in book.pages
+        ):
+            return []
+        page = book.page(SOURCE_EXCEPTION_SSA_HANDLER_STATE)
+        routes = book.page(SOURCE_EXCEPTION_SSA_ROUTE)
+        states = book.page(SOURCE_EXCEPTION_REGION_STATE)
+        found = []
+        for route_row in routes.rows():
+            route = routes.latest(route_row)
+            if not isinstance(route, ExceptionSSARouteFact):
+                continue
+            checkpoint = book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).latest(
+                route.checkpoint.row,
+            )
+            if not isinstance(checkpoint, ExceptionSSACheckpointFact):
+                continue
+            for state_row in states.rows():
+                if state_row[:3] != checkpoint.region_site.row:
+                    continue
+                row = (*route_row, state_row[3])
+                if page.latest(row) is None:
+                    found.append(Finding(
+                        "source-exception-ssa-handler-state-disagreement",
+                        str(row), None,
+                        "selected route has no deployed live name",
+                    ))
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_HANDLER_STATE, row)
+            problem = None
+            if not isinstance(fact, ExceptionSSAHandlerStateFact) or not all(
+                isinstance(cell, Ref) for cell in (
+                    fact.ssa_route, fact.region_state,
+                    fact.match_block, fact.incoming_value,
+                )
+            ):
+                problem = "native handler state lacks exact cells"
+            else:
+                route = routes.latest(fact.ssa_route.row)
+                checkpoint = (
+                    book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).latest(
+                        route.checkpoint.row,
+                    ) if isinstance(route, ExceptionSSARouteFact)
+                    else None
+                )
+                state = states.latest(fact.region_state.row)
+                if (
+                    fact.ssa_route.page != SOURCE_EXCEPTION_SSA_ROUTE
+                    or fact.ssa_route.row != row[:4]
+                    or not isinstance(route, ExceptionSSARouteFact)
+                    or not isinstance(checkpoint, ExceptionSSACheckpointFact)
+                    or fact.region_state.page != SOURCE_EXCEPTION_REGION_STATE
+                    or fact.region_state.row != (
+                        *checkpoint.region_site.row, row[4],
+                    )
+                    or not isinstance(state, ExceptionRegionStateFact)
+                    or route.match_block != fact.match_block
+                    or fact.incoming_value.page != SSA_VALUE
+                    or fact.incoming_value.row[0] != row[0]
+                    or any(book.latest_ref(cell.page, cell.row) != cell
+                           for cell in (
+                               fact.ssa_route, fact.region_state,
+                               fact.match_block, fact.incoming_value,
+                           ))
+                ):
+                    problem = "native handler state disagrees with source site"
+                else:
+                    for arm_row in book.page(
+                        SOURCE_EXCEPTION_SSA_HANDLER_ARM
+                    ).rows():
+                        if arm_row[:4] != row[:4]:
+                            continue
+                        arm = book.page(
+                            SOURCE_EXCEPTION_SSA_HANDLER_ARM
+                        ).latest(arm_row)
+                        if isinstance(arm, ExceptionSSAHandlerArmFact) and (
+                            arm.region_state == fact.region_state
+                            and arm.incoming_value != fact.incoming_value
+                        ):
+                            problem = "handler Phi arm differs from live state"
+                            break
+                if problem is None and (
+                    receipt is None or {
+                        cause for cause, _stage in book.edges_into(receipt)
+                    } != {
+                        fact.ssa_route, fact.region_state,
+                        fact.match_block, fact.incoming_value,
+                    }
+                ):
+                    problem = "native handler state provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-handler-state-disagreement",
                     str(row), None, problem,
                 ))
         return found

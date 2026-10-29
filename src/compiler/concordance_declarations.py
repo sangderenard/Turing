@@ -1336,6 +1336,27 @@ SOURCE_EXCEPTION_SSA_HANDLER_ARM = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSAHandlerStateFact:
+    """One live name captured on a matched native failure route."""
+
+    ssa_route: Ref
+    region_state: Ref
+    match_block: Ref
+    incoming_value: Ref
+
+
+SOURCE_EXCEPTION_SSA_HANDLER_STATE = declare_page(
+    "source_exception_ssa_handler_state", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("region", K.INDEX),
+        RowField("canonical_site", K.VALUE_ID),
+        RowField("status", K.INDEX),
+        RowField("name", K.NAME),
+    ), ExceptionSSAHandlerStateFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionSSAHandlerEntryFact:
     """Selected routes entering one native handler block."""
 
