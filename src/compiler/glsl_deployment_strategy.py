@@ -4861,6 +4861,33 @@ def _static_literal_value(graph, value_id: int, depth: int = 0):
             return getattr(holder, str(field))
         except AttributeError:
             return _STATIC_READ_MISSING
+    if kind in {"tuple", "list", "generatorexp"} or str(
+        data.get("type") or ""
+    ) in {"Tuple", "List", "GeneratorExp"}:
+        # A display whose elements are static (``lanes, capacity = (int(n)
+        # for n in octets.shape)`` once the fold settled each ``int(n)``):
+        # the sequence of those elements.
+        ordered = sorted(
+            (
+                (int(role[3:]) if role.startswith("arg") and role[3:].isdigit()
+                 else index, int(parent))
+                for index, (parent, role) in enumerate(
+                    (int(parent), str(role))
+                    for parent, role in (data.get("parents") or ())
+                )
+                if role == "elts"
+                or (role.startswith("arg") and role[3:].isdigit())
+            ),
+        )
+        if not ordered:
+            return _STATIC_READ_MISSING
+        elements = []
+        for _position, parent in ordered:
+            element = _static_literal_value(graph, parent, depth + 1)
+            if element is _STATIC_READ_MISSING:
+                return element
+            elements.append(element)
+        return tuple(elements)
     if kind == "indexed" and "base" in parents and "index" in parents:
         holder = _static_literal_value(graph, parents["base"], depth + 1)
         index = _static_literal_value(graph, parents["index"], depth + 1)
@@ -4918,6 +4945,73 @@ def _literal_element_dtype(value: Any, depth: int = 0):
     if dtype is not None and hasattr(value, "shape"):
         return str(dtype)
     return None
+
+
+def _view_or_gather_extents(operation, node, declared, records, logical):
+    """The extents of a view or gather the graph posted no descriptor for.
+
+    ``x.reshape((-1,))`` / ``x.view(r, c)``: the literal target, with one
+    ``-1`` taking the element count the value leaves; ``x.flatten()``: one
+    axis of every element; ``x.gather(index, dim)``: the index's extents
+    (``AbstractTensor.gather`` answers one element per index).  Without a
+    settled value or literal target the prior record stands.
+    """
+
+    roles = {
+        str(role): int(parent) for parent, role in (node.get("parents") or ())
+    }
+    value_id = next(
+        (roles[role] for role in ("operand", "value", "base", "self")
+         if role in roles),
+        None,
+    )
+    if operation == "gather":
+        index = roles.get("arg:0", roles.get("index", roles.get("kw:index")))
+        if index is not None and index in records:
+            return tuple(records[index][0] or ())
+        return logical
+    if value_id is None or value_id not in records:
+        return logical
+    source = tuple(int(extent) for extent in (records[value_id][0] or ()))
+    count = 1
+    for extent in source:
+        count *= extent
+    if operation == "flatten":
+        return (count,)
+
+    def literal(parent):
+        record = declared(parent)
+        return record[2].get("value", record[0].get("constant"))
+
+    positional = sorted(
+        (int(role[4:]), parent) for role, parent in roles.items()
+        if role.startswith("arg:") and role[4:].isdigit()
+    )
+    if len(positional) == 1:
+        target = literal(positional[0][1])
+        target = (
+            tuple(target) if isinstance(target, (tuple, list)) else (target,)
+        )
+    else:
+        target = tuple(literal(parent) for _index, parent in positional)
+    if not target or not all(
+        isinstance(extent, int) and not isinstance(extent, bool)
+        for extent in target
+    ):
+        return logical
+    known = 1
+    for extent in target:
+        if extent != -1:
+            known *= extent
+    if list(target).count(-1) > 1 or (-1 in target and known == 0):
+        return logical
+    resolved = tuple(
+        count // known if extent == -1 else extent for extent in target
+    )
+    product = 1
+    for extent in resolved:
+        product *= extent
+    return resolved if product == count else logical
 
 
 def _dtype_producer_cells(graph: Any, value_id: int, *extra: Any) -> tuple:
@@ -6643,6 +6737,9 @@ def _build_shell_hierarchy_plan(
                     operation in {
                         "unsqueeze", "squeeze", "expand", "broadcast_to",
                         "sum", "prod", "min", "max", "cumsum", "cumprod",
+                        # A view or a gather re-addresses its VALUE's
+                        # elements; the index operand names no element class.
+                        "reshape", "view", "flatten", "gather",
                     }
                     and not tensor.get("dtype")
                 ):
@@ -6675,6 +6772,19 @@ def _build_shell_hierarchy_plan(
                         dtype = str(posted["dtype"])
                     elif value_parent in _shape_dtype_cache:
                         dtype = _shape_dtype_cache[value_parent][1]
+                if operation in {"reshape", "view", "flatten", "gather"}:
+                    settled = planned_descriptor(int(current))
+                    if settled is not None and descriptor_states_a_shape(
+                        settled
+                    ):
+                        logical = tuple(
+                            int(e) for e in (settled.get("shape") or ())
+                        )
+                    else:
+                        logical = _view_or_gather_extents(
+                            operation, _node, declared, _shape_dtype_cache,
+                            logical,
+                        )
                 if operation == "mean" and not tensor.get("dtype"):
                     # ``x.mean()`` (numpy, AbstractTensor): a float operand's
                     # width stands; an integer or bool operand means float64.
@@ -6780,6 +6890,28 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
+                if operation in {"to_dtype", "astype", "to"} and not tensor.get(
+                    "dtype"
+                ):
+                    # ``x.to_dtype("int64")`` is an int64 value whatever
+                    # ``x`` holds: the literal argument names the class.
+                    named = next((
+                        str(declared(parent)[2].get(
+                            "value", declared(parent)[0].get("constant")
+                        ))
+                        for parent, role in (_node.get("parents") or ())
+                        if str(role) in {"arg:0", "dtype", "kw:dtype"}
+                        and declared(int(parent))[5] in {"const", "constant"}
+                        and isinstance(declared(parent)[2].get(
+                            "value", declared(parent)[0].get("constant")
+                        ), str)
+                    ), None)
+                    if named in {
+                        "bool", "int8", "int16", "int32", "int64", "uint8",
+                        "uint16", "uint32", "uint64", "int128", "float16",
+                        "float32", "float64",
+                    }:
+                        dtype = named
                 if operation in {"floor", "ceil", "trunc", "round", "invert"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so
@@ -6913,6 +7045,14 @@ def _build_shell_hierarchy_plan(
                 str(node.get("op") or node.get("type") or "").casefold()
                 == "staticreference"
             ):
+                return None, ()
+            if str(
+                node.get("op") or node.get("type") or ""
+            ).casefold() in {"const", "constant"} and isinstance(
+                attributes.get("value", node.get("constant")), str
+            ):
+                # A string literal argument (``to_dtype("int64")``) names a
+                # static choice, as a StaticReference does: not a value.
                 return None, ()
             if (
                 str(node.get("op") or node.get("type") or "").casefold()
@@ -28064,6 +28204,33 @@ def _fold_callsite_structural_values(
             return result or None
         return None
 
+    def bound_class_expression(expression: ast.AST | None):
+        """The classes a type expression names through the program's
+        supplied bindings, or ``None`` when any part is not a bound class."""
+
+        bindings = getattr(graph, "python_bindings", None) or {}
+        if isinstance(expression, ast.Tuple):
+            parts = [bound_class_expression(item) for item in expression.elts]
+            if not parts or any(part is None for part in parts):
+                return None
+            return tuple(
+                cls for part in parts
+                for cls in (part if isinstance(part, tuple) else (part,))
+            )
+        if isinstance(expression, ast.Attribute):
+            owner = bound_class_expression(expression.value)
+            if owner is None:
+                owner = (
+                    bindings.get(expression.value.id)
+                    if isinstance(expression.value, ast.Name) else None
+                )
+            value = getattr(owner, expression.attr, None)
+            return value if isinstance(value, type) else None
+        if isinstance(expression, ast.Name):
+            value = bindings.get(expression.id)
+            return value if isinstance(value, type) else None
+        return None
+
     def type_identities(expression: ast.AST | None) -> tuple[str, ...]:
         if isinstance(expression, ast.Name):
             return (str(expression.id),)
@@ -28981,6 +29148,19 @@ def _fold_callsite_structural_values(
             if len(values) >= 3 and values[2] is not unresolved:
                 return values[2]
         if name == "isinstance" and values:
+            if (
+                values[0] is not unresolved
+                and not isinstance(values[0], _ProgramABIValueFact)
+                and len(expression.args) > 1
+            ):
+                # A bound literal (``batch`` once the fold made it a
+                # constant) is a real instance of a real class, so
+                # ``isinstance(batch, X86PreparedReadBatch)`` is decided by
+                # the supplied class itself: the dead arm is pruned here
+                # instead of reading a field the instance does not have.
+                accepted_classes = bound_class_expression(expression.args[1])
+                if accepted_classes is not None:
+                    return isinstance(values[0], accepted_classes)
             if values[0] is unresolved and arguments:
                 source_class = source_value_class_identity(arguments[0])
                 accepted_identities = type_identities(

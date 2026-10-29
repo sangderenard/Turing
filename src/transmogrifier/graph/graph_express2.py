@@ -6527,6 +6527,14 @@ class ProcessGraph(TiledObject):
             # source itself (``from .machine_path_forest import
             # MachinePathHeadStatus``) was real and resolved, just
             # discarded before reduction could ever see it.
+            # ``parent_bindings`` name the classes of the entry's formals
+            # (the host's actuals): lookup context for pursuit only.  A
+            # formal is a parameter, never a static global of the program.
+            for name, value in (parent_bindings or {}).items():
+                if root_bindings.get(name) is value and name not in (
+                    getattr(self, "python_bindings", {}) or {}
+                ):
+                    root_bindings.pop(name)
             self.python_bindings = root_bindings
             # Source pursuit is what resolves ``open``/``Path.open`` to the
             # extraction contract's shell-file boundary. Lower the lexical
