@@ -27867,6 +27867,29 @@ def _class_surface_ssa_program(
         record_specialization = graph_obj.graph.get("parameter_record_abi") or {}
         if record_specialization and shape_scope_is_variant(graph_obj):
             specialization_contract = (*specialization_contract, record_specialization)
+        # Program: ``intern_batch(1, [65, 66, 67], [0, 3])`` beside
+        # ``intern_batch(1, atoms, ...)`` with ``atoms`` grown by appends
+        # (string-core intern driver).  Wrong record: the two
+        # ``_validate_atom_span`` copies settled their list formal FIXED and
+        # DYNAMIC (``_settle_linked_dynamic_sequences``) but carried one
+        # contract, so both lowered under one symbol and the FIXED caller
+        # bound the DYNAMIC view ("bound sequence views disagree about
+        # dynamic capacity").  Rule: a copy's settled capacity policy for
+        # its formals is part of its callsite contract.
+        linked_dynamic_ids = set(
+            map(int, graph_obj.graph.get("linked_dynamic_sequence_ids", ()))
+        )
+        dynamic_formals = tuple(sorted(
+            str((data.get("attributes") or {}).get("binding_name"))
+            for node_id, data in graph_obj.nodes(data=True)
+            if str(data.get("type") or data.get("op") or "").casefold() == "input"
+            and (data.get("attributes") or {}).get("binding_name") is not None
+            and int(data.get("value_id", node_id)) in linked_dynamic_ids
+        ))
+        if dynamic_formals and any(specialization_contract):
+            specialization_contract = (
+                *specialization_contract, ("dynamic_formals", dynamic_formals),
+            )
         if (
             any(specialization_contract)
             and (
