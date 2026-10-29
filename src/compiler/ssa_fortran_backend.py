@@ -261,6 +261,25 @@ _UNARY: dict[str, str] = {
         "merge(2.0_c_double * anint({0} / 2.0_c_double), anint({0}), "
         "abs({0} - aint({0})) == 0.5_c_double)"
     ),
+    # The repository-SSA spellings of the same three (C ``floor``/``ceil``/
+    # ``nearbyint``, LLVM ``llvm.floor``/``llvm.ceil``/``llvm.roundeven``):
+    # every one is exact.  A signal-core expansion
+    # (``ir_identities.lower_transcendentals_to_signal_cores``) takes its
+    # binade with ``Round``; without these the Fortran lane refused c22's
+    # ``math.exp`` once it was routed ("Round [entry]: no Fortran intrinsic
+    # or expression is registered").
+    "Floor": (
+        "(aint({0}) - merge(1.0_c_double, 0.0_c_double, "
+        "{0} < aint({0})))"
+    ),
+    "Ceil": (
+        "(aint({0}) + merge(1.0_c_double, 0.0_c_double, "
+        "{0} > aint({0})))"
+    ),
+    "Round": (
+        "merge(2.0_c_double * anint({0} / 2.0_c_double), anint({0}), "
+        "abs({0} - aint({0})) == 0.5_c_double)"
+    ),
     "sign": "sign(1.0_c_double, {0})",
     "logical_not": "(.not. {0})",
     "trunc": "aint({0})",

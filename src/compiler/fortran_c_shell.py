@@ -60338,6 +60338,7 @@ def _class_surface_ssa_program(
         drop_dead_pure_region_calls,
         reduce_constant_exponent_pow,
         reduce_integer_pow,
+        lower_transcendentals_to_signal_cores,
     )
 
     compile_substage("reduce constant powers and dead pure work")
@@ -60351,6 +60352,12 @@ def _class_surface_ssa_program(
     # the dead sweeps: its guards call the validation runtime, which a
     # pure-region sweep must not see as removable work.
     reduce_integer_pow(all_functions)
+    # Scalar float ``math`` transcendentals become the signal cores'
+    # correctly rounded expansions here, once, so C, LLVM and Fortran
+    # compile the same exact primitive ops instead of each host's libm.
+    # After the dead sweeps for the same reason as the int power: the
+    # domain/range guards call the validation runtime.
+    lower_transcendentals_to_signal_cores(all_functions)
 
     # Sequence descriptors are the canonical physical ABI.  A source value
     # may have been captured provisionally by a numerical region before its

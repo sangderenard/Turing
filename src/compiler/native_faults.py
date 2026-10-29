@@ -40,6 +40,20 @@ POW_MODULUS_ZERO = 90
 #: quotient is computed on Precision limbs, the native module reports it.
 INT_TRUE_DIVISION_INEXACT = 91
 
+#: A ``math`` function called outside its domain (``math.log(-1.0)``,
+#: ``math.log(0.0)``, ``math.sqrt(-1.0)``, ``math.asin(2.0)``,
+#: ``math.pow(-8.0, 1/3)``): Python raises ``ValueError('math domain
+#: error')``.  Reported by the guard
+#: ``ir_identities.lower_transcendentals_to_signal_cores`` builds from the
+#: domain predicate the signal-core expansion returns.
+MATH_DOMAIN_ERROR = 92
+
+#: A finite argument whose ``math`` result is too large for a float
+#: (``math.exp(710.0)``, ``math.pow(10.0, 400.0)``, ``math.cosh(1000.0)``):
+#: Python raises ``OverflowError('math range error')`` instead of returning
+#: ``inf``.  Reported by the same guard from the overflow predicate.
+MATH_RANGE_ERROR = 93
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -51,6 +65,10 @@ class NativeIntOverflow(RuntimeError, OverflowError):
 
 class NativeValueError(RuntimeError, ValueError):
     """``ValueError`` raised from a native validation code."""
+
+
+class NativeOverflowError(RuntimeError, OverflowError):
+    """``OverflowError`` raised from a native validation code."""
 
 
 class NativeZeroDivisionError(RuntimeError, ZeroDivisionError):
@@ -103,4 +121,8 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
         return NativeValueError(
             f"pow() 3rd argument cannot be 0 ({runtime_message})"
         )
+    if int(code) == MATH_DOMAIN_ERROR:
+        return NativeValueError(f"math domain error ({runtime_message})")
+    if int(code) == MATH_RANGE_ERROR:
+        return NativeOverflowError(f"math range error ({runtime_message})")
     return RuntimeError(runtime_message)

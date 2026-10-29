@@ -1093,6 +1093,7 @@ _NUMERIC_CONVERSION_MODES = {
         "signedness": "preserve",
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
+        "transcendentals": "signal_cores",
     },
 
     "scientific": {
@@ -1103,6 +1104,7 @@ _NUMERIC_CONVERSION_MODES = {
         "signedness": "preserve",
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
+        "transcendentals": "signal_cores",
     },
 
     "stochastic": {
@@ -1113,6 +1115,7 @@ _NUMERIC_CONVERSION_MODES = {
         "signedness": "preserve",
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
+        "transcendentals": "signal_cores",
     },
 }
 
@@ -1137,6 +1140,32 @@ def integer_arithmetic_policy(mode=None):
     if policy not in _INTEGER_ARITHMETIC_POLICIES:
         raise ValueError(
             f"integer_arithmetic must be one of {_INTEGER_ARITHMETIC_POLICIES}, "
+            f"got {policy!r}"
+        )
+    return policy
+
+
+#: ``transcendentals``: what computes a scalar float ``math.exp``/``log``/
+#: ``sin``/... in native code.  ``signal_cores`` -- the repository's own
+#: correctly rounded route: ``signal_symbolic`` proofs materialised as wide
+#: SSA by ``ir_identities.WideExpansionEmitter`` and collapsed to one double
+#: (``ir_identities.lower_transcendentals_to_signal_cores``).  It is the only
+#: value: host libm, ``llvm.*`` intrinsics and Fortran intrinsic math are not
+#: a policy this contract offers, so any other value refuses by name.
+_TRANSCENDENTAL_POLICIES = ("signal_cores",)
+
+
+def transcendental_policy(mode=None):
+    """The numeric contract's ``transcendentals`` for ``mode``."""
+
+    try:
+        contract = _NUMERIC_CONVERSION_MODES[mode or _DEFAULT_NUMERIC_MODE]
+    except KeyError:
+        raise ValueError(f"unknown numeric conversion mode {mode!r}")
+    policy = contract["transcendentals"]
+    if policy not in _TRANSCENDENTAL_POLICIES:
+        raise ValueError(
+            f"transcendentals must be one of {_TRANSCENDENTAL_POLICIES}, "
             f"got {policy!r}"
         )
     return policy
