@@ -118,7 +118,9 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
     from ..common.tensors.topological_reducer import node_identity_cell
     from .concordance_declarations import (
         EXCEPTION_TOPOLOGY, SOURCE_CONTROL_SPECIALIZATION,
-        SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
+        SOURCE_EXCEPTION_FINALIZER_PHI, SOURCE_EXCEPTION_HANDLER_ENTRY,
+        SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_TRANSFER,
+        ExceptionFinalizerPhiFact,
         ExceptionHandlerEntryFact, ExceptionTransferFact,
     )
     from .identity_concordance import Derived, Mode, current_identity_book
@@ -226,8 +228,10 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             for item in reversed(crossed)
             if item.has_finally and item.arm != "finalbody"
         ))
-        site_states = G.graph.get("source_exception_site_bindings") or {}
-        if source_id not in site_states:
+        site_state = book.page(SOURCE_EXCEPTION_SITE_STATE).latest((
+            scope, int(source_id),
+        ))
+        if site_state is None:
             raise ValueError(
                 "live exception operation has no exact lexical entry state: "
                 f"source={source_id}, kind={type(expression).__name__}"
@@ -238,7 +242,10 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             catch_try_node_id=destination,
             scopes=scopes,
             unwind_finally_node_ids=unwind,
-            entry_bindings=tuple(site_states[source_id]),
+            entry_bindings=tuple(
+                (name, int(value_cell.row[1]))
+                for name, value_cell in site_state.bindings
+            ),
         )
         if source_id in transfers and transfers[source_id] != transfer:
             raise ValueError(
@@ -333,6 +340,7 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
         )
         dependencies = tuple(dict.fromkeys((
             source_cell,
+            book.latest_ref(SOURCE_EXCEPTION_SITE_STATE, (scope, source_id)),
             *((target_cell,) if target_cell is not None else ()),
             *(item for owner, _arm, handler, _has_finally in scope_cells
               for item in (owner, handler) if item is not None),
@@ -404,6 +412,81 @@ def build_exception_topology(graph: Any) -> dict[int, ExceptionTransfer]:
             provenance=Derived(tuple(dict.fromkeys((
                 owner_cell, handler_cell, *incoming,
                 *(cell for _name, cell in selected),
+            )))),
+            mode=Mode.CONCORD if previous is None or previous == fact
+            else Mode.REVISE,
+        )
+    for phi_id, data in G.nodes(data=True):
+        attributes = data.get("attributes") or {}
+        if "source_exception_finally_id" not in attributes:
+            continue
+        if str(data.get("type")) != "Phi":
+            raise ValueError(
+                f"finalbody entry {phi_id} is not an exact graph Phi"
+            )
+        owner_id = int(attributes["source_exception_finally_id"])
+        name = str(attributes["source_exception_finally_name"])
+        predecessor_ids = tuple(attributes[
+            "source_exception_finally_entries"
+        ])
+        parents = tuple(data.get("parents") or ())
+        if len(predecessor_ids) != len(parents):
+            raise ValueError(
+                "finalbody Phi entries disagree with graph operands: "
+                f"phi={phi_id}"
+            )
+        owner_cell = node_identity_cell(graph, owner_id)
+        phi_cell = node_identity_cell(graph, int(phi_id))
+        entries = []
+        for index, ((kind, source_id), (value_id, role)) in enumerate(zip(
+            predecessor_ids, parents,
+        )):
+            if role != f"entry:{index}":
+                raise ValueError(
+                    "finalbody Phi has no exact ordered entry operand: "
+                    f"phi={phi_id}, role={role!r}"
+                )
+            source_cell = (
+                book.latest_ref(
+                    SOURCE_EXCEPTION_TRANSFER, (scope, int(source_id)),
+                ) if kind == "exception" else
+                node_identity_cell(graph, int(source_id))
+            )
+            value_cell = node_identity_cell(graph, int(value_id))
+            if source_cell is None or value_cell is None:
+                raise ValueError(
+                    "finalbody Phi entry lost its source or value cell: "
+                    f"phi={phi_id}, kind={kind!r}, source={source_id}, "
+                    f"value={value_id}"
+                )
+            if kind == "exception":
+                transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest((
+                    scope, int(source_id),
+                ))
+                if transfer is None or dict(transfer.entry_bindings).get(
+                    name
+                ) != value_cell:
+                    raise ValueError(
+                        "finalbody Phi exceptional arm disagrees with "
+                        f"its source transfer: phi={phi_id}, source={source_id}"
+                    )
+            elif kind not in {"success", "handler"}:
+                raise ValueError(
+                    f"finalbody Phi has unknown source arm {kind!r}"
+                )
+            entries.append((str(kind), source_cell, value_cell))
+        fact = ExceptionFinalizerPhiFact(
+            owner_cell, phi_cell, name, tuple(entries),
+        )
+        row = (scope, int(phi_id))
+        previous = book.page(SOURCE_EXCEPTION_FINALIZER_PHI).latest(row)
+        book.post(
+            SOURCE_EXCEPTION_FINALIZER_PHI, row, fact,
+            stage=EXCEPTION_TOPOLOGY,
+            provenance=Derived(tuple(dict.fromkeys((
+                owner_cell, phi_cell,
+                *(cell for _kind, source_cell, value_cell in entries
+                  for cell in (source_cell, value_cell)),
             )))),
             mode=Mode.CONCORD if previous is None or previous == fact
             else Mode.REVISE,

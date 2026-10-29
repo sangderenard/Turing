@@ -6834,7 +6834,6 @@ def analyze_shader_loop_reductions(
                         )
                     )
                 )
-                or try_statement.finalbody
                 or any(
                     isinstance(member, (
                         ast.Return, ast.If, ast.For, ast.While,
@@ -6846,6 +6845,15 @@ def analyze_shader_loop_reductions(
                           for item in handler.body),
                     )
                     for member in ast.walk(statement)
+                )
+                or any(
+                    isinstance(member, (
+                        ast.Return, ast.Break, ast.Continue, ast.If,
+                        ast.For, ast.While, ast.Try, ast.TryStar,
+                        ast.Yield, ast.YieldFrom, ast.Await,
+                    ))
+                    for final_statement in try_statement.finalbody
+                    for member in ast.walk(final_statement)
                 )
             ):
                 blockers.append("try-exception-entry-state-not-composed")

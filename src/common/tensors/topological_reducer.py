@@ -57,6 +57,8 @@ from ...compiler.concordance_declarations import (
     SCALAR_PARAMETER as _SCALAR_PARAMETER,
     SCHEMA_NODE as _SCHEMA_NODE,
     SOURCE_CALL_RESULT_IDENTITY as _SOURCE_CALL_RESULT_IDENTITY,
+    SOURCE_EXCEPTION_SITE_STATE as _SOURCE_EXCEPTION_SITE_STATE,
+    ExceptionSiteStateFact as _ExceptionSiteStateFact,
     SOURCE_AGGREGATE_LAYOUT as _SOURCE_AGGREGATE_LAYOUT,
     SOURCE_GLYPH_SEQUENCE as _SOURCE_GLYPH_SEQUENCE,
     SOURCE_ENUM_GLYPH_TABLE as _SOURCE_ENUM_GLYPH_TABLE,
@@ -5143,6 +5145,12 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             isinstance(expression, ast.IfExp)
             and str(data.get("type") or "") == "IfExp"
         )
+        exception_phi = (
+            str(data.get("type") or data.get("op") or "").casefold() == "phi"
+            and (data.get("attributes") or {}).get(
+                "source_exception_finally_id"
+            ) is not None
+        )
         loop_attributes = data.get("attributes") or {}
         if (
             isinstance(expression, ast.For)
@@ -5291,7 +5299,12 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
                         )
                         changed = True
             continue
-        if conditional_phi:
+        if exception_phi:
+            roles = tuple(
+                f"entry:{index}"
+                for index, _parent in enumerate(data.get("parents") or ())
+            )
+        elif conditional_phi:
             roles = ("body", "orelse")
         elif isinstance(expression, (ast.BinOp, ast.AugAssign, ast.Compare)):
             roles = ("lhs", "rhs")
@@ -5324,7 +5337,7 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             for cell in operand_cells
         )
         result_limbs = 1
-        if conditional_phi:
+        if conditional_phi or exception_phi:
             # The optional fingerprint's present and computed arms both
             # prove int, but their control-owned merge previously lost that
             # class. A merge inherits a scalar class only when EVERY exact
@@ -5344,7 +5357,11 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
         _concord_source_value_class(
             scope, value_id, result_class,
             precision_limbs=result_limbs,
-            source="conditional scalar arm classes" if conditional_phi else "builtin scalar operator result",
+            source=(
+                "exceptional finalizer arm classes" if exception_phi
+                else "conditional scalar arm classes" if conditional_phi
+                else "builtin scalar operator result"
+            ),
             provenance=_Derived(tuple(dict.fromkeys(
                 cell for cell in (node_cell, *operand_cells, *(
                     (node_identity_cell(graph, parents["test"]),) if conditional_phi else ()
@@ -6880,13 +6897,10 @@ def _normalize_lexical_values(
     )
     environment: dict[str, int] = {}
     static_environment: dict[str, _StaticPythonReference] = {}
-    # The source exception-transfer fact owns the execution state at each
-    # fallible source operation.  Keep exact authored occurrences until the
-    # topology pass can correlate them with their source graph cells.  In
-    # particular, the second conversion in tensor_octets_to_bytes sees the
-    # first conversion's binding, while the first does not.
-    exception_site_bindings: dict[int, tuple[tuple[str, int], ...]] = {}
-    graph.G.graph["source_exception_site_bindings"] = exception_site_bindings
+    # The ingestion SOURCE_EXCEPTION_SITE_STATE page owns the lexical values
+    # at each fallible source operation. The later transfer derives its
+    # canonical state from that page. In the codec, the second conversion
+    # sees the first conversion's binding while the first does not.
     handler_entry_receipts: dict[int, dict[str, Any]] = {}
     graph.G.graph["source_exception_handler_entries"] = (
         handler_entry_receipts
@@ -6895,17 +6909,46 @@ def _normalize_lexical_values(
     def capture_exception_site(expression: ast.AST) -> None:
         if id(expression) not in graph.G:
             return
+        source_cell = node_identity_cell(graph, id(expression))
         bindings = tuple(sorted(
-            (str(name), int(value))
+            (str(name), node_identity_cell(graph, int(value)))
             for name, value in environment.items()
             if isinstance(value, int) and not isinstance(value, bool)
         ))
-        prior = exception_site_bindings.setdefault(id(expression), bindings)
-        if prior != bindings:
+        if source_cell is None or any(cell is None for _name, cell in bindings):
+            raise ValueError(
+                "exception site has no concordance identity for its "
+                f"lexical state: site={id(expression)}"
+            )
+        fact = _ExceptionSiteStateFact(source_cell, bindings)
+        book = current_identity_book()
+        row = (ingestion_read_scope, id(expression))
+        prior_fact = book.page(_SOURCE_EXCEPTION_SITE_STATE).latest(row)
+        if prior_fact is not None and prior_fact != fact:
             raise ValueError(
                 "one source exception site has conflicting lexical states: "
-                f"node={id(expression)}, before={prior!r}, after={bindings!r}"
+                f"node={id(expression)}, before={prior_fact!r}, after={fact!r}"
             )
+        if prior_fact is None:
+            book.post(
+                _SOURCE_EXCEPTION_SITE_STATE, row, fact,
+                stage=_REDUCTION,
+                provenance=_Derived(tuple(dict.fromkeys((
+                    source_cell, *(cell for _name, cell in bindings),
+                )))),
+                mode=_Mode.CONCORD,
+            )
+
+    def exception_site_state(site_id: int) -> dict[str, int] | None:
+        fact = current_identity_book().page(
+            _SOURCE_EXCEPTION_SITE_STATE
+        ).latest((ingestion_read_scope, int(site_id)))
+        if fact is None:
+            return None
+        return {
+            str(name): int(cell.row[1])
+            for name, cell in fact.bindings
+        }
     deleted_names: set[str] = set()
     identity_bindings: dict[str, list[int]] = {}
     # Exact AST ownership of assignment sites, not a source-line containment
@@ -17342,12 +17385,17 @@ def _normalize_lexical_values(
                 for statement in body_statement.body
                 for member in ast.walk(statement)
                 if isinstance(member, (ast.Call, ast.Raise))
-                and id(member) in exception_site_bindings
+                and exception_site_state(id(member)) is not None
             ))
             body_exception_states = tuple(
-                dict(exception_site_bindings[site_id])
+                exception_site_state(site_id)
                 for site_id in body_exception_sites
             )
+            if any(state is None for state in body_exception_states):
+                raise ValueError(
+                    "protected source operation has no concorded "
+                    f"entry state: try={id(body_statement)}"
+                )
             body_ends_in_raise = bool(
                 body_statement.body
                 and isinstance(body_statement.body[-1], ast.Raise)
@@ -17512,6 +17560,83 @@ def _normalize_lexical_values(
                         # resolution a Phi would, without inventing a second
                         # node or a synthetic "did-raise" boolean.
                         environment[name] = id(body_statement)
+            if body_statement.finalbody:
+                # Program: z = int(x) in a loop Try, whose handler raises,
+                # followed by finally: z = z + 1. The success arm binds z to
+                # the int Call, but that Call has no result on its failure
+                # edge. The exceptional transfer records the earlier z.
+                # A finalbody read needs a control-owned join of those exact
+                # values; reducing it under the success-only environment
+                # would give the error edge a non-dominating Call operand.
+                finalbody_reads = set().union(*(
+                    _source_read_names(final_statement)
+                    for final_statement in body_statement.finalbody
+                ))
+                finalbody_states = (
+                    [(("success", id(body_statement)), successful_environment)]
+                    if not body_ends_in_raise else []
+                )
+                finalbody_states.extend(
+                    (("handler", id(handler)), candidate)
+                    for handler, candidate in zip(
+                        body_statement.handlers, handler_environments,
+                    )
+                )
+                for exception_statement in (
+                    *body_statement.body,
+                    *(item for handler in body_statement.handlers
+                      for item in handler.body),
+                    *body_statement.orelse,
+                ):
+                    for member in ast.walk(exception_statement):
+                        site_state = exception_site_state(id(member))
+                        if site_state is not None:
+                            finalbody_states.append((
+                                ("exception", id(member)), dict(site_state),
+                            ))
+                for name in sorted(finalbody_reads):
+                    incoming = tuple(
+                        (edge, state.get(name))
+                        for edge, state in finalbody_states
+                    )
+                    values = {value for _edge, value in incoming}
+                    if values == {None}:
+                        # A name absent from every lexical state may be a
+                        # static exception class; the ordinary resolver owns
+                        # that identity when it reduces finalbody below.
+                        continue
+                    if None in values:
+                        raise ValueError(
+                            "finalbody reads a name missing from an entry: "
+                            f"try={id(body_statement)}, name={name!r}, "
+                            f"incoming={incoming!r}"
+                        )
+                    if len(values) == 1:
+                        environment[name] = int(next(iter(values)))
+                    elif values:
+                        parents = tuple(
+                            (int(value), f"entry:{index}")
+                            for index, (_edge, value) in enumerate(incoming)
+                        )
+                        entry_phi = new_node(
+                            "Phi", name,
+                            attributes={
+                                "source_exception_finally_id": id(body_statement),
+                                "source_exception_finally_name": name,
+                                "source_exception_finally_entries": tuple(
+                                    edge for edge, _value in incoming
+                                ),
+                            },
+                            parents=parents,
+                            source=body_statement,
+                            source_cell=tuple(dict.fromkeys((
+                                node_identity_cell(graph, id(body_statement)),
+                                *(node_identity_cell(graph, int(value))
+                                  for _edge, value in incoming),
+                            ))),
+                        )
+                        environment[name] = entry_phi
+                        identity_bindings.setdefault(name, []).append(entry_phi)
             for nested in body_statement.finalbody:
                 reduce_statement(nested)
             return id(body_statement)
@@ -19061,9 +19186,14 @@ def _normalize_lexical_values(
     # lexical values must cross the same canonical relabel as every operand.
     # A live failure edge may not carry an ingestion id into canonical SSA.
     canonical_exception_states = {}
-    for site_id, bindings in (
-        graph.G.graph.get("source_exception_site_bindings") or {}
-    ).items():
+    site_page = current_identity_book().page(_SOURCE_EXCEPTION_SITE_STATE)
+    for site_row in site_page.scope_rows(ingestion_read_scope):
+        site_id = int(site_row[1])
+        site_fact = site_page.latest(site_row)
+        bindings = tuple(
+            (name, int(cell.row[1]))
+            for name, cell in site_fact.bindings
+        )
         if int(site_id) not in mapping:
             continue
         missing = tuple(
@@ -19079,9 +19209,6 @@ def _normalize_lexical_values(
             (name, int(mapping[int(value_id)]))
             for name, value_id in bindings
         )
-    ordered_graph.graph["source_exception_site_bindings"] = (
-        canonical_exception_states
-    )
     canonical_handler_entries = {}
     for handler_id, receipt in (
         graph.G.graph.get("source_exception_handler_entries") or {}
@@ -19135,6 +19262,41 @@ def _normalize_lexical_values(
             tuple(node_token_chains[node_id]),
             stage=_CANONICAL_RELABEL_STAGE,
             provenance=_Derived((node_identity_cell(graph, node_id),)),
+            mode=_Mode.CONCORD,
+        )
+    ingestion_id_for_canonical = {
+        int(canonical_id): int(raw_id)
+        for raw_id, canonical_id in mapping.items()
+    }
+    for site_id, bindings in canonical_exception_states.items():
+        source_cell = book.latest_ref(
+            _CANONICAL_VALUE, (read_scope, int(site_id)),
+        )
+        binding_cells = tuple(
+            (name, book.latest_ref(
+                _CANONICAL_VALUE, (read_scope, int(value_id)),
+            )) for name, value_id in bindings
+        )
+        if source_cell is None or any(
+            cell is None for _name, cell in binding_cells
+        ):
+            raise ValueError(
+                "canonical exception state lost a source or value cell: "
+                f"site={site_id}"
+            )
+        ingestion_site_id = ingestion_id_for_canonical[int(site_id)]
+        ingestion_cell = book.latest_ref(
+            _SOURCE_EXCEPTION_SITE_STATE,
+            (ingestion_read_scope, int(ingestion_site_id)),
+        )
+        book.post(
+            _SOURCE_EXCEPTION_SITE_STATE, (read_scope, int(site_id)),
+            _ExceptionSiteStateFact(source_cell, binding_cells),
+            stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived(tuple(dict.fromkeys((
+                ingestion_cell, source_cell,
+                *(cell for _name, cell in binding_cells),
+            )))),
             mode=_Mode.CONCORD,
         )
     canonical_page = book.page(_CANONICAL_VALUE)
@@ -19935,6 +20097,32 @@ def _normalize_lexical_values(
                 attributes["source_conditional_id"] = mapping[
                     source_conditional_id
                 ]
+        if "source_exception_finally_id" in attributes:
+            source_finally_id = int(attributes["source_exception_finally_id"])
+            if source_finally_id not in mapping:
+                raise ValueError(
+                    "finalbody Phi lost its exact source Try identity: "
+                    f"phi={node_id}, try={source_finally_id}"
+                )
+            attributes["source_exception_finally_id"] = int(
+                mapping[source_finally_id]
+            )
+            predecessors = tuple(attributes.get(
+                "source_exception_finally_entries", (),
+            ))
+            missing = tuple(
+                (kind, source_id) for kind, source_id in predecessors
+                if int(source_id) not in mapping
+            )
+            if missing:
+                raise ValueError(
+                    "finalbody Phi lost predecessor identities: "
+                    f"phi={node_id}, missing={missing!r}"
+                )
+            attributes["source_exception_finally_entries"] = tuple(
+                (str(kind), int(mapping[int(source_id)]))
+                for kind, source_id in predecessors
+            )
         if "initial_value_id" in attributes:
             initial_value_id = attributes["initial_value_id"]
             if initial_value_id in mapping:

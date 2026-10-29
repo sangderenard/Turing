@@ -9,7 +9,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
 
 import networkx as nx
@@ -92,6 +92,7 @@ from .concordance_declarations import (
     NAME_BINDING,
     NO_PRODUCER_AT_USE,
     PHI_CONDITIONAL,
+    PHI_EXCEPTION_FINALIZER,
     PHI_LOOP_EXIT,
     PHI_LOOP_HEADER,
     PHI_RETURN_MERGE,
@@ -2186,6 +2187,11 @@ class _NativeTryFrame:
     owner: Ref | None
     handler_entries: tuple[BasicBlock, ...]
     phase: str = "body"
+    finalizer_entry: BasicBlock | None = None
+    finalizer_facts: tuple[tuple[int, Any, Ref], ...] = ()
+    finalizer_edges: list[tuple[BasicBlock, SSAValue, tuple[SSAValue, ...]]] = field(
+        default_factory=list
+    )
 
 
 class _ControlSSABuilder(TiledObject):
@@ -10186,6 +10192,14 @@ class _ControlSSABuilder(TiledObject):
             })
             self.current = next_handler
 
+        if frame.finalizer_entry is not None:
+            self._native_finalizer_edge(
+                frame, status, kind="exception", source=transfer_cell,
+                path=location,
+            )
+            self._protected_call_edges.add((frame.owner, source_id))
+            self.current = passed
+            return
         self.emit(
             Handler.Call, [status],
             attributes={
@@ -10494,6 +10508,140 @@ class _ControlSSABuilder(TiledObject):
             self._function_exit = self.new_block("function_exit")
         return self._function_exit
 
+    def _native_finalizer_edge(
+        self, frame: _NativeTryFrame, status: SSAValue,
+        *, kind: str, source: Ref, path: str,
+    ) -> None:
+        """Carry one exact lexical state and pending status into finally."""
+
+        if frame.finalizer_entry is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "native-finally", path,
+                "source Try has no finalizer entry block",
+            ))
+            return
+        if self.current.name in self._dead_control_blocks:
+            return
+        values = []
+        for phi_id, fact, fact_cell in frame.finalizer_facts:
+            matches = tuple(
+                value_cell for edge_kind, edge_source, value_cell
+                in fact.entries
+                if edge_kind == kind and edge_source == source
+            )
+            if len(matches) != 1:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-finally", path,
+                    "finalizer Phi has no unique source edge: "
+                    f"phi={phi_id}, kind={kind}, source={source!r}",
+                ))
+                return
+            value_cell = matches[0]
+            if value_cell.page != CANONICAL_VALUE:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-finally", path,
+                    f"finalizer Phi {phi_id} has no canonical entry value",
+                ))
+                return
+            values.append(self.external_value(int(value_cell.row[1])))
+        predecessor = self.current
+        self.branch(frame.finalizer_entry)
+        if predecessor.name in self._dead_control_blocks:
+            return
+        predecessor.instrs[-1].attributes.update({
+            "source_control": "exception_finalizer_entry",
+            "source_try_cell": frame.owner,
+            "source_edge_kind": kind,
+            "source_edge_cell": source,
+        })
+        frame.finalizer_edges.append((predecessor, status, tuple(values)))
+
+    def _finish_native_finalizer(
+        self, frame: _NativeTryFrame, exit_block: BasicBlock, *, path: str,
+    ) -> None:
+        """Join exact incoming values, run finally, then propagate status."""
+
+        if frame.finalizer_entry is None:
+            return
+        edges = tuple(frame.finalizer_edges)
+        if not edges:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "native-finally", path,
+                "finalizer has no reachable source predecessor",
+            ))
+            return
+        self.current = frame.finalizer_entry
+        blocks = tuple(predecessor.name for predecessor, _status, _values in edges)
+        for position, (phi_id, _fact, fact_cell) in enumerate(
+            frame.finalizer_facts
+        ):
+            arms = tuple(values[position] for _block, _status, values in edges)
+            dtypes = {str(value.dtype) for value in arms}
+            if len(dtypes) != 1:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-finally", path,
+                    f"finalizer Phi {phi_id} has incompatible arm dtypes: "
+                    f"{tuple(sorted(dtypes))!r}",
+                ))
+                continue
+            merged = self.fresh_value(
+                dtype=next(iter(dtypes)),
+                transform=PHI_EXCEPTION_FINALIZER,
+                operands=(fact_cell, *arms),
+                physical=self._phi_physical(*arms),
+            )
+            self.emit(
+                Handler.Phi, list(arms), merged,
+                attributes={
+                    "incoming_blocks": blocks,
+                    "binding": "exception_finalizer_entry",
+                    "source_finalizer_phi_cell": fact_cell,
+                },
+            )
+            self._bind(
+                phi_id, merged, BindingKind.EXCEPTION_FINALIZER_MERGE,
+                fact_cell,
+            )
+        statuses = tuple(status for _block, status, _values in edges)
+        if len(statuses) == 1:
+            pending = statuses[0]
+        else:
+            pending = self.fresh_value(
+                dtype="int64", transform=PHI_EXCEPTION_FINALIZER,
+                operands=(frame.owner, *statuses),
+            )
+            self.emit(
+                Handler.Phi, list(statuses), pending,
+                attributes={
+                    "incoming_blocks": blocks,
+                    "binding": "exception_finalizer_status",
+                    "source_try_cell": frame.owner,
+                },
+            )
+        frame.phase = "finalbody"
+        self.lower(frame.block.finalbody, path=f"{path}.finalbody")
+        clear = self.fresh_value(
+            dtype="bool", transform=CONTROL_PREDICATE,
+            operands=(pending,),
+        )
+        self.emit(
+            Handler.Eq,
+            [pending, self.constant_value(0, pending, dtype="int64")], clear,
+        )
+        fault = self.new_block("native_try_call_failure")
+        self.conditional_branch(clear, exit_block, fault)
+        self.current = fault
+        self.emit(
+            Handler.Call, [pending],
+            attributes={
+                "callee": "turing_validation_error",
+                "source_try_cell": frame.owner,
+            },
+        )
+        if self._fault_exit is None:
+            self._fault_exit = self.new_block("validation_fault_exit")
+        self.branch(self._fault_exit)
+
     def _native_raise_handler(
         self, block: ValidationBlock, *, path: str,
     ) -> tuple[BasicBlock, int, Ref] | None:
@@ -10532,11 +10680,11 @@ class _ControlSSABuilder(TiledObject):
                 f"source raise {block.source_raise_node_id} has no exact exception edge",
             ))
             return None
-        if transfer.unwind_finally:
+        if transfer.unwind_finally and transfer.catch_try is not None:
             self.shortfalls.append(SSALoweringShortfall(
                 "control", "raise", path,
-                "native raise crosses a finally arm without a lowered "
-                f"finalizer edge: {transfer.unwind_finally!r}",
+                "native raise needs a finalizer before an outer handler: "
+                f"{transfer.unwind_finally!r}",
             ))
             return None
         target = transfer.catch_try
@@ -12358,7 +12506,8 @@ class _ControlSSABuilder(TiledObject):
             return
         if isinstance(block, NativeTryBlock):
             from .concordance_declarations import (
-                CANONICAL_VALUE, SOURCE_EXCEPTION_TRANSFER,
+                CANONICAL_VALUE, SOURCE_EXCEPTION_FINALIZER_PHI,
+                SOURCE_EXCEPTION_TRANSFER,
             )
 
             owner = (
@@ -12406,18 +12555,24 @@ class _ControlSSABuilder(TiledObject):
                         "protected call has no exact source exception edge: "
                         f"call={source_call_id}, try={block.source_try_node_id}",
                     ))
-            if _flatten_control_sequence(block.finalbody):
-                self.shortfalls.append(SSALoweringShortfall(
-                    "control", "native-try", path,
-                    f"Try {block.source_try_node_id} has a finalbody whose "
-                    "exceptional SSA edge is not lowered",
-                ))
             handlers = tuple(
                 self.new_block("native_try_handler")
                 for _ in block.handlers
             )
             exit_block = self.new_block("native_try_exit")
             frame = _NativeTryFrame(block, owner, handlers)
+            if _flatten_control_sequence(block.finalbody):
+                frame.finalizer_entry = self.new_block(
+                    "native_try_exception_finally"
+                )
+                page = self._book().page(SOURCE_EXCEPTION_FINALIZER_PHI)
+                frame.finalizer_facts = tuple(
+                    (int(row[1]), page.latest(row),
+                     self._book().latest_ref(SOURCE_EXCEPTION_FINALIZER_PHI, row))
+                    for row in page.rows()
+                    if row[0] == self.lexical_read_scope
+                    and page.latest(row).owner == owner
+                )
             self.native_try_frames.append(frame)
             try:
                 self.lower(block.body, path=f"{path}.try_body")
@@ -12434,8 +12589,15 @@ class _ControlSSABuilder(TiledObject):
                 frame.phase = "orelse"
                 if block.orelse is not None:
                     self.lower(block.orelse, path=f"{path}.try_orelse")
-                self.lower(block.finalbody, path=f"{path}.try_finalbody")
-                self.branch(exit_block)
+                if frame.finalizer_entry is not None and owner is not None:
+                    self._native_finalizer_edge(
+                        frame,
+                        self.constant_value(0, owner, dtype="int64"),
+                        kind="success", source=owner, path=path,
+                    )
+                else:
+                    self.lower(block.finalbody, path=f"{path}.try_finalbody")
+                    self.branch(exit_block)
                 for index, handler in enumerate(block.handlers):
                     self.current = handlers[index]
                     frame.phase = "handler"
@@ -12443,11 +12605,34 @@ class _ControlSSABuilder(TiledObject):
                         handler.body,
                         path=f"{path}.handler[{index}]",
                     )
-                    self.lower(
-                        block.finalbody,
-                        path=f"{path}.handler[{index}].finalbody",
-                    )
-                    self.branch(exit_block)
+                    if frame.finalizer_entry is not None:
+                        handler_cell = self._book().latest_ref(
+                            CANONICAL_VALUE,
+                            (self.lexical_read_scope,
+                             int(handler.source_handler_node_id)),
+                        )
+                        if handler_cell is None:
+                            self.shortfalls.append(SSALoweringShortfall(
+                                "control", "native-finally", path,
+                                "handler has no exact source cell",
+                            ))
+                        else:
+                            self._native_finalizer_edge(
+                                frame,
+                                self.constant_value(
+                                    0, handler_cell, dtype="int64",
+                                ),
+                                kind="handler", source=handler_cell,
+                                path=f"{path}.handler[{index}]",
+                            )
+                    else:
+                        self.lower(
+                            block.finalbody,
+                            path=f"{path}.handler[{index}].finalbody",
+                        )
+                        self.branch(exit_block)
+                if frame.finalizer_entry is not None:
+                    self._finish_native_finalizer(frame, exit_block, path=path)
             finally:
                 self.native_try_frames.pop()
             self.current = exit_block
@@ -12976,6 +13161,42 @@ class _ControlSSABuilder(TiledObject):
                 if literal_failure:
                     self._dead_control_blocks.add(passed.name)
                 return
+            if (
+                block.source_raise_node_id is not None
+                and self.lexical_read_scope is not None
+                and native_status is not None
+            ):
+                row = (
+                    self.lexical_read_scope,
+                    int(block.source_raise_node_id),
+                )
+                transfer = self._book().page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+                transfer_cell = self._book().latest_ref(
+                    SOURCE_EXCEPTION_TRANSFER, row,
+                )
+                finalizer_frames = tuple(
+                    frame for frame in reversed(self.native_try_frames)
+                    if frame.finalizer_entry is not None
+                    and frame.phase != "finalbody"
+                    and transfer is not None
+                    and frame.owner in (
+                        *transfer.unwind_finally,
+                        transfer.catch_try,
+                    )
+                )
+                if len(finalizer_frames) == 1 and transfer_cell is not None:
+                    status_value = self.constant_value(
+                        int(native_status), transfer_cell, dtype="int64",
+                    )
+                    self._native_finalizer_edge(
+                        finalizer_frames[0], status_value,
+                        kind="exception", source=transfer_cell,
+                        path=path,
+                    )
+                    self.current = passed
+                    if literal_failure:
+                        self._dead_control_blocks.add(passed.name)
+                    return
             self.emit(
                 Handler.Call, [], attributes={
                     "callee": "turing_validation_error",

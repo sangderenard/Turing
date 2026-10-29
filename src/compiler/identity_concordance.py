@@ -1935,8 +1935,10 @@ class CorrelationTable:
             Arm, CALL_BINDING, CANONICAL_VALUE, CONTROL_BLOCK,
             CONTROL_BLOCK_PLACEMENT, ControlBlockKind,
             DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
-            NATIVE_STATUS_CLASS,
-            SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_TRANSFER,
+            INGESTION_VALUE, NATIVE_STATUS_CLASS, SCOPE_ORIGIN,
+            SOURCE_EXCEPTION_FINALIZER_PHI,
+            SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_TRANSFER,
             STATIC_SYMBOL_DEFINITION,
         )
         from .native_faults import NATIVE_STATUS_CLASS_IDENTITIES
@@ -1946,6 +1948,52 @@ class CorrelationTable:
             return []
         page = book.page(SOURCE_EXCEPTION_TRANSFER)
         found: list[Finding] = []
+        state_page = book.page(SOURCE_EXCEPTION_SITE_STATE)
+        for state_row in state_page.rows():
+            state = state_page.latest(state_row)
+            state_cell = book.latest_ref(SOURCE_EXCEPTION_SITE_STATE, state_row)
+            state_causes = {
+                source for source, _stage in (
+                    () if state_cell is None else book.edges_into(state_cell)
+                )
+            }
+            fork = book.page(SCOPE_ORIGIN).latest((state_row[0],))
+            origin_row = (
+                None if fork is None else
+                (fork.source_scope, int(state_row[1]))
+            )
+            origin_cell = (
+                None if origin_row is None else
+                book.latest_ref(SOURCE_EXCEPTION_SITE_STATE, origin_row)
+            )
+            origin_backed = (
+                origin_cell is not None
+                and state_page.latest(origin_row) == state
+                and origin_cell in state_causes
+            )
+            if (
+                int(state.source.row[1]) != int(state_row[1])
+                or (state.source not in state_causes and not origin_backed)
+            ):
+                found.append(Finding(
+                    "source-exception-site-owner-disagree", str(state_row[0]),
+                    int(state_row[1]), f"source={state.source!r}",
+                ))
+            names = tuple(name for name, _cell in state.bindings)
+            if names != tuple(sorted(set(names))):
+                found.append(Finding(
+                    "source-exception-site-names-disagree", str(state_row[0]),
+                    int(state_row[1]), f"names={names!r}",
+                ))
+            for name, value_cell in state.bindings:
+                if (
+                    value_cell.page not in {INGESTION_VALUE, CANONICAL_VALUE}
+                    or (value_cell not in state_causes and not origin_backed)
+                ):
+                    found.append(Finding(
+                        "source-exception-site-value-disagree", str(state_row[0]),
+                        int(state_row[1]), f"{name}={value_cell!r}",
+                    ))
         status_page = book.page(NATIVE_STATUS_CLASS)
         status_rows = tuple(status_page.rows())
         if status_rows and {int(row[0]) for row in status_rows} != set(
@@ -2018,6 +2066,23 @@ class CorrelationTable:
                 )
             }
             class_cell = fact.raised_class_definition
+            site_state = state_page.latest(row)
+            site_cell = book.latest_ref(SOURCE_EXCEPTION_SITE_STATE, row)
+            if (
+                site_state is None
+                or tuple(
+                    (name, int(value_cell.row[1]))
+                    for name, value_cell in site_state.bindings
+                ) != tuple(
+                    (name, int(value_cell.row[1]))
+                    for name, value_cell in entry
+                )
+                or site_cell not in causes
+            ):
+                found.append(Finding(
+                    "source-exception-transfer-state-disagree", str(row[0]),
+                    int(row[1]), f"site={site_state!r}, transfer={entry!r}",
+                ))
             if class_cell is not None and (
                 fact.source_kind != "raise"
                 or class_cell.page != STATIC_SYMBOL_DEFINITION
@@ -2104,6 +2169,52 @@ class CorrelationTable:
                             f"{name!r} from {transfer_cell!r} "
                             f"is not {value_cell!r}",
                         ))
+        finalizer_page = book.page(SOURCE_EXCEPTION_FINALIZER_PHI)
+        for row in finalizer_page.rows():
+            fact = finalizer_page.latest(row)
+            finalizer_cell = book.latest_ref(SOURCE_EXCEPTION_FINALIZER_PHI, row)
+            causes = {
+                source for source, _stage in (
+                    () if finalizer_cell is None
+                    else book.edges_into(finalizer_cell)
+                )
+            }
+            if (
+                fact.phi.row != row
+                or fact.owner.row[0] != row[0]
+                or fact.phi not in causes
+                or fact.owner not in causes
+            ):
+                found.append(Finding(
+                    "source-exception-finalizer-owner-disagree", str(row[0]),
+                    int(row[1]), f"owner={fact.owner!r}, phi={fact.phi!r}",
+                ))
+            for kind, source_cell, value_cell in fact.entries:
+                transfer = (
+                    page.cell(source_cell.row, source_cell.column)
+                    if source_cell.page == SOURCE_EXCEPTION_TRANSFER else None
+                )
+                if (
+                    kind not in {"success", "handler", "exception"}
+                    or source_cell not in causes
+                    or value_cell not in causes
+                    or value_cell.page != CANONICAL_VALUE
+                    or value_cell.row[0] != row[0]
+                    or (kind == "exception" and (
+                        transfer is None
+                        or dict(transfer.entry_bindings).get(fact.name)
+                        != value_cell
+                    ))
+                    or (kind != "exception" and (
+                        source_cell.page != CANONICAL_VALUE
+                        or source_cell.row[0] != row[0]
+                    ))
+                ):
+                    found.append(Finding(
+                        "source-exception-finalizer-entry-disagree",
+                        str(row[0]), int(row[1]),
+                        f"{kind}: source={source_cell!r}, value={value_cell!r}",
+                    ))
         if CONTROL_BLOCK.name in book.pages:
             control_page = book.page(CONTROL_BLOCK)
             for row in control_page.rows():

@@ -1148,6 +1148,20 @@ EXCEPTION_TOPOLOGY = declare_stage("exception_topology")
 
 
 @dataclass(frozen=True)
+class ExceptionSiteStateFact:
+    source: Ref
+    bindings: tuple[tuple[str, Ref], ...]
+
+
+SOURCE_EXCEPTION_SITE_STATE = declare_page(
+    "source_exception_site_state", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("source_node", K.VALUE_ID),
+    ), ExceptionSiteStateFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionTransferFact:
     source: Ref
     source_kind: str
@@ -1183,6 +1197,24 @@ SOURCE_EXCEPTION_HANDLER_ENTRY = declare_page(
         RowField("source_scope", K.SCOPE),
         RowField("handler_node", K.VALUE_ID),
     ), ExceptionHandlerEntryFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionFinalizerPhiFact:
+    owner: Ref
+    phi: Ref
+    name: str
+    # In graph operand order: source edge kind, exact source control or
+    # transfer cell, and the canonical value entering from that edge.
+    entries: tuple[tuple[str, Ref, Ref], ...]
+
+
+SOURCE_EXCEPTION_FINALIZER_PHI = declare_page(
+    "source_exception_finalizer_phi", (
+        RowField("source_scope", K.SCOPE),
+        RowField("phi_node", K.VALUE_ID),
+    ), ExceptionFinalizerPhiFact,
 )
 # Native validation status to Python-semantic exception class. The fact is
 # the static definition cell of that class; native-width limitations have
@@ -1366,6 +1398,7 @@ CONTROL_PREDICATE = declare_transform("control_predicate", 1)
 CONTROL_EXPRESSION = declare_transform("control_expression", 1)
 CONTROL_CAST = declare_transform("control_cast", 1)
 PHI_CONDITIONAL = declare_transform("phi_conditional", 1)
+PHI_EXCEPTION_FINALIZER = declare_transform("phi_exception_finalizer", 1)
 PHI_LOOP_HEADER = declare_transform("phi_loop_header", 1)
 PHI_LOOP_EXIT = declare_transform("phi_loop_exit", 1)
 PHI_RETURN_MERGE = declare_transform("phi_return_merge", 1)
@@ -1545,6 +1578,7 @@ class BindingKind(Enum):
     SEQUENCE_RESULT = "sequence_result"
     RESTORED = "restored"
     CONDITIONAL_MERGE = "conditional_merge"
+    EXCEPTION_FINALIZER_MERGE = "exception_finalizer_merge"
     LOOP_RESULT_PORT = "loop_result_port"
     LOOP_SEED = "loop_seed"
     LOOP_HEADER = "loop_header"
@@ -3070,6 +3104,7 @@ class SSABlockKind(Enum):
     NATIVE_TRY_EXIT = "native_try_exit"
     NATIVE_TRY_CALL_SUCCESS = "native_try_call_success"
     NATIVE_TRY_CALL_FAILURE = "native_try_call_failure"
+    NATIVE_TRY_EXCEPTION_FINALLY = "native_try_exception_finally"
     UNREACHABLE_RAISE = "unreachable_raise"
     STATE_CASE = "state_case"
     STATE_NEXT = "state_next"
