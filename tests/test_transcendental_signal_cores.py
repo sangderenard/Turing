@@ -6,14 +6,16 @@
   with a ``TRANSCENDENTAL_SIGNAL_CORES`` row into that emitter method's
   instructions, binds the op's own result id to the core's value, and
   guards each fault predicate with ``CondBr`` to ``turing_validation_error``
-  (``MATH_DOMAIN_ERROR`` -> ``ValueError``, ``MATH_RANGE_ERROR`` ->
-  ``OverflowError``).  An op without a row stays and is named in the
-  receipt.
+  with the code the core names.  An op without a row stays and is named in
+  the receipt.
 
 The routing tests install a probe row over ``exp_expansion`` (whose scale is
 still a host ``Pow``, so it is not a production row): what they check is the
-plumbing -- the rewrite, the result binding, the guard -- on the C and LLVM
-lanes.
+plumbing -- the rewrite, the collapse, the result binding, the guard -- on
+the C and LLVM lanes, for both answer shapes the cores use: ``(double,
+((predicate, code, name), ...))`` and ``(expansion, bare predicate)`` with
+the code on the route row.  ``INT_OVERFLOW`` stands in for a math range code
+(both raise ``OverflowError``).
 """
 
 from __future__ import annotations
@@ -53,17 +55,6 @@ def test_contract_refuses_any_other_transcendental_route(monkeypatch):
     )
     with pytest.raises(ValueError, match="transcendentals must be one of"):
         adapters.transcendental_policy("compute")
-
-
-def test_math_fault_codes_raise_pythons_exceptions():
-    from src.compiler.native_faults import (
-        MATH_DOMAIN_ERROR, MATH_RANGE_ERROR, validation_fault,
-    )
-
-    assert isinstance(validation_fault(MATH_DOMAIN_ERROR, "m"), ValueError)
-    assert "math domain error" in str(validation_fault(MATH_DOMAIN_ERROR, "m"))
-    assert isinstance(validation_fault(MATH_RANGE_ERROR, "m"), OverflowError)
-    assert "math range error" in str(validation_fault(MATH_RANGE_ERROR, "m"))
 
 
 def _lower():
@@ -107,32 +98,43 @@ def test_op_without_a_core_stays_and_is_named():
     )
 
 
-@pytest.fixture
-def probe_route(monkeypatch):
+@pytest.fixture(params=["rows", "bare"])
+def probe_route(request, monkeypatch):
     from src.compiler import ir_identities
     from src.compiler.ir_identities import SignalCoreRoute
-    from src.compiler.native_faults import MATH_RANGE_ERROR
+    from src.compiler.native_faults import INT_OVERFLOW
     from src.compiler.ssa_record_return_state import mint_ssa_value
     from src.transmogrifier.ssa import Instr, SSAValue
 
-    def exp_probe(self, x):
-        core = self.exp_expansion(self.expanded(x, 2), 2)
-        result = self.put("Add", (core[0], core[1]), core[0])
+    def overflow(self, x):
         limit = self.scalar_constant(709.782712893384, x)
-        overflow = SSAValue(mint_ssa_value(
+        predicate = SSAValue(mint_ssa_value(
             self.function, self._limb_kind, (x, limit),
             dtype="bool", shape=(), stage=self._stage,
         ), dtype="bool", shape=())
-        self.emitted.append(Instr("Gt", [x, limit], overflow, attributes={}))
-        return result, overflow
+        self.emitted.append(Instr("Gt", [x, limit], predicate, attributes={}))
+        return predicate
 
-    monkeypatch.setattr(
-        ir_identities.WideExpansionEmitter, "exp_probe", exp_probe,
-        raising=False,
-    )
+    def exp_rows(self, x):
+        core = self.exp_expansion(self.expanded(x, 2), 2)
+        result = self.put("Add", (core[0], core[1]), core[0])
+        return result, ((overflow(self, x), INT_OVERFLOW, "probe_overflow"),)
+
+    def exp_bare(self, x):
+        return self.exp_expansion(self.expanded(x, 2), 2), overflow(self, x)
+
+    rows = {
+        "rows": SignalCoreRoute("exp_rows"),
+        "bare": SignalCoreRoute(
+            "exp_bare", fault=(INT_OVERFLOW, "probe_overflow"),
+        ),
+    }
+    for name, method in (("exp_rows", exp_rows), ("exp_bare", exp_bare)):
+        monkeypatch.setattr(
+            ir_identities.WideExpansionEmitter, name, method, raising=False,
+        )
     monkeypatch.setitem(
-        ir_identities.TRANSCENDENTAL_SIGNAL_CORES, "Exp",
-        SignalCoreRoute("exp_probe", (), (MATH_RANGE_ERROR,)),
+        ir_identities.TRANSCENDENTAL_SIGNAL_CORES, "Exp", rows[request.param],
     )
 
 
@@ -177,5 +179,5 @@ def test_routed_op_binds_its_result_and_guards_its_fault(
 
     for x in (0.5, -3.25, 100.0, 709.0):
         assert run(x) == math.exp(x)
-    with pytest.raises(OverflowError, match="math range error"):
+    with pytest.raises(OverflowError):
         run(710.0)

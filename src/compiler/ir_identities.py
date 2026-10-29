@@ -511,28 +511,34 @@ TRANSCENDENTAL_OPS = frozenset({
 class SignalCoreRoute:
     """One row of ``TRANSCENDENTAL_SIGNAL_CORES``: how an op reaches its core.
 
-    ``getattr(WideExpansionEmitter, method)(*leading, *operands)`` appends the
-    core's instructions through the emitter and returns ``(value,
-    *predicates)``: ``value`` is the correctly rounded float64 (already
-    collapsed from its expansion) and must be a value the method emitted;
-    each predicate is a ``bool`` SSA value true exactly where Python's
-    ``math`` raises, or ``None`` when the core proves it cannot, and
-    ``faults[i]`` is the ``native_faults`` code predicate ``i`` reports
-    (``MATH_DOMAIN_ERROR`` -> ``ValueError``, ``MATH_RANGE_ERROR`` ->
-    ``OverflowError``).
+    The pass calls ``getattr(emitter, method)(*leading, *operands,
+    **dict(keywords))`` with the op's float64 operands.  The cores on the
+    emitter answer in three shapes, and the pass reads each one:
+
+    * an expansion (a list of limbs, high first) -- collapsed to one double;
+    * ``(value, faults)`` -- ``value`` a double or an expansion, ``faults``
+      a sequence of ``(predicate, code, name)`` rows: a ``bool`` SSA value
+      true exactly where Python raises, the ``native_faults`` code it
+      reports, and the failure's name;
+    * ``(value, predicate)`` -- one bare ``bool`` predicate, reported as
+      this row's ``fault`` (a ``(code, name)`` pair).
+
+    A predicate of ``None`` is a fault the core proves cannot happen.
     """
 
     method: str
     leading: tuple = ()
-    faults: tuple = ()
+    keywords: tuple = ()
+    fault: tuple | None = None
 
 
 #: SSA op -> its signal core.  One row per op, added as each core lands on
-#: ``WideExpansionEmitter``; ``sin``/``cos``/``tan`` arrive as
-#: ``SignalCoreRoute("circular_double", ("sin",), (MATH_DOMAIN_ERROR,))``.
-#: ``exp_expansion``/``log_expansion`` are not routed: their binade and
-#: scale are host ``Log``/``Pow`` calls, and they return NaN or 0 at the
-#: edges of the double range.
+#: ``WideExpansionEmitter``, e.g. ``"sin": SignalCoreRoute("circular_double",
+#: ("sin",), fault=(<math domain code>, "math_sin_infinite"))`` and
+#: ``"atan": SignalCoreRoute("atan_expansion")``.  ``exp_expansion``/
+#: ``log_expansion`` are not routed: their binade and scale are host
+#: ``Log``/``Pow`` calls, and they return NaN or 0 at the edges of the
+#: double range.
 TRANSCENDENTAL_SIGNAL_CORES: dict[str, SignalCoreRoute] = {}
 
 _FLOAT64_SPELLINGS = frozenset({"float64", "float", "double", "f64"})
@@ -598,18 +604,34 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
         emitter = WideExpansionEmitter(
             function, emitted, two_product_flavor=flavor,
         )
-        result, *predicates = getattr(emitter, method)(
-            *row.leading, *call.args
+        answer = getattr(emitter, method)(
+            *row.leading, *call.args, **dict(row.keywords)
         )
-        if len(predicates) != len(row.faults):
+        faults = ()
+        if isinstance(answer, tuple):
+            answer, faults = answer
+        if not isinstance(answer, (SSAValue, list, tuple)):
             raise ValueError(
-                f"signal core {method!r} for {op} returned "
-                f"{len(predicates)} fault predicate(s); its route names "
-                f"{len(row.faults)} fault code(s) {row.faults}"
+                f"signal core {method!r} for {op} answered {answer!r}; "
+                "expected a double, an expansion, or (value, faults)"
             )
+        # An expansion is renormalised (|low| <= ulp(high)/2), so one
+        # rounded add of its two leading limbs is its correctly rounded
+        # double.
+        result = (
+            emitter.lead(list(answer)) if isinstance(answer, (list, tuple))
+            else answer
+        )
+        if isinstance(faults, SSAValue):
+            if row.fault is None:
+                raise ValueError(
+                    f"signal core {method!r} for {op} returned a fault "
+                    "predicate and its route names no fault code for it"
+                )
+            faults = ((faults, *row.fault),)
         faults = [
-            (predicate, code)
-            for predicate, code in zip(predicates, row.faults)
+            (predicate, int(code), str(name))
+            for predicate, code, name in faults
             if predicate is not None
         ]
         producer = next(
@@ -636,7 +658,10 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
         for instruction in emitted:
             instruction.args = [bound(value) for value in instruction.args]
             instruction.attributes["lowered_from"] = f"signal_core.{op}"
-        faults = [(bound(predicate), int(code)) for predicate, code in faults]
+        faults = [
+            (bound(predicate), code, name)
+            for predicate, code, name in faults
+        ]
         block.instrs = block.instrs[:index] + emitted
         added: list[BasicBlock] = []
         taken = set(function.blocks)
@@ -662,7 +687,7 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
                 )
             return created
 
-        for predicate, code in faults:
+        for predicate, code, name in faults:
             fault = new_block("math_fault", SSABlockKind.VALIDATION_FAIL)
             passing = new_block("math_checked", SSABlockKind.VALIDATION_PASS)
             current.instrs.append(Instr("CondBr", [predicate], None, attributes={
@@ -671,7 +696,7 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
             current.successors = [fault.name, passing.name]
             fault.instrs.append(Instr("Call", [], None, attributes={
                 "callee": "turing_validation_error", "error_code": code,
-                "failure": f"math_{op.casefold()}",
+                "failure": name,
             }))
             fault.instrs.append(
                 Instr("Br", [], None, attributes={"target": passing.name})

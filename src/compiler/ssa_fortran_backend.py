@@ -5161,6 +5161,17 @@ class _FunctionEmitter:
                 converted = f"{intrinsic}({args[0]}, {target_kind})"
                 return _native_integer_conversion(converted, target_dtype)
             return _native_integer_conversion(args[0], target_dtype)
+        if (
+            op == "Not" and len(args) == 1
+            and str(instr.args[0].dtype or "").casefold() in {"bool", "i1"}
+        ):
+            # ``Not`` of a bool is logical negation, as C (``!``) and LLVM
+            # (``xor i1``) spell it; Fortran's ``not()`` is the integer
+            # bitwise complement and gfortran refuses it on a LOGICAL ("'i'
+            # argument of 'not' intrinsic must be INTEGER"), measured on the
+            # signal-core ``pow``/``atan`` guards
+            # (``lower_transcendentals_to_signal_cores``).
+            return f"(.not. {args[0]})"
         if op in _UNARY and len(args) == 1:
             if op not in _LOGICAL_UNARY and op not in _LOGICAL_RESULT_UNARY:
                 args = self._numeric(instr, args)
