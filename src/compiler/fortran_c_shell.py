@@ -5210,9 +5210,11 @@ def _host_callback_admission(graph: Any, owner: str, field: str) -> str | None:
     ``host_callback_admission``; the verdict read back from that page is the
     decision.  A host callback is a call into code the host process owns,
     handed in as a pointer at run time -- a live Python interpreter when the
-    host is Python -- so only a Python-hosted contract that keeps callbacks
-    admits one.  A full-native contract never does: its stored callable must
-    compile as native code or refuse.  A graph with no contract refuses.
+    host is Python -- so only a field the contract names in
+    ``python_callback_whitelist``, under a Python-hosted contract that keeps
+    callbacks, is admitted.  A full-native contract never admits one: its
+    stored callable must compile as native code or refuse.  A graph with no
+    contract refuses.
     """
 
     from .concordance_declarations import (
@@ -5230,9 +5232,14 @@ def _host_callback_admission(graph: Any, owner: str, field: str) -> str | None:
     host = str(execution.get("host_runtime"))
     callbacks = str(execution.get("python_callbacks"))
     full_native = str(bool(execution.get("require_full_native"))).lower()
-    if host == "python" and callbacks == "contract_only" and full_native == "false":
-        verdict = "admit"
-    else:
+    named = f"{owner}.{field}" in set(
+        map(str, execution.get("python_callback_whitelist") or ())
+    )
+    whitelisted = str(named).lower()
+    if not (
+        host == "python" and callbacks == "contract_only"
+        and full_native == "false"
+    ):
         verdict = (
             f"{owner}.{field} is a stored callable; calling it as a host "
             "callback would call code the host owns at run time, and the "
@@ -5240,8 +5247,18 @@ def _host_callback_admission(graph: Any, owner: str, field: str) -> str | None:
             f"{callbacks}, require_full_native: {full_native}) admits no "
             "host callback.  The stored callable must compile as native code"
         )
+    elif not named:
+        verdict = (
+            f"{owner}.{field} is a stored callable; calling it as a host "
+            "callback would call code the host owns at run time, and the "
+            "execution contract admits only the host callbacks it names: "
+            f"{owner}.{field} is not in execution.python_callback_whitelist.  "
+            "The stored callable must compile as native code"
+        )
+    else:
+        verdict = "admit"
     book = current_identity_book()
-    row = (owner, field, host, callbacks, full_native)
+    row = (owner, field, host, callbacks, full_native, whitelisted)
     book.post(
         HOST_CALLBACK_ADMISSION, row, verdict,
         stage=PLANNER_STRUCTURAL_FOLD,
