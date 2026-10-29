@@ -28229,7 +28229,14 @@ def _fold_callsite_structural_values(
                     dtype,
                 )
             return unresolved
-        if node_type in {"Slice", "slice"} or isinstance(
+        # ``Box.slice(n, 2, 3)`` (and Vocabulary.slice) has a resolved
+        # method_ref but ingestion's op spelling is also ``slice``. The
+        # old type-only test posted slice(None, None, None) for that Call,
+        # erasing its return before the caller read the tuple. A structural
+        # slice is an AST slice, not a Call carrying the same spelling.
+        if (node_type in {"Slice", "slice"} and not isinstance(
+            expression, ast.Call,
+        )) or isinstance(
             expression, ast.Slice,
         ):
             # A slice is an ordinary structural value, the same currency the
@@ -29038,7 +29045,10 @@ def _fold_callsite_structural_values(
                 return all(*values)
             if name == "any":
                 return any(*values)
-            if name == "slice":
+            if name == "slice" and all(
+                (data.get("attributes") or {}).get(reference) is None
+                for reference in ("callee_ref", "method_ref")
+            ):
                 return slice(*values)
         except (TypeError, ValueError, OverflowError):
             return unresolved
