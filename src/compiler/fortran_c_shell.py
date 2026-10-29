@@ -28621,7 +28621,8 @@ def _class_surface_ssa_program(
         # contract, so both lowered under one symbol and the FIXED caller
         # bound the DYNAMIC view ("bound sequence views disagree about
         # dynamic capacity").  Rule: a copy's settled capacity policy for
-        # its formals is part of its callsite contract.
+        # its formals is part of its callsite contract, always (not only
+        # when another part of the contract already specialized it).
         linked_dynamic_ids = set(
             map(int, graph_obj.graph.get("linked_dynamic_sequence_ids", ()))
         )
@@ -28632,7 +28633,7 @@ def _class_surface_ssa_program(
             and (data.get("attributes") or {}).get("binding_name") is not None
             and int(data.get("value_id", node_id)) in linked_dynamic_ids
         ))
-        if dynamic_formals and any(specialization_contract):
+        if dynamic_formals:
             specialization_contract = (
                 *specialization_contract, ("dynamic_formals", dynamic_formals),
             )
