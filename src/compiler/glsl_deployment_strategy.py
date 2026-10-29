@@ -2109,6 +2109,12 @@ def _post_call_result_projections(graph, node_id):
     posts through here, so the rows exist whichever lane binds the call.
     """
     caller_paths = {}
+    # ``r = pair(n); while i < 2: total += r[i]``: inside the loop the graph
+    # reads the carried ``i`` through its initial literal, which is not a
+    # literal path onto the call's result (``_loop_carried_initial_ids``).
+    from .resident_sequence_materialization import _loop_carried_initial_ids
+
+    carried_initials = _loop_carried_initial_ids(graph.G)
 
     def collect(path, value_id):
         for successor in graph.G.successors(int(value_id)):
@@ -2117,7 +2123,7 @@ def _post_call_result_projections(graph, node_id):
                 continue
             indices = tuple(int(parent) for parent, role in data.get("parents") or ()
                             if str(role) == "index")
-            if len(indices) != 1:
+            if len(indices) != 1 or indices[0] in carried_initials:
                 continue
             index_data = graph.G.nodes[indices[0]]
             index = index_data.get("constant")
@@ -4330,6 +4336,10 @@ def _planned_scalar_dtypes_from_graph(
                     "callee_ref", base_attributes.get("method_ref")
                 )
                 member_index = None
+                from .resident_sequence_materialization import (
+                    _loop_carried_initial_ids,
+                )
+
                 for index_node in parents(data, "index"):
                     index_data = G.nodes[index_node]
                     literal = index_data.get("constant")
@@ -4337,7 +4347,11 @@ def _planned_scalar_dtypes_from_graph(
                         literal = (index_data.get("attributes") or {}).get(
                             "value"
                         )
-                    if isinstance(literal, int) and not isinstance(literal, bool):
+                    if (
+                        isinstance(literal, int)
+                        and not isinstance(literal, bool)
+                        and index_node not in _loop_carried_initial_ids(G)
+                    ):
                         member_index = int(literal)
                 member_dtype = (
                     _callee_return_member_dtype(
@@ -31525,6 +31539,17 @@ def _apply_callsite_aggregate_descriptors(
 
             aggregate_source_cell = node_identity_cell(graph, int(input_id))
             projections: dict[int, list[int]] = {}
+            # Program: ``commit([1 + n, 3], 2)`` reading ``fingerprints[i]``
+            # in ``while i < count``.  Wrong record: the loop reads its
+            # carried ``i`` through the binding's initial ``i = 0``, a
+            # Constant, so the read was taken as a literal projection and
+            # aliased to member 0 on every iteration (200 for 400; silent).
+            # Rule: a loop-carried initial is not a literal index.
+            from .resident_sequence_materialization import (
+                _loop_carried_initial_ids,
+            )
+
+            carried_initials = set(_loop_carried_initial_ids(graph.G))
             for node_id, data in tuple(graph.G.nodes(data=True)):
                 if str(
                     data.get("op") or data.get("type") or ""
@@ -31543,6 +31568,8 @@ def _apply_callsite_aggregate_descriptors(
                     if str(role) in {"index", "slice", "subscript"}
                 )
                 if len(index_ids) != 1 or index_ids[0] not in graph.G:
+                    continue
+                if index_ids[0] in carried_initials:
                     continue
                 index_data = graph.G.nodes[index_ids[0]]
                 index = index_data.get("constant")

@@ -24172,6 +24172,13 @@ def _class_surface_ssa_program(
                 projection_order = tuple(nx.topological_sort(planned_graph))
             except nx.NetworkXUnfeasible:
                 projection_order = tuple(planned_graph.nodes)
+            # A loop reads its carried index through the binding's initial
+            # literal; that read is not a literal member projection.
+            from .resident_sequence_materialization import (
+                _loop_carried_initial_ids as _carried_initial_ids,
+            )
+
+            carried_index_ids = _carried_initial_ids(planned_graph)
             for projection_node_id in projection_order:
                 projection_data = planned_graph.nodes[projection_node_id]
                 if str(
@@ -24189,6 +24196,8 @@ def _class_surface_ssa_program(
                     if str(role) == "index" and parent in planned_graph
                 )
                 if len(base_nodes) != 1 or len(index_nodes) != 1:
+                    continue
+                if index_nodes[0] in carried_index_ids:
                     continue
                 base_id = int(planned_graph.nodes[base_nodes[0]].get(
                     "value_id", base_nodes[0],
@@ -51651,6 +51660,14 @@ def _class_surface_ssa_program(
                                 index_ids[0] not in caller_graph
                             ):
                                 continue
+                            from .resident_sequence_materialization import (
+                                _loop_carried_initial_ids,
+                            )
+
+                            if index_ids[0] in _loop_carried_initial_ids(
+                                caller_graph
+                            ):
+                                continue
                             index_node = caller_graph.nodes[index_ids[0]]
                             literal = index_node.get("constant")
                             if literal is None:
@@ -52235,8 +52252,14 @@ def _class_surface_ssa_program(
                                     in projection.get("parents") or ()
                                     if str(role) == "index"
                                 )
+                                from .resident_sequence_materialization import (
+                                    _loop_carried_initial_ids,
+                                )
+
                                 if len(index_ids) == 1 and (
                                     index_ids[0] in aggregate_graph
+                                ) and index_ids[0] not in (
+                                    _loop_carried_initial_ids(aggregate_graph)
                                 ):
                                     index_node = aggregate_graph.nodes[
                                         index_ids[0]
