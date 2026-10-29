@@ -31292,14 +31292,29 @@ def _post_callsite_loop_element_classes(
             actual_record = caller.G.nodes[int(actual_id)].get(
                 "attributes"
             ) or {}
+            # Program: ``one(atoms)`` called as ``v.one([97, 98])`` forwards
+            # ``atoms`` to ``batch(self, values: list[int], ...)``.  Wrong
+            # record: only an aggregate-parameter actual gave the formal its
+            # record, so a list display actual left ``atoms`` a bare span
+            # with no length member, and ``values``'s length was leased from
+            # nothing.  Rule: a display actual binds the formal to its
+            # storage the same way.
             if (
                 formal_attributes.get("aggregate_kind") is None
                 and actual_record.get("producer_kind")
-                == "aggregate_parameter"
+                in {"aggregate_parameter", "aggregate"}
                 and actual_record.get("aggregate_kind") in {"list", "tuple"}
+                and all(
+                    record_key in actual_record
+                    for record_key in (
+                        "sequence_key_columns", "sequence_column_count",
+                        "sequence_writable",
+                    )
+                )
             ):
+                formal_attributes["producer_kind"] = "aggregate_parameter"
                 for record_key in (
-                    "producer_kind", "aggregate_kind",
+                    "aggregate_kind",
                     "sequence_key_columns", "sequence_column_count",
                     "sequence_writable",
                 ):
