@@ -248,3 +248,51 @@ def test_axis_reduction_operator_matches_numpy(tmp_path, name):
     assert proof["passed"] is True
     assert all(case["passed"] for case in proof["cases"])
 
+
+
+# Python floors ``%`` and ``//`` where WebAssembly's rem_s/div_s (and a
+# truncated float remainder) round toward zero: -7 % 3 is 2, not -1. The
+# expected values are Python's own scalar results, every sign pairing.
+_FLOOR_X = {
+    "int64": np.asarray([-7, 7, -7, 7, 6, -6, 0], dtype=np.int64),
+    "float64": np.asarray([-7.5, 7.5, -7.5, 7.5, 6.0, -6.0, 0.0]),
+}
+_FLOOR_Y = {
+    "int64": np.asarray([3, 3, -3, -3, -3, 3, -3], dtype=np.int64),
+    "float64": np.asarray([2.0, 2.0, -2.0, -2.0, -3.0, 3.0, -3.0]),
+}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.parametrize("dtype", ["int64", "float64"])
+@pytest.mark.parametrize("symbol", ["%", "//"])
+def test_floor_division_and_remainder_follow_python_signs(tmp_path, dtype, symbol):
+    named = {"x": _FLOOR_X[dtype], "y": _FLOOR_Y[dtype]}
+    aot = compile_ast_aot(
+        f"def op(x, y):\n    return x {symbol} y\n", "op", named,
+        precompile_only=True, remove_loops=True, mutable_parameters=("x", "y"),
+    )
+    program = project_public_numerical_program(aot)
+    module = emit_wasm_module(program, name="op", dtype=dtype)
+    assert module.complete, module.shortfall_report()
+    origins = program.extras["capture_feed_origins"]
+    feeds = {
+        feed_id: named[origins[feed_id]["binding_name"]]
+        for feed_id in ordered_feed_ids(program)
+    }
+    # A zero divisor is Python's ZeroDivisionError (a Wasm trap), so the
+    # generated sweep, which feeds zeros, is replaced by the sign table.
+    proof = verify_wasm_module(
+        module, program, feeds, tmp_path, entrypoint="op",
+        cases=[("python-signs", feeds)],
+    )
+    cast = int if dtype == "int64" else float
+    expected = [
+        cast(a) % cast(b) if symbol == "%" else cast(a) // cast(b)
+        for a, b in zip(named["x"].tolist(), named["y"].tolist())
+    ]
+    wasm = proof["cases"][0]["outputs"][0]["wasm"]
+    # (A zero's sign is not checked: the Node runner reports values through
+    # JSON, which writes -0 as 0.)
+    assert wasm == expected
+    assert proof["passed"] is True
