@@ -2814,6 +2814,7 @@ def _callee_return_member_dtype(
 
     from ..common.tensors.topological_reducer import _int_range_cell, _int_range_scopes
     from .identity_concordance import current_identity_book
+    from .resident_sequence_materialization import _merged_storage_identity
 
     try:
         callee = graph.function_table.entry(int(reference)).graph
@@ -2880,7 +2881,12 @@ def _callee_return_member_dtype(
             )))
         if not 0 <= int(member) < len(leaves):
             return None
-        leaf_id = int(_indexed_store_source(callee_graph, int(leaves[int(member)])))
+        # ``if status == 0: while ...: out[i] = ...; return status, out``
+        # returns the merge of the loop's version and the birth: one
+        # storage, the birth's (``_merged_storage_identity``).
+        leaf_id = int(_merged_storage_identity(
+            callee_graph, int(_indexed_store_source(callee_graph, int(leaves[int(member)]))),
+        ))
         if leaf_id not in callee_graph:
             return None
         leaf_attributes = callee_graph.nodes[leaf_id].get("attributes") or {}
