@@ -30129,6 +30129,35 @@ def _fold_callsite_structural_values(
                     )
                     if len(matches) == 1:
                         selected_return_id = matches[0]
+                # Program: ``if domain == DOMAIN_TEXT: return
+                # TEXT_EMPTY_TOKEN`` then ``return BYTES_EMPTY_TOKEN``, both
+                # module ints, specialized on ``domain=1`` (string-core
+                # ``Vocabulary._empty_token``).  Wrong record: a module
+                # constant is no local binding and its folded Constant has
+                # no authored expression, so neither lookup above found the
+                # selected value; the later return sites were kept and the
+                # fallthrough ``return`` overwrote the selected one (native
+                # 2, Python 1).  Rule: the reducer's ``return_slot_values``
+                # ledger, keyed by the returned expression's span, is the
+                # authority for what a single-slot site returns.
+                if (
+                    selected_return_id is None
+                    and getattr(returned_expression, "lineno", None) is not None
+                ):
+                    site_slots = tuple(dict(
+                        graph.G.graph.get("return_slot_values") or {}
+                    ).get((
+                        int(returned_expression.lineno),
+                        int(getattr(returned_expression, "col_offset", -1)),
+                        int(getattr(returned_expression, "end_lineno", -1)),
+                        int(getattr(returned_expression, "end_col_offset", -1)),
+                    ), ()))
+                    if (
+                        len(site_slots) == 1
+                        and len(tuple(graph.G.graph.get("function_outputs") or ())) == 1
+                        and int(site_slots[0]) in graph.G
+                    ):
+                        selected_return_id = int(site_slots[0])
             control_signature = _ast_source_signature(expression)
             retained_control_id = next((
                 int(source_id)
