@@ -1783,7 +1783,8 @@ def _recover_late_source_literals(
                         "physical_dtype": str(instruction.res.dtype),
                         "storage": "scalar", "rank": 0, "arena": False,
                     }
-                    if type(literal) is int else KEEP_PHYSICAL
+                    if isinstance(literal, int) and not isinstance(literal, bool)
+                    else KEEP_PHYSICAL
                 ),
             )
     return tuple(recovered)
@@ -2220,7 +2221,7 @@ def _recover_late_source_pure_expressions(
                         return None
                     if isinstance(literal, bool):
                         dtype = "bool"
-                    elif type(literal) is int:
+                    elif isinstance(literal, int):
                         from ..transmogrifier.dtype_layout import (
                             python_int_literal_dtype,
                         )
@@ -34347,7 +34348,7 @@ def _class_surface_ssa_program(
                     return result
                 if isinstance(literal, bool):
                     dtype = "bool"
-                elif type(literal) is int:
+                elif isinstance(literal, int):
                     from ..transmogrifier.dtype_layout import (
                         python_int_literal_dtype,
                     )
