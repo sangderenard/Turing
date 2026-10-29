@@ -522,7 +522,11 @@ class SignalCoreRoute:
       true exactly where Python raises, the ``native_faults`` code it
       reports, and the failure's name;
     * ``(value, predicate)`` -- one bare ``bool`` predicate, reported as
-      this row's ``fault`` (a ``(code, name)`` pair).
+      this row's ``fault`` (a ``(code, name)`` pair).  A row whose fault
+      code does not exist yet names why in ``unwired`` instead: the
+      predicate is left unguarded (the value there is the core's NaN, as
+      the host libm returned before) and the receipt lists it under
+      ``unwired_faults``.
 
     A predicate of ``None`` is a fault the core proves cannot happen.
     """
@@ -531,16 +535,36 @@ class SignalCoreRoute:
     leading: tuple = ()
     keywords: tuple = ()
     fault: tuple | None = None
+    unwired: str = ""
+
+
+#: ``sin``/``cos``/``tan`` of +-inf: Python raises ``ValueError('math domain
+#: error')``; the math-domain fault code lands with PR #1147.
+_CIRCULAR_UNWIRED = (
+    "math.sin/cos/tan(+-inf) raises ValueError in Python; no math-domain "
+    "native_faults code exists yet (PR #1147 adds it), so the core's NaN "
+    "is returned unguarded"
+)
 
 
 #: SSA op -> its signal core.  One row per op, added as each core lands on
-#: ``WideExpansionEmitter``, e.g. ``"sin": SignalCoreRoute("circular_double",
-#: ("sin",), fault=(<math domain code>, "math_sin_infinite"))`` and
-#: ``"atan": SignalCoreRoute("atan_expansion")``.  ``exp_expansion``/
+#: ``WideExpansionEmitter`` (``atan``/``tanh``/``Pow`` with PR #1147, e.g.
+#: ``"atan": SignalCoreRoute("atan_expansion")``).  ``exp_expansion``/
 #: ``log_expansion`` are not routed: their binade and scale are host
 #: ``Log``/``Pow`` calls, and they return NaN or 0 at the edges of the
-#: double range.
-TRANSCENDENTAL_SIGNAL_CORES: dict[str, SignalCoreRoute] = {}
+#: double range.  ``sin``/``cos`` hold c22 on all three lanes (Fortran's
+#: 1e-6 sine table was 4.8e-8 off there).
+TRANSCENDENTAL_SIGNAL_CORES: dict[str, SignalCoreRoute] = {
+    "sin": SignalCoreRoute(
+        "circular_double", ("sin",), unwired=_CIRCULAR_UNWIRED,
+    ),
+    "cos": SignalCoreRoute(
+        "circular_double", ("cos",), unwired=_CIRCULAR_UNWIRED,
+    ),
+    "tan": SignalCoreRoute(
+        "circular_double", ("tan",), unwired=_CIRCULAR_UNWIRED,
+    ),
+}
 
 _FLOAT64_SPELLINGS = frozenset({"float64", "float", "double", "f64"})
 
@@ -582,7 +606,10 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
     from ..transmogrifier.ssa import BasicBlock
 
     policy = transcendental_policy(mode)
-    receipt = {"policy": policy, "lowered": {}, "left_native": {}}
+    receipt = {
+        "policy": policy, "lowered": {}, "left_native": {},
+        "unwired_faults": {},
+    }
     flavor = active_two_product_flavor()
 
     def routed(instruction) -> bool:
@@ -623,6 +650,12 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
             emitter.lead(list(answer)) if isinstance(answer, (list, tuple))
             else answer
         )
+        if isinstance(faults, SSAValue) and row.fault is None and row.unwired:
+            unwired = receipt["unwired_faults"].setdefault(
+                str(function.name), {},
+            )
+            unwired[op] = row.unwired
+            faults = ()
         if isinstance(faults, SSAValue):
             if row.fault is None:
                 raise ValueError(
@@ -758,6 +791,9 @@ def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
                 "policy": policy,
                 "lowered": dict(receipt["lowered"].get(str(function.name), {})),
                 "left_native": tuple(left),
+                "unwired_faults": dict(
+                    receipt["unwired_faults"].get(str(function.name), {})
+                ),
             }
     return receipt
 

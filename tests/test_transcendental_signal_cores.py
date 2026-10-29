@@ -181,3 +181,48 @@ def test_routed_op_binds_its_result_and_guards_its_fault(
         assert run(x) == math.exp(x)
     with pytest.raises(OverflowError):
         run(710.0)
+
+
+SINE_SOURCE = '''
+import math
+
+def root(x: float) -> float:
+    return 1.0 * math.sin(x)
+'''
+
+
+def test_sine_routes_to_circular_double_with_its_fault_unwired(tmp_path):
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+    module, _outputs, exports = lower_ast_source_to_ssa(
+        SINE_SOURCE, "root", name="signal_core_sine",
+        extraction_contract=str(CONTRACT), progress=lambda _message: None,
+    )
+    assert "sin" not in _ops(module)
+    receipt = next(
+        function.metadata["transcendental_pipeline"]
+        for function in module.functions.values()
+        if function.metadata.get("transcendental_pipeline")
+    )
+    assert receipt["lowered"] == {"sin": 1}
+    assert "sin" in receipt["unwired_faults"]
+    root = module.functions[exports[0]]
+    parameters = dict(root.metadata["parameter_names"])
+    output = next(
+        int(value.id)
+        for block in root.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+        for value in instruction.args
+    )
+    artifact = emit_ssa_to_c(module, exports[0])
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / "native")
+    for x in (0.5, -3.25, 1e22, 5e-324, -0.0):
+        execution = artifact.prepare_execution(
+            {parameters["x"]: np.array([x])}
+        ).run()
+        got = execution.buffers[output].reshape(-1)[0].item()
+        assert got == math.sin(x), x
+        assert math.copysign(1.0, got) == math.copysign(1.0, math.sin(x))
