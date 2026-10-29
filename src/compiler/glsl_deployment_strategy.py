@@ -6572,7 +6572,7 @@ def _build_shell_hierarchy_plan(
                 if operation in {
                     "neg", "abs", "sqrt", "exp", "log", "round", "trunc",
                     "floor", "ceil", "isfinite", "isnan", "isinf",
-                    "logical_not", "tanh", "sin", "cos", "tan", "asin",
+                    "logical_not", "invert", "tanh", "sin", "cos", "tan", "asin",
                     "acos", "atan", "sinh", "cosh", "asinh", "acosh",
                     "atanh", "sign", "add", "sub", "mul", "truediv",
                     "floordiv", "mod", "pow", "less", "less_equal",
@@ -6642,10 +6642,11 @@ def _build_shell_hierarchy_plan(
                             dtype = "int"
                         elif "bool" in numeric_dtypes:
                             dtype = "bool"
-                if operation in {"floor", "ceil", "trunc", "round"}:
+                if operation in {"floor", "ceil", "trunc", "round", "invert"}:
                     # A scalar ``math.floor(x)`` is a Python ``int`` whatever
                     # its operand's class; the source proof says so
                     # (``_planned_scalar_dtypes_from``), the operand does not.
+                    # So is a scalar ``~flag``: Python inverts a bool as int.
                     proven = planned_scalar_dtypes().get(int(current))
                     if proven is not None:
                         dtype = str(proven)
