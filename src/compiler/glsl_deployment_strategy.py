@@ -2795,6 +2795,11 @@ def _call_actual_classes(
     return classes
 
 
+# (callee graph id, member) pairs whose returned member is being read:
+# a tail call chain that returns to itself proves nothing.
+_RETURN_MEMBER_ACTIVE: set[tuple[int, int]] = set()
+
+
 def _callee_return_member_dtype(
     graph: Any, reference: int, member: int,
     actual_classes: dict[str, tuple[str | None, tuple[int, int] | None]]
@@ -2881,7 +2886,34 @@ def _callee_return_member_dtype(
                 return None
             node = callee_graph.nodes[int(values[0])]
             if not isinstance(node.get("expr_obj"), ast.Tuple):
-                return None
+                # Program: Token Orchard ``concat`` ends ``return
+                # self.intern(domain, left_atoms + right_atoms)`` beside
+                # ``return STATUS_INVALID_TOKEN, 0``; the caller reads
+                # ``status, grown = vocabulary.concat(t, t)``.  Wrong
+                # record: a site returning another call's tuple named no
+                # members, so the whole member proved nothing.  Rule: that
+                # site's member is the same member of the inner callee's
+                # returned tuple.
+                node_attributes = node.get("attributes") or {}
+                inner = node_attributes.get(
+                    "callee_ref", node_attributes.get("method_ref")
+                )
+                active = (id(callee_graph), int(member))
+                if inner is None or active in _RETURN_MEMBER_ACTIVE:
+                    return None
+                _RETURN_MEMBER_ACTIVE.add(active)
+                try:
+                    inner_member = _callee_return_member_dtype(
+                        callee, int(inner), int(member),
+                        _call_actual_classes(callee, int(values[0]), dtypes),
+                    )
+                finally:
+                    _RETURN_MEMBER_ACTIVE.discard(active)
+                if inner_member is None:
+                    return None
+                kinds.add(inner_member[0])
+                classes.append((inner_member[1], None))
+                continue
             leaves = tuple(map(int, (node.get("attributes") or {}).get(
                 "aggregate_leaf_value_ids", ()
             )))
