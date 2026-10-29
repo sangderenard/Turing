@@ -2580,6 +2580,29 @@ def _join_member_classes(
     return common_integer_dtype((proven, *sorted(stated)))
 
 
+def _guarded_site_interval(scopes, site_id: int, value_id: int):
+    """A value's interval as read at ``site_id``, if a guard narrowed it.
+
+    The interval solver posts a guarded read for a call actual and for a
+    list display's member (``guarded_call_actual_range``): ``[token]``
+    under ``if kind == TOKEN_KIND_ATOM`` holds the token where that test
+    held, not the token's whole interval.
+    """
+
+    from .concordance_declarations import GUARDED_CALL_ACTUAL_RANGE
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    for scope in scopes:
+        cell = book.latest_ref(
+            GUARDED_CALL_ACTUAL_RANGE, (scope, int(site_id), int(value_id)),
+        )
+        if cell is not None:
+            interval = book.page(cell.page).cell(cell.row, cell.column)
+            return int(interval[0]), int(interval[1])
+    return None
+
+
 def _returned_list_slot_leaves(G: Any) -> list[list[tuple[int, tuple[int, ...] | None]]]:
     """Per return slot holding lists at two or more sites, its list leaves.
 
@@ -2673,7 +2696,7 @@ def _callee_return_member_dtype(
     by proven range (``_join_member_classes``).
     """
 
-    from ..common.tensors.topological_reducer import _int_range_cell
+    from ..common.tensors.topological_reducer import _int_range_cell, _int_range_scopes
     from .identity_concordance import current_identity_book
 
     try:
@@ -2769,7 +2792,14 @@ def _callee_return_member_dtype(
             continue
         if displayed:
             # ``[token]``: the display's rows are its members' values.
-            intervals = [proven_interval(item) for item in displayed]
+            intervals = [
+                _guarded_site_interval(
+                    _int_range_scopes(callee), int(leaf_id), int(
+                        callee_graph.nodes.get(int(item), {}).get("value_id", item)
+                    ),
+                ) or proven_interval(item)
+                for item in displayed
+            ]
             rows = [stated_class(item) for item in displayed]
             if all(interval is not None for interval in intervals):
                 classes.append((
@@ -2895,8 +2925,14 @@ def _planned_scalar_dtypes_from_graph(
         interval = range_page.cell(cell.row, cell.column)
         return python_int_range_dtype(int(interval[0]), int(interval[1]))
 
-    def member_interval(node_id):
+    def member_interval(node_id, site=None):
         data = G.nodes.get(int(node_id), {})
+        if site is not None:
+            read = _guarded_site_interval(
+                range_scopes, int(site), int(data.get("value_id", node_id)),
+            )
+            if read is not None:
+                return read
         cell = _range_cell(range_scopes, int(data.get("value_id", node_id)))
         if cell is None:
             # A callsite copy's formal is its actual: the interval the
@@ -4481,7 +4517,8 @@ def _planned_scalar_dtypes_from_graph(
                     if element.get(leaf_id) is None:
                         continue  # ``[]`` states no row class
                 intervals = [
-                    member_interval(item) for item in (displayed or ())
+                    member_interval(item, site=leaf_id)
+                    for item in (displayed or ())
                 ]
                 if displayed and all(
                     interval is not None for interval in intervals

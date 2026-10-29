@@ -5496,6 +5496,21 @@ class CorrelationTable:
             # stable ProgramABI field; every other sequence member must keep
             # its compiler-frame owner in the comparison key.
             owner = accounting.get("compiler_frame_storage") or function
+            # Program: ``def f(t): if t == 0: return 3, []; return 0, [t,
+            # t + 1]`` then ``st, xs = f(n)``.  Wrong record: the caller's
+            # ``xs`` (its sequence 5) is the callee's frame storage for the
+            # callee's sequence 10, but was keyed by the CALLER's id under
+            # the callee's frame, so it collided with the callee's own
+            # unrelated sequence 5 (``[]``) and was refused as one arena
+            # leased twice.  Rule: a frame-owned member is keyed by its
+            # owner frame's sequence id (``compiler_frame_sequence_id``).
+            frame_sequence_id = accounting.get("compiler_frame_sequence_id")
+            if (
+                accounting.get("compiler_frame_storage") is not None
+                and isinstance(frame_sequence_id, int)
+                and not isinstance(frame_sequence_id, bool)
+            ):
+                sequence_id = int(frame_sequence_id)
             return f"{owner}.seq{sequence_id}.{role}"
         return None
 

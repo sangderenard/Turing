@@ -5297,12 +5297,30 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
             class_cells[key] = (cell, identity)
             members[key] = [(unit, node_id)]
 
-    def callee_of(unit, node_id):
+    external_units: dict = {}
+
+    def callee_of(unit, node_id, external=False):
         data = unit.G.nodes[node_id]
         attributes = data.get("attributes") or {}
         reference = attributes.get("callee_ref", attributes.get("method_ref"))
         if reference is None:
             return None
+        if external and str(data.get("type")) != "GetAttr":
+            try:
+                found = by_address.get(int(reference))
+            except (TypeError, ValueError):
+                return None
+            if found is not None:
+                return found
+            # A copy's own solve holds only the copy: its callee is read
+            # from the function table, through the rows it already posted.
+            try:
+                wrapper = unit.wrapper.function_table.entry(int(reference)).graph
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return None
+            if int(reference) not in external_units:
+                external_units[int(reference)] = Unit(wrapper, int(reference))
+            return external_units[int(reference)]
         if str(data.get("type")) == "GetAttr":
             # Program: ``hi, lo = self.fingerprint(mode, n)`` (corpus c794).
             # The bound-method READ ``self.fingerprint`` carries the same
@@ -5403,7 +5421,10 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                         found.extend(leaves(int(parent)))
                 return found
             kind = str(data.get("type") or data.get("op") or "").casefold()
-            if kind not in {"less", "less_equal", "greater", "greater_equal"}:
+            if kind not in {
+                "less", "less_equal", "greater", "greater_equal",
+                "equal", "not_equal",
+            }:
                 return []
             roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}
             if not {"lhs", "rhs"} <= set(roles):
@@ -5413,6 +5434,7 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         negated = {
             "less": "greater_equal", "less_equal": "greater",
             "greater": "less_equal", "greater_equal": "less",
+            "equal": "not_equal", "not_equal": "equal",
         }
 
         def conjuncts(node_id):
@@ -5453,6 +5475,19 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                         guards.append((region(statement.body), tuple(held)))
                 if (
                     isinstance(statement, ast.If)
+                    and id(statement.test) in nodes_by_expression
+                ):
+                    # Program: Token Orchard ``token_kind``: ``if
+                    # TEXT_ATOM_BASE <= token < BYTE_ATOM_LIMIT: return
+                    # TOKEN_KIND_ATOM``.  Rule: the body runs only where the
+                    # test held, so a body read of the SAME value the test
+                    # compared lies where every ``and``-ed comparison with a
+                    # constant holds, exactly as in a ``while`` body.
+                    held = conjuncts(nodes_by_expression[id(statement.test)])
+                    if held:
+                        guards.append((region(statement.body), tuple(held)))
+                if (
+                    isinstance(statement, ast.If)
                     and not statement.orelse
                     and statement.body
                     and isinstance(statement.body[-1], ast.Raise)
@@ -5477,10 +5512,122 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
         guard_cache[id(unit)] = guards
         return guards
 
-    def guarded(unit, site_id, value_key, interval):
-        """``interval`` of ``value_key`` as read at ``site_id``."""
+    def known(unit, node_id):
+        """A value's interval: this solve's state, else its posted row."""
 
-        site = unit.G.nodes.get(site_id, {}).get("expr_obj")
+        key = unit.key(int(node_id))
+        interval = current(key)
+        if interval is None and unit not in units:
+            posted = range_page.latest(key)
+            if posted is not None:
+                interval = (int(posted[0]), int(posted[1]))
+        data = unit.G.nodes.get(int(node_id), {})
+        literal = data.get("constant", (data.get("attributes") or {}).get("value"))
+        if interval is None and isinstance(literal, int) and not isinstance(literal, bool) and str(
+            data.get("type") or data.get("op") or ""
+        ).casefold() in {"constant", "const"}:
+            interval = (int(literal), int(literal))
+        return interval
+
+    summary_active: set = set()
+
+    def returning_actual_range(unit, call_id, actual_key, c):
+        """The interval of ``actual_key`` wherever ``call_id`` returned ``c``.
+
+        Program: Token Orchard ``cover``: ``kind = self.token_kind(token)``
+        then ``if kind == TOKEN_KIND_ATOM: return STATUS_OK, [token]``.
+        Rule: the call returned ``c`` only through a return site that can
+        yield ``c``; at each, the callee's formal bound to the actual lies
+        in its interval as read at that site (its own guards).  The actual
+        is the formal, so it lies in the join of those.  A site whose value
+        is unproven, or a formal unbounded at a site, proves nothing.
+        """
+
+        callee = callee_of(unit, int(call_id), external=True)
+        if callee is None or (id(callee.G), int(c)) in summary_active:
+            return None
+        try:
+            edges = tuple(_expanded_callsite_argument_edges(unit.wrapper, int(call_id)))
+        except Exception:
+            return None
+        receiver, positional, _all = _method_parameter_layout(callee.G)
+        formal_nodes = {
+            str((data.get("attributes") or {}).get("binding_name")): int(node_id)
+            for node_id, data in callee.G.nodes(data=True)
+            if data.get("type") == "Input"
+            and (data.get("attributes") or {}).get("binding_name") is not None
+        }
+        formals = [
+            formal_nodes.get(str(name))
+            for actual_id, role in edges
+            if unit.key(int(actual_id)) == actual_key
+            for name in (_callsite_parameter_name(role, receiver, positional),)
+            if name is not None
+        ]
+        if len(formals) != 1 or formals[0] is None:
+            return None
+        formal = int(formals[0])
+        sites = tuple(
+            (span, tuple(values)) for span, values in (
+                callee.G.graph.get("return_slot_values") or {}
+            ).items()
+        )
+        if not sites:
+            return None
+        # Each return site is keyed by its returned expression's span; that
+        # authored expression is where the site's guards are read.
+        returned_by_span: dict = {}
+        body = callee.G.graph.get("function_body")
+        for statement in (body if isinstance(body, (list, tuple)) else ()):
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Return) and node.value is not None:
+                    value = node.value
+                    returned_by_span[(
+                        getattr(value, "lineno", None),
+                        getattr(value, "col_offset", None),
+                        getattr(value, "end_lineno", None),
+                        getattr(value, "end_col_offset", None),
+                    )] = value
+        summary_active.add((id(callee.G), int(c)))
+        try:
+            low = high = None
+            for span, values in sites:
+                if len(values) != 1:
+                    return None
+                if int(values[0]) not in callee.G:
+                    continue  # pruned
+                returned = known(callee, int(values[0]))
+                if returned is None or returned == _INT_RANGE_TOP:
+                    return None
+                if not int(returned[0]) <= c <= int(returned[1]):
+                    continue
+                formal_interval = known(callee, formal)
+                at_site, _used = guarded(
+                    callee, int(values[0]), callee.key(formal),
+                    _INT_RANGE_TOP if formal_interval is None else formal_interval,
+                    site_ast=returned_by_span.get(tuple(span)) if isinstance(
+                        span, (tuple, list)
+                    ) else None,
+                )
+                if at_site is None or at_site == _INT_RANGE_TOP:
+                    return None
+                low = int(at_site[0]) if low is None else min(low, int(at_site[0]))
+                high = int(at_site[1]) if high is None else max(high, int(at_site[1]))
+            return None if low is None else (low, high)
+        finally:
+            summary_active.discard((id(callee.G), int(c)))
+
+    def guarded(unit, site_id, value_key, interval, site_ast=None):
+        """``interval`` of ``value_key`` as read at ``site_id``.
+
+        ``site_ast``: the authored expression of the read when the site's
+        node carries none (a returned module constant is a folded node).
+        """
+
+        site = (
+            site_ast if site_ast is not None
+            else unit.G.nodes.get(site_id, {}).get("expr_obj")
+        )
         if site is None:
             return interval, ()
         low = high = None
@@ -5490,18 +5637,37 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
                 continue
             for kind, lhs, rhs in disjuncts:
                 for value, constant, flipped in ((lhs, rhs, False), (rhs, lhs, True)):
-                    if unit.key(value) != value_key:
-                        continue
-                    bound = current(unit.key(constant))
+                    if kind == "equal":
+                        continue  # ``x != c`` holds: no interval
+                    bound = known(unit, constant)
                     if bound is None or bound == _INT_RANGE_TOP or bound[0] != bound[1]:
                         continue
                     c = int(bound[0])
+                    if unit.key(value) != value_key:
+                        if kind != "not_equal":
+                            continue
+                        # ``k == c`` holds where ``k = f(..., x, ...)``:
+                        # ``x`` is what ``f`` was called with on a path to
+                        # a return of ``c`` (``_returning_formal_range``).
+                        summary = returning_actual_range(
+                            unit, value, value_key, c,
+                        )
+                        if summary is None:
+                            continue
+                        low = summary[0] if low is None else max(low, summary[0])
+                        high = summary[1] if high is None else min(high, summary[1])
+                        read.append(unit.key(constant))
+                        continue
                     relation = {
                         "less": "greater", "less_equal": "greater_equal",
                         "greater": "less", "greater_equal": "less_equal",
+                        "not_equal": "not_equal",
                     }[kind] if flipped else kind
                     # The disjunct is FALSE past the guard.
-                    if relation == "less":
+                    if relation == "not_equal":
+                        low = c if low is None else max(low, c)
+                        high = c if high is None else min(high, c)
+                    elif relation == "less":
                         low = c if low is None else max(low, c)
                     elif relation == "less_equal":
                         low = c + 1 if low is None else max(low, c + 1)
@@ -5988,9 +6154,32 @@ def _solve_int_ranges(units: list, *, inherited_scope: Any = None) -> bool:
     # value's own row keeps its whole interval, and the narrowed one is
     # posted for that callsite (corpus c795: ``preflighted`` passes its
     # guarded int64 pair to ``intern``'s uint64 members).
-    for actuals in (*formal_actuals.values(), *formal_member_actuals.values()):
+    # A list display reads its members where it is built (Token Orchard
+    # ``cover``'s ``[token]`` under ``if kind == TOKEN_KIND_ATOM``): the
+    # guarded read is posted for that site exactly as for a call actual.
+    display_reads = []
+    for unit in units:
+        for display_id, display in unit.G.nodes(data=True):
+            if not isinstance(display.get("expr_obj"), ast.List):
+                continue
+            for parent, role in display.get("parents") or ():
+                if str(role) == "elts" and int(parent) in unit.G:
+                    display_reads.append(
+                        (unit.key(int(parent)), unit, int(display_id))
+                    )
+    for actuals, unclassed in (
+        *((group, False) for group in formal_actuals.values()),
+        *((group, False) for group in formal_member_actuals.values()),
+        # A display member may have no class row of its own (an
+        # unannotated formal): its guards alone bound it there.
+        (display_reads, True),
+    ):
         for actual, caller, call_id in actuals:
-            interval, used = guarded(caller, call_id, actual, current(actual))
+            interval, used = guarded(
+                caller, call_id, actual,
+                _INT_RANGE_TOP if unclassed and current(actual) is None
+                else current(actual),
+            )
             if not used or interval is None or interval == _INT_RANGE_TOP:
                 continue
             row = (actual[0], int(call_id), int(actual[1]))
