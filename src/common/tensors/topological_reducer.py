@@ -1874,26 +1874,43 @@ def _concord_aggregate_merge_class(graph: Any, value_id: Any) -> None:
 
 
 def _indexed_store_source(graph: Any, value_id: Any) -> Any:
-    """The sequence an ``IndexedStore`` chain writes, by its ``base`` edges."""
+    """The sequence an ``IndexedStore`` chain writes, by its ``base`` edges.
+
+    Program: ``out = [0] * count; while i < count: out[i] = i + d; i += 1;
+    return out`` (string core ``intern_batch``'s statuses).  Wrong record:
+    only a straight store chain was walked, so the loop's version of ``out``
+    (a ``LoopResult`` carrying the body's store) stood as the returned
+    output; the call bound the caller to a value with no sequence, the
+    callee kept its own frame arena and the caller's view of it was
+    withdrawn (refused).  Rule: a loop-carried version of a list the body
+    stores into is that list's one storage, as a store version is, so the
+    walk crosses ``LoopResult`` ``value`` edges -- but answers only through
+    a store it reaches; a loop result that carries no store is itself.
+    """
 
     target = getattr(graph, "G", graph)
+    roles = {"IndexedStore": "base", "LoopResult": "value"}
     seen: set[int] = set()
+    current, stored = value_id, value_id
     while (
-        isinstance(value_id, int)
-        and value_id in target
-        and value_id not in seen
-        and target.nodes[value_id].get("type") == "IndexedStore"
+        isinstance(current, int)
+        and current in target
+        and current not in seen
+        and target.nodes[current].get("type") in roles
     ):
-        seen.add(value_id)
-        value_id = next(
+        seen.add(current)
+        kind = target.nodes[current].get("type")
+        current = next(
             (
                 parent
-                for parent, role in target.nodes[value_id].get("parents") or ()
-                if role == "base"
+                for parent, role in target.nodes[current].get("parents") or ()
+                if role == roles[kind]
             ),
             None,
         )
-    return value_id
+        if kind == "IndexedStore":
+            stored = current
+    return stored
 
 
 def _is_row_collection(graph: Any, value_id: Any) -> bool:
