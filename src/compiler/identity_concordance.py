@@ -1559,6 +1559,7 @@ class CorrelationTable:
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_continuation_phi_findings(module))
+        found.extend(self._source_exception_continuation_arm_value_findings(module))
         found.extend(self._native_status_class_findings(module))
         found.extend(self._source_exception_admission_findings(module))
         found.extend(self._source_page_declaration_findings(module))
@@ -2542,6 +2543,121 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-continuation-phi-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_continuation_arm_value_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Each planned Try join arm must follow its exact source binding."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE, NAME_BINDING,
+            SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
+            SOURCE_EXCEPTION_CONTINUATION_PHI,
+            ExceptionContinuationArmValueFact, ExceptionContinuationPhiFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE.name not in book.pages:
+            return []
+        successors = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for cause, _stage in book.edges_into(canonical):
+                successors.setdefault(cause, set()).add(canonical)
+
+        def reaches(source: Ref, target: Ref) -> bool:
+            pending = [source]
+            seen = set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                pending.extend(successors.get(cell, ()))
+            return target in seen
+
+        found = []
+        page = book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE, row)
+            problem = None
+            if not isinstance(fact, ExceptionContinuationArmValueFact):
+                problem = "Try continuation arm has no planned value fact"
+            elif (
+                not isinstance(fact.source_phi, Ref)
+                or fact.source_phi.page != SOURCE_EXCEPTION_CONTINUATION_PHI
+                or book.latest_ref(
+                    SOURCE_EXCEPTION_CONTINUATION_PHI, fact.source_phi.row,
+                ) != fact.source_phi
+            ):
+                problem = "Try continuation arm has no source Phi"
+            elif not all(isinstance(cell, Ref) for cell in (
+                fact.source_control, fact.source_binding, fact.source_value,
+                fact.canonical_phi, fact.canonical_control,
+                fact.canonical_value,
+            )):
+                problem = "Try continuation arm lacks exact value cells"
+            else:
+                phi = book.page(SOURCE_EXCEPTION_CONTINUATION_PHI).latest(
+                    fact.source_phi.row
+                )
+                binding = book.page(NAME_BINDING).cells.get((
+                    fact.source_binding.row, fact.source_binding.column,
+                ))
+                if (
+                    not isinstance(phi, ExceptionContinuationPhiFact)
+                    or fact.source_binding.page != NAME_BINDING
+                    or fact.source_value.page != INGESTION_VALUE
+                    or int(row[2]) < 0
+                    or int(row[2]) >= len(phi.arms)
+                    or phi.arms[int(row[2])] != (
+                        fact.arm_kind, fact.source_control,
+                        fact.source_binding,
+                    )
+                    or binding is None
+                    or fact.source_binding.row[1] != phi.name
+                    or fact.source_value != book.latest_ref(
+                        INGESTION_VALUE,
+                        (phi.owner.row[0], int(binding.value_id))
+                        if binding is not None else (None, -1),
+                    )
+                    or int(fact.canonical_phi.row[1]) != int(row[1])
+                    or any(
+                        cell.row[0] != fact.canonical_phi.row[0]
+                        for cell in (
+                            fact.canonical_phi, fact.canonical_control,
+                            fact.canonical_value,
+                        )
+                    )
+                    or any(
+                        cell.page != CANONICAL_VALUE
+                        or book.latest_ref(CANONICAL_VALUE, cell.row) != cell
+                        for cell in (
+                            fact.canonical_phi, fact.canonical_control,
+                            fact.canonical_value,
+                        )
+                    )
+                    or not reaches(phi.phi, fact.canonical_phi)
+                    or not reaches(fact.source_control, fact.canonical_control)
+                    or not reaches(fact.source_value, fact.canonical_value)
+                ):
+                    problem = "Try continuation arm disagrees with source value"
+                elif {
+                    source for source, _stage in book.edges_into(receipt)
+                } != {
+                    fact.source_phi, fact.source_control,
+                    fact.source_binding, fact.source_value,
+                    fact.canonical_phi, fact.canonical_control,
+                    fact.canonical_value,
+                }:
+                    problem = "Try continuation arm provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-continuation-arm-value-disagreement",
                     str(row), None, problem,
                 ))
         return found

@@ -18,6 +18,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
     SOURCE_EXCEPTION_CONTINUATION_PHI,
+    SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
 )
 from src.compiler.identity_concordance import (
     CorrelationTable, Unresolved, begin_identity_book, end_identity_book,
@@ -107,6 +108,19 @@ def root(x: float) -> int:
         assert region_site.transfer == try_fact.sites[0]
         assert region_site.canonical_site.row[1] == region_rows[0][2]
         assert region_site.deployment_member.row == region_rows[0]
+        arm_page = book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE)
+        arm_rows = tuple(sorted(arm_page.rows(), key=lambda row: row[2]))
+        assert len(arm_rows) == 2
+        arm_facts = tuple(arm_page.latest(row) for row in arm_rows)
+        assert tuple(fact.arm_kind for fact in arm_facts) == (
+            "success", "handler",
+        )
+        assert all(
+            fact.source_phi == try_fact.carried[1]
+            and fact.canonical_phi.row[1] == row[1]
+            for row, fact in zip(arm_rows, arm_facts)
+        )
+        assert arm_facts[0].canonical_value != arm_facts[1].canonical_value
         source_module = SimpleNamespace(metadata={"identity_book": book})
         for check in (
             CorrelationTable._source_exception_site_state_findings,
@@ -116,6 +130,7 @@ def root(x: float) -> int:
             CorrelationTable._source_exception_handler_entry_findings,
             CorrelationTable._source_exception_handler_phi_findings,
             CorrelationTable._source_exception_continuation_phi_findings,
+            CorrelationTable._source_exception_continuation_arm_value_findings,
         ):
             assert check(source_module) == []
     finally:

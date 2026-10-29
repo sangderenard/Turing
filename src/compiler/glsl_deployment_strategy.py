@@ -13460,11 +13460,13 @@ def _source_try_control_programs(
     from .concordance_declarations import (
         CANONICAL_VALUE, CONTROL_PROGRAM_BUILD,
         DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER,
+        INGESTION_VALUE, NAME_BINDING,
+        SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
         SOURCE_EXCEPTION_CONTINUATION_PHI,
         SOURCE_EXCEPTION_HANDLER_CLASS,
         SOURCE_EXCEPTION_REGION_SITE,
         SOURCE_EXCEPTION_TRANSFER,
-        ExceptionRegionSiteFact,
+        ExceptionContinuationArmValueFact, ExceptionRegionSiteFact,
         ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
         ExceptionTransferFact,
     )
@@ -13657,6 +13659,71 @@ def _source_try_control_programs(
                     f"Try continuation Phi has no fact cell: {row!r}"
                 )
             continuation_cells.append(continuation_cell)
+            if planning_scope is None:
+                raise ValueError(
+                    f"Try continuation has no planning scope: {row!r}"
+                )
+            canonical_phi = book.latest_ref(
+                CANONICAL_VALUE, (canonical_scope, phi),
+            )
+            if canonical_phi is None:
+                raise ValueError(
+                    f"Try continuation has no forked Phi cell: {row!r}"
+                )
+            for arm_index, (kind, control, binding) in enumerate(fact.arms):
+                binding_fact = book.page(NAME_BINDING).cells.get((
+                    binding.row, binding.column,
+                ))
+                if (
+                    kind not in {"success", "handler"}
+                    or binding.row[1] != fact.name
+                    or binding_fact is None
+                ):
+                    raise ValueError(
+                        "Try continuation arm lacks exact name binding: "
+                        f"phi={row!r}, arm={arm_index}"
+                    )
+                source_value = book.latest_ref(
+                    INGESTION_VALUE,
+                    (fact.owner.row[0], int(binding_fact.value_id)),
+                )
+                if source_value is None:
+                    raise ValueError(
+                        "Try continuation binding has no source value: "
+                        f"phi={row!r}, arm={arm_index}"
+                    )
+                value_id = canonical_from_source(source_value)
+                control_id = canonical_from_source(control)
+                canonical_value = book.latest_ref(
+                    CANONICAL_VALUE, (canonical_scope, value_id),
+                )
+                canonical_control = book.latest_ref(
+                    CANONICAL_VALUE, (canonical_scope, control_id),
+                )
+                if canonical_value is None or canonical_control is None:
+                    raise ValueError(
+                        "Try continuation arm has no forked value or owner: "
+                        f"phi={row!r}, arm={arm_index}"
+                    )
+                # Program: `try: y = int(x); except ValueError: y = 2`.
+                # The source binding's value IDs map to forked 6 and 1;
+                # reading the final name `y` would lose which arm defined
+                # each value. Keep both exact value and control edges.
+                book.post(
+                    SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
+                    (planning_scope, phi, arm_index),
+                    ExceptionContinuationArmValueFact(
+                        continuation_cell, control, binding, source_value,
+                        canonical_phi, canonical_control, canonical_value,
+                        kind,
+                    ),
+                    stage=CONTROL_PROGRAM_BUILD,
+                    provenance=Derived((
+                        continuation_cell, control, binding, source_value,
+                        canonical_phi, canonical_control, canonical_value,
+                    )),
+                    mode=Mode.CONCORD,
+                )
         protected_transfers = []
         transfer_page = book.page(SOURCE_EXCEPTION_TRANSFER)
         for row in transfer_page.rows():

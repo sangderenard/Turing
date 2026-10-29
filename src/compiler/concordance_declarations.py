@@ -1306,6 +1306,29 @@ SOURCE_EXCEPTION_CONTINUATION_PHI = declare_page(
     ), ExceptionContinuationPhiFact,
 )
 
+
+@dataclass(frozen=True)
+class ExceptionContinuationArmValueFact:
+    """One source Try Phi arm's exact value in a forked control graph."""
+
+    source_phi: Ref
+    source_control: Ref
+    source_binding: Ref
+    source_value: Ref
+    canonical_phi: Ref
+    canonical_control: Ref
+    canonical_value: Ref
+    arm_kind: str
+
+
+SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE = declare_page(
+    "source_exception_continuation_arm_value", (
+        RowField("planning_scope", K.SCOPE),
+        RowField("canonical_phi", K.VALUE_ID),
+        RowField("arm", K.INDEX),
+    ), ExceptionContinuationArmValueFact,
+)
+
 # A native status is catchable only when this row points at the exact static
 # class definition. Native width limitations intentionally have no row.
 NATIVE_STATUS_CLASS = declare_page("native_status_class", (
