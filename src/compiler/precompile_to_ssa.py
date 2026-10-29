@@ -12035,7 +12035,9 @@ class _ControlSSABuilder(TiledObject):
         """Select exact status routes while admission remains shut."""
         from .concordance_declarations import (
             CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
-            SOURCE_EXCEPTION_HANDLER_CLASS, SOURCE_EXCEPTION_HANDLER_PHI,
+            SOURCE_EXCEPTION_HANDLER_CLASS,
+            SOURCE_EXCEPTION_HANDLER_ENTRY,
+            SOURCE_EXCEPTION_HANDLER_PHI,
             SOURCE_EXCEPTION_REGION_STATE, SOURCE_EXCEPTION_SSA_HANDLER_ARM,
             SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
             SOURCE_EXCEPTION_SSA_HANDLER_PHI,
@@ -12043,7 +12045,8 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_ROUTE, SOURCE_EXCEPTION_STATUS_ROUTE,
             ExceptionHandlerArmValueFact, ExceptionHandlerClassFact,
-            ExceptionHandlerPhiFact, ExceptionRegionStateFact,
+            ExceptionHandlerEntryFact, ExceptionHandlerPhiFact,
+            ExceptionRegionStateFact,
             ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
             ExceptionSSAHandlerPhiFact, ExceptionSSAHandlerStateFact,
             ExceptionSSARouteFact,
@@ -12371,9 +12374,9 @@ class _ControlSSABuilder(TiledObject):
                         "native Try handler identity has two control arms: "
                         f"handler={route.selected_handler!r}"
                     )
-                # A selected route reaches its handler entry. The entry
-                # still propagates until the authored body and finalizer
-                # have executable pending-outcome control.
+                # A selected route reaches its handler entry. Its body
+                # still ends in status propagation until the continuation
+                # and pending finalizer outcomes are executable.
                 self.branch(entry)
                 handler_incoming[route.selected_handler].append(
                     ssa_route_cell
@@ -12542,6 +12545,121 @@ class _ControlSSABuilder(TiledObject):
                     )),
                     mode=Mode.CONCORD,
                 )
+            source_entries = tuple(
+                (row, book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest(row))
+                for row in book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).rows()
+                if book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest(
+                    row
+                ).handler == source_handler
+            )
+            if len(source_entries) != 1 or not isinstance(
+                source_entries[0][1], ExceptionHandlerEntryFact,
+            ):
+                raise ValueError(
+                    "native handler has no exact source entry state: "
+                    f"handler={source_handler!r}"
+                )
+            source_entry_row, source_entry = source_entries[0]
+            source_entry_cell = book.latest_ref(
+                SOURCE_EXCEPTION_HANDLER_ENTRY, source_entry_row,
+            )
+            route_owners = {
+                book.page(SOURCE_EXCEPTION_STATUS_ROUTE).cell(
+                    route.source_route.row, route.source_route.column,
+                ).owner
+                for route in route_facts
+            }
+            if source_entry_cell is None or route_owners != {
+                source_entry.owner
+            }:
+                raise ValueError(
+                    "native handler source entry disagrees with Try owner: "
+                    f"handler={source_handler!r}"
+                )
+            for name in source_entry.required_names:
+                state_cells = tuple(
+                    book.latest_ref(
+                        SOURCE_EXCEPTION_SSA_HANDLER_STATE,
+                        (*route_cell.row, name),
+                    ) for route_cell in route_cells
+                )
+                if any(cell is None for cell in state_cells):
+                    raise ValueError(
+                        "native handler required name has no route state: "
+                        f"handler={source_handler!r}, name={name!r}"
+                    )
+                route_states = tuple(
+                    book.page(SOURCE_EXCEPTION_SSA_HANDLER_STATE).cell(
+                        cell.row, cell.column,
+                    ) for cell in state_cells
+                )
+                region_states = tuple(
+                    book.page(SOURCE_EXCEPTION_REGION_STATE).cell(
+                        fact.region_state.row, fact.region_state.column,
+                    ) for fact in route_states
+                )
+                expected_bindings = dict(source_entry.incoming_bindings)[name]
+                if any(
+                    (region.transfer, region.source_binding)
+                    not in expected_bindings
+                    for region in region_states
+                ):
+                    raise ValueError(
+                        "native handler name disagrees with source entry: "
+                        f"handler={source_handler!r}, name={name!r}"
+                    )
+                canonical_values = {
+                    region.canonical_value for region in region_states
+                }
+                incoming_values = {
+                    state.incoming_value for state in route_states
+                }
+                if len(canonical_values) == len(incoming_values) == 1:
+                    canonical_value = next(iter(canonical_values))
+                    incoming_cell = next(iter(incoming_values))
+                    incoming = self.ssa_value_objects[
+                        int(incoming_cell.row[1])
+                    ]
+                    if not self._value_dominates_current_edge(incoming):
+                        raise ValueError(
+                            "native handler single-valued name does not "
+                            "dominate entry: "
+                            f"handler={source_handler!r}, name={name!r}"
+                        )
+                    # Program: z=5; try: y=int(x); except ValueError:
+                    # y=z+1. The handler reads z from the failed call's
+                    # source binding. Restore that exact value, not the
+                    # successful arm's final lexical environment.
+                    self._bind(
+                        int(canonical_value.row[1]), incoming,
+                        BindingKind.RESTORED,
+                        source_entry_cell, *state_cells,
+                    )
+                    continue
+                matching_phis = tuple(
+                    fact for row in book.page(
+                        SOURCE_EXCEPTION_SSA_HANDLER_PHI
+                    ).rows()
+                    for fact in (
+                        book.page(
+                            SOURCE_EXCEPTION_SSA_HANDLER_PHI
+                        ).latest(row),
+                    )
+                    if isinstance(fact, ExceptionSSAHandlerPhiFact)
+                    and fact.handler_entry == entry_fact_cell
+                    and book.page(SOURCE_EXCEPTION_HANDLER_PHI).cell(
+                        fact.source_phi.row, fact.source_phi.column,
+                    ).name == name
+                )
+                if len(matching_phis) != 1:
+                    raise ValueError(
+                        "native handler differing name has no exact Phi: "
+                        f"handler={source_handler!r}, name={name!r}"
+                    )
+            self.lower(
+                block.handlers[handler_ordinals[source_handler]].body,
+                path=f"{path}.try_handler[{handler_ordinals[source_handler]}]",
+            )
             self.emit(
                 Handler.Call, [status_phi],
                 attributes={

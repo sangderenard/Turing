@@ -11,6 +11,7 @@ from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.glsl_deployment_strategy import CompilationSubdivisionRequired
 from src.compiler.concordance_declarations import (
     CONTROL_BLOCK, ControlBlockKind,
+    CONTROL_VALUE_BINDING, BindingKind,
     NAME_BINDING, SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_SITE_STATE,
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
@@ -626,6 +627,113 @@ def root(x: float) -> int:
             for route_cell in entry.incoming_routes
         )
         assert CorrelationTable._source_exception_ssa_handler_entry_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    finally:
+        end_identity_book(token)
+
+
+def test_handler_body_reads_restored_failure_site_state(monkeypatch):
+    source = """\
+def root(x: float) -> float:
+    try:
+        y = int(x)
+    except ValueError:
+        y = x + 1.0
+    return y
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+    overlaid = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            overlaid.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_handler_body", identity_book=book)
+        assert len(overlaid) == 1
+        site_row, = tuple(book.page(SOURCE_EXCEPTION_REGION_SITE).rows())
+        state_row, = tuple(book.page(SOURCE_EXCEPTION_REGION_STATE).rows())
+        assert state_row[3] == "x"
+        input_id = int(book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
+            state_row
+        ).canonical_value.row[1])
+        outputs = {
+            book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE).latest(
+                row
+            ).arm_kind: int(book.page(
+                SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE
+            ).latest(row).canonical_value.row[1])
+            for row in book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE).rows()
+        }
+        try_row, = tuple(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        lowered, shortfalls = lower_control_program_to_ssa(
+            overlaid[0], function_name="exception_handler_body_probe",
+            first_value_id=1000,
+            lexical_read_scope=try_row[0], planning_scope=site_row[0],
+            region_callees={
+                0: "numerical_region_0", 1: "numerical_region_1",
+            },
+            region_signatures={
+                0: ((input_id,), (outputs["handler"],)),
+                1: ((input_id,), (outputs["success"],)),
+            },
+        )
+        assert any(
+            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
+        )
+        handler_entry_row, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_HANDLER_ENTRY
+        ).rows())
+        handler_entry = book.page(
+            SOURCE_EXCEPTION_SSA_HANDLER_ENTRY
+        ).latest(handler_entry_row)
+        assert any(
+            instruction.attributes.get("callee") == "numerical_region_0"
+            for instruction in lowered.blocks[
+                handler_entry.entry_block.row[2]
+            ].instrs
+        )
+        binding = book.page(CONTROL_VALUE_BINDING).latest((
+            handler_entry_row[0], input_id,
+        ))
+        assert binding.kind is BindingKind.RESTORED
+        source_entry_row, = tuple(
+            row for row in book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).rows()
+            if book.page(SOURCE_EXCEPTION_HANDLER_ENTRY).latest(
+                row
+            ).handler == handler_entry.source_handler
+        )
+        binding_cell = book.latest_ref(CONTROL_VALUE_BINDING, (
+            handler_entry_row[0], input_id,
+        ))
+        assert book.latest_ref(
+            SOURCE_EXCEPTION_HANDLER_ENTRY, source_entry_row,
+        ) in {
+            cause for cause, _stage in book.edges_into(binding_cell)
+        }
+        assert all(
+            book.latest_ref(SOURCE_EXCEPTION_SSA_HANDLER_STATE, (
+                *route_cell.row, "x",
+            )) in {
+                cause for cause, _stage in book.edges_into(binding_cell)
+            }
+            for route_cell in handler_entry.incoming_routes
+        )
+        assert CorrelationTable._source_exception_ssa_handler_state_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
     finally:
