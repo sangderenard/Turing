@@ -976,12 +976,32 @@ def _promote_conditional_sequence_aliases(
     sequence_kinds = copyable_sequence_kinds | in_place_sequence_kinds
     resident_by_value: dict[int, int] = {}
     kind_by_value: dict[int, str] = {}
+    # Program: ``xs = [7]; for i in range(n): xs = xs + [i, i * 2]``.  Wrong
+    # record: residency was read from the ``aggregate_kind`` node attribute,
+    # which a concatenation's result does not carry, so the rebound list was
+    # no resident and its carry fell to a scalar handle.  Rule: a value is a
+    # sequence resident when its SOURCE_VALUE_CLASS row names a sequence
+    # class.
+    from ..common.tensors.topological_reducer import _source_numeric_scope
+    from .concordance_declarations import SOURCE_VALUE_CLASS
+    from .identity_concordance import current_identity_book
+
+    class_page = current_identity_book().page(SOURCE_VALUE_CLASS)
+    class_scope = _source_numeric_scope(graph_obj)
+    sequence_classes = {
+        "builtins.list": "list", "builtins.bytes": "bytes",
+        "builtins.bytearray": "bytearray", "builtins.dict": "dict",
+        "builtins.set": "set",
+    }
     for node_id, data in graph_obj.nodes(data=True):
-        attributes = data.get("attributes") or {}
-        kind = str(attributes.get("aggregate_kind") or "")
-        if kind not in sequence_kinds:
-            continue
         value_id = int(data.get("value_id", node_id))
+        fact = class_page.latest((class_scope, value_id))
+        kind = (
+            sequence_classes.get(str(fact[0]))
+            if isinstance(fact, tuple) and fact else None
+        )
+        if kind is None:
+            continue
         resident_by_value[value_id] = value_id
         kind_by_value[value_id] = kind
     for value_id, kind in dict(call_result_kinds or {}).items():
@@ -2190,7 +2210,9 @@ def _static_mapping_capacity_bounds(
             if node_id not in unknown}
 
 
-def _control_sequence_capacity_bounds(control: Any, sequence_ids: Iterable[int]) -> dict[int, int]:
+def _control_sequence_capacity_bounds(
+    control: Any, sequence_ids: Iterable[int],
+) -> dict[int, int | None]:
     """Interval transfer over the existing lexical control tree, not a replay.
 
     In the controller-shaped repro, failures grows at most once in a while
@@ -2364,7 +2386,7 @@ def _control_sequence_capacity_bounds(control: Any, sequence_ids: Iterable[int])
         return state
 
     visit(control.root, initial)
-    return {key: value for key, value in peaks.items() if value is not None}
+    return dict(peaks)
 
 
 #: Builtins that read (or copy) a collection argument without retaining or
@@ -2674,9 +2696,22 @@ def _static_sequence_capacity_survey(
                     and isinstance(arm.get("value"), (list, tuple))):
                 bounds.setdefault(int(parent), len(arm["value"]))
     if control is not None:
-        bounds.update({key: max(count, bounds.get(key, 0)) for key, count in _control_sequence_capacity_bounds(
+        # Program: ``xs = [7]; for i in range(n): xs = xs + [i, i * 2]``.
+        # Wrong record: the transfer proved ``xs``'s arena unbounded (the
+        # loop's ``replace`` of the carried list, a trip count no literal
+        # bounds), but only its bounded peaks were read, so the display's
+        # one row stayed the bound and the second trip's copy raised
+        # capacity error 75.  Rule: a list the transfer leaves unbounded
+        # keeps no bound of its own birth.
+        for key, count in _control_sequence_capacity_bounds(
             control, local_lists,
-        ).items() if key not in escaped})
+        ).items():
+            if key in escaped:
+                continue
+            if count is None:
+                bounds.pop(key, None)
+            else:
+                bounds[key] = max(count, bounds.get(key, 0))
     # Program: ``ys = list(xs); ys.append(n); len(ys)`` (fuzzer p3_37).
     # Wrong record: the snapshot took its source's bound and its own later
     # appends were never counted, so the append found the arena full, its

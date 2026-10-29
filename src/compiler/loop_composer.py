@@ -841,9 +841,18 @@ def _retarget_plan_value_ids(
         (name, rename(initial), rename(continuation))
         for name, initial, continuation in loop.break_bindings
     )
+    # Program: ``xs = [7]; for i in range(n): xs = xs + [i, i * 2]`` then
+    # ``for x in xs``.  Wrong record: the earlier loop's port redirected the
+    # second loop's ``iterable`` edge onto its LoopResult, but this copy kept
+    # the body's last concatenation, so the second loop iterated that arena
+    # (empty when the first loop runs no trip) instead of the carried list.
+    iterable_node = (
+        None if loop.iterable_node is None else rename(loop.iterable_node)
+    )
     renamed_loop = (
         replace(
             loop,
+            iterable_node=iterable_node,
             carried_bindings=carried,
             state_effects=rename_effects(loop.state_effects),
             iteration_outputs=rename_outputs(loop.iteration_outputs),
@@ -853,6 +862,7 @@ def _retarget_plan_value_ids(
         )
         if (
             carried != tuple(loop.carried_bindings)
+            or iterable_node != loop.iterable_node
             or return_controls != tuple(loop.return_controls)
             or control_sites != tuple(loop.control_sites)
             or break_bindings != tuple(loop.break_bindings)
