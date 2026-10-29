@@ -32887,24 +32887,29 @@ def lower_control_sections_to_ssa(
                     _function_value_dtypes.setdefault(
                         int(_value.id), set()
                     ).add(str(_value.dtype))
-    # Program: ``self.steps = 0`` in a constructor that never reads it.
-    # Wrong record: the written constant is no instruction's operand in the
-    # function (the field store is the epilogue's), so its op carried no
-    # dtype and the slot was refused.  Rule: a value no instruction carries
-    # is typed by the plan that typed it (``value_dtypes``, the record the
-    # constant materializer reads).
+    # Program: the structure driver's ``fold(d, vocabulary.epoch)`` on a
+    # local ``Vocabulary()``; ``self.steps = 0`` in a constructor that never
+    # reads it.  Wrong record: a field operation's value that no instruction
+    # carries (a read consumed only as a call actual, a constant whose store
+    # is the epilogue's) was read for a dtype from the instructions alone,
+    # so the slot was refused though the value's own VALUE_TYPE_ABI row
+    # states its scalar storage.  Rule: each field operation's value states
+    # its dtype through its VALUE_TYPE_ABI row (one scalar arm) as well as
+    # through the instructions that carry it; they must agree.
+    def _abi_scalar_dtypes(value_id: int) -> set[str]:
+        fact = (native_value_type_abi or {}).get(int(value_id))
+        arms = tuple(getattr(fact, "physical_alternatives", ()) or ())
+        if len(arms) != 1 or arms[0].storage != "scalar" or not arms[0].dtype:
+            return set()
+        return {str(arms[0].dtype)}
+
     for _name in undeclared_scalar_fields:
         _slot = field_names.index(_name)
         _seen = set()
         for _kind, _value_id, _op_slot in field_ops:
             if int(_op_slot) == _slot:
-                _carried = _function_value_dtypes.get(int(_value_id))
-                _planned = (value_dtypes or {}).get(int(_value_id))
-                _seen |= (
-                    _carried if _carried
-                    else {str(_planned)} if _planned is not None
-                    else set()
-                )
+                _seen |= _function_value_dtypes.get(int(_value_id), set())
+                _seen |= _abi_scalar_dtypes(int(_value_id))
         if len(_seen) != 1:
             raise ValueError(
                 f"record scalar slot ABI lacks dtype in {control_function.name} "
