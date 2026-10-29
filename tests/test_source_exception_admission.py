@@ -38,7 +38,7 @@ def _lower(source: str, name: str, **kwargs):
     )
 
 
-def test_authored_catch_without_exceptional_control_refuses():
+def test_authored_catch_without_exceptional_control_refuses(monkeypatch):
     # Before admission, the C artifact for NaN returned INT64_MIN instead of
     # running the ValueError handler and returning 2.
     source = """\
@@ -49,6 +49,21 @@ def root(x: float) -> int:
         y = 2
     return y
 """
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.control_source import NativeTryBlock
+
+    overlaid = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            overlaid.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
     book, token = begin_identity_book()
     try:
         with pytest.raises(CompilationSubdivisionRequired) as error:
@@ -73,6 +88,11 @@ def root(x: float) -> int:
             if row[1] is ControlBlockKind.NATIVE_TRY
         )
         assert len(try_blocks) == 1
+        assert len(overlaid) == 1
+        assert any(
+            isinstance(block, NativeTryBlock)
+            for block in overlaid[0].root.blocks
+        )
         try_fact = book.page(CONTROL_BLOCK).latest(try_blocks[0])
         assert len(try_fact.carried) == 2
         assert try_fact.carried[1].page == SOURCE_EXCEPTION_CONTINUATION_PHI

@@ -14396,6 +14396,7 @@ def _overlay_control_or_require_subdivision(
     conditional_controls: Sequence[ControlProgram],
     nesting: Mapping[int, Iterable[int]],
     *,
+    try_controls: Sequence[ControlProgram] = (),
     authored_control_sites: "Mapping[tuple[int, int], AuthoredControlSite] | None" = None,
     region_dependencies: Iterable[tuple[int, int]] = (),
     dispatch_subgraphs: Iterable[Any] = (),
@@ -14468,7 +14469,7 @@ def _overlay_control_or_require_subdivision(
         from .control_source import order_control_region_dependencies
         program = overlay_scheduled_control(
             runtime_regions,
-            (*loop_controls, *conditional_controls),
+            (*loop_controls, *conditional_controls, *try_controls),
             known_nesting=nesting,
             authored_control_sites=authored_control_sites,
             source_graph=graph,
@@ -34947,7 +34948,6 @@ class ProcessGraphGLSLDeployment(TiledObject):
                     target.process_graph, runtime_regions,
                     target.dispatch_subgraphs,
                 )
-                refuse_unadmitted_source_tries()
             # A blocked loop (real blockers, e.g. an authored ``raise``) has
             # no control_program and is silently excluded above. Its BODY
             # REGIONS were still compiled as ordinary numerical work and
@@ -35186,11 +35186,15 @@ class ProcessGraphGLSLDeployment(TiledObject):
                     file=sys.stderr,
                 )
             authored_control_sites = {}
+            try_controls = tuple(getattr(
+                target, "source_try_control_programs", (),
+            ))
             nesting = _source_control_nesting_hints(
                 considered_reductions,
                 conditional_controls,
                 target.loop_plans,
                 target.process_graph,
+                try_programs=try_controls,
                 authored_control_site_sink=authored_control_sites,
             )
             shell_control = _overlay_control_or_require_subdivision(
@@ -35200,6 +35204,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 loop_controls,
                 conditional_controls,
                 nesting,
+                try_controls=try_controls,
                 authored_control_sites=authored_control_sites,
                 region_dependencies=region_dependencies,
                 dispatch_subgraphs=target.dispatch_subgraphs,
