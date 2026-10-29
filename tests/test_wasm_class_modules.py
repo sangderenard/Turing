@@ -9,6 +9,7 @@ import subprocess
 import pytest
 
 from src.common.tensors.fused_ir import FusedProgram, OpStep
+from tests.wasm_captured_programs import captured_floats
 from src.compiler.wasm_class_modules import (
     build_embedded_class_graph, build_hued_process_graph_views, build_manifest, build_module_process_graph,
     describe_process_graph_api, emit_class_modules,
@@ -34,6 +35,38 @@ def _linear_program(n_steps: int, feed_id: int = 1) -> FusedProgram:
         previous = result_id
     return FusedProgram(
         version=1, feeds={feed_id}, steps=steps, outputs={"result": previous},
+    )
+
+
+def _captured_chain(n_steps: int) -> FusedProgram:
+    """The same scalar-multiply chain, captured from source so the emitted
+    modules have the capture's dtype record to lower from."""
+
+    body = "".join("    x = x * 2.0\n" for _ in range(n_steps - 1))
+    program = captured_floats(
+        f"def kernel(x):\n{body}    result = x * 2.0\n    return result\n",
+        "x",
+    )
+    assert [step.op_name for step in program.steps] == ["mul"] * n_steps
+    return program
+
+
+def _chain_ids(program: FusedProgram) -> tuple[int, list[int]]:
+    """The chain's one feed and its step results, in order."""
+
+    (feed,) = program.feeds
+    return int(feed), [int(step.result_id) for step in program.steps]
+
+
+def _without_feed_origins(program: FusedProgram) -> FusedProgram:
+    """A captured program whose producer recorded no feed origins."""
+
+    extras = dict(program.extras or {})
+    extras.pop("capture_feed_origins", None)
+    return FusedProgram(
+        version=program.version, feeds=set(program.feeds),
+        steps=list(program.steps), outputs=dict(program.outputs),
+        state_in=program.state_in, meta=program.meta, extras=extras,
     )
 
 
@@ -159,7 +192,7 @@ def test_partition_prunes_a_dead_tail_after_the_declared_output():
 
 
 def test_emit_class_modules_produces_one_complete_module_per_chunk():
-    program = _linear_program(5)
+    program = _captured_chain(5)
     specs = partition_reduced_program(program, chunk_size=2, owner_name="kernel")
     modules = emit_class_modules(specs, link_calls=False)
     assert set(modules) == {s.index for s in specs}
@@ -170,7 +203,7 @@ def test_emit_class_modules_produces_one_complete_module_per_chunk():
 
 
 def test_link_calls_true_wires_a_real_import_for_the_dependency():
-    program = _linear_program(4)
+    program = _captured_chain(4)
     specs = partition_reduced_program(program, chunk_size=2, owner_name="kernel")
     modules = emit_class_modules(specs, link_calls=True)
     chunk0, chunk1 = specs
@@ -179,7 +212,7 @@ def test_link_calls_true_wires_a_real_import_for_the_dependency():
 
 
 def test_link_calls_false_produces_independently_instantiable_modules():
-    program = _linear_program(4)
+    program = _captured_chain(4)
     specs = partition_reduced_program(program, chunk_size=2, owner_name="kernel")
     modules = emit_class_modules(specs, link_calls=False)
     for module in modules.values():
@@ -246,7 +279,7 @@ def test_the_wired_import_actually_type_checks_against_its_exporter(tmp_path):
     there is exactly the kind of bug that assembles fine but fails to
     *instantiate*, which is what this checks."""
 
-    program = _linear_program(4)
+    program = _captured_chain(4)
     specs = partition_reduced_program(program, chunk_size=2, owner_name="kernel")
     modules = emit_class_modules(specs, link_calls=True)
     chunk0, chunk1 = specs
@@ -291,35 +324,41 @@ def test_the_wired_import_actually_type_checks_against_its_exporter(tmp_path):
 
 
 def test_build_manifest_derives_edges_from_the_cut_boundary():
-    program = _linear_program(4)
+    program = _captured_chain(4)
+    feed, results = _chain_ids(program)
     specs = partition_reduced_program(program, chunk_size=2, owner_name="kernel")
     modules = emit_class_modules(specs, link_calls=False)
     manifest = build_manifest(specs, modules)
 
     chunk0, chunk1 = specs
-    assert {"from": {"module": chunk0.module_name, "output": "value_101"},
+    assert {"from": {"module": chunk0.module_name, "output": f"value_{results[1]}"},
             "to": {"module": chunk1.module_name, "input": "feed0"}} in manifest["edges"]
     # The program's own external feed is needed only by chunk0.
     assert chunk1.module_name not in manifest["graph_input_value_ids"]
-    assert manifest["graph_input_value_ids"][chunk0.module_name] == [(1, "feed0")]
+    assert manifest["graph_input_value_ids"][chunk0.module_name] == [(feed, "feed0")]
 
 
 def test_manifest_uses_the_emitted_module_feed_order_not_boundary_set_order():
-    program = FusedProgram(
-        version=1,
-        feeds={1, 2},
-        steps=[OpStep(0, "sub", [2, 1], result_id=3)],
-        outputs={"result": 3},
+    program = captured_floats(
+        "def kernel(first, second):\n    return second - first\n",
+        "first", "second",
     )
+    origins = program.extras["capture_feed_origins"]
+    first, second = (
+        next(int(feed) for feed in program.feeds
+             if origins[feed]["binding_name"] == name)
+        for name in ("first", "second")
+    )
+    assert first < second
     specs = partition_reduced_program(program, chunk_size=10, owner_name="kernel")
     modules = emit_class_modules(specs, link_calls=False)
     manifest = build_manifest(specs, modules)
 
-    # The graph boundary discovers feeds as 1,2, but the emitted function
-    # consumes 2 first and therefore assigns feed0 to value 2.
-    assert specs[0].region.input_ids == (1, 2)
+    # The graph boundary discovers feeds in id order, but the emitted
+    # function consumes ``second`` first and therefore assigns it feed0.
+    assert specs[0].region.input_ids == (first, second)
     assert manifest["graph_input_value_ids"][specs[0].module_name] == [
-        (2, "feed0"), (1, "feed1"),
+        (second, "feed0"), (first, "feed1"),
     ]
 
 
@@ -486,19 +525,10 @@ def test_describe_process_graph_api_collapses_a_value_needed_by_several_chunks()
     of them) must appear exactly once in the logical API, not once per
     chunk that happens to need it."""
 
-    program = FusedProgram(
-        version=1, feeds={1},
-        steps=[
-            OpStep(step_id=0, op_name="mul", input_ids=[1],
-                   attrs={"right_scalar": 2.0}, result_id=101),
-            OpStep(step_id=1, op_name="mul", input_ids=[1],
-                   attrs={"right_scalar": 3.0}, result_id=102),
-            OpStep(step_id=2, op_name="add", input_ids=[101, 102],
-                   attrs={}, result_id=103),
-        ],
-        outputs={"result": 103},
-        extras={"capture_feed_origins": {1: {"binding_name": "x"}}},
+    program = captured_floats(
+        "def kernel(x):\n    return x * 2.0 + x * 3.0\n", "x",
     )
+    assert [step.op_name for step in program.steps] == ["mul", "mul", "add"]
     specs = partition_reduced_program(program, chunk_size=1, owner_name="kernel")
     modules = emit_class_modules(specs, link_calls=False)
     api = describe_process_graph_api(specs, modules, program, entrypoint="kernel")
@@ -507,10 +537,7 @@ def test_describe_process_graph_api_collapses_a_value_needed_by_several_chunks()
 
 
 def test_embedded_graph_can_redirect_a_logical_input_to_output_storage():
-    program = _linear_program(4)
-    program.extras = {"capture_feed_origins": {
-        1: {"binding_name": "x"},
-    }}
+    program = _captured_chain(4)
     specs = partition_reduced_program(program, chunk_size=2, owner_name="kernel")
     modules = emit_class_modules(
         specs, link_calls=False, shared_memory=True,
@@ -528,15 +555,12 @@ def test_embedded_graph_can_redirect_a_logical_input_to_output_storage():
 
 
 def test_state_feedback_names_an_originless_feed_before_inventory_consumes_it():
-    program = FusedProgram(
-        version=1,
-        feeds={4},
-        steps=[OpStep(
-            step_id=0, op_name="add", input_ids=[4],
-            attrs={"right_scalar": 1.0}, result_id=5,
-        )],
-        outputs={"phase_next": 5},
-    )
+    program = _without_feed_origins(captured_floats(
+        "def kernel(phase):\n    phase_next = phase + 1.0\n"
+        "    return phase_next\n",
+        "phase",
+    ))
+    assert set(program.outputs) == {"phase_next"}
     specs = partition_reduced_program(program, chunk_size=10, owner_name="kernel")
     modules = emit_class_modules(
         specs, link_calls=False, shared_memory=True,
@@ -568,17 +592,15 @@ def test_describe_process_graph_api_falls_back_to_a_synthetic_name():
     """A hand-built program with no capture_feed_origins extras still gets
     a usable, if less pretty, parameter name -- never a crash."""
 
-    program = FusedProgram(
-        version=1, feeds={1},
-        steps=[OpStep(step_id=0, op_name="mul", input_ids=[1],
-                       attrs={"right_scalar": 2.0}, result_id=2)],
-        outputs={"result": 2},
-    )
+    program = _without_feed_origins(captured_floats(
+        "def kernel(x):\n    return x * 2.0\n", "x",
+    ))
+    (feed,) = program.feeds
     specs = partition_reduced_program(program, chunk_size=10, owner_name="kernel")
     modules = emit_class_modules(specs, link_calls=False)
     api = describe_process_graph_api(specs, modules, program, entrypoint="kernel")
     inputs = [p.name for p in api.entry_points[0].parameters if p.role == "input"]
-    assert inputs == ["input_1"]
+    assert inputs == [f"input_{feed}"]
 
 
 def test_hue_identities_trickle_through_the_reduced_schedule():

@@ -1,30 +1,18 @@
+import numpy as np
 import pytest
 
-from src.common.tensors.fused_ir import FusedProgram, OpStep
 from src.compiler import machine_targets
 from src.compiler.fused_program_wasm_backend import (
     WasmEmissionError,
     emit_wasm_module,
 )
+from tests.wasm_captured_programs import captured_floats, captured_program
 
 
-def _program(*steps: OpStep, feeds, outputs) -> FusedProgram:
-    return FusedProgram(
-        version=1, feeds=set(feeds), steps=list(steps), outputs=dict(outputs)
-    )
-
-
-def _sub_abs_plus_one() -> FusedProgram:
-    left, right, s0, s1, s2 = 1, 2, 3, 4, 5
-    return _program(
-        OpStep(step_id=0, op_name="sub", input_ids=[left, right], attrs={}, result_id=s0),
-        OpStep(step_id=1, op_name="abs", input_ids=[s0], attrs={}, result_id=s1),
-        OpStep(
-            step_id=2, op_name="add", input_ids=[s1],
-            attrs={"right_scalar": 1.0}, result_id=s2,
-        ),
-        feeds=(left, right),
-        outputs={"result": s2},
+def _sub_abs_plus_one():
+    return captured_floats(
+        "def demo(left, right):\n    return abs(left - right) + 1.0\n",
+        "left", "right",
     )
 
 
@@ -32,7 +20,7 @@ def test_elementwise_program_emits_a_complete_module():
     module = emit_wasm_module(_sub_abs_plus_one(), name="demo")
 
     assert module.complete, module.shortfall_report()
-    assert module.parameters == ("$count", "$feed0", "$feed1", "$out0")
+    assert module.parameters == ("$count", "$left", "$right", "$out0")
     assert module.value_type == "f64"
     # The instructions the steps lower to, in order.
     for instruction in ("f64.sub", "f64.abs", "f64.add", "f64.load", "f64.store"):
@@ -45,87 +33,63 @@ def test_elementwise_program_emits_a_complete_module():
 def test_tan_composes_the_existing_sine_and_cosine_tables():
 
     module = emit_wasm_module(
-        _program(
-            OpStep(step_id=0, op_name="tan", input_ids=[1], attrs={}, result_id=2),
-            feeds=(1,),
-            outputs={"result": 2},
-        ),
-        name="t",
+        captured_floats("def t(x):\n    return x.tan()\n", "x"), name="t",
     )
     assert module.complete, module.shortfall_report()
     assert module.binary
 
 
 def test_composed_pow_mod_and_sign_are_real_wasm_lowerings():
-    for operation in ("pow", "mod"):
-        module = emit_wasm_module(
-            _program(
-                OpStep(
-                    step_id=0, op_name=operation, input_ids=[1, 2],
-                    attrs={}, result_id=3,
-                ),
-                feeds=(1, 2),
-                outputs={"result": 3},
-            ),
-            name=operation,
+    for operation, symbol in (("pow", "**"), ("mod", "%")):
+        program = captured_floats(
+            f"def t(x, y):\n    return x {symbol} y\n", "x", "y",
         )
+        assert [step.op_name for step in program.steps] == [operation]
+        module = emit_wasm_module(program, name=operation)
         assert module.complete, module.shortfall_report()
         assert module.binary
     sign = emit_wasm_module(
-        _program(
-            OpStep(step_id=0, op_name="sign", input_ids=[1], attrs={}, result_id=2),
-            feeds=(1,), outputs={"result": 2},
-        ),
-        name="sign",
+        captured_floats("def t(x):\n    return x.sign()\n", "x"), name="sign",
     )
     assert sign.complete, sign.shortfall_report()
     assert sign.binary
 
 
 @pytest.mark.parametrize(
-    ("operation", "inputs"),
+    ("operation", "expression"),
     [
-        ("isfinite", [1]),
-        ("isnan", [1]),
-        ("isinf", [1]),
-        ("logical_not", [1]),
-        ("invert", [1]),
-        ("logical_and", [1, 2]),
-        ("logical_or", [1, 2]),
+        ("isfinite", "x.isfinite()"),
+        ("isnan", "x.isnan()"),
+        ("isinf", "x.isinf()"),
+        ("logical_not", "x.logical_not()"),
+        ("invert", "~x"),
+        ("logical_and", "x.logical_and(y)"),
+        ("logical_or", "x.logical_or(y)"),
     ],
 )
-def test_predicate_logical_and_invert_paths_emit_runnable_wasm(operation, inputs):
-    result_id = 3 if len(inputs) == 2 else 2
-    module = emit_wasm_module(
-        _program(
-            OpStep(
-                step_id=0, op_name=operation, input_ids=inputs,
-                attrs={}, result_id=result_id,
-            ),
-            feeds=tuple(inputs), outputs={"result": result_id},
-        ),
-        name=operation,
-        dtype="float64",
-    )
+def test_predicate_logical_and_invert_paths_emit_runnable_wasm(operation, expression):
+    names = ("x", "y") if "(y)" in expression else ("x",)
+    source = f"def t({', '.join(names)}):\n    return {expression}\n"
+    if operation == "invert":
+        # ``~`` inverts an integer's bits; a float has none to invert.
+        program = captured_program(
+            source, x=np.asarray([0b1010, -8, 255], dtype=np.int64),
+        )
+    else:
+        program = captured_floats(source, *names)
+    assert [step.op_name for step in program.steps] == [operation]
+    module = emit_wasm_module(program, name=operation)
     assert module.complete, module.shortfall_report()
     assert module.binary
 
 
 def test_a_scalar_operand_becomes_a_constant_not_a_second_feed():
     module = emit_wasm_module(
-        _program(
-            OpStep(
-                step_id=0, op_name="mul", input_ids=[1],
-                attrs={"right_scalar": 2.5}, result_id=2,
-            ),
-            feeds=(1,),
-            outputs={"result": 2},
-        ),
-        name="t",
+        captured_floats("def t(x):\n    return x * 2.5\n", "x"), name="t",
     )
     assert module.complete
     assert "f64.const 2.5" in module.source
-    assert module.parameters == ("$count", "$feed0", "$out0")
+    assert module.parameters == ("$count", "$x", "$out0")
 
 
 def test_reversed_scalar_operands_keep_their_order():
@@ -133,15 +97,7 @@ def test_reversed_scalar_operands_keep_their_order():
     decides it."""
 
     module = emit_wasm_module(
-        _program(
-            OpStep(
-                step_id=0, op_name="sub", input_ids=[1],
-                attrs={"right_scalar": 10.0, "reverse": True}, result_id=2,
-            ),
-            feeds=(1,),
-            outputs={"result": 2},
-        ),
-        name="t",
+        captured_floats("def t(x):\n    return 10.0 - x\n", "x"), name="t",
     )
     body = module.source
     assert body.index("f64.const 10.0") < body.index("local.get $v0")
@@ -152,12 +108,7 @@ def test_comparisons_come_back_in_the_value_type():
     type; WebAssembly's comparisons yield i32, so the result is converted."""
 
     module = emit_wasm_module(
-        _program(
-            OpStep(step_id=0, op_name="less", input_ids=[1, 2], attrs={}, result_id=3),
-            feeds=(1, 2),
-            outputs={"result": 3},
-        ),
-        name="t",
+        captured_floats("def t(x, y):\n    return x < y\n", "x", "y"), name="t",
     )
     assert module.complete
     assert "f64.lt" in module.source
@@ -222,21 +173,11 @@ def test_wasm_is_registered_and_declares_what_it_cannot_do():
 
 
 def test_the_hub_chooses_before_emitting_rather_than_by_failing():
-    representable = _program(
-        OpStep(step_id=0, op_name="mul", input_ids=[1, 2], attrs={}, result_id=3),
-        feeds=(1, 2),
-        outputs={"result": 3},
+    representable = captured_floats(
+        "def t(x, y):\n    return x * y\n", "x", "y",
     )
-    unreachable = _program(
-        OpStep(step_id=0, op_name="tan", input_ids=[1], attrs={}, result_id=2),
-        feeds=(1,),
-        outputs={"result": 2},
-    )
-    tabulated = _program(
-        OpStep(step_id=0, op_name="sin", input_ids=[1], attrs={}, result_id=2),
-        feeds=(1,),
-        outputs={"result": 2},
-    )
+    unreachable = captured_floats("def t(x):\n    return x.tan()\n", "x")
+    tabulated = captured_floats("def t(x):\n    return x.sin()\n", "x")
 
     assert "wasm" in machine_targets.targets_for(representable)
     assert "wasm" in machine_targets.targets_for(unreachable)

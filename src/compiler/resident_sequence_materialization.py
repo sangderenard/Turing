@@ -3674,6 +3674,10 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
                 )
     aggregate_page = current_identity_book().page(SOURCE_AGGREGATE_LAYOUT)
     mutations = []
+    loop_expressions = tuple(
+        data["expr_obj"] for _loop_id, data in graph_obj.nodes(data=True)
+        if isinstance(data.get("expr_obj"), (ast.For, ast.While))
+    )
     nodes_by_value: dict[int, list[int]] = {}
     for candidate_id, candidate in graph_obj.nodes(data=True):
         nodes_by_value.setdefault(
@@ -3905,6 +3909,27 @@ def _list_literal_mutations(graph_obj: Any, sequence_ids: Iterable[int]) -> tupl
         # survives, only refines a member's spelling.
         if isinstance(expression, (ast.List, ast.Tuple, ast.Set)):
             if not expression.elts:
+                # Program: ``while i < n: values = []; while k < 2:
+                # values.append(...)`` then ``len(values)`` (string-core
+                # intern driver).  Wrong record: an empty display had no
+                # birth here, only the frame's zero-length initializer at
+                # function entry, so a display re-executed by a loop never
+                # emptied its list: ``len`` read 2, 4, 6 and ``values[0]``
+                # the first iteration's row (silently).  Rule: the birth of
+                # an empty display inside a loop is its lexical clear, at
+                # its own site; outside a loop the entry initializer is that
+                # clear already.
+                line = getattr(expression, "lineno", None)
+                if line is not None and any(
+                    isinstance(loop, (ast.For, ast.While))
+                    and loop.lineno < line <= getattr(loop, "end_lineno", -1)
+                    for loop in loop_expressions
+                ):
+                    mutations.append(ControlSequenceMutation(
+                        sequence_value_id=sequence_id, operator="clear",
+                        argument_value_ids=(), effect_node_id=int(node_id),
+                        policy="unique" if is_set else "duplicates",
+                    ))
                 continue
             elements = tuple(expression.elts)
         elif layout_members:

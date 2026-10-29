@@ -299,7 +299,9 @@ def python_int_literal_dtype(value: object) -> str:
     outside the declared native layouts are refused by the caller.
     """
 
-    if type(value) is not int:
+    # An int subclass such as an IntEnum member is a Python int and takes the
+    # exact integer's layout; bool keeps its own layout.
+    if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError("integer literal layout requires an exact Python int")
     integer = int(value)
     if -(1 << 63) <= integer <= (1 << 63) - 1:

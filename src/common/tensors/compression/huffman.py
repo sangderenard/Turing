@@ -115,8 +115,8 @@ def canonical_codes_from_lengths(
         lengths.unsqueeze(1) - lengths.unsqueeze(0)
     ) == 0
     rank_within_length = (
-        earlier_symbol & same_length
-    ).to_dtype("int64").sum(dim=1)
+        earlier_symbol.to_dtype("int64") * same_length.to_dtype("int64")
+    ).sum(dim=1)
 
     present = (lengths > 0).to_dtype("int64")
     safe_length_index = (

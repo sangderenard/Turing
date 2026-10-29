@@ -812,6 +812,80 @@ class SpecializationFact:
     value: Any
     source: SpecializationSource
 
+    def __eq__(self, other: object) -> bool:
+        # A bound tensor literal (an array, an AbstractTensor) answers ``==``
+        # elementwise, and ``bool`` of that refuses: the fixed-point re-post
+        # check raised "truth value ... ambiguous" on every tensor binding.
+        # Two literals are the same fact when their class, dtype, shape and
+        # element bytes agree.
+        if not isinstance(other, SpecializationFact):
+            return NotImplemented
+        return self.source == other.source and (
+            literal_identity(self.value) == literal_identity(other.value)
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.source, literal_identity(self.value)))
+
+
+def is_array_literal(value: Any) -> bool:
+    """An ndarray, or a tensor that exposes its shape and its elements."""
+
+    if isinstance(value, (str, bytes, bool, int, float, complex)):
+        return False
+    return hasattr(value, "shape") and callable(getattr(value, "tolist", None))
+
+
+def literal_identity(value: Any) -> Any:
+    """``value`` itself, or for an array-like literal a key of its class,
+    dtype, shape and element bytes.  A tuple, list, dict or dataclass record
+    that holds an array literal is keyed field by field the same way, so a
+    record of tensors compares by content instead of by tensor ``==``."""
+
+    key, holds_array = _literal_identity(value, 0)
+    return key if holds_array else value
+
+
+def _literal_identity(value: Any, depth: int) -> tuple[Any, bool]:
+    import dataclasses
+
+    if is_array_literal(value):
+        import numpy as np
+
+        data = value.tolist() if not isinstance(value, np.ndarray) and hasattr(
+            value, "tolist"
+        ) else value
+        array = np.asarray(data)
+        return (
+            f"{type(value).__module__}.{type(value).__qualname__}",
+            str(getattr(value, "dtype", array.dtype)),
+            tuple(int(extent) for extent in array.shape),
+            array.tobytes(),
+        ), True
+    if depth >= 16:
+        return value, False
+    if isinstance(value, (tuple, list)):
+        parts = [_literal_identity(item, depth + 1) for item in value]
+        children = tuple(part[0] for part in parts)
+    elif isinstance(value, dict):
+        parts = [_literal_identity(item, depth + 1) for item in value.values()]
+        children = tuple(zip(value.keys(), (part[0] for part in parts)))
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = dataclasses.fields(value)
+        parts = [
+            _literal_identity(getattr(value, field.name), depth + 1)
+            for field in fields
+        ]
+        children = tuple(
+            zip((field.name for field in fields), (part[0] for part in parts))
+        )
+    else:
+        return value, False
+    if not any(part[1] for part in parts):
+        return value, False
+    kind = f"{type(value).__module__}.{type(value).__qualname__}"
+    return (kind, children), True
+
 
 class ExecutionKind(Enum):
     EXECUTABLE = "executable"
@@ -3255,6 +3329,24 @@ class ParameterAbiKind(Enum):
     TABLE = "table"
     REFERENCE = "reference"
 
+
+#: Whether the execution contract admits a call through a stored callable
+#: field as a host callback (``turing-host-callback-v1``).  A host callback
+#: calls code the host process owns -- a live Python interpreter, when the
+#: host is Python -- through a pointer handed in at run time, so only a
+#: field the contract names in ``python_callback_whitelist``, under a
+#: Python-hosted contract that keeps callbacks (``host_runtime: python``,
+#: ``python_callbacks: contract_only``, ``require_full_native: false``), is
+#: admitted.  Row: the field, the contract's three deciding fields and
+#: whether the whitelist names the field.
+#: Fact: ``"admit"`` or the refusal.  NOVEL(HOST_CALLBACK_ADMISSION_DECISION);
+#: CONCORD.  Writer and reader: ``fortran_c_shell._host_callback_admission``.
+HOST_CALLBACK_ADMISSION_DECISION = declare_transform("host_callback_admission", 0)
+HOST_CALLBACK_ADMISSION = declare_page("host_callback_admission", (
+    RowField("owner", K.NAME), RowField("field", K.NAME),
+    RowField("host_runtime", K.LABEL), RowField("python_callbacks", K.LABEL),
+    RowField("require_full_native", K.LABEL), RowField("whitelisted", K.LABEL),
+), str)
 
 #: The extraction contract declares a parameter's ABI kind at the function
 #: signature.  Operand: the parameter's version-0 ``name_binding`` cell.

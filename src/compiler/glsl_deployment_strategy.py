@@ -1422,6 +1422,32 @@ def _authored_aggregate_descriptor_tree(graph: Any, value_id: int) -> Any:
             for leaf in leaves
         )
     descriptor = _tensor_descriptor(graph, value_id)
+    if descriptor is None and value_id in graph.G:
+        # Program: ``commit([(1, 2), (3, 4)], 2)`` binding its rows by
+        # member.  Wrong record: a literal member had no descriptor, so the
+        # callee's row reads had no dtype at all (refused).  Rule: an
+        # authored scalar literal states its own exact native layout.
+        member = graph.G.nodes[value_id]
+        if str(member.get("type") or "") in {"Constant", "Const", "const"}:
+            literal = (member.get("attributes") or {}).get(
+                "value", member.get("constant")
+            )
+            dtype = None
+            if type(literal) is bool:
+                dtype = "bool"
+            elif type(literal) is int:
+                from ..transmogrifier.dtype_layout import (
+                    python_int_literal_dtype,
+                )
+
+                try:
+                    dtype = python_int_literal_dtype(literal)
+                except OverflowError:
+                    dtype = None
+            elif type(literal) is float:
+                dtype = "float64"
+            if dtype is not None:
+                return {"shape": (), "dtype": dtype, "rank": 0}
     return (
         None if descriptor is None
         else copy.deepcopy(dict(descriptor))
@@ -2109,6 +2135,12 @@ def _post_call_result_projections(graph, node_id):
     posts through here, so the rows exist whichever lane binds the call.
     """
     caller_paths = {}
+    # ``r = pair(n); while i < 2: total += r[i]``: inside the loop the graph
+    # reads the carried ``i`` through its initial literal, which is not a
+    # literal path onto the call's result (``_loop_carried_initial_ids``).
+    from .resident_sequence_materialization import _loop_carried_initial_ids
+
+    carried_initials = _loop_carried_initial_ids(graph.G)
 
     def collect(path, value_id):
         for successor in graph.G.successors(int(value_id)):
@@ -2117,7 +2149,7 @@ def _post_call_result_projections(graph, node_id):
                 continue
             indices = tuple(int(parent) for parent, role in data.get("parents") or ()
                             if str(role) == "index")
-            if len(indices) != 1:
+            if len(indices) != 1 or indices[0] in carried_initials:
                 continue
             index_data = graph.G.nodes[indices[0]]
             index = index_data.get("constant")
@@ -3381,9 +3413,12 @@ def _planned_scalar_dtypes_from_graph(
             # has op ``delta``); its resolved ``method_ref`` names the callee
             # whose return record types it, exactly as for a plain call.
             method_reference = attributes.get("method_ref")
+            # A method call resolved at ingestion (its receiver's class is
+            # a construction's class row) carries ``callee_ref`` as well;
+            # it is still named by its method, not ``call``.
             if (
-                callee_reference is None
-                and method_reference is not None
+                method_reference is not None
+                and (callee_reference is None or op != "call")
                 and not attributes.get("aggregate_kind")
                 and node_id not in scalar and node_id not in element
             ):
@@ -4330,6 +4365,10 @@ def _planned_scalar_dtypes_from_graph(
                     "callee_ref", base_attributes.get("method_ref")
                 )
                 member_index = None
+                from .resident_sequence_materialization import (
+                    _loop_carried_initial_ids,
+                )
+
                 for index_node in parents(data, "index"):
                     index_data = G.nodes[index_node]
                     literal = index_data.get("constant")
@@ -4337,7 +4376,11 @@ def _planned_scalar_dtypes_from_graph(
                         literal = (index_data.get("attributes") or {}).get(
                             "value"
                         )
-                    if isinstance(literal, int) and not isinstance(literal, bool):
+                    if (
+                        isinstance(literal, int)
+                        and not isinstance(literal, bool)
+                        and index_node not in _loop_carried_initial_ids(G)
+                    ):
                         member_index = int(literal)
                 member_dtype = (
                     _callee_return_member_dtype(
@@ -4806,6 +4849,101 @@ def _refuse_unsettled_host_scalars(graph: Any, planned_dtypes: Any) -> None:
             "consumed as a host scalar but has no source_value_class cell "
             "and no planned scalar dtype"
         )
+
+
+_STATIC_READ_MISSING = object()
+
+
+def _static_literal_value(graph, value_id: int, depth: int = 0):
+    """The Python value a constant, or a field/element read off one, holds.
+
+    Follows ``GetAttr`` and constant-index ``Indexed`` reads down to a
+    ``const`` node; anything else (a computed value, a runtime input)
+    answers ``_STATIC_READ_MISSING``.
+    """
+
+    if depth > 16:
+        return _STATIC_READ_MISSING
+    data = graph.G.nodes.get(int(value_id), {})
+    kind = str(data.get("op") or data.get("type") or "").casefold()
+    if kind in {"const", "constant"}:
+        return data.get("constant")
+    parents = {
+        str(role): int(parent) for parent, role in (data.get("parents") or ())
+    }
+    if kind in {"getattr", "attribute"}:
+        field = (data.get("attributes") or {}).get("attribute")
+        receiver = next(
+            (parents[role] for role in ("value", "base", "object")
+             if role in parents),
+            None,
+        )
+        if field is None or receiver is None:
+            return _STATIC_READ_MISSING
+        holder = _static_literal_value(graph, receiver, depth + 1)
+        if holder is _STATIC_READ_MISSING:
+            return holder
+        try:
+            return getattr(holder, str(field))
+        except AttributeError:
+            return _STATIC_READ_MISSING
+    if kind == "indexed" and "base" in parents and "index" in parents:
+        holder = _static_literal_value(graph, parents["base"], depth + 1)
+        index = _static_literal_value(graph, parents["index"], depth + 1)
+        if holder is _STATIC_READ_MISSING or type(index) is not int:
+            return _STATIC_READ_MISSING
+        try:
+            return holder[index]
+        except (IndexError, KeyError, TypeError):
+            return _STATIC_READ_MISSING
+    return _STATIC_READ_MISSING
+
+
+def _static_literal_dtype(graph, value_id: int):
+    """The element dtype of a static literal read, or ``None``."""
+
+    data = graph.G.nodes.get(int(value_id), {})
+    if str(data.get("op") or data.get("type") or "").casefold() in {
+        "const", "constant",
+    }:
+        # A bare constant is typed by the literal rules elsewhere.
+        return None
+    value = _static_literal_value(graph, int(value_id))
+    if value is _STATIC_READ_MISSING:
+        return None
+    return _literal_element_dtype(value)
+
+
+def _literal_element_dtype(value: Any, depth: int = 0):
+    """The class a static literal's elements share, or ``None``.
+
+    A tuple or list of literals (``config.rows``) holds one element class
+    when every element settles to the same dtype; mixed or unsettled
+    elements answer ``None``.
+    """
+
+    if value is None or depth > 16:
+        return None
+    if isinstance(value, (tuple, list)):
+        dtypes = {_literal_element_dtype(item, depth + 1) for item in value}
+        if len(dtypes) == 1 and None not in dtypes:
+            return next(iter(dtypes))
+        return None
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+        try:
+            return python_int_literal_dtype(value)
+        except OverflowError:
+            return None
+    if isinstance(value, float):
+        return "float64"
+    dtype = getattr(value, "dtype", None)
+    if dtype is not None and hasattr(value, "shape"):
+        return str(dtype)
+    return None
 
 
 def _dtype_producer_cells(graph: Any, value_id: int, *extra: Any) -> tuple:
@@ -6054,9 +6192,9 @@ def _build_shell_hierarchy_plan(
             ) is not None:
                 return
             dtype = (
-                "bool" if type(literal) is bool else
-                python_int_literal_dtype(literal) if type(literal) is int else
-                "float64"
+                "bool" if isinstance(literal, bool) else
+                python_int_literal_dtype(literal) if isinstance(literal, int)
+                else "float64"
             )
             record_shape_transformation(
                 scope, int(value_id), scope, int(value_id),
@@ -6304,6 +6442,19 @@ def _build_shell_hierarchy_plan(
                         .get(str(receiver_binding))
                         if receiver_binding is not None else None
                     )
+                    receiver_node = (
+                        graph.G.nodes.get(receiver_id, {})
+                        if receiver_id is not None else {}
+                    )
+                    if receiver_value is None and str(
+                        receiver_node.get("op") or receiver_node.get("type")
+                        or ""
+                    ).casefold() in {"const", "constant"}:
+                        # A receiver the structural fold already replaced by
+                        # its bound record (``state.cursor`` once ``state``
+                        # is a specialized literal) holds the same object
+                        # as its constant; its field is read the same way.
+                        receiver_value = receiver_node.get("constant")
                     if receiver_value is not None:
                         try:
                             field_value = getattr(
@@ -6357,6 +6508,13 @@ def _build_shell_hierarchy_plan(
                         dtype = python_int_literal_dtype(literal)
                     elif isinstance(literal, float):
                         dtype = "float64"
+                if dtype is None and operation in {"getattr", "indexed"}:
+                    # A field or element read off a bound literal
+                    # (``config.rows[0]`` once the structural fold made
+                    # ``config`` a constant) is that literal's own value;
+                    # its class is read structurally, so the arithmetic it
+                    # feeds settles from its operands.
+                    dtype = _static_literal_dtype(graph, int(current))
                 # Callable/operator-reference edges are provenance, not
                 # numeric operands.  Letting their default domain dtype enter
                 # scalar promotion made an all-integer ``min`` or arithmetic
@@ -6735,6 +6893,76 @@ def _build_shell_hierarchy_plan(
             )
             return (root, logical, dtype)
 
+        def _fixed_width_row_width(value_id):
+            """Width of the fixed-width tuple row ``value_id`` reads, or 1.
+
+            The row handle is read only by its literal column loads
+            (``_sequence_row_operations``).  Program: ``fingerprints[i][j]``
+            with a runtime ``j``, or ``sum(fingerprints[i])``.  Wrong
+            record: the handle reached a region as a scalar formal no
+            caller fills and every read gave 0 (silent).  Rule: any other
+            reader of a fixed-width row is refused here, before any record
+            of the row is used.
+            """
+
+            node = graph.G.nodes.get(int(value_id), {})
+            if str(node.get("type") or "") != "Indexed":
+                return 1
+            row_base = next((
+                int(parent) for parent, role in (node.get("parents") or ())
+                if str(role) == "base" and int(parent) in graph.G
+            ), None)
+            row_base_attributes = (
+                graph.G.nodes[row_base].get("attributes") or {}
+                if row_base is not None else {}
+            )
+            if row_base_attributes.get("aggregate_kind") not in {
+                "list", "tuple",
+            }:
+                return 1
+            row_width = max(
+                len(tuple(row_base_attributes.get(
+                    "sequence_member_class_refs", ()
+                ))),
+                int(row_base_attributes.get("sequence_column_count", 1) or 1),
+            )
+            if row_width <= 1:
+                return 1
+            from .resident_sequence_materialization import (
+                _loop_carried_initial_ids,
+            )
+
+            carried = set(_loop_carried_initial_ids(graph.G))
+            for child, role in node.get("children") or ():
+                reader = graph.G.nodes.get(int(child), {})
+                reader_roles = {
+                    str(reader_role): int(parent)
+                    for parent, reader_role in (reader.get("parents") or ())
+                }
+                column_node = graph.G.nodes.get(reader_roles.get("index"), {})
+                column = (column_node.get("attributes") or {}).get(
+                    "value", column_node.get("constant")
+                )
+                if not (
+                    str(role) == "base"
+                    and str(reader.get("type") or "") == "Indexed"
+                    and str(column_node.get("type") or "") in {
+                        "Constant", "Const", "const",
+                    }
+                    and reader_roles.get("index") not in carried
+                    and type(column) is int
+                    and 0 <= column < row_width
+                ):
+                    raise ValueError(
+                        f"row {int(value_id)} of a {row_width}-column tuple "
+                        "sequence in function "
+                        f"{graph.G.graph.get('function_name')!r} is read by "
+                        f"{reader.get('type') or reader.get('op')!r} (role "
+                        f"{str(role)!r}); only a literal column read of a "
+                        "fixed-width row is lowered"
+                    )
+            return row_width
+
         def _decide_value_shape(value_id):
             """A region value's record; a typed value with none refuses.
 
@@ -6744,6 +6972,7 @@ def _build_shell_hierarchy_plan(
             else without a settled dtype is a missing record: name it.
             """
 
+            _fixed_width_row_width(int(value_id))
             record = _value_shape_dtype(value_id)
             if record[2] is not None:
                 return record, _dtype_producer_cells(graph, int(value_id))
@@ -6766,9 +6995,37 @@ def _build_shell_hierarchy_plan(
                       or ()),
                     attributes.get("sequence_element_annotation_cell"),
                 )
+            member_classes = tuple(
+                str(member).removeprefix("builtins.")
+                for member in attributes.get("sequence_member_class_refs", ())
+            )
+            if (
+                attributes.get("aggregate_kind") in {"list", "tuple"}
+                and len(member_classes) > 1
+                and all(
+                    member in {"int", "float", "bool"}
+                    for member in member_classes
+                )
+            ):
+                # ``fingerprints: list[tuple[int, int]]``: the sequence
+                # handle's storage is its column-0 arena, whose class is the
+                # annotation's first tuple position.
+                return (record[0], record[1], {
+                    "int": "int64", "float": "float64", "bool": "bool",
+                }[member_classes[0]]), _dtype_producer_cells(
+                    graph, int(value_id),
+                    attributes.get("sequence_element_annotation_cell"),
+                )
+            row_width = _fixed_width_row_width(int(value_id))
             if attributes.get("program_abi_record_identity") or (
                 attributes.get("aggregate_kind") == "dict"
                 and attributes.get("mapping_value_tensor")
+            ) or (
+                # Program: ``fingerprint = fingerprints[i]`` over
+                # ``fingerprints: list[tuple[int, int]]``.  The row of a
+                # fixed-width tuple sequence is a handle onto its columns,
+                # which its ``fingerprint[k]`` reads load; it is no scalar.
+                row_width > 1
             ):
                 # A record value is a handle onto its fields' storage; so is
                 # a ``Mapping[K, Tensor]`` table, whose rows are child-row
@@ -6907,6 +7164,14 @@ def _build_shell_hierarchy_plan(
                 for source in nx.ancestors(graph.G, int(value_id))
             ):
                 return None, ()
+            # A read off a bound literal (``self.config.rows[0]`` once the
+            # structural fold made ``self`` a constant) is that literal's own
+            # field or element: its class is the value's, read structurally.
+            static_dtype = _static_literal_dtype(graph, int(value_id))
+            if static_dtype is not None:
+                return (record[0], record[1], static_dtype), (
+                    _dtype_producer_cells(graph, int(value_id))
+                )
             if not terminal:
                 _post_region_value_obligation(graph, int(value_id))
                 return None, ()
@@ -25851,7 +26116,7 @@ def _tensor_descriptor_rule(
                             return None
                     if isinstance(literal, bool):
                         dtype = "bool"
-                    elif type(literal) is int:
+                    elif isinstance(literal, int):
                         from ..transmogrifier.dtype_layout import (
                             python_int_literal_dtype,
                         )
@@ -26334,7 +26599,7 @@ def _tensor_descriptor_rule(
                                 # weak scalar (``_promoting_sides``).
                                 if isinstance(literal, bool):
                                     literal_dtype = "bool"
-                                elif type(literal) is int:
+                                elif isinstance(literal, int):
                                     from ..transmogrifier.dtype_layout import (
                                         python_int_literal_dtype,
                                     )
@@ -28043,6 +28308,77 @@ def _fold_callsite_structural_values(
             bool(field.get("optional", False)),
         )
 
+    def uniform_tuple_row_width(row_id: int, reader_id: int) -> int | None:
+        """The width every row of ``row_id``'s base has, or None.
+
+        A row read ``xs[i]`` whose base is an immutable aggregate whose
+        members are all tuples of one width, or a formal declared as rows
+        of one width, has that width (and is not None), whichever row the
+        index selects.  The base must be neither loop-carried nor mutated.
+        The row read must keep a consumer other
+        than ``reader_id``, so it still reads its index and an out-of-range
+        index still faults where Python raises.
+        """
+        row = graph.G.nodes.get(int(row_id), {})
+        if str(row.get("type") or row.get("op") or "").casefold() not in {
+            "indexed", "getitem", "subscript",
+        }:
+            return None
+        row_base = next((
+            int(parent)
+            for parent, role in (row.get("parents") or ())
+            if str(role) in {"base", "value", "object"}
+        ), None)
+        if row_base is None or row_base not in graph.G:
+            return None
+        if not ({
+            int(child) for child, _role in (row.get("children") or ())
+        } - {int(reader_id)}):
+            return None
+        base_attributes = graph.G.nodes[row_base].get("attributes") or {}
+        if (
+            base_attributes.get("producer_kind") == "aggregate_parameter"
+            and base_attributes.get("aggregate_kind") in {"list", "tuple"}
+            and str(graph.G.nodes[row_base].get("type") or "") == "Input"
+        ):
+            # A formal whose rows the call edge (``sequence_column_count``)
+            # or the annotation (``tuple[int, int]`` positions) declares
+            # fixed-width is resident rows of exactly that width: a row of
+            # any other width is refused at insertion, so every row read
+            # has it, before or after an append to the formal.
+            declared = max(
+                int(base_attributes.get("sequence_column_count", 1) or 1),
+                len(tuple(base_attributes.get(
+                    "sequence_member_class_refs", ()
+                ))),
+            )
+            return declared if declared > 1 else None
+        if (
+            row_base in loop_carried_initial_ids
+            or row_base in loop_carried_updated_ids
+            or row_base in mutated_sequence_ids
+        ):
+            return None
+        if (
+            base_attributes.get("producer_kind") != "aggregate"
+            or base_attributes.get("aggregate_kind") != "tuple"
+        ):
+            return None
+        widths = set()
+        for leaf in base_attributes.get("aggregate_leaf_value_ids", ()):
+            leaf_attributes = (
+                graph.G.nodes[int(leaf)].get("attributes") or {}
+                if int(leaf) in graph.G else {}
+            )
+            if leaf_attributes.get("aggregate_kind") != "tuple":
+                return None
+            widths.add(len(tuple(
+                leaf_attributes.get("aggregate_leaf_value_ids", ())
+            )))
+        if len(widths) != 1:
+            return None
+        return min(widths)
+
     def evaluate(node_id: int, data: Mapping[str, Any]) -> Any:
         if (data.get("attributes") or {}).get("bound_method_ref") is not None:
             return unresolved
@@ -28640,6 +28976,20 @@ def _fold_callsite_structural_values(
             }
             left = known.get(parents.get("lhs", parents.get("left")), unresolved)
             right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            if (
+                isinstance(expression.ops[0], (ast.Is, ast.IsNot))
+                and left is unresolved
+                and right is None
+                and parents.get("lhs", parents.get("left")) is not None
+                and uniform_tuple_row_width(
+                    int(parents.get("lhs", parents.get("left"))),
+                    int(node_id),
+                ) is not None
+            ):
+                # ``fingerprint is None`` over a row of ``[(1, n), (3,
+                # 4)]`` read by a loop-carried index: every row is a tuple,
+                # so none is None (``uniform_tuple_row_width``).
+                return isinstance(expression.ops[0], ast.IsNot)
             if left is unresolved or right is unresolved:
                 return unresolved
             comparison_node = expression.ops[0]
@@ -28768,6 +29118,22 @@ def _fold_callsite_structural_values(
                     str(program_abi_records[record_name]["identity"]),
                     "record", None,
                 )
+        if (
+            name == "len"
+            and len(arguments) == 1
+            and values[0] is unresolved
+            and (data.get("attributes") or {}).get("extraction_identity")
+            == "builtins.len"
+        ):
+            # Program: ``fingerprint = fingerprints[i]`` inside ``while i <
+            # count`` over ``[(1, n), (3, 4)]``, then ``len(fingerprint) !=
+            # 2``.  Wrong record: the row's index is loop-carried, so the row
+            # had no value here and ``len`` became a formal of the callee no
+            # caller fills (native raised the guard's ValueError for every
+            # row).  Rule: ``uniform_tuple_row_width``.
+            width = uniform_tuple_row_width(int(arguments[0]), int(node_id))
+            if width is not None:
+                return width
         if (name == "callable" and len(arguments) == 1
                 and (data.get("attributes") or {}).get("extraction_identity") == "builtins.callable"
                 and (graph.G.nodes[arguments[0]].get("attributes") or {}).get("bound_method_ref") is not None):
@@ -29295,6 +29661,17 @@ def _fold_callsite_structural_values(
                 return bool(np.array_equal(left, right))
             except (TypeError, ValueError):
                 return False
+        from .concordance_declarations import literal_identity
+
+        left_key = literal_identity(left)
+        right_key = literal_identity(right)
+        if left_key is not left or right_key is not right:
+            # An AbstractTensor literal, or a record holding one, answers
+            # ``==`` elementwise and its truth value refuses, so the same
+            # value read as "changed" on every round and the fixed point
+            # never closed.
+
+            return left_key == right_key
         try:
             return bool(left == right)
         except (TypeError, ValueError):
@@ -29339,7 +29716,7 @@ def _fold_callsite_structural_values(
                         # A scalar literal operand is an exact rank-0 value.
                         if isinstance(literal, bool):
                             literal_dtype = "bool"
-                        elif type(literal) is int:
+                        elif isinstance(literal, int):
                             from ..transmogrifier.dtype_layout import (
                                 python_int_literal_dtype,
                             )
@@ -31525,6 +31902,17 @@ def _apply_callsite_aggregate_descriptors(
 
             aggregate_source_cell = node_identity_cell(graph, int(input_id))
             projections: dict[int, list[int]] = {}
+            # Program: ``commit([1 + n, 3], 2)`` reading ``fingerprints[i]``
+            # in ``while i < count``.  Wrong record: the loop reads its
+            # carried ``i`` through the binding's initial ``i = 0``, a
+            # Constant, so the read was taken as a literal projection and
+            # aliased to member 0 on every iteration (200 for 400; silent).
+            # Rule: a loop-carried initial is not a literal index.
+            from .resident_sequence_materialization import (
+                _loop_carried_initial_ids,
+            )
+
+            carried_initials = set(_loop_carried_initial_ids(graph.G))
             for node_id, data in tuple(graph.G.nodes(data=True)):
                 if str(
                     data.get("op") or data.get("type") or ""
@@ -31543,6 +31931,8 @@ def _apply_callsite_aggregate_descriptors(
                     if str(role) in {"index", "slice", "subscript"}
                 )
                 if len(index_ids) != 1 or index_ids[0] not in graph.G:
+                    continue
+                if index_ids[0] in carried_initials:
                     continue
                 index_data = graph.G.nodes[index_ids[0]]
                 index = index_data.get("constant")
@@ -31613,7 +32003,24 @@ def _apply_callsite_aggregate_descriptors(
                 "aggregate_leaf_value_ids": leaves,
                 "tensor_output_descriptors": copy.deepcopy(tuple(members)),
                 "sequence_key_columns": (),
-                "sequence_column_count": 1,
+                # Program: ``commit(((1, n), (3, 4)), 2)`` reading
+                # ``fingerprints[i][0]``.  Wrong record: the formal kept a
+                # width of one while every member is a two-value row, so
+                # the row read was taken as a nested handle.  Rule: an
+                # aggregate whose members are all rows of one width has
+                # resident rows of that width, as the caller's display does.
+                "sequence_column_count": (
+                    len(members[0])
+                    if members
+                    and all(isinstance(member, tuple) for member in members)
+                    and len({len(member) for member in members}) == 1
+                    and len(members[0]) > 1
+                    and not any(
+                        isinstance(item, tuple)
+                        for member in members for item in member
+                    )
+                    else 1
+                ),
                 "sequence_writable": False,
             })
             formal = graph.G.nodes[input_id]
@@ -32390,6 +32797,29 @@ def _callsite_specialized_shell_type(
             caller, int(node_id), int(parent),
         ) and not _formal_is_mutated_in_place(original.G, parameter)
         leaves = _authored_aggregate_leaves(caller, int(parent))
+        if static_argument and leaves:
+            # Program: ``commit([(1, 2), (3, 4)], 2)`` reading
+            # ``fingerprints[i]`` with a loop-carried ``i``.  Wrong record:
+            # the all-literal rows became the callee's structural constant,
+            # which the planner reads as a 2x2 tensor while the resident
+            # sequence is two-column rows (rank 2 against rank 1, refused).
+            # Rule: rows of fixed-width tuples bind by member, exactly as
+            # the same display with one runtime element does.
+            try:
+                literal = _source_static_literal(caller, int(parent))
+            except ValueError:
+                literal = None
+            if (
+                isinstance(literal, (list, tuple))
+                and literal
+                and all(isinstance(row, tuple) for row in literal)
+                and len({len(row) for row in literal}) == 1
+                and len(literal[0]) > 1
+                and _aggregate_binds_by_member(
+                    caller.G, int(parent), original.G, parameter, int(node_id),
+                )
+            ):
+                static_argument = False
         if leaves and not static_argument and _aggregate_binds_by_member(
             caller.G, int(parent), original.G, parameter, int(node_id),
         ):
