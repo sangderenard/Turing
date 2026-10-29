@@ -5366,9 +5366,35 @@ class CorrelationTable:
                     if not accounting.get("linked_call_frame_storage"):
                         continue
                     formal_roles = sequence_roles_of(callee_name, int(callee_id))
+                    lease_frame = (
+                        accounting.get("linked_call_frame_storage"),
+                        accounting.get("callsite_id"),
+                    )
                     owned = []
                     for owner in caller_by_key.get(key, ()):
                         if owner == argument_id:
+                            continue
+                        # Program: ``env, t = batch(n, 2)`` in the root
+                        # and again in ``one(n)``, which the root calls.
+                        # Wrong record: the root's storage for its own
+                        # ``batch`` frame and the lease it hands ``one``
+                        # for ``one``'s inner ``batch`` frame share the
+                        # compiler-frame key, and the lease was reported
+                        # as duplicate storage.  Rule: storage linked to
+                        # one call frame of this caller and a lease linked
+                        # to another call frame are two instances; an
+                        # owner that states no frame keeps the check.
+                        owner_accounting = formals[owner].accounting or {}
+                        owner_frame = (
+                            owner_accounting.get("linked_call_frame_storage"),
+                            owner_accounting.get("callsite_id"),
+                        )
+                        if (
+                            owner_frame[0] is not None
+                            and owner_frame[1] is not None
+                            and lease_frame[1] is not None
+                            and owner_frame != lease_frame
+                        ):
                             continue
                         owner_roles = sequence_roles_of(name, owner)
                         # c631: the callee's operational status lease is
