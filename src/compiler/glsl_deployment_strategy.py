@@ -12068,10 +12068,14 @@ def _retain_source_control_records(graph_obj: Any) -> None:
     if any(
         isinstance(record["expression"], ast.Try)
         for record in records.values()
+    ) or any(
+        isinstance(data.get("expr_obj"), ast.Raise)
+        for _node_id, data in graph_obj.nodes(data=True)
     ):
-        # The Try node's ordinary value edges cannot say which catch scope a
-        # nested raise may enter.  Post that authored control topology while
-        # the exact AST and source graph nodes are both still available.
+        # Program: a protected call enters fail_if_zero(), whose callee has
+        # an authored Raise but no Try. The old trigger posted no transfer
+        # for that Raise, so SSA had no class definition for its native
+        # fault. Post the topology while the exact source nodes are live.
         from .exception_topology import build_exception_topology
 
         build_exception_topology(graph_obj)

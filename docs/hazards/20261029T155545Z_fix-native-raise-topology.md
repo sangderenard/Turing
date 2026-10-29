@@ -1,4 +1,3 @@
-2026-10-29 TITLE (MEASURED, where): 
 # 2026-10-29 Protected native call failure edge
 
 The retained Try's exact deployment region/source Call pair now emits a
