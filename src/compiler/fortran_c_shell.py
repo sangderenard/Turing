@@ -484,6 +484,71 @@ def _accepted_record_sequence_members(
     return candidates[0] if candidates else ()
 
 
+def _post_positional_return_slots(
+    function: Any, graph: Any, terminator: Any,
+    previous_ids: tuple[int, ...], *, declared_ids: tuple[int, ...],
+) -> None:
+    """Publish the physical ``function_output`` slots a positional Ret
+    reassembly changed (c924), before block geometry reads them.
+
+    Each changed or new slot is DERIVED from its value's ``ssa_value`` and
+    graph cells, the source return-site cells, and the aggregate layout of
+    every declared output: the positions are the source's, not this
+    writer's.  A slot whose value is unchanged keeps its row.
+    """
+
+    from .concordance_declarations import (
+        AGGREGATE_RETURN_LAYOUT, CONTROL_SSA_FINISH, FUNCTION_OUTPUT,
+    )
+    from .identity_concordance import (
+        ConcordanceRefusal, Derived, Mode, current_identity_book,
+    )
+    from .ssa_record_return_state import (
+        function_scope_of, return_site_cells, ssa_value_identity_cell,
+    )
+
+    book = current_identity_book()
+    scope = function_scope_of(function)
+    page = book.page(FUNCTION_OUTPUT)
+    layout_cells = tuple(
+        cell for value_id in dict.fromkeys(declared_ids)
+        for cell in (book.current_ref(
+            AGGREGATE_RETURN_LAYOUT, (scope, int(value_id)),
+        ),)
+        if cell is not None
+    )
+    site_cells = tuple(dict.fromkeys(
+        return_site_cells(graph.graph).values()
+    ))
+    for slot, argument in enumerate(terminator.args):
+        value_id = int(argument.id)
+        if slot < len(previous_ids) and previous_ids[slot] == value_id:
+            continue
+        row = (scope, int(slot))
+        incumbent = page.latest(row)
+        name = (
+            incumbent[0]
+            if incumbent is not None and int(incumbent[1]) == value_id
+            else None
+        )
+        sources = tuple(dict.fromkeys(cell for cell in (
+            _frame_graph_cell(graph, value_id),
+            ssa_value_identity_cell(function, value_id, book=book),
+            *layout_cells,
+            *site_cells,
+        ) if cell is not None))
+        if not sources:
+            raise ConcordanceRefusal(
+                "positional return slot has no source identity: "
+                f"function={function.name!r}, slot={slot}, value={value_id}"
+            )
+        book.post(
+            FUNCTION_OUTPUT, row, (name, value_id),
+            stage=CONTROL_SSA_FINISH, provenance=Derived(sources),
+            mode=Mode.REVISE if incumbent is not None else Mode.CONCORD,
+        )
+
+
 def _publish_concorded_output_identities(
     function: Any, bindings: Mapping[int, int],
 ) -> dict[int, int]:
@@ -5203,6 +5268,72 @@ def host_callback_signature(annotation: str) -> dict[str, Any]:
     }
 
 
+def _host_callback_admission(graph: Any, owner: str, field: str) -> str | None:
+    """The refusal of a host callback for ``owner.field``, or ``None``.
+
+    Reads the execution contract the graph carries and posts the verdict to
+    ``host_callback_admission``; the verdict read back from that page is the
+    decision.  A host callback is a call into code the host process owns,
+    handed in as a pointer at run time -- a live Python interpreter when the
+    host is Python -- so only a field the contract names in
+    ``python_callback_whitelist``, under a Python-hosted contract that keeps
+    callbacks, is admitted.  A full-native contract never admits one: its
+    stored callable must compile as native code or refuse.  A graph with no
+    contract refuses.
+    """
+
+    from .concordance_declarations import (
+        HOST_CALLBACK_ADMISSION, HOST_CALLBACK_ADMISSION_DECISION,
+        PLANNER_STRUCTURAL_FOLD,
+    )
+    from .identity_concordance import Mode, Novel, current_identity_book
+
+    execution = graph.graph.get("execution_contract")
+    if not isinstance(execution, Mapping):
+        return (
+            f"{owner}.{field} is a stored callable, and no execution contract "
+            "reached this method to say whether a host callback is admitted"
+        )
+    host = str(execution.get("host_runtime"))
+    callbacks = str(execution.get("python_callbacks"))
+    full_native = str(bool(execution.get("require_full_native"))).lower()
+    named = f"{owner}.{field}" in set(
+        map(str, execution.get("python_callback_whitelist") or ())
+    )
+    whitelisted = str(named).lower()
+    if not (
+        host == "python" and callbacks == "contract_only"
+        and full_native == "false"
+    ):
+        verdict = (
+            f"{owner}.{field} is a stored callable; calling it as a host "
+            "callback would call code the host owns at run time, and the "
+            f"execution contract (host_runtime: {host}, python_callbacks: "
+            f"{callbacks}, require_full_native: {full_native}) admits no "
+            "host callback.  The stored callable must compile as native code"
+        )
+    elif not named:
+        verdict = (
+            f"{owner}.{field} is a stored callable; calling it as a host "
+            "callback would call code the host owns at run time, and the "
+            "execution contract admits only the host callbacks it names: "
+            f"{owner}.{field} is not in execution.python_callback_whitelist.  "
+            "The stored callable must compile as native code"
+        )
+    else:
+        verdict = "admit"
+    book = current_identity_book()
+    row = (owner, field, host, callbacks, full_native, whitelisted)
+    book.post(
+        HOST_CALLBACK_ADMISSION, row, verdict,
+        stage=PLANNER_STRUCTURAL_FOLD,
+        provenance=Novel(HOST_CALLBACK_ADMISSION_DECISION, ()),
+        mode=Mode.CONCORD,
+    )
+    decided = book.page(HOST_CALLBACK_ADMISSION).latest(row)
+    return None if decided == "admit" else str(decided)
+
+
 def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
     """Lower calls through a host-supplied callable field to a native call.
 
@@ -5258,6 +5389,10 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
                 continue
             field = (data.get("attributes") or {}).get("attribute")
             if field not in callables:
+                continue
+            if _host_callback_admission(graph, owner, str(field)) is not None:
+                # The store stays a store; a method that calls the field
+                # refuses there with the contract's reason.
                 continue
             parents = dict(
                 (str(role), parent)
@@ -5331,6 +5466,9 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
             presence.setdefault(read[2], []).extend(compares)
     records = list(graph.graph.get("host_callback_inputs") or ())
     for name in sorted(set(calls) | set(presence)):
+        refusal = _host_callback_admission(graph, owner, name)
+        if refusal is not None:
+            raise ValueError(refusal)
         signature = host_callback_signature(callables[name])
         if presence.get(name) and not signature["optional"]:
             raise ValueError(
@@ -5817,8 +5955,26 @@ def _lower_optional_record_presence_catalogue(graph: Any) -> int:
             continue
         seen.add(id(graph_obj))
         lowered += _lower_optional_record_presence_graph(graph_obj)
-        lowered += _lower_host_callback_field_calls_graph(graph_obj)
+        try:
+            lowered += _lower_host_callback_field_calls_graph(graph_obj)
+        except ValueError as error:
+            # Program: ``CompressedTable._loader: Callable[[bytes], Any]``
+            # (bootstrap; doc 41 declares no bytes/str callback argument).
+            # Wrong record: the catalogue pass raised for one method's
+            # callback use, so every function of the program was refused.
+            # Rule: the refusal belongs to the method that uses the field.
+            # It is kept on that graph by name and raised when the method
+            # is lowered (``_raise_host_callback_refusal``).
+            graph_obj.graph["host_callback_refusal"] = str(error)
     return lowered
+
+
+def _raise_host_callback_refusal(graph_obj: Any) -> None:
+    """Raise the host-callback refusal the catalogue pass kept on a graph."""
+
+    refusal = graph_obj.graph.get("host_callback_refusal")
+    if refusal is not None:
+        raise ValueError(str(refusal))
 
 
 def _prove_tensor_value_dtypes(contracts: dict) -> None:
@@ -23639,6 +23795,7 @@ def _class_surface_ssa_program(
                     **incumbent_records, **selected,
                 }
         _lower_optional_record_presence_graph(planned_graph)
+        _raise_host_callback_refusal(planned_graph)
         _lower_host_callback_field_calls_graph(planned_graph)
         if program_abi and not planned_graph.graph.get("parameter_value_abi"):
             value_bindings = _contract_input_binding_names(planned_graph)
@@ -24080,6 +24237,13 @@ def _class_surface_ssa_program(
                 projection_order = tuple(nx.topological_sort(planned_graph))
             except nx.NetworkXUnfeasible:
                 projection_order = tuple(planned_graph.nodes)
+            # A loop reads its carried index through the binding's initial
+            # literal; that read is not a literal member projection.
+            from .resident_sequence_materialization import (
+                _loop_carried_initial_ids as _carried_initial_ids,
+            )
+
+            carried_index_ids = _carried_initial_ids(planned_graph)
             for projection_node_id in projection_order:
                 projection_data = planned_graph.nodes[projection_node_id]
                 if str(
@@ -24097,6 +24261,8 @@ def _class_surface_ssa_program(
                     if str(role) == "index" and parent in planned_graph
                 )
                 if len(base_nodes) != 1 or len(index_nodes) != 1:
+                    continue
+                if index_nodes[0] in carried_index_ids:
                     continue
                 base_id = int(planned_graph.nodes[base_nodes[0]].get(
                     "value_id", base_nodes[0],
@@ -35532,7 +35698,31 @@ def _class_surface_ssa_program(
                             "structural_formal_replacements"
                         ] = (*prior_replacements, replacement_receipt)
         aggregate_layouts = aggregate_return_layouts(function)
-        if aggregate_layouts:
+        # The source's top-level return positions, repeats kept:
+        # ``return x, x`` is ``('x', 'x')``.  ``output_names`` is the set
+        # of names (deduplicated) the recovery publishes; it is not a
+        # position list.
+        positional_output_names = tuple((
+            *tuple(graph.graph.get("function_outputs") or ()),
+            *(
+                name for name in output_names
+                if name not in tuple(graph.graph.get("function_outputs") or ())
+            ),
+        ))
+        declared_order: list[int] = []
+        for output_name in positional_output_names:
+            history = tuple(identities.get(str(output_name), ()))
+            if not history and str(output_name) not in named_output_ids:
+                continue
+            output_id = int(
+                named_output_ids[str(output_name)]
+                if str(output_name) in named_output_ids
+                else history[-1]
+            )
+            declared_order.extend(
+                aggregate_layouts.get(output_id, (output_id,))
+            )
+        if aggregate_layouts or len(set(declared_order)) < len(declared_order):
             # The Ret is the function's physical output ABI.  Its order is the
             # declared output order with every aggregate output expanded in
             # place -- ``total, (hub, angle), valid`` returns
@@ -35540,27 +35730,52 @@ def _class_surface_ssa_program(
             # path order a caller's PlanCall binds its projections in.
             # Appending recovered leaves at the end would let a positional
             # correlation pair ``hub`` with ``valid``.
-            declared_order: list[int] = []
-            for output_name in output_names:
-                history = tuple(identities.get(str(output_name), ()))
-                if not history and str(output_name) not in named_output_ids:
-                    continue
-                output_id = int(
-                    named_output_ids[str(output_name)]
-                    if str(output_name) in named_output_ids
-                    else history[-1]
-                )
-                declared_order.extend(
-                    aggregate_layouts.get(output_id, (output_id,))
-                )
-            rank = {
-                value_id: position
-                for position, value_id in enumerate(declared_order)
+            #
+            # Program: ``return (x, (x, 1.0))`` (c924).  Wrong record: the
+            # Ret was assembled by value id -- the leaf ``x`` of the inner
+            # tuple was "already published" by the outer ``x`` -- and the
+            # order was a sort by first rank, so the Ret was ``[x, 1.0]``
+            # for Python's three leaves ``x, x, 1.0`` on every backend.
+            # Rule: each declared position is its own slot.  A position
+            # takes the next unused Ret occurrence of its value; a value
+            # the Ret already carries but at fewer positions than declared
+            # is the same SSA value repeated.  A value the Ret does not
+            # carry at all is not invented here, and Ret values no declared
+            # position names (union frames, presence flags) keep their
+            # order after the declared ones, as the rank sort left them.
+            unused: dict[int, list[Any]] = {}
+            for argument in terminator.args:
+                unused.setdefault(int(argument.id), []).append(argument)
+            carried = {
+                value_id: arguments[0] for value_id, arguments in unused.items()
             }
-            terminator.args = sorted(
-                terminator.args,
-                key=lambda value: rank.get(int(value.id), len(rank)),
-            )
+            ordered = []
+            for value_id in declared_order:
+                if unused.get(value_id):
+                    ordered.append(unused[value_id].pop(0))
+                elif value_id in carried:
+                    ordered.append(carried[value_id])
+            leftover = {
+                id(argument)
+                for arguments in unused.values() for argument in arguments
+            }
+            previous_ids = tuple(int(argument.id) for argument in terminator.args)
+            terminator.args = ordered + [
+                argument for argument in terminator.args
+                if id(argument) in leftover
+            ]
+            if tuple(int(a.id) for a in terminator.args) != previous_ids:
+                _post_positional_return_slots(
+                    function, graph, terminator, previous_ids,
+                    declared_ids=tuple(
+                        int(named_output_ids[str(name)])
+                        if str(name) in named_output_ids
+                        else int(tuple(identities.get(str(name), ()))[-1])
+                        for name in positional_output_names
+                        if tuple(identities.get(str(name), ()))
+                        or str(name) in named_output_ids
+                    ),
+                )
         # A named output the builder already resolved through its name
         # history stands in the Ret under the carried phi's id, which the
         # graph's identity table cannot know -- so the recovery above may
@@ -51559,6 +51774,14 @@ def _class_surface_ssa_program(
                                 index_ids[0] not in caller_graph
                             ):
                                 continue
+                            from .resident_sequence_materialization import (
+                                _loop_carried_initial_ids,
+                            )
+
+                            if index_ids[0] in _loop_carried_initial_ids(
+                                caller_graph
+                            ):
+                                continue
                             index_node = caller_graph.nodes[index_ids[0]]
                             literal = index_node.get("constant")
                             if literal is None:
@@ -52143,8 +52366,14 @@ def _class_surface_ssa_program(
                                     in projection.get("parents") or ()
                                     if str(role) == "index"
                                 )
+                                from .resident_sequence_materialization import (
+                                    _loop_carried_initial_ids,
+                                )
+
                                 if len(index_ids) == 1 and (
                                     index_ids[0] in aggregate_graph
+                                ) and index_ids[0] not in (
+                                    _loop_carried_initial_ids(aggregate_graph)
                                 ):
                                     index_node = aggregate_graph.nodes[
                                         index_ids[0]

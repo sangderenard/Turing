@@ -52,8 +52,17 @@ def _feeds(module, export, params, feeds):
     return out
 
 
+def _leaves(value):
+    """A returned tuple's leaves in order: the Ret carries a nested tuple
+    ``(x, (x, 1.0))`` as its three leaves (c924)."""
+
+    if isinstance(value, tuple):
+        return [leaf for member in value for leaf in _leaves(member)]
+    return [value]
+
+
 def judge(feeds, expect, flat, kinds):
-    exp = list(expect) if isinstance(expect, tuple) else [expect]
+    exp = _leaves(expect)
     # An integer answer is exact: a float64 round trip of 6 * (2**55 + 1)
     # passed under the relative tolerance (a comprehension row typed float64).
     ok = len(flat) == len(exp) and all(
