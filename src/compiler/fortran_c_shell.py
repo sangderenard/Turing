@@ -30239,28 +30239,6 @@ def _class_surface_ssa_program(
             if not (0 <= int(slot) < len(field_names)):
                 continue
             field = dict(self_record_fields.get(field_names[int(slot)]) or {})
-            if field.get("dtype") is None and _kind == "read" and (
-                int(value_id) in graph_obj
-            ):
-                # Program: the structure driver's ``fold(d,
-                # vocabulary.epoch)`` on a local ``Vocabulary()``.  Wrong
-                # record: only a receiver PARAMETER's record fields were
-                # read here, so a local record's field read, consumed only
-                # as a call actual, reached the slot ABI with no dtype.
-                # Rule: the read carries its class field's declared scalar
-                # storage (stamped at ingestion from the field's storage
-                # contract); that is the slot's dtype.
-                read = graph_obj.nodes[int(value_id)]
-                descriptor = read.get("tensor") or {}
-                if (
-                    str(read.get("op") or read.get("type") or "").casefold()
-                    == "getattr"
-                    and (read.get("attributes") or {}).get("value_kind")
-                    == "scalar"
-                    and not tuple(descriptor.get("shape") or ())
-                    and descriptor.get("dtype") is not None
-                ):
-                    field = {"dtype": str(descriptor["dtype"])}
             if field.get("dtype") is not None:
                 parameter_value_dtypes[int(value_id)] = str(field["dtype"])
             if field.get("shape") is not None:
