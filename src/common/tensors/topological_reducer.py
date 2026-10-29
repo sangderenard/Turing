@@ -4954,6 +4954,150 @@ def _builtin_scalar_operator_class(expression: Any, operand_classes: tuple) -> s
     return None
 
 
+def _project_iterated_mapping_key_classes(
+    graph: Any, loop_id: int, expression: ast.For, scope: str,
+) -> bool:
+    """Give the targets of ``for k in d`` the class of ``d``'s keys.
+
+    Program: ``cells = {}; cells[(i % 2, i)] = i`` then ``for row, column in
+    cells`` (the bootstrap's ``_reindex_in_place``), and ``d[i * 3] = i *
+    0.5`` then ``for k in d``.  Wrong record: the targets had no class row
+    (and ``k`` took the dict's row class), so ``row * 10`` reached its
+    region with no dtype.  Rule: iterating a mapping (or its ``keys()``)
+    yields its keys, so a target has the class of the key operands every
+    store into the mapping writes: one name the key's class, the i-th name
+    of a tuple target the i-th key operand's class (a displayed key is one
+    such operand).  The class is DERIVED from the loop's cell, each store's
+    (or displayed key's) cell and each operand's class cell;
+    a position whose stores disagree, or whose operands have no class row
+    yet, gets no row.  Returns whether a row was added.
+    """
+
+    from ...compiler.concordance_declarations import SOURCE_VALUE_CLASS
+
+    G = getattr(graph, "G", graph)
+    iterator = expression.iter
+    if isinstance(iterator, ast.Call):
+        if not (
+            isinstance(iterator.func, ast.Attribute)
+            and iterator.func.attr == "keys"
+            and not iterator.args
+        ):
+            return False
+    elif not isinstance(iterator, (ast.Name, ast.Attribute)):
+        return False
+
+    def kind(node_id):
+        data = G.nodes[node_id]
+        return str(data.get("op") or data.get("type") or "").casefold()
+
+    def roles(node_id, *names):
+        return [
+            int(parent) for parent, role in G.nodes[node_id].get("parents") or ()
+            if int(parent) in G and str(role) in names
+        ]
+
+    iterables = roles(loop_id, "iterable")
+    if len(iterables) != 1:
+        return False
+    current, seen, stores = iterables[0], set(), []
+    if isinstance(iterator, ast.Call):
+        operands = roles(current, "operand")
+        if len(operands) != 1:
+            return False
+        current = operands[0]
+    while current in G and current not in seen:
+        seen.add(current)
+        if kind(current) == "loopresult" and len(roles(current, "value")) == 1:
+            current = roles(current, "value")[0]
+            continue
+        if kind(current) in {"indexedstore", "setitem"}:
+            stores.append(current)
+            bases = roles(current, "base")
+            if len(bases) != 1:
+                return False
+            current = bases[0]
+            continue
+        break
+    if current not in G or (
+        G.nodes[current].get("attributes") or {}
+    ).get("aggregate_kind") != "dict":
+        return False
+    stores.extend(
+        int(child) for child in G.successors(current)
+        if kind(child) in {"indexedstore", "setitem"}
+        and int(child) not in stores and current in roles(child, "base")
+    )
+    displayed_keys = roles(current, "keys")
+    if not stores and not displayed_keys:
+        return False
+    book = current_identity_book()
+    page = book.page(SOURCE_VALUE_CLASS)
+
+    def value_of(node_id):
+        return int(G.nodes[node_id].get("value_id", node_id))
+
+    # A displayed key (``{1: 10, 2: 20}``) is one key operand of the
+    # mapping, as a store's index is.
+    key_writers = [*stores, *displayed_keys]
+    key_rows = [
+        *(roles(store, "index") for store in stores),
+        *([key] for key in displayed_keys),
+    ]
+    widths = {len(keys) for keys in key_rows}
+    if len(widths) != 1:
+        return False
+    width = next(iter(widths))
+    target = expression.target
+    names = (
+        (target.id,) if isinstance(target, ast.Name) and width == 1
+        else tuple(element.id for element in target.elts)
+        if isinstance(target, (ast.Tuple, ast.List))
+        and len(target.elts) == width
+        and all(isinstance(element, ast.Name) for element in target.elts)
+        else ()
+    )
+    bindings = dict(
+        (G.nodes[loop_id].get("attributes") or {}).get("loop_target_bindings")
+        or {}
+    )
+    loop_cell = node_identity_cell(graph, int(loop_id))
+    changed = False
+    for position, name in enumerate(names):
+        target_id = bindings.get(name)
+        if target_id is None or int(target_id) not in G or loop_cell is None:
+            continue
+        target_value = value_of(int(target_id))
+        if page.latest((scope, target_value)) is not None:
+            continue
+        facts = {
+            page.latest((scope, value_of(keys[position])))
+            for keys in key_rows
+        }
+        if len(facts) != 1:
+            continue
+        fact = next(iter(facts))
+        if not (isinstance(fact, tuple) and len(fact) >= 2 and fact[0]):
+            continue
+        sources = [loop_cell]
+        for store, keys in zip(key_writers, key_rows):
+            sources.append(node_identity_cell(graph, int(store)))
+            sources.append(book.latest_ref(
+                SOURCE_VALUE_CLASS, (scope, value_of(keys[position])),
+            ))
+        G.nodes[int(target_id)].setdefault(
+            "attributes", {}
+        )["result_class_ref"] = str(fact[0])
+        _concord_source_value_class(
+            scope, target_value, str(fact[0]),
+            precision_limbs=int(fact[1]),
+            source="iterated mapping key projection",
+            provenance=_Derived(tuple(dict.fromkeys(filter(None, sources)))),
+        )
+        changed = True
+    return changed
+
+
 def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
     """Publish the class of every builtin scalar operator result.
 
@@ -5017,6 +5161,12 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
                     source="range loop counter",
                     provenance=_Derived((loop_cell,)),
                 )
+                changed = True
+            continue
+        if isinstance(expression, ast.For):
+            if _project_iterated_mapping_key_classes(
+                graph, int(node_id), expression, scope,
+            ):
                 changed = True
             continue
         field_state = (data.get("attributes") or {}).get("record_field_state")
