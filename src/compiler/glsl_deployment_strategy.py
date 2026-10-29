@@ -2567,9 +2567,11 @@ def _callee_return_member_dtype(
             return None
         leaf_attributes = callee_graph.nodes[leaf_id].get("attributes") or {}
         aggregate_kind = leaf_attributes.get("aggregate_kind")
-        if aggregate_kind is not None and aggregate_kind != "list":
+        # A returned array (``return 0, self.values[b : e]``) holds rows of
+        # its typecode, exactly as a returned list holds its element class.
+        if aggregate_kind is not None and aggregate_kind not in {"list", "array"}:
             return None
-        kinds.add("element" if aggregate_kind == "list" else "scalar")
+        kinds.add("scalar" if aggregate_kind is None else "element")
         if (
             aggregate_kind == "list"
             and dtypes.get(leaf_id) is None

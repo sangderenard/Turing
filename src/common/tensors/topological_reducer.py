@@ -11363,13 +11363,29 @@ def _normalize_lexical_values(
                         "tuple", "frozenset", "bytes"
                     },
                 })
+                constructor_arguments = tuple(
+                    int(parent)
+                    for parent, role in constructor.get("parents") or ()
+                    if str(role).startswith(("arg", "kw:"))
+                )
+                # Program: ``rows = list(self.values[b : b + 2]); rows[0]``
+                # and ``for x in list(xs)`` (string core ``expand``/``cover``).
+                # Wrong record: the one argument of ``list(x)`` was recorded
+                # as the result's sole member, so ``rows[0]`` read the whole
+                # slice and the loop ran once over ``xs`` itself.  Rule:
+                # ``list``/``tuple``/``set``/``frozenset`` of one iterable
+                # copy its ROWS; the iterable is no member.  (``bytes([v])``
+                # keeps its argument edge: its lowering reads that list's
+                # own leaves.)
+                if (
+                    aggregate_kind in {"list", "tuple", "set", "frozenset"}
+                    and len(expression.args) == 1
+                    and not expression.keywords
+                    and not isinstance(expression.args[0], ast.Starred)
+                ):
+                    constructor_arguments = ()
                 constructor_attributes.setdefault(
-                    "aggregate_leaf_value_ids",
-                    tuple(
-                        int(parent)
-                        for parent, role in constructor.get("parents") or ()
-                        if str(role).startswith(("arg", "kw:"))
-                    ),
+                    "aggregate_leaf_value_ids", constructor_arguments,
                 )
                 # The admitted builtin constructor is the semantic source
                 # declaration for its result.  Publish that declaration to
