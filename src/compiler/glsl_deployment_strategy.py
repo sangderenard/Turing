@@ -32770,6 +32770,51 @@ def _post_callsite_loop_element_classes(
                     target_attributes.pop("result_class_ref", None)
 
 
+def _reachability_through_call_identity(book, caller, call_id, callee_scope):
+    """The reachability row of the authored call this call node IS.
+
+    Program: ``def f(x): return g(x, 4)`` through ``compile_ast_aot``.
+    Wrong record: the caller planned there is the whole-module graph, whose
+    numeric scope is synthetic, so the row keyed by ``f``'s scope and call
+    id was never found and every helper return was refused.  Rule: the row
+    whose call cell (``canonical_value`` of ``f``'s call) derives from this
+    node's own identity cell is this call's authority; exactly one must.
+    """
+
+    from ..common.tensors.topological_reducer import node_identity_cell
+    from .concordance_declarations import SOURCE_FUNCTION_REACHABILITY
+
+    try:
+        call_cell = node_identity_cell(caller, int(call_id))
+    except ValueError:
+        return None
+    identity_pages = {"canonical_value", "ingestion_value"}
+    matches = []
+    page = book.page(SOURCE_FUNCTION_REACHABILITY)
+    for row in page.rows():
+        if not (isinstance(row, tuple) and len(row) == 3) or row[2] != callee_scope:
+            continue
+        ref = book.latest_ref(SOURCE_FUNCTION_REACHABILITY, row)
+        frontier = [
+            source for source, _stage in book.edges_into(ref)
+            if source.page.name in identity_pages
+        ]
+        seen = set()
+        while frontier:
+            cell = frontier.pop()
+            if cell in seen:
+                continue
+            seen.add(cell)
+            if cell == call_cell:
+                matches.append(ref)
+                break
+            frontier.extend(
+                source for source, _stage in book.edges_into(cell)
+                if source.page.name in identity_pages
+            )
+    return matches[0] if len(matches) == 1 else None
+
+
 def _callsite_return_shape_sources(caller, original, specialized, call_id, return_id, descriptor):
     """Read the selected return's shape through its existing exact call edge."""
     from ..common.tensors.topological_reducer import node_identity_cell, _source_numeric_scope
@@ -32807,6 +32852,10 @@ def _callsite_return_shape_sources(caller, original, specialized, call_id, retur
         binding = book.latest_ref(
             SOURCE_FUNCTION_REACHABILITY,
             (caller_scope, authored_value, callee_scope),
+        )
+    if binding is None:
+        binding = _reachability_through_call_identity(
+            book, caller, int(call_id), callee_scope,
         )
     if binding is None or book.page(SOURCE_FUNCTION_REACHABILITY).cell(binding.row, binding.column) is not True:
         raise ValueError("selected return has no exact source call reachability authority")
