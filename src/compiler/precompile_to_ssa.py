@@ -12034,10 +12034,14 @@ class _ControlSSABuilder(TiledObject):
     ) -> None:
         """Select exact status routes while admission remains shut."""
         from .concordance_declarations import (
-            CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_CLASS,
+            CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+            SOURCE_EXCEPTION_HANDLER_CLASS, SOURCE_EXCEPTION_HANDLER_PHI,
+            SOURCE_EXCEPTION_REGION_STATE, SOURCE_EXCEPTION_SSA_HANDLER_ARM,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_ROUTE, SOURCE_EXCEPTION_STATUS_ROUTE,
-            ExceptionHandlerClassFact, ExceptionSSARouteFact,
+            ExceptionHandlerArmValueFact, ExceptionHandlerClassFact,
+            ExceptionHandlerPhiFact, ExceptionRegionStateFact,
+            ExceptionSSAHandlerArmFact, ExceptionSSARouteFact,
             ExceptionStatusRouteFact,
         )
 
@@ -12210,7 +12214,7 @@ class _ControlSSABuilder(TiledObject):
                     raise ValueError(
                         f"native Try route lacks SSA cells: {route_row!r}"
                     )
-                book.post(
+                ssa_route_cell = book.post(
                     SOURCE_EXCEPTION_SSA_ROUTE,
                     (self._scope(), edge["site"].row[1],
                      edge["site"].row[2], int(route_row[2])),
@@ -12228,6 +12232,84 @@ class _ControlSSABuilder(TiledObject):
                     mode=Mode.CONCORD,
                 )
                 self.current = match_block
+                for source_phi in block.handlers[
+                    selected_facts[0].ordinal
+                ].entry_phi_cells:
+                    phi = book.page(SOURCE_EXCEPTION_HANDLER_PHI).cell(
+                        source_phi.row, source_phi.column,
+                    )
+                    arms = tuple(
+                        (arm_row, book.page(
+                            SOURCE_EXCEPTION_HANDLER_ARM_VALUE
+                        ).latest(arm_row))
+                        for arm_row in book.page(
+                            SOURCE_EXCEPTION_HANDLER_ARM_VALUE
+                        ).rows()
+                        if book.page(
+                            SOURCE_EXCEPTION_HANDLER_ARM_VALUE
+                        ).latest(arm_row).source_phi == source_phi
+                        and book.page(
+                            SOURCE_EXCEPTION_HANDLER_ARM_VALUE
+                        ).latest(arm_row).source_transfer == edge["transfer"]
+                    )
+                    if not isinstance(phi, ExceptionHandlerPhiFact) or (
+                        phi.handler != route.selected_handler
+                        or len(arms) != 1
+                        or not isinstance(arms[0][1],
+                                       ExceptionHandlerArmValueFact)
+                    ):
+                        raise ValueError(
+                            "native Try match has no exact handler Phi arm: "
+                            f"route={route_row!r}, phi={source_phi!r}"
+                        )
+                    arm_row, arm = arms[0]
+                    state_row = (*edge["site"].row, phi.name)
+                    state = book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
+                        state_row,
+                    )
+                    incoming = edge["state"].get(phi.name)
+                    if not isinstance(state, ExceptionRegionStateFact) or (
+                        state.transfer != edge["transfer"]
+                        or state.canonical_value != arm.canonical_value
+                        or incoming is None
+                        or not self._value_dominates_current_edge(incoming)
+                    ):
+                        raise ValueError(
+                            "native Try handler Phi arm disagrees with "
+                            "deployed failure state: "
+                            f"route={route_row!r}, name={phi.name!r}"
+                        )
+                    arm_cell = book.latest_ref(
+                        SOURCE_EXCEPTION_HANDLER_ARM_VALUE, arm_row,
+                    )
+                    state_cell = book.latest_ref(
+                        SOURCE_EXCEPTION_REGION_STATE, state_row,
+                    )
+                    incoming_cell = self._value_cell(incoming)
+                    if arm_cell is None or state_cell is None:
+                        raise ValueError(
+                            "native Try handler arm lacks source cells: "
+                            f"route={route_row!r}, phi={source_phi!r}"
+                        )
+                    # Program: y=1; a=int(x); y=2; b=int(x).
+                    # The first failure needs y=1 and the second y=2;
+                    # the final name y cannot identify either operand.
+                    # Each matched native code retains the source arm and
+                    # the SSA value captured at its own deployed site.
+                    book.post(
+                        SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+                        (*ssa_route_cell.row, int(arm.canonical_phi.row[1])),
+                        ExceptionSSAHandlerArmFact(
+                            ssa_route_cell, arm_cell, state_cell,
+                            match_cell, incoming_cell,
+                        ),
+                        stage=self._stage(),
+                        provenance=Derived((
+                            ssa_route_cell, arm_cell, state_cell,
+                            match_cell, incoming_cell,
+                        )),
+                        mode=Mode.CONCORD,
+                    )
                 propagate(edge)
                 self.current = remainder
             propagate(edge)

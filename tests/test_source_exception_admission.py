@@ -16,7 +16,9 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
     SOURCE_EXCEPTION_REGION_SITE,
     SOURCE_EXCEPTION_REGION_STATE,
+    SOURCE_EXCEPTION_SSA_CHECKPOINT,
     SOURCE_EXCEPTION_SSA_ROUTE,
+    SOURCE_EXCEPTION_SSA_HANDLER_ARM,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
     SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
@@ -427,7 +429,7 @@ def root(x: int) -> int:
         end_identity_book(token)
 
 
-def test_handler_phi_joins_distinct_exception_site_bindings():
+def test_handler_phi_joins_distinct_exception_site_bindings(monkeypatch):
     source = """\
 def root(x: float) -> int:
     y = 0
@@ -440,6 +442,21 @@ def root(x: float) -> int:
         return y
     return y + a + b
 """
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+    overlaid = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            overlaid.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
     book, token = begin_identity_book()
     try:
         with pytest.raises(CompilationSubdivisionRequired):
@@ -479,6 +496,73 @@ def root(x: float) -> int:
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
         assert CorrelationTable._source_exception_handler_arm_value_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert len(overlaid) == 1
+        state_rows = tuple(book.page(SOURCE_EXCEPTION_REGION_STATE).rows())
+        # These two literal versions are already present in the source
+        # graph. Give direct control lowering the same literal IDs the
+        # public compiler would supply after region planning.
+        literal_ids = tuple(
+            int(book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
+                row
+            ).canonical_value.row[1])
+            for row in state_rows if row[3] == "y"
+        )
+        lowered, shortfalls = lower_control_program_to_ssa(
+            overlaid[0], function_name="exception_handler_phi_probe",
+            first_value_id=1000,
+            lexical_read_scope=try_rows[0][0],
+            planning_scope=site_rows[0][0],
+            region_callees={
+                row[1]: f"numerical_region_{row[1]}" for row in site_rows
+            },
+            region_signatures={row[1]: ((), ()) for row in site_rows},
+            constant_value_ids=literal_ids,
+        )
+        assert any(
+            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
+        )
+        assert len(tuple(book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).rows())) == 2
+        route_rows = tuple(book.page(SOURCE_EXCEPTION_SSA_ROUTE).rows())
+        source_route_rows = tuple(
+            row for row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
+            if book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(
+                row
+            ).selected_handler is not None
+        )
+        assert len(route_rows) == len(source_route_rows)
+        assert {row[3] for row in route_rows} == {
+            row[2] for row in source_route_rows
+        }
+        assert {row[1:3] for row in route_rows} == {
+            row[1:] for row in site_rows
+        }
+        assert all(
+            book.page(SOURCE_EXCEPTION_SSA_ROUTE).latest(
+                row
+            ).selected_handler == arm_facts[0].source_handler
+            for row in route_rows
+        )
+        assert CorrelationTable._source_exception_ssa_route_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        incoming_rows = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_HANDLER_ARM
+        ).rows())
+        assert len(incoming_rows) == len(route_rows)
+        assert {
+            row[1:3]: book.page(SOURCE_EXCEPTION_SSA_HANDLER_ARM).latest(
+                row
+            ).source_arm
+            for row in incoming_rows
+        } == {
+            site_row[1:]: book.latest_ref(
+                SOURCE_EXCEPTION_HANDLER_ARM_VALUE, arm_row,
+            )
+            for site_row, arm_row in zip(site_rows, arm_rows)
+        }
+        assert CorrelationTable._source_exception_ssa_handler_arm_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
     finally:

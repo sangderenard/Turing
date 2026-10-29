@@ -1559,6 +1559,7 @@ class CorrelationTable:
         found.extend(self._source_exception_region_state_findings(module))
         found.extend(self._source_exception_ssa_checkpoint_findings(module))
         found.extend(self._source_exception_ssa_route_findings(module))
+        found.extend(self._source_exception_ssa_handler_arm_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_handler_arm_value_findings(module))
@@ -2721,6 +2722,135 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-ssa-route-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_handler_arm_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Every selected native route carries its site's handler value."""
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+            SOURCE_EXCEPTION_HANDLER_PHI, SOURCE_EXCEPTION_REGION_STATE,
+            SOURCE_EXCEPTION_SSA_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_HANDLER_ARM, SOURCE_EXCEPTION_SSA_ROUTE,
+            SOURCE_EXCEPTION_STATUS_ROUTE, SSA_VALUE,
+            ExceptionHandlerArmValueFact, ExceptionHandlerPhiFact,
+            ExceptionRegionStateFact, ExceptionSSACheckpointFact,
+            ExceptionSSAHandlerArmFact, ExceptionSSARouteFact,
+            ExceptionStatusRouteFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_SSA_HANDLER_ARM.name not in book.pages:
+            return []
+        page = book.page(SOURCE_EXCEPTION_SSA_HANDLER_ARM)
+        routes = book.page(SOURCE_EXCEPTION_SSA_ROUTE)
+        found = []
+        expected = {}
+        for route_row in routes.rows():
+            route = routes.latest(route_row)
+            if not isinstance(route, ExceptionSSARouteFact):
+                continue
+            source_route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(
+                route.source_route.row,
+            )
+            if not isinstance(source_route, ExceptionStatusRouteFact):
+                continue
+            for arm_row in book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).rows():
+                arm = book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).latest(
+                    arm_row,
+                )
+                if not isinstance(arm, ExceptionHandlerArmValueFact) or (
+                    arm.source_handler != route.selected_handler
+                    or arm.source_transfer != source_route.transfer
+                ):
+                    continue
+                expected_row = (*route_row, int(arm.canonical_phi.row[1]))
+                if expected_row in expected:
+                    found.append(Finding(
+                        "source-exception-ssa-handler-arm-disagreement",
+                        str(expected_row), None,
+                        "source route has duplicate handler Phi arms",
+                    ))
+                expected[expected_row] = arm_row
+                if page.latest(expected_row) is None:
+                    found.append(Finding(
+                        "source-exception-ssa-handler-arm-disagreement",
+                        str(expected_row), None,
+                        "selected native route has no incoming handler value",
+                    ))
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_HANDLER_ARM, row)
+            problem = None
+            if row not in expected:
+                problem = "native handler value has no selected source arm"
+            elif not isinstance(fact, ExceptionSSAHandlerArmFact) or not all(
+                isinstance(cell, Ref) for cell in (
+                    fact.ssa_route, fact.source_arm, fact.region_state,
+                    fact.match_block, fact.incoming_value,
+                )
+            ):
+                problem = "native handler value has no exact cells"
+            else:
+                route = routes.latest(fact.ssa_route.row)
+                arm = book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).latest(
+                    fact.source_arm.row,
+                )
+                state = book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
+                    fact.region_state.row,
+                )
+                checkpoint = (
+                    book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).latest(
+                        route.checkpoint.row,
+                    ) if isinstance(route, ExceptionSSARouteFact)
+                    else None
+                )
+                phi = (
+                    book.page(SOURCE_EXCEPTION_HANDLER_PHI).latest(
+                        arm.source_phi.row,
+                    ) if isinstance(arm, ExceptionHandlerArmValueFact)
+                    else None
+                )
+                if (
+                    fact.ssa_route.row != row[:4]
+                    or fact.source_arm.row != expected[row]
+                    or not isinstance(checkpoint, ExceptionSSACheckpointFact)
+                    or fact.region_state.row != (
+                        *checkpoint.region_site.row,
+                        getattr(phi, "name", None),
+                    )
+                    or not isinstance(route, ExceptionSSARouteFact)
+                    or not isinstance(arm, ExceptionHandlerArmValueFact)
+                    or not isinstance(state, ExceptionRegionStateFact)
+                    or not isinstance(phi, ExceptionHandlerPhiFact)
+                    or route.match_block != fact.match_block
+                    or arm.canonical_phi.row[1] != row[4]
+                    or state.transfer != arm.source_transfer
+                    or state.canonical_value != arm.canonical_value
+                    or state.source_binding != arm.source_binding
+                    or fact.incoming_value.page != SSA_VALUE
+                    or any(book.latest_ref(cell.page, cell.row) != cell
+                           for cell in (
+                               fact.ssa_route, fact.source_arm,
+                               fact.region_state, fact.match_block,
+                               fact.incoming_value,
+                           ))
+                ):
+                    problem = "native handler value disagrees with source state"
+                elif receipt is None or {
+                    cause for cause, _stage in book.edges_into(receipt)
+                } != {
+                    fact.ssa_route, fact.source_arm, fact.region_state,
+                    fact.match_block, fact.incoming_value,
+                }:
+                    problem = "native handler value provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-handler-arm-disagreement",
                     str(row), None, problem,
                 ))
         return found

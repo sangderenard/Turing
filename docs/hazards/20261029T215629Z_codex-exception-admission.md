@@ -1,0 +1,6 @@
+2026-10-29 Exact SSA handler inputs by exceptional site (MEASURED, codex/exception-admission):
+
+- The bounded source `y=1; a=int(x); y=2; b=int(x)` inside one Try has two deployed protected sites. The first site's handler arm names canonical value 2; the second names canonical value 3. Direct control lowering with the source literal IDs reaches both checkpoints and emits ten selected route comparisons, five native status codes per site.
+- Each comparison now posts `SOURCE_EXCEPTION_SSA_HANDLER_ARM` from its selected route, exact `SOURCE_EXCEPTION_HANDLER_ARM_VALUE`, deployed `SOURCE_EXCEPTION_REGION_STATE`, match block and live SSA value. The handler-arm audit has no finding on the two-site case; the recorded arm for each site's routes matches that site's source arm.
+- Targeted gate: `python -m pytest -q tests/test_source_exception_admission.py tests/test_metadata_copy_control_ownership.py tests/test_native_float_int_status.py` completed, 25 passed in 6.47s. `git diff --check` passed.
+- The broad concordance audit still stops at the pre-existing `selected return has no exact source call reachability authority` refusal after 1.7s. Native handler entry Phi, body execution, finalizer outcome routing and public admission remain unfinished; `native_try_dispatch` still fails closed.

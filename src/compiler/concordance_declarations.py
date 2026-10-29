@@ -1314,6 +1314,28 @@ SOURCE_EXCEPTION_SSA_ROUTE = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSAHandlerArmFact:
+    """One matched route's exact incoming handler Phi operand."""
+
+    ssa_route: Ref
+    source_arm: Ref
+    region_state: Ref
+    match_block: Ref
+    incoming_value: Ref
+
+
+SOURCE_EXCEPTION_SSA_HANDLER_ARM = declare_page(
+    "source_exception_ssa_handler_arm", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("region", K.INDEX),
+        RowField("canonical_site", K.VALUE_ID),
+        RowField("status", K.INDEX),
+        RowField("canonical_phi", K.VALUE_ID),
+    ), ExceptionSSAHandlerArmFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionHandlerEntryFact:
     """Candidate failure edges and binding versions at one handler entry."""
 
