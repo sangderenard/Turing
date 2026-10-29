@@ -12189,9 +12189,24 @@ def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
                 "orelse": (expression.orelse,),
             }
         elif isinstance(expression, ast.Try):
+            # Program: two ``except`` arms of one Try each raise a different
+            # exception. Wrong record: both raises had the same ``handlers``
+            # membership, so control composition could not tell which
+            # handler owned either exceptional edge. The authored handler's
+            # exact graph node is the arm key; its index or source span is
+            # insufficient once source controls are cloned or specialized.
+            handler_arms = {}
+            for handler in expression.handlers:
+                handler_id = expression_nodes.get(id(handler))
+                if handler_id is None:
+                    raise ValueError(
+                        "source Try handler has no exact graph identity: "
+                        f"try={control_id}, handler={id(handler)}"
+                    )
+                handler_arms[f"handler:{int(handler_id)}"] = (handler,)
             branches = {
                 "body": tuple(expression.body),
-                "handlers": tuple(expression.handlers),
+                **handler_arms,
                 "orelse": tuple(expression.orelse),
                 "finalbody": tuple(expression.finalbody),
             }
