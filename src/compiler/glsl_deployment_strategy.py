@@ -3223,37 +3223,6 @@ def _planned_scalar_dtypes_from_graph(
             )
         )
 
-    def concatenated_empty_display(node_id):
-        """The ``+`` an empty list display is read by alone, or ``None``.
-
-        ``[]`` (a display with no members, or its folded ``[]`` constant)
-        whose one reader is a concatenation: it states no element class of
-        its own, and its zero rows are stored in the concatenation's.
-        """
-
-        data = G.nodes.get(int(node_id), {})
-        attributes = data.get("attributes") or {}
-        constant = data.get("constant", attributes.get("value"))
-        empty = (
-            attributes.get("aggregate_leaf_value_ids") == ()
-            and attributes.get("producer_kind") == "aggregate"
-        ) or (
-            operation(data) in {"const", "constant"}
-            and attributes.get("aggregate_kind") == "list"
-            and isinstance(constant, (list, tuple))
-            and not constant
-        )
-        readers = set(G.successors(int(node_id))) if empty else set()
-        if len(readers) != 1:
-            return None
-        reader = next(iter(readers))
-        reader_data = G.nodes[reader]
-        if operation(reader_data) != "add" or int(node_id) not in parents(
-            reader_data, "lhs", "rhs",
-        ):
-            return None
-        return int(reader)
-
     records = G.graph.get("source_sequence_mutation_records") or {}
     # Program: ``xs = collect(n); return sum(xs)`` (corpus c152).  Wrong
     # record: the call result's element type was unread, so ``sum`` fell to
@@ -3337,16 +3306,6 @@ def _planned_scalar_dtypes_from_graph(
                 # class-only contract does not narrow it.
                 scalar[node_id] = proven_width
                 changed = True
-            # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca``
-            # (the structure-queries cover rebuild).  Wrong record: the
-            # empty display states no element class, so it entered the
-            # concatenation's region with no dtype.  Rule: an empty display
-            # read only by a concatenation stores its zero rows in the
-            # concatenation's class.
-            concatenation = concatenated_empty_display(node_id)
-            if concatenation is not None and element.get(concatenation):
-                settle(element, node_id, element[concatenation])
-                continue
             # Program: ``k.mul(x) + k.scale`` with ``def mul(self, x: int) ->
             # int`` (corpus c426).  Wrong record: a method call is named by
             # its method (``mul``), so no operator rule typed it and its
@@ -4714,23 +4673,7 @@ def _planned_scalar_dtypes_from_graph(
                     and all(is_collection(o) or o in element for o in operands)
                     and not any(o in scalar for o in operands)
                 ):
-                    # Program: ``rebuilt = []; for c in cover: ...;
-                    # rebuilt = rebuilt + ca`` (structure_queries).  Wrong
-                    # record: the empty display states no element class, so
-                    # the concatenation's join never closed.  Rule (as for
-                    # a branch join's empty arm): an empty display that
-                    # only this concatenation reads states no class; the
-                    # rows are the other operand's, and its zero rows are
-                    # stored in that class.
-                    empty_operands = [
-                        o for o in operands
-                        if concatenated_empty_display(o) == node_id
-                        and element.get(o) is None
-                    ]
-                    writers = [
-                        element.get(o) for o in operands
-                        if o not in empty_operands
-                    ]
+                    writers = [element.get(o) for o in operands]
                     for child in G.successors(node_id):
                         child_data = G.nodes[child]
                         if operation(child_data) in {"indexedstore", "setitem"}:
@@ -6747,11 +6690,16 @@ def _build_shell_hierarchy_plan(
                     literal = attributes.get("value", node.get("constant"))
                     # A list/tuple literal is an array of its own extent; the
                     # DomainNode pads it to (1, 1, 1), which squeezed to a
-                    # scalar (``sum([1, 1, 1])`` read one element).
+                    # scalar (``sum([1, 1, 1])`` read one element).  An
+                    # empty one is such an array when its declaration posted
+                    # its element class (``_declared_empty_sequence_cell``).
                     if (
                         isinstance(literal, (list, tuple))
                         and not tensor_shape_declared
-                        and literal
+                        and (
+                            literal
+                            or _declared_empty_sequence_cell(node) is not None
+                        )
                         and all(
                             isinstance(item, (bool, int, float))
                             for item in literal
@@ -7589,26 +7537,6 @@ def _build_shell_hierarchy_plan(
             if isinstance(literal, list) and literal and all(
                 isinstance(member, (list, tuple)) for member in literal
             )
-        )
-        # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca``.
-        # Wrong record: the folded ``[]`` has no tensor extent, so its
-        # ``Const`` line got a scalar record and was dropped above, and the
-        # concatenation's region refused it.  Rule: an empty list constant
-        # is a list of zero rows of its element class (the planner's, from
-        # the concatenation it feeds); no class, no record.
-        value_shapes += tuple(
-            (int(value_id), (0,), str(record[2]))
-            for value_id in sorted(materialised)
-            if int(value_id) not in produced
-            and int(value_id) not in captured
-            and int(value_id) not in {row[0] for row in value_shapes}
-            for literal in ((
-                (graph.G.nodes.get(int(value_id)) or {}).get("attributes")
-                or {}
-            ).get("value"),)
-            if isinstance(literal, list) and not literal
-            for record in (_typed_value_shape(value_id),)
-            if record is not None and record[2] is not None
         )
         value_ranks = tuple(
             (
@@ -11031,6 +10959,13 @@ def _dispatch_metadata_node_classifier(graph: Any):
                 f"executable_node: no source cell for {row!r} -- {exc}"
             ) from exc
         cells = [cell]
+        cells.extend(
+            declared
+            for parent, _role in (G.nodes[int(node_id)].get("parents") or ())
+            if parent in G
+            for declared in (_declared_empty_sequence_cell(G.nodes[parent]),)
+            if declared is not None
+        )
         if rule is MetadataRule.COORDINATOR_NODE_TYPE:
             # An Input the reducer declared scalar: the rule read that row.
             scalar = book.latest_ref(SCALAR_PARAMETER, (cell.row[0], int(node_id)))
@@ -11089,6 +11024,32 @@ def _is_dispatch_metadata_node(graph: Any, node_id: int) -> bool:
 
 def _is_dispatch_metadata_node_impl(graph: Any, node_id: int) -> bool:
     return _dispatch_metadata_rule(graph, node_id) not in _EXECUTABLE_RULES
+
+
+def _declared_empty_sequence_cell(data: Mapping[str, Any]) -> Any:
+    """The ANNOTATION_DECLARATION cell of an empty sequence constant, or None.
+
+    Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca``.  Wrong
+    record: the folded ``[]`` has no members, so ``flatten_tensor_constant``
+    refused it as a non-numeric payload; the concatenation became dispatch
+    metadata, no region produced it, and ``rebuilt`` read back empty.  The
+    element class of ``[]`` is the one its declaration posted
+    (``sequence_element_class_ref`` with its annotation cell): a numeric
+    class makes it a zero-row payload of that class.  A ``[]`` with no
+    posted class keeps the non-numeric verdict.
+    """
+
+    attributes = data.get("attributes") or {}
+    constant = data.get("constant", attributes.get("value"))
+    cell = attributes.get("sequence_element_annotation_cell")
+    if (
+        isinstance(constant, (list, tuple)) and not constant
+        and cell is not None
+        and str(attributes.get("sequence_element_class_ref") or "")
+        in {"builtins.int", "builtins.float", "builtins.bool"}
+    ):
+        return cell
+    return None
 
 
 def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
@@ -11238,19 +11199,7 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
             and _constant_value(parent_data) in {"sum", "mean", "max", "min"}
         ):
             continue
-        # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca`` (the
-        # structure-queries cover rebuild).  Wrong record: the folded empty
-        # display is a constant no tensor flattens, so the concatenation was
-        # classified coordinator metadata and dropped: its result had no
-        # producer, became a root formal, and the list read back empty.
-        # Rule: a sequence constant operand of ``+`` is a sequence, and the
-        # ``+`` is the structural concatenation ``_sequence_concat_ops``
-        # lowers, not a Python object dependency.
-        if (
-            node_type == "Add"
-            and (parent_data.get("attributes") or {}).get("aggregate_kind")
-            in {"list", "bytes", "bytearray"}
-        ):
+        if _declared_empty_sequence_cell(parent_data) is not None:
             continue
         try:
             flatten_tensor_constant(parent_data.get("constant"))
@@ -26016,6 +25965,20 @@ def _tensor_descriptor_rule(
                     "dtype": str(literal_dtype),
                     "rank": len(literal_shape),
                 }
+        elif _declared_empty_sequence_cell(data) is not None:
+            # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca``.
+            # Wrong record: an empty payload has no dtype of its own, so
+            # ``[]`` got no descriptor and its region line no value record.
+            # Rule: its extent is the literal's own and its class is the one
+            # its declaration posted (``_declared_empty_sequence_cell``).
+            tensor = {
+                "shape": (len(literal),),
+                "dtype": {
+                    "builtins.int": "int64", "builtins.float": "float64",
+                    "builtins.bool": "bool",
+                }[str(attributes["sequence_element_class_ref"])],
+                "rank": 1,
+            }
         elif isinstance(literal, (list, tuple)) and literal:
             # A source-authored nested numeric literal is the payload of a
             # ``tensor_from_list`` once it enters tensor dataflow.  Its
@@ -29955,6 +29918,13 @@ def _fold_callsite_structural_values(
                 "sequence_writable",
                 "aggregate_leaf_value_ids",
                 "tensor_output_descriptors",
+                # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt +
+                # ca``.  Wrong record: the fold kept the ledger and dropped
+                # the element class the declaration posted with it, so the
+                # folded ``[]`` read as a payload of no class.  The class
+                # and its ANNOTATION_DECLARATION cell travel together.
+                "sequence_element_class_ref",
+                "sequence_element_annotation_cell",
             )
             if key in source_attributes
         }
