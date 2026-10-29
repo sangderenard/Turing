@@ -7,7 +7,7 @@ import dataclasses
 import os
 import sys
 from dataclasses import replace
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 def _source_contract_rows(graph_obj: Any, page: Any) -> tuple[tuple, ...]:
@@ -883,6 +883,66 @@ def _loop_carried_storage_aliases(graph_obj) -> dict[int, int]:
         source: target for source, target in aliases.items()
         if source != target
     }
+
+
+def _merged_storage_identity(
+    graph_obj, value_id: int, aliases: Mapping[int, int] | None = None,
+    stop: Callable[[int], bool] | None = None,
+) -> int:
+    """The storage a returned value names, through versions and merges.
+
+    Program: ``out = [0] * count; if status == 0: while i < count: out[i] =
+    ...; return status, out`` (Token Orchard ``intern_batch``).  Wrong
+    record: the returned value is the ``if`` merge of the loop's version and
+    the birth.  A merge is no store or loop version, so the storage-alias
+    ledger left it alone: the callee's descriptor was never found for the
+    caller's view (its capacity and status cells were never defined), and
+    the caller's ``out[j]`` had no element class.  Rule: a merge whose
+    every arm (``body``/``orelse``) is a version of one storage is that
+    storage.  Arms naming different storages prove nothing; the merge
+    stays itself.
+
+    ``aliases`` is ``_loop_carried_storage_aliases(graph_obj)`` when the
+    caller has it; ``stop(value_id)`` ends the walk early at a value the
+    caller already knows (a published descriptor).
+    """
+
+    target = getattr(graph_obj, "G", graph_obj)
+    aliases = _loop_carried_storage_aliases(target) if aliases is None else aliases
+
+    def walk(value: int, seen: frozenset[int]) -> int:
+        value = int(value)
+        while True:
+            if stop is not None and stop(value):
+                return value
+            data = target.nodes.get(value) or {}
+            kind = str(data.get("op") or data.get("type") or "").casefold()
+            if value in aliases and value not in seen:
+                seen = seen | {value}
+                value = int(aliases[value])
+                continue
+            if kind == "indexedstore" and value not in seen:
+                base = next((
+                    parent for parent, role in data.get("parents") or ()
+                    if str(role) == "base" and parent in target
+                ), None)
+                if base is not None:
+                    seen = seen | {value}
+                    value = int(base)
+                    continue
+            break
+        data = target.nodes.get(value) or {}
+        kind = str(data.get("op") or data.get("type") or "").casefold()
+        if kind != "phi" or value in seen:
+            return value
+        arms = {
+            walk(int(parent), seen | {value})
+            for parent, role in data.get("parents") or ()
+            if str(role) in {"body", "orelse"} and parent in target
+        }
+        return next(iter(arms)) if len(arms) == 1 else value
+
+    return walk(int(value_id), frozenset())
 
 
 def _promote_conditional_sequence_aliases(

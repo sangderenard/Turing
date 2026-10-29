@@ -22390,16 +22390,31 @@ def _settle_linked_dynamic_sequences(
     # linked version joins its storage's component.
     from .resident_sequence_materialization import (
         _loop_carried_storage_aliases,
+        _merged_storage_identity,
     )
 
     # The aliases are one level per node (loop result -> store -> birth);
     # joining is repeated until no linked version reaches a new storage.
+    # ``if status == 0: while ...: out[i] = ...`` returns the merge of the
+    # loop's version and the birth: every arm is one storage, so the merge
+    # is that storage too (``_merged_storage_identity``).
+    def graph_storage_aliases(graph_obj):
+        aliases = _loop_carried_storage_aliases(graph_obj)
+        merged = {}
+        for node_id, data in graph_obj.nodes(data=True):
+            kind = str(data.get("op") or data.get("type") or "").casefold()
+            if kind != "phi":
+                continue
+            value_id = int(data.get("value_id", node_id))
+            storage_id = _merged_storage_identity(graph_obj, value_id, aliases)
+            if storage_id != value_id:
+                merged[value_id] = storage_id
+        return {**aliases, **merged}
+
     storage_aliases = tuple(
         ((id(graph_obj), int(version_id)), (id(graph_obj), int(storage_id)))
         for graph_obj in graphs
-        for version_id, storage_id in _loop_carried_storage_aliases(
-            graph_obj
-        ).items()
+        for version_id, storage_id in graph_storage_aliases(graph_obj).items()
     )
     joined = True
     while joined:
@@ -46542,26 +46557,24 @@ def _class_surface_ssa_program(
                     # ``out = [0] * count; while ...: out[i] = ...; return
                     # count, out`` returns the loop's version of ``out``: the
                     # same storage as its birth (loop result -> store ->
-                    # birth, ``_loop_carried_storage_aliases``).  Without
-                    # this the caller's arena members (heap owner, length,
-                    # capacity) were never bound to the callee's.
+                    # birth, ``_loop_carried_storage_aliases``); ``if status
+                    # == 0: while ...`` returns the merge of that version and
+                    # the birth, which is the birth's storage too
+                    # (``_merged_storage_identity``).  Without this the
+                    # caller's arena members (heap owner, length, capacity,
+                    # status) were never bound to the callee's.
                     from .resident_sequence_materialization import (
-                        _loop_carried_storage_aliases as returned_store_aliases,
+                        _merged_storage_identity as returned_storage_identity,
                     )
-                    storage_aliases = returned_store_aliases(
-                        getattr(child_graph, "G", child_graph)
-                    )
-                    storage_id, seen = int(callee_result_id), set()
-                    while (
-                        callee_sequence is None
-                        and storage_id in storage_aliases
-                        and storage_id not in seen
-                    ):
-                        seen.add(storage_id)
-                        storage_id = int(storage_aliases[storage_id])
-                        callee_sequence = callee_result_sequences.by_id(
-                            storage_id
+
+                    callee_sequence = callee_result_sequences.by_id(
+                        returned_storage_identity(
+                            child_graph, int(callee_result_id),
+                            stop=lambda value: (
+                                callee_result_sequences.by_id(value) is not None
+                            ),
                         )
+                    )
                 if callee_sequence is None or caller_sequence is None:
                     continue
                 if (
