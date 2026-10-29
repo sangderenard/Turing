@@ -12032,7 +12032,32 @@ class _ControlSSABuilder(TiledObject):
     def lower_native_try(
         self, block: NativeTryBlock, *, path: str,
     ) -> None:
-        """Lower protected region checkpoints while admission remains shut."""
+        """Select exact status routes while admission remains shut."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_CLASS,
+            SOURCE_EXCEPTION_SSA_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_ROUTE, SOURCE_EXCEPTION_STATUS_ROUTE,
+            ExceptionHandlerClassFact, ExceptionSSARouteFact,
+            ExceptionStatusRouteFact,
+        )
+
+        book = self._book()
+        canonical_successors = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for cause, _stage in book.edges_into(canonical):
+                canonical_successors.setdefault(cause, set()).add(canonical)
+
+        def reaches_canonical(source: Ref, target: Ref) -> bool:
+            pending = [source]
+            seen = set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                pending.extend(canonical_successors.get(cell, ()))
+            return target in seen
         owner = self._control_cells[-1]
         if owner is None:
             raise ValueError(
@@ -12050,8 +12075,8 @@ class _ControlSSABuilder(TiledObject):
             self.lower(block.orelse, path=f"{path}.try_else")
         self.lower(block.finalbody, path=f"{path}.try_finally")
         normal = self.current
-        for edge in frame["edges"]:
-            self.current = edge["failure"]
+
+        def propagate(edge: dict[str, Any]) -> None:
             self.emit(
                 Handler.Call, [edge["status"]],
                 attributes={
@@ -12065,6 +12090,147 @@ class _ControlSSABuilder(TiledObject):
                     owner=frame["owner"],
                 )
             self.branch(self._fault_exit)
+
+        for edge in frame["edges"]:
+            self.current = edge["failure"]
+            checkpoint = book.latest_ref(
+                SOURCE_EXCEPTION_SSA_CHECKPOINT,
+                (self._scope(), edge["site"].row[1],
+                 edge["site"].row[2]),
+            )
+            if checkpoint is None:
+                raise ValueError(
+                    "native Try route has no exact status checkpoint: "
+                    f"site={edge['site']!r}"
+                )
+            routes = sorted((
+                (route_row, book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(
+                    route_row,
+                ))
+                for route_row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
+                if route_row[:2] == edge["transfer"].row
+            ), key=lambda item: int(item[0][2]))
+            for route_row, route in routes:
+                if not isinstance(route, ExceptionStatusRouteFact) or (
+                    route.transfer != edge["transfer"]
+                ):
+                    raise ValueError(
+                        "native Try status route disagrees with transfer: "
+                        f"route={route_row!r}"
+                    )
+                if route.selected_handler is None:
+                    continue
+                selected_facts = tuple(
+                    book.page(SOURCE_EXCEPTION_HANDLER_CLASS).latest(row)
+                    for row in book.page(
+                        SOURCE_EXCEPTION_HANDLER_CLASS
+                    ).rows()
+                    if book.page(SOURCE_EXCEPTION_HANDLER_CLASS).latest(
+                        row
+                    ).handler == route.selected_handler
+                    and book.page(SOURCE_EXCEPTION_HANDLER_CLASS).latest(
+                        row
+                    ).owner == route.owner
+                )
+                if len(selected_facts) != 1 or not isinstance(
+                    selected_facts[0], ExceptionHandlerClassFact,
+                ) or not 0 <= selected_facts[0].ordinal < len(
+                    block.handlers
+                ):
+                    raise ValueError(
+                        "native Try route has no exact authored handler: "
+                        f"route={route_row!r}"
+                    )
+                # In `try: y = int(x); except ValueError: y = 2`, an
+                # ordinal alone can select a forked handler unrelated to
+                # the source route. The selected source cell must reach
+                # that handler's canonical cell before SSA uses its body.
+                canonical_handler = book.latest_ref(
+                    CANONICAL_VALUE,
+                    (self.lexical_read_scope,
+                     int(block.handlers[
+                         selected_facts[0].ordinal
+                     ].source_handler_node_id)),
+                )
+                if canonical_handler is None or not reaches_canonical(
+                    route.selected_handler, canonical_handler,
+                ):
+                    raise ValueError(
+                        "native Try selected handler disagrees with forked "
+                        f"control identity: route={route_row!r}"
+                    )
+                route_cell = book.latest_ref(
+                    SOURCE_EXCEPTION_STATUS_ROUTE, route_row,
+                )
+                if route_cell is None:
+                    raise ValueError(
+                        f"native Try route has no fact cell: {route_row!r}"
+                    )
+                matched = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(route_cell, edge["status"]),
+                )
+                self.emit(
+                    Handler.Eq,
+                    [edge["status"], self.constant_value(
+                        int(route_row[2]), edge["status"],
+                    )], matched,
+                    attributes={"source_exception_route_cell": route_cell},
+                )
+                match_block = self.new_block(
+                    "exception_route_match",
+                    also=(route_cell, route.selected_handler),
+                    owner=frame["owner"],
+                )
+                remainder = self.new_block(
+                    "exception_route_next", also=(route_cell,),
+                    owner=frame["owner"],
+                )
+                self.conditional_branch(matched, match_block, remainder)
+                self.current.instrs[-1].attributes[
+                    "source_exception_route_cell"
+                ] = route_cell
+                status_cell = book.latest_ref(
+                    SSA_VALUE, (self._scope(), int(edge["status"].id)),
+                )
+                predicate_cell = book.latest_ref(
+                    SSA_VALUE, (self._scope(), int(matched.id)),
+                )
+                match_cell = book.latest_ref(
+                    SSA_BLOCK,
+                    (self._scope(), self.function_name, match_block.name),
+                )
+                remainder_cell = book.latest_ref(
+                    SSA_BLOCK,
+                    (self._scope(), self.function_name, remainder.name),
+                )
+                if any(cell is None for cell in (
+                    status_cell, predicate_cell, match_cell, remainder_cell,
+                )):
+                    raise ValueError(
+                        f"native Try route lacks SSA cells: {route_row!r}"
+                    )
+                book.post(
+                    SOURCE_EXCEPTION_SSA_ROUTE,
+                    (self._scope(), edge["site"].row[1],
+                     edge["site"].row[2], int(route_row[2])),
+                    ExceptionSSARouteFact(
+                        checkpoint, route_cell, status_cell,
+                        predicate_cell, match_cell, remainder_cell,
+                        route.selected_handler,
+                    ),
+                    stage=self._stage(),
+                    provenance=Derived((
+                        checkpoint, route_cell, status_cell,
+                        predicate_cell, match_cell, remainder_cell,
+                        route.selected_handler,
+                    )),
+                    mode=Mode.CONCORD,
+                )
+                self.current = match_block
+                propagate(edge)
+                self.current = remainder
+            propagate(edge)
         self.current = normal
         # The status is taken on the exact protected edge and restored
         # before the existing fault exit. Until dispatch, joins and pending
@@ -12072,8 +12238,8 @@ class _ControlSSABuilder(TiledObject):
         # this Try is executable.
         self.shortfalls.append(SSALoweringShortfall(
             "control", "native_try_dispatch", path,
-            "authored Try has a source-owned status checkpoint but no "
-            "executable handler/finalizer dispatch",
+            "authored Try selects concorded status routes but has no "
+            "executable handler join or pending finalizer outcomes",
         ))
 
     def _lower(self, block: ControlBlock, *, path: str = "root") -> None:

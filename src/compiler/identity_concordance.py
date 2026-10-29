@@ -1558,6 +1558,7 @@ class CorrelationTable:
         found.extend(self._source_exception_region_site_findings(module))
         found.extend(self._source_exception_region_state_findings(module))
         found.extend(self._source_exception_ssa_checkpoint_findings(module))
+        found.extend(self._source_exception_ssa_route_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
         found.extend(self._source_exception_handler_arm_value_findings(module))
@@ -2595,6 +2596,131 @@ class CorrelationTable:
             if problem is not None:
                 found.append(Finding(
                     "source-exception-ssa-checkpoint-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_route_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """A native comparison selects its source route's exact handler."""
+        from .concordance_declarations import (
+            CONTROL_PREDICATE, SOURCE_EXCEPTION_REGION_SITE,
+            SOURCE_EXCEPTION_SSA_CHECKPOINT, SOURCE_EXCEPTION_SSA_ROUTE,
+            SOURCE_EXCEPTION_STATUS_ROUTE, SSA_BLOCK, SSA_VALUE,
+            ExceptionRegionSiteFact, ExceptionSSACheckpointFact,
+            ExceptionSSARouteFact, ExceptionStatusRouteFact, SSABlockKind,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_SSA_ROUTE.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_SSA_ROUTE)
+        routes = book.page(SOURCE_EXCEPTION_STATUS_ROUTE)
+        checkpoints = book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT)
+        for checkpoint_row in checkpoints.rows():
+            checkpoint = checkpoints.latest(checkpoint_row)
+            if not isinstance(checkpoint, ExceptionSSACheckpointFact):
+                continue
+            site = book.page(SOURCE_EXCEPTION_REGION_SITE).latest(
+                checkpoint.region_site.row
+            )
+            if not isinstance(site, ExceptionRegionSiteFact):
+                continue
+            for route_row in routes.rows():
+                route = routes.latest(route_row)
+                if not isinstance(route, ExceptionStatusRouteFact) or (
+                    route.transfer != site.transfer
+                    or route.selected_handler is None
+                ):
+                    continue
+                expected_row = (*checkpoint_row, int(route_row[2]))
+                if page.latest(expected_row) is None:
+                    found.append(Finding(
+                        "source-exception-ssa-route-disagreement",
+                        str(expected_row), None,
+                        "selected source status has no SSA comparison",
+                    ))
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_ROUTE, row)
+            problem = None
+            if not isinstance(fact, ExceptionSSARouteFact):
+                problem = "native status route has no SSA fact"
+            elif not all(isinstance(cell, Ref) for cell in (
+                fact.checkpoint, fact.source_route, fact.status_value,
+                fact.predicate_value, fact.match_block,
+                fact.remainder_block, fact.selected_handler,
+            )):
+                problem = "native status route lacks exact cells"
+            elif (
+                fact.checkpoint.page != SOURCE_EXCEPTION_SSA_CHECKPOINT
+                or fact.checkpoint.row != row[:3]
+                or fact.source_route.page != SOURCE_EXCEPTION_STATUS_ROUTE
+                or int(fact.source_route.row[2]) != int(row[3])
+                or book.latest_ref(
+                    SOURCE_EXCEPTION_SSA_CHECKPOINT, fact.checkpoint.row,
+                ) != fact.checkpoint
+                or book.latest_ref(
+                    SOURCE_EXCEPTION_STATUS_ROUTE, fact.source_route.row,
+                ) != fact.source_route
+            ):
+                problem = "native status route disagrees with source row"
+            else:
+                checkpoint = checkpoints.latest(fact.checkpoint.row)
+                route = routes.latest(fact.source_route.row)
+                mint = book.mint_of(fact.predicate_value)
+                if (
+                    not isinstance(checkpoint, ExceptionSSACheckpointFact)
+                    or not isinstance(route, ExceptionStatusRouteFact)
+                    or fact.status_value != checkpoint.status_value
+                    or fact.selected_handler != route.selected_handler
+                    or fact.predicate_value.page != SSA_VALUE
+                    or fact.predicate_value.row[0] != row[0]
+                    or book.latest_ref(
+                        SSA_VALUE, fact.predicate_value.row,
+                    ) != fact.predicate_value
+                    or mint is None or mint[0] != CONTROL_PREDICATE
+                    or len(mint[1]) != 1
+                    or {
+                        cause for cause, _stage in book.edges_into(
+                            mint[1][0],
+                        )
+                    } != {fact.source_route, fact.status_value}
+                    or any(
+                        cell.page != SSA_BLOCK or cell.row[0] != row[0]
+                        or book.latest_ref(SSA_BLOCK, cell.row) != cell
+                        for cell in (fact.match_block, fact.remainder_block)
+                    )
+                    or book.page(SSA_BLOCK).latest(fact.match_block.row)
+                    is not SSABlockKind.EXCEPTION_ROUTE_MATCH
+                    or book.page(SSA_BLOCK).latest(fact.remainder_block.row)
+                    is not SSABlockKind.EXCEPTION_ROUTE_NEXT
+                ):
+                    problem = "native status route disagrees with handler or SSA"
+                elif any(
+                    source not in {
+                        cause for cause, _stage in book.edges_into(block)
+                    } for source, block in (
+                        (fact.source_route, fact.match_block),
+                        (fact.selected_handler, fact.match_block),
+                        (fact.source_route, fact.remainder_block),
+                    )
+                ):
+                    problem = "native route successor lacks source authority"
+                elif {
+                    cause for cause, _stage in book.edges_into(receipt)
+                } != {
+                    fact.checkpoint, fact.source_route, fact.status_value,
+                    fact.predicate_value, fact.match_block,
+                    fact.remainder_block, fact.selected_handler,
+                }:
+                    problem = "native route provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-ssa-route-disagreement",
                     str(row), None, problem,
                 ))
         return found

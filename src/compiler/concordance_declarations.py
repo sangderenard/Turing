@@ -1291,6 +1291,29 @@ SOURCE_EXCEPTION_SSA_CHECKPOINT = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSARouteFact:
+    """One native code comparison for a source-selected handler."""
+
+    checkpoint: Ref
+    source_route: Ref
+    status_value: Ref
+    predicate_value: Ref
+    match_block: Ref
+    remainder_block: Ref
+    selected_handler: Ref
+
+
+SOURCE_EXCEPTION_SSA_ROUTE = declare_page(
+    "source_exception_ssa_route", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("region", K.INDEX),
+        RowField("canonical_site", K.VALUE_ID),
+        RowField("status", K.INDEX),
+    ), ExceptionSSARouteFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionHandlerEntryFact:
     """Candidate failure edges and binding versions at one handler entry."""
 
@@ -3259,6 +3282,7 @@ class SSABlockKind(Enum):
     EXCEPTION_JOIN = "exception_join"
     EXCEPTION_HANDLER = "exception_handler"
     EXCEPTION_ROUTE_NEXT = "exception_route_next"
+    EXCEPTION_ROUTE_MATCH = "exception_route_match"
     EXCEPTION_UNMATCHED = "exception_unmatched"
     LOOP_HEADER = "loop_header"
     LOOP_BODY = "loop_body"

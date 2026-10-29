@@ -16,6 +16,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
     SOURCE_EXCEPTION_REGION_SITE,
     SOURCE_EXCEPTION_REGION_STATE,
+    SOURCE_EXCEPTION_SSA_ROUTE,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
     SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
@@ -166,6 +167,17 @@ def root(x: float) -> int:
             for instruction in block.instrs
         )
         assert CorrelationTable._source_exception_ssa_checkpoint_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        route_rows = tuple(book.page(SOURCE_EXCEPTION_SSA_ROUTE).rows())
+        nan_route_row, = tuple(
+            row for row in route_rows if row[3] == FLOAT_TO_INT_NAN
+        )
+        native_route = book.page(SOURCE_EXCEPTION_SSA_ROUTE).latest(
+            nan_route_row
+        )
+        assert native_route.selected_handler == nan_route.selected_handler
+        assert CorrelationTable._source_exception_ssa_route_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
     finally:
