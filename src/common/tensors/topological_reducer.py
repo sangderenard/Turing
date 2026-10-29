@@ -1036,25 +1036,6 @@ def specialize_python_precision_widths(graph: Any) -> bool:
                 for row in address_page.rows()
                 if address_page.latest(row) == int(authored_address)
             ), None)
-        # Program: ``def f(x): return g(x, 4)`` through ``compile_ast_aot``.
-        # Wrong record: the whole-module graph executes ``f``'s body and is
-        # refreshed after ``g``'s return shape is published, but it names no
-        # function, so its numeric scope -- the book-minted synthetic scope
-        # above -- had no source cell and the call was refused.  Rule: a
-        # synthetic graph is named by its ``scope_registry`` row; that row
-        # is its authored cell.
-        if (
-            authored_cell is None
-            and authored_address is None
-            and metadata.get("authored_function_identity") is None
-        ):
-            from ...compiler.concordance_declarations import (
-                SCOPE_REGISTRY as _SCOPE_REGISTRY,
-            )
-
-            authored_cell = specialization_book.latest_ref(
-                _SCOPE_REGISTRY, tuple(authored_scope),
-            )
         # The specialization is its authored function with some inputs
         # known: NOVEL from the authored function's address cell.
         if authored_cell is None:
