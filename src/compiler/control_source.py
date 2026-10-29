@@ -544,6 +544,10 @@ class NativeExceptionHandler(TiledObject):
     # The source graph identities of the exception class declarations.  A
     # bare except has no declarations and therefore an empty tuple.
     exception_type_value_ids: tuple[int, ...] = ()
+    # Resolved declarations for native status matching.  Each identity is
+    # derived from the corresponding source value, never from a handler's
+    # spelling or position.
+    exception_type_identities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -576,6 +580,43 @@ class ValidationBlock(TiledObject):
     # Exact source values consumed only by the authored exception diagnostic.
     # Native validation reports ``error_code`` and does not materialize them.
     diagnostic_value_ids: tuple[int, ...] = ()
+
+
+def validation_raise_identity(
+    graph: Any,
+    statement: ast.Raise,
+    node_for_expression: Callable[[ast.AST], int | None],
+) -> str | None:
+    """Read a raise constructor's resolved graph identity, not its spelling.
+
+    A program may define its own ``ValueError``.  That call has a
+    ``callee_ref`` and is not the builtin constructor even though the AST
+    spells the same name.  Only the graph's static builtin reference can
+    establish the exception class of the native validation status.
+    """
+
+    raised = statement.exc
+    if isinstance(raised, ast.Call):
+        node_id = node_for_expression(raised)
+        spelling = raised.func.id if isinstance(raised.func, ast.Name) else None
+    elif isinstance(raised, ast.Name):
+        node_id = node_for_expression(raised)
+        spelling = raised.id
+    else:
+        return None
+    if node_id is None or spelling is None or int(node_id) not in graph:
+        return None
+    attributes = graph.nodes[int(node_id)].get("attributes") or {}
+    if attributes.get("callee_ref") is not None:
+        return None
+    if attributes.get("static_python_reference") != spelling:
+        return None
+    import builtins
+
+    candidate = getattr(builtins, spelling, None)
+    if not isinstance(candidate, type) or not issubclass(candidate, BaseException):
+        return None
+    return f"builtins.{spelling}"
 
 
 def validation_diagnostic_value_ids(
@@ -1236,7 +1277,10 @@ def _describe_control_block(
             for value_id in handler.exception_type_value_ids
         )
         extra = tuple(
-            int(handler.source_handler_node_id)
+            (
+                int(handler.source_handler_node_id),
+                tuple(handler.exception_type_identities),
+            )
             for handler in block.handlers
         )
     elif isinstance(block, ValidationBlock):

@@ -1124,6 +1124,28 @@ SOURCE_CONTROL_SPECIALIZATION = declare_page(
         RowField("function", K.NAME), RowField("control", K.VALUE_ID),
     ), dict,                           # dict | Unresolved(PREDICATE_NOT_KNOWN)
 )
+
+# An exceptional transfer belongs to its exact source node and lexical read
+# scope.  Its fact carries the eligible catch scope and every finally scope
+# crossed on the way there; it is not inferred from line numbers or names.
+EXCEPTION_TOPOLOGY = declare_stage("exception_topology")
+
+
+@dataclass(frozen=True)
+class ExceptionTransferFact:
+    source: Ref
+    source_kind: str
+    catch_try: Ref | None
+    scopes: tuple[tuple[Ref, str, Ref | None, bool], ...]
+    unwind_finally: tuple[Ref, ...]
+
+
+SOURCE_EXCEPTION_TRANSFER = declare_page(
+    "source_exception_transfer", (
+        RowField("source_scope", K.SCOPE),
+        RowField("source_node", K.VALUE_ID),
+    ), ExceptionTransferFact,
+)
 STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
     "structural_specialization_fixed_point", (
         RowField("invocation", K.SCOPE), RowField("round", K.INDEX),
@@ -2967,6 +2989,10 @@ class SSABlockKind(Enum):
     RESOURCE_EXIT_NEXT = "resource_exit_next"
     VALIDATION_PASS = "validation_pass"
     VALIDATION_FAIL = "validation_fail"
+    VALIDATION_FAULT_EXIT = "validation_fault_exit"
+    NATIVE_TRY_HANDLER = "native_try_handler"
+    NATIVE_TRY_EXIT = "native_try_exit"
+    UNREACHABLE_RAISE = "unreachable_raise"
     STATE_CASE = "state_case"
     STATE_NEXT = "state_next"
     STATE_MERGE = "state_merge"

@@ -61,6 +61,29 @@ FLOAT_POW_OVERFLOW = 95
 #: ``math.pow`` overflow: ``OverflowError("math range error")``.
 FLOAT_MATH_RANGE = 96
 
+# An authored ``raise`` retains its source node id in the SSA validation
+# contract.  The native status ABI carries the exception class separately:
+# source node ids are local to functions and can collide with runtime fault
+# codes (the codec's ValueError raise was node 8).  These reserved codes are
+# class tags, not invented identities for the source raise sites.
+AUTHORED_RAISE_STATUSES = {
+    "builtins.RuntimeError": 0x7FFF0000,
+    "builtins.ValueError": 0x7FFF0001,
+    "builtins.TypeError": 0x7FFF0002,
+    "builtins.OverflowError": 0x7FFF0003,
+    "builtins.ZeroDivisionError": 0x7FFF0004,
+    "builtins.IndexError": 0x7FFF0005,
+    "builtins.KeyError": 0x7FFF0006,
+    "builtins.AssertionError": 0x7FFF0007,
+    "builtins.NotImplementedError": 0x7FFF0008,
+}
+
+
+def authored_raise_status(identity: str | None) -> int | None:
+    """Native class tag for an exact builtin exception declaration."""
+
+    return AUTHORED_RAISE_STATUSES.get(identity)
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -72,6 +95,22 @@ class NativeIntOverflow(RuntimeError, OverflowError):
 
 class NativeValueError(RuntimeError, ValueError):
     """``ValueError`` raised from a native validation code."""
+
+
+class NativeTypeError(RuntimeError, TypeError):
+    """``TypeError`` raised from an authored native raise."""
+
+
+class NativeOverflowError(RuntimeError, OverflowError):
+    """``OverflowError`` raised from an authored native raise."""
+
+
+class NativeAssertionError(RuntimeError, AssertionError):
+    """``AssertionError`` raised from an authored native raise."""
+
+
+class NativeNotImplementedError(NotImplementedError):
+    """``NotImplementedError`` raised from an authored native raise."""
 
 
 class NativeZeroDivisionError(RuntimeError, ZeroDivisionError):
@@ -103,6 +142,20 @@ class NativeKeyError(RuntimeError, KeyError):
 
 def validation_fault(code: int, runtime_message: str) -> RuntimeError:
     """The exception for one recorded validation code."""
+
+    authored = {
+        AUTHORED_RAISE_STATUSES["builtins.RuntimeError"]: RuntimeError,
+        AUTHORED_RAISE_STATUSES["builtins.ValueError"]: NativeValueError,
+        AUTHORED_RAISE_STATUSES["builtins.TypeError"]: NativeTypeError,
+        AUTHORED_RAISE_STATUSES["builtins.OverflowError"]: NativeOverflowError,
+        AUTHORED_RAISE_STATUSES["builtins.ZeroDivisionError"]: NativeZeroDivisionError,
+        AUTHORED_RAISE_STATUSES["builtins.IndexError"]: NativeIndexError,
+        AUTHORED_RAISE_STATUSES["builtins.KeyError"]: NativeKeyError,
+        AUTHORED_RAISE_STATUSES["builtins.AssertionError"]: NativeAssertionError,
+        AUTHORED_RAISE_STATUSES["builtins.NotImplementedError"]: NativeNotImplementedError,
+    }.get(int(code))
+    if authored is not None:
+        return authored(runtime_message)
 
     if int(code) == LIST_INDEX_OUT_OF_RANGE:
         return NativeIndexError(f"list index out of range ({runtime_message})")

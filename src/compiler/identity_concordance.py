@@ -1552,6 +1552,7 @@ class CorrelationTable:
         found.extend(self._name_binding_capture_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_page_declaration_findings(module))
+        found.extend(self._source_exception_transfer_findings(module))
         found.extend(self._graph_work_publication_findings(module))
         found.extend(self._tile_storage_findings(module))
         found.extend(self._source_field_identity_findings(module))
@@ -1918,6 +1919,57 @@ class CorrelationTable:
                 found.append(Finding(
                     "value-type-tag-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_transfer_findings(module: Any) -> list[Finding]:
+        """Audit catch and finally edges against their retained scope stack.
+
+        A handler is outside its own try's catch scope.  The nearest body
+        scope alone can catch a transfer, and every skipped finalizer must
+        appear on the edge in inner-to-outer order.
+        """
+
+        from .concordance_declarations import SOURCE_EXCEPTION_TRANSFER
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_TRANSFER.name not in book.pages:
+            return []
+        page = book.page(SOURCE_EXCEPTION_TRANSFER)
+        found: list[Finding] = []
+        for row in page.rows():
+            fact = page.latest(row)
+            if fact is None:
+                continue
+            scopes = tuple(fact.scopes)
+            catch_index = next((
+                index for index in range(len(scopes) - 1, -1, -1)
+                if scopes[index][1] == "body"
+            ), None)
+            expected_catch = (
+                None if catch_index is None else scopes[catch_index][0]
+            )
+            crossed = scopes if catch_index is None else scopes[catch_index + 1:]
+            expected_finalizers = tuple(dict.fromkeys(
+                owner for owner, arm, _handler, has_finally
+                in reversed(crossed)
+                if has_finally and arm != "finalbody"
+            ))
+            if (fact.catch_try != expected_catch
+                    or tuple(fact.unwind_finally) != expected_finalizers):
+                found.append(Finding(
+                    "source-exception-transfer-disagreement", str(row[0]),
+                    int(row[1]),
+                    f"catch={fact.catch_try!r}, expected={expected_catch!r}; "
+                    f"finally={fact.unwind_finally!r}, "
+                    f"expected={expected_finalizers!r}",
+                ))
+            if fact.source.row[1] != int(row[1]):
+                found.append(Finding(
+                    "source-exception-transfer-source-disagreement",
+                    str(row[0]), int(row[1]),
+                    f"source cell {fact.source!r} names another node",
                 ))
         return found
 

@@ -157,6 +157,7 @@ from .control_source import (
     ExternalReferenceCallBlock,
     LoopControlBlock,
     LoopBlock,
+    NativeTryBlock,
     ParallelDeployment,
     SequenceBlock,
     SequenceMutationBlock,
@@ -2177,6 +2178,16 @@ def register_sequence_lowering(
     return registered, unposted
 
 
+@dataclass
+class _NativeTryFrame:
+    """One active source Try and the SSA entries of its handler arms."""
+
+    block: NativeTryBlock
+    owner: Ref | None
+    handler_entries: tuple[BasicBlock, ...]
+    phase: str = "body"
+
+
 class _ControlSSABuilder(TiledObject):
     __live_storage_root__ = True
 
@@ -2407,6 +2418,7 @@ class _ControlSSABuilder(TiledObject):
         # ``_finish_fault_exits``.
         self._index_fault_blocks: list[tuple[BasicBlock, BasicBlock]] = []
         self._fault_exit: BasicBlock | None = None
+        self.native_try_frames: list[_NativeTryFrame] = []
         self.named_output_histories = {
             str(name): tuple(map(int, history))
             for name, history in (named_output_histories or {}).items()
@@ -10254,6 +10266,105 @@ class _ControlSSABuilder(TiledObject):
             self._function_exit = self.new_block("function_exit")
         return self._function_exit
 
+    def _native_raise_handler(
+        self, block: ValidationBlock, *, path: str,
+    ) -> tuple[BasicBlock, int, Ref] | None:
+        """Find the authored handler edge for a source Raise, if it has one.
+
+        The source exception-transfer row owns containment.  In particular,
+        a Raise in an except suite has a handler scope but that same Try is
+        not eligible to catch it.  A missing row while a Try is active is a
+        lowering shortfall, never permission to guess from nesting.
+        """
+
+        if not self.native_try_frames:
+            return None
+        from .concordance_declarations import (
+            CANONICAL_VALUE, SOURCE_EXCEPTION_TRANSFER,
+        )
+        from .native_faults import authored_raise_status
+        import builtins
+
+        if self.lexical_read_scope is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "raise", path,
+                "native Try has no source exception-transfer scope",
+            ))
+            return None
+        book = self._book()
+        row = (self.lexical_read_scope, int(block.error_code))
+        transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+        transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+        if transfer is None or transfer_cell is None or transfer.source_kind != "raise":
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "raise", path,
+                f"source raise {block.error_code} has no exact exception edge",
+            ))
+            return None
+        if transfer.unwind_finally:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "raise", path,
+                "native raise crosses a finally arm without a lowered "
+                f"finalizer edge: {transfer.unwind_finally!r}",
+            ))
+            return None
+        target = transfer.catch_try
+        if target is None:
+            return None
+        active = next((
+            index for index in range(len(self.native_try_frames) - 1, -1, -1)
+            if self.native_try_frames[index].owner == target
+        ), None)
+        if active is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "raise", path,
+                f"source exception target {target!r} has no active native Try",
+            ))
+            return None
+        raised_name = str(block.extraction_identity or "")
+        if authored_raise_status(raised_name) is None:
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "raise", path,
+                f"source raise has no resolved native exception class: {raised_name!r}",
+            ))
+            return None
+        raised_class = getattr(builtins, raised_name.removeprefix("builtins."))
+        for frame in reversed(self.native_try_frames[:active + 1]):
+            if frame.phase != "body":
+                continue
+            for index, handler in enumerate(frame.block.handlers):
+                if not handler.exception_type_value_ids and not handler.exception_type_identities:
+                    return frame.handler_entries[index], int(handler.source_handler_node_id), transfer_cell
+                if len(handler.exception_type_value_ids) != len(handler.exception_type_identities):
+                    self.shortfalls.append(SSALoweringShortfall(
+                        "control", "raise", path,
+                        f"handler {handler.source_handler_node_id} lacks exact exception declarations",
+                    ))
+                    return None
+                for identity in handler.exception_type_identities:
+                    if not str(identity).startswith("builtins."):
+                        self.shortfalls.append(SSALoweringShortfall(
+                            "control", "raise", path,
+                            f"handler class {identity!r} has no native match rule",
+                        ))
+                        return None
+                    candidate = getattr(builtins, str(identity).removeprefix("builtins."), None)
+                    if not isinstance(candidate, type) or not issubclass(candidate, BaseException):
+                        self.shortfalls.append(SSALoweringShortfall(
+                            "control", "raise", path,
+                            f"handler class {identity!r} is not an exception declaration",
+                        ))
+                        return None
+                    if issubclass(raised_class, candidate):
+                        return frame.handler_entries[index], int(handler.source_handler_node_id), transfer_cell
+            if frame.block.finalbody != SequenceBlock(()) and frame.owner != target:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "raise", path,
+                    "unmatched exception crosses a finalbody with no SSA edge",
+                ))
+                return None
+        return None
+
     def _carried_run_class(
         self, initial: SSAValue, updated_id: int, carried_dtype: Any,
     ) -> tuple[SSAValue, str | None]:
@@ -11962,6 +12073,57 @@ class _ControlSSABuilder(TiledObject):
             for index, operation in enumerate(block.cleanup):
                 self.lower(operation, path=f"{path}.resource_cleanup[{index}]")
             return
+        if isinstance(block, NativeTryBlock):
+            from .concordance_declarations import CANONICAL_VALUE
+
+            owner = (
+                None if self.lexical_read_scope is None else
+                self._book().latest_ref(
+                    CANONICAL_VALUE,
+                    (self.lexical_read_scope, int(block.source_try_node_id)),
+                )
+            )
+            if owner is None:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-try", path,
+                    f"Try {block.source_try_node_id} has no exact source cell",
+                ))
+            if _flatten_control_sequence(block.finalbody):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "native-try", path,
+                    f"Try {block.source_try_node_id} has a finalbody whose "
+                    "exceptional SSA edge is not lowered",
+                ))
+            handlers = tuple(
+                self.new_block("native_try_handler")
+                for _ in block.handlers
+            )
+            exit_block = self.new_block("native_try_exit")
+            frame = _NativeTryFrame(block, owner, handlers)
+            self.native_try_frames.append(frame)
+            try:
+                self.lower(block.body, path=f"{path}.try_body")
+                frame.phase = "orelse"
+                if block.orelse is not None:
+                    self.lower(block.orelse, path=f"{path}.try_orelse")
+                self.lower(block.finalbody, path=f"{path}.try_finalbody")
+                self.branch(exit_block)
+                for index, handler in enumerate(block.handlers):
+                    self.current = handlers[index]
+                    frame.phase = "handler"
+                    self.lower(
+                        handler.body,
+                        path=f"{path}.handler[{index}]",
+                    )
+                    self.lower(
+                        block.finalbody,
+                        path=f"{path}.handler[{index}].finalbody",
+                    )
+                    self.branch(exit_block)
+            finally:
+                self.native_try_frames.pop()
+            self.current = exit_block
+            return
         if isinstance(block, LoopControlBlock) and block.action == "return":
             # Program: ``validate_batch_envelope``'s ``if not
             # isinstance(offset, int) or isinstance(offset, bool): return 1,
@@ -12358,9 +12520,31 @@ class _ControlSSABuilder(TiledObject):
                 self.current = passed
             return
         if isinstance(block, ValidationBlock):
+            from .native_faults import (
+                AUTHORED_RAISE_STATUSES, authored_raise_status,
+            )
+
+            native_status = authored_raise_status(block.extraction_identity)
+            if block.extraction_identity is not None and native_status is None:
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "raise", path,
+                    "native raise has no status class for "
+                    f"{block.extraction_identity}",
+                ))
+                return
+            if native_status is None and int(block.error_code) in (
+                AUTHORED_RAISE_STATUSES.values()
+            ):
+                self.shortfalls.append(SSALoweringShortfall(
+                    "control", "raise", path,
+                    "source validation code collides with native authored "
+                    f"exception class status {block.error_code}",
+                ))
+                return
             self.validation_contracts.append({
                 "predicate_value_id": int(block.predicate_value_id),
                 "error_code": int(block.error_code),
+                "native_status": int(native_status or block.error_code),
                 "expect_true": bool(block.expect_true),
                 "predicate_expression": _control_expression_mapping(
                     block.predicate_expression
@@ -12382,16 +12566,34 @@ class _ControlSSABuilder(TiledObject):
             else:
                 self.conditional_branch(predicate, failed, passed)
             self.current = failed
+            handler_edge = self._native_raise_handler(block, path=path)
+            if handler_edge is not None:
+                destination, handler_id, transfer_cell = handler_edge
+                self.branch(destination)
+                self.current.instrs[-1].attributes.update({
+                    "source_control": "raise",
+                    "source_raise_node_id": int(block.error_code),
+                    "source_handler_node_id": int(handler_id),
+                    "exception_transfer_cell": transfer_cell,
+                })
+                self.current = passed
+                return
             self.emit(
-                Handler.Call,
-                [],
-                attributes={
+                Handler.Call, [], attributes={
                     "callee": "turing_validation_error",
-                    "error_code": int(block.error_code),
+                    "error_code": int(native_status or block.error_code),
+                    "source_raise_node_id": int(block.error_code),
                     "extraction_identity": block.extraction_identity,
                 },
             )
-            self.branch(passed)
+            # An authored raise terminates this path.  Continuing through
+            # the validation's success block after recording the error let
+            # later loop iterations and writes execute after the raise.
+            # Share the existing non-returning fault exit used by checked
+            # sequence accesses; the shell consumes the recorded status.
+            if self._fault_exit is None:
+                self._fault_exit = self.new_block("validation_fault_exit")
+            self.branch(self._fault_exit)
             self.current = passed
             return
         if isinstance(block, SequenceMutationBlock):

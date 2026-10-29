@@ -77,6 +77,7 @@ from .control_source import (
     place_validations_after_region_producers,
     project_control_regions,
     validation_diagnostic_value_ids,
+    validation_raise_identity,
 )
 from .hierarchical_control import compose_hierarchical_control
 from .process_graph_value_ids import next_process_value_id
@@ -795,12 +796,6 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             raise ValueError(
                 "terminal function raise has no exact source node"
             )
-        raised = direct_raise.exc
-        raised_name = (
-            raised.func.id
-            if isinstance(raised, ast.Call) and isinstance(raised.func, ast.Name)
-            else raised.id if isinstance(raised, ast.Name) else None
-        )
         blocks.append(ValidationBlock(
             int(raise_id),
             int(raise_id),
@@ -808,8 +803,8 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             predicate_expression=ControlExpression(
                 "const", value_id=int(raise_id), literal=False,
             ),
-            extraction_identity=(
-                f"builtins.{raised_name}" if raised_name else None
+            extraction_identity=validation_raise_identity(
+                graph, direct_raise, node_for_expression,
             ),
             diagnostic_value_ids=validation_diagnostic_value_ids(
                 direct_raise, node_for_expression,
@@ -888,19 +883,13 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             ), predicate_id)
         elif predicate_expression is None:
             continue
-        raised = raised_statement.exc
-        raised_name = (
-            raised.func.id
-            if isinstance(raised, ast.Call) and isinstance(raised.func, ast.Name)
-            else raised.id if isinstance(raised, ast.Name) else None
-        )
         blocks.append(ValidationBlock(
             predicate_id,
             int(node_id),
             expect_true=not raises_when_true,
             predicate_expression=predicate_expression,
-            extraction_identity=(
-                f"builtins.{raised_name}" if raised_name else None
+            extraction_identity=validation_raise_identity(
+                graph, raised_statement, node_for_expression,
             ),
             diagnostic_value_ids=validation_diagnostic_value_ids(
                 raised_statement, node_for_expression,
@@ -11704,6 +11693,16 @@ def _retain_source_control_records(graph_obj: Any) -> None:
         }
     if records:
         graph_obj.graph["source_control_records"] = records
+    if any(
+        isinstance(record["expression"], ast.Try)
+        for record in records.values()
+    ):
+        # The Try node's ordinary value edges cannot say which catch scope a
+        # nested raise may enter.  Post that authored control topology while
+        # the exact AST and source graph nodes are both still available.
+        from .exception_topology import build_exception_topology
+
+        build_exception_topology(graph_obj)
 
 
 def _retain_source_sequence_mutation_records(
@@ -26177,21 +26176,27 @@ def _tensor_descriptor_rule(
             # successive callsite specializations.  Requiring an explicit
             # shape silently lost scalar type/non-None facts at the first call
             # edge (dt_init -> ref_dt -> ref).
-            tensor = {
-                "shape": tuple(
-                    int(extent) for extent in (boundary.get("shape") or ())
-                ),
-                "dtype": _recorded_dtype(
-                    boundary.get("dtype"), "ProgramABI boundary",
-                    data.get("value_id", node_id),
-                ),
-            }
+            # The octet codec's validate() passes self.codes to
+            # _require_tensor(value), which returns that same Input. Its
+            # callsite descriptor says shape=(), rank=1, dynamic; copying
+            # only shape and dtype made the returned value rank 0 and sent
+            # call-result specialization around a repeated-state cycle.
+            # Keep the complete boundary descriptor as this value's one
+            # record; an empty shape does not erase a runtime span's rank.
+            tensor = dict(boundary)
+            tensor["shape"] = tuple(
+                int(extent) for extent in (boundary.get("shape") or ())
+            )
+            tensor["dtype"] = _recorded_dtype(
+                boundary.get("dtype"), "ProgramABI boundary",
+                data.get("value_id", node_id),
+            )
+            if tensor.get("rank") is None:
+                tensor["rank"] = len(tensor["shape"])
             # The declared Python type travels with the descriptor.  A
             # callee re-deriving the type from the dtype alone turned a
             # declared ``builtins.NoneType`` scalar into ``builtins.int``
             # and folded ``distribution is not None`` the wrong way.
-            if boundary.get("python_type"):
-                tensor["python_type"] = str(boundary["python_type"])
         if "shape" not in tensor:
             # Program: ``sum(i * k for i in range(6))`` with ``k: int``.
             # Wrong record: an Input with no planner/ProgramABI boundary had

@@ -36,6 +36,7 @@ from .control_source import (
     ValidationBlock,
     WhileBlock,
     validation_diagnostic_value_ids,
+    validation_raise_identity,
 )
 from .loop_ir import (
     ConditionDomain,
@@ -5733,6 +5734,27 @@ def analyze_shader_loop_reductions(
             validated_raise_signatures.update(
                 expression_signature(item) for item in raise_items
             )
+        # A direct, unconditional raise is an exit of this loop body, just
+        # as a direct guard whose raising arm is selected is an exit.  The
+        # source statement owns the position; a raise inside a Try handler
+        # does not belong to this rule because its handler owns execution.
+        # The codec's handler raise must therefore retain its Try owner.
+        if isinstance(loop_syntax, (ast.For, ast.While)):
+            for statement in loop_syntax.body:
+                if not isinstance(statement, ast.Raise):
+                    continue
+                raise_node_id = node_for_expression(statement)
+                if raise_node_id is None:
+                    continue
+                validations.append((
+                    int(raise_node_id), int(raise_node_id), True,
+                    validation_diagnostic_value_ids(
+                        statement, node_for_expression,
+                    ),
+                ))
+                validated_raise_signatures.add(
+                    expression_signature(statement)
+                )
         def earliest_member(index: int) -> int:
             return min(
                 lexical_position[node_id]
@@ -6429,7 +6451,7 @@ def analyze_shader_loop_reductions(
         # as region-less and dropped with its authored return; the function
         # always fell through (silent 0 for 70 in a dict-of-lists ``.get``
         # read).  Rule: a source ``return`` edge is loop work too.
-        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings and not loop.return_controls:
+        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings and not loop.return_controls and not validations:
             blockers.append("no-shader-region")
         if (
             loop.source_type == "While"
@@ -6688,19 +6710,23 @@ def analyze_shader_loop_reductions(
             node_id, predicate_value_id, expect_true, diagnostic_value_ids,
         ):
             expression = graph.G.nodes[node_id].get("expr_obj")
+            predicate_expression = (
+                ControlExpression(
+                    "const", value_id=int(node_id), literal=False,
+                )
+                if int(node_id) == int(predicate_value_id)
+                and isinstance(expression, ast.Raise)
+                else structured_control_expression(predicate_value_id)
+            )
             return ValidationBlock(
                 predicate_value_id,
                 error_code=node_id,
                 expect_true=expect_true,
-                predicate_expression=structured_control_expression(
-                    predicate_value_id
-                ),
+                predicate_expression=predicate_expression,
                 extraction_identity=(
-                    f"builtins.{expression.exc.func.id}"
-                    if isinstance(expression, ast.Raise)
-                    and isinstance(expression.exc, ast.Call)
-                    and isinstance(expression.exc.func, ast.Name)
-                    else None
+                    validation_raise_identity(
+                        graph.G, expression, node_for_expression,
+                    ) if isinstance(expression, ast.Raise) else None
                 ),
                 diagnostic_value_ids=diagnostic_value_ids,
             )
@@ -6722,27 +6748,10 @@ def analyze_shader_loop_reductions(
                 handed[int(item[0])] = validation_block(*item)
             graph.G.graph["arm_nested_loop_validations"] = handed
         body_items.extend(
-            (
-                lexical_position[node_id],
-                ValidationBlock(
-                    predicate_value_id,
-                    error_code=node_id,
-                    expect_true=expect_true,
-                    predicate_expression=structured_control_expression(
-                        predicate_value_id
-                    ),
-                    extraction_identity=(
-                        f"builtins.{expression.exc.func.id}"
-                        if isinstance((expression := graph.G.nodes[node_id].get(
-                            "expr_obj"
-                        )), ast.Raise)
-                        and isinstance(expression.exc, ast.Call)
-                        and isinstance(expression.exc.func, ast.Name)
-                        else None
-                    ),
-                    diagnostic_value_ids=diagnostic_value_ids,
-                ),
-            )
+            (lexical_position[node_id], validation_block(
+                node_id, predicate_value_id, expect_true,
+                diagnostic_value_ids,
+            ))
             for (
                 node_id, predicate_value_id, expect_true,
                 diagnostic_value_ids,
