@@ -1,0 +1,3 @@
+2026-10-29 Precision construction width (MEASURED, tests/test_rational_compiler.py::test_precision_width_is_concorded_per_exact_specialization):
+- Fixed: the class-construction row added for `v = V()` (string core) also posted `Precision(parts, limbs)` as ('Precision', 1). The precision specialization then disagreed with ('Precision', 2) and refused. A Precision construction's width is its `limbs` argument, so the precision specialization owns that row; the construction row now skips classes that have the precision feature.
+- Still open on the complex-rational-precision tests: `Precision.term(k)` (a limb read) has no compiled meaning, so `_rebalanced`'s `shift` and the `_exp(value)` actual downstream of it carry no type at the call edge.

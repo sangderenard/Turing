@@ -495,6 +495,372 @@ def reduce_integer_pow(functions) -> dict:
     return counts
 
 
+#: The scalar float64 transcendental SSA ops the signal cores route, by the
+#: name the planner leaves on them: ``hierarchical_plan``'s
+#: ``TENSOR_OPERATION_SCALAR_SPELLING`` respells ``exp``/``log``/``pow`` to
+#: ``Exp``/``Log``/``Pow``; every other ``math`` name keeps its lowercase
+#: tensor-vocabulary spelling.  ``Sqrt`` is not here: IEEE square root is
+#: correctly rounded in every backend and stays native.
+TRANSCENDENTAL_OPS = frozenset({
+    "Exp", "Log", "Pow",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh",
+})
+
+
+@dataclasses.dataclass(frozen=True)
+class SignalCoreRoute:
+    """One row of ``TRANSCENDENTAL_SIGNAL_CORES``: how an op reaches its core.
+
+    ``method`` names a ``WideExpansionEmitter`` method, called as
+    ``method(*leading, *operands, **dict(keywords))`` with the op's float64
+    operands, or is a function ``method(emitter, instruction)`` for a core
+    that reads the op's own record (``Pow``'s operator/``math.pow`` form).
+    The cores answer in three shapes, and the pass reads each one:
+
+    * an expansion (a list of limbs, high first) -- collapsed to one double;
+    * ``(value, faults)`` -- ``value`` a double or an expansion, ``faults``
+      a sequence of ``(predicate, code, name)`` rows: a ``bool`` SSA value
+      true exactly where Python raises, the ``native_faults`` code it
+      reports, and the failure's name;
+    * ``(value, predicate)`` -- one bare ``bool`` predicate, reported as
+      this row's ``fault`` (a ``(code, name)`` pair).
+
+    A predicate of ``None`` is a fault the core proves cannot happen.
+    """
+
+    method: object
+    leading: tuple = ()
+    keywords: tuple = ()
+    fault: tuple | None = None
+
+
+def _exp_signal_core(emitter, instruction):
+    """``math.exp``: the full-range core, plus Python's ``OverflowError``.
+
+    The predicate is read from the limbs the core returned
+    (``exp_overflow_predicate``), so the fault and the value agree at the
+    last finite binade (709.782712893384 finite, 709.7827128933841 raises).
+    """
+
+    from .native_faults import FLOAT_MATH_RANGE
+
+    source = emitter.expanded(instruction.args[0], 2)
+    result = emitter.exp_expansion(source, 2)
+    return result, ((
+        emitter.exp_overflow_predicate(source, result),
+        FLOAT_MATH_RANGE, "math_exp_overflow",
+    ),)
+
+
+def _log_signal_core(emitter, instruction):
+    """``math.log``: the full-range core; ``x <= 0`` raises ``ValueError``."""
+
+    from .native_faults import FLOAT_MATH_DOMAIN
+
+    source = emitter.expanded(instruction.args[0], 2)
+    return emitter.log_expansion(source, 2), ((
+        emitter.log_domain_predicate(source),
+        FLOAT_MATH_DOMAIN, "math_log_domain",
+    ),)
+
+
+def _pow_signal_core(emitter, instruction):
+    """``x ** y`` or ``math.pow(x, y)``, by the record that wrote the op.
+
+    The planner spells both ``Pow``; Python faults them differently
+    (``0.0 ** -1`` is ``ZeroDivisionError``, ``math.pow(0.0, -1)`` is
+    ``ValueError``), and ``pow_expansion`` returns the rows for the form it
+    is told.  The extraction contract names ``math.pow`` on the call; the
+    operator carries ``source_type`` ``BinOp``.  Neither is a refusal by
+    name rather than a guessed form.
+    """
+
+    attributes = instruction.attributes or {}
+    contract = attributes.get("extraction_contract") or {}
+    identity = (
+        contract.get("identity") if isinstance(contract, Mapping) else None
+    )
+    if identity == "math.pow":
+        form = "math"
+    elif attributes.get("source_type") == "BinOp":
+        form = "operator"
+    else:
+        raise ValueError(
+            "float Pow carries neither a math.pow extraction contract nor "
+            f"an operator source_type ({dict(attributes)!r}); its Python "
+            "faults cannot be chosen"
+        )
+    return emitter.pow_expansion(*instruction.args, 2, form=form)
+
+
+def _circular_route(name: str) -> SignalCoreRoute:
+    from .native_faults import FLOAT_MATH_DOMAIN
+
+    # sin/cos/tan(+-inf): Python raises ValueError('math domain error').
+    return SignalCoreRoute(
+        "circular_double", (name,),
+        fault=(FLOAT_MATH_DOMAIN, f"math_{name}_infinite"),
+    )
+
+
+#: SSA op -> its signal core, for ``transcendentals: signal_cores``.  Every
+#: other op in ``TRANSCENDENTAL_OPS`` (``asin``, ``acos``, ``sinh``,
+#: ``cosh``) has no core yet and is refused by name under that policy.
+#: c22, c913-c915 and c925 hold these on C, LLVM and Fortran.
+TRANSCENDENTAL_SIGNAL_CORES: dict[str, SignalCoreRoute] = {
+    "Exp": SignalCoreRoute(_exp_signal_core),
+    "Log": SignalCoreRoute(_log_signal_core),
+    "Pow": SignalCoreRoute(_pow_signal_core),
+    "sin": _circular_route("sin"),
+    "cos": _circular_route("cos"),
+    "tan": _circular_route("tan"),
+    "atan": SignalCoreRoute("atan_expansion"),
+    "atan2": SignalCoreRoute("atan2_expansion"),
+    "tanh": SignalCoreRoute("tanh_expansion"),
+}
+
+_TRANSCENDENTAL_FLOAT64 = frozenset({"float64", "float", "double", "f64"})
+
+
+def _scalar_float64(value) -> bool:
+    return (
+        value is not None
+        and str(value.dtype or "").casefold() in _TRANSCENDENTAL_FLOAT64
+        and not tuple(value.shape or ())
+    )
+
+
+def lower_transcendentals_to_signal_cores(functions, *, mode=None) -> dict:
+    """Route scalar float64 ``math`` transcendentals through the signal cores.
+
+    Program: any ``math.exp``/``math.log``/``math.sin``/... on a float.
+    Wrong record: each backend spelled the op through its own table -- C
+    libm, ``llvm.*`` intrinsics (``atan``/``asin`` refused), Fortran
+    intrinsics and a 1e-6 sine LUT -- so the native value depended on the
+    host library, not on the repository.  Rule: the numeric contract's
+    ``transcendentals`` (``ssa_call_input_adapters.transcendental_policy``)
+    names the route; ``signal_cores`` rewrites each op that has a row in
+    ``TRANSCENDENTAL_SIGNAL_CORES`` into that ``WideExpansionEmitter``
+    method's instructions, in place, so C, LLVM and Fortran all compile the
+    same exact primitive ops (Add/Sub/Mul/Div/Fma/Floor/compare/Select).
+
+    Python's raising outcomes are named faults: each predicate the core
+    returns is guarded with ``CondBr`` to a ``turing_validation_error``
+    block, as ``reduce_integer_pow`` guards its own.  A scalar
+    transcendental with no core is refused by name: under ``signal_cores``
+    it is never left on host math.
+
+    ``backend_intrinsic`` (the ``compute`` mode) rewrites nothing: each
+    backend spells the op with its own math library (C libm, ``llvm.*`` or
+    libm calls, gfortran intrinsics).  The receipt names those ops
+    (``left_native``).
+    """
+
+    from .concordance_declarations import (
+        PRECISION_IDENTITIES, SSA_BLOCK, SSABlockKind,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .ssa_call_input_adapters import transcendental_policy
+    from .ssa_record_return_state import function_scope_of, identity_cells
+    from ..transmogrifier.ssa import BasicBlock
+
+    policy = transcendental_policy(mode)
+    receipt = {"policy": policy, "lowered": {}, "left_native": {}}
+    flavor = active_two_product_flavor()
+
+    def scalar(instruction) -> bool:
+        return (
+            str(instruction.op) in TRANSCENDENTAL_OPS
+            and _scalar_float64(instruction.res)
+            and bool(instruction.args)
+            and all(_scalar_float64(value) for value in instruction.args)
+        )
+
+    def routed(instruction) -> bool:
+        if policy != "signal_cores" or not scalar(instruction):
+            return False
+        if str(instruction.op) not in TRANSCENDENTAL_SIGNAL_CORES:
+            raise ValueError(
+                f"scalar float {instruction.op} has no signal core; the "
+                "numeric contract's transcendentals is 'signal_cores', "
+                "which never leaves a math function on the host library "
+                "(numeric mode 'compute' selects backend_intrinsic)"
+            )
+        return True
+
+    def rewrite(function, block_name: str, index: int) -> None:
+        block = function.blocks[block_name]
+        call = block.instrs[index]
+        op = str(call.op)
+        row = TRANSCENDENTAL_SIGNAL_CORES[op]
+        method = row.method
+        post = block.instrs[index + 1:]
+        old_successors = list(block.successors)
+        emitted: list = []
+        emitter = WideExpansionEmitter(
+            function, emitted, two_product_flavor=flavor,
+        )
+        answer = (
+            method(emitter, call) if callable(method)
+            else getattr(emitter, method)(
+                *row.leading, *call.args, **dict(row.keywords)
+            )
+        )
+        faults = ()
+        if isinstance(answer, tuple):
+            answer, faults = answer
+        if not isinstance(answer, (SSAValue, list, tuple)):
+            raise ValueError(
+                f"signal core {method!r} for {op} answered {answer!r}; "
+                "expected a double, an expansion, or (value, faults)"
+            )
+        # An expansion is renormalised (|low| <= ulp(high)/2), so one
+        # rounded add of its two leading limbs is its correctly rounded
+        # double.
+        result = (
+            emitter.lead(list(answer)) if isinstance(answer, (list, tuple))
+            else answer
+        )
+        if isinstance(faults, SSAValue):
+            if row.fault is None:
+                raise ValueError(
+                    f"signal core {method!r} for {op} returned a fault "
+                    "predicate and its route names no fault code for it"
+                )
+            faults = ((faults, *row.fault),)
+        faults = [
+            (predicate, int(code), str(name))
+            for predicate, code, name in faults
+            if predicate is not None
+        ]
+        producer = next(
+            (
+                instruction for instruction in emitted
+                if instruction.res is not None
+                and int(instruction.res.id) == int(result.id)
+            ),
+            None,
+        )
+        if producer is None:
+            raise ValueError(
+                f"signal core {method!r} for {op} returned a value it did "
+                "not compute; the rewrite has no instruction to bind the "
+                "op's result to"
+            )
+        # The op's own result id becomes the core's final value, so every
+        # reader of the op reads the collapsed signal-core double.
+        producer.res = call.res
+
+        def bound(value):
+            return call.res if int(value.id) == int(result.id) else value
+
+        for instruction in emitted:
+            instruction.args = [bound(value) for value in instruction.args]
+            instruction.attributes["lowered_from"] = f"signal_core.{op}"
+        faults = [
+            (bound(predicate), code, name)
+            for predicate, code, name in faults
+        ]
+        block.instrs = block.instrs[:index] + emitted
+        added: list[BasicBlock] = []
+        taken = set(function.blocks)
+        current = block
+
+        def new_block(stem: str, kind) -> BasicBlock:
+            serial = 0
+            name = f"{block_name}.{stem}"
+            while name in taken:
+                serial += 1
+                name = f"{block_name}.{stem}.{serial}"
+            taken.add(name)
+            created = BasicBlock(name)
+            added.append(created)
+            # The block's ``ssa_block`` row, from the op it spells.
+            owners = identity_cells(function, call.res, *call.args)
+            book = current_identity_book()
+            row = (function_scope_of(function), str(function.name), name)
+            if owners and book.latest_ref(SSA_BLOCK, row) is None:
+                book.post(
+                    SSA_BLOCK, row, kind, stage=PRECISION_IDENTITIES,
+                    provenance=Derived(owners), mode=Mode.CONCORD,
+                )
+            return created
+
+        for predicate, code, name in faults:
+            fault = new_block("math_fault", SSABlockKind.VALIDATION_FAIL)
+            passing = new_block("math_checked", SSABlockKind.VALIDATION_PASS)
+            current.instrs.append(Instr("CondBr", [predicate], None, attributes={
+                "true_target": fault.name, "false_target": passing.name,
+            }))
+            current.successors = [fault.name, passing.name]
+            fault.instrs.append(Instr("Call", [], None, attributes={
+                "callee": "turing_validation_error", "error_code": code,
+                "failure": name,
+            }))
+            fault.instrs.append(
+                Instr("Br", [], None, attributes={"target": passing.name})
+            )
+            fault.successors = [passing.name]
+            current = passing
+        current.instrs.extend(post)
+        current.successors = old_successors
+        if current is not block:
+            # Successor Phis now enter from the block holding the tail.
+            for successor in old_successors:
+                target = function.blocks.get(successor)
+                for instruction in (target.instrs if target else ()):
+                    blocks = instruction.attributes.get("incoming_blocks")
+                    if str(instruction.op) == "Phi" and blocks:
+                        instruction.attributes["incoming_blocks"] = tuple(
+                            current.name if str(origin) == block_name
+                            else origin
+                            for origin in blocks
+                        )
+            ordered = []
+            for name, existing in function.blocks.items():
+                ordered.append((name, existing))
+                if name == block_name:
+                    ordered.extend((made.name, made) for made in added)
+            function.blocks.clear()
+            function.blocks.update(ordered)
+        lowered = receipt["lowered"].setdefault(str(function.name), {})
+        lowered[op] = lowered.get(op, 0) + 1
+
+    for function in functions.values():
+        while True:
+            site = next(
+                (
+                    (name, position)
+                    for name, candidate in function.blocks.items()
+                    for position, instruction in enumerate(candidate.instrs)
+                    if routed(instruction)
+                ),
+                None,
+            )
+            if site is None:
+                break
+            rewrite(function, *site)
+        left = sorted({
+            str(instruction.op)
+            for candidate in function.blocks.values()
+            for instruction in candidate.instrs
+            if str(instruction.op) in TRANSCENDENTAL_OPS
+            and not str(
+                instruction.attributes.get("lowered_from") or ""
+            ).startswith("signal_core.")
+        })
+        if left:
+            receipt["left_native"][str(function.name)] = left
+        if str(function.name) in receipt["lowered"] or left:
+            function.metadata["transcendental_pipeline"] = {
+                "policy": policy,
+                "lowered": dict(receipt["lowered"].get(str(function.name), {})),
+                "left_native": tuple(left),
+            }
+    return receipt
+
+
 # Operations a region may contain and still be removable when nothing reads
 # its results: value construction and arithmetic only -- no stores, no
 # calls, no table traffic.  ``LNot``, ``Select`` and ``isfinite`` are the

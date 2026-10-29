@@ -3154,6 +3154,53 @@ def _planned_scalar_dtypes_from_graph(
 
     collection_kinds = {"list", "tuple", "set", "dict"}
 
+    def iterated_keys(iterable_id):
+        """The key columns an iterated mapping holds, or None.
+
+        The iterable is the mapping or the carried result of the loop that
+        filled it (``d = {}; for ..: d[k] = v`` then ``for k in d``).  Each
+        key is the tuple of the store's index leaves (a tuple key
+        ``d[(a, b)]`` stores two) or one displayed key.
+        """
+
+        current = int(iterable_id)
+        seen = set()
+        stores = []
+        while current in G and current not in seen:
+            seen.add(current)
+            data = G.nodes[current]
+            op = operation(data)
+            if op == "loopresult" and len(parents(data, "value")) == 1:
+                current = parents(data, "value")[0]
+                continue
+            if op in {"indexedstore", "setitem"}:
+                stores.append(current)
+                bases = parents(data, "base")
+                if len(bases) != 1:
+                    return None
+                current = bases[0]
+                continue
+            break
+        data = G.nodes.get(current, {})
+        if (data.get("attributes") or {}).get("aggregate_kind") != "dict":
+            return None
+        if any(str(role).startswith("keys") and int(parent) in G and isinstance(
+            G.nodes[int(parent)].get("expr_obj"), ast.Tuple,
+        ) for parent, role in data.get("parents") or ()):
+            # A displayed tuple key's columns are not separate leaves here.
+            return None
+        stores.extend(
+            int(child) for child in G.successors(current)
+            if operation(G.nodes[child]) in {"indexedstore", "setitem"}
+            and int(child) not in stores
+            and current in parents(G.nodes[child], "base")
+        )
+        keys = [(key,) for key in parents(data, "keys")]
+        keys.extend(
+            tuple(parents(G.nodes[store], "index")) for store in stores
+        )
+        return keys
+
     # ``def put(xs, t): xs.append(t)``: an unannotated parameter that a
     # retained append grows is a collection; its rows are what it appends.
     grown_receivers = {
@@ -3175,6 +3222,37 @@ def _planned_scalar_dtypes_from_graph(
                 and int(data.get("value_id", node_id)) in grown_receivers
             )
         )
+
+    def concatenated_empty_display(node_id):
+        """The ``+`` an empty list display is read by alone, or ``None``.
+
+        ``[]`` (a display with no members, or its folded ``[]`` constant)
+        whose one reader is a concatenation: it states no element class of
+        its own, and its zero rows are stored in the concatenation's.
+        """
+
+        data = G.nodes.get(int(node_id), {})
+        attributes = data.get("attributes") or {}
+        constant = data.get("constant", attributes.get("value"))
+        empty = (
+            attributes.get("aggregate_leaf_value_ids") == ()
+            and attributes.get("producer_kind") == "aggregate"
+        ) or (
+            operation(data) in {"const", "constant"}
+            and attributes.get("aggregate_kind") == "list"
+            and isinstance(constant, (list, tuple))
+            and not constant
+        )
+        readers = set(G.successors(int(node_id))) if empty else set()
+        if len(readers) != 1:
+            return None
+        reader = next(iter(readers))
+        reader_data = G.nodes[reader]
+        if operation(reader_data) != "add" or int(node_id) not in parents(
+            reader_data, "lhs", "rhs",
+        ):
+            return None
+        return int(reader)
 
     records = G.graph.get("source_sequence_mutation_records") or {}
     # Program: ``xs = collect(n); return sum(xs)`` (corpus c152).  Wrong
@@ -3259,6 +3337,16 @@ def _planned_scalar_dtypes_from_graph(
                 # class-only contract does not narrow it.
                 scalar[node_id] = proven_width
                 changed = True
+            # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca``
+            # (the structure-queries cover rebuild).  Wrong record: the
+            # empty display states no element class, so it entered the
+            # concatenation's region with no dtype.  Rule: an empty display
+            # read only by a concatenation stores its zero rows in the
+            # concatenation's class.
+            concatenation = concatenated_empty_display(node_id)
+            if concatenation is not None and element.get(concatenation):
+                settle(element, node_id, element[concatenation])
+                continue
             # Program: ``k.mul(x) + k.scale`` with ``def mul(self, x: int) ->
             # int`` (corpus c426).  Wrong record: a method call is named by
             # its method (``mul``), so no operator rule typed it and its
@@ -3614,6 +3702,20 @@ def _planned_scalar_dtypes_from_graph(
                         # annotation's key class, concorded on the target,
                         # is the dtype, not the value rows' class.
                         held = None
+                    elif iterated_keys(iterable[0]):
+                        # Program: ``d = {}; d[i * 3] = i * 0.5`` then ``for
+                        # k in d``.  Wrong record: the target took the dict's
+                        # row class (its values), although iterating a
+                        # mapping yields its keys.  Rule: the target of an
+                        # unannotated mapping is the join of its keys.
+                        held = join([
+                            scalar.get(leaves[0])
+                            for leaves in iterated_keys(iterable[0])
+                            if len(leaves) == 1
+                        ] or [None]) if all(
+                            len(leaves) == 1
+                            for leaves in iterated_keys(iterable[0])
+                        ) else None
                     for name in target_names:
                         for target_id, target in G.nodes(data=True):
                             if (
@@ -3813,6 +3915,44 @@ def _planned_scalar_dtypes_from_graph(
                                     ) == "loop"
                                 ):
                                     settle(scalar, int(target_id), held)
+                # Program: ``cells[(i % 2, i)] = i`` then ``for row, column
+                # in cells`` (the bootstrap's ``_reindex_in_place``).  Wrong
+                # record: a tuple target over an unannotated mapping had no
+                # rule, so ``row * 10`` reached its region with no dtype.
+                # Rule: iterating a mapping yields its keys; the i-th name of
+                # a tuple target is the join of the i-th column of every key
+                # the mapping stores or displays (a key of another width
+                # leaves the names unknown, as any join does).
+                keyed = iterated_keys(iterable[0]) if iterable else None
+                if (
+                    keyed
+                    and isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and operation(G.nodes[iterable[0]]) != "items"
+                    and not (G.nodes[iterable[0]].get("attributes") or {}).get(
+                        "mapping_key_class_ref"
+                    )
+                ):
+                    width = len(loop_expression.target.elts)
+                    for position, item in enumerate(loop_expression.target.elts):
+                        held = join([
+                            scalar.get(leaves[position])
+                            if len(leaves) == width else None
+                            for leaves in keyed
+                        ])
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == item.id
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
@@ -4574,7 +4714,23 @@ def _planned_scalar_dtypes_from_graph(
                     and all(is_collection(o) or o in element for o in operands)
                     and not any(o in scalar for o in operands)
                 ):
-                    writers = [element.get(o) for o in operands]
+                    # Program: ``rebuilt = []; for c in cover: ...;
+                    # rebuilt = rebuilt + ca`` (structure_queries).  Wrong
+                    # record: the empty display states no element class, so
+                    # the concatenation's join never closed.  Rule (as for
+                    # a branch join's empty arm): an empty display that
+                    # only this concatenation reads states no class; the
+                    # rows are the other operand's, and its zero rows are
+                    # stored in that class.
+                    empty_operands = [
+                        o for o in operands
+                        if concatenated_empty_display(o) == node_id
+                        and element.get(o) is None
+                    ]
+                    writers = [
+                        element.get(o) for o in operands
+                        if o not in empty_operands
+                    ]
                     for child in G.successors(node_id):
                         child_data = G.nodes[child]
                         if operation(child_data) in {"indexedstore", "setitem"}:
@@ -7433,6 +7589,26 @@ def _build_shell_hierarchy_plan(
             if isinstance(literal, list) and literal and all(
                 isinstance(member, (list, tuple)) for member in literal
             )
+        )
+        # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca``.
+        # Wrong record: the folded ``[]`` has no tensor extent, so its
+        # ``Const`` line got a scalar record and was dropped above, and the
+        # concatenation's region refused it.  Rule: an empty list constant
+        # is a list of zero rows of its element class (the planner's, from
+        # the concatenation it feeds); no class, no record.
+        value_shapes += tuple(
+            (int(value_id), (0,), str(record[2]))
+            for value_id in sorted(materialised)
+            if int(value_id) not in produced
+            and int(value_id) not in captured
+            and int(value_id) not in {row[0] for row in value_shapes}
+            for literal in ((
+                (graph.G.nodes.get(int(value_id)) or {}).get("attributes")
+                or {}
+            ).get("value"),)
+            if isinstance(literal, list) and not literal
+            for record in (_typed_value_shape(value_id),)
+            if record is not None and record[2] is not None
         )
         value_ranks = tuple(
             (
@@ -11060,6 +11236,20 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
             str(role) == "kw:reduce"
             and str(data.get("op") or node_type) == "scatter"
             and _constant_value(parent_data) in {"sum", "mean", "max", "min"}
+        ):
+            continue
+        # Program: ``rebuilt: list[int] = []; rebuilt = rebuilt + ca`` (the
+        # structure-queries cover rebuild).  Wrong record: the folded empty
+        # display is a constant no tensor flattens, so the concatenation was
+        # classified coordinator metadata and dropped: its result had no
+        # producer, became a root formal, and the list read back empty.
+        # Rule: a sequence constant operand of ``+`` is a sequence, and the
+        # ``+`` is the structural concatenation ``_sequence_concat_ops``
+        # lowers, not a Python object dependency.
+        if (
+            node_type == "Add"
+            and (parent_data.get("attributes") or {}).get("aggregate_kind")
+            in {"list", "bytes", "bytearray"}
         ):
             continue
         try:
@@ -26382,6 +26572,18 @@ def _tensor_descriptor_rule(
             # and folded ``distribution is not None`` the wrong way.
             if boundary.get("python_type"):
                 tensor["python_type"] = str(boundary["python_type"])
+            # Program: ``_require_tensor(self.codes, "codes")`` (huffman.py),
+            # an identity on an unannotated formal, called with a rank-1
+            # runtime-sized span.  Wrong record: only shape and dtype were
+            # read off the boundary, so the formal's empty runtime shape read
+            # as rank 0 and the callee returned a scalar.  The call's declared
+            # rank-1 descriptor and that scalar replaced each other every
+            # specialization round.  Rule: the rank and metadata state that
+            # the boundary states travel with the shape.
+            if boundary.get("rank") is not None:
+                tensor["rank"] = int(boundary["rank"])
+            if boundary.get("metadata_state") is not None:
+                tensor["metadata_state"] = str(boundary["metadata_state"])
         if "shape" not in tensor:
             # Program: ``sum(i * k for i in range(6))`` with ``k: int``.
             # Wrong record: an Input with no planner/ProgramABI boundary had
@@ -29193,6 +29395,39 @@ def _fold_callsite_structural_values(
             }
             left = known.get(parents.get("lhs", parents.get("left")), unresolved)
             right = known.get(parents.get("rhs", parents.get("right")), unresolved)
+            if isinstance(expression.ops[0], (ast.Is, ast.IsNot)) and (
+                left is None or right is None
+            ):
+                # Program: ``y = None; if n > 2: y = n; return f(y)``.
+                # Wrong record: f's copy bound x to the payload's
+                # descriptor (int64); that fact reads as storage that
+                # cannot be None, so ``x is None`` folded to False and
+                # f(None) returned 0 instead of 7.  Rule: a formal whose
+                # actual at this callsite may be None keeps ``is None`` as
+                # a runtime test of the presence the call carries.
+                optional_actuals = set(
+                    graph.G.graph.get("planner_parameter_optional_actuals")
+                    or ()
+                )
+                subject_id = (
+                    parents.get("lhs", parents.get("left"))
+                    if right is None
+                    else parents.get("rhs", parents.get("right"))
+                )
+                subject = (
+                    graph.G.nodes.get(int(subject_id), {})
+                    if subject_id is not None else {}
+                )
+                subject_name = (subject.get("attributes") or {}).get(
+                    "binding_name"
+                )
+                if (
+                    optional_actuals
+                    and str(subject.get("type") or "") in {"Input", "input"}
+                    and subject_name is not None
+                    and str(subject_name) in optional_actuals
+                ):
+                    return unresolved
             if (
                 isinstance(expression.ops[0], (ast.Is, ast.IsNot))
                 and left is unresolved
@@ -32945,6 +33180,67 @@ def _authored_formal_int_range(original: Any, formal: str):
     return None
 
 
+def _callsite_actual_may_be_none(caller: Any, value_id: int) -> bool:
+    """Whether a caller value may be ``None`` at runtime, structurally.
+
+    A literal ``None``, a merge (Phi) any arm of which may be None, and a
+    call whose callee returns a value that may be None (followed into the
+    callee's own returned identities).  Nothing else is claimed.
+    """
+
+    seen: set[tuple[int, int]] = set()
+    stack = [(caller, int(value_id), 0)]
+    while stack:
+        owner, current, depth = stack.pop()
+        graph = owner.G
+        if (id(graph), current) in seen or current not in graph or depth > 8:
+            continue
+        seen.add((id(graph), current))
+        data = graph.nodes[current]
+        node_type = str(data.get("type") or "")
+        expression = data.get("expr_obj")
+        if node_type in {"Constant", "const", "Const"}:
+            if isinstance(expression, ast.Constant) and expression.value is None:
+                return True
+            continue
+        if node_type in {"Input", "input"}:
+            # A formal this copy was specialized for an optional actual
+            # forwards that optional (``f(x)`` passing ``x`` to ``h(x)``).
+            binding_name = (data.get("attributes") or {}).get("binding_name")
+            if binding_name is not None and str(binding_name) in set(
+                graph.graph.get("planner_parameter_optional_actuals") or ()
+            ):
+                return True
+            continue
+        if node_type in {"Phi", "phi"}:
+            stack.extend(
+                (owner, int(parent), depth)
+                for parent, role in data.get("parents") or ()
+                if str(role) not in {"test", "condition", "predicate"}
+            )
+            continue
+        function_table = getattr(owner, "function_table", None)
+        if node_type in {"Call", "call"} and function_table is not None:
+            reference = (data.get("attributes") or {}).get("callee_ref")
+            if reference is None:
+                continue
+            try:
+                callee = function_table.entry(int(reference)).graph
+            except (KeyError, TypeError, ValueError):
+                continue
+            if callee is None:
+                continue
+            identities = callee.G.graph.get("identity_table") or {}
+            outputs = tuple(callee.G.graph.get("function_outputs") or ())
+            if len(outputs) != 1:
+                continue
+            stack.extend(
+                (callee, int(returned), depth + 1)
+                for returned in identities.get(str(outputs[0]), ())
+            )
+    return False
+
+
 def _callsite_specialized_shell_type(
     owner: Any,
     node_id: int,
@@ -33005,6 +33301,10 @@ def _callsite_specialized_shell_type(
         "source_value_class_concordance"
     )
     bound_parameters: set[str] = set()
+    #: Parameters whose actual at this callsite may be ``None`` (a merge
+    #: with a None arm, an optional call result).  The copy keeps
+    #: ``is None`` tests of them as runtime tests of their presence.
+    parameter_optional_actuals: dict[str, bool] = {}
     data = caller.G.nodes[int(node_id)]
     caller_record_abi = dict(
         caller.G.graph.get("parameter_record_abi") or {}
@@ -33043,6 +33343,8 @@ def _callsite_specialized_shell_type(
         parameter = str(parameter)
         bound_parameters.add(parameter)
         class_fact = caller_class_page.latest((caller_scope, int(parent)))
+        if _callsite_actual_may_be_none(caller, int(parent)):
+            parameter_optional_actuals[parameter] = True
         # The actual's element class (``list[int]`` against ``list[float]``)
         # is part of the signature the copy is built for: the called
         # inventory's classes for the formal are exact.
@@ -33299,6 +33601,7 @@ def _callsite_specialized_shell_type(
         tuple(sorted(parameter_classes.items())),
         tuple(sorted(parameter_element_classes.items())),
         tuple(sorted(parameter_int_ranges.items())),
+        tuple(sorted(parameter_optional_actuals)),
     )
     key = (
         tuple(policy.items()), generation,
@@ -33417,6 +33720,9 @@ def _callsite_specialized_shell_type(
     )
     specialized.G.graph["planner_parameter_element_classes"] = dict(
         parameter_element_classes
+    )
+    specialized.G.graph["planner_parameter_optional_actuals"] = tuple(
+        sorted(parameter_optional_actuals)
     )
     specialized.G.graph["planner_parameter_class_cells"] = dict(
         parameter_class_cells

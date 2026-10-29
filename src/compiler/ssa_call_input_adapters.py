@@ -1,6 +1,7 @@
 """Adapt logical values to already compiled physical buffer contracts."""
 from __future__ import annotations
 
+import contextlib
 from itertools import chain
 from math import prod
 import time
@@ -1093,6 +1094,7 @@ _NUMERIC_CONVERSION_MODES = {
         "signedness": "preserve",
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
+        "transcendentals": "backend_intrinsic",
     },
 
     "scientific": {
@@ -1103,6 +1105,7 @@ _NUMERIC_CONVERSION_MODES = {
         "signedness": "preserve",
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
+        "transcendentals": "signal_cores",
     },
 
     "stochastic": {
@@ -1113,11 +1116,39 @@ _NUMERIC_CONVERSION_MODES = {
         "signedness": "preserve",
         "implicit_conversion": "allow",
         "integer_arithmetic": "python_exact",
+        "transcendentals": "signal_cores",
     },
 }
 
 
 _DEFAULT_NUMERIC_MODE = "scientific"
+
+
+def active_numeric_mode() -> str:
+    """The mode the contract accessors read when not told one."""
+
+    return _DEFAULT_NUMERIC_MODE
+
+
+@contextlib.contextmanager
+def numeric_mode_scope(mode: str):
+    """Compile everything inside this scope under numeric ``mode``.
+
+    The accessors (``integer_arithmetic_policy``, ``transcendental_policy``,
+    ...) read the active mode at the moment a pass asks, many layers below
+    whoever chose it -- the same ambient-scope shape as
+    ``ir_identities.two_product_flavor_scope``.
+    """
+
+    global _DEFAULT_NUMERIC_MODE
+    if mode not in _NUMERIC_CONVERSION_MODES:
+        raise ValueError(f"unknown numeric conversion mode {mode!r}")
+    held = _DEFAULT_NUMERIC_MODE
+    _DEFAULT_NUMERIC_MODE = str(mode)
+    try:
+        yield
+    finally:
+        _DEFAULT_NUMERIC_MODE = held
 
 #: ``integer_arithmetic``: what an int result that leaves int64 means.
 #: ``python_exact`` -- Python's ``int``: the native op is overflow-checked and
@@ -1137,6 +1168,36 @@ def integer_arithmetic_policy(mode=None):
     if policy not in _INTEGER_ARITHMETIC_POLICIES:
         raise ValueError(
             f"integer_arithmetic must be one of {_INTEGER_ARITHMETIC_POLICIES}, "
+            f"got {policy!r}"
+        )
+    return policy
+
+
+#: ``transcendentals``: what computes a scalar float ``math.exp``/``log``/
+#: ``sin``/... in native code.  ``signal_cores`` (``scientific``,
+#: ``stochastic``) -- the repository's own correctly rounded route:
+#: ``signal_symbolic`` proofs materialised as wide SSA by
+#: ``ir_identities.WideExpansionEmitter`` and collapsed to one double
+#: (``ir_identities.lower_transcendentals_to_signal_cores``); an op with no
+#: core is refused by name.  ``backend_intrinsic`` (``compute``) -- each
+#: backend's own math library: C libm, ``llvm.*``/libm calls, gfortran
+#: intrinsics (never the 1e-6 sine table).  A rounding contract of
+#: scientific or stricter cannot use a language intrinsic; only compute
+#: may.  Any other value refuses by name.
+_TRANSCENDENTAL_POLICIES = ("signal_cores", "backend_intrinsic")
+
+
+def transcendental_policy(mode=None):
+    """The numeric contract's ``transcendentals`` for ``mode``."""
+
+    try:
+        contract = _NUMERIC_CONVERSION_MODES[mode or _DEFAULT_NUMERIC_MODE]
+    except KeyError:
+        raise ValueError(f"unknown numeric conversion mode {mode!r}")
+    policy = contract["transcendentals"]
+    if policy not in _TRANSCENDENTAL_POLICIES:
+        raise ValueError(
+            f"transcendentals must be one of {_TRANSCENDENTAL_POLICIES}, "
             f"got {policy!r}"
         )
     return policy

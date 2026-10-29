@@ -262,6 +262,25 @@ _UNARY: dict[str, str] = {
         "merge(2.0_c_double * anint({0} / 2.0_c_double), anint({0}), "
         "abs({0} - aint({0})) == 0.5_c_double)"
     ),
+    # The repository-SSA spellings of the same three (C ``floor``/``ceil``/
+    # ``nearbyint``, LLVM ``llvm.floor``/``llvm.ceil``/``llvm.roundeven``):
+    # every one is exact.  A signal-core expansion
+    # (``ir_identities.lower_transcendentals_to_signal_cores``) takes its
+    # binade with ``Round``; without these the Fortran lane refused c22's
+    # ``math.exp`` once it was routed ("Round [entry]: no Fortran intrinsic
+    # or expression is registered").
+    "Floor": (
+        "(aint({0}) - merge(1.0_c_double, 0.0_c_double, "
+        "{0} < aint({0})))"
+    ),
+    "Ceil": (
+        "(aint({0}) + merge(1.0_c_double, 0.0_c_double, "
+        "{0} > aint({0})))"
+    ),
+    "Round": (
+        "merge(2.0_c_double * anint({0} / 2.0_c_double), anint({0}), "
+        "abs({0} - aint({0})) == 0.5_c_double)"
+    ),
     "sign": "sign(1.0_c_double, {0})",
     "logical_not": "(.not. {0})",
     "trunc": "aint({0})",
@@ -960,7 +979,7 @@ class _FunctionEmitter:
         callee_inout_pairs: Mapping[
             str, Sequence[tuple[int, int]]
         ] | None = None,
-        trig_solver: str = "lut",
+        trig_solver: str = "intrinsic",
         array_base_ids: Sequence[int] = (),
         mutated_base_ids: Sequence[int] = (),
         dynamic_array_ranks: Mapping[int, int] | None = None,
@@ -974,10 +993,16 @@ class _FunctionEmitter:
         release_heap_owners: bool = False,
         dynamic_extent_aliases: Mapping[int, int] | None = None,
     ):
-        if str(trig_solver) not in {"lut", "continuous"}:
+        # ``intrinsic`` (the default) spells sin/cos with gfortran's own
+        # SIN/COS, as every other transcendental is: the 1e-6 ``lut`` matched
+        # math.sin on 0% of arguments (c22 came back 4.8e-8 off) and
+        # ``continuous`` is a 7e-10 series, so neither is a backend
+        # intrinsic a ``compute`` contract may stand on.  Both stay
+        # available by name.
+        if str(trig_solver) not in {"intrinsic", "lut", "continuous"}:
             raise ValueError(
-                f"unknown trig solver {trig_solver!r}; expected 'lut' or "
-                "'continuous'"
+                f"unknown trig solver {trig_solver!r}; expected 'intrinsic', "
+                "'lut' or 'continuous'"
             )
         self.trig_solver = str(trig_solver)
         self.uses_sin_table = False
@@ -4732,7 +4757,10 @@ class _FunctionEmitter:
             comparator = "==" if op in ("equal", "Eq") else "/="
             return f"({args[0]} {comparator} {args[1]})"
 
-        if op.casefold() in {"sin", "cos"} and len(args) == 1:
+        if (
+            op.casefold() in {"sin", "cos"} and len(args) == 1
+            and self.trig_solver != "intrinsic"
+        ):
             from .bounded_constants import materialize_pi
 
             shift = (
@@ -5143,6 +5171,17 @@ class _FunctionEmitter:
                 converted = f"{intrinsic}({args[0]}, {target_kind})"
                 return _native_integer_conversion(converted, target_dtype)
             return _native_integer_conversion(args[0], target_dtype)
+        if (
+            op == "Not" and len(args) == 1
+            and str(instr.args[0].dtype or "").casefold() in {"bool", "i1"}
+        ):
+            # ``Not`` of a bool is logical negation, as C (``!``) and LLVM
+            # (``xor i1``) spell it; Fortran's ``not()`` is the integer
+            # bitwise complement and gfortran refuses it on a LOGICAL ("'i'
+            # argument of 'not' intrinsic must be INTEGER"), measured on the
+            # signal-core ``pow``/``atan`` guards
+            # (``lower_transcendentals_to_signal_cores``).
+            return f"(.not. {args[0]})"
         if op in _UNARY and len(args) == 1:
             if op not in _LOGICAL_UNARY and op not in _LOGICAL_RESULT_UNARY:
                 args = self._numeric(instr, args)
@@ -5997,7 +6036,7 @@ def emit_function(
     callee_inout_pairs: Mapping[
         str, Sequence[tuple[int, int]]
     ] | None = None,
-    trig_solver: str = "lut",
+    trig_solver: str = "intrinsic",
     array_base_ids: Sequence[int] = (),
     mutated_base_ids: Sequence[int] = (),
     dynamic_array_ranks: Mapping[int, int] | None = None,
@@ -6232,7 +6271,7 @@ def emit_module(
     dtype: str = DEFAULT_DTYPE,
     outputs: Mapping[str, Sequence[SSAValue]] | None = None,
     extra_roots: Sequence[str] = (),
-    trig_solver: str = "lut",
+    trig_solver: str = "intrinsic",
     progress: "Callable[[str], None] | None" = None,
 ) -> FortranModule:
     """Translate an SSA module into one Fortran module.

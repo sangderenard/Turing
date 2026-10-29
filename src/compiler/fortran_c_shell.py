@@ -3580,6 +3580,27 @@ def _linked_caller_member_cell(
     )
 
 
+def _is_call_bound_type_tag_formal(formal: Any) -> bool:
+    """A union formal's native type tag, bound from its subject's actual.
+
+    Program: ``f(y)`` with ``def f(x: int | None)`` and ``y`` None on one
+    path.  Wrong record: x's tag formal was leased as frame storage, so the
+    root grew a tag formal nobody fills (zero, the NoneType tag) and f read
+    None at every call.  A tag is not storage: native call linking binds it
+    from the subject actual (forwarded, remapped or the exact constant).
+    """
+
+    accounting = dict(getattr(formal, "accounting", None) or {})
+    return accounting.get("native_type_tag_for_value_id") is not None and not any(
+        accounting.get(key)
+        for key in (
+            "compiler_frame_storage",
+            "linked_call_frame_storage",
+            "returned_record_storage",
+        )
+    )
+
+
 def _restore_linked_sequence_member(
     caller: Any, values: dict, member_id: int, callee_formal: Any,
     callee_symbol: str, callsite_id: int,
@@ -30121,6 +30142,28 @@ def _class_surface_ssa_program(
             if not (0 <= int(slot) < len(field_names)):
                 continue
             field = dict(self_record_fields.get(field_names[int(slot)]) or {})
+            if field.get("dtype") is None and _kind == "read" and (
+                int(value_id) in graph_obj
+            ):
+                # Program: the structure driver's ``fold(d,
+                # vocabulary.epoch)`` on a local ``Vocabulary()``.  Wrong
+                # record: only a receiver PARAMETER's record fields were
+                # read here, so a local record's field read, consumed only
+                # as a call actual, reached the slot ABI with no dtype.
+                # Rule: the read carries its class field's declared scalar
+                # storage (stamped at ingestion from the field's storage
+                # contract); that is the slot's dtype.
+                read = graph_obj.nodes[int(value_id)]
+                descriptor = read.get("tensor") or {}
+                if (
+                    str(read.get("op") or read.get("type") or "").casefold()
+                    == "getattr"
+                    and (read.get("attributes") or {}).get("value_kind")
+                    == "scalar"
+                    and not tuple(descriptor.get("shape") or ())
+                    and descriptor.get("dtype") is not None
+                ):
+                    field = {"dtype": str(descriptor["dtype"])}
             if field.get("dtype") is not None:
                 parameter_value_dtypes[int(value_id)] = str(field["dtype"])
             if field.get("shape") is not None:
@@ -31462,6 +31505,28 @@ def _class_surface_ssa_program(
                             or dict(graph_obj.graph.get(
                                 "linked_sequence_element_dtypes"
                             ) or {}).get(int(sequence_id)),
+                        )
+                        if _native_row_dtype(planned)
+                    },
+                    # Program: ``rebuilt = []; rebuilt = rebuilt + ca``.
+                    # Wrong record: the folded ``[]`` has no rows to settle
+                    # its column, so its descriptor kept an ``unknown`` row
+                    # the backends cannot lay out.  Rule: an empty list
+                    # constant's rows are of the class the planner settled
+                    # for it (the concatenation it feeds); it is declared
+                    # with that class at birth.
+                    **{
+                        int(sequence_id): (planned,)
+                        for sequence_id, _policy, column_count, _writable
+                        in sequence_declarations
+                        if int(column_count) == 1
+                        and int(sequence_id) in graph_obj
+                        and (
+                            graph_obj.nodes[int(sequence_id)].get("attributes")
+                            or {}
+                        ).get("value") == []
+                        for planned in (
+                            planned_sequence_elements.get(int(sequence_id)),
                         )
                         if _native_row_dtype(planned)
                     },
@@ -48272,6 +48337,16 @@ def _class_surface_ssa_program(
                 frame_bindings.append((
                     value_id, "caller_storage", int(linked_discovery),
                 ))
+            elif _is_call_bound_type_tag_formal(value):
+                # Program: ``f(y)`` with ``def f(x: int | None)`` and ``y``
+                # None on one path.  Wrong record: x's native type tag
+                # formal fell to the storage-from-absence lease below, so
+                # the root grew a tag formal nobody fills (zero, the
+                # NoneType tag) and f read None for every call.  Rule: a
+                # tag formal is not frame storage; the call's tag is the
+                # subject actual's own (forwarded, remapped, or the exact
+                # constant), which native call linking binds.
+                pass
             elif "record_instance" in dict(value.accounting or {}):
                 # Storage introduced while constructing an object remains
                 # part of that function's physical ABI even when it is not a
@@ -50734,6 +50809,12 @@ def _class_surface_ssa_program(
                         for argument in callee.args:
                             argument_id = int(argument.id)
                             if argument_id in bound_frame_ids:
+                                continue
+                            if _is_call_bound_type_tag_formal(argument):
+                                # The tag of a union formal is the subject
+                                # actual's own tag, bound by native call
+                                # linking; leasing it gave the root a tag
+                                # nobody fills (see the frame binding walk).
                                 continue
                             # A callee argument that is a record field
                             # (``program_abi_parameter``/``program_abi_field``
@@ -60878,6 +60959,7 @@ def _class_surface_ssa_program(
         drop_dead_pure_region_calls,
         reduce_constant_exponent_pow,
         reduce_integer_pow,
+        lower_transcendentals_to_signal_cores,
     )
 
     compile_substage("reduce constant powers and dead pure work")
@@ -60891,6 +60973,12 @@ def _class_surface_ssa_program(
     # the dead sweeps: its guards call the validation runtime, which a
     # pure-region sweep must not see as removable work.
     reduce_integer_pow(all_functions)
+    # Scalar float ``math`` transcendentals become the signal cores'
+    # correctly rounded expansions here, once, so C, LLVM and Fortran
+    # compile the same exact primitive ops instead of each host's libm.
+    # After the dead sweeps for the same reason as the int power: the
+    # domain/range guards call the validation runtime.
+    lower_transcendentals_to_signal_cores(all_functions)
 
     # Sequence descriptors are the canonical physical ABI.  A source value
     # may have been captured provisionally by a numerical region before its
@@ -62010,6 +62098,10 @@ def _class_surface_ssa_program(
     from .ssa_optional_values import lower_optional_scalar_returns
     lowered_module.metadata["optional_scalar_return_lowerings"] = len(
         lower_optional_scalar_returns(lowered_module)
+    )
+    from .ssa_optional_values import lower_optional_scalar_arguments
+    lowered_module.metadata["optional_scalar_argument_lowerings"] = len(
+        lower_optional_scalar_arguments(lowered_module)
     )
     # A join of int and float arms is one physical class; refuse it where
     # Python would see each arm's own class (``ssa_numeric_joins``).
