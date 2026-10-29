@@ -1087,7 +1087,44 @@ def _callsite_argument_descriptor(
 
     if not _callsite_argument_is_initializer(caller, call_id, argument_id):
         return None
-    return _tensor_descriptor(caller, int(argument_id))
+    descriptor = _tensor_descriptor(caller, int(argument_id))
+    if descriptor is not None:
+        return descriptor
+    return _planned_scalar_actual_descriptor(caller, int(argument_id))
+
+
+def _planned_scalar_actual_descriptor(caller: Any, argument_id: int) -> Any:
+    """A scalar actual's rank-0 descriptor from the caller's proven dtype.
+
+    Program: ``hist = [1, 2]; pick(hist[seed % 2], n)`` with ``def
+    pick(domain, atom)`` unannotated (string-core intern driver).  Wrong
+    record: the element read has no class cell and no tensor descriptor at
+    the callsite (a dynamic index into an unannotated local list), so the
+    callee's formal had no dtype and planning refused ``pick``, although
+    the caller's own planner proves the read is int64 (the list's element
+    type, joined from its writers).  Rule: a non-aggregate actual whose
+    dtype ``_planned_scalar_dtypes`` proves is that rank-0 scalar.  The
+    plan is memoized on the graph by its node/edge stamp, exactly as the
+    host-scalar query does.
+    """
+
+    G = caller.G
+    if int(argument_id) not in G:
+        return None
+    attributes = G.nodes[int(argument_id)].get("attributes") or {}
+    if attributes.get("aggregate_kind") or attributes.get(
+        "program_abi_record_identity"
+    ):
+        return None
+    stamp = (G.number_of_nodes(), G.number_of_edges())
+    memo = G.graph.get("_host_scalar_planned")
+    if memo is None or memo[0] != stamp:
+        memo = (stamp, _planned_scalar_dtypes(caller))
+        G.graph["_host_scalar_planned"] = memo
+    dtype = memo[1].get(int(argument_id))
+    if dtype not in {"int64", "float64", "bool"}:
+        return None
+    return {"shape": (), "dtype": str(dtype), "rank": 0}
 
 
 def _formal_is_mutated_in_place(callee_graph: Any, parameter: str) -> bool:
@@ -2382,26 +2419,86 @@ def _planned_scalar_dtypes(graph: Any) -> dict[int, str]:
         if dtype is not None:
             hypotheses[node_id] = dtype
     hypotheses = {key: value for key, value in hypotheses.items() if value}
+    result, accepted = _accepted_element_hypotheses(graph, proven, {}, hypotheses)
+    # Program: ``hist = []; d = 1; if ...: d = hist[k]; hist.append(d)``
+    # (string-core intern driver).  Wrong record: the list's rows are its
+    # appends, an append writes ``d``, and ``d`` merges a row read: the join
+    # waits on itself, no member or annotation seeds an assumption, and the
+    # phi refused ("consumed as a host scalar but has no ... planned scalar
+    # dtype").  Rule: a list grown by appends whose rows are still unproven
+    # assumes the narrowest class, in the order bool < int64 < float64, that
+    # its writers then join to exactly -- the least consistent typing of the
+    # cycle, accepted only under the same writers check (a join of int and
+    # float is no class, so an int cycle is never typed float).
+    grown = {
+        int(record.get("sequence_value_id", -1))
+        for record in (
+            graph.G.graph.get("source_sequence_mutation_records") or {}
+        ).values()
+        if str(record.get("operator")) in {"append", "insert"}
+    }
+    open_lists = {
+        node_id for node_id in grown
+        if node_id in G
+        and node_id not in result
+        and node_id not in accepted
+        and (G.nodes[node_id].get("attributes") or {}).get("aggregate_kind")
+        == "list"
+        and not str(
+            G.nodes[node_id].get("op") or G.nodes[node_id].get("type") or ""
+        ).casefold().startswith("indexed")
+    }
+    for candidate in ("bool", "int64", "float64"):
+        if not open_lists:
+            break
+        trial = {node_id: candidate for node_id in open_lists}
+        trial_result, trial_accepted = _accepted_element_hypotheses(
+            graph, result, accepted, trial,
+        )
+        newly = set(trial_accepted) - set(accepted)
+        if newly:
+            result, accepted = trial_result, trial_accepted
+            open_lists -= newly
+    return result
+
+
+def _accepted_element_hypotheses(
+    graph: Any,
+    fallback: dict[int, str],
+    accepted: dict[int, str],
+    hypotheses: dict[int, str],
+) -> tuple[dict[int, str], dict[int, str]]:
+    """Plan under ``accepted`` plus ``hypotheses``; keep the consistent ones.
+
+    A hypothesis is accepted when, assuming it (and every already accepted
+    one), the collection's writers join to exactly its class.  The accepted
+    set is then re-planned alone and must still hold; otherwise only the
+    already accepted set stands (``fallback`` is its plan).
+    """
+
     if not hypotheses:
-        return proven
+        return fallback, accepted
+    trial = {**accepted, **hypotheses}
     observed: dict[int, str | None] = {}
     assumed = _planned_scalar_dtypes_from(
-        graph, assumed_elements=hypotheses, observed_writers=observed,
+        graph, assumed_elements=trial, observed_writers=observed,
     )
-    accepted = {
-        receiver: dtype for receiver, dtype in hypotheses.items()
+    kept = {
+        receiver: dtype for receiver, dtype in trial.items()
         if observed.get(receiver) == dtype
     }
-    if accepted != hypotheses:
-        if not accepted:
-            return proven
+    if kept != trial:
+        if not set(kept) - set(accepted) or any(
+            key not in kept for key in accepted
+        ):
+            return fallback, accepted
         observed = {}
         assumed = _planned_scalar_dtypes_from(
-            graph, assumed_elements=accepted, observed_writers=observed,
+            graph, assumed_elements=kept, observed_writers=observed,
         )
-        if any(observed.get(key) != value for key, value in accepted.items()):
-            return proven
-    return assumed
+        if any(observed.get(key) != value for key, value in kept.items()):
+            return fallback, accepted
+    return assumed, kept
 
 
 _CALLEE_RETURN_ACTIVE: set[int] = set()
