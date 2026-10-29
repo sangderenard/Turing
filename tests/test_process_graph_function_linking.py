@@ -5196,13 +5196,19 @@ def test_mixed_call_results_read_authored_projection_concordance():
     assert tuple(source_page.latest(row) for row in source_rows) == (
         "metrics", "dt_next", "dt_used",
     )
-    identity_rows = identity_page.scope_rows(int(call_record.callsite_id))
+    # Rows are (calling function, call, projection): node ids are local to
+    # one function's graph.
+    identity_rows = tuple(
+        row for row in identity_page.rows()
+        if int(row[1]) == int(call_record.callsite_id)
+    )
+    assert len({row[0] for row in identity_rows}) == 1
     identity_facts = tuple(identity_page.latest(row) for row in identity_rows)
     assert identity_facts == ((0,), (1,), (2,))
     caller_result_ids = tuple(
         int(caller_id) for _callee_id, caller_id in call_record.result_bindings
     )
-    assert caller_result_ids == tuple(int(row[1]) for row in identity_rows)
+    assert caller_result_ids == tuple(int(row[2]) for row in identity_rows)
     transition_rows = tuple(
         row for row in transition_page.scope_rows(root_name)
         if int(row[1]) == int(call_record.callsite_id)

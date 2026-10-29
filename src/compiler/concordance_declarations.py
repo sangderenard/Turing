@@ -4271,10 +4271,14 @@ TENSOR_SHAPE_ENRICHMENT = declare_page("tensor_shape_enrichment", (
     RowField("field", K.LABEL),
 ), tuple)
 #: ``_call_result_bindings``: the Indexed projection node of one output path
-#: of a call, ``(call node, projection node)`` -> path; CONCORD, DERIVED(the
-#: call node's cell, the projection node's cell).
+#: of a call, ``(calling function, call node, projection node)`` -> path;
+#: CONCORD, DERIVED(the call node's cell, the projection node's cell).  Node
+#: ids are local to one function's graph, so the calling function is part of
+#: the row: two functions' calls of one callee share node ids and differ in
+#: what each projection reads.
 CALL_RESULT_PROJECTION = declare_page("call_result_projection_concordance", (
-    RowField("call", K.VALUE_ID), RowField("projection", K.VALUE_ID),
+    RowField("function", K.SCOPE), RowField("call", K.VALUE_ID),
+    RowField("projection", K.VALUE_ID),
 ), tuple)
 #: A call-result aggregate projection that was replaced after specialization
 #: or structural folding, ``(callsite copy, slot, stale projection)`` -> the
