@@ -1002,6 +1002,18 @@ def specialize_python_precision_widths(graph: Any) -> bool:
             dict(metadata.get("planner_tensor_descriptors") or {}).items()
         )
         if isinstance(descriptor, Mapping)
+    ) + tuple(
+        # Program: string-core ``intern(1, [x])`` beside ``intern(1, [65,
+        # x])``.  Wrong record: the copies differ only by the member layout
+        # of an aggregate actual (one int member against two), which the
+        # receipt left out, so both shared one numeric scope and
+        # ``len(atoms)`` disagreed ((1, 1) against (2, 2)).  Rule: the
+        # aggregate descriptors a copy is minted for are part of its numeric
+        # identity, as its tensor descriptors are.
+        (f"aggregate:{name}", stable(descriptor))
+        for name, descriptor in sorted(
+            dict(metadata.get("planner_aggregate_descriptors") or {}).items()
+        )
     )
     digest = hashlib.sha256(repr(receipt).encode("utf-8")).hexdigest()[:16]
     scope = (authored_scope, "specialization", digest)
