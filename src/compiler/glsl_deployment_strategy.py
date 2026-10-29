@@ -7319,48 +7319,6 @@ def _build_shell_hierarchy_plan(
                 return (record[0], record[1], "opaque_ref"), (
                     _dtype_producer_cells(graph, int(value_id))
                 )
-            # An external name read only as the receiver of tensor-namespace
-            # calls (``AbstractTensor`` in ``AbstractTensor.get_tensor(x)``,
-            # imported inside the method) is a static symbol, as a
-            # StaticReference is: not a value.
-            receivers = tuple(node.get("children") or ())
-            if (
-                attributes.get("binding_kind") == "external"
-                and receivers
-                and all(
-                    str(role) == "operand"
-                    and (
-                        graph.G.nodes.get(int(child), {}).get("attributes")
-                        or {}
-                    ).get("tensor_candidate") is not None
-                    for child, role in receivers
-                )
-            ):
-                return None, ()
-            # A limb of a Precision value: Precision is a numeric value, not
-            # a record, and its ``_stack`` holds its limbs, whose element the
-            # precision library states (``Precision.term`` reads
-            # ``self._stack[k]``).
-            limb_stack = int(value_id)
-            if str(node.get("type")) == "Indexed":
-                limb_stack = next((
-                    int(parent) for parent, role in (node.get("parents") or ())
-                    if str(role) == "base"
-                ), None)
-            if limb_stack is not None:
-                cell = (
-                    graph.G.nodes.get(limb_stack, {}).get("attributes") or {}
-                ).get("field_declaration_cell")
-                if getattr(cell, "row", None) == (
-                    "src.common.tensors.extended_precision", "Precision",
-                    "_stack",
-                ):
-                    from ..common.tensors.extended_precision import (
-                        limb_element_name,
-                    )
-                    return (record[0], record[1], limb_element_name(
-                        attributes.get("precision_element")
-                    )), _dtype_producer_cells(graph, int(value_id), cell)
             if isinstance(attributes.get("value"), slice):
                 # A slice literal is index metadata for the load it feeds:
                 # a handle, as a record identity is, not an element type.
