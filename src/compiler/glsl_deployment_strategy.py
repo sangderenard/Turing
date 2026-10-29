@@ -3154,6 +3154,53 @@ def _planned_scalar_dtypes_from_graph(
 
     collection_kinds = {"list", "tuple", "set", "dict"}
 
+    def iterated_keys(iterable_id):
+        """The key columns an iterated mapping holds, or None.
+
+        The iterable is the mapping or the carried result of the loop that
+        filled it (``d = {}; for ..: d[k] = v`` then ``for k in d``).  Each
+        key is the tuple of the store's index leaves (a tuple key
+        ``d[(a, b)]`` stores two) or one displayed key.
+        """
+
+        current = int(iterable_id)
+        seen = set()
+        stores = []
+        while current in G and current not in seen:
+            seen.add(current)
+            data = G.nodes[current]
+            op = operation(data)
+            if op == "loopresult" and len(parents(data, "value")) == 1:
+                current = parents(data, "value")[0]
+                continue
+            if op in {"indexedstore", "setitem"}:
+                stores.append(current)
+                bases = parents(data, "base")
+                if len(bases) != 1:
+                    return None
+                current = bases[0]
+                continue
+            break
+        data = G.nodes.get(current, {})
+        if (data.get("attributes") or {}).get("aggregate_kind") != "dict":
+            return None
+        if any(str(role).startswith("keys") and int(parent) in G and isinstance(
+            G.nodes[int(parent)].get("expr_obj"), ast.Tuple,
+        ) for parent, role in data.get("parents") or ()):
+            # A displayed tuple key's columns are not separate leaves here.
+            return None
+        stores.extend(
+            int(child) for child in G.successors(current)
+            if operation(G.nodes[child]) in {"indexedstore", "setitem"}
+            and int(child) not in stores
+            and current in parents(G.nodes[child], "base")
+        )
+        keys = [(key,) for key in parents(data, "keys")]
+        keys.extend(
+            tuple(parents(G.nodes[store], "index")) for store in stores
+        )
+        return keys
+
     # ``def put(xs, t): xs.append(t)``: an unannotated parameter that a
     # retained append grows is a collection; its rows are what it appends.
     grown_receivers = {
@@ -3614,6 +3661,20 @@ def _planned_scalar_dtypes_from_graph(
                         # annotation's key class, concorded on the target,
                         # is the dtype, not the value rows' class.
                         held = None
+                    elif iterated_keys(iterable[0]):
+                        # Program: ``d = {}; d[i * 3] = i * 0.5`` then ``for
+                        # k in d``.  Wrong record: the target took the dict's
+                        # row class (its values), although iterating a
+                        # mapping yields its keys.  Rule: the target of an
+                        # unannotated mapping is the join of its keys.
+                        held = join([
+                            scalar.get(leaves[0])
+                            for leaves in iterated_keys(iterable[0])
+                            if len(leaves) == 1
+                        ] or [None]) if all(
+                            len(leaves) == 1
+                            for leaves in iterated_keys(iterable[0])
+                        ) else None
                     for name in target_names:
                         for target_id, target in G.nodes(data=True):
                             if (
@@ -3813,6 +3874,44 @@ def _planned_scalar_dtypes_from_graph(
                                     ) == "loop"
                                 ):
                                     settle(scalar, int(target_id), held)
+                # Program: ``cells[(i % 2, i)] = i`` then ``for row, column
+                # in cells`` (the bootstrap's ``_reindex_in_place``).  Wrong
+                # record: a tuple target over an unannotated mapping had no
+                # rule, so ``row * 10`` reached its region with no dtype.
+                # Rule: iterating a mapping yields its keys; the i-th name of
+                # a tuple target is the join of the i-th column of every key
+                # the mapping stores or displays (a key of another width
+                # leaves the names unknown, as any join does).
+                keyed = iterated_keys(iterable[0]) if iterable else None
+                if (
+                    keyed
+                    and isinstance(loop_expression, ast.For)
+                    and isinstance(loop_expression.target, ast.Tuple)
+                    and all(isinstance(item, ast.Name)
+                            for item in loop_expression.target.elts)
+                    and operation(G.nodes[iterable[0]]) != "items"
+                    and not (G.nodes[iterable[0]].get("attributes") or {}).get(
+                        "mapping_key_class_ref"
+                    )
+                ):
+                    width = len(loop_expression.target.elts)
+                    for position, item in enumerate(loop_expression.target.elts):
+                        held = join([
+                            scalar.get(leaves[position])
+                            if len(leaves) == width else None
+                            for leaves in keyed
+                        ])
+                        for target_id, target in G.nodes(data=True):
+                            if (
+                                operation(target) == "input"
+                                and (target.get("attributes") or {}).get(
+                                    "binding_name"
+                                ) == item.id
+                                and (target.get("attributes") or {}).get(
+                                    "binding_kind"
+                                ) == "loop"
+                            ):
+                                settle(scalar, int(target_id), held)
                 del targets, stop
                 continue
             # Program: ``ys = [x * 2 for x in xs if x > 2]; sum(ys)`` (fuzzer
