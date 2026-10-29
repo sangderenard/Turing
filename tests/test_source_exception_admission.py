@@ -10,6 +10,7 @@ import pytest
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.glsl_deployment_strategy import CompilationSubdivisionRequired
 from src.compiler.concordance_declarations import (
+    CONTROL_BLOCK, ControlBlockKind,
     NAME_BINDING, SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_SITE_STATE,
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
@@ -65,6 +66,13 @@ def root(x: float) -> int:
         )
         assert len(findings) == 1
         assert "no executable exceptional control" in findings[0].detail
+        try_blocks = tuple(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        assert len(try_blocks) == 1
+        try_fact = book.page(CONTROL_BLOCK).latest(try_blocks[0])
+        assert len(try_fact.carried) == 1
         source_module = SimpleNamespace(metadata={"identity_book": book})
         for check in (
             CorrelationTable._source_exception_site_state_findings,

@@ -94,13 +94,16 @@ conditions hold for the whole retained control subtree.
 The current control pipeline constructs loop programs in
 `analyze_shader_loop_reductions` and ordinary conditional programs in
 `_ordinary_conditional_control_programs`, then overlays those programs before
-`precompile_to_ssa` lowers them. `NativeTryBlock` is a declared control shape,
-but the live pipeline constructs no instance and the SSA lowerer has no branch
-for it. Its historical constructor only owned selected loop-body Try syntax
-and rejected nested control and abrupt finalizer paths. The next executable
-step is to give each retained source Try one exact control owner in this
-pipeline, including call placement and source-arm membership; a Try-shaped
-block alone cannot discharge admission without SSA failure successors.
+`precompile_to_ssa` lowers them. The live precompile now constructs a
+`NativeTryBlock` for a retained function Try and posts its source control
+fact before the admission refusal. Its region markers have exact arm
+membership, and handler class values follow ingestion-to-canonical edges
+into the forked shell. The block is not yet in the executable overlay, and
+the SSA lowerer has no branch for it. Folded assignments with no deployment
+region, call placement, and pending outcomes still need control ownership;
+this Try-shaped block does not discharge admission without SSA failure
+successors. The historical constructor only owned selected loop-body Try
+syntax and rejected nested control and abrupt finalizer paths.
 
 The bounded native matrix must cover direct raise, caught call failure,
 handler order and mismatch, `else`, `finally` on each outcome, nested outward

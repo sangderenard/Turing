@@ -13444,6 +13444,199 @@ def _ordinary_conditional_control_programs(
     return nested
 
 
+def _source_try_control_programs(
+    graph: Any,
+    retained_regions: Iterable[int],
+    dispatch_subgraphs: Iterable[Any],
+) -> tuple[ControlProgram, ...]:
+    """Build arm-owned control trees from retained Try source identities.
+
+    This constructs control topology only. Admission remains unresolved until
+    SSA supplies every exceptional successor and pending finalizer outcome.
+    A deployment region shared by two arms has no legal insertion point and
+    is refused instead of being assigned by its first member.
+    """
+
+    from .concordance_declarations import (
+        CANONICAL_VALUE, CONTROL_PROGRAM_BUILD,
+        SOURCE_EXCEPTION_HANDLER_CLASS,
+        ExceptionHandlerClassFact,
+    )
+    from .control_source import (
+        NativeExceptionHandler, NativeTryBlock, post_control_program,
+    )
+    from .identity_concordance import current_identity_book
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    book = current_identity_book()
+    canonical_scope = graph.G.graph.get("lexical_read_scope")
+    if canonical_scope is None:
+        raise ValueError("source Try control has no canonical value scope")
+    canonical_page = book.page(CANONICAL_VALUE)
+    canonical_successors: dict[Any, list[Any]] = {}
+    for row in canonical_page.rows():
+        canonical = book.latest_ref(CANONICAL_VALUE, row)
+        if canonical is None:
+            continue
+        for cause, _stage in book.edges_into(canonical):
+            canonical_successors.setdefault(cause, []).append(canonical)
+
+    def canonical_from_source(source_cell: Any) -> int:
+        # Program: except ValueError in a retained Try. The class occurrence
+        # is an ingestion cell with an AST object id; canonical relabel made
+        # its control value 2 on the bounded source case. Copying the source
+        # id into NativeExceptionHandler would fabricate a missing argument.
+        # Follow the exact canonical-value edge from that source cell.
+        pending = [source_cell]
+        seen = set()
+        matches = set()
+        while pending:
+            cause = pending.pop()
+            if cause in seen:
+                continue
+            seen.add(cause)
+            for canonical in canonical_successors.get(cause, ()):
+                if canonical.row[0] == canonical_scope:
+                    matches.add(int(canonical.row[1]))
+                pending.append(canonical)
+        if len(matches) != 1:
+            raise ValueError(
+                "source Try handler type has no unique canonical value: "
+                f"source={source_cell!r}, matches={tuple(sorted(matches))!r}"
+            )
+        return next(iter(matches))
+    subgraphs = tuple(dispatch_subgraphs)
+    memberships = _branch_compartments(graph)
+    programs = []
+    for try_id, record in _source_control_records(graph.G).items():
+        expression = record.get("expression")
+        if (
+            not isinstance(expression, ast.Try)
+            or int(try_id) not in graph.G
+            or getattr(expression, "_turing_resource_scope", None)
+        ):
+            continue
+        owner = node_identity_cell(graph, int(try_id))
+        if owner is None:
+            raise ValueError(f"retained Try has no source cell: {try_id}")
+        handler_members = tuple(
+            frozenset(id(member) for member in ast.walk(handler))
+            for handler in expression.handlers
+        )
+        owned: dict[tuple[str, int], list[int]] = {}
+        for region in retained_regions:
+            region = int(region)
+            nodes = tuple(map(
+                int, subgraphs[region].G.graph.get("deployment_nodes", ()),
+            ))
+            if not nodes:
+                continue
+            roles = tuple(
+                next((
+                    arm for owner_id, arm in memberships.get(node_id, ())
+                    if int(owner_id) == int(try_id)
+                ), None)
+                for node_id in nodes
+            )
+            claimed = {role for role in roles if role is not None}
+            if not claimed:
+                continue
+            if len(claimed) != 1 or any(role is None for role in roles):
+                raise ValueError(
+                    "source Try deployment region crosses arm boundary: "
+                    f"try={try_id}, region={region}, roles={roles!r}"
+                )
+            arm = next(iter(claimed))
+            if arm == "handlers":
+                indices = set()
+                for node_id in nodes:
+                    data = graph.G.nodes.get(node_id, {})
+                    source = data.get("authored_expr_obj") or data.get("expr_obj")
+                    matches = tuple(
+                        index for index, members in enumerate(handler_members)
+                        if id(source) in members
+                    )
+                    if len(matches) != 1:
+                        raise ValueError(
+                            "source Try handler region lacks exact handler "
+                            f"ownership: try={try_id}, region={region}, "
+                            f"node={node_id}"
+                        )
+                    indices.add(matches[0])
+                if len(indices) != 1:
+                    raise ValueError(
+                        "source Try region joins distinct handlers: "
+                        f"try={try_id}, region={region}"
+                    )
+                key = ("handler", next(iter(indices)))
+            elif arm in {"body", "orelse", "finalbody"}:
+                key = (arm, 0)
+            else:
+                raise ValueError(
+                    f"source Try has unknown arm {arm!r}: try={try_id}"
+                )
+            owned.setdefault(key, []).append(region)
+
+        def arm_body(key: tuple[str, int]) -> SequenceBlock:
+            return SequenceBlock(tuple(
+                StatementBlock((f"__scheduled_region_{region}__",))
+                for region in owned.get(key, ())
+            ))
+
+        handlers = []
+        for index, handler in enumerate(expression.handlers):
+            handler_facts = tuple(
+                book.page(SOURCE_EXCEPTION_HANDLER_CLASS).latest(row)
+                for row in book.page(SOURCE_EXCEPTION_HANDLER_CLASS).rows()
+                if int(row[1]) == id(handler)
+            )
+            if len(handler_facts) != 1 or not isinstance(
+                handler_facts[0], ExceptionHandlerClassFact,
+            ):
+                raise ValueError(
+                    "source Try handler lacks exact class fact: "
+                    f"try={try_id}, handler={id(handler)}"
+                )
+            fact = handler_facts[0]
+            if (
+                int(fact.owner.row[1]) != id(expression)
+                or int(fact.handler.row[1]) != id(handler)
+                or canonical_from_source(fact.owner) != int(try_id)
+            ):
+                raise ValueError(
+                    "source Try handler class fact disagrees with control "
+                    f"owner: try={try_id}, handler={id(handler)}"
+                )
+            if any(declaration is None
+                   for _value, declaration in fact.declarations):
+                raise ValueError(
+                    "source Try handler class is unresolved: "
+                    f"try={try_id}, handler={id(handler)}"
+                )
+            handlers.append(NativeExceptionHandler(
+                arm_body(("handler", index)),
+                canonical_from_source(fact.handler),
+                tuple(canonical_from_source(value)
+                      for value, _declaration in fact.declarations),
+            ))
+        regions = tuple(dict.fromkeys(
+            region for arm_regions in owned.values() for region in arm_regions
+        ))
+        program = ControlProgram(
+            NativeTryBlock(
+                arm_body(("body", 0)), tuple(handlers),
+                arm_body(("orelse", 0)) if expression.orelse else None,
+                arm_body(("finalbody", 0)), int(try_id),
+            ),
+            region_indices=regions,
+        )
+        post_control_program(
+            graph, program, stage=CONTROL_PROGRAM_BUILD, cause=(owner,),
+        )
+        programs.append(program)
+    return tuple(programs)
+
+
 def _nest_region_less_conditionals(
     graph: Any,
     programs: tuple[ControlProgram, ...],
@@ -34522,6 +34715,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
         # function's graph is an open concordance obligation.  Until an exact
         # exceptional control cell discharges it, precompile must refuse.
         graph = self.process_graph
+        pending_source_tries = []
         if graph is not None:
             from ..common.tensors.topological_reducer import node_identity_cell
             from .concordance_declarations import (
@@ -34533,7 +34727,6 @@ class ProcessGraphGLSLDeployment(TiledObject):
             )
 
             book = current_identity_book()
-            pending_source_tries = []
             for node_id, data in graph.G.nodes(data=True):
                 expression = data.get("expr_obj")
                 if not isinstance(expression, (ast.Try, ast.TryStar)) or (
@@ -34563,21 +34756,22 @@ class ProcessGraphGLSLDeployment(TiledObject):
                         f"source Try: {source_cell!r}"
                     )
                 pending_source_tries.append((int(node_id), source_cell))
-            if pending_source_tries:
-                # Program: two retained Try statements in one function.
-                # Previously the first refusal left the second with no
-                # admission row at all. Every authored Try is an obligation
-                # even when one unresolved owner already stops compilation.
-                boundaries = tuple({
-                    "kind": "source-exception-control-owner",
-                    "source_try_cell": repr(source_cell),
-                    "source_try_node_id": node_id,
-                } for node_id, source_cell in pending_source_tries)
-                raise CompilationSubdivisionRequired(
-                    "authored Try has no concorded exceptional control "
-                    f"owner: source_tries={tuple(cell for _, cell in pending_source_tries)!r}",
-                    boundaries=boundaries,
-                )
+        def refuse_unadmitted_source_tries() -> None:
+            if not pending_source_tries:
+                return
+            # Every retained Try is posted before this refusal. Planning can
+            # now construct its source control tree, but only an executable
+            # SSA status route may revise SOURCE_EXCEPTION_ADMISSION.
+            boundaries = tuple({
+                "kind": "source-exception-control-owner",
+                "source_try_cell": repr(source_cell),
+                "source_try_node_id": node_id,
+            } for node_id, source_cell in pending_source_tries)
+            raise CompilationSubdivisionRequired(
+                "authored Try has no concorded exceptional control "
+                f"owner: source_tries={tuple(cell for _, cell in pending_source_tries)!r}",
+                boundaries=boundaries,
+            )
         #
         # ``reduction_cache`` (a ``ReductionArtifactStore``), when given,
         # persists each region program under its own content key as it is
@@ -34680,6 +34874,28 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 int(region) for region in complete_regions
                 if int(region) not in structurally_owned_regions
             )
+            pending_occurrences = {
+                id(graph.G.nodes[node_id].get("expr_obj"))
+                for node_id, _cell in pending_source_tries
+            } if graph is not None else set()
+            if (
+                pending_occurrences
+                and target.process_graph.G.graph.get("function_name")
+                and any(
+                id(record.get("expression")) in pending_occurrences
+                for record in _source_control_records(target.process_graph.G).values()
+                )
+            ):
+                # Program: a retained Try reaches the forked function shell.
+                # Its class declarations are source-ingestion cells, while
+                # its control nodes are canonical values in that fork. Build
+                # their exact control correlation before refusing admission;
+                # this block is not yet an executable exceptional successor.
+                target.source_try_control_programs = _source_try_control_programs(
+                    target.process_graph, runtime_regions,
+                    target.dispatch_subgraphs,
+                )
+                refuse_unadmitted_source_tries()
             # A blocked loop (real blockers, e.g. an authored ``raise``) has
             # no control_program and is silently excluded above. Its BODY
             # REGIONS were still compiled as ordinary numerical work and
@@ -35014,6 +35230,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 f"{shell_name} structural preparation end in "
                 f"{time.perf_counter() - shell_started:.3f}s"
             )
+        refuse_unadmitted_source_tries()
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,
