@@ -18,6 +18,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_REGION_STATE,
     SOURCE_EXCEPTION_HANDLER_ENTRY,
     SOURCE_EXCEPTION_HANDLER_PHI,
+    SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
     SOURCE_EXCEPTION_CONTINUATION_PHI,
     SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
 )
@@ -415,6 +416,31 @@ def root(x: float) -> int:
         assert phi.name == "y"
         assert len(phi.arms) == 2
         assert phi.arms[0][1] != phi.arms[1][1]
+        phi_cell = book.latest_ref(SOURCE_EXCEPTION_HANDLER_PHI, rows[0])
+        try_rows = tuple(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        assert len(try_rows) == 1
+        assert phi_cell in book.page(CONTROL_BLOCK).latest(
+            try_rows[0]
+        ).carried
+        arm_rows = tuple(sorted(
+            book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).rows(),
+            key=lambda row: row[2],
+        ))
+        assert len(arm_rows) == 2
+        arm_facts = tuple(
+            book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).latest(row)
+            for row in arm_rows
+        )
+        assert tuple(fact.source_binding for fact in arm_facts) == tuple(
+            binding for _transfer, binding in phi.arms
+        )
+        assert arm_facts[0].canonical_value != arm_facts[1].canonical_value
+        assert CorrelationTable._source_exception_handler_arm_value_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
     finally:
         end_identity_book(token)
 

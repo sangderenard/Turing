@@ -544,6 +544,7 @@ class NativeExceptionHandler(TiledObject):
     # The source graph identities of the exception class declarations.  A
     # bare except has no declarations and therefore an empty tuple.
     exception_type_value_ids: tuple[int, ...] = ()
+    entry_phi_cells: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1240,7 +1241,9 @@ def _describe_control_block(
             value_id
             for handler in block.handlers
             for value_id in handler.exception_type_value_ids
-        ), *(item for item in block.continuation_phi_cells
+        ), *(item for handler in block.handlers
+             for item in handler.entry_phi_cells if isinstance(item, Ref)),
+            *(item for item in block.continuation_phi_cells
              if isinstance(item, Ref)))
         sites = tuple(
             item for item in block.protected_transfer_cells

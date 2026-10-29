@@ -1559,6 +1559,7 @@ class CorrelationTable:
         found.extend(self._source_exception_region_state_findings(module))
         found.extend(self._source_exception_handler_entry_findings(module))
         found.extend(self._source_exception_handler_phi_findings(module))
+        found.extend(self._source_exception_handler_arm_value_findings(module))
         found.extend(self._source_exception_continuation_phi_findings(module))
         found.extend(self._source_exception_continuation_arm_value_findings(module))
         found.extend(self._native_status_class_findings(module))
@@ -2629,6 +2630,138 @@ class CorrelationTable:
                     "source-exception-handler-phi-disagreement",
                     str(row), None, problem,
                 ))
+        return found
+
+    @staticmethod
+    def _source_exception_handler_arm_value_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Each handler Phi arm follows its source transfer's binding."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CONTROL_BLOCK, INGESTION_VALUE, NAME_BINDING,
+            SOURCE_EXCEPTION_HANDLER_ARM_VALUE, SOURCE_EXCEPTION_HANDLER_PHI,
+            ControlBlockFact, ControlBlockKind,
+            ExceptionHandlerArmValueFact, ExceptionHandlerPhiFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        successors = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for cause, _stage in book.edges_into(canonical):
+                successors.setdefault(cause, set()).add(canonical)
+
+        def reaches(source: Ref, target: Ref) -> bool:
+            pending = [source]
+            seen = set()
+            while pending:
+                cell = pending.pop()
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                pending.extend(successors.get(cell, ()))
+            return target in seen
+
+        found = []
+        page = book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE)
+        grouped = {}
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_HANDLER_ARM_VALUE, row)
+            problem = None
+            if not isinstance(fact, ExceptionHandlerArmValueFact):
+                problem = "handler Phi arm has no planned value fact"
+            elif not all(isinstance(cell, Ref) for cell in (
+                fact.source_phi, fact.source_handler, fact.source_transfer,
+                fact.source_binding, fact.source_value, fact.canonical_phi,
+                fact.canonical_handler, fact.canonical_value,
+            )):
+                problem = "handler Phi arm lacks exact cells"
+            elif fact.source_phi.page != SOURCE_EXCEPTION_HANDLER_PHI:
+                problem = "handler Phi arm has no source Phi"
+            else:
+                phi = book.page(SOURCE_EXCEPTION_HANDLER_PHI).latest(
+                    fact.source_phi.row
+                )
+                binding = book.page(NAME_BINDING).cells.get((
+                    fact.source_binding.row, fact.source_binding.column,
+                ))
+                source_causes = () if binding is None else tuple(
+                    cause for cause, _stage in book.edges_into(
+                        fact.source_binding,
+                    ) if cause.page == INGESTION_VALUE
+                    and int(cause.row[1]) == int(binding.value_id)
+                )
+                if (
+                    not isinstance(phi, ExceptionHandlerPhiFact)
+                    or book.latest_ref(
+                        SOURCE_EXCEPTION_HANDLER_PHI, fact.source_phi.row,
+                    ) != fact.source_phi
+                    or int(row[2]) < 0
+                    or int(row[2]) >= len(phi.arms)
+                    or phi.arms[int(row[2])] != (
+                        fact.source_transfer, fact.source_binding,
+                    )
+                    or fact.source_handler != phi.handler
+                    or fact.source_binding.page != NAME_BINDING
+                    or fact.source_binding.row[1] != phi.name
+                    or source_causes != (fact.source_value,)
+                    or fact.canonical_phi.row[1] != row[1]
+                    or any(
+                        cell.page != CANONICAL_VALUE
+                        or cell.row[0] != fact.canonical_phi.row[0]
+                        or book.latest_ref(CANONICAL_VALUE, cell.row) != cell
+                        for cell in (
+                            fact.canonical_phi, fact.canonical_handler,
+                            fact.canonical_value,
+                        )
+                    )
+                    or not reaches(phi.phi, fact.canonical_phi)
+                    or not reaches(phi.handler, fact.canonical_handler)
+                    or not reaches(fact.source_value, fact.canonical_value)
+                ):
+                    problem = "handler Phi arm disagrees with source value"
+                elif {
+                    source for source, _stage in book.edges_into(receipt)
+                } != {
+                    fact.source_phi, fact.source_handler,
+                    fact.source_transfer, fact.source_binding,
+                    fact.source_value, fact.canonical_phi,
+                    fact.canonical_handler, fact.canonical_value,
+                }:
+                    problem = "handler Phi arm provenance disagrees"
+                if isinstance(phi, ExceptionHandlerPhiFact):
+                    grouped.setdefault(fact.source_phi, set()).add(int(row[2]))
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-handler-arm-value-disagreement",
+                    str(row), None, problem,
+                ))
+        for control_row in book.page(CONTROL_BLOCK).rows():
+            control = book.page(CONTROL_BLOCK).latest(control_row)
+            if not isinstance(control, ControlBlockFact) or (
+                control.kind is not ControlBlockKind.NATIVE_TRY
+            ):
+                continue
+            for source_phi in control.carried:
+                if not isinstance(source_phi, Ref) or (
+                    source_phi.page != SOURCE_EXCEPTION_HANDLER_PHI
+                ):
+                    continue
+                phi = book.page(SOURCE_EXCEPTION_HANDLER_PHI).latest(
+                    source_phi.row
+                )
+                if not isinstance(phi, ExceptionHandlerPhiFact) or (
+                    grouped.get(source_phi, set())
+                    != set(range(len(phi.arms)))
+                ):
+                    found.append(Finding(
+                        "source-exception-handler-arm-value-disagreement",
+                        str(source_phi.row), None,
+                        "handler Phi lacks an exact planned operand",
+                    ))
         return found
 
     @staticmethod

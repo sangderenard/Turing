@@ -1311,6 +1311,29 @@ SOURCE_EXCEPTION_HANDLER_PHI = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionHandlerArmValueFact:
+    """One handler Phi operand from an exact deployed failure edge."""
+
+    source_phi: Ref
+    source_handler: Ref
+    source_transfer: Ref
+    source_binding: Ref
+    source_value: Ref
+    canonical_phi: Ref
+    canonical_handler: Ref
+    canonical_value: Ref
+
+
+SOURCE_EXCEPTION_HANDLER_ARM_VALUE = declare_page(
+    "source_exception_handler_arm_value", (
+        RowField("planning_scope", K.SCOPE),
+        RowField("canonical_phi", K.VALUE_ID),
+        RowField("arm", K.INDEX),
+    ), ExceptionHandlerArmValueFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionContinuationPhiFact:
     """One post-Try name joined from the successful and handler arms."""
 

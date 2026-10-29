@@ -13464,10 +13464,13 @@ def _source_try_control_programs(
         SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
         SOURCE_EXCEPTION_CONTINUATION_PHI,
         SOURCE_EXCEPTION_HANDLER_CLASS,
+        SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+        SOURCE_EXCEPTION_HANDLER_PHI,
         SOURCE_EXCEPTION_REGION_SITE,
         SOURCE_EXCEPTION_REGION_STATE,
         SOURCE_EXCEPTION_TRANSFER,
-        ExceptionContinuationArmValueFact, ExceptionRegionSiteFact,
+        ExceptionContinuationArmValueFact, ExceptionHandlerArmValueFact,
+        ExceptionHandlerPhiFact, ExceptionRegionSiteFact,
         ExceptionRegionStateFact,
         ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
         ExceptionTransferFact,
@@ -13654,11 +13657,92 @@ def _source_try_control_programs(
                     "source Try handler class is unresolved: "
                     f"try={try_id}, handler={id(handler)}"
                 )
+            entry_phi_cells = []
+            for phi_row in book.page(SOURCE_EXCEPTION_HANDLER_PHI).rows():
+                phi_fact = book.page(SOURCE_EXCEPTION_HANDLER_PHI).latest(
+                    phi_row
+                )
+                if not isinstance(phi_fact, ExceptionHandlerPhiFact) or (
+                    phi_fact.handler != fact.handler
+                ):
+                    continue
+                source_phi = book.latest_ref(
+                    SOURCE_EXCEPTION_HANDLER_PHI, phi_row,
+                )
+                canonical_phi_id = canonical_from_source(phi_fact.phi)
+                canonical_handler_id = canonical_from_source(phi_fact.handler)
+                canonical_phi = book.latest_ref(
+                    CANONICAL_VALUE, (canonical_scope, canonical_phi_id),
+                )
+                canonical_handler = book.latest_ref(
+                    CANONICAL_VALUE, (canonical_scope, canonical_handler_id),
+                )
+                if (
+                    source_phi is None or canonical_phi is None
+                    or canonical_handler is None or planning_scope is None
+                ):
+                    raise ValueError(
+                        "handler Phi lacks exact forked cells: "
+                        f"handler={id(handler)}, phi={phi_row!r}"
+                    )
+                entry_phi_cells.append(source_phi)
+                for arm_index, (source_transfer, binding) in enumerate(
+                    phi_fact.arms
+                ):
+                    transfer_fact = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                        source_transfer.row, source_transfer.column,
+                    )
+                    if (
+                        not isinstance(transfer_fact, ExceptionTransferFact)
+                        or transfer_fact.catch_try != fact.owner
+                        or dict(transfer_fact.entry_bindings).get(
+                            phi_fact.name
+                        ) != binding
+                    ):
+                        raise ValueError(
+                            "handler Phi arm has a foreign transfer: "
+                            f"phi={phi_row!r}, arm={arm_index}"
+                        )
+                    source_value = source_value_for_binding(
+                        binding, phi_fact.name,
+                    )
+                    canonical_value = book.latest_ref(
+                        CANONICAL_VALUE, (
+                            canonical_scope,
+                            canonical_from_source(source_value),
+                        ),
+                    )
+                    if canonical_value is None:
+                        raise ValueError(
+                            "handler Phi arm lacks a forked value: "
+                            f"phi={phi_row!r}, arm={arm_index}"
+                        )
+                    # Program: `y=1; a=int(x); y=2; b=int(x)` in a
+                    # Try. The handler reads y=1 or y=2 according to
+                    # which Call failed. Each operand keeps that site's
+                    # binding edge, not the final lexical name y.
+                    book.post(
+                        SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+                        (planning_scope, canonical_phi_id, arm_index),
+                        ExceptionHandlerArmValueFact(
+                            source_phi, phi_fact.handler, source_transfer,
+                            binding, source_value, canonical_phi,
+                            canonical_handler, canonical_value,
+                        ),
+                        stage=CONTROL_PROGRAM_BUILD,
+                        provenance=Derived((
+                            source_phi, phi_fact.handler, source_transfer,
+                            binding, source_value, canonical_phi,
+                            canonical_handler, canonical_value,
+                        )),
+                        mode=Mode.CONCORD,
+                    )
             handlers.append(NativeExceptionHandler(
                 arm_body(("handler", index)),
                 canonical_from_source(fact.handler),
                 tuple(canonical_from_source(value)
                       for value, _declaration in fact.declarations),
+                entry_phi_cells=tuple(entry_phi_cells),
             ))
         regions = tuple(dict.fromkeys(
             region for arm_regions in owned.values() for region in arm_regions
