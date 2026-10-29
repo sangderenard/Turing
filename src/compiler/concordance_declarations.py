@@ -59,6 +59,10 @@ CONTRACT_DEMAND = declare_transform("contract_demand", 0)
 SYNTHESIZED_NO_SOURCE = declare_reason("synthesized_no_source")
 EXTERNAL_DECLARATION = declare_reason("external_declaration")
 HELPER_CALLER_UNROUTED = declare_reason("helper_caller_unrouted")
+SOURCE_EXCEPTION_CONTROL_UNLOWERED = declare_reason(
+    "source_exception_control_unlowered"
+)
+EXCEPTION_ADMISSION = declare_stage("exception_admission")
 
 
 # -- facts -------------------------------------------------------------------
@@ -1140,6 +1144,14 @@ SOURCE_CONTROL_SPECIALIZATION = declare_page(
         RowField("function", K.NAME), RowField("control", K.VALUE_ID),
     ), dict,                           # dict | Unresolved(PREDICATE_NOT_KNOWN)
 )
+#: An authored Try that still has a source node owes executable exceptional
+#: control.  The row is keyed by its exact ingestion/canonical identity;
+#: structural precompile posts Unresolved and refuses.  A later exception
+#: lowering must establish executable control and extend this admission rule
+#: explicitly; an arbitrary control-block reference is not discharge proof.
+SOURCE_EXCEPTION_ADMISSION = declare_page("source_exception_admission", (
+    RowField("source_try", K.PAGE_REF),
+), object)
 STRUCTURAL_SPECIALIZATION_FIXED_POINT = declare_page(
     "structural_specialization_fixed_point", (
         RowField("invocation", K.SCOPE), RowField("round", K.INDEX),

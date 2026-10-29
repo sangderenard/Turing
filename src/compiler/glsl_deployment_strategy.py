@@ -34479,6 +34479,61 @@ class ProcessGraphGLSLDeployment(TiledObject):
         structural_ssa_only: bool = False,
     ):
         # Prepare graph/control IR without observing runtime parameter values.
+        # Program: try: y = int(x); except ValueError: y = 2.  On main,
+        # x=NaN emitted a complete C artifact and returned INT64_MIN: the
+        # source Try had an ingestion cell, but no exceptional control block
+        # owned the failed cast.  Rule: an authored Try still present in this
+        # function's graph is an open concordance obligation.  Until an exact
+        # exceptional control cell discharges it, precompile must refuse.
+        graph = self.process_graph
+        if graph is not None:
+            from ..common.tensors.topological_reducer import node_identity_cell
+            from .concordance_declarations import (
+                EXCEPTION_ADMISSION, SOURCE_EXCEPTION_ADMISSION,
+                SOURCE_EXCEPTION_CONTROL_UNLOWERED,
+            )
+            from .identity_concordance import (
+                Derived, Mode, Unresolved, current_identity_book,
+            )
+
+            book = current_identity_book()
+            for node_id, data in graph.G.nodes(data=True):
+                expression = data.get("expr_obj")
+                if not isinstance(expression, (ast.Try, ast.TryStar)) or (
+                    getattr(expression, "_turing_resource_scope", None)
+                ):
+                    continue
+                source_cell = node_identity_cell(graph, int(node_id))
+                row = (source_cell,)
+                if book.page(SOURCE_EXCEPTION_ADMISSION).latest(row) is None:
+                    book.post(
+                        SOURCE_EXCEPTION_ADMISSION, row,
+                        Unresolved(
+                            SOURCE_EXCEPTION_CONTROL_UNLOWERED,
+                            read=(source_cell,),
+                        ),
+                        stage=EXCEPTION_ADMISSION,
+                        provenance=Derived((source_cell,)),
+                        mode=Mode.REVISE,
+                    )
+                admission = book.page(SOURCE_EXCEPTION_ADMISSION).latest(row)
+                if not isinstance(admission, Unresolved) or (
+                    admission.reason != SOURCE_EXCEPTION_CONTROL_UNLOWERED
+                    or admission.read != (source_cell,)
+                ):
+                    raise ValueError(
+                        "source exception admission disagrees with its "
+                        f"source Try: {source_cell!r}"
+                    )
+                raise CompilationSubdivisionRequired(
+                    "authored Try has no concorded exceptional control "
+                    f"owner: source_try={source_cell!r}",
+                    boundaries=({
+                        "kind": "source-exception-control-owner",
+                        "source_try_cell": repr(source_cell),
+                        "source_try_node_id": int(node_id),
+                    },),
+                )
         #
         # ``reduction_cache`` (a ``ReductionArtifactStore``), when given,
         # persists each region program under its own content key as it is

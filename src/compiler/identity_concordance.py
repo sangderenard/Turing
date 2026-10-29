@@ -1551,6 +1551,7 @@ class CorrelationTable:
         found.extend(self._binding_kind_findings(module))
         found.extend(self._name_binding_capture_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
+        found.extend(self._source_exception_admission_findings(module))
         found.extend(self._source_page_declaration_findings(module))
         found.extend(self._graph_work_publication_findings(module))
         found.extend(self._tile_storage_findings(module))
@@ -1918,6 +1919,50 @@ class CorrelationTable:
                 found.append(Finding(
                     "value-type-tag-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_admission_findings(module: Any) -> list[Finding]:
+        """A retained Try needs an exact control owner before artifact emission."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE,
+            SOURCE_EXCEPTION_ADMISSION,
+            SOURCE_EXCEPTION_CONTROL_UNLOWERED,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_ADMISSION.name not in book.pages:
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_ADMISSION)
+        for row in page.rows():
+            source_cell = row[0]
+            admission = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_ADMISSION, row)
+            causes = {
+                source for source, _stage in book.edges_into(receipt)
+            }
+            problem = None
+            if (
+                not isinstance(source_cell, Ref)
+                or source_cell.page not in {INGESTION_VALUE, CANONICAL_VALUE}
+                or causes != {source_cell}
+            ):
+                problem = "exception admission lacks its exact source Try cause"
+            elif isinstance(admission, Unresolved):
+                problem = (
+                    "retained source Try has no executable exceptional control"
+                    if admission.reason == SOURCE_EXCEPTION_CONTROL_UNLOWERED
+                    and admission.read == (source_cell,)
+                    else "exception admission has an invalid unresolved fact"
+                )
+            else:
+                problem = "exception admission claims an unproven discharge"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-admission-disagreement",
+                    str(source_cell), None, problem,
                 ))
         return found
 
