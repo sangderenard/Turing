@@ -380,4 +380,13 @@ def check_group(path, src, inputs, expects, inventory, label=None):
 
 
 if __name__ == "__main__":
-    main()
+    # TYPED_CHECK_NUMERIC_MODE=compute runs the corpus under the compute
+    # numeric contract (transcendentals: backend_intrinsic); unset, the
+    # contract's default mode (scientific: signal_cores) applies.
+    from src.compiler.ssa_call_input_adapters import (
+        active_numeric_mode, numeric_mode_scope,
+    )
+    with numeric_mode_scope(
+        os.environ.get("TYPED_CHECK_NUMERIC_MODE") or active_numeric_mode()
+    ):
+        main()
