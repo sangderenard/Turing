@@ -3387,9 +3387,12 @@ def _planned_scalar_dtypes_from_graph(
             # has op ``delta``); its resolved ``method_ref`` names the callee
             # whose return record types it, exactly as for a plain call.
             method_reference = attributes.get("method_ref")
+            # A method call resolved at ingestion (its receiver's class is
+            # a construction's class row) carries ``callee_ref`` as well;
+            # it is still named by its method, not ``call``.
             if (
-                callee_reference is None
-                and method_reference is not None
+                method_reference is not None
+                and (callee_reference is None or op != "call")
                 and not attributes.get("aggregate_kind")
                 and node_id not in scalar and node_id not in element
             ):
