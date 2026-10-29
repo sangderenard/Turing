@@ -2644,6 +2644,312 @@ class WideExpansionEmitter:
     def constant_expansion(self, parts_, like):
         return [self.scalar_constant(part, like) for part in parts_]
 
+    # -- exact integer expansions -------------------------------------------
+    #
+    # A Python ``int`` past the native width is carried as an expansion
+    # whose limbs are integer-valued binary64 values (high first).  Sums,
+    # differences and products of integers are integers, and so are the
+    # error terms ``two_sum``/``two_product`` return, so the expansion
+    # arithmetic above stays on integers and is exact while the result fits
+    # the width; ``renormalise_exact`` says when it does not.  Floor
+    # division, the floor modulus and the int64 boundary are spelled below
+    # from the same primitives plus ``Floor`` of a double, which is exact.
+
+    def _typed_constant(self, number, dtype: str, like):
+        """A rank-0 constant of ``dtype`` (``like`` supplies its cells)."""
+
+        result = SSAValue(
+            self._mint(
+                self.function, self._constant_kind, (like,),
+                dtype=dtype, shape=(), stage=self._stage,
+            ),
+            dtype=dtype, shape=(), device=like.device,
+        )
+        integral = str(dtype).startswith(("int", "uint"))
+        self.emitted.append(Instr("Const", [], result, attributes={
+            "value": int(number) if integral else float(number),
+            **({} if integral else {"constant": float(number)}),
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.integer_constant",
+        }))
+        self.known_scalar_ids.add(int(result.id))
+        return result
+
+    def _typed(self, op, args, like, dtype: str):
+        """``put`` with a stated result dtype (a conversion's target)."""
+
+        result = SSAValue(
+            self._mint(
+                self.function, self._limb_kind, tuple(args),
+                dtype=dtype, shape=(), stage=self._stage,
+            ),
+            dtype=dtype, shape=(), device=like.device,
+        )
+        self.emitted.append(Instr(op, list(args), result, attributes={
+            PRECISION_SECTION_ATTRIBUTE: True,
+            "lowered_from": "precision.integer_conversion",
+        }))
+        return result
+
+    def renormalise_exact(self, terms, width: int):
+        """``renormalise`` plus a test that no part of the sum was lost.
+
+        Distillation keeps the sum exactly in ``kept + leftovers``; the
+        leftovers are what ``width`` limbs had no room for.  Each is folded
+        into the last limb through ``two_sum``, and a non-zero error there
+        is a part of the value the expansion no longer holds.  Returns
+        ``(limbs, inexact)``; ``inexact`` is a ``bool`` value, or ``None``
+        when nothing was left over (exact by construction).
+        """
+
+        rest = list(terms)
+        if not rest:
+            raise ValueError("cannot renormalise an empty expansion")
+        kept = []
+        for _index in range(int(width)):
+            if not rest:
+                break
+            carry = rest[-1]
+            tail = [None] * (len(rest) - 1)
+            for position in range(len(rest) - 2, -1, -1):
+                carry, tail[position] = self.two_sum(rest[position], carry)
+            kept.append(carry)
+            rest = tail
+        while len(kept) < int(width):
+            kept.append(self.zero(kept[-1]))
+        inexact = None
+        for leftover in rest:
+            kept[-1], lost = self.two_sum(kept[-1], leftover)
+            test = self.compare("Ne", lost, self.scalar_constant(0.0, lost))
+            inexact = test if inexact is None else self._any(inexact, test)
+        return kept, inexact
+
+    def _join_inexact(self, *tests):
+        present = [test for test in tests if test is not None]
+        if not present:
+            return None
+        return present[0] if len(present) == 1 else self._any(*present)
+
+    def integer_from_int64(self, value, width: int):
+        """An int64 as an exact integer expansion of ``width`` limbs.
+
+        ``value & (2**32 - 1)`` and ``value`` minus it are each exactly a
+        double (32 and at most 32 significant bits), so their two
+        conversions are exact and one ``two_sum`` makes them an expansion.
+        No int64 operation here can overflow: the difference rounds
+        ``value`` down to a multiple of 2**32, which int64 holds.
+        """
+
+        if int(width) < 2:
+            raise ValueError("an int64 needs at least two binary64 limbs")
+        mask = self._typed_constant((1 << 32) - 1, "int64", value)
+        low_bits = self.put("BitAnd", (value, mask), value)
+        high_bits = self.put("Sub", (value, low_bits), value)
+        high = self._typed("SiToFp", (high_bits,), value, "float64")
+        low = self._typed("SiToFp", (low_bits,), value, "float64")
+        head, tail = self.two_sum(high, low)
+        return [head, tail, *(self.zero(head) for _ in range(int(width) - 2))]
+
+    def integer_to_int64(self, expansion, like_int):
+        """An integer expansion as an int64, and where int64 cannot hold it.
+
+        Returns ``(value, outside)``.  ``outside`` is true where the
+        expansion's integer is outside int64; the value there is 0 (the pass
+        lowering the conversion reports ``INT_OVERFLOW``).  Each limb ``l``
+        (at most 2**64 in magnitude once the head is) splits exactly as
+        ``a * 2**32 + b`` with ``a = floor(l / 2**32)``, ``0 <= b < 2**32``;
+        the sums of the ``a`` and of the ``b`` are exact doubles, the ``b``
+        carry above 2**32 moves into ``a``, and the int64 is ``a * 2**32 +
+        b`` exactly when ``-2**31 <= a < 2**31``.  ``like_int`` is an int64
+        value the result's cells derive from.
+        """
+
+        head = expansion[0]
+        zero = self.scalar_constant(0.0, head)
+        in_reach = self.compare(
+            "Le", self.put("Abs", (head,), head),
+            self.scalar_constant(2.0 ** 64, head),
+        )
+        limbs = [self.select(in_reach, limb, zero) for limb in expansion]
+        scale_down = self.scalar_constant(2.0 ** -32, head)
+        scale_up = self.scalar_constant(2.0 ** 32, head)
+
+        def split(value):
+            high = self.put(
+                "Floor", (self.put("Mul", (value, scale_down), value),), value,
+            )
+            low = self.put(
+                "Sub", (value, self.put("Mul", (high, scale_up), value)), value,
+            )
+            return high, low
+
+        pieces = [split(limb) for limb in limbs]
+        high_sum = self.sum_expansion([high for high, _low in pieces])
+        carry, low_word = split(self.sum_expansion([low for _high, low in pieces]))
+        high_word = self.put("Add", (high_sum, carry), high_sum)
+        fits = self._all(
+            in_reach,
+            self.compare(
+                "Ge", high_word, self.scalar_constant(-(2.0 ** 31), head),
+            ),
+            self.compare(
+                "Lt", high_word, self.scalar_constant(2.0 ** 31, head),
+            ),
+        )
+        high_word = self.select(fits, high_word, zero)
+        low_word = self.select(fits, low_word, zero)
+        high_int = self._typed("FpToSi", (high_word,), like_int, "int64")
+        low_int = self._typed("FpToSi", (low_word,), like_int, "int64")
+        word = self._typed_constant(1 << 32, "int64", like_int)
+        value = self.put(
+            "Add", (self.put("Mul", (high_int, word), high_int), low_int),
+            high_int,
+        )
+        return value, self._not(fits)
+
+    def _integer_sign_tests(self, expansion):
+        """``(negative, positive, unsure)`` of an integer expansion.
+
+        One distillation can leave a head of the wrong sign after heavy
+        cancellation (``[2**63, -2, -2**63, 1]`` distils to ``[0, ...]``
+        with a total of -1).  The expansion is distilled once more, and the
+        sign is the head's only where every limb dominates the next by
+        2**49 -- then the tail cannot outweigh the head.  ``unsure`` is
+        true where that does not hold; a caller treats it as a result it
+        cannot vouch for (``inexact``), never as a sign.
+        """
+
+        limbs = self.renormalise(list(expansion), len(expansion))
+        head = limbs[0]
+        zero = self.scalar_constant(0.0, head)
+        margin = self.scalar_constant(2.0 ** 49, head)
+        dominated = [
+            self.compare(
+                "Le",
+                self.put("Mul", (self.put("Abs", (lower,), lower), margin),
+                         lower),
+                self.put("Abs", (upper,), upper),
+            )
+            for upper, lower in zip(limbs, limbs[1:])
+        ]
+        unsure = self._not(self._all(*dominated)) if dominated else None
+        return (
+            self.compare("Lt", head, zero),
+            self.compare("Gt", head, zero),
+            unsure,
+        )
+
+    def _integer_floor_tests(self, remainder, divisor, divisor_negative,
+                             working: int):
+        """Where ``remainder`` is below, or at or past, Python's floor range.
+
+        Python's remainder has the divisor's sign and is smaller than it in
+        magnitude.  Returns ``(below, at_or_past, beyond, unsure, lost)``:
+        ``below`` -- on the far side of zero from the divisor (one divisor
+        too few was taken); ``at_or_past`` -- ``remainder - divisor`` is on
+        the divisor's side of zero or zero (one too many is left);
+        ``beyond`` is that difference.
+        """
+
+        negative, positive, unsure = self._integer_sign_tests(remainder)
+        below = self._select_bool(divisor_negative, positive, negative)
+        beyond, lost = self.renormalise_exact(
+            [*remainder, *self._negated(divisor)], working,
+        )
+        past_negative, past_positive, past_unsure = (
+            self._integer_sign_tests(beyond)
+        )
+        at_or_past = self._select_bool(
+            divisor_negative, self._not(past_positive),
+            self._not(past_negative),
+        )
+        return (
+            below, at_or_past, beyond,
+            self._join_inexact(unsure, past_unsure), lost,
+        )
+
+    def integer_divmod(self, left, right, width: int):
+        """Python's ``left // right`` and ``left % right`` on integer expansions.
+
+        Returns ``(quotient, remainder, zero_divisor, inexact)``: both
+        results as ``width`` limbs; ``zero_divisor`` is true where
+        ``right == 0`` (Python raises ``ZeroDivisionError``; those lanes
+        compute on the divisor 1); ``inexact`` is true where the results
+        cannot be vouched for -- a part did not fit ``width`` limbs, or the
+        final floor check could not be decided -- and a caller reports it.
+
+        Each step takes the quotient digit ``floor(lead(r) / lead(right))``
+        -- an integer double -- and subtracts ``digit * right`` exactly
+        (``two_product`` of integers), so the remainder stays the exact
+        integer ``left - q * right`` while each step removes about fifty of
+        its bits.  The remainder then lies within a divisor of Python's;
+        two corrections move it into Python's floor range, and a last check
+        confirms it is there.
+        """
+
+        width = int(width)
+        working = width + 2
+        divisor = self.renormalise(list(right), len(right))
+        divisor_head = divisor[0]
+        zero = self.scalar_constant(0.0, divisor_head)
+        one = self.scalar_constant(1.0, divisor_head)
+        minus_one = self.scalar_constant(-1.0, divisor_head)
+        zero_divisor = self.compare("Eq", divisor_head, zero)
+        divisor = [
+            self.select(zero_divisor, one if index == 0 else zero, limb)
+            for index, limb in enumerate(divisor)
+        ]
+        divisor_lead = self.lead(divisor)
+        divisor_negative, _positive, divisor_unsure = (
+            self._integer_sign_tests(divisor)
+        )
+        remainder, inexact = self.renormalise_exact(list(left), working)
+        inexact = self._join_inexact(inexact, divisor_unsure)
+        digits = []
+        for _step in range(53 * max(len(left), width) // 50 + 2):
+            digit = self.put("Floor", (self.put(
+                "Div", (self.lead(remainder), divisor_lead), divisor_lead,
+            ),), divisor_lead)
+            digits.append(digit)
+            products = []
+            for limb in divisor:
+                products.extend(self._negated(self.two_product(digit, limb)))
+            remainder, lost = self.renormalise_exact(
+                [*remainder, *products], working,
+            )
+            inexact = self._join_inexact(inexact, lost)
+        for _round in range(2):
+            # A sign this round cannot vouch for only misplaces a
+            # correction; the check after the rounds catches it.
+            below, _past, _beyond, _unsure, _lost = self._integer_floor_tests(
+                remainder, divisor, divisor_negative, working,
+            )
+            raised, lost_raised = self.renormalise_exact(
+                [*remainder, *divisor], working,
+            )
+            remainder = self._select_expansion(below, raised, remainder)
+            digits.append(self.select(below, minus_one, zero))
+            _below, at_or_past, beyond, _unsure, lost_beyond = (
+                self._integer_floor_tests(
+                    remainder, divisor, divisor_negative, working,
+                )
+            )
+            remainder = self._select_expansion(at_or_past, beyond, remainder)
+            digits.append(self.select(at_or_past, one, zero))
+            inexact = self._join_inexact(
+                inexact, lost_raised, lost_beyond,
+            )
+        below, at_or_past, _beyond, unsure, lost = self._integer_floor_tests(
+            remainder, divisor, divisor_negative, working,
+        )
+        quotient, lost_quotient = self.renormalise_exact(digits, width)
+        remainder, lost_remainder = self.renormalise_exact(remainder, width)
+        inexact = self._join_inexact(
+            inexact, unsure, lost, self._any(below, at_or_past),
+            lost_quotient, lost_remainder,
+        )
+        return quotient, remainder, zero_divisor, inexact
+
     # -- transcendental expansions ------------------------------------------
 
     def sqrt_expansion(self, source, width: int):
