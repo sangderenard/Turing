@@ -158,7 +158,7 @@ from .control_source import (
     LoopControlBlock,
     LoopBlock,
     NativeTryBlock,
-    NativeRaiseBlock,
+    NativeAssertBlock,
     ParallelDeployment,
     SequenceBlock,
     SequenceMutationBlock,
@@ -13111,12 +13111,12 @@ class _ControlSSABuilder(TiledObject):
         if isinstance(block, NativeTryBlock):
             self.lower_native_try(block, path=path)
             return
-        if isinstance(block, NativeRaiseBlock):
-            # The source transfer identifies the catch and unwind path, but
-            # there is no SSA status edge for this authored Raise yet.
+        if isinstance(block, NativeAssertBlock):
+            # Both `assert predicate` and `raise` (predicate=false) need one
+            # exceptional SSA status edge backed by this source transfer.
             self.shortfalls.append(SSALoweringShortfall(
-                "control", "native_raise", path,
-                f"authored Raise has no executable status edge: "
+                "control", "native_assert", path,
+                f"authored exceptional check has no executable status edge: "
                 f"transfer={block.transfer_cell!r}",
             ))
             return

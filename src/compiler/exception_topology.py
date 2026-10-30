@@ -16,6 +16,7 @@ from .concordance_declarations import (
     ExceptionHandlerPhiFact, ExceptionStatusRouteFact,
     ExceptionSiteStateFact, ExceptionTransferFact,
     canonical_python_subtype_identities, concorded_native_status_classes,
+    ensure_builtin_class_topology,
 )
 from .identity_concordance import Derived, Mode, Ref, current_identity_book
 from .native_faults import authored_raise_status
@@ -85,9 +86,9 @@ def post_source_exception_transfers(
             raise ValueError(f"exception site has no exact state: {row!r}")
         source_id = int(row[1])
         expression = syntax.get(source_id)
-        if not isinstance(expression, (ast.Call, ast.Raise)):
+        if not isinstance(expression, (ast.Call, ast.Raise, ast.Assert)):
             raise ValueError(
-                "exception site has no authored call or raise: "
+                "exception site has no authored call, raise or assert: "
                 f"source={source_id}"
             )
         source = site.source
@@ -134,15 +135,26 @@ def post_source_exception_transfers(
             owner for owner, arm, _handler, has_finally in reversed(crossed)
             if has_finally and arm != "finalbody"
         ))
-        raised_class = (
-            _raised_class_definition(graph, ingestion_scope, expression)
-            if isinstance(expression, ast.Raise) else None
-        )
+        raised_class = None
+        if isinstance(expression, ast.Raise):
+            raised_class = _raised_class_definition(
+                graph, ingestion_scope, expression,
+            )
+        elif isinstance(expression, ast.Assert):
+            ensure_builtin_class_topology(book)
+            raised_class = book.latest_ref(
+                STATIC_SYMBOL_DEFINITION, ("builtins", "AssertionError", ""),
+            )
+            if raised_class is None:
+                raise ValueError(
+                    f"authored Assert lacks AssertionError class: {source_id}"
+                )
         fact = ExceptionTransferFact(
             source,
             "reraise" if isinstance(expression, ast.Raise)
             and expression.exc is None else
-            "raise" if isinstance(expression, ast.Raise) else "call",
+            "raise" if isinstance(expression, ast.Raise) else
+            "assert" if isinstance(expression, ast.Assert) else "call",
             catch_try, tuple(scopes), unwind, raised_class,
             site.bindings,
         )
@@ -309,19 +321,19 @@ def post_source_exception_transfers(
             )
 
     # A protected Call or reraise can return any catchable native status;
-    # its actual code is selected at runtime. An authored Raise with an
-    # exact static class has only that class's status. Both paths select
-    # handlers through the same ordered declaration cells.
+    # its actual code is selected at runtime. Authored Raise and Assert have
+    # an exact static class and one status. All paths select handlers through
+    # the same ordered declaration cells.
     concorded_native_status_classes(book)
     status_page = book.page(NATIVE_STATUS_CLASS)
     handler_page = book.page(SOURCE_EXCEPTION_HANDLER_CLASS)
     for transfer_row in transfer_page.scope_rows(ingestion_scope):
         transfer = transfer_page.latest(transfer_row)
-        if transfer.source_kind == "raise" and (
+        if transfer.source_kind in {"raise", "assert"} and (
             transfer.raised_class_definition is None
         ):
             continue
-        if transfer.source_kind == "raise":
+        if transfer.source_kind in {"raise", "assert"}:
             raised_identity = ".".join(
                 transfer.raised_class_definition.row[:2]
             )
@@ -355,7 +367,7 @@ def post_source_exception_transfers(
                 raise ValueError(
                     f"exception status has no class: {transfer_row!r}, {status}"
                 )
-            if transfer.source_kind == "raise" and (
+            if transfer.source_kind in {"raise", "assert"} and (
                 definition != transfer.raised_class_definition
             ):
                 raise ValueError(

@@ -1553,7 +1553,7 @@ class CorrelationTable:
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_exception_site_state_findings(module))
         found.extend(self._source_exception_transfer_findings(module))
-        found.extend(self._source_exception_raise_control_findings(module))
+        found.extend(self._source_exception_assert_control_findings(module))
         found.extend(self._source_exception_handler_class_findings(module))
         found.extend(self._source_exception_status_route_findings(module))
         found.extend(self._source_exception_region_site_findings(module))
@@ -2088,7 +2088,7 @@ class CorrelationTable:
                 ))
                 if transfer.catch_try != catch or transfer.unwind_finally != unwind:
                     problem = "exception catch or unwind disagrees with scopes"
-                elif transfer.source_kind not in {"call", "raise", "reraise"}:
+                elif transfer.source_kind not in {"call", "raise", "reraise", "assert"}:
                     problem = "exception transfer has unknown source kind"
                 else:
                     causes = {
@@ -2114,8 +2114,8 @@ class CorrelationTable:
         return found
 
     @staticmethod
-    def _source_exception_raise_control_findings(module: Any) -> list[Finding]:
-        """A native Raise block must cite its authored transfer as a site."""
+    def _source_exception_assert_control_findings(module: Any) -> list[Finding]:
+        """A native exceptional check cites its exact authored transfer."""
         from .concordance_declarations import (
             CANONICAL_VALUE, CONTROL_BLOCK, SOURCE_EXCEPTION_TRANSFER,
             ControlBlockFact, ControlBlockKind,
@@ -2129,7 +2129,7 @@ class CorrelationTable:
         for row in book.page(CONTROL_BLOCK).rows():
             fact = book.page(CONTROL_BLOCK).latest(row)
             if not isinstance(fact, ControlBlockFact) or (
-                fact.kind is not ControlBlockKind.NATIVE_RAISE
+                fact.kind is not ControlBlockKind.NATIVE_ASSERT
             ):
                 continue
             sites = fact.sites
@@ -2140,14 +2140,25 @@ class CorrelationTable:
                 and sites[0].page == SOURCE_EXCEPTION_TRANSFER else None
             )
             if not isinstance(transfer, ExceptionTransferFact) or (
-                transfer.source_kind not in {"raise", "reraise"}
+                transfer.source_kind not in {"raise", "reraise", "assert"}
             ):
                 found.append(Finding(
-                    "source-exception-raise-control-disagreement",
+                    "source-exception-assert-control-disagreement",
                     str(row), None,
-                    "native Raise block lacks its exact authored transfer",
+                    "exception check lacks its exact authored transfer",
                 ))
                 continue
+            if (
+                transfer.source_kind == "assert" and fact.predicate is None
+            ) or (
+                transfer.source_kind in {"raise", "reraise"}
+                and fact.predicate is not None
+            ):
+                found.append(Finding(
+                    "source-exception-assert-control-disagreement",
+                    str(row), None,
+                    "exception check predicate disagrees with source kind",
+                ))
             pending = [row[2]]
             ancestors = set()
             while pending:
@@ -2161,9 +2172,9 @@ class CorrelationTable:
                     )
             if transfer.source not in ancestors:
                 found.append(Finding(
-                    "source-exception-raise-control-disagreement",
+                    "source-exception-assert-control-disagreement",
                     str(row), None,
-                    "native Raise owner has no exact source transfer origin",
+                    "exception check owner has no exact source origin",
                 ))
         return found
 
@@ -2253,7 +2264,7 @@ class CorrelationTable:
             transfer = transfers.latest(transfer_row)
             if not isinstance(transfer, ExceptionTransferFact):
                 continue
-            if transfer.source_kind == "raise":
+            if transfer.source_kind in {"raise", "assert"}:
                 identity = (
                     None if transfer.raised_class_definition is None
                     else ".".join(transfer.raised_class_definition.row[:2])
@@ -2287,14 +2298,14 @@ class CorrelationTable:
             if (
                 not isinstance(route, ExceptionStatusRouteFact)
                 or not isinstance(transfer, ExceptionTransferFact)
-                or transfer.source_kind not in {"call", "raise", "reraise"}
+                or transfer.source_kind not in {"call", "raise", "reraise", "assert"}
                 or route.transfer != transfer_cell
                 or route.status_class != status_class
                 or status_page.latest((row[2],)) is None
                 or route.owner != transfer.catch_try
                 or route.unwind_finally != transfer.unwind_finally
                 or (
-                    transfer.source_kind == "raise"
+                    transfer.source_kind in {"raise", "assert"}
                     and (
                         transfer.raised_class_definition is None
                         or status_page.latest((row[2],))

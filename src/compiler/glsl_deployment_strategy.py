@@ -12824,17 +12824,17 @@ def _authored_arm_return_control(
     )
 
 
-def _authored_arm_raise_control(
+def _authored_arm_exception_check(
     graph: Any, statements: Sequence[ast.stmt],
 ) -> Any:
-    """Retain an authored Raise as its own control consequence."""
+    """Retain an authored assert or raise as one exceptional check."""
 
-    if not statements or not isinstance(statements[-1], ast.Raise):
+    if not statements or not isinstance(statements[-1], (ast.Assert, ast.Raise)):
         return None
     from .concordance_declarations import (
-        CANONICAL_VALUE, SOURCE_EXCEPTION_TRANSFER,
+        CANONICAL_VALUE, INGESTION_VALUE, SOURCE_EXCEPTION_TRANSFER,
     )
-    from .control_source import NativeRaiseBlock
+    from .control_source import NativeAssertBlock
     from .identity_concordance import current_identity_book
 
     statement = statements[-1]
@@ -12843,7 +12843,7 @@ def _authored_arm_raise_control(
         row for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
         if int(row[1]) == id(statement)
         and book.page(SOURCE_EXCEPTION_TRANSFER).latest(row).source_kind
-        in {"raise", "reraise"}
+        in {"raise", "reraise", "assert"}
     )
     matches = []
     for row in transfer_rows:
@@ -12885,15 +12885,60 @@ def _authored_arm_raise_control(
             if canonical in reached
             and int(canonical_row[1]) in graph.G
             and isinstance(graph.G.nodes[int(canonical_row[1])].get(
-                "expr_obj"), ast.Raise)
+                "expr_obj"), type(statement))
         ))
         matches.extend((node_id, transfer_cell) for node_id in canonical_ids)
     if len(matches) != 1 or matches[0][1] is None:
         raise ValueError(
-            "authored Raise has no unique source transfer: "
+            "authored exceptional check has no unique source transfer: "
             f"source={id(statement)}, matches={matches!r}"
         )
-    return NativeRaiseBlock(*matches[0])
+    predicate_id = None
+    if isinstance(statement, ast.Assert):
+        direct_test = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if data.get("expr_obj") is statement.test
+        )
+        if direct_test:
+            candidates = direct_test
+        else:
+            transfer = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                matches[0][1].row, matches[0][1].column,
+            )
+            test_source = book.latest_ref(
+                INGESTION_VALUE,
+                (transfer.source.row[0], id(statement.test)),
+            )
+            if test_source is None:
+                raise ValueError(
+                    f"authored Assert has no exact test cell: {id(statement)}"
+                )
+            successors = {}
+            for canonical_row in book.page(CANONICAL_VALUE).rows():
+                canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+                for cause, _stage in book.edges_into(canonical):
+                    successors.setdefault(cause, set()).add(canonical)
+            pending = [test_source]
+            reached = set()
+            while pending:
+                source_cell = pending.pop()
+                if source_cell in reached:
+                    continue
+                reached.add(source_cell)
+                pending.extend(successors.get(source_cell, ()))
+            candidates = tuple(
+                int(row[1]) for row in book.page(CANONICAL_VALUE).rows()
+                if row[0] == graph.G.graph.get("lexical_read_scope")
+                and book.latest_ref(CANONICAL_VALUE, row) in reached
+                and int(row[1]) in graph.G
+            )
+        if len(candidates) != 1:
+            raise ValueError(
+                "authored Assert has no unique retained test: "
+                f"source={id(statement.test)}, candidates={candidates!r}"
+            )
+        predicate_id = candidates[0]
+    return NativeAssertBlock(*matches[0], predicate_id)
 
 
 def _ordinary_conditional_control_programs(
@@ -13194,7 +13239,7 @@ def _ordinary_conditional_control_programs(
             return _authored_arm_return_control(
                 graph, statements, return_slot_values,
                 inside_loop=inside_loop,
-            ) or _authored_arm_raise_control(graph, statements)
+            ) or _authored_arm_exception_check(graph, statements)
 
         body_return_control = (
             arm_return_control(body_statements)
@@ -13716,16 +13761,16 @@ def _source_try_control_programs(
             key: tuple[str, int], statements: Sequence[ast.stmt],
         ) -> SequenceBlock:
             arm_regions = tuple(owned.get(key, ()))
-            raises = tuple(
+            checks = tuple(
                 statement for statement in statements
-                if isinstance(statement, ast.Raise)
+                if isinstance(statement, (ast.Assert, ast.Raise))
             )
-            if raises:
-                # A Raise is an exit at its authored site. Put each region
-                # before or after that exit using its source span; refuse a
-                # region crossing the boundary instead of moving work past it.
+            if checks:
+                # Assert can fail and Raise always fails. Place their checks
+                # at the authored site, between regions divided by that
+                # source-control frontier.
                 buckets: dict[int, list[Any]] = {
-                    index: [] for index in range(len(raises) + 1)
+                    index: [] for index in range(len(checks) + 1)
                 }
                 for region in arm_regions:
                     positions = tuple(
@@ -13743,7 +13788,7 @@ def _source_try_control_programs(
                     )
                     if not positions:
                         raise ValueError(
-                            "source Raise arm has an unpositioned region: "
+                            "exception check arm has an unpositioned region: "
                             f"try={try_id}, region={region}"
                         )
                     start = min((line, column)
@@ -13751,30 +13796,30 @@ def _source_try_control_programs(
                                 in positions)
                     end = max((line, column)
                               for _line, _column, line, column in positions)
-                    for statement in raises:
+                    for statement in checks:
                         raise_end = (int(statement.end_lineno),
                                      int(statement.end_col_offset))
                         if start <= raise_end and end > raise_end:
                             raise ValueError(
-                                "deployment region crosses source Raise: "
+                                "deployment region crosses exception check: "
                                 f"try={try_id}, region={region}"
                             )
                     bucket = sum(
                         start > (int(statement.end_lineno),
                                  int(statement.end_col_offset))
-                        for statement in raises
+                        for statement in checks
                     )
                     buckets[bucket].append(StatementBlock((
                         f"__scheduled_region_{region}__",
                     )))
                 children = tuple(
                     child
-                    for index in range(len(raises) + 1)
+                    for index in range(len(checks) + 1)
                     for child in (
                         *buckets[index],
-                        *((_authored_arm_raise_control(
-                            graph, (raises[index],),
-                        ),) if index < len(raises) else ()),
+                        *((_authored_arm_exception_check(
+                            graph, (checks[index],),
+                        ),) if index < len(checks) else ()),
                     )
                 )
             else:
@@ -15144,7 +15189,7 @@ def _control_partition_keys(
         )
         for control_id, data in graph.G.nodes(data=True)
         for expression in (data.get("expr_obj"),)
-        if isinstance(expression, (ast.If, ast.Raise))
+        if isinstance(expression, (ast.If, ast.Assert, ast.Raise))
     )
     branch_frontiers_by_node: dict[int, list[int]] = {}
     for control_id, end_position in ordinary_control_frontiers:
@@ -35249,7 +35294,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
         # exceptional control cell discharges it, precompile must refuse.
         graph = self.process_graph
         pending_source_tries = []
-        pending_source_raises = []
+        pending_source_checks = []
         if graph is not None:
             from ..common.tensors.topological_reducer import node_identity_cell
             from .concordance_declarations import (
@@ -35297,28 +35342,30 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 source_id = int(row[1])
                 if (
                     not isinstance(transfer, ExceptionTransferFact)
-                    or transfer.source_kind not in {"raise", "reraise"}
+                    or transfer.source_kind not in {"raise", "reraise", "assert"}
                     or source_id not in graph.G
                     or not isinstance(
-                        graph.G.nodes[source_id].get("expr_obj"), ast.Raise,
+                        graph.G.nodes[source_id].get("expr_obj"),
+                        (ast.Raise, ast.Assert),
                     )
                 ):
                     continue
                 source_cell = node_identity_cell(graph, source_id)
                 if source_cell != transfer.source:
                     raise ValueError(
-                        "retained Raise disagrees with its source transfer: "
-                        f"raise={source_id}, transfer={row!r}"
+                        "retained exception check disagrees with its source transfer: "
+                        f"source={source_id}, transfer={row!r}"
                     )
                 admission_row = (source_cell,)
                 if book.page(SOURCE_EXCEPTION_ADMISSION).latest(
                     admission_row
                 ) is None:
-                    # Program: `raise ValueError('bad')` without a Try.
+                    # Program: `raise ValueError('bad')` or `assert ready`
+                    # without a Try.
                     # Wrong artifact: the native lane emitted validation
                     # code 3, which the runtime raised as RuntimeError.
-                    # Rule: an authored Raise needs its own exact executable
-                    # status route before any artifact is admitted.
+                    # Rule: an authored exceptional check needs its exact
+                    # executable status route before any artifact is admitted.
                     book.post(
                         SOURCE_EXCEPTION_ADMISSION, admission_row,
                         Unresolved(
@@ -35337,14 +35384,15 @@ class ProcessGraphGLSLDeployment(TiledObject):
                     or admission.read != (source_cell,)
                 ):
                     raise ValueError(
-                        "source Raise admission disagrees with its source: "
+                        "source exception check admission disagrees with its source: "
                         f"{source_cell!r}"
                     )
-                pending_source_raises.append((source_id, source_cell))
+                pending_source_checks.append((source_id, source_cell))
         def refuse_unadmitted_source_exceptions() -> None:
-            if not pending_source_tries and not pending_source_raises:
+            if not pending_source_tries and not pending_source_checks:
                 return
-            # Every retained Try and Raise is posted before this refusal.
+            # Every retained Try and authored exceptional check is posted
+            # before this refusal.
             # Planning can construct the Try control tree, but only an
             # executable SSA status route may revise the admission rows.
             boundaries = tuple({
@@ -35353,15 +35401,15 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 "source_try_node_id": node_id,
             } for node_id, source_cell in pending_source_tries)
             boundaries += tuple({
-                "kind": "source-raise-control-owner",
-                "source_raise_cell": repr(source_cell),
-                "source_raise_node_id": node_id,
-            } for node_id, source_cell in pending_source_raises)
+                "kind": "source-exception-check-owner",
+                "source_check_cell": repr(source_cell),
+                "source_check_node_id": node_id,
+            } for node_id, source_cell in pending_source_checks)
             raise CompilationSubdivisionRequired(
                 "authored exceptional control has no executable status "
                 "route: "
                 f"source_tries={tuple(cell for _, cell in pending_source_tries)!r}, "
-                f"source_raises={tuple(cell for _, cell in pending_source_raises)!r}",
+                f"source_checks={tuple(cell for _, cell in pending_source_checks)!r}",
                 boundaries=boundaries,
             )
         #

@@ -8625,7 +8625,7 @@ def _normalize_lexical_values(
         )
 
     def capture_exception_site(expression: ast.AST) -> None:
-        """Publish demanded lexical versions before a call or raise finishes."""
+        """Publish lexical versions before a fallible source site finishes."""
 
         source_id = id(expression)
         if source_id not in graph.G:
@@ -18788,7 +18788,7 @@ def _normalize_lexical_values(
         for child in source_child_nodes(body_statement):
             if isinstance(child, ast.expr):
                 resolve_expression(child)
-        if isinstance(body_statement, ast.Raise):
+        if isinstance(body_statement, (ast.Raise, ast.Assert)):
             capture_exception_site(body_statement)
         return id(body_statement) if id(body_statement) in graph.G else None
 

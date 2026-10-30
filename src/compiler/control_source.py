@@ -572,11 +572,12 @@ class NativeTryBlock(TiledObject):
 
 
 @dataclass(frozen=True)
-class NativeRaiseBlock(TiledObject):
-    """An authored abrupt exit, owned by its exact source transfer."""
+class NativeAssertBlock(TiledObject):
+    """An exceptional predicate check; Raise uses constant false."""
 
-    source_raise_node_id: int
+    source_node_id: int
     transfer_cell: Any
+    predicate_value_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -736,7 +737,7 @@ ControlBlock = (
     | ResourceScopeBlock
     | ExternalReferenceCallBlock
     | NativeTryBlock
-    | NativeRaiseBlock
+    | NativeAssertBlock
     | ValidationBlock
     | SequenceMutationBlock
     | SequenceQueryBlock
@@ -1039,7 +1040,7 @@ def _control_block_kind(block: Any) -> Any:
         ResourceScopeBlock: Kind.RESOURCE_SCOPE,
         ExternalReferenceCallBlock: Kind.EXTERNAL_REFERENCE_CALL,
         NativeTryBlock: Kind.NATIVE_TRY,
-        NativeRaiseBlock: Kind.NATIVE_RAISE,
+        NativeAssertBlock: Kind.NATIVE_ASSERT,
         ValidationBlock: Kind.VALIDATION,
         SequenceMutationBlock: Kind.SEQUENCE_MUTATION,
         SequenceQueryBlock: Kind.SEQUENCE_QUERY,
@@ -1263,8 +1264,9 @@ def _describe_control_block(
             int(handler.source_handler_node_id)
             for handler in block.handlers
         )
-    elif isinstance(block, NativeRaiseBlock):
-        owner = cell(block.source_raise_node_id)
+    elif isinstance(block, NativeAssertBlock):
+        owner = cell(block.source_node_id)
+        predicate = cell(block.predicate_value_id)
         sites = (block.transfer_cell,)
     elif isinstance(block, ValidationBlock):
         owner = predicate = cell(block.predicate_value_id)
@@ -5201,7 +5203,7 @@ __all__ = [
     "ExternalReferenceCallBlock",
     "NativeExceptionHandler",
     "NativeTryBlock",
-    "NativeRaiseBlock",
+    "NativeAssertBlock",
     "DispatchBlock",
     "ResourceScopeBlock",
     "ValidationBlock",

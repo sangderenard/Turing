@@ -3047,7 +3047,7 @@ class ControlBlockKind(Enum):
     RESOURCE_SCOPE = "resource_scope"
     EXTERNAL_REFERENCE_CALL = "external_reference_call"
     NATIVE_TRY = "native_try"
-    NATIVE_RAISE = "native_raise"
+    NATIVE_ASSERT = "native_assert"
     VALIDATION = "validation"
     SEQUENCE_MUTATION = "sequence_mutation"
     SEQUENCE_QUERY = "sequence_query"

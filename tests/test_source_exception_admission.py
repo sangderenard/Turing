@@ -334,8 +334,8 @@ def root(x: int) -> int:
     finally:
         end_identity_book(token)
     boundary, = error.value.to_failure_mapping()["subdivision_boundaries"]
-    assert boundary["kind"] == "source-raise-control-owner"
-    assert boundary["source_raise_cell"] == repr(source_cell)
+    assert boundary["kind"] == "source-exception-check-owner"
+    assert boundary["source_check_cell"] == repr(source_cell)
 
 
 def test_every_retained_try_has_an_admission_obligation():
@@ -906,7 +906,7 @@ def root(x: int) -> int:
 """
     from src.compiler import glsl_deployment_strategy as strategy
     from src.compiler.control_source import (
-        LoopControlBlock, NativeRaiseBlock, NativeTryBlock,
+        LoopControlBlock, NativeAssertBlock, NativeTryBlock,
     )
 
     observed = []
@@ -953,18 +953,21 @@ def root(x: int) -> int:
         assert transfer.source_kind == "raise"
         raise_block, = tuple(
             child for child in retained_try.body.blocks
-            if isinstance(child, NativeRaiseBlock)
+            if isinstance(child, NativeAssertBlock)
         )
-        assert raise_block.source_raise_node_id == raise_id
+        assert raise_block.source_node_id == raise_id
         assert raise_block.transfer_cell == transfer_cell
         raise_control, = tuple(
             book.page(CONTROL_BLOCK).latest(row)
             for row in book.page(CONTROL_BLOCK).rows()
             if book.page(CONTROL_BLOCK).latest(row).kind
-            is ControlBlockKind.NATIVE_RAISE
+            is ControlBlockKind.NATIVE_ASSERT
         )
         assert raise_control.sites == (transfer_cell,)
-        assert not CorrelationTable._source_exception_raise_control_findings(
+        assert not CorrelationTable._source_exception_assert_control_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        )
+        assert not CorrelationTable._source_exception_status_route_findings(
             SimpleNamespace(metadata={"identity_book": book})
         )
         route_row, = tuple(
@@ -1199,7 +1202,7 @@ def root(x: int) -> int:
             book.page(CONTROL_BLOCK).latest(row)
             for row in book.page(CONTROL_BLOCK).rows()
             if book.page(CONTROL_BLOCK).latest(row).kind
-            is ControlBlockKind.NATIVE_RAISE
+            is ControlBlockKind.NATIVE_ASSERT
         )
         assert len(raise_controls) == 2
         inner_raise, = tuple(
@@ -1247,7 +1250,7 @@ def root(x: int) -> int:
 """
     from src.compiler import glsl_deployment_strategy as strategy
     from src.compiler.control_source import (
-        NativeRaiseBlock, NativeTryBlock, StatementBlock,
+        NativeAssertBlock, NativeTryBlock, StatementBlock,
     )
 
     observed = []
@@ -1273,7 +1276,7 @@ def root(x: int) -> int:
         )
         raise_positions = tuple(
             index for index, block in enumerate(retained_try.body.blocks)
-            if isinstance(block, NativeRaiseBlock)
+            if isinstance(block, NativeAssertBlock)
         )
         assert len(raise_positions) == 1
         assert any(
@@ -1334,8 +1337,88 @@ def root(x: int) -> int:
         keys = strategy._control_partition_keys(graph, (), later_nodes)
         assert all(raise_id in keys[node_id][6] for node_id in later_nodes)
         assert any(
-            row[1] is ControlBlockKind.NATIVE_RAISE
+            row[1] is ControlBlockKind.NATIVE_ASSERT
             for row in book.page(CONTROL_BLOCK).rows()
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_assert_and_raise_share_concorded_exception_check():
+    source = """\
+def root(x: int) -> int:
+    try:
+        assert x > 0
+        raise ValueError("bad")
+    except AssertionError:
+        return 1
+    except ValueError:
+        return 2
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_assert_raise_check", identity_book=book)
+        transfers = tuple(
+            book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+            if book.page(SOURCE_EXCEPTION_TRANSFER).latest(row).source_kind
+            in {"assert", "raise"}
+        )
+        assert {transfer.source_kind for transfer in transfers} == {
+            "assert", "raise",
+        }
+        checks = tuple(
+            book.page(CONTROL_BLOCK).latest(row)
+            for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_ASSERT
+        )
+        assert len(checks) == 2
+        assert {check.predicate is None for check in checks} == {True, False}
+        assert not CorrelationTable._source_exception_assert_control_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        )
+        assert not CorrelationTable._source_exception_status_route_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        )
+        for transfer in transfers:
+            transfer_cell, = tuple(
+                book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+                for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+                if book.page(SOURCE_EXCEPTION_TRANSFER).latest(row) == transfer
+            )
+            routes = tuple(
+                book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(row)
+                for row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
+                if book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(
+                    row
+                ).transfer == transfer_cell
+            )
+            assert len(routes) == 1
+            assert routes[0].selected_handler is not None
+    finally:
+        end_identity_book(token)
+
+
+def test_authored_assert_without_try_refuses_unimplemented_status_exit():
+    source = """\
+def root(x: int) -> int:
+    assert x > 0
+    return x
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_unhandled_assert", identity_book=book)
+        assert any(
+            book.page(SOURCE_EXCEPTION_TRANSFER).latest(row).source_kind
+            == "assert"
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+        )
+        assert any(
+            isinstance(book.page(SOURCE_EXCEPTION_ADMISSION).latest(row),
+                       Unresolved)
+            for row in book.page(SOURCE_EXCEPTION_ADMISSION).rows()
         )
     finally:
         end_identity_book(token)
