@@ -6,6 +6,24 @@ from src.compiler.identity_concordance import concordance_report
 from src.compiler.identity_concordance import CorrelationTable
 
 
+def test_view_audit_retains_late_method_edge_and_ellipsis_index():
+    namespace = runpy.run_path(str(
+        Path(__file__).resolve().parents[1]
+        / "tools/audit_identity_concordance.py"
+    ))
+    module = namespace["_lower_view"]()
+    report = concordance_report(module)
+    assert report.splitlines()[0].endswith("0 finding(s)"), report
+    from src.compiler.concordance_declarations import SOURCE_FUNCTION_REACHABILITY
+
+    book = module.metadata["identity_book"]
+    assert any(
+        row[0][-1] == "tick" and row[2][-1] == "Cell.copy_shallow"
+        and book.page(SOURCE_FUNCTION_REACHABILITY).latest(row) is True
+        for row in book.page(SOURCE_FUNCTION_REACHABILITY).rows()
+    )
+
+
 def test_sequence_status_lease_is_distinct_but_duplicate_column_is_reported():
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 

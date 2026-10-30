@@ -7408,9 +7408,13 @@ def _build_shell_hierarchy_plan(
                 return (record[0], record[1], "opaque_ref"), (
                     _dtype_producer_cells(graph, int(value_id))
                 )
-            if isinstance(attributes.get("value"), slice):
-                # A slice literal is index metadata for the load it feeds:
-                # a handle, as a record identity is, not an element type.
+            if isinstance(attributes.get("value"), slice) or (
+                attributes.get("value") is Ellipsis
+            ):
+                # Program: `Cell.restore` writes `self.memory[...] = saved`.
+                # The Ellipsis literal, like a slice literal, is index
+                # metadata for the operation it feeds; asking it for an
+                # element dtype invented a missing numerical value.
                 return (record[0], record[1], "opaque_ref"), (
                     _dtype_producer_cells(graph, int(value_id))
                 )
@@ -7569,6 +7573,9 @@ def _build_shell_hierarchy_plan(
             if record is not None and (record[1] or isinstance(
                 (graph.G.nodes.get(int(record[0])) or {}).get("constant"),
                 slice,
+            ) or (
+                (graph.G.nodes.get(int(record[0])) or {}).get("constant")
+                is Ellipsis
             ) or (
                 (descriptor := planned_descriptor(int(record[0]))) is not None
                 and int(descriptor.get("rank", -1)) == 0

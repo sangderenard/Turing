@@ -177,11 +177,11 @@ def _resolve_bound_function_references(graph: Any) -> None:
         attributes["callee_ref"] = int(bound.address)
         attributes["callee_resolution"] = "bound-function-parameter"
         data["attributes"] = attributes
-        _post_bound_call_reachability(graph, int(_node_id), bound)
+        _post_resolved_call_reachability(graph, int(_node_id), bound)
 
 
-def _post_bound_call_reachability(graph: Any, call_id: int, bound: Any) -> None:
-    """Record that this call reaches the function its parameter is bound to.
+def _post_resolved_call_reachability(graph: Any, call_id: int, bound: Any) -> None:
+    """Record a call's exact callee when this pass first resolves it.
 
     Program: ``def drive(step, t): return step(t)`` called as
     ``drive(advance, t)`` with ``advance`` returning a tensor (the managed
@@ -646,6 +646,7 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                    if str(role) not in {"callee", "func", "function", "operand", "receiver"}]
         parents.append((receiver_id, "operand"))
         _set_operands(graph, int(node_id), parents, cause=_BOUND_RECEIVER)
+        _post_resolved_call_reachability(graph, int(node_id), reference)
 
     for _node_id, data in graph.G.nodes(data=True):
         attributes = data.get("attributes") or {}
@@ -735,6 +736,7 @@ def _resolve_grounded_method_references(graph: Any) -> None:
                 "receiver_class_ref": class_identity,
             })
             data["attributes"] = attributes
+            _post_resolved_call_reachability(graph, int(_node_id), reference)
             continue
         if reference is not None and not class_object_call_admits(
             receiver_id, reference,
@@ -754,6 +756,12 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         if class_identity is not None:
             attributes["receiver_class_ref"] = class_identity
         data["attributes"] = attributes
+        # Program: `tick` calls `state.copy_shallow()` after receiver-class
+        # resolution. Source pursuit saw no callee_ref/method_ref, so the
+        # callsite shape consumer found no reachability row for this exact
+        # call and `Cell.copy_shallow`. The writer of method_ref also posts
+        # the call-to-address concordance edge.
+        _post_resolved_call_reachability(graph, int(_node_id), reference)
 
     # Lexical loop effects are recorded before receiver classes necessarily
     # resolve. Apply the reducer's source-linked-call rule again now: the
