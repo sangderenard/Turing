@@ -1164,6 +1164,19 @@ class ExceptionAdmissionFact:
 
 
 @dataclass(frozen=True)
+class ExceptionTryAdmissionFact:
+    """A Try whose source exits all have executable SSA successors."""
+
+    source: Ref
+    control: Ref
+    normal_exit: Ref
+    exit_proofs: tuple[tuple[Ref, tuple[Ref, ...]], ...]
+    continuation_phis: tuple[Ref, ...]
+    normal_finalizer_entry: Ref | None = None
+    unwind_paths: tuple[Ref, ...] = ()
+
+
+@dataclass(frozen=True)
 class ExceptionSiteStateFact:
     """Exact lexical bindings at a fallible operation or abrupt exit."""
 
@@ -1213,6 +1226,43 @@ SOURCE_EXCEPTION_FINALIZER_INPUT = declare_page(
         RowField("try_node", K.VALUE_ID),
         RowField("name", K.NAME),
     ), ExceptionFinalizerInputFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionFinalizerOutputBindingFact:
+    """Finalbody's exact binding after normal completion on one exit."""
+
+    owner: Ref
+    exit_site: Ref
+    output_binding: Ref
+
+
+SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING = declare_page(
+    "source_exception_finalizer_output_binding", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("try_node", K.VALUE_ID),
+        RowField("exit_site", K.PAGE_REF),
+        RowField("name", K.NAME),
+    ), ExceptionFinalizerOutputBindingFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionFinalizerOutputFact:
+    """Canonical output of finalbody, derived from the source binding."""
+
+    source_output: Ref
+    canonical_output: Ref
+
+
+SOURCE_EXCEPTION_FINALIZER_OUTPUT = declare_page(
+    "source_exception_finalizer_output", (
+        RowField("planning_scope", K.SCOPE),
+        RowField("try_node", K.VALUE_ID),
+        RowField("exit_site", K.PAGE_REF),
+        RowField("name", K.NAME),
+    ), ExceptionFinalizerOutputFact,
 )
 
 
@@ -1416,6 +1466,27 @@ SOURCE_EXCEPTION_SSA_RETURN_FINALIZER = declare_page(
         RowField("try_control", K.PAGE_REF),
         RowField("before_block", K.PAGE_REF),
     ), ExceptionSSAReturnFinalizerFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionSSALoopExitFinalizerFact:
+    """One source break/continue edge crossing a Try finalbody in SSA."""
+
+    exit_site: Ref
+    try_control: Ref
+    before_block: Ref
+    after_block: Ref
+    output_values: tuple[tuple[Ref, Ref], ...]
+
+
+SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER = declare_page(
+    "source_exception_ssa_loop_exit_finalizer", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("exit_site", K.PAGE_REF),
+        RowField("try_control", K.PAGE_REF),
+        RowField("before_block", K.PAGE_REF),
+    ), ExceptionSSALoopExitFinalizerFact,
 )
 
 

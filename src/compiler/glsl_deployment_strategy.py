@@ -13334,6 +13334,8 @@ def _ordinary_conditional_control_programs(
                 )
             if not owned:
                 return None
+            from .control_source import exception_exit_site_cell
+
             return LoopControlBlock(
                 action, None, True, None,
                 source_action=action,
@@ -13342,6 +13344,9 @@ def _ordinary_conditional_control_programs(
                     ((int(initial), int(updated)), int(value))
                     for (initial, updated), value in site_values.items()
                 )),
+                exception_exit_site_cell=exception_exit_site_cell(
+                    graph, terminal,
+                ),
             )
 
         def arm_return_control(statements):
@@ -13695,11 +13700,14 @@ def _source_try_control_programs(
         SOURCE_EXCEPTION_CONTROL_STATE,
         SOURCE_EXCEPTION_FINALIZER_BINDING,
         SOURCE_EXCEPTION_FINALIZER_INPUT,
+        SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+        SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING,
         SOURCE_EXCEPTION_HANDLER_CLASS,
         SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
         SOURCE_EXCEPTION_HANDLER_PHI,
         SOURCE_EXCEPTION_REGION_SITE,
         SOURCE_EXCEPTION_REGION_STATE,
+        SOURCE_EXCEPTION_SITE_STATE,
         SOURCE_EXCEPTION_TRANSFER,
         ExceptionControlStateFact,
         ExceptionContinuationArmValueFact, ExceptionHandlerArmValueFact,
@@ -13707,10 +13715,12 @@ def _source_try_control_programs(
         ExceptionRegionStateFact,
         ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
         ExceptionFinalizerInputFact,
-        ExceptionTransferFact, MemberRole,
+        ExceptionFinalizerOutputBindingFact, ExceptionFinalizerOutputFact,
+        ExceptionSiteStateFact, ExceptionTransferFact, MemberRole,
     )
     from .control_source import (
-        NativeExceptionHandler, NativeTryBlock, post_control_program,
+        NativeExceptionHandler, NativeTryBlock,
+        exception_exit_site_cell, post_control_program,
     )
     from .identity_concordance import Derived, Mode, current_identity_book
     from ..common.tensors.topological_reducer import node_identity_cell
@@ -13871,6 +13881,55 @@ def _source_try_control_programs(
             start <= int(expression.lineno) <= end
             for start, end in enclosing_loop_spans
         )
+
+        # Program: `while x: try: break; finally: x += 1`.
+        # A loop exit whose nearest target is outside this Try must cross
+        # this Try's finalizer. SOURCE_EXCEPTION_SITE_STATE already owns the
+        # lexical site and every value read by the finalizer on that exit.
+        # Select by source ancestry, including nested Try, and never by a
+        # region's position or a reconstructed name.
+        syntax_parents = {
+            id(child): parent
+            for parent in ast.walk(expression)
+            for child in ast.iter_child_nodes(parent)
+        }
+        abrupt_exit_sites = []
+        for statement in ast.walk(expression):
+            if not isinstance(statement, (ast.Break, ast.Continue,
+                                          ast.Return)):
+                continue
+            ancestor = syntax_parents.get(id(statement))
+            while ancestor is not None and ancestor is not expression and (
+                isinstance(statement, ast.Return)
+                or not isinstance(ancestor,
+                                  (ast.For, ast.AsyncFor, ast.While))
+            ):
+                ancestor = syntax_parents.get(id(ancestor))
+            if ancestor is not expression:
+                continue
+            site_cell = exception_exit_site_cell(graph, statement)
+            site = (
+                book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                    site_cell.row, site_cell.column,
+                ) if site_cell is not None else None
+            )
+            action = (
+                "break" if isinstance(statement, ast.Break)
+                else "continue" if isinstance(statement, ast.Continue)
+                else "return"
+            )
+            arm = next((
+                scope_arm for scope_owner, scope_arm, _handler
+                in reversed(site.scopes)
+                if int(scope_owner.row[1]) == id(expression)
+            ), None) if isinstance(site, ExceptionSiteStateFact) else None
+            if site_cell is None or site.action != action or arm is None:
+                raise ValueError(
+                    "Try abrupt exit has no exact source site and scope: "
+                    f"try={try_id}, source={id(statement)}"
+                )
+            if arm != "finalbody":
+                abrupt_exit_sites.append(site_cell)
 
         def arm_body(
             key: tuple[str, int], statements: Sequence[ast.stmt],
@@ -14215,6 +14274,51 @@ def _source_try_control_programs(
                 )))),
                 mode=Mode.CONCORD,
             )
+        for output_row in book.page(
+            SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING
+        ).rows():
+            if int(output_row[1]) != id(expression):
+                continue
+            output_source = book.latest_ref(
+                SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING, output_row,
+            )
+            output = book.page(
+                SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING
+            ).latest(output_row)
+            if not isinstance(output, ExceptionFinalizerOutputBindingFact) or (
+                output.owner.row[1] != id(expression)
+                or output.exit_site != output_row[2]
+                or output_source is None
+            ):
+                raise ValueError(
+                    "Try finalizer output lacks exact source owner: "
+                    f"row={output_row!r}"
+                )
+            source_value = source_value_for_binding(
+                output.output_binding, str(output_row[3]),
+            )
+            canonical_output = book.latest_ref(
+                CANONICAL_VALUE,
+                (canonical_scope, canonical_from_source(source_value)),
+            )
+            if canonical_output is None:
+                raise ValueError(
+                    "Try finalizer output has no forked value: "
+                    f"row={output_row!r}"
+                )
+            book.post(
+                SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+                (planning_scope, int(try_id), output.exit_site,
+                 str(output_row[3])),
+                ExceptionFinalizerOutputFact(
+                    output_source, canonical_output,
+                ),
+                stage=CONTROL_PROGRAM_BUILD,
+                provenance=Derived((
+                    output_source, canonical_output,
+                )),
+                mode=Mode.CONCORD,
+            )
         protected_transfers = []
         transfer_page = book.page(SOURCE_EXCEPTION_TRANSFER)
         for row in transfer_page.rows():
@@ -14389,7 +14493,8 @@ def _source_try_control_programs(
                 if expression.orelse else None,
                 arm_body(("finalbody", 0), expression.finalbody), int(try_id),
                 continuation_phi_cells=tuple(continuation_cells),
-                protected_transfer_cells=tuple(protected_transfers),
+                exit_cells=tuple((*protected_transfers,
+                                  *abrupt_exit_sites)),
             ),
             region_indices=regions,
             anchor_region=anchor_region,
@@ -15407,7 +15512,8 @@ def _overlay_control_or_require_subdivision(
     """Turn a named cross-scope overlay refusal into loop-owned frontier data."""
 
     from .control_source import (
-        CallBlock, ConditionalBlock, LoopBlock, LoopControlBlock, SequenceBlock, WhileBlock,
+        CallBlock, ConditionalBlock, LoopBlock, LoopControlBlock,
+        NativeTryBlock, SequenceBlock, WhileBlock,
     )
 
     def children(block):
@@ -15467,6 +15573,194 @@ def _overlay_control_or_require_subdivision(
     if owned_returns:
         loop_controls = tuple(replace(control, root=remove_duplicate_return(control.root))
                               for control in loop_controls)
+
+    # A direct `break`/`continue` in a Try body is sometimes scheduled as
+    # a sibling of the Try by the loop composer. Move that SAME control
+    # object under its source-owned Try arm. Its site cell, carried values,
+    # and loop target are unchanged. The final overlay has one edge object.
+    loop_exit_by_site = {}
+    def collect_loop_exit(block):
+        if (isinstance(block, LoopControlBlock)
+                and block.action in {"break", "continue"}
+                and block.exception_exit_site_cell is not None):
+            loop_exit_by_site.setdefault(
+                block.exception_exit_site_cell, []
+            ).append(block)
+        for child in children(block):
+            collect_loop_exit(child)
+
+    for control in loop_controls:
+        collect_loop_exit(control.root)
+
+    moved_exit_sites = set()
+    if try_controls and loop_exit_by_site:
+        from .control_source import (
+            _region_marker, exception_exit_site_cell,
+        )
+        subgraphs = tuple(dispatch_subgraphs)
+
+        source_try_by_node = {
+            int(node_id): data.get("expr_obj")
+            for node_id, data in graph.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Try)
+        }
+
+        def attach_direct_exit(block):
+            if not isinstance(block, NativeTryBlock):
+                return block
+            expression = source_try_by_node.get(
+                int(block.source_try_node_id)
+            )
+            if expression is None:
+                raise ValueError(
+                    "Try control has no exact source syntax: "
+                    f"{block.source_try_node_id}"
+                )
+            syntax_parents = {
+                id(child): parent
+                for parent in ast.walk(expression)
+                for child in ast.iter_child_nodes(parent)
+            }
+
+            def arm_with_exit(body, statements, *, own_finalbody=False):
+                if not isinstance(body, SequenceBlock):
+                    raise ValueError("Try abrupt exit has no sequence arm")
+                children = list(body.blocks)
+
+                def span(child):
+                    if isinstance(child, StatementBlock):
+                        region = _region_marker(child)
+                        sources = (
+                            graph.G.nodes[int(node_id)].get(
+                                "authored_expr_obj"
+                            ) or graph.G.nodes[int(node_id)].get("expr_obj")
+                            for node_id in subgraphs[region].G.graph.get(
+                                "deployment_nodes", ()
+                            )
+                        ) if region is not None else ()
+                    else:
+                        node_id = getattr(
+                            child, "source_node_id",
+                            getattr(child, "source_try_node_id",
+                                    getattr(child, "site_node_id", None)),
+                        )
+                        sources = (
+                            graph.G.nodes[int(node_id)].get("expr_obj"),
+                        ) if node_id is not None else ()
+                    positions = tuple(
+                        ((int(source.lineno), int(source.col_offset)),
+                         (int(getattr(source, "end_lineno", source.lineno)),
+                          int(getattr(source, "end_col_offset",
+                                      source.col_offset))))
+                        for source in sources
+                        if getattr(source, "lineno", None) is not None
+                    )
+                    if not positions:
+                        raise ValueError(
+                            "Try arm child has no source order: "
+                            f"{child!r}"
+                        )
+                    return min(start for start, _end in positions), max(
+                        end for _start, end in positions
+                    )
+
+                for statement in (
+                    nested for source_statement in statements
+                    for nested in ast.walk(source_statement)
+                    if isinstance(nested, (ast.Break, ast.Continue))
+                ):
+                    ancestor = syntax_parents.get(id(statement))
+                    while ancestor is not None and ancestor is not expression and (
+                        not isinstance(ancestor, (
+                            ast.Try, ast.For, ast.AsyncFor, ast.While,
+                        ))
+                    ):
+                        ancestor = syntax_parents.get(id(ancestor))
+                    if ancestor is not expression:
+                        continue
+                    site = exception_exit_site_cell(graph, statement)
+                    if site not in block.abrupt_exit_site_cells and not own_finalbody:
+                        continue
+                    candidates = tuple(loop_exit_by_site.get(site, ()))
+                    if not candidates:
+                        continue
+                    if len(candidates) != 1 or site in moved_exit_sites:
+                        raise ValueError(
+                            "Try abrupt exit has no unique source loop edge: "
+                            f"site={site!r}"
+                        )
+                    position = (
+                        int(statement.lineno), int(statement.col_offset)
+                    )
+                    insertion = len(children)
+                    for index, child in enumerate(children):
+                        start, end = span(child)
+                        if start <= position < end:
+                            raise ValueError(
+                                "Try region crosses an abrupt source exit: "
+                                f"site={site!r}"
+                            )
+                        if start > position:
+                            insertion = index
+                            break
+                    children.insert(insertion, candidates[0])
+                    moved_exit_sites.add(site)
+                return replace(body, blocks=tuple(children))
+
+            handlers = tuple(
+                replace(handler, body=arm_with_exit(
+                    handler.body, expression.handlers[index].body,
+                ))
+                for index, handler in enumerate(block.handlers)
+            )
+            return replace(
+                block,
+                body=arm_with_exit(block.body, expression.body),
+                handlers=handlers,
+                orelse=(arm_with_exit(block.orelse, expression.orelse)
+                        if block.orelse is not None else None),
+                finalbody=arm_with_exit(
+                    block.finalbody, expression.finalbody,
+                    own_finalbody=True,
+                ),
+            )
+
+        try_controls = tuple(
+            replace(control, root=attach_direct_exit(control.root))
+            for control in try_controls
+        )
+
+    if moved_exit_sites:
+        def remove_moved_exit(block):
+            if (isinstance(block, LoopControlBlock)
+                    and block.exception_exit_site_cell in moved_exit_sites):
+                return SequenceBlock(())
+            if isinstance(block, SequenceBlock):
+                return replace(block, blocks=tuple(
+                    remove_moved_exit(child) for child in block.blocks
+                ))
+            if isinstance(block, ConditionalBlock):
+                return replace(
+                    block, body=remove_moved_exit(block.body),
+                    orelse=(None if block.orelse is None else
+                            remove_moved_exit(block.orelse)),
+                )
+            if isinstance(block, (LoopBlock, WhileBlock)):
+                return replace(
+                    block, body=remove_moved_exit(block.body),
+                    terminal_controls=tuple(
+                        remove_moved_exit(child)
+                        for child in block.terminal_controls
+                    ),
+                )
+            if isinstance(block, CallBlock):
+                return replace(block, callee=remove_moved_exit(block.callee))
+            return block
+
+        loop_controls = tuple(
+            replace(control, root=remove_moved_exit(control.root))
+            for control in loop_controls
+        )
 
     try:
         from .control_source import order_control_region_dependencies

@@ -12217,19 +12217,132 @@ class _ControlSSABuilder(TiledObject):
                 mode=Mode.CONCORD,
             )
 
+    def _emit_native_loop_exit_finalizers(
+        self, block: LoopControlBlock, path: str,
+    ) -> dict[int, SSAValue]:
+        """Traverse source-owned finalizers before a break/continue target."""
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+            SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
+            ExceptionFinalizerOutputFact, ExceptionSiteStateFact,
+            ExceptionSSALoopExitFinalizerFact,
+        )
+
+        site = block.exception_exit_site_cell
+        if site is None:
+            return {}
+        book = self._book()
+        source = book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+            site.row, site.column,
+        )
+        if not isinstance(source, ExceptionSiteStateFact) or (
+            source.action != block.action
+        ):
+            raise ValueError(
+                "loop exit has no exact abrupt source state: "
+                f"site={site!r}, action={block.action!r}"
+            )
+        frames = tuple(self._native_try_frames)
+        selected = tuple(
+            (index, frame) for index, frame in enumerate(frames)
+            if site in frame["block"].abrupt_exit_site_cells
+        )
+        if selected and self.resource_scopes:
+            raise ValueError(
+                "loop exit finalizer lacks resource cleanup ordering: "
+                f"site={site!r}"
+            )
+        finalized = {}
+        for index, frame in reversed(selected):
+            before_cell = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, self.current.name),
+            )
+            self._restore_native_finalizer_inputs(frame, site)
+            saved_frames = self._native_try_frames
+            self._native_try_frames = list(frames[:index])
+            try:
+                self.lower(
+                    frame["block"].finalbody,
+                    path=f"{path}.pending_finally[{index}]",
+                )
+            finally:
+                self._native_try_frames = saved_frames
+            after_cell = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, self.current.name),
+            )
+            if before_cell is None or after_cell is None:
+                raise ValueError(
+                    "loop finalizer lacks exact SSA entry or exit: "
+                    f"site={site!r}"
+                )
+            output_cells = []
+            for row in book.page(SOURCE_EXCEPTION_FINALIZER_OUTPUT).rows():
+                if row[:3] != (
+                    self.planning_scope,
+                    int(frame["block"].source_try_node_id), site,
+                ):
+                    continue
+                output = book.page(
+                    SOURCE_EXCEPTION_FINALIZER_OUTPUT
+                ).latest(row)
+                if not isinstance(output, ExceptionFinalizerOutputFact):
+                    raise ValueError(
+                        "loop finalizer has no exact output: "
+                        f"row={row!r}"
+                    )
+                value_id = int(output.canonical_output.row[1])
+                value = self.external_values.get(value_id)
+                if value is None or not self._value_dominates_current_edge(
+                    value,
+                ):
+                    raise ValueError(
+                        "loop finalizer output does not dominate exit: "
+                        f"row={row!r}"
+                    )
+                finalized[value_id] = value
+                output_cell = book.latest_ref(
+                    SOURCE_EXCEPTION_FINALIZER_OUTPUT, row,
+                )
+                if output_cell is None:
+                    raise ValueError(
+                        "loop finalizer output has no fact cell: "
+                        f"row={row!r}"
+                    )
+                output_cells.append((output_cell, self._value_cell(value)))
+            book.post(
+                SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
+                (self._scope(), site, frame["owner"], before_cell),
+                ExceptionSSALoopExitFinalizerFact(
+                    site, frame["owner"], before_cell, after_cell,
+                    tuple(output_cells),
+                ),
+                stage=self._stage(),
+                provenance=Derived(tuple(dict.fromkeys((
+                    site, frame["owner"], before_cell, after_cell,
+                    *(cell for pair in output_cells for cell in pair),
+                )))),
+                mode=Mode.CONCORD,
+            )
+        return finalized
+
     def lower_native_try(
         self, block: NativeTryBlock, *, path: str,
     ) -> None:
-        """Select exact status routes while admission remains shut."""
+        """Lower source-owned status routes and discharge proved Try exits."""
         from .concordance_declarations import (
-            CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+            CANONICAL_VALUE, EXCEPTION_ADMISSION,
+            SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
             SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
             SOURCE_EXCEPTION_CONTINUATION_PHI,
             SOURCE_EXCEPTION_CONTROL_STATE,
             SOURCE_EXCEPTION_HANDLER_CLASS,
             SOURCE_EXCEPTION_HANDLER_ENTRY,
             SOURCE_EXCEPTION_HANDLER_PHI,
-            SOURCE_EXCEPTION_REGION_STATE, SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+            SOURCE_EXCEPTION_REGION_SITE, SOURCE_EXCEPTION_REGION_STATE,
+            SOURCE_EXCEPTION_SSA_HANDLER_ARM,
             SOURCE_EXCEPTION_ROUTE_STEP,
             SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM,
             SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE,
@@ -12240,6 +12353,7 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_SSA_HANDLER_PHI,
             SOURCE_EXCEPTION_SSA_HANDLER_STATE,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
             SOURCE_EXCEPTION_SSA_ROUTE,
@@ -12254,12 +12368,16 @@ class _ControlSSABuilder(TiledObject):
             ExceptionHandlerEntryFact, ExceptionHandlerPhiFact,
             ExceptionRouteStepFact,
             ExceptionRegionStateFact,
+            ExceptionRegionSiteFact,
             ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
             ExceptionSSAHandlerPhiFact, ExceptionSSAHandlerStateFact,
             ExceptionSSAContinuationArmFact,
             ExceptionSSAContinuationPhiFact, ExceptionSSARouteFact,
             ExceptionSSAPropagationFact, ExceptionStatusRouteFact,
             ExceptionSSAUnwindFact,
+            ExceptionTryAdmissionFact,
+            ExceptionSSACheckpointFact,
+            ExceptionSSAControlCheckpointFact,
         )
 
         book = self._book()
@@ -13314,12 +13432,142 @@ class _ControlSSABuilder(TiledObject):
         # finalbody. In `try: y=int(x); except ValueError: y=2; finally:
         # y=y+1`, finalbody consumes that Phi. Emitting it before the join
         # invents an input for the Phi and runs it only on the normal arm.
+        finalizer_entry = book.latest_ref(
+            SSA_BLOCK,
+            (self._scope(), self.function_name, self.current.name),
+        )
         self.lower(block.finalbody, path=f"{path}.try_finally")
-        # The status is taken at the protected edge. Selected handlers with
-        # source continuation arms join normal control. Other finalizer
-        # outcomes still need complete SSA transfer handling.
-        # Until every abrupt outcome and nested transfer is represented,
-        # no public artifact may claim this Try is executable.
+        # The existing control IR has one normal finalizer arm. A finalbody
+        # consisting only of scheduled numerical regions has no new control
+        # outcome; every failure edge separately records its unwind path.
+        finalbody_is_numeric = isinstance(block.finalbody, SequenceBlock) and all(
+            isinstance(child, StatementBlock)
+            for child in block.finalbody.blocks
+        )
+        # A nested Try can be observed in an isolated control probe without
+        # an executable region callee. It has source transfers but no SSA
+        # checkpoint, so its admission must remain closed at this frontier.
+        def checkpoint_evidence(transfer: Ref) -> tuple[Ref, ...]:
+            evidence = []
+            for checkpoint_row in book.page(
+                SOURCE_EXCEPTION_SSA_CHECKPOINT
+            ).rows():
+                checkpoint = book.page(
+                    SOURCE_EXCEPTION_SSA_CHECKPOINT
+                ).latest(checkpoint_row)
+                region_site = (
+                    book.page(SOURCE_EXCEPTION_REGION_SITE).cell(
+                        checkpoint.region_site.row,
+                        checkpoint.region_site.column,
+                    ) if isinstance(checkpoint, ExceptionSSACheckpointFact)
+                    else None
+                )
+                if isinstance(region_site, ExceptionRegionSiteFact) and (
+                    region_site.transfer == transfer
+                ):
+                    evidence.append(book.latest_ref(
+                        SOURCE_EXCEPTION_SSA_CHECKPOINT, checkpoint_row,
+                    ))
+            for checkpoint_row in book.page(
+                SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT
+            ).rows():
+                checkpoint = book.page(
+                    SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT
+                ).latest(checkpoint_row)
+                if isinstance(checkpoint,
+                              ExceptionSSAControlCheckpointFact) and (
+                    checkpoint.transfer == transfer
+                ):
+                    evidence.append(book.latest_ref(
+                        SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+                        checkpoint_row,
+                    ))
+            return tuple(evidence)
+
+        checkpoint_proofs = tuple(
+            (transfer, checkpoint_evidence(transfer))
+            for transfer in block.protected_transfer_cells
+        )
+        if (
+            finalbody_is_numeric and not block.abrupt_exit_site_cells
+            and all(evidence for _transfer, evidence in checkpoint_proofs)
+        ):
+            canonical_try = book.latest_ref(
+                CANONICAL_VALUE,
+                (self.lexical_read_scope, int(block.source_try_node_id)),
+            )
+            admission_rows = tuple(
+                row for row in book.page(SOURCE_EXCEPTION_ADMISSION).rows()
+                if canonical_try is not None
+                and reaches_canonical(row[0], canonical_try)
+            )
+            if len(admission_rows) != 1:
+                raise ValueError(
+                    "executable Try has no unique source admission row: "
+                    f"try={block.source_try_node_id}"
+                )
+            source = admission_rows[0][0]
+            proofs = checkpoint_proofs
+            continuation_proofs = tuple(
+                book.latest_ref(SOURCE_EXCEPTION_SSA_CONTINUATION_PHI, row)
+                for row in book.page(
+                    SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+                ).rows()
+                if book.page(
+                    SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+                ).latest(row).source_phi in block.continuation_phi_cells
+            )
+            if len(continuation_proofs) != len(
+                block.continuation_phi_cells
+            ):
+                raise ValueError(
+                    "executable Try lacks an exact continuation SSA Phi: "
+                    f"try={block.source_try_node_id}"
+                )
+            unwind_proofs = tuple(
+                book.latest_ref(SOURCE_EXCEPTION_SSA_UNWIND, row)
+                for row in book.page(SOURCE_EXCEPTION_SSA_UNWIND).rows()
+                if row[2] == frame["owner"]
+                and row[1] in block.protected_transfer_cells
+            )
+            if len(unwind_proofs) != len(
+                block.protected_transfer_cells
+            ):
+                raise ValueError(
+                    "executable Try lacks an exact unmatched unwind: "
+                    f"try={block.source_try_node_id}"
+                )
+            normal_exit = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, self.current.name),
+            )
+            if normal_exit is None:
+                raise ValueError(
+                    "executable Try has no SSA normal exit: "
+                    f"try={block.source_try_node_id}"
+                )
+            causes = tuple(dict.fromkeys((
+                source, frame["owner"], normal_exit,
+                *(proof for _transfer, items in proofs for proof in items),
+                *(transfer for transfer, _items in proofs),
+                *continuation_proofs,
+                *(unwind_proofs if block.finalbody.blocks else ()),
+                *((finalizer_entry,) if block.finalbody.blocks else ()),
+            )))
+            book.post(
+                SOURCE_EXCEPTION_ADMISSION, (source,),
+                ExceptionTryAdmissionFact(
+                    source, frame["owner"], normal_exit,
+                    tuple(proofs), continuation_proofs,
+                    finalizer_entry if block.finalbody.blocks else None,
+                    unwind_proofs if block.finalbody.blocks else (),
+                ),
+                stage=EXCEPTION_ADMISSION,
+                provenance=Derived(causes), mode=Mode.REVISE,
+            )
+            return
+        # A data-bearing finalbody or pending return/break/continue still
+        # requires complete outcome dispatch before native admission.
         self.shortfalls.append(SSALoweringShortfall(
             "control", "native_try_dispatch", path,
             "authored Try has source-owned handler joins but lacks "
@@ -13752,6 +14000,38 @@ class _ControlSSABuilder(TiledObject):
                 self.lower(replace(block, predicate_value_id=None, predicate_expression=None), path=path)
                 self.current = fallthrough
                 return
+            if (
+                block.action in {"break", "continue"}
+                and block.exception_exit_site_cell is not None
+                and any(
+                    block.exception_exit_site_cell in
+                    frame["block"].abrupt_exit_site_cells
+                    for frame in self._native_try_frames
+                )
+                and (block.predicate_value_id is not None
+                     or block.predicate_expression is not None)
+            ):
+                predicate = (
+                    self.lower_control_expression(
+                        block.predicate_expression,
+                    ) if block.predicate_expression is not None else
+                    self.external_value(block.predicate_value_id,
+                                        dtype="bool")
+                )
+                leaving = self.new_block("loop_control_next")
+                fallthrough = self.new_block("loop_control_next")
+                self.conditional_branch(
+                    predicate,
+                    leaving if block.expect_true else fallthrough,
+                    fallthrough if block.expect_true else leaving,
+                )
+                self.current = leaving
+                self.lower(replace(
+                    block, predicate_value_id=None,
+                    predicate_expression=None,
+                ), path=path)
+                self.current = fallthrough
+                return
             if not self.loop_targets:
                 raise ValueError(
                     f"{block.action} appears outside a loop "
@@ -13759,6 +14039,10 @@ class _ControlSSABuilder(TiledObject):
                 )
             latch, exit_block = self.loop_targets[-1]
             target = exit_block if block.action == "break" else latch
+            finalized = (
+                self._emit_native_loop_exit_finalizers(block, path)
+                if block.action in {"break", "continue"} else {}
+            )
             self._emit_resource_cleanup(block.action, path)
             if self.loop_exit_contexts and block.site_node_id is not None:
                 self.loop_exit_contexts[-1]["sites_seen"].add(
@@ -13785,6 +14069,8 @@ class _ControlSSABuilder(TiledObject):
                     value_id = site_values.get((int(initial_id), int(updated_id)))
                     if value_id is None:
                         return None
+                    if int(updated_id) in finalized:
+                        return finalized[int(updated_id)]
                     if int(value_id) == int(initial_id):
                         # The reducer's explicit unchanged-site receipt is
                         # this binding's header generation, not the live
@@ -13837,6 +14123,9 @@ class _ControlSSABuilder(TiledObject):
                 for updated_id, initial_id, current, initial_value in (
                     context["carried"]
                 ):
+                    if int(updated_id) in finalized:
+                        carried_values.append(finalized[int(updated_id)])
+                        continue
                     at_site = site_value(
                         int(initial_id), int(updated_id), current,
                         initial_value,

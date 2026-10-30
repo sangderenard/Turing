@@ -35,6 +35,7 @@ from .control_source import (
     StreamPublishBlock,
     ValidationBlock,
     WhileBlock,
+    exception_exit_site_cell,
     validation_diagnostic_value_ids,
 )
 from .loop_ir import (
@@ -6629,6 +6630,9 @@ def analyze_shader_loop_reductions(
                     source_action=action,
                     site_node_id=int(site_id),
                     site_values=tuple(site_values),
+                    exception_exit_site_cell=exception_exit_site_cell(
+                        graph, graph.G.nodes[int(site_id)]["expr_obj"],
+                    ),
                 ),
             )
             for site_id, action, chain, site_values, arm_span

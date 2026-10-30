@@ -568,9 +568,22 @@ class NativeTryBlock(TiledObject):
     # The reducer's exact post-Try value joins. Lowering reads each fact's
     # arm binding cells; it must not rebuild an arm from a final environment.
     continuation_phi_cells: tuple[Any, ...] = ()
-    # Exact source transfers whose nearest eligible body is this Try.
-    # Matching and any unwind path still require executable SSA edges.
-    protected_transfer_cells: tuple[Any, ...] = ()
+    # One adjacency list of source-owned exits crossing this Try. Exception
+    # transfers and abrupt return/break/continue sites retain their original
+    # concordance cells; the views below do not store a second edge list.
+    exit_cells: tuple[Any, ...] = ()
+
+    @property
+    def protected_transfer_cells(self) -> tuple[Any, ...]:
+        from .concordance_declarations import SOURCE_EXCEPTION_TRANSFER
+        return tuple(cell for cell in self.exit_cells
+                     if cell.page == SOURCE_EXCEPTION_TRANSFER)
+
+    @property
+    def abrupt_exit_site_cells(self) -> tuple[Any, ...]:
+        from .concordance_declarations import SOURCE_EXCEPTION_SITE_STATE
+        return tuple(cell for cell in self.exit_cells
+                     if cell.page == SOURCE_EXCEPTION_SITE_STATE)
 
 
 @dataclass(frozen=True)
@@ -580,6 +593,43 @@ class NativeAssertBlock(TiledObject):
     source_node_id: int
     transfer_cell: Any
     predicate_value_id: int | None = None
+
+
+def exception_exit_site_cell(graph: Any, statement: ast.stmt) -> Any:
+    """Read an abrupt control site's existing reducer identity, if any."""
+
+    from .concordance_declarations import (
+        SOURCE_EXCEPTION_SITE_STATE, ExceptionSiteStateFact,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    page = book.page(SOURCE_EXCEPTION_SITE_STATE)
+    ingestion_scope = graph.G.graph.get("ingestion_value_scope")
+    matches = tuple(row for row in page.rows()
+                    if int(row[1]) == id(statement)
+                    and isinstance(page.latest(row), ExceptionSiteStateFact)
+                    and page.latest(row).source.row[0] == ingestion_scope)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError(
+            "abrupt control has multiple exact source exits: "
+            f"source={id(statement)}, rows={matches!r}"
+        )
+    row, = matches
+    fact = page.latest(row)
+    action = (
+        "break" if isinstance(statement, ast.Break) else
+        "continue" if isinstance(statement, ast.Continue) else
+        "return" if isinstance(statement, ast.Return) else None
+    )
+    if not isinstance(fact, ExceptionSiteStateFact) or fact.action != action:
+        raise ValueError(
+            "abrupt control disagrees with exact source exit: "
+            f"site={row!r}, action={action!r}"
+        )
+    return book.latest_ref(SOURCE_EXCEPTION_SITE_STATE, row)
 
 
 @dataclass(frozen=True)
@@ -1259,7 +1309,7 @@ def _describe_control_block(
             *(item for item in block.continuation_phi_cells
              if isinstance(item, Ref)))
         sites = tuple(
-            item for item in block.protected_transfer_cells
+            item for item in block.exit_cells
             if isinstance(item, Ref)
         )
         extra = tuple(

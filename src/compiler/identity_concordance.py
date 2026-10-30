@@ -1260,6 +1260,32 @@ def scope_local_accounting_ids(value: Any) -> tuple[int, ...]:
 class CorrelationTable:
     """Every identity claim the module makes, keyed by (function, value id)."""
 
+    @staticmethod
+    def _current_or_revised_value(book: Any, cell: Ref) -> bool:
+        from .concordance_declarations import SSA_VALUE
+
+        latest = book.latest_ref(cell.page, cell.row)
+        if latest == cell:
+            return True
+        if cell.page != SSA_VALUE or latest is None:
+            return False
+        # A physical-dtype revision is the same SSA row with a direct
+        # derivation from its previous cell. Follow only that exact chain.
+        pending = [latest]
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current == cell:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(
+                source for source, _stage in book.edges_into(current)
+                if source.page == SSA_VALUE and source.row == cell.row
+            )
+        return False
+
     def __init__(self) -> None:
         self.rows: dict[tuple[str, int], ValueRow] = {}
         self.sequence_roles: dict[tuple[str, int], list[tuple[int, str]]] = (
@@ -1553,6 +1579,7 @@ class CorrelationTable:
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_exception_site_state_findings(module))
         found.extend(self._source_exception_finalizer_binding_findings(module))
+        found.extend(self._source_exception_finalizer_output_findings(module))
         found.extend(self._source_exception_finalizer_path_findings(module))
         found.extend(self._source_exception_transfer_findings(module))
         found.extend(self._source_exception_assert_control_findings(module))
@@ -1567,6 +1594,7 @@ class CorrelationTable:
         found.extend(self._source_exception_ssa_escalation_findings(module))
         found.extend(self._source_exception_ssa_propagation_findings(module))
         found.extend(self._source_exception_ssa_return_finalizer_findings(module))
+        found.extend(self._source_exception_ssa_loop_exit_finalizer_findings(module))
         found.extend(self._source_exception_ssa_route_findings(module))
         found.extend(self._source_exception_ssa_handler_arm_findings(module))
         found.extend(self._source_exception_ssa_handler_state_findings(module))
@@ -2102,6 +2130,103 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_exception_finalizer_output_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Finalbody output keeps one source and one canonical value key."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, NAME_BINDING, SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+            SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING,
+            ExceptionFinalizerOutputBindingFact,
+            ExceptionFinalizerOutputFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None:
+            return []
+        source_page = book.page(SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING)
+        plan_page = book.page(SOURCE_EXCEPTION_FINALIZER_OUTPUT)
+        canonical_successors = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for cause, _stage in book.edges_into(canonical):
+                canonical_successors.setdefault(cause, set()).add(canonical)
+
+        def reaches(source: Ref, target: Ref | None) -> bool:
+            pending = [source]
+            seen = set()
+            while pending:
+                cell = pending.pop()
+                if cell == target:
+                    return True
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                pending.extend(canonical_successors.get(cell, ()))
+            return False
+
+        found = []
+        for row in source_page.rows():
+            fact = source_page.latest(row)
+            receipt = book.latest_ref(
+                SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING, row,
+            )
+            causes = {
+                cell for cell, _stage in book.edges_into(receipt)
+            } if receipt is not None else set()
+            if not isinstance(fact, ExceptionFinalizerOutputBindingFact) or (
+                fact.owner.row[1] != row[1]
+                or fact.exit_site != row[2]
+                or fact.exit_site.page != SOURCE_EXCEPTION_SITE_STATE
+                or fact.output_binding.page != NAME_BINDING
+                or fact.output_binding.row[:2] != (row[0], row[3])
+                or causes != {
+                    fact.owner, fact.exit_site, fact.output_binding,
+                }
+            ):
+                found.append(Finding(
+                    "source-exception-finalizer-output-disagreement",
+                    str(row), None,
+                    "finalizer output has no exact source exit and binding",
+                ))
+        for row in plan_page.rows():
+            fact = plan_page.latest(row)
+            receipt = book.latest_ref(
+                SOURCE_EXCEPTION_FINALIZER_OUTPUT, row,
+            )
+            source = (
+                source_page.cell(
+                    fact.source_output.row, fact.source_output.column,
+                ) if isinstance(fact, ExceptionFinalizerOutputFact)
+                and fact.source_output.page ==
+                SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING else None
+            )
+            causes = {
+                cell for cell, _stage in book.edges_into(receipt)
+            } if receipt is not None else set()
+            if not isinstance(source, ExceptionFinalizerOutputBindingFact) or (
+                fact.canonical_output.page != CANONICAL_VALUE
+                or int(fact.canonical_output.row[1]) < 0
+                or not reaches(
+                    source.owner,
+                    book.latest_ref(CANONICAL_VALUE, (
+                        fact.canonical_output.row[0], int(row[1]),
+                    )),
+                )
+                or source.exit_site != row[2]
+                or causes != {fact.source_output, fact.canonical_output}
+            ):
+                found.append(Finding(
+                    "source-exception-finalizer-output-disagreement",
+                    str(row), None,
+                    "planned finalizer output lost source binding identity",
+                ))
+        return found
+
+    @staticmethod
     def _source_exception_finalizer_path_findings(
         module: Any,
     ) -> list[Finding]:
@@ -2325,6 +2450,7 @@ class CorrelationTable:
             CANONICAL_VALUE, CONTROL_BLOCK, CONTROL_BLOCK_PLACEMENT,
             CONTROL_PROGRAM, SHELL,
             SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_TRANSFER,
+            SOURCE_EXCEPTION_SITE_STATE, ExceptionSiteStateFact,
             ControlBlockFact, ControlBlockKind, ControlProgramFact,
             ExceptionTransferFact, Placement,
         )
@@ -2426,6 +2552,38 @@ class CorrelationTable:
             source = row[0]
             if source not in check_sources:
                 check(source, ControlBlockKind.NATIVE_TRY, None)
+        site_page = book.page(SOURCE_EXCEPTION_SITE_STATE)
+        for row in controls.rows():
+            fact = controls.latest(row)
+            if not isinstance(fact, ControlBlockFact) or (
+                fact.kind is not ControlBlockKind.NATIVE_TRY
+            ):
+                continue
+            abrupt = tuple(
+                cell for cell in fact.sites
+                if cell.page == SOURCE_EXCEPTION_SITE_STATE
+            )
+            if len(abrupt) != len(set(abrupt)):
+                found.append(Finding(
+                    "source-exception-control-coverage-disagreement",
+                    str(row), None,
+                    "Try control repeats an abrupt source exit",
+                ))
+            for site_cell in abrupt:
+                site = site_page.cells.get((
+                    site_cell.row, site_cell.column,
+                ))
+                if not isinstance(site, ExceptionSiteStateFact) or (
+                    site.action not in {"return", "break", "continue"}
+                ) or not any(
+                    arm != "finalbody" and row[2] in identities(owner)
+                    for owner, arm, _handler in site.scopes
+                ):
+                    found.append(Finding(
+                        "source-exception-control-coverage-disagreement",
+                        str((row, site_cell)), None,
+                        "Try abrupt edge has no exact enclosing source scope",
+                    ))
         return found
 
     @staticmethod
@@ -3122,6 +3280,75 @@ class CorrelationTable:
                 found.append(Finding(
                     "source-exception-ssa-return-finalizer-disagreement",
                     str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_loop_exit_finalizer_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """A loop exit traverses its source-owned Try and output values."""
+        from .concordance_declarations import (
+            CONTROL_BLOCK, SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+            SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
+            SSA_BLOCK, SSA_VALUE, ControlBlockKind,
+            ExceptionFinalizerOutputFact,
+            ExceptionSiteStateFact, ExceptionSSALoopExitFinalizerFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None:
+            return []
+        page = book.page(SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER)
+        found = []
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(
+                SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER, row,
+            )
+            site = (
+                book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                    fact.exit_site.row, fact.exit_site.column,
+                ) if isinstance(fact, ExceptionSSALoopExitFinalizerFact)
+                and fact.exit_site.page == SOURCE_EXCEPTION_SITE_STATE
+                else None
+            )
+            causes = {
+                cell for cell, _stage in book.edges_into(receipt)
+            } if receipt is not None else set()
+            expected = {
+                fact.exit_site, fact.try_control,
+                fact.before_block, fact.after_block,
+                *(cell for pair in fact.output_values for cell in pair),
+            } if isinstance(fact, ExceptionSSALoopExitFinalizerFact) else set()
+            if not isinstance(site, ExceptionSiteStateFact) or (
+                site.action not in {"break", "continue"}
+                or row[1:] != (
+                    fact.exit_site, fact.try_control, fact.before_block,
+                )
+                or fact.try_control.page != CONTROL_BLOCK
+                or fact.try_control.row[1] is not ControlBlockKind.NATIVE_TRY
+                or fact.before_block.page != SSA_BLOCK
+                or fact.after_block.page != SSA_BLOCK
+                or any(
+                    source.page != SOURCE_EXCEPTION_FINALIZER_OUTPUT
+                    or value.page != SSA_VALUE
+                    or not isinstance(book.page(
+                        SOURCE_EXCEPTION_FINALIZER_OUTPUT
+                    ).cell(source.row, source.column),
+                                   ExceptionFinalizerOutputFact)
+                    or source.row[2] != fact.exit_site
+                    for source, value in fact.output_values
+                )
+                or causes != expected
+            ):
+                found.append(Finding(
+                    "source-exception-ssa-loop-exit-finalizer-disagreement",
+                    str(row), None,
+                    "loop finalizer edge lost source or SSA identity",
                 ))
         return found
 
@@ -3853,7 +4080,8 @@ class CorrelationTable:
                     or route.match_block != fact.match_block
                     or fact.incoming_value.page != SSA_VALUE
                     or fact.incoming_value.row[0] != row[0]
-                    or any(book.latest_ref(cell.page, cell.row) != cell
+                    or any(not CorrelationTable._current_or_revised_value(
+                               book, cell)
                            for cell in (
                                fact.ssa_route, fact.region_state,
                                fact.match_block, fact.incoming_value,
@@ -4148,6 +4376,7 @@ class CorrelationTable:
         arms = book.page(SOURCE_EXCEPTION_SSA_CONTINUATION_ARM)
         source_arms = book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE)
         found = []
+
         for row in phis.rows():
             fact = phis.latest(row)
             receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_CONTINUATION_PHI, row)
@@ -4201,7 +4430,8 @@ class CorrelationTable:
                         or cell.row[:2] != row
                         for cell in fact.incoming_arms
                     )
-                    or any(book.latest_ref(cell.page, cell.row) != cell
+                    or any(not CorrelationTable._current_or_revised_value(
+                               book, cell)
                            for cell in (
                                fact.source_phi, fact.join_block,
                                fact.result_value, *fact.incoming_arms,
@@ -4243,7 +4473,8 @@ class CorrelationTable:
                     or fact.exit_block.page != SSA_BLOCK
                     or fact.incoming_value.page != SSA_VALUE
                     or fact.incoming_value.row[0] != row[0]
-                    or any(book.latest_ref(cell.page, cell.row) != cell
+                    or any(not CorrelationTable._current_or_revised_value(
+                               book, cell)
                            for cell in (
                                fact.source_arm, fact.exit_block,
                                fact.incoming_value,
@@ -4756,17 +4987,52 @@ class CorrelationTable:
     def _source_exception_admission_findings(module: Any) -> list[Finding]:
         """A retained Try or Raise needs executable control before emission."""
         from .concordance_declarations import (
-            CANONICAL_VALUE, INGESTION_VALUE, SSA_BLOCK,
+            CANONICAL_VALUE, CONTROL_BLOCK, INGESTION_VALUE, SSA_BLOCK,
             SOURCE_EXCEPTION_ADMISSION,
             SOURCE_EXCEPTION_CONTROL_UNLOWERED,
             SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
+            SOURCE_EXCEPTION_SSA_UNWIND,
+            SOURCE_EXCEPTION_REGION_SITE,
             ExceptionAdmissionFact, ExceptionSSAControlCheckpointFact,
+            ExceptionTryAdmissionFact, ExceptionSSACheckpointFact,
+            ExceptionSSAUnwindFact,
+            ExceptionRegionSiteFact, ControlBlockFact, ControlBlockKind,
             ExceptionTransferFact, SOURCE_EXCEPTION_TRANSFER,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None or SOURCE_EXCEPTION_ADMISSION.name not in book.pages:
             return []
+
+        def proof_matches(transfer: Ref, proof: Ref) -> bool:
+            if proof.page == SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT:
+                checkpoint = book.page(proof.page).cells.get((
+                    proof.row, proof.column,
+                ))
+                return (
+                    isinstance(checkpoint,
+                               ExceptionSSAControlCheckpointFact)
+                    and checkpoint.transfer == transfer
+                )
+            if proof.page == SOURCE_EXCEPTION_SSA_CHECKPOINT:
+                checkpoint = book.page(proof.page).cells.get((
+                    proof.row, proof.column,
+                ))
+                region_site = (
+                    book.page(SOURCE_EXCEPTION_REGION_SITE).cell(
+                        checkpoint.region_site.row,
+                        checkpoint.region_site.column,
+                    ) if isinstance(checkpoint,
+                                    ExceptionSSACheckpointFact) else None
+                )
+                return (
+                    isinstance(region_site, ExceptionRegionSiteFact)
+                    and region_site.transfer == transfer
+                )
+            return False
+
         found = []
         page = book.page(SOURCE_EXCEPTION_ADMISSION)
         for row in page.rows():
@@ -4826,6 +5092,72 @@ class CorrelationTable:
                     }
                 ):
                     problem = "exception admission has no exact SSA fault proof"
+            elif isinstance(admission, ExceptionTryAdmissionFact):
+                control = (
+                    book.page(CONTROL_BLOCK).cell(
+                        admission.control.row,
+                        admission.control.column,
+                    ) if admission.control.page == CONTROL_BLOCK else None
+                )
+                expected = {
+                    source_cell, admission.control,
+                    admission.normal_exit,
+                    *(transfer for transfer, _proofs
+                      in admission.exit_proofs),
+                    *(proof for _transfer, proofs
+                      in admission.exit_proofs for proof in proofs),
+                    *admission.continuation_phis,
+                    *admission.unwind_paths,
+                    *((admission.normal_finalizer_entry,)
+                      if admission.normal_finalizer_entry is not None else ()),
+                }
+                if (
+                    admission.source != source_cell
+                    or not isinstance(control, ControlBlockFact)
+                    or control.kind is not ControlBlockKind.NATIVE_TRY
+                    or set(control.sites) != {
+                        transfer for transfer, _proofs
+                        in admission.exit_proofs
+                    }
+                    or admission.normal_exit.page != SSA_BLOCK
+                    or book.page(SSA_BLOCK).cells.get((
+                        admission.normal_exit.row,
+                        admission.normal_exit.column,
+                    )) is None
+                    or any(
+                        transfer.page != SOURCE_EXCEPTION_TRANSFER
+                        or not proofs
+                        or any(not proof_matches(transfer, proof)
+                               for proof in proofs)
+                        for transfer, proofs in admission.exit_proofs
+                    )
+                    or any(
+                        cell.page != SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
+                        for cell in admission.continuation_phis
+                    )
+                    or (
+                        admission.normal_finalizer_entry is not None
+                        and admission.normal_finalizer_entry.page != SSA_BLOCK
+                    )
+                    or (
+                        admission.normal_finalizer_entry is not None
+                        and len(admission.unwind_paths) != len(
+                            admission.exit_proofs
+                        )
+                    )
+                    or any(
+                        path.page != SOURCE_EXCEPTION_SSA_UNWIND
+                        or not isinstance(book.page(path.page).cell(
+                            path.row, path.column,
+                        ), ExceptionSSAUnwindFact)
+                        or book.page(path.page).cell(
+                            path.row, path.column,
+                        ).try_control != admission.control
+                        for path in admission.unwind_paths
+                    )
+                    or causes != expected
+                ):
+                    problem = "Try admission lacks exact control and SSA exits"
             else:
                 problem = "exception admission claims an unproven discharge"
             if problem is not None:

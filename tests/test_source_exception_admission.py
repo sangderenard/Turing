@@ -24,6 +24,8 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
     SOURCE_EXCEPTION_FINALIZER_BINDING,
     SOURCE_EXCEPTION_FINALIZER_INPUT,
+    SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+    SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
     SOURCE_EXCEPTION_SSA_FINALIZER_INPUT,
     SOURCE_EXCEPTION_SSA_ROUTE,
     SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
@@ -44,7 +46,9 @@ from src.compiler.identity_concordance import (
     CorrelationTable, Unresolved, begin_identity_book, end_identity_book,
 )
 from src.compiler.native_faults import FLOAT_TO_INT_NAN, FLOAT_TO_INT_INFINITY
-from src.compiler.native_faults import NativeAssertionError, NativeValueError
+from src.compiler.native_faults import (
+    NativeAssertionError, NativeOverflowError, NativeValueError,
+)
 
 
 CONTRACT = (
@@ -203,9 +207,7 @@ def root(x: float) -> int:
                 int(arm_facts[1].canonical_value.row[1]),
             ),
         )
-        assert any(
-            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
-        )
+        assert not shortfalls, shortfalls
         assert any(
             instruction.attributes.get("callee")
             == "turing_validation_error_take"
@@ -511,11 +513,15 @@ def root(x: int) -> int:
         assert len(try_facts) == 2
         # Each authored ``raise E(...)`` has a fallible constructor Call and
         # a subsequent Raise; both sites have their own transfer cell.
-        assert sorted(len(fact.sites) for fact in try_facts) == [2, 2]
-        assert all(
-            site.page == SOURCE_EXCEPTION_TRANSFER
+        assert sorted(
+            sum(site.page == SOURCE_EXCEPTION_TRANSFER
+                for site in fact.sites)
+            for fact in try_facts
+        ) == [2, 2]
+        assert sum(
+            site.page == SOURCE_EXCEPTION_SITE_STATE
             for fact in try_facts for site in fact.sites
-        )
+        ) == 1
     finally:
         end_identity_book(token)
 
@@ -776,9 +782,7 @@ def root(x: float) -> float:
                 1: ((input_id,), (outputs["success"],)),
             },
         )
-        assert any(
-            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
-        )
+        assert not shortfalls, shortfalls
         handler_entry_row, = tuple(book.page(
             SOURCE_EXCEPTION_SSA_HANDLER_ENTRY
         ).rows())
@@ -906,9 +910,7 @@ def root(x: float) -> float:
             },
             constant_value_ids=constants,
         )
-        assert any(
-            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
-        )
+        assert not shortfalls, shortfalls
         continuation_row, = tuple(book.page(
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
         ).rows())
@@ -1893,29 +1895,69 @@ def test_unconditional_root_raise_has_empty_native_buffer_abi(
         run()
 
 
-def test_production_try_reaches_ssa_maker_before_refusal():
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+@pytest.mark.parametrize("with_finally", [False, True], ids=["no-finally", "numeric-finally"])
+def test_production_try_dispatch_matches_native_status(
+    backend, with_finally, tmp_path,
+):
     source = """\
 def root(x: float) -> int:
+{initial}
     try:
         y = int(x)
     except ValueError:
         y = 2
+{finalbody}
     return y
-"""
-    book, token = begin_identity_book()
-    try:
-        with pytest.raises(CompilationSubdivisionRequired) as error:
-            _lower(
-                source, "exception_try_ssa_frontier", complete=True,
-                identity_book=book,
-            )
-        assert "native_try_dispatch" in str(error.value)
-        assert book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).rows()
-        assert error.value.boundaries[0]["kind"] == (
-            "source-exception-control-owner"
+""".format(
+        initial="    y = 0" if with_finally else "",
+        finalbody="    finally:\n        y = y + 1" if with_finally else "",
+    )
+    module, _outputs, exports = _lower(
+        source, f"exception_try_dispatch_{backend}", complete=True,
+    )
+    function = module.functions[exports[0]]
+    book = module.metadata["identity_book"]
+    assert book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).rows()
+    from src.compiler.concordance_declarations import ExceptionTryAdmissionFact
+    admission_rows = tuple(book.page(SOURCE_EXCEPTION_ADMISSION).rows())
+    assert len(admission_rows) == 1
+    assert isinstance(
+        book.page(SOURCE_EXCEPTION_ADMISSION).latest(admission_rows[0]),
+        ExceptionTryAdmissionFact,
+    )
+    parameter = dict(function.metadata["parameter_names"])["x"]
+    returns = tuple(
+        instruction for basic in function.blocks.values()
+        for instruction in basic.instrs if str(instruction.op) == "Ret"
+    )
+    assert len(returns) == 1 and len(returns[0].args) == 1
+    output = int(returns[0].args[0].id)
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, function.name)
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "c")
+        run = lambda value: artifact.prepare_execution({
+            parameter: np.array([value], dtype=np.float64),
+        }).run()
+    else:
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact, emit_ssa_function_to_llvm,
+            prepare_artifact_execution,
         )
-    finally:
-        end_identity_book(token)
+
+        emitted = emit_ssa_function_to_llvm(module, function.name)
+        assert not emitted.shortfalls, emitted.shortfalls
+        artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+        run = lambda value: prepare_artifact_execution(artifact, {
+            parameter: np.array([value], dtype=np.float64),
+        }).run()
+    assert int(run(1.9).buffers[output].reshape(-1)[0]) == (2 if with_finally else 1)
+    assert int(run(float("nan")).buffers[output].reshape(-1)[0]) == (3 if with_finally else 2)
+    with pytest.raises(NativeOverflowError):
+        run(float("inf"))
 
 
 def test_production_try_return_has_concorded_ssa_dominance_observations():
@@ -1932,17 +1974,6 @@ def root(x: float) -> int:
 
 
 @pytest.mark.parametrize("source", [
-    """\
-def root(x: float) -> int:
-    y = 0
-    try:
-        y = int(x)
-    except ValueError:
-        y = 2
-    finally:
-        y = y + 1
-    return y
-""",
     """\
 def root(x: int) -> int:
     try:
@@ -1972,7 +2003,7 @@ def root(x: int) -> int:
     except ValueError:
         return 2
 """,
-], ids=["join-finally", "handled-raise-finally", "assert-finally",
+], ids=["handled-raise-finally", "assert-finally",
         "nested-propagation"])
 def test_production_exception_control_reaches_ssa_frontier(source):
     book, token = begin_identity_book()
@@ -2011,11 +2042,10 @@ def root(x: float) -> int:
 """
     book, token = begin_identity_book()
     try:
-        with pytest.raises(CompilationSubdivisionRequired):
-            _lower(
-                source, "exception_finally_dtype_evidence",
-                complete=True, identity_book=book,
-            )
+        _lower(
+            source, "exception_finally_dtype_evidence",
+            complete=True, identity_book=book,
+        )
         arms = {
             book.latest_ref(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE, row)
             for row in book.page(
@@ -2177,3 +2207,129 @@ def root(x: float) -> int:
 """
     module, _outputs, exports = _lower(source, "exception_admission_plain")
     assert exports[0] in module.functions
+
+
+@pytest.mark.parametrize("action", ["break", "continue"])
+@pytest.mark.parametrize("guarded", [False, True])
+def test_try_loop_exit_has_one_source_owned_control_edge(
+    action, guarded, monkeypatch,
+):
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.control_source import (
+        ConditionalBlock, LoopBlock, LoopControlBlock, NativeTryBlock,
+        SequenceBlock, WhileBlock,
+    )
+    from src.compiler.precompile_to_ssa import _ControlSSABuilder
+
+    body = (
+        f"            if x > 1:\n                {action}\n"
+        "            x = x - 1\n"
+        if guarded else
+        f"            x = x - 1\n            {action}\n"
+    )
+    source = f"""\
+def root(x: int) -> int:
+    while x > 0:
+        try:
+{body.rstrip()}
+        finally:
+            x = x - 1
+    return x
+"""
+    observed = []
+    finished = []
+    original = strategy._overlay_control_or_require_subdivision
+    original_finish = _ControlSSABuilder.finish
+
+    def capture(*args, **kwargs):
+        program = original(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", capture,
+    )
+
+    def capture_finish(builder, *args, **kwargs):
+        result = original_finish(builder, *args, **kwargs)
+        finished.append(result[0])
+        return result
+
+    monkeypatch.setattr(_ControlSSABuilder, "finish", capture_finish)
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired) as error:
+            _lower(
+                source, f"exception_try_{action}_edge", complete=True,
+                identity_book=book,
+            )
+        assert "native_try_dispatch" in str(error.value)
+        program, = observed
+
+        def visit(block):
+            yield block
+            if isinstance(block, SequenceBlock):
+                arms = block.blocks
+            elif isinstance(block, ConditionalBlock):
+                arms = (block.body, block.orelse)
+            elif isinstance(block, (LoopBlock, WhileBlock)):
+                arms = (block.body, *block.terminal_controls)
+            elif isinstance(block, NativeTryBlock):
+                arms = (
+                    block.body, *(handler.body for handler in block.handlers),
+                    block.orelse, block.finalbody,
+                )
+            else:
+                arms = ()
+            for arm in arms:
+                if arm is not None:
+                    yield from visit(arm)
+
+        exits = tuple(
+            block for block in visit(program.root)
+            if isinstance(block, LoopControlBlock)
+            and block.action == action
+        )
+        assert len(exits) == 1
+        site = exits[0].exception_exit_site_cell
+        assert site is not None
+        tries = tuple(
+            block for block in visit(program.root)
+            if isinstance(block, NativeTryBlock)
+        )
+        assert len(tries) == 1
+        assert site in tries[0].abrupt_exit_site_cells
+        assert exits[0] in tuple(visit(tries[0].body))
+        output_rows = tuple(
+            row for row in book.page(
+                SOURCE_EXCEPTION_FINALIZER_OUTPUT
+            ).rows() if row[2] == site
+        )
+        assert len(output_rows) == 1
+        ssa_rows = tuple(
+            row for row in book.page(
+                SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER
+            ).rows() if row[1] == site
+        )
+        assert len(ssa_rows) == 1
+        receipt = book.page(
+            SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER
+        ).latest(ssa_rows[0])
+        assert len(receipt.output_values) == 1
+        assert CorrelationTable._source_exception_ssa_loop_exit_finalizer_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        exit_blocks = tuple(
+            basic for function in finished
+            for basic in function.blocks.values()
+            if any(instruction.attributes.get("source_control") == action
+                   for instruction in basic.instrs)
+        )
+        assert len(exit_blocks) == 1
+        instructions = exit_blocks[0].instrs
+        assert str(instructions[-1].op) == "Br"
+        assert any(str(instruction.op) == "Call"
+                   for instruction in instructions[:-1])
+    finally:
+        end_identity_book(token)

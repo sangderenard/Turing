@@ -52,6 +52,7 @@ from ...compiler.concordance_declarations import (
     NAME_BINDING as _NAME_BINDING,
     ExceptionSiteStateFact as _ExceptionSiteStateFact,
     ExceptionFinalizerBindingFact as _ExceptionFinalizerBindingFact,
+    ExceptionFinalizerOutputBindingFact as _ExceptionFinalizerOutputBindingFact,
     ExceptionContinuationPhiFact as _ExceptionContinuationPhiFact,
     NodeFact as _NodeFact,
     PARAMETER_ANNOTATION as _PARAMETER_ANNOTATION,
@@ -62,6 +63,7 @@ from ...compiler.concordance_declarations import (
     SOURCE_CALL_RESULT_IDENTITY as _SOURCE_CALL_RESULT_IDENTITY,
     SOURCE_EXCEPTION_SITE_STATE as _SOURCE_EXCEPTION_SITE_STATE,
     SOURCE_EXCEPTION_FINALIZER_BINDING as _SOURCE_EXCEPTION_FINALIZER_BINDING,
+    SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING as _SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING,
     SOURCE_EXCEPTION_CONTINUATION_PHI as _SOURCE_EXCEPTION_CONTINUATION_PHI,
     SOURCE_AGGREGATE_LAYOUT as _SOURCE_AGGREGATE_LAYOUT,
     SOURCE_GLYPH_SEQUENCE as _SOURCE_GLYPH_SEQUENCE,
@@ -17760,7 +17762,50 @@ def _normalize_lexical_values(
                         )))),
                         mode=_Mode.CONCORD,
                     )
+            before_finalbody = dict(environment)
             reduce_exception_arm(body_statement.finalbody, "finalbody")
+            if body_statement.finalbody:
+                # Program: `while x: try: break; finally: x=x-1`.
+                # The break site records pre-finalizer x. Its loop exit must
+                # carry the binding produced by finalbody. Record that exact
+                # source binding for every exit that crosses this Try; SSA
+                # may then compute a separate generation on each edge.
+                book = current_identity_book()
+                site_page = book.page(_SOURCE_EXCEPTION_SITE_STATE)
+                crossing_sites = tuple(
+                    book.latest_ref(_SOURCE_EXCEPTION_SITE_STATE, row)
+                    for row in site_page.scope_rows(ingestion_read_scope)
+                    if any(
+                        owner == try_cell and arm != "finalbody"
+                        for owner, arm, _handler in
+                        site_page.latest(row).scopes
+                    )
+                )
+                for name, value in sorted(environment.items()):
+                    if value == before_finalbody.get(name) or not isinstance(
+                        value, int
+                    ) or isinstance(value, bool):
+                        continue
+                    binding = current_name_binding_cell(name, value)
+                    if binding is None:
+                        raise ValueError(
+                            "finalizer output has no exact source binding: "
+                            f"try={id(body_statement)}, name={name!r}"
+                        )
+                    for site_cell in crossing_sites:
+                        book.post(
+                            _SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING,
+                            (ingestion_read_scope, id(body_statement),
+                             site_cell, name),
+                            _ExceptionFinalizerOutputBindingFact(
+                                try_cell, site_cell, binding,
+                            ),
+                            stage=_REDUCTION,
+                            provenance=_Derived((
+                                try_cell, site_cell, binding,
+                            )),
+                            mode=_Mode.CONCORD,
+                        )
             return id(body_statement)
         if isinstance(body_statement, (ast.For, ast.While)):
             if isinstance(body_statement, ast.While):
