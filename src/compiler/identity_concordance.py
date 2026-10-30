@@ -1595,6 +1595,7 @@ class CorrelationTable:
         found.extend(self._source_exception_ssa_propagation_findings(module))
         found.extend(self._source_exception_ssa_return_finalizer_findings(module))
         found.extend(self._source_exception_ssa_loop_exit_finalizer_findings(module))
+        found.extend(self._source_exception_ssa_finalizer_output_findings(module))
         found.extend(self._source_exception_ssa_route_findings(module))
         found.extend(self._source_exception_ssa_handler_arm_findings(module))
         found.extend(self._source_exception_ssa_handler_state_findings(module))
@@ -3370,6 +3371,100 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_exception_ssa_finalizer_output_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Each finalbody execution records its exact SSA output version."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CONTROL_BLOCK, REGION_SIGNATURE,
+            SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT, SSA_BLOCK, SSA_VALUE,
+            ControlBlockKind, ExceptionSSAFinalizerOutputFact,
+            ExceptionSiteStateFact, RegionSignature,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None:
+            return []
+        page = book.page(SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT)
+        found = []
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(
+                SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT, row,
+            )
+            region = (
+                book.page(REGION_SIGNATURE).cell(
+                    fact.region_signature.row,
+                    fact.region_signature.column,
+                ) if isinstance(fact, ExceptionSSAFinalizerOutputFact)
+                and fact.region_signature is not None
+                and fact.region_signature.page == REGION_SIGNATURE else None
+            )
+            site = (
+                book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                    fact.exit_site.row, fact.exit_site.column,
+                ) if isinstance(fact, ExceptionSSAFinalizerOutputFact)
+                and fact.exit_site is not None
+                and fact.exit_site.page == SOURCE_EXCEPTION_SITE_STATE
+                else None
+            )
+            causes = (
+                {cell for cell, _stage in book.edges_into(receipt)}
+                if receipt is not None else set()
+            )
+            if (
+                not isinstance(fact, ExceptionSSAFinalizerOutputFact)
+                or row[:3] != (
+                    row[0], fact.try_control, fact.entry_block,
+                )
+                or (fact.region_signature is not None and
+                    row[3] != fact.region_signature.row[1])
+                or (fact.canonical_output is not None and
+                    row[4] != fact.canonical_output.row[1])
+                or fact.try_control.page != CONTROL_BLOCK
+                or fact.try_control.row[1] is not ControlBlockKind.NATIVE_TRY
+                or fact.entry_block.page != SSA_BLOCK
+                or fact.entry_block.row[0] != row[0]
+                or (fact.region_signature is None and
+                    fact.canonical_output is None)
+                or (fact.region_signature is not None and (
+                    not isinstance(region, RegionSignature)
+                    or int(row[4]) not in tuple(map(int, region.outputs))
+                ))
+                or (fact.canonical_output is not None and
+                    fact.canonical_output.page != CANONICAL_VALUE)
+                or fact.ssa_value.page != SSA_VALUE
+                or fact.ssa_value.row[0] != row[0]
+                or not CorrelationTable._current_or_revised_value(
+                    book, fact.ssa_value,
+                )
+                or (fact.exit_site is not None and (
+                    not isinstance(site, ExceptionSiteStateFact)
+                    or site.action not in {
+                        "return", "break", "continue", "exception",
+                    }
+                ))
+                or causes != {
+                    fact.try_control, fact.entry_block,
+                    *((fact.region_signature,)
+                      if fact.region_signature is not None else ()),
+                    *((fact.canonical_output,)
+                      if fact.canonical_output is not None else ()),
+                    fact.ssa_value,
+                    *((fact.exit_site,) if fact.exit_site is not None else ()),
+                }
+            ):
+                found.append(Finding(
+                    "source-exception-ssa-finalizer-output-disagreement",
+                    str(row), None,
+                    "finalizer output lacks its exact source and SSA edge",
+                ))
+        return found
+
+    @staticmethod
     def _source_exception_ssa_control_findings(
         module: Any,
     ) -> list[Finding]:
@@ -5011,13 +5106,15 @@ class CorrelationTable:
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
             SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
+            SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
             SOURCE_EXCEPTION_SSA_UNWIND,
             SOURCE_EXCEPTION_SITE_STATE,
             SOURCE_EXCEPTION_REGION_SITE,
             ExceptionAdmissionFact, ExceptionSSAControlCheckpointFact,
             ExceptionTryAdmissionFact, ExceptionSSACheckpointFact,
             ExceptionSSAUnwindFact,
-            ExceptionSSAReturnFinalizerFact, ExceptionSiteStateFact,
+            ExceptionSSAReturnFinalizerFact,
+            ExceptionSSALoopExitFinalizerFact, ExceptionSiteStateFact,
             ExceptionRegionSiteFact, ControlBlockFact, ControlBlockKind,
             ExceptionTransferFact, SOURCE_EXCEPTION_TRANSFER,
         )
@@ -5170,22 +5267,31 @@ class CorrelationTable:
                             SOURCE_EXCEPTION_SITE_STATE
                         ).cell(site.row, site.column),
                             ExceptionSiteStateFact)
-                        or book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
-                            site.row, site.column,
-                        ).action != "return"
-                        or proof.page != SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
-                        or not isinstance(book.page(
-                            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
-                        ).cell(proof.row, proof.column),
-                            ExceptionSSAReturnFinalizerFact)
-                        or book.page(
-                            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
-                        ).cell(proof.row, proof.column).exception_exit_site
-                        != site
-                        or book.page(
-                            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
-                        ).cell(proof.row, proof.column).try_control
-                        != admission.control
+                        or not (
+                            proof.page == SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                            and isinstance(book.page(proof.page).cell(
+                                proof.row, proof.column,
+                            ), ExceptionSSAReturnFinalizerFact)
+                            and book.page(proof.page).cell(
+                                proof.row, proof.column,
+                            ).exception_exit_site == site
+                            and book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                                site.row, site.column,
+                            ).action == "return"
+                            or proof.page == SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER
+                            and isinstance(book.page(proof.page).cell(
+                                proof.row, proof.column,
+                            ), ExceptionSSALoopExitFinalizerFact)
+                            and book.page(proof.page).cell(
+                                proof.row, proof.column,
+                            ).exit_site == site
+                            and book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                                site.row, site.column,
+                            ).action in {"break", "continue"}
+                        )
+                        or book.page(proof.page).cell(
+                            proof.row, proof.column,
+                        ).try_control != admission.control
                         for site, proof in admission.abrupt_exit_proofs
                     )
                     or (

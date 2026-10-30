@@ -2427,6 +2427,9 @@ class _ControlSSABuilder(TiledObject):
         self._control_cells: list[Ref | None] = []
         self.shortfalls: list[SSALoweringShortfall] = []
         self._native_try_frames: list[dict[str, Any]] = []
+        self._native_finalizer_instances: list[
+            tuple[Ref, Ref, Ref | None]
+        ] = []
         self.region_callees = dict(region_callees or {})
         # A region with a recorded signature is schedulable by definition; its
         # callee name follows the one convention every consumer already uses
@@ -6338,7 +6341,66 @@ class _ControlSSABuilder(TiledObject):
                     value_id, value, BindingKind.VERSIONED_WRITE, *producer,
                 )
                 return value
-            if self._defines(value) and self.__dict__.get("_latch_test_generation"):
+            normal_finalizer_inputs = ()
+            if self._defines(value) and self._native_try_frames:
+                from .concordance_declarations import (
+                    SOURCE_EXCEPTION_FINALIZER_INPUT,
+                    ExceptionFinalizerInputFact,
+                )
+                book = self._book()
+                owners = {
+                    int(frame["block"].source_try_node_id)
+                    for frame in self._native_try_frames
+                }
+                normal_finalizer_inputs = tuple(
+                    book.latest_ref(SOURCE_EXCEPTION_FINALIZER_INPUT, row)
+                    for row in book.page(
+                        SOURCE_EXCEPTION_FINALIZER_INPUT
+                    ).rows()
+                    if row[:2] in tuple(
+                        (self.planning_scope, owner) for owner in owners
+                    )
+                    and isinstance(book.page(
+                        SOURCE_EXCEPTION_FINALIZER_INPUT
+                    ).latest(row), ExceptionFinalizerInputFact)
+                    and int(book.page(
+                        SOURCE_EXCEPTION_FINALIZER_INPUT
+                    ).latest(row).normal_value.row[1]) == value_id
+                )
+            if self._defines(value) and (
+                self._native_finalizer_instances
+                or normal_finalizer_inputs
+            ):
+                # `if x > 1: break` executes the same finalbody region on
+                # the leaving edge and the fallthrough edge. Its canonical
+                # output id is one source identity, but each edge needs its
+                # own SSA definition. Mint the next version before the Load
+                # and record that exact edge output when the Load emits.
+                owner, entry, exit_site = (
+                    self._native_finalizer_instances[-1]
+                    if self._native_finalizer_instances
+                    else (None, None, None)
+                )
+                previous = value
+                value = self.fresh_value(
+                    dtype=dtype or previous.dtype,
+                    shape=tuple(previous.shape),
+                    transform=VERSIONED_WRITE,
+                    operands=self._cells(
+                        self._binding_cell(value_id), owner, entry,
+                        exit_site, *normal_finalizer_inputs, *producer,
+                    ),
+                )
+                value.accounting.update({
+                    **dict(previous.accounting or {}),
+                    "source_value_id": value_id,
+                })
+                self._bind(
+                    value_id, value, BindingKind.VERSIONED_WRITE,
+                    owner, entry, exit_site, *normal_finalizer_inputs,
+                    *producer,
+                )
+            elif self._defines(value) and self.__dict__.get("_latch_test_generation"):
                 # Program: ``while index < count and everything[index] ==
                 # position:`` (c37_while_in_for).  Wrong record: the latch
                 # re-evaluates the test, re-emitting the row load of 11 with
@@ -10128,8 +10190,11 @@ class _ControlSSABuilder(TiledObject):
                             "discarded_carried_seed_projection": True,
                         },
                     )
+                    self._record_native_finalizer_output(
+                        region_index, int(output_id), scratch,
+                    )
                 else:
-                    self.indexed_load(
+                    output_value = self.indexed_load(
                         aggregate,
                         index,
                         output_id,
@@ -10142,6 +10207,9 @@ class _ControlSSABuilder(TiledObject):
                         # formal.  ``produced_value`` still refuses this transition
                         # for declared in/out storage and versions those writes.
                         claim_provisional_definition=True,
+                    )
+                    self._record_native_finalizer_output(
+                        region_index, int(output_id), output_value,
                     )
         self._emit_region_post_operations(region_index, location=location)
 
@@ -12122,6 +12190,66 @@ class _ControlSSABuilder(TiledObject):
                 mode=Mode.CONCORD,
             )
 
+    def _lower_native_finalbody(
+        self, frame: dict[str, Any], *, path: str,
+        exit_site: Ref | None = None,
+    ) -> Ref:
+        """Emit one finalbody execution under its exact SSA entry cell."""
+        entry = self._book().latest_ref(
+            SSA_BLOCK,
+            (self._scope(), self.function_name, self.current.name),
+        )
+        if entry is None:
+            raise ValueError("native finalizer has no SSA entry block")
+        self._native_finalizer_instances.append((
+            frame["owner"], entry, exit_site,
+        ))
+        try:
+            self.lower(frame["block"].finalbody, path=path)
+        finally:
+            self._native_finalizer_instances.pop()
+        return entry
+
+    def _record_native_finalizer_output(
+        self, region_index: int, output_id: int, value: SSAValue,
+    ) -> None:
+        """Post the SSA version when this finalbody region emits it."""
+        if not self._native_finalizer_instances:
+            return
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
+            ExceptionSSAFinalizerOutputFact,
+        )
+
+        owner, entry, exit_site = self._native_finalizer_instances[-1]
+        region = self._declared_cell(
+            REGION_SIGNATURE.name, (self._scope(), int(region_index)),
+        )
+        canonical = self._canonical_cell(int(output_id))
+        result = self._value_cell(value)
+        if (region is None and canonical is None) or result is None:
+            raise ValueError(
+                "finalizer output lacks source or SSA identity: "
+                f"region={region_index}, output={output_id}"
+            )
+        causes = self._cells(
+            owner, entry, exit_site, region, canonical, result,
+        )
+        receipt = self._book().post(
+            SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
+            (self._scope(), owner, entry, int(region_index),
+             int(output_id)),
+            ExceptionSSAFinalizerOutputFact(
+                owner, entry, exit_site, region, canonical, result,
+            ),
+            stage=self._stage(), provenance=Derived(causes),
+            mode=Mode.CONCORD,
+        )
+        self._bind(
+            int(output_id), value, BindingKind.REGION_RESULT,
+            receipt, region,
+        )
+
     def _emit_native_return_finalizers(
         self, block: LoopControlBlock, edge_values: tuple[SSAValue | None, ...],
         path: str,
@@ -12137,7 +12265,9 @@ class _ControlSSABuilder(TiledObject):
         from .concordance_declarations import (
             SOURCE_EXCEPTION_FINALIZER_INPUT,
             SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
+            SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
             ExceptionSSAReturnFinalizerFact,
+            ExceptionSSALoopExitFinalizerFact,
         )
 
         if block.return_site_cell is None:
@@ -12201,9 +12331,9 @@ class _ControlSSABuilder(TiledObject):
             saved_frames = self._native_try_frames
             self._native_try_frames = list(frames[:index])
             try:
-                self.lower(
-                    frame["block"].finalbody,
-                    path=f"{path}.pending_finally[{index}]",
+                self._lower_native_finalbody(
+                    frame, path=f"{path}.pending_finally[{index}]",
+                    exit_site=block.exception_exit_site_cell,
                 )
             finally:
                 self._native_try_frames = saved_frames
@@ -12238,9 +12368,11 @@ class _ControlSSABuilder(TiledObject):
         """Traverse source-owned finalizers before a break/continue target."""
         from .concordance_declarations import (
             SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+            SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
             SOURCE_EXCEPTION_SITE_STATE,
             SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
-            ExceptionFinalizerOutputFact, ExceptionSiteStateFact,
+            ExceptionFinalizerOutputFact,
+            ExceptionSSAFinalizerOutputFact, ExceptionSiteStateFact,
             ExceptionSSALoopExitFinalizerFact,
         )
 
@@ -12278,9 +12410,9 @@ class _ControlSSABuilder(TiledObject):
             saved_frames = self._native_try_frames
             self._native_try_frames = list(frames[:index])
             try:
-                self.lower(
-                    frame["block"].finalbody,
-                    path=f"{path}.pending_finally[{index}]",
+                self._lower_native_finalbody(
+                    frame, path=f"{path}.pending_finally[{index}]",
+                    exit_site=site,
                 )
             finally:
                 self._native_try_frames = saved_frames
@@ -12309,7 +12441,31 @@ class _ControlSSABuilder(TiledObject):
                         f"row={row!r}"
                     )
                 value_id = int(output.canonical_output.row[1])
-                value = self.external_values.get(value_id)
+                versions = tuple(
+                    book.page(SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT).latest(
+                        candidate,
+                    )
+                    for candidate in book.page(
+                        SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT
+                    ).rows()
+                    if candidate[:3] == (
+                        self._scope(), frame["owner"], before_cell,
+                    ) and int(candidate[4]) == value_id
+                )
+                if len(versions) != 1 or not isinstance(
+                    versions[0], ExceptionSSAFinalizerOutputFact,
+                ) or (
+                    versions[0].exit_site != site
+                    or versions[0].canonical_output
+                    != output.canonical_output
+                ):
+                    raise ValueError(
+                        "loop finalizer lacks its edge-specific SSA output: "
+                        f"row={row!r}"
+                    )
+                value = self.ssa_value_objects.get(
+                    int(versions[0].ssa_value.row[1]),
+                )
                 if value is None or not self._value_dominates_current_edge(
                     value,
                 ):
@@ -12370,6 +12526,7 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
+            SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
             SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
             SOURCE_EXCEPTION_SSA_ROUTE,
@@ -12390,6 +12547,7 @@ class _ControlSSABuilder(TiledObject):
             ExceptionSSAContinuationArmFact,
             ExceptionSSAContinuationPhiFact, ExceptionSSARouteFact,
             ExceptionSSAReturnFinalizerFact,
+            ExceptionSSALoopExitFinalizerFact,
             ExceptionSSAPropagationFact, ExceptionStatusRouteFact,
             ExceptionSSAUnwindFact,
             ExceptionSiteStateFact,
@@ -12545,7 +12703,10 @@ class _ControlSSABuilder(TiledObject):
             self._restore_native_finalizer_inputs(
                 frame, exit_site, edge["state"],
             )
-            self.lower(block.finalbody, path=f"{path}.escalation_finally")
+            self._lower_native_finalbody(
+                frame, path=f"{path}.escalation_finally",
+                exit_site=exit_site,
+            )
             before_cell = book.latest_ref(
                 SSA_BLOCK,
                 (self._scope(), self.function_name, before.name),
@@ -13454,7 +13615,9 @@ class _ControlSSABuilder(TiledObject):
             SSA_BLOCK,
             (self._scope(), self.function_name, self.current.name),
         )
-        self.lower(block.finalbody, path=f"{path}.try_finally")
+        self._lower_native_finalbody(
+            frame, path=f"{path}.try_finally",
+        )
         # The existing control IR has one normal finalizer arm. A finalbody
         # consisting only of scheduled numerical regions has no new control
         # outcome; every failure edge separately records its unwind path.
@@ -13507,28 +13670,37 @@ class _ControlSSABuilder(TiledObject):
             for transfer in block.protected_transfer_cells
         )
         abrupt_exit_proofs = []
+        abrupt_exit_actions = []
         for site in block.abrupt_exit_site_cells:
             source_site = book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
                 site.row, site.column,
             )
             if not isinstance(source_site, ExceptionSiteStateFact) or (
-                source_site.action != "return"
+                source_site.action not in {"return", "break", "continue"}
             ):
                 break
+            abrupt_exit_actions.append(source_site.action)
+            receipt_page = (
+                SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                if source_site.action == "return"
+                else SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER
+            )
             receipts = tuple(
-                book.latest_ref(SOURCE_EXCEPTION_SSA_RETURN_FINALIZER, row)
-                for row in book.page(
-                    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
-                ).rows()
-                if isinstance(book.page(
-                    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
-                ).latest(row), ExceptionSSAReturnFinalizerFact)
-                and book.page(
-                    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
-                ).latest(row).exception_exit_site == site
-                and book.page(
-                    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
-                ).latest(row).try_control == frame["owner"]
+                book.latest_ref(receipt_page, row)
+                for row in book.page(receipt_page).rows()
+                if (
+                    isinstance(book.page(receipt_page).latest(row),
+                               ExceptionSSAReturnFinalizerFact)
+                    and book.page(receipt_page).latest(
+                        row
+                    ).exception_exit_site == site
+                    or isinstance(book.page(receipt_page).latest(row),
+                                  ExceptionSSALoopExitFinalizerFact)
+                    and book.page(receipt_page).latest(row).exit_site == site
+                )
+                and book.page(receipt_page).latest(
+                    row
+                ).try_control == frame["owner"]
             )
             if len(receipts) != 1:
                 break
@@ -13536,9 +13708,13 @@ class _ControlSSABuilder(TiledObject):
         if (
             finalbody_is_numeric
             and (not block.abrupt_exit_site_cells or (
-                not block.finalbody.blocks
-                and len(abrupt_exit_proofs) == len(
+                len(abrupt_exit_proofs) == len(
                     block.abrupt_exit_site_cells
+                )
+                and all(
+                    action in {"break", "continue"}
+                    or not block.finalbody.blocks
+                    for action in abrupt_exit_actions
                 )
             ))
             and all(evidence for _transfer, evidence in checkpoint_proofs)

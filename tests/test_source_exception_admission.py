@@ -25,6 +25,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_FINALIZER_BINDING,
     SOURCE_EXCEPTION_FINALIZER_INPUT,
     SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+    SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
     SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
     SOURCE_EXCEPTION_SSA_FINALIZER_INPUT,
     SOURCE_EXCEPTION_SSA_ROUTE,
@@ -2301,12 +2302,10 @@ def root(x: int) -> int:
     monkeypatch.setattr(_ControlSSABuilder, "finish", capture_finish)
     book, token = begin_identity_book()
     try:
-        with pytest.raises(CompilationSubdivisionRequired) as error:
-            _lower(
-                source, f"exception_try_{action}_edge", complete=True,
-                identity_book=book,
-            )
-        assert "native_try_dispatch" in str(error.value)
+        _lower(
+            source, f"exception_try_{action}_edge", complete=True,
+            identity_book=book,
+        )
         program, = observed
 
         def visit(block):
@@ -2355,10 +2354,36 @@ def root(x: int) -> int:
             ).rows() if row[1] == site
         )
         assert len(ssa_rows) == 1
+        admission_rows = tuple(book.page(SOURCE_EXCEPTION_ADMISSION).rows())
+        assert len(admission_rows) == 1
+        admission = book.page(SOURCE_EXCEPTION_ADMISSION).latest(
+            admission_rows[0]
+        )
+        assert admission.abrupt_exit_proofs == ((
+            site,
+            book.latest_ref(SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
+                            ssa_rows[0]),
+        ),)
         receipt = book.page(
             SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER
         ).latest(ssa_rows[0])
         assert len(receipt.output_values) == 1
+        versions = tuple(
+            book.page(SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT).latest(row)
+            for row in book.page(
+                SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT
+            ).rows()
+            if row[4] == book.page(
+                SOURCE_EXCEPTION_FINALIZER_OUTPUT
+            ).latest(output_rows[0]).canonical_output.row[1]
+        )
+        assert any(version.exit_site == site for version in versions)
+        assert any(version.exit_site is None for version in versions)
+        if guarded:
+            assert len({version.ssa_value for version in versions}) == 2
+        assert CorrelationTable._source_exception_ssa_finalizer_output_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
         assert CorrelationTable._source_exception_ssa_loop_exit_finalizer_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
@@ -2375,3 +2400,64 @@ def root(x: int) -> int:
                    for instruction in instructions[:-1])
     finally:
         end_identity_book(token)
+
+
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+@pytest.mark.parametrize(
+    "action,guarded,expected",
+    [("break", False, 1), ("continue", False, -1),
+     ("break", True, 2), ("continue", True, -1)],
+)
+def test_try_loop_exit_finalizer_executes_on_correct_edge(
+    backend, action, guarded, expected, tmp_path,
+):
+    body = (
+        f"            if x > 1:\n                {action}\n"
+        "            x = x - 1\n"
+        if guarded else
+        f"            x = x - 1\n            {action}\n"
+    )
+    source = f"""\
+def root(x: int) -> int:
+    while x > 0:
+        try:
+{body.rstrip()}
+        finally:
+            x = x - 1
+    return x
+"""
+    module, _outputs, exports = _lower(
+        source, f"exception_loop_{action}_{guarded}_{backend}",
+        complete=True,
+    )
+    function = module.functions[exports[0]]
+    parameter = dict(function.metadata["parameter_names"])["x"]
+    returns = tuple(
+        instruction for basic in function.blocks.values()
+        for instruction in basic.instrs if str(instruction.op) == "Ret"
+    )
+    assert len(returns) == 1 and len(returns[0].args) == 1
+    output = int(returns[0].args[0].id)
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, function.name)
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "c")
+        run = lambda value: artifact.prepare_execution({
+            parameter: np.array([value], dtype=np.int64),
+        }).run()
+    else:
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact, emit_ssa_function_to_llvm,
+            prepare_artifact_execution,
+        )
+
+        emitted = emit_ssa_function_to_llvm(module, function.name)
+        assert not emitted.shortfalls, emitted.shortfalls
+        artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+        run = lambda value: prepare_artifact_execution(artifact, {
+            parameter: np.array([value], dtype=np.int64),
+        }).run()
+    assert int(run(3).buffers[output].reshape(-1)[0]) == expected
+    assert int(run(0).buffers[output].reshape(-1)[0]) == 0

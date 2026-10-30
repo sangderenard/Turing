@@ -1268,6 +1268,29 @@ SOURCE_EXCEPTION_FINALIZER_OUTPUT = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSAFinalizerOutputFact:
+    """One finalbody execution's exact SSA version of a planned output."""
+
+    try_control: Ref
+    entry_block: Ref
+    exit_site: Ref | None
+    region_signature: Ref | None
+    canonical_output: Ref | None
+    ssa_value: Ref
+
+
+SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT = declare_page(
+    "source_exception_ssa_finalizer_output", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("try_control", K.PAGE_REF),
+        RowField("entry_block", K.PAGE_REF),
+        RowField("region_index", K.INDEX),
+        RowField("output_id", K.VALUE_ID),
+    ), ExceptionSSAFinalizerOutputFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionTransferFact:
     """Source-owned route and state for one fallible operation."""
 
