@@ -16,6 +16,7 @@ from src.compiler.concordance_declarations import (
     CONTROL_BLOCK, ControlBlockKind,
     CONTROL_VALUE_BINDING, BindingKind,
     NAME_BINDING, SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_SITE_STATE,
+    SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT,
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_INERT_CONSTRUCTOR,
     SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT,
@@ -91,6 +92,25 @@ def _lower(source: str, name: str, *, complete=False, **kwargs):
 
     with patch.object(fortran_c_shell, "_class_surface_ssa_program", planned):
         return lower()
+
+
+def test_structural_fold_retires_exact_rejected_raise():
+    source = """\
+def root(x: int) -> int:
+    if isinstance(x, int):
+        return x
+    raise TypeError("bad")
+"""
+    module, _outputs, _exports = _lower(source, "root", complete=True)
+    book = module.metadata["identity_book"]
+    page = book.page(SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT)
+    rows = tuple(page.rows())
+    assert rows
+    assert all(page.latest(row).transfer == row[1] for row in rows)
+    assert not CorrelationTable._source_exception_control_coverage_findings(
+        module
+    )
+    assert not CorrelationTable._source_exception_admission_findings(module)
 
 
 def test_authored_catch_without_exceptional_control_refuses(monkeypatch):

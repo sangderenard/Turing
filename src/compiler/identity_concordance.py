@@ -2533,8 +2533,11 @@ class CorrelationTable:
         from .concordance_declarations import (
             CANONICAL_VALUE, CONTROL_BLOCK, CONTROL_BLOCK_PLACEMENT,
             CONTROL_PROGRAM, SHELL,
+            SOURCE_CONTROL_SPECIALIZATION,
             SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_TRANSFER,
+            SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT,
             SOURCE_EXCEPTION_SITE_STATE, ExceptionSiteStateFact,
+            ExceptionStructuralRetirementFact,
             ControlBlockFact, ControlBlockKind, ControlProgramFact,
             ExceptionTransferFact, Placement,
         )
@@ -2544,6 +2547,7 @@ class CorrelationTable:
             return []
         controls = book.page(CONTROL_BLOCK)
         programs = book.page(CONTROL_PROGRAM)
+        retirements = book.page(SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT)
         canonical_successors = {}
         for row in book.page(CANONICAL_VALUE).rows():
             canonical = book.latest_ref(CANONICAL_VALUE, row)
@@ -2597,6 +2601,11 @@ class CorrelationTable:
             if not scopes:
                 scopes = {source.row[0]}
             for scope in scopes:
+                if transfer is not None and isinstance(
+                    retirements.latest((scope, transfer)),
+                    ExceptionStructuralRetirementFact,
+                ):
+                    continue
                 matches = tuple(
                     row for row in controls.rows()
                     if row[0] == scope
@@ -2623,6 +2632,54 @@ class CorrelationTable:
                     ))
 
         check_sources = set()
+        for row in retirements.rows():
+            fact = retirements.latest(row)
+            receipt = book.latest_ref(
+                SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT, row,
+            )
+            transfer = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                row[1].row, row[1].column,
+            ) if isinstance(row[1], Ref) and row[1].page == (
+                SOURCE_EXCEPTION_TRANSFER
+            ) else None
+            choice = book.page(SOURCE_CONTROL_SPECIALIZATION).cell(
+                fact.specialization.row, fact.specialization.column,
+            ) if isinstance(fact, ExceptionStructuralRetirementFact) and (
+                fact.specialization.page == SOURCE_CONTROL_SPECIALIZATION
+            ) else None
+            causes = {
+                source for source, _stage in book.edges_into(receipt)
+            } if receipt is not None else set()
+            canonical_scopes = {
+                cell.row[0] for cell in identities(fact.source)
+                if cell.page == CANONICAL_VALUE
+            } if isinstance(fact, ExceptionStructuralRetirementFact) else set()
+            if (
+                not isinstance(fact, ExceptionStructuralRetirementFact)
+                or row[0] not in canonical_scopes
+                or fact.transfer != row[1]
+                or not isinstance(transfer, ExceptionTransferFact)
+                or transfer.source != fact.source
+                or not isinstance(choice, dict)
+                or choice.get("rejected_role") != fact.rejected_role
+                or choice.get("selected_role") == fact.rejected_role
+                or fact.rejected_role not in {"body", "orelse"}
+                or causes != {fact.transfer, fact.specialization}
+                or any(
+                    control_row[0] == row[0]
+                    and isinstance(controls.latest(control_row), ControlBlockFact)
+                    and controls.latest(control_row).kind is (
+                        ControlBlockKind.NATIVE_ASSERT
+                    )
+                    and controls.latest(control_row).sites == (fact.transfer,)
+                    for control_row in controls.rows()
+                )
+            ):
+                found.append(Finding(
+                    "source-exception-control-coverage-disagreement",
+                    str(row), None,
+                    "structural exception retirement lacks exact fold proof",
+                ))
         for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows():
             fact = book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
             if not isinstance(fact, ExceptionTransferFact) or (
@@ -5203,8 +5260,10 @@ class CorrelationTable:
     def _source_exception_admission_findings(module: Any) -> list[Finding]:
         """A retained Try or Raise needs executable control before emission."""
         from .concordance_declarations import (
-            CANONICAL_VALUE, CONTROL_BLOCK, INGESTION_VALUE, SSA_BLOCK,
+            CANONICAL_VALUE, CONTROL_BLOCK, CONTROL_PROGRAM, INGESTION_VALUE,
+            SSA_BLOCK,
             SOURCE_EXCEPTION_ADMISSION,
+            SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT,
             SOURCE_EXCEPTION_CONTROL_UNLOWERED,
             SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
@@ -5228,12 +5287,55 @@ class CorrelationTable:
             ExceptionFinalizerOutputFact,
             ExceptionSSAFinalizerOutputFact,
             ExceptionRegionSiteFact, ControlBlockFact, ControlBlockKind,
-            ExceptionTransferFact, SOURCE_EXCEPTION_TRANSFER,
+            ExceptionStructuralRetirementFact, ExceptionTransferFact,
+            SOURCE_EXCEPTION_TRANSFER,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None or SOURCE_EXCEPTION_ADMISSION.name not in book.pages:
             return []
+
+        def retired_in_every_program_scope(source: Ref) -> bool:
+            transfers = tuple(
+                book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+                for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+                if isinstance(
+                    fact := book.page(SOURCE_EXCEPTION_TRANSFER).latest(row),
+                    ExceptionTransferFact,
+                ) and fact.source == source
+                and fact.source_kind in {"raise", "reraise", "assert"}
+            )
+            if len(transfers) != 1:
+                return False
+            transfer = transfers[0]
+            successors = {}
+            for canonical_row in book.page(CANONICAL_VALUE).rows():
+                canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+                for cause, _stage in book.edges_into(canonical):
+                    successors.setdefault(cause, set()).add(canonical)
+            pending = [source]
+            reached = set()
+            while pending:
+                cell = pending.pop()
+                if cell in reached:
+                    continue
+                reached.add(cell)
+                pending.extend(successors.get(cell, ()))
+            program_scopes = {
+                row[0] for row in book.page(CONTROL_PROGRAM).rows()
+            }
+            scopes = {
+                cell.row[0] for cell in reached
+                if cell.page == CANONICAL_VALUE
+                and cell.row[0] in program_scopes
+            }
+            return bool(scopes) and all(
+                isinstance(book.page(
+                    SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT
+                ).latest((scope, transfer)),
+                           ExceptionStructuralRetirementFact)
+                for scope in scopes
+            )
 
         def proof_matches(transfer: Ref, proof: Ref) -> bool:
             if proof.page == SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT:
@@ -5279,13 +5381,19 @@ class CorrelationTable:
             ):
                 problem = "exception admission lacks its exact source Try cause"
             elif isinstance(admission, Unresolved):
-                problem = (
-                    "retained source Try or Raise has no executable exceptional control"
-                    if admission.reason == SOURCE_EXCEPTION_CONTROL_UNLOWERED
+                valid_pending = (
+                    admission.reason == SOURCE_EXCEPTION_CONTROL_UNLOWERED
                     and admission.read == (source_cell,)
                     and causes == {source_cell}
-                    else "exception admission has an invalid unresolved fact"
                 )
+                if valid_pending and retired_in_every_program_scope(source_cell):
+                    problem = None
+                else:
+                    problem = (
+                        "retained source Try or Raise has no executable exceptional control"
+                        if valid_pending else
+                        "exception admission has an invalid unresolved fact"
+                    )
             elif isinstance(admission, ExceptionAdmissionFact):
                 checkpoint = book.page(
                     SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT

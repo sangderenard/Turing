@@ -1155,6 +1155,24 @@ SOURCE_EXCEPTION_ADMISSION = declare_page("source_exception_admission", (
 
 
 @dataclass(frozen=True)
+class ExceptionStructuralRetirementFact:
+    """A source check removed with a structurally rejected control arm."""
+
+    source: Ref
+    transfer: Ref
+    specialization: Ref
+    rejected_role: str
+
+
+SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT = declare_page(
+    "source_exception_structural_retirement", (
+        RowField("lexical_scope", K.SCOPE),
+        RowField("transfer", K.PAGE_REF),
+    ), ExceptionStructuralRetirementFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionAdmissionFact:
     """A root exceptional check with a recorded SSA fault exit."""
 

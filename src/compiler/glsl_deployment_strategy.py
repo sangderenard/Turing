@@ -14679,7 +14679,8 @@ def _source_exception_check_control_programs(
     """Retain each authored Raise/Assert absent from a Try control arm."""
 
     from .concordance_declarations import (
-        CONTROL_PROGRAM_BUILD, SOURCE_EXCEPTION_TRANSFER,
+        CONTROL_PROGRAM_BUILD, SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT,
+        SOURCE_EXCEPTION_TRANSFER, ExceptionStructuralRetirementFact,
         ExceptionTransferFact,
     )
     from .control_source import (
@@ -14727,6 +14728,30 @@ def _source_exception_check_control_programs(
                 id(member): member for member in ast.walk(expression)
                 if isinstance(member, (ast.Raise, ast.Assert))
             })
+    # A retained source If is a source catalogue, including the arm that a
+    # later fork-specific structural fold proved unreachable. Only the exact
+    # retirement written by that fold may remove its check obligation here.
+    lexical_scope = graph.G.graph.get("lexical_read_scope")
+    retirement_page = book.page(SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT)
+    for retirement_row in retirement_page.rows():
+        if retirement_row[0] != lexical_scope:
+            continue
+        retirement = retirement_page.latest(retirement_row)
+        if not isinstance(retirement, ExceptionStructuralRetirementFact):
+            raise ValueError(
+                f"invalid structural exception retirement: {retirement_row!r}"
+            )
+        source_id = int(retirement.source.row[1])
+        if source_id in source_nodes:
+            if any(
+                data.get("expr_obj") is source_nodes[source_id]
+                for _node_id, data in graph.G.nodes(data=True)
+            ):
+                raise ValueError(
+                    "retired exceptional check remains live in graph: "
+                    f"{retirement_row!r}"
+                )
+            source_nodes.pop(source_id)
     transferred = {
         int(fact.source.row[1])
         for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
@@ -33197,6 +33222,11 @@ def _fold_callsite_structural_values(
                 and selected_statements
                 and isinstance(selected_statements[-1], (ast.Return, ast.Raise))
             ):
+                rejected_ast_ids.update(
+                    id(member)
+                    for statement in function_body[source_index + 1:]
+                    for member in ast.walk(statement)
+                )
                 rejected_signatures.update(
                     _ast_source_signature(member)
                     for statement in function_body[source_index + 1:]
@@ -33368,6 +33398,51 @@ def _fold_callsite_structural_values(
                 },
                 int(predicate_id), predicate_known=True,
             ))
+            # Program: tensor_octets_to_bytes has a rejected TypeError Raise
+            # under its statically successful isinstance guard. The graph
+            # fold removes node 45, but source exception obligations survive
+            # in the retained If. Record each rejected transfer at the same
+            # writer that removes its node, derived from this control choice.
+            from .concordance_declarations import (
+                PLANNER_STRUCTURAL_FOLD, SOURCE_CONTROL_SPECIALIZATION,
+                SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT,
+                SOURCE_EXCEPTION_TRANSFER, ExceptionStructuralRetirementFact,
+                ExceptionTransferFact,
+            )
+            specialization = fold_book.latest_ref(
+                SOURCE_CONTROL_SPECIALIZATION,
+                (str(graph.G.graph.get("function_name")),
+                 int(retained_control_id)),
+            )
+            if specialization is None:
+                raise ValueError(
+                    "structural exception retirement lacks its control proof"
+                )
+            for transfer_row in fold_book.page(SOURCE_EXCEPTION_TRANSFER).rows():
+                transfer = fold_book.page(SOURCE_EXCEPTION_TRANSFER).latest(
+                    transfer_row
+                )
+                if not isinstance(transfer, ExceptionTransferFact) or (
+                    transfer.source_kind not in {"raise", "reraise", "assert"}
+                    or int(transfer.source.row[1]) not in rejected_ast_ids
+                ):
+                    continue
+                transfer_cell = fold_book.latest_ref(
+                    SOURCE_EXCEPTION_TRANSFER, transfer_row,
+                )
+                retirement_row = (
+                    graph.G.graph.get("lexical_read_scope"), transfer_cell,
+                )
+                round_cells.append(_post_if_changed(
+                    SOURCE_EXCEPTION_STRUCTURAL_RETIREMENT,
+                    retirement_row,
+                    ExceptionStructuralRetirementFact(
+                        transfer.source, transfer_cell, specialization,
+                        str(rejected_role),
+                    ),
+                    stage=PLANNER_STRUCTURAL_FOLD,
+                    cells=(transfer_cell, specialization),
+                ))
             for node_id in sorted(rejected_nodes, reverse=True):
                 remove_node(node_id)
             # Program: ``raise ValueError(f"(0..{SERIAL_BITS})")`` with a
