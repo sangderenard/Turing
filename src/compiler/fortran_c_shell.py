@@ -30554,7 +30554,7 @@ def _class_surface_ssa_program(
         # fields. Restore authored sibling order before the dependency
         # scheduler: an early bool(field) must precede the conditional
         # that updates the field and publishes its continuation version.
-        from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock
+        from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock, NativeAssertBlock
         # A dispatch region is atomic and may contain early input casts
         # together with a later authored update.  Place it where the
         # whole region becomes complete.  Using the earliest member here
@@ -30564,6 +30564,13 @@ def _class_surface_ssa_program(
         region_positions = _dispatch_region_completion_positions(
             graph_obj, getattr(shell, "dispatch_subgraphs", ()),
         )
+        predicate_region_positions = {
+            int(node_id): region_positions[index]
+            for index, subgraph in enumerate(
+                getattr(shell, "dispatch_subgraphs", ())
+            )
+            for node_id in subgraph.G.graph.get("deployment_nodes", ())
+        }
         def source_position(block):
             if isinstance(block, StatementBlock) and len(block.lines) == 1:
                 line = block.lines[0]
@@ -30574,7 +30581,22 @@ def _class_surface_ssa_program(
             if node_id is None:
                 node_id = getattr(block, "source_loop_node_id", None)
             if node_id is not None:
-                return _authored_node_position(graph_obj, int(node_id))
+                authored = _authored_node_position(graph_obj, int(node_id))
+                if isinstance(block, NativeAssertBlock) and (
+                    block.predicate_value_id is not None
+                    and int(block.predicate_value_id) in predicate_region_positions
+                ):
+                    # `assert x > 0` has a control node at the statement's
+                    # start, while its predicate is produced by a numerical
+                    # region at the expression's end. The exact predicate
+                    # value edge requires that region to precede the branch.
+                    producer = predicate_region_positions[
+                        int(block.predicate_value_id)
+                    ]
+                    return max(authored, (
+                        producer[0], producer[1], producer[2] + 1,
+                    ))
+                return authored
             return (1 << 30, 0, 0)
         def order_field_effects(block):
             if isinstance(block, SequenceBlock):
@@ -62692,16 +62714,32 @@ def _lower_resolved_process_graph_deployment(
     compile_stage("ssa-lowering")
     report("ssa-source: lowering full planned source to repository SSA")
     artifact_name = _identifier(str(name or entrypoint or "whole_source"))
-    module, outputs, exports = _class_surface_ssa_program(
-        compilation,
-        artifact_name,
-        tensor_ssa_reference=tensor_ssa_reference,
-        progress=progress,
-        # This function owns ``deployment`` and reads nothing of it after the
-        # lowering returns.
-        release_dispatch_regions=True,
-        build_target=build_target,
-    )
+    from .precompile_to_ssa import SSALoweringIncompleteError
+    from .glsl_deployment_strategy import CompilationSubdivisionRequired
+
+    try:
+        module, outputs, exports = _class_surface_ssa_program(
+            compilation,
+            artifact_name,
+            tensor_ssa_reference=tensor_ssa_reference,
+            progress=progress,
+            # This function owns ``deployment`` and reads nothing of it after
+            # the lowering returns.
+            release_dispatch_regions=True,
+            build_target=build_target,
+        )
+    except SSALoweringIncompleteError as error:
+        if not any(
+            shortfall.name == "native_try_dispatch"
+            for _symbol, shortfall in error.failures
+        ):
+            raise
+        raise CompilationSubdivisionRequired(
+            str(error),
+            boundaries=getattr(
+                deployment, "_source_exception_boundaries", (),
+            ),
+        ) from error
     stage_boundary("ssa-source: repository SSA lowered")
     # Derived views of the exact field/class/key-layout cells survive source
     # graph retirement so concordance can check the shared child contract.

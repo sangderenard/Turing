@@ -13332,10 +13332,13 @@ class _ControlSSABuilder(TiledObject):
         """Branch at the authored Raise or Assert using its transfer cell."""
 
         from .concordance_declarations import (
+            EXCEPTION_ADMISSION, SOURCE_EXCEPTION_ADMISSION,
             SOURCE_EXCEPTION_CONTROL_STATE,
+            SOURCE_EXCEPTION_ROUTE_STEP,
             SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
             SOURCE_EXCEPTION_STATUS_ROUTE, SOURCE_EXCEPTION_TRANSFER,
-            ExceptionControlStateFact,
+            ExceptionAdmissionFact, ExceptionControlStateFact,
+            ExceptionRouteStepFact,
             ExceptionSSAControlCheckpointFact, ExceptionStatusRouteFact,
             ExceptionTransferFact,
         )
@@ -13357,10 +13360,28 @@ class _ControlSSABuilder(TiledObject):
             if transfer_cell in item["block"].protected_transfer_cells
         ), None)
         if frame is None:
-            raise ValueError(
-                "authored exceptional check lacks a live source edge: "
-                f"{transfer_cell!r}"
+            # A root Raise/Assert has a top-context successor in the source
+            # route graph. It branches to the same fault exit as a Try whose
+            # handler search reaches that successor.
+            top_steps = tuple(
+                book.page(SOURCE_EXCEPTION_ROUTE_STEP).latest(row)
+                for row in book.page(SOURCE_EXCEPTION_ROUTE_STEP).rows()
+                if row[:2] == transfer_cell.row
             )
+            if not top_steps or any(
+                not isinstance(step, ExceptionRouteStepFact)
+                or step.transfer != transfer_cell
+                or step.owner is not None
+                or step.selected_handler is not None
+                or step.successor is not None
+                or step.before_finalizers
+                or step.after_finalizers
+                for step in top_steps
+            ):
+                raise ValueError(
+                    "authored exceptional check lacks a top-context edge: "
+                    f"{transfer_cell!r}"
+                )
         captured = {}
         for name, _binding in transfer.entry_bindings:
             row = (self.planning_scope, transfer_cell, name)
@@ -13412,13 +13433,19 @@ class _ControlSSABuilder(TiledObject):
             status = self.constant_value(
                 int(route_rows[0][2]), transfer_cell, dtype="int64",
             )
+        owner = frame["owner"] if frame is not None else self._control_cells[-1]
+        if owner is None:
+            raise ValueError(
+                "authored exceptional check has no control owner: "
+                f"{transfer_cell!r}"
+            )
         failure = self.new_block(
             "exception_site_failure", also=(transfer_cell,),
-            owner=frame["owner"],
+            owner=owner,
         )
         resume = self.new_block(
             "exception_site_resume", also=(transfer_cell,),
-            owner=frame["owner"],
+            owner=owner,
         )
         if block.predicate_value_id is None:
             failed = self.constant_value(
@@ -13470,11 +13497,47 @@ class _ControlSSABuilder(TiledObject):
             )),
             mode=Mode.CONCORD,
         )
-        frame["edges"].append({
-            "site": transfer_cell, "transfer": transfer_cell,
-            "status": status, "failure": failure, "state": captured,
-            "checkpoint": checkpoint,
-        })
+        if frame is None:
+            self.current = failure
+            self.emit(
+                Handler.Call, [status],
+                attributes={
+                    "callee": "turing_validation_error",
+                    "source_exception_site_cell": transfer_cell,
+                },
+            )
+            if self._fault_exit is None:
+                self._fault_exit = self.new_block(
+                    "exception_unmatched", also=(transfer_cell,),
+                    owner=owner,
+                )
+            self.branch(self._fault_exit)
+            fault_cell = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, self._fault_exit.name),
+            )
+            if fault_cell is None:
+                raise ValueError(
+                    "authored exceptional check has no SSA fault exit: "
+                    f"{transfer_cell!r}"
+                )
+            book.post(
+                SOURCE_EXCEPTION_ADMISSION, (transfer.source,),
+                ExceptionAdmissionFact(
+                    transfer.source, checkpoint, fault_cell,
+                ),
+                stage=EXCEPTION_ADMISSION,
+                provenance=Derived((
+                    transfer.source, checkpoint, fault_cell,
+                )),
+                mode=Mode.REVISE,
+            )
+        else:
+            frame["edges"].append({
+                "site": transfer_cell, "transfer": transfer_cell,
+                "status": status, "failure": failure, "state": captured,
+                "checkpoint": checkpoint,
+            })
         self.current = resume
 
     def _lower(self, block: ControlBlock, *, path: str = "root") -> None:

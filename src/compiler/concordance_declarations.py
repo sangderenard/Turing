@@ -1147,12 +1147,20 @@ SOURCE_CONTROL_SPECIALIZATION = declare_page(
 )
 #: An authored Try that still has a source node owes executable exceptional
 #: control.  The row is keyed by its exact ingestion/canonical identity;
-#: structural precompile posts Unresolved and refuses.  A later exception
-#: lowering must establish executable control and extend this admission rule
-#: explicitly; an arbitrary control-block reference is not discharge proof.
+#: structural precompile posts Unresolved. SSA lowering may revise a root
+#: check only after recording its exact checkpoint and fault exit.
 SOURCE_EXCEPTION_ADMISSION = declare_page("source_exception_admission", (
     RowField("source_try", K.PAGE_REF),
 ), object)
+
+
+@dataclass(frozen=True)
+class ExceptionAdmissionFact:
+    """A root exceptional check with a recorded SSA fault exit."""
+
+    source: Ref
+    checkpoint: Ref
+    fault_exit: Ref
 
 
 @dataclass(frozen=True)

@@ -35788,23 +35788,23 @@ class ProcessGraphGLSLDeployment(TiledObject):
                         f"{source_cell!r}"
                     )
                 pending_source_checks.append((source_id, source_cell))
-        def refuse_unadmitted_source_exceptions() -> None:
-            if not pending_source_tries and not pending_source_checks:
-                return
-            # Every retained Try and authored exceptional check is posted
-            # before this refusal.
-            # Planning can construct the Try control tree, but only an
-            # executable SSA status route may revise the admission rows.
-            boundaries = tuple({
+        # Keep the exact source obligations for the source SSA boundary.
+        # Structural lowering can then send the control tree into its maker
+        # and report a remaining shortfall against these same source cells.
+        boundaries = tuple({
                 "kind": "source-exception-control-owner",
                 "source_try_cell": repr(source_cell),
                 "source_try_node_id": node_id,
             } for node_id, source_cell in pending_source_tries)
-            boundaries += tuple({
+        boundaries += tuple({
                 "kind": "source-exception-check-owner",
                 "source_check_cell": repr(source_cell),
                 "source_check_node_id": node_id,
             } for node_id, source_cell in pending_source_checks)
+        self._source_exception_boundaries = boundaries
+        def refuse_unadmitted_source_exceptions() -> None:
+            if not boundaries:
+                return
             raise CompilationSubdivisionRequired(
                 "authored exceptional control has no executable status "
                 "route: "
@@ -36306,7 +36306,12 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 f"{shell_name} structural preparation end in "
                 f"{time.perf_counter() - shell_started:.3f}s"
             )
-        refuse_unadmitted_source_exceptions()
+        # Complete-source lowering passes this control tree to the existing
+        # control-to-SSA builder. Its exact branch and Phi results decide
+        # admission; refusing here would prevent that builder from seeing the
+        # authored exception nodes at all.
+        if not structural_ssa_only:
+            refuse_unadmitted_source_exceptions()
         (
             self.hierarchy_plan,
             self.hierarchy_value_table,

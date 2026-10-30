@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -51,12 +52,35 @@ CONTRACT = (
 )
 
 
-def _lower(source: str, name: str, **kwargs):
-    return lower_ast_source_to_ssa(
-        source, "root", name=name, extraction_contract=CONTRACT,
-        progress=lambda _message: None, progress_bars=False,
-        **kwargs,
-    )
+def _lower(source: str, name: str, *, complete=False, **kwargs):
+    def lower():
+        return lower_ast_source_to_ssa(
+            source, "root", name=name, extraction_contract=CONTRACT,
+            progress=lambda _message: None, progress_bars=False,
+            **kwargs,
+        )
+
+    if complete or not any(
+        isinstance(node, (ast.Try, ast.TryStar, ast.Raise, ast.Assert))
+        for node in ast.walk(ast.parse(source))
+    ):
+        return lower()
+
+    # These control-shape cases stop at the SSA boundary so they can inspect
+    # the exact planned control tree and lower it with bounded region inputs.
+    # The production path is exercised separately with complete=True.
+    from src.compiler import fortran_c_shell
+
+    def planned(compilation, *_args, **_kwargs):
+        raise CompilationSubdivisionRequired(
+            "bounded exception control planning probe",
+            boundaries=getattr(
+                compilation.deployment, "_source_exception_boundaries", (),
+            ),
+        )
+
+    with patch.object(fortran_c_shell, "_class_surface_ssa_program", planned):
+        return lower()
 
 
 def test_authored_catch_without_exceptional_control_refuses(monkeypatch):
@@ -1679,6 +1703,139 @@ def root(x: int) -> int:
             isinstance(book.page(SOURCE_EXCEPTION_ADMISSION).latest(row),
                        Unresolved)
             for row in book.page(SOURCE_EXCEPTION_ADMISSION).rows()
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_root_raise_control_lowers_to_ssa_fault_edge(monkeypatch):
+    source = """\
+def root() -> int:
+    raise ValueError()
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.concordance_declarations import ExceptionAdmissionFact
+    from src.transmogrifier.ssa_registry import Handler
+
+    observed = []
+    original = strategy._overlay_control_or_require_subdivision
+
+    def capture(*args, **kwargs):
+        program = original(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", capture,
+    )
+    book, token = begin_identity_book()
+    try:
+        module, _outputs, exports = _lower(
+            source, "exception_root_raise_ssa", complete=True,
+            identity_book=book,
+        )
+        control_row, = tuple(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_ASSERT
+        )
+        assert observed
+        assert control_row[0]
+        lowered = module.functions[exports[0]]
+        assert any(
+            instruction.op in {Handler.CondBr.value, Handler.Br.value}
+            for block in lowered.blocks.values()
+            for instruction in block.instrs
+        )
+        assert all(
+            isinstance(book.page(SOURCE_EXCEPTION_ADMISSION).latest(row),
+                       ExceptionAdmissionFact)
+            for row in book.page(SOURCE_EXCEPTION_ADMISSION).rows()
+        )
+        assert CorrelationTable._source_exception_admission_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert any(
+            instruction.attributes.get("callee") == "turing_validation_error"
+            for block in lowered.blocks.values()
+            for instruction in block.instrs
+        )
+        assert CorrelationTable._source_exception_ssa_control_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    finally:
+        end_identity_book(token)
+
+
+def test_root_assert_predicate_precedes_production_ssa_fault_edge():
+    source = """\
+def root(x: int) -> int:
+    assert x > 0
+    return x
+"""
+    from src.compiler.concordance_declarations import ExceptionAdmissionFact
+    from src.transmogrifier.ssa_registry import Handler
+
+    book, token = begin_identity_book()
+    try:
+        module, _outputs, exports = _lower(
+            source, "exception_root_assert_ssa", complete=True,
+            identity_book=book,
+        )
+        function = module.functions[exports[0]]
+        entry_ops = tuple(instruction.op for instruction in (
+            function.blocks["entry"].instrs
+        ))
+        assert entry_ops.index(Handler.Call.value) < entry_ops.index(
+            Handler.CondBr.value
+        )
+        assert any(
+            instruction.op == Handler.CondBr.value
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        )
+        assert any(
+            instruction.op == Handler.Trap.value
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        )
+        assert any(
+            instruction.attributes.get("callee") == "turing_validation_error"
+            for block in function.blocks.values()
+            for instruction in block.instrs
+        )
+        admission_row, = tuple(book.page(SOURCE_EXCEPTION_ADMISSION).rows())
+        assert isinstance(
+            book.page(SOURCE_EXCEPTION_ADMISSION).latest(admission_row),
+            ExceptionAdmissionFact,
+        )
+        assert CorrelationTable._source_exception_admission_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    finally:
+        end_identity_book(token)
+
+
+def test_production_try_reaches_ssa_maker_before_refusal():
+    source = """\
+def root(x: float) -> int:
+    try:
+        y = int(x)
+    except ValueError:
+        y = 2
+    return y
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired) as error:
+            _lower(
+                source, "exception_try_ssa_frontier", complete=True,
+                identity_book=book,
+            )
+        assert "native_try_dispatch" in str(error.value)
+        assert book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).rows()
+        assert error.value.boundaries[0]["kind"] == (
+            "source-exception-control-owner"
         )
     finally:
         end_identity_book(token)

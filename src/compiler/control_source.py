@@ -4567,7 +4567,8 @@ def overlay_scheduled_control(
         for child in remaining_children:
             control = controls[child]
             if (not control.region_indices
-                    and isinstance(control.root, NativeAssertBlock)):
+                    and isinstance(control.root, NativeAssertBlock)
+                    and authored_control_sites.get((index, child)) is not None):
                 root = place_authored_comprehension_control(
                     root,
                     nested_root(child, visiting | {index}),

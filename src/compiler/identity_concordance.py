@@ -4756,9 +4756,12 @@ class CorrelationTable:
     def _source_exception_admission_findings(module: Any) -> list[Finding]:
         """A retained Try or Raise needs executable control before emission."""
         from .concordance_declarations import (
-            CANONICAL_VALUE, INGESTION_VALUE,
+            CANONICAL_VALUE, INGESTION_VALUE, SSA_BLOCK,
             SOURCE_EXCEPTION_ADMISSION,
             SOURCE_EXCEPTION_CONTROL_UNLOWERED,
+            SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+            ExceptionAdmissionFact, ExceptionSSAControlCheckpointFact,
+            ExceptionTransferFact, SOURCE_EXCEPTION_TRANSFER,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -4777,7 +4780,6 @@ class CorrelationTable:
             if (
                 not isinstance(source_cell, Ref)
                 or source_cell.page not in {INGESTION_VALUE, CANONICAL_VALUE}
-                or causes != {source_cell}
             ):
                 problem = "exception admission lacks its exact source Try cause"
             elif isinstance(admission, Unresolved):
@@ -4785,8 +4787,45 @@ class CorrelationTable:
                     "retained source Try or Raise has no executable exceptional control"
                     if admission.reason == SOURCE_EXCEPTION_CONTROL_UNLOWERED
                     and admission.read == (source_cell,)
+                    and causes == {source_cell}
                     else "exception admission has an invalid unresolved fact"
                 )
+            elif isinstance(admission, ExceptionAdmissionFact):
+                checkpoint = book.page(
+                    SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT
+                ).cells.get((
+                    admission.checkpoint.row,
+                    admission.checkpoint.column,
+                )) if admission.checkpoint.page == (
+                    SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT
+                ) else None
+                transfer = (
+                    book.page(SOURCE_EXCEPTION_TRANSFER).cells.get((
+                        checkpoint.transfer.row,
+                        checkpoint.transfer.column,
+                    ))
+                    if isinstance(checkpoint, ExceptionSSAControlCheckpointFact)
+                    and checkpoint.transfer.page == SOURCE_EXCEPTION_TRANSFER
+                    else None
+                )
+                if (
+                    admission.source != source_cell
+                    or not isinstance(
+                        checkpoint, ExceptionSSAControlCheckpointFact,
+                    )
+                    or not isinstance(transfer, ExceptionTransferFact)
+                    or transfer.source != source_cell
+                    or admission.fault_exit.page != SSA_BLOCK
+                    or book.page(SSA_BLOCK).cells.get((
+                        admission.fault_exit.row,
+                        admission.fault_exit.column,
+                    )) is None
+                    or causes != {
+                        source_cell, admission.checkpoint,
+                        admission.fault_exit,
+                    }
+                ):
+                    problem = "exception admission has no exact SSA fault proof"
             else:
                 problem = "exception admission claims an unproven discharge"
             if problem is not None:
