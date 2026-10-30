@@ -164,6 +164,14 @@ _BINARY = {
     "Pow": lambda a, b: np.power(a, b),
 }
 
+def _round_nearest_away(value):
+    """C99 round / llvm.round, including exact values adjacent to a tie."""
+    fractional, integral = np.modf(value)
+    return np.copysign(
+        integral + (np.abs(fractional) >= 0.5), value,
+    )
+
+
 _UNARY = {
     "Neg": lambda a: -a,
     "Abs": np.abs,
@@ -176,6 +184,7 @@ _UNARY = {
     "Ceil": np.ceil,
     "Trunc": np.trunc,
     "Round": np.round,
+    "RoundNearestAway": _round_nearest_away,
     "Not": np.logical_not,
     "LNot": np.logical_not,
     "Invert": lambda a: np.bitwise_not(np.int64(a)),

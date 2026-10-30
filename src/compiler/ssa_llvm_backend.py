@@ -102,6 +102,7 @@ _UNARY: dict[str, str] = {
     "Ceil": "{out} = call double @llvm.ceil.f64(double {0})",
     "Trunc": "{out} = call double @llvm.trunc.f64(double {0})",
     "Round": "{out} = call double @llvm.roundeven.f64(double {0})",
+    "RoundNearestAway": "{out} = call double @llvm.round.f64(double {0})",
     "IsFinite": (
         "{out}.abs = call double @llvm.fabs.f64(double {0})\n"
         "{out} = fcmp one double {out}.abs, 0x7FF0000000000000"

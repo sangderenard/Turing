@@ -2235,9 +2235,11 @@ class CorrelationTable:
 
         from .concordance_declarations import (
             ExceptionFinalizerInputFact, ExceptionSSAFinalizerInputFact,
+            ExceptionSSANormalFinalizerInputFact,
             ExceptionSSAUnwindFact, SOURCE_EXCEPTION_FINALIZER_BINDING,
             SOURCE_EXCEPTION_FINALIZER_INPUT,
             SOURCE_EXCEPTION_SSA_FINALIZER_INPUT,
+            SOURCE_EXCEPTION_SSA_NORMAL_FINALIZER_INPUT,
             SOURCE_EXCEPTION_SSA_UNWIND,
         )
 
@@ -2279,6 +2281,36 @@ class CorrelationTable:
                 found.append(Finding(
                     "ssa-finalizer-input-disagreement", str(row), None,
                     "SSA finalizer input differs from its source edge",
+                ))
+        for row in book.page(
+            SOURCE_EXCEPTION_SSA_NORMAL_FINALIZER_INPUT
+        ).rows():
+            receipt = book.latest_ref(
+                SOURCE_EXCEPTION_SSA_NORMAL_FINALIZER_INPUT, row,
+            )
+            fact = book.page(
+                SOURCE_EXCEPTION_SSA_NORMAL_FINALIZER_INPUT
+            ).latest(row)
+            planned = planned_page.cell(
+                fact.source_input.row, fact.source_input.column,
+            ) if isinstance(
+                fact, ExceptionSSANormalFinalizerInputFact
+            ) else None
+            if planned is None or (
+                fact.source_input.page != SOURCE_EXCEPTION_FINALIZER_INPUT
+                or str(row[3]) != str(fact.source_input.row[2])
+                or planned.normal_value != fact.canonical_input
+                or fact.incoming_value is None
+                or fact.before_block != row[2]
+                or set(cause for cause, _stage in book.edges_into(receipt))
+                != {
+                    fact.source_input, fact.canonical_input,
+                    fact.incoming_value, fact.before_block,
+                }
+            ):
+                found.append(Finding(
+                    "ssa-normal-finalizer-input-disagreement", str(row), None,
+                    "normal finalizer input differs from its source value",
                 ))
         for row in book.page(SOURCE_EXCEPTION_SSA_UNWIND).rows():
             fact = book.page(SOURCE_EXCEPTION_SSA_UNWIND).latest(row)
@@ -3231,9 +3263,11 @@ class CorrelationTable:
         """A pending return cites its source site, Try, blocks and slots."""
         from .concordance_declarations import (
             CONTROL_BLOCK, SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
             SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
             SSA_BLOCK, SSA_VALUE, ControlBlockKind,
             ExceptionSiteStateFact, ExceptionSSAReturnFinalizerFact,
+            ExceptionSSAFinalizerOutputFact,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -3245,6 +3279,23 @@ class CorrelationTable:
             fact = page.latest(row)
             receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_RETURN_FINALIZER, row)
             problem = None
+            output_receipts = tuple(
+                book.latest_ref(SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
+                                output_row)
+                for output_row in book.page(
+                    SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT
+                ).rows()
+                if isinstance(fact, ExceptionSSAReturnFinalizerFact)
+                and output_row[:3] == (
+                    row[0], fact.try_control, fact.before_block,
+                )
+                and isinstance(book.page(
+                    SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT
+                ).latest(output_row), ExceptionSSAFinalizerOutputFact)
+                and book.page(
+                    SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT
+                ).latest(output_row).exit_site == fact.exception_exit_site
+            )
             if not isinstance(fact, ExceptionSSAReturnFinalizerFact):
                 problem = "pending return has no finalizer fact"
             elif (
@@ -3283,6 +3334,7 @@ class CorrelationTable:
                     book.latest_ref(cell.page, cell.row) != cell
                     for cell in (fact.return_site, fact.try_control)
                 )
+                or set(fact.finalizer_outputs) != set(output_receipts)
             ):
                 problem = "pending return disagrees with source or SSA cells"
             elif receipt is None or {
@@ -3292,6 +3344,7 @@ class CorrelationTable:
                 fact.try_control, fact.before_block,
                 fact.after_block,
                 *(cell for cell in fact.pending_values if cell is not None),
+                *fact.finalizer_outputs,
             }:
                 problem = "pending return finalizer provenance disagrees"
             if problem is not None:
@@ -5105,6 +5158,8 @@ class CorrelationTable:
             SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
+            SOURCE_EXCEPTION_FINALIZER_OUTPUT,
+            SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
             SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
             SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
             SOURCE_EXCEPTION_SSA_UNWIND,
@@ -5115,6 +5170,8 @@ class CorrelationTable:
             ExceptionSSAUnwindFact,
             ExceptionSSAReturnFinalizerFact,
             ExceptionSSALoopExitFinalizerFact, ExceptionSiteStateFact,
+            ExceptionFinalizerOutputFact,
+            ExceptionSSAFinalizerOutputFact,
             ExceptionRegionSiteFact, ControlBlockFact, ControlBlockKind,
             ExceptionTransferFact, SOURCE_EXCEPTION_TRANSFER,
         )
@@ -5230,6 +5287,42 @@ class CorrelationTable:
                     *((admission.normal_finalizer_entry,)
                       if admission.normal_finalizer_entry is not None else ()),
                 }
+                def return_outputs_match(site: Ref, proof: Ref) -> bool:
+                    if proof.page != SOURCE_EXCEPTION_SSA_RETURN_FINALIZER:
+                        return True
+                    pending_fact = book.page(proof.page).cell(
+                        proof.row, proof.column,
+                    )
+                    if not isinstance(pending_fact,
+                                      ExceptionSSAReturnFinalizerFact):
+                        return False
+                    if admission.normal_finalizer_entry is None:
+                        return not pending_fact.finalizer_outputs
+                    planned = {
+                        fact.canonical_output
+                        for source_row in book.page(
+                            SOURCE_EXCEPTION_FINALIZER_OUTPUT
+                        ).rows()
+                        for fact in (book.page(
+                            SOURCE_EXCEPTION_FINALIZER_OUTPUT
+                        ).latest(source_row),)
+                        if source_row[1:3] == (
+                            admission.control.row[2].row[1], site,
+                        )
+                        and isinstance(fact, ExceptionFinalizerOutputFact)
+                        and fact.canonical_output.row[0]
+                        == admission.control.row[0]
+                    }
+                    emitted = {
+                        fact.canonical_output
+                        for output in pending_fact.finalizer_outputs
+                        for fact in (book.page(
+                            SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT
+                        ).cell(output.row, output.column),)
+                        if isinstance(fact,
+                                      ExceptionSSAFinalizerOutputFact)
+                    }
+                    return bool(planned) and planned == emitted
                 if (
                     admission.source != source_cell
                     or not isinstance(control, ControlBlockFact)
@@ -5261,6 +5354,10 @@ class CorrelationTable:
                             admission.abrupt_exit_proofs}) != len(
                                 admission.abrupt_exit_proofs
                             )
+                    or any(
+                        not return_outputs_match(site, proof)
+                        for site, proof in admission.abrupt_exit_proofs
+                    )
                     or any(
                         site.page != SOURCE_EXCEPTION_SITE_STATE
                         or not isinstance(book.page(

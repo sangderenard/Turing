@@ -522,6 +522,7 @@ _UNARY = {
     # cannot compile a transcendental outside its core's own interval.
     # C99 has all three in <math.h>.
     "Floor": "floor", "Ceil": "ceil", "Round": "nearbyint",
+    "RoundNearestAway": "round",
     "Trunc": "trunc", "Exp": "exp", "Log": "log", "Sin": "sin",
     "Cos": "cos", "Tan": "tan", "Asin": "asin", "Acos": "acos",
     "Atan": "atan", "Sinh": "sinh", "Cosh": "cosh",

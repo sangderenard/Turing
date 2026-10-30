@@ -26,6 +26,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_FINALIZER_INPUT,
     SOURCE_EXCEPTION_FINALIZER_OUTPUT,
     SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
+    SOURCE_EXCEPTION_SSA_NORMAL_FINALIZER_INPUT,
     SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
     SOURCE_EXCEPTION_SSA_FINALIZER_INPUT,
     SOURCE_EXCEPTION_SSA_ROUTE,
@@ -1223,7 +1224,7 @@ def root(x: float) -> float:
                 constant_value_ids=(*constants, *state_constants),
         )
         assert lowered.blocks
-        assert any(item.name == "native_try_dispatch" for item in shortfalls)
+        assert any(item.name == "return" for item in shortfalls)
         source_rows = tuple(book.page(
             SOURCE_EXCEPTION_FINALIZER_BINDING
         ).rows())
@@ -2014,6 +2015,108 @@ def root(x: float) -> int:
     assert int(run(float("nan")).buffers[output].reshape(-1)[0]) == 2
     with pytest.raises(NativeOverflowError):
         run(float("inf"))
+
+
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+@pytest.mark.parametrize("case", ["pending-return", "handler-return"])
+def test_production_return_crosses_numeric_finally(
+    backend, case, tmp_path,
+):
+    if case == "pending-return":
+        source = """\
+def root(x: int) -> int:
+    try:
+        return x
+    finally:
+        x = x + 1
+"""
+        dtype = np.int64
+        examples = ((3, 3), (-2, -2))
+    else:
+        source = """\
+def root(x: float) -> float:
+    y = 0.0
+    try:
+        y = int(x)
+    except ValueError:
+        return 1.0
+    finally:
+        y = y + 1.0
+    return y
+"""
+        dtype = np.float64
+        examples = ((1.9, 2.0), (float("nan"), 1.0))
+    module, _outputs, exports = _lower(
+        source, f"exception_{case}_{backend}", complete=True,
+    )
+    function = module.functions[exports[0]]
+    book = module.metadata["identity_book"]
+    admission_row, = tuple(book.page(SOURCE_EXCEPTION_ADMISSION).rows())
+    admission = book.page(SOURCE_EXCEPTION_ADMISSION).latest(admission_row)
+    assert len(admission.abrupt_exit_proofs) == 1
+    pending_rows = tuple(book.page(
+        SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+    ).rows())
+    assert len(pending_rows) == 1
+    pending = book.page(SOURCE_EXCEPTION_SSA_RETURN_FINALIZER).latest(
+        pending_rows[0]
+    )
+    assert pending.finalizer_outputs
+    if case == "handler-return":
+        normal_rows = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_NORMAL_FINALIZER_INPUT
+        ).rows())
+        assert len(normal_rows) == 1
+        normal = book.page(
+            SOURCE_EXCEPTION_SSA_NORMAL_FINALIZER_INPUT
+        ).latest(normal_rows[0])
+        planned_row, = tuple(book.page(
+            SOURCE_EXCEPTION_FINALIZER_INPUT
+        ).rows())
+        planned = book.page(SOURCE_EXCEPTION_FINALIZER_INPUT).latest(
+            planned_row
+        )
+        assert normal.canonical_input == planned.normal_value
+        assert normal.incoming_value is not None
+        assert CorrelationTable._source_exception_finalizer_path_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    assert CorrelationTable._source_exception_ssa_return_finalizer_findings(
+        SimpleNamespace(metadata={"identity_book": book})
+    ) == []
+    parameter = dict(function.metadata["parameter_names"])["x"]
+    returns = tuple(
+        instruction for basic in function.blocks.values()
+        for instruction in basic.instrs if str(instruction.op) == "Ret"
+    )
+    assert len(returns) == 1 and len(returns[0].args) == 1
+    output = int(returns[0].args[0].id)
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, function.name)
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "c")
+        run = lambda value: artifact.prepare_execution({
+            parameter: np.array([value], dtype=dtype),
+        }).run()
+    else:
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact, emit_ssa_function_to_llvm,
+            prepare_artifact_execution,
+        )
+
+        emitted = emit_ssa_function_to_llvm(module, function.name)
+        assert not emitted.shortfalls, emitted.shortfalls
+        artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+        run = lambda value: prepare_artifact_execution(artifact, {
+            parameter: np.array([value], dtype=dtype),
+        }).run()
+    for value, expected in examples:
+        assert float(run(value).buffers[output].reshape(-1)[0]) == expected
+    if case == "handler-return":
+        with pytest.raises(NativeOverflowError):
+            run(float("inf"))
 
 
 @pytest.mark.parametrize("source", [

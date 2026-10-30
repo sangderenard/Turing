@@ -1482,6 +1482,7 @@ class ExceptionSSAReturnFinalizerFact:
     after_block: Ref
     pending_values: tuple[Ref | None, ...]
     exception_exit_site: Ref | None = None
+    finalizer_outputs: tuple[Ref, ...] = ()
 
 
 SOURCE_EXCEPTION_SSA_RETURN_FINALIZER = declare_page(
@@ -1535,6 +1536,26 @@ SOURCE_EXCEPTION_SSA_FINALIZER_INPUT = declare_page(
         RowField("before_block", K.PAGE_REF),
         RowField("name", K.NAME),
     ), ExceptionSSAFinalizerInputFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionSSANormalFinalizerInputFact:
+    """The successful Try edge's source-owned finalbody input."""
+
+    source_input: Ref
+    canonical_input: Ref
+    incoming_value: Ref
+    before_block: Ref
+
+
+SOURCE_EXCEPTION_SSA_NORMAL_FINALIZER_INPUT = declare_page(
+    "source_exception_ssa_normal_finalizer_input", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("try_control", K.PAGE_REF),
+        RowField("before_block", K.PAGE_REF),
+        RowField("name", K.NAME),
+    ), ExceptionSSANormalFinalizerInputFact,
 )
 
 

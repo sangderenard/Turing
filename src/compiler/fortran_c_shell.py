@@ -29975,6 +29975,81 @@ def _class_surface_ssa_program(
             if fact_dtype is not None:
                 parameter_value_dtypes[int(value_id)] = fact_dtype
 
+        # `y = 0.0; try: y = int(x); except ValueError: return 1.0`:
+        # the reducer retains y's exact pre-call binding as canonical value
+        # 1, but removes its literal node from the deployment graph. The
+        # graph-only constant scan above therefore omitted 1 and the SSA
+        # exception checkpoint could not capture y. Source literal and
+        # region-state cells already retain the identity: follow their
+        # concordance edges and materialize that literal before lowering.
+        from .concordance_declarations import (
+            CANONICAL_VALUE, SOURCE_EXCEPTION_REGION_STATE,
+            SOURCE_LITERAL_VALUE, ExceptionRegionStateFact,
+        )
+        exception_book = current_identity_book()
+        exception_scope = graph_obj.graph.get("planning_scope")
+        if exception_scope is not None:
+            literal_page = exception_book.page(SOURCE_LITERAL_VALUE)
+            for state_row in exception_book.page(
+                SOURCE_EXCEPTION_REGION_STATE
+            ).rows():
+                if state_row[0] != exception_scope:
+                    continue
+                state = exception_book.page(
+                    SOURCE_EXCEPTION_REGION_STATE
+                ).latest(state_row)
+                if not isinstance(state, ExceptionRegionStateFact):
+                    continue
+                value_id = int(state.canonical_value.row[1])
+                if value_id in constant_values:
+                    continue
+                canonical_ancestors = set()
+                pending_cells = [state.canonical_value]
+                while pending_cells:
+                    cell = pending_cells.pop()
+                    if cell in canonical_ancestors:
+                        continue
+                    canonical_ancestors.add(cell)
+                    pending_cells.extend(
+                        parent for parent, _stage
+                        in exception_book.edges_into(cell)
+                        if parent.page == CANONICAL_VALUE
+                    )
+                literal_cells = tuple(
+                    exception_book.latest_ref(SOURCE_LITERAL_VALUE, row)
+                    for row in literal_page.rows()
+                    if int(row[1]) == value_id
+                    and any(
+                        parent in canonical_ancestors
+                        for parent, _stage in exception_book.edges_into(
+                            exception_book.latest_ref(
+                                SOURCE_LITERAL_VALUE, row,
+                            )
+                        )
+                    )
+                )
+                if len(literal_cells) > 1:
+                    raise ValueError(
+                        "exception state has multiple exact source literals: "
+                        f"value={value_id}, state={state_row!r}"
+                    )
+                if literal_cells:
+                    source_literal = literal_cells[0]
+                    constant_values[value_id] = _copy_literal_payload(
+                        literal_page.cell(
+                            source_literal.row,
+                            source_literal.column,
+                        )
+                    )
+                    constant_source_cells[value_id] = tuple(
+                        dict.fromkeys((
+                            state.canonical_value, source_literal,
+                            exception_book.latest_ref(
+                                SOURCE_EXCEPTION_REGION_STATE, state_row,
+                            ),
+                        ))
+                    )
+
         # A same-source Enum member is a declared native scalar, not a live
         # Python attribute read and not a caller-supplied formal.  Join the
         # GetAttr's external class binding to SOURCE_ENUM_GLYPH_TABLE.  When
