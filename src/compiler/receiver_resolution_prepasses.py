@@ -940,7 +940,51 @@ def _stamp_max_semantics(graph: Any) -> None:
 def _resolve_grounded_tensor_operations(graph: Any) -> None:
     """Promote method-name candidates only along tensor-valued SSA edges."""
 
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope, node_identity_cell,
+    )
+    from .concordance_declarations import (
+        PLANNER_TENSOR_SPECIALIZATION, SOURCE_VALUE_CLASS,
+    )
+    from .hierarchical_plan import REGION_INTEGER_RESULT_OPS
+    from .identity_concordance import Derived, Mode, current_identity_book
+
     specializations = graph.G.graph.get("planner_specializations") or {}
+
+    def concord_scalar_result(node_id: int, receiver_id: int) -> None:
+        # Program: `octets.ndims()` in tensor_octets_to_bytes. The receiver
+        # is a tensor with unknown ELEMENT dtype, but the canonical ndims
+        # operator returns a Python int. Grounding used to stamp only the
+        # graph's tensor operation and leave the result class absent, so the
+        # hierarchy freeze refused node 7. The same operator result contract
+        # used by region SSA is posted here under the source value's identity.
+        book = current_identity_book()
+        row = (
+            _source_numeric_scope(graph.G),
+            int(graph.G.nodes[int(node_id)].get("value_id", node_id)),
+        )
+        page = book.page(SOURCE_VALUE_CLASS)
+        incumbent = page.latest(row)
+        if incumbent is not None and (
+            not isinstance(incumbent, tuple)
+            or tuple(incumbent[:2]) != ("builtins.int", 1)
+        ):
+            raise ValueError(
+                "grounded tensor operator result class disagrees with "
+                f"source value class: {row!r} -> {incumbent!r}"
+            )
+        book.post(
+            SOURCE_VALUE_CLASS, row,
+            incumbent if incumbent is not None else (
+                "builtins.int", 1, "grounded tensor operator result",
+            ),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived((
+                node_identity_cell(graph, int(node_id)),
+                node_identity_cell(graph, int(receiver_id)),
+            )),
+            mode=Mode.CONCORD,
+        )
 
     def is_tensor_value(value: Any) -> bool:
         return (
@@ -952,8 +996,18 @@ def _resolve_grounded_tensor_operations(graph: Any) -> None:
     tensor_values = {
         int(node_id)
         for node_id, data in graph.G.nodes(data=True)
-        if data.get("tensor") is not None
-        or (data.get("attributes") or {}).get("tensor") is not None
+        if (
+            data.get("tensor") is not None
+            and (
+                not isinstance(data.get("tensor"), str)
+                or data.get("tensor") not in REGION_INTEGER_RESULT_OPS
+            )
+        )
+        or (
+            (data.get("attributes") or {}).get("tensor") is not None
+            and (data.get("attributes") or {}).get("tensor")
+            not in REGION_INTEGER_RESULT_OPS
+        )
         or (
             data.get("type") == "Input"
             and is_tensor_value(specializations.get(str(
@@ -974,6 +1028,12 @@ def _resolve_grounded_tensor_operations(graph: Any) -> None:
         for node_id, data in graph.G.nodes(data=True):
             attributes = data.get("attributes") or {}
             candidate = attributes.get("tensor_candidate")
+            if (
+                candidate in REGION_INTEGER_RESULT_OPS
+                and attributes.get("tensor_resolution")
+                == "receiver-tensor-value"
+            ):
+                continue
             if (
                 int(node_id) in tensor_values
                 and (
@@ -1021,5 +1081,8 @@ def _resolve_grounded_tensor_operations(graph: Any) -> None:
             attributes["tensor"] = str(candidate)
             attributes["tensor_resolution"] = "receiver-tensor-value"
             data["attributes"] = attributes
-            tensor_values.add(int(node_id))
+            if candidate in REGION_INTEGER_RESULT_OPS:
+                concord_scalar_result(int(node_id), int(receiver))
+            else:
+                tensor_values.add(int(node_id))
             changed = True

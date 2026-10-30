@@ -140,7 +140,7 @@ REGION_PREDICATE_OPS = frozenset({
     "logical_not", "is", "is_not", "contains", "not_contains",
 }) | _PREDICATE_OPERATION_SPELLINGS
 REGION_INTEGER_RESULT_OPS = frozenset({
-    "len", "length", "extent", "bitlength", "bit_length",
+    "len", "length", "extent", "bitlength", "bit_length", "ndims",
 })
 #: Python ``int`` is not the backend's C ``int``.  Repository SSA uses the
 #: widest portable signed scalar ABI for authored Python integers; wrappers
