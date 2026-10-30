@@ -26665,6 +26665,13 @@ def _canonicalize_non_dominating_loop_result_uses(
                         book.latest_ref(SSA_VALUE, (scope, int(argument.id))),
                         geometry.get(block_name),
                         *(geometry.get(label) for label, _index in definition_sites.get(int(argument.id), ())),
+                        # `try: return int(x); except ValueError: return 2`
+                        # shifts the candidate's entry definition when
+                        # section composition inserts a Const. The candidate
+                        # definition geometry, not its value cell alone,
+                        # justifies the changed dominance observation.
+                        *((geometry.get(label) for label, _index in definition_sites.get(int(candidate.id), ()))
+                          if candidate is not None else ()),
                         *((book.latest_ref(SSA_VALUE, (scope, int(instruction.res.id))),)
                           if instruction.res is not None else ()),
                         *((book.latest_ref(SSA_VALUE, (scope, int(candidate.id))),)

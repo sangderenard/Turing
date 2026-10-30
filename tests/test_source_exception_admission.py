@@ -1841,6 +1841,19 @@ def root(x: float) -> int:
         end_identity_book(token)
 
 
+def test_production_try_return_has_concorded_ssa_dominance_observations():
+    source = """\
+def root(x: float) -> int:
+    try:
+        return int(x)
+    except ValueError:
+        return 2
+"""
+    with pytest.raises(CompilationSubdivisionRequired) as error:
+        _lower(source, "exception_try_return_ssa", complete=True)
+    assert "native_try_dispatch" in str(error.value)
+
+
 def test_nested_assert_is_in_dual_ir_control_half(monkeypatch):
     source = """\
 def root(x: int) -> int:

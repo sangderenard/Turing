@@ -1,0 +1,5 @@
+2026-10-30 Direct Try return reaches fail-closed SSA frontier (MEASURED, exception-admission worktree):
+
+- `try: return int(x); except ValueError: return 2` initially reached `_canonicalize_non_dominating_loop_result_uses` twice. Section composition shifted the candidate value's definition in `entry` from instruction 4 to 5. `LOOP_RESULT_RECONCILIATION` changed its observation but its provenance omitted the candidate definition block's geometry, so the concordance correctly refused a revision without a changed source.
+- `_note` now cites geometry for both the argument's definition and the candidate's definition. The direct-return source then reaches the intended `native_try_dispatch` shortfall, which the source entry reports as `CompilationSubdivisionRequired`.
+- The targeted exception gate (`tests/test_source_exception_admission.py`, `tests/test_metadata_copy_control_ownership.py`, `tests/test_native_float_int_status.py`) passed: 43 tests, 2 warnings. `git diff --check` passed. Public Try execution remains fail closed.
