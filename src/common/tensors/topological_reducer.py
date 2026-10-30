@@ -5142,6 +5142,111 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
     scope = _source_numeric_scope(graph)
     page = book.page(SOURCE_VALUE_CLASS)
     changed = False
+
+    def project_iterated_sequence_classes(loop_id: int, expression: ast.For) -> bool:
+        # Program: `for index, value in enumerate(xs)` with `xs: list[int]`.
+        # The parameter annotation already names the element class, but the
+        # loop target had no SOURCE_VALUE_CLASS row. The planner later typed
+        # it from a private element map. Rule: enumerate and zip project each
+        # source sequence's annotated element class onto its exact tuple
+        # target binding, citing the declaration cell. Direct iteration has
+        # its existing declared-sequence projection.
+        loop_data = target.nodes[int(loop_id)]
+        loop_attributes = loop_data.get("attributes") or {}
+        bindings = dict(loop_attributes.get("loop_target_bindings") or {})
+        iterables = tuple(
+            int(parent) for parent, role in loop_data.get("parents") or ()
+            if str(role) == "iterable" and int(parent) in target
+        )
+        if len(iterables) != 1 or not bindings:
+            return False
+        iterable_id = iterables[0]
+        iterable_data = target.nodes[iterable_id]
+        identity = (iterable_data.get("attributes") or {}).get(
+            "extraction_identity"
+        )
+        components = ()
+        if identity == "builtins.enumerate" and (
+            isinstance(expression.target, ast.Tuple)
+            and len(expression.target.elts) == 2
+            and all(isinstance(item, ast.Name)
+                    for item in expression.target.elts)
+        ):
+            sources = tuple(
+                int(parent) for parent, role in iterable_data.get("parents") or ()
+                if str(role) == "arg:0" and int(parent) in target
+            )
+            if len(sources) == 1:
+                components = (
+                    (expression.target.elts[0].id, None, iterable_id),
+                    (expression.target.elts[1].id, sources[0], iterable_id),
+                )
+        elif identity == "builtins.zip" and (
+            isinstance(expression.target, ast.Tuple)
+            and all(isinstance(item, ast.Name)
+                    for item in expression.target.elts)
+        ):
+            arguments = sorted(
+                (int(str(role).split(":", 1)[1]), int(parent))
+                for parent, role in iterable_data.get("parents") or ()
+                if str(role).startswith("arg:") and int(parent) in target
+            )
+            if len(arguments) == len(expression.target.elts) and (
+                tuple(position for position, _source in arguments)
+                == tuple(range(len(arguments)))
+            ):
+                components = tuple(
+                    (item.id, source, iterable_id)
+                    for item, (_position, source) in zip(
+                        expression.target.elts, arguments
+                    )
+                )
+        loop_cell = node_identity_cell(graph, int(loop_id))
+        if loop_cell is None:
+            return False
+        projected = False
+        for name, source_id, operator_id in components:
+            target_id = bindings.get(name)
+            if target_id is None or int(target_id) not in target:
+                continue
+            sources = [loop_cell, node_identity_cell(graph, int(operator_id))]
+            if source_id is None:
+                class_ref = "builtins.int"
+            else:
+                source_attributes = target.nodes[source_id].get("attributes") or {}
+                if source_attributes.get("aggregate_kind") == "dict":
+                    continue
+                class_ref = source_attributes.get("sequence_element_class_ref")
+                sources.extend((
+                    node_identity_cell(graph, int(source_id)),
+                    source_attributes.get("sequence_element_annotation_cell"),
+                    *(source_attributes.get(
+                        "callsite_sequence_element_class_cells"
+                    ) or ()),
+                ))
+                if not any(
+                    cell is not None for cell in sources[3:]
+                ):
+                    continue
+            if _canonical_source_class_identity(str(class_ref)) not in {
+                "builtins.int", "builtins.float", "builtins.bool",
+            }:
+                continue
+            value_id = int(target.nodes[int(target_id)].get(
+                "value_id", target_id
+            ))
+            row = (scope, value_id)
+            was_absent = page.latest(row) is None
+            _concord_source_value_class(
+                scope, value_id, str(class_ref),
+                source="iterated sequence element projection",
+                provenance=_Derived(tuple(dict.fromkeys(
+                    cell for cell in sources if cell is not None
+                ))),
+            )
+            projected |= was_absent
+        return projected
+
     for node_id, data in tuple(target.nodes(data=True)):
         expression = data.get("expr_obj")
         conditional_phi = (
@@ -5189,6 +5294,8 @@ def _propagate_builtin_scalar_operator_classes(graph: Any) -> bool:
             if _project_iterated_mapping_key_classes(
                 graph, int(node_id), expression, scope,
             ):
+                changed = True
+            if project_iterated_sequence_classes(int(node_id), expression):
                 changed = True
             continue
         field_state = (data.get("attributes") or {}).get("record_field_state")
