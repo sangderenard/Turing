@@ -4,7 +4,7 @@
 
 The slope is down, but exception handling is not complete. Authored `try`, `except`, `raise`, `assert`, and several `finally` exits now have control IR and SSA paths with source-owned concordance records. Bounded native C and LLVM cases have executed handled raises, assertions, nested propagation, and numeric finalizers. These cases establish those paths, not universal exception semantics.
 
-The exact source of `tensor_octets_to_bytes` in `src/common/tensors/compression/bitstream.py` is the current real-program probe. It now passes the first guard's exception-control failure and stops at `CompilationSubdivisionRequired`: the loop body regions are scheduled, but the loop itself cannot compile. No native codec artifact was admitted. The older `repros/codec_roundtrip.py` driver named in the continuation note is absent from the checked Turing worktrees and canonical checkout; the probe compiled the actual function source through `lower_ast_source_to_ssa`.
+The exact source of `tensor_octets_to_bytes` in `src/common/tensors/compression/bitstream.py` is the current real-program probe. It now passes the first guard's exception-control failure and stops at `CompilationSubdivisionRequired` for its `for index, value in enumerate(values)` loop. The loop composer accepts the two direct `if` guard raises at lines 31 and 35 as validations, but blocks the `raise ValueError(...) from error` at line 27 inside the `except` handler. The source transfer already records `catch_try=None` and handler scope for that raise: it must leave the loop. The composer's generic `Raise` blocker does not consume that route. This is still an exception-control frontier, not an independent loop-bound or opaque-state failure. No native codec artifact was admitted. The older `repros/codec_roundtrip.py` driver named in the continuation note is absent from the checked Turing worktrees and canonical checkout; the probe compiled the actual function source through `lower_ast_source_to_ssa`.
 
 ## What changed
 
@@ -16,7 +16,7 @@ The exact source of `tensor_octets_to_bytes` in `src/common/tensors/compression/
 
 ## Evidence and limits
 
-The targeted exception gate (`tests/test_source_exception_admission.py`, `tests/test_metadata_copy_control_ownership.py`, and `tests/test_native_float_int_status.py`) passed 80 tests on 2026-10-30. The new structural-retirement regression compiles a bounded guard whose selected terminal arm makes a following `raise` unreachable; its control-coverage and admission audits are clean. The exact codec source advances past its first guard, then refuses at the loop boundary. This is the next measured frontier, not evidence that the codec's `try` and `except` have executed.
+The targeted exception gate (`tests/test_source_exception_admission.py`, `tests/test_metadata_copy_control_ownership.py`, and `tests/test_native_float_int_status.py`) passed 80 tests on 2026-10-30. The new structural-retirement regression compiles a bounded guard whose selected terminal arm makes a following `raise` unreachable; its control-coverage and admission audits are clean. The exact codec source advances past its first guard, then refuses because the loop composer cannot place the handler's outward raise edge. This is the next measured frontier, not evidence that the codec's `try` and `except` have executed.
 
 Other exception shapes still require execution evidence, including finalizers that read a name absent on an unmatched edge and any path behind the codec loop refusal. The current result must not be described as complete native exception support.
 
@@ -28,4 +28,4 @@ The structural guard was a compact example. Ingestion recorded its `raise`; the 
 
 ## Next measured step
 
-Inspect why the codec loop has scheduled body regions but no compilable loop control. Identify the writer of the missing loop fact, correct it there through the concordance, and rerun the exact-source compile. Once it reaches an artifact, execute the codec's normal, handled, unmatched, and finalizer paths against Python behavior before claiming the real program works.
+Make the loop composer consume the handler raise's existing source transfer and outward route when constructing the loop's control exits. The current classifier only exempts direct `if` validation raises; it must not simply ignore the handler raise or place it as a normal loop iteration. Rerun the exact-source compile. Once it reaches an artifact, execute the codec's normal and exceptional paths against Python behavior before claiming the real program works.
