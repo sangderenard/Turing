@@ -30582,16 +30582,22 @@ def _class_surface_ssa_program(
                 node_id = getattr(block, "source_loop_node_id", None)
             if node_id is not None:
                 authored = _authored_node_position(graph_obj, int(node_id))
-                if isinstance(block, NativeAssertBlock) and (
-                    block.predicate_value_id is not None
-                    and int(block.predicate_value_id) in predicate_region_positions
+                predicate_id = (
+                    block.predicate_value_id
+                    if isinstance(block, (NativeAssertBlock, ConditionalBlock))
+                    else None
+                )
+                if (
+                    predicate_id is not None
+                    and int(predicate_id) in predicate_region_positions
                 ):
-                    # `assert x > 0` has a control node at the statement's
-                    # start, while its predicate is produced by a numerical
-                    # region at the expression's end. The exact predicate
-                    # value edge requires that region to precede the branch.
+                    # `assert x > 0` and `if x <= 0: raise ValueError()`
+                    # branch on a value produced inside a numerical region.
+                    # The exact predicate edge requires that region to run
+                    # before the authored control, even when the statement's
+                    # starting coordinate sorts before its test expression.
                     producer = predicate_region_positions[
-                        int(block.predicate_value_id)
+                        int(predicate_id)
                     ]
                     return max(authored, (
                         producer[0], producer[1], producer[2] + 1,

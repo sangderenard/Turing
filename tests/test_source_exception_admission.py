@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
@@ -43,6 +44,7 @@ from src.compiler.identity_concordance import (
     CorrelationTable, Unresolved, begin_identity_book, end_identity_book,
 )
 from src.compiler.native_faults import FLOAT_TO_INT_NAN, FLOAT_TO_INT_INFINITY
+from src.compiler.native_faults import NativeAssertionError, NativeValueError
 
 
 CONTRACT = (
@@ -1816,6 +1818,81 @@ def root(x: int) -> int:
         end_identity_book(token)
 
 
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+@pytest.mark.parametrize("kind", ["raise", "assert"])
+def test_root_exception_control_executes_on_native_backends(
+    backend, kind, tmp_path,
+):
+    source = (
+        "def root(x: int) -> int:\n"
+        "    if x <= 0:\n        raise ValueError()\n"
+        "    return x\n"
+        if kind == "raise" else
+        "def root(x: int) -> int:\n    assert x > 0\n    return x\n"
+    )
+    module, _outputs, exports = _lower(
+        source, f"exception_native_{kind}_{backend}", complete=True,
+    )
+    function = module.functions[exports[0]]
+    parameters = {
+        dict(function.metadata["parameter_names"])["x"]:
+            np.array([1], dtype=np.int64),
+    }
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, function.name)
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "c")
+        run = lambda inputs: artifact.prepare_execution(inputs).run()
+    else:
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact, emit_ssa_function_to_llvm,
+            prepare_artifact_execution,
+        )
+
+        emitted = emit_ssa_function_to_llvm(module, function.name)
+        assert not emitted.shortfalls, emitted.shortfalls
+        artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+        run = lambda inputs: prepare_artifact_execution(artifact, inputs).run()
+    assert run(parameters).buffers
+    parameter, = tuple(parameters)
+    with pytest.raises(
+        NativeValueError if kind == "raise" else NativeAssertionError
+    ):
+        run({parameter: np.array([0], dtype=np.int64)})
+
+
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+def test_unconditional_root_raise_has_empty_native_buffer_abi(
+    backend, tmp_path,
+):
+    module, _outputs, exports = _lower(
+        "def root() -> int:\n    raise ValueError()\n",
+        f"exception_unconditional_raise_{backend}", complete=True,
+    )
+    export = exports[0]
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, export)
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "c")
+        run = lambda: artifact.prepare_execution({}).run()
+    else:
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact, emit_ssa_function_to_llvm,
+            prepare_artifact_execution,
+        )
+
+        emitted = emit_ssa_function_to_llvm(module, export)
+        assert not emitted.shortfalls, emitted.shortfalls
+        artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+        run = lambda: prepare_artifact_execution(artifact, {}).run()
+    with pytest.raises(NativeValueError):
+        run()
+
+
 def test_production_try_reaches_ssa_maker_before_refusal():
     source = """\
 def root(x: float) -> int:
@@ -1852,6 +1929,111 @@ def root(x: float) -> int:
     with pytest.raises(CompilationSubdivisionRequired) as error:
         _lower(source, "exception_try_return_ssa", complete=True)
     assert "native_try_dispatch" in str(error.value)
+
+
+@pytest.mark.parametrize("source", [
+    """\
+def root(x: float) -> int:
+    y = 0
+    try:
+        y = int(x)
+    except ValueError:
+        y = 2
+    finally:
+        y = y + 1
+    return y
+""",
+    """\
+def root(x: int) -> int:
+    try:
+        raise ValueError()
+    except ValueError:
+        return 2
+    finally:
+        x = x + 1
+""",
+    """\
+def root(x: int) -> int:
+    try:
+        assert x > 0
+        return x
+    except AssertionError:
+        return 2
+    finally:
+        x = x + 1
+""",
+    """\
+def root(x: int) -> int:
+    try:
+        try:
+            raise ValueError()
+        except TypeError:
+            return 1
+    except ValueError:
+        return 2
+""",
+], ids=["join-finally", "handled-raise-finally", "assert-finally",
+        "nested-propagation"])
+def test_production_exception_control_reaches_ssa_frontier(source):
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired) as error:
+            _lower(
+                source, "exception_production_matrix", complete=True,
+                identity_book=book,
+            )
+        assert "native_try_dispatch" in str(error.value)
+        assert book.page(SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT).rows() or (
+            book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).rows()
+        )
+        assert CorrelationTable._source_exception_control_coverage_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    finally:
+        end_identity_book(token)
+
+
+def test_finally_arithmetic_dtype_cites_exact_try_phi_arms():
+    from src.compiler.concordance_declarations import (
+        PLAN_REGION_VALUE_DTYPE, SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
+    )
+
+    source = """\
+def root(x: float) -> int:
+    y = 0
+    try:
+        y = int(x)
+    except ValueError:
+        y = 2
+    finally:
+        y = y + 1
+    return y
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(
+                source, "exception_finally_dtype_evidence",
+                complete=True, identity_book=book,
+            )
+        arms = {
+            book.latest_ref(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE, row)
+            for row in book.page(
+                SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE
+            ).rows()
+        }
+        assert len(arms) == 2
+        assert any(
+            book.page(PLAN_REGION_VALUE_DTYPE).latest(row) == "int64"
+            and arms.issubset({
+                cause for cause, _stage in book.edges_into(
+                    book.latest_ref(PLAN_REGION_VALUE_DTYPE, row)
+                )
+            })
+            for row in book.page(PLAN_REGION_VALUE_DTYPE).rows()
+        )
+    finally:
+        end_identity_book(token)
 
 
 def test_nested_assert_is_in_dual_ir_control_half(monkeypatch):

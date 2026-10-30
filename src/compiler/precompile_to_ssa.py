@@ -25978,10 +25978,12 @@ class _ControlSSABuilder(TiledObject):
                     continue
                 self._revise_semantic_output(name, int(merged_id))
             self.emit(Handler.Ret, returned)
-            self._finish_fault_exits(returned)
         elif fallthrough_open:
             self.emit(Handler.Ret, returned)
-            self._finish_fault_exits(returned)
+        # `def root(): raise ValueError()` has no return or fallthrough.
+        # Its exceptional block still branches to the shared fault exit,
+        # so that exit must receive Trap independently of Ret construction.
+        self._finish_fault_exits(returned)
 
         # A returned union can be widened into a physical frame before the
         # function-exit join is built.  When that join has multiple incoming

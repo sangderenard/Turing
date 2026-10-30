@@ -7808,6 +7808,8 @@ def emit_ssa_module_to_c(
         reason=FUNCTION_TEXT_PENDING, stage=EMISSION_C,
         module=module, what="emit_ssa_module_to_c",
     )
+    # `def root(): raise ValueError()` has an empty host buffer order. Its
+    # finished wrapper, which contains the Trap path, proves that empty ABI.
     buffer_order_cell = None if emission is None else post_artifact_part(
         emission, name, Backend.C_MODULE, ArtifactPart.BUFFER_ORDER,
         data=repr((
@@ -7815,8 +7817,10 @@ def emit_ssa_module_to_c(
             tuple(extent_order),
         )),
         location=tuple(buffer_order),
-        sources=tuple(
-            value_cell(emission, root, value_id) for value_id in buffer_order
+        sources=(
+            tuple(value_cell(emission, root, value_id)
+                  for value_id in buffer_order)
+            if buffer_order else (wrapper_finished,)
         ),
         reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_C,
     )

@@ -6819,6 +6819,8 @@ def _emit_repository_call_module(
         reason=FUNCTION_TEXT_PENDING, stage=EMISSION_LLVM,
         module=module, what="_emit_repository_call_module",
     )
+    # `def root(): raise ValueError()` has no host buffers. The finished
+    # wrapper proves the empty ABI as it does the executable Trap path.
     buffer_order_cell = None if emission is None else post_artifact_part(
         emission, entry_name, Backend.LLVM_MODULE, ArtifactPart.BUFFER_ORDER,
         data=repr((
@@ -6826,8 +6828,10 @@ def _emit_repository_call_module(
             tuple(module_extent_order),
         )),
         location=tuple(buffer_order),
-        sources=tuple(
-            value_cell(emission, root, value_id) for value_id in buffer_order
+        sources=(
+            tuple(value_cell(emission, root, value_id)
+                  for value_id in buffer_order)
+            if buffer_order else (wrapper_finished,)
         ),
         reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_LLVM,
     )

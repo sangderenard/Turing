@@ -1546,6 +1546,27 @@ def post_control_program(
         return None if stored is None else stored.latest(row)
 
     root_blocks = _flatten_control_sequence(program.root)
+    exception_owners = set()
+
+    def require_one_exception_node(blocks: tuple) -> None:
+        for block in blocks:
+            identity = (
+                ("check", block.transfer_cell)
+                if isinstance(block, NativeAssertBlock) else
+                ("try", int(block.source_try_node_id))
+                if isinstance(block, NativeTryBlock) else None
+            )
+            if identity is not None:
+                if identity in exception_owners:
+                    raise ValueError(
+                        "authored exception occurs twice in one control tree: "
+                        f"{identity!r}"
+                    )
+                exception_owners.add(identity)
+            for _arm, _index, children in _control_block_arms(block):
+                require_one_exception_node(children)
+
+    require_one_exception_node(root_blocks)
     descriptions = {id(block): describe(block) for block in root_blocks}
     if label is None:
         label = SHELL

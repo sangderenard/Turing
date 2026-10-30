@@ -673,6 +673,21 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
     """
 
     graph = shell.process_graph.G
+    from .concordance_declarations import (
+        SOURCE_EXCEPTION_TRANSFER, ExceptionTransferFact,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    ingestion_scope = graph.graph.get("ingestion_value_scope")
+    authored_transfers = {
+        int(fact.source.row[1])
+        for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+        for fact in (book.page(SOURCE_EXCEPTION_TRANSFER).latest(row),)
+        if isinstance(fact, ExceptionTransferFact)
+        and fact.source_kind in {"raise", "reraise"}
+        and fact.source.row[0] == ingestion_scope
+    }
     expression_nodes = {
         id(data.get("expr_obj")): int(node_id)
         for node_id, data in graph.nodes(data=True)
@@ -789,7 +804,7 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
     direct_raise = terminal_raise(tuple(
         graph.graph.get("function_body") or ()
     ))
-    if direct_raise is not None:
+    if direct_raise is not None and id(direct_raise) not in authored_transfers:
         raise_id = node_for_expression(direct_raise)
         if raise_id is None:
             raise ValueError(
@@ -845,6 +860,11 @@ def _validation_control_blocks(shell: Any) -> tuple[ValidationBlock, ...]:
             raised_statement = orelse_raise
             raises_when_true = False
         else:
+            continue
+        # `if x <= 0: raise ValueError()` owns one exceptional control
+        # transfer. The older terminal-guard validation would run first and
+        # report generic code 6, hiding the authored ValueError status.
+        if id(raised_statement) in authored_transfers:
             continue
         test = statement.test
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
@@ -5287,6 +5307,44 @@ def _build_shell_hierarchy_plan(
         return incumbent_plan
 
     graph = shell.process_graph
+    from .concordance_declarations import (
+        SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
+        ExceptionContinuationArmValueFact,
+    )
+    from .identity_concordance import current_identity_book
+
+    exception_phi_arms: dict[int, tuple[int, ...]] = {}
+    exception_phi_arm_cells: dict[int, tuple[Any, ...]] = {}
+    planning_scope = graph.G.graph.get("planning_scope")
+    book = current_identity_book()
+    arm_page = book.page(SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE)
+    if planning_scope is not None:
+        for row in sorted(
+            (row for row in arm_page.rows() if row[0] == planning_scope),
+            key=lambda row: (int(row[1]), int(row[2])),
+        ):
+            fact = arm_page.latest(row)
+            if not isinstance(fact, ExceptionContinuationArmValueFact) or (
+                int(fact.canonical_phi.row[1]) != int(row[1])
+                or fact.canonical_phi.row[0] != graph.G.graph.get(
+                    "lexical_read_scope"
+                )
+            ):
+                raise ValueError(
+                    "Try Phi arm has no exact canonical owner: "
+                    f"{row!r}"
+                )
+            phi_id = int(row[1])
+            exception_phi_arms[phi_id] = (
+                *exception_phi_arms.get(phi_id, ()),
+                int(fact.canonical_value.row[1]),
+            )
+            exception_phi_arm_cells[phi_id] = (
+                *exception_phi_arm_cells.get(phi_id, ()),
+                book.latest_ref(
+                    SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE, row,
+                ),
+            )
     # The plan freezes tensor descriptors into ``PlanClosure.value_shapes``.
     # Some catalogue and callsite shells are constructed before their
     # ProgramABI descriptors arrive; freezing them at that point permanently
@@ -6758,6 +6816,25 @@ def _build_shell_hierarchy_plan(
                         or str(role).casefold() in {"body", "orelse"}
                     )
                 )
+                # `try: y=int(x); except ValueError: y=2; finally: y=y+1`
+                # records the post-Try Phi's parents as arm:0/arm:1. The
+                # ordinary conditional-only body/orelse filter dropped both,
+                # leaving Add untyped. Read the exact continuation-arm cells
+                # and require their ordered values to equal the graph arms.
+                if operation == "phi" and int(current) in exception_phi_arms:
+                    recorded = exception_phi_arms[int(current)]
+                    graph_arms = tuple(
+                        int(parent)
+                        for parent, role in (node.get("parents") or ())
+                        if str(role).startswith("arm:")
+                    )
+                    if graph_arms != recorded:
+                        raise ValueError(
+                            "Try Phi graph arms disagree with concordance: "
+                            f"phi={current}, graph={graph_arms!r}, "
+                            f"recorded={recorded!r}"
+                        )
+                    parents = recorded
                 return node, tensor, attributes, logical, dtype, operation, parents
 
             def phi_element_dtypes(attributes, parent_records, declared):
@@ -7237,7 +7314,19 @@ def _build_shell_hierarchy_plan(
             _fixed_width_row_width(int(value_id))
             record = _value_shape_dtype(value_id)
             if record[2] is not None:
-                return record, _dtype_producer_cells(graph, int(value_id))
+                arm_sources = tuple(
+                    cell
+                    for phi_id in (
+                        int(value_id),
+                        *(sorted(nx.ancestors(graph.G, int(value_id)))
+                          if exception_phi_arm_cells and int(value_id) in graph.G
+                          else ()),
+                    )
+                    for cell in exception_phi_arm_cells.get(int(phi_id), ())
+                )
+                return record, _dtype_producer_cells(
+                    graph, int(value_id), *arm_sources,
+                )
             node = graph.G.nodes.get(int(value_id), {})
             attributes = node.get("attributes") or {}
             # A collection the callsite specialization folded from its
@@ -14473,7 +14562,7 @@ def _source_exception_check_control_programs(
     graph: Any,
     retained_regions: Iterable[int],
     dispatch_subgraphs: Iterable[Any],
-    try_programs: Sequence[ControlProgram],
+    existing_programs: Sequence[ControlProgram],
 ) -> tuple[ControlProgram, ...]:
     """Retain each authored Raise/Assert absent from a Try control arm."""
 
@@ -14510,7 +14599,7 @@ def _source_exception_check_control_programs(
             yield from represented(block.body)
 
     covered = {
-        cell for program in try_programs
+        cell for program in existing_programs
         for cell in represented(program.root)
     }
     source_nodes = {
@@ -35914,6 +36003,11 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 int(region) for region in complete_regions
                 if int(region) not in structurally_owned_regions
             )
+            conditional_controls = _ordinary_conditional_control_programs(
+                target.process_graph,
+                runtime_regions,
+                target.dispatch_subgraphs,
+            )
             pending_occurrences = {
                 id(graph.G.nodes[node_id].get("expr_obj"))
                 for node_id, _cell in pending_source_tries
@@ -35939,7 +36033,12 @@ class ProcessGraphGLSLDeployment(TiledObject):
             source_check_programs = (
                 _source_exception_check_control_programs(
                     target.process_graph, runtime_regions,
-                    target.dispatch_subgraphs, source_try_programs,
+                    target.dispatch_subgraphs, (
+                        *source_try_programs,
+                        *conditional_controls,
+                        *(reduction.control_program
+                          for reduction in considered_reductions),
+                    ),
                 ) if target.process_graph.G.graph.get(
                     "lexical_read_scope"
                 ) is not None and (
@@ -36157,11 +36256,6 @@ class ProcessGraphGLSLDeployment(TiledObject):
                     preserve_source_loop_carries=True,
                 )
                 for reduction in considered_reductions
-            )
-            conditional_controls = _ordinary_conditional_control_programs(
-                target.process_graph,
-                runtime_regions,
-                target.dispatch_subgraphs,
             )
             validations = _validation_control_blocks(target)
             if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
