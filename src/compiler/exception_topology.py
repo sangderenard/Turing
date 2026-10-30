@@ -9,11 +9,13 @@ from .concordance_declarations import (
     EXCEPTION_TOPOLOGY, INGESTION_VALUE, NAME_BINDING,
     SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_HANDLER_ENTRY, SOURCE_EXCEPTION_HANDLER_PHI,
+    SOURCE_EXCEPTION_ROUTE_STEP,
     SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
     SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_TRANSFER,
     STATIC_REFERENCE_USE, STATIC_SYMBOL_DEFINITION,
     ExceptionHandlerClassFact, ExceptionHandlerEntryFact,
-    ExceptionHandlerPhiFact, ExceptionStatusRouteFact,
+    ExceptionHandlerPhiFact, ExceptionRouteStepFact,
+    ExceptionStatusRouteFact,
     ExceptionSiteStateFact, ExceptionTransferFact,
     canonical_python_subtype_identities, concorded_native_status_classes,
     ensure_builtin_class_topology,
@@ -421,6 +423,106 @@ def post_source_exception_transfers(
                 stage=EXCEPTION_TOPOLOGY,
                 provenance=Derived(causes), mode=Mode.CONCORD,
             )
+            # Program: an inner Try raises a status its own handlers do not
+            # select, while an enclosing Try does. The old single route
+            # ended at the inner search and gave SSA no edge to the outer
+            # owner. Record every owner search, then the top context, with
+            # a successor Ref from each step to the next outer step.
+            scope_indices = tuple(
+                index for index in range(len(transfer.scopes) - 1, -1, -1)
+                if transfer.scopes[index][1] == "body"
+            )
+            successor = None
+            for depth in range(len(scope_indices), -1, -1):
+                owner_index = (
+                    scope_indices[depth]
+                    if depth < len(scope_indices) else None
+                )
+                owner = (
+                    transfer.scopes[owner_index][0]
+                    if owner_index is not None else None
+                )
+                ordered = sorted((
+                    (handler_page.latest(row).ordinal,
+                     book.latest_ref(SOURCE_EXCEPTION_HANDLER_CLASS, row),
+                     handler_page.latest(row))
+                    for row in handler_page.scope_rows(ingestion_scope)
+                    if handler_page.latest(row).owner == owner
+                ), key=lambda item: item[0]) if owner is not None else ()
+                if tuple(item[0] for item in ordered) != tuple(
+                    range(len(ordered))
+                ) or any(cell is None for _ordinal, cell, _fact in ordered):
+                    raise ValueError(
+                        "exception route step has incomplete handler order: "
+                        f"transfer={transfer_row!r}, depth={depth}"
+                    )
+                examined_step = []
+                selected_step = matched_step = None
+                for _ordinal, handler_cell, handler in ordered:
+                    examined_step.append(handler_cell)
+                    if not handler.declarations:
+                        selected_step = handler.handler
+                        break
+                    for _value, handler_definition in handler.declarations:
+                        if handler_definition is None:
+                            raise ValueError(
+                                "route step handler has no exact class: "
+                                f"transfer={transfer_row!r}"
+                            )
+                        handler_identity = ".".join(
+                            handler_definition.row[:2]
+                        )
+                        if raised_identity in canonical_python_subtype_identities(
+                            handler_identity, book=book,
+                        ):
+                            selected_step = handler.handler
+                            matched_step = handler_definition
+                            break
+                    if selected_step is not None:
+                        break
+                next_index = (
+                    scope_indices[depth + 1]
+                    if depth + 1 < len(scope_indices) else -1
+                )
+                after = tuple(dict.fromkeys(
+                    scope_owner
+                    for scope_owner, arm, _handler, has_finally in reversed(
+                        transfer.scopes[next_index + 1:owner_index + 1]
+                    )
+                    if has_finally and arm != "finalbody"
+                )) if owner_index is not None else ()
+                before = transfer.unwind_finally if depth == 0 else ()
+                fact_step = ExceptionRouteStepFact(
+                    transfer_cell, status_class, owner,
+                    tuple(examined_step), selected_step, matched_step,
+                    successor, before, after,
+                )
+                step_causes = tuple(dict.fromkeys((
+                    transfer_cell, status_class,
+                    *((owner,) if owner is not None else ()),
+                    *examined_step,
+                    *((selected_step,) if selected_step is not None else ()),
+                    *((matched_step,) if matched_step is not None else ()),
+                    *((successor,) if successor is not None else ()),
+                    *before, *after,
+                )))
+                successor = book.post(
+                    SOURCE_EXCEPTION_ROUTE_STEP,
+                    (ingestion_scope, transfer_row[1], status, depth),
+                    fact_step, stage=EXCEPTION_TOPOLOGY,
+                    provenance=Derived(step_causes), mode=Mode.CONCORD,
+                )
+                if depth == 0 and (
+                    owner != route.owner
+                    or tuple(examined_step) != route.examined_handlers
+                    or selected_step != route.selected_handler
+                    or matched_step != route.matched_declaration
+                    or before != route.unwind_finally
+                ):
+                    raise ValueError(
+                        "nearest route step disagrees with source status route: "
+                        f"transfer={transfer_row!r}, status={status}"
+                    )
 
     binding_page = book.page(NAME_BINDING)
     for phi_id, data in graph.G.nodes(data=True):

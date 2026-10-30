@@ -1373,6 +1373,103 @@ def root(x: int) -> int:
         end_identity_book(token)
 
 
+def test_inner_try_miss_has_explicit_outer_handler_edge(monkeypatch):
+    source = """\
+def root(x: int) -> int:
+    try:
+        try:
+            raise ValueError("inner")
+        except TypeError:
+            return 1
+    except ValueError:
+        return 2
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.concordance_declarations import (
+        SOURCE_EXCEPTION_ROUTE_STEP, SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE,
+        SOURCE_EXCEPTION_SSA_PROPAGATION,
+    )
+    from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+    observed = []
+    original = strategy._overlay_control_or_require_subdivision
+
+    def capture(*args, **kwargs):
+        program = original(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append((program, args[0]))
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", capture,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_outer_handler_edge", identity_book=book)
+        transfer_cell, = tuple(
+            book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+            if book.page(SOURCE_EXCEPTION_TRANSFER).latest(row).source_kind
+            == "raise"
+        )
+        source_route_row, = tuple(
+            row for row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
+            if row[:2] == transfer_cell.row
+        )
+        assert book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(
+            source_route_row,
+        ).selected_handler is None
+        first = book.page(SOURCE_EXCEPTION_ROUTE_STEP).latest(
+            (*source_route_row, 0),
+        )
+        assert first.selected_handler is None
+        assert first.successor is not None
+        second = book.page(SOURCE_EXCEPTION_ROUTE_STEP).cell(
+            first.successor.row, first.successor.column,
+        )
+        assert second.selected_handler is not None
+        assert CorrelationTable._source_exception_route_step_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        (program, graph), = observed
+        try_row = next(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        constants = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("op")).casefold() == "const"
+        )
+        lowered, shortfalls = lower_control_program_to_ssa(
+            program, function_name="exception_outer_handler_edge_probe",
+            first_value_id=1000, lexical_read_scope=try_row[0],
+            planning_scope=graph.G.graph.get("planning_scope"),
+            constant_value_ids=constants,
+        )
+        assert lowered.blocks
+        assert any(item.name == "native_try_dispatch" for item in shortfalls)
+        assert book.page(SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE).latest((
+            "exception_outer_handler_edge_probe@control:0",
+            transfer_cell, int(source_route_row[2]), 1,
+        )) is not None
+        assert any(
+            row[1] == transfer_cell
+            for row in book.page(SOURCE_EXCEPTION_SSA_PROPAGATION).rows()
+        )
+        assert CorrelationTable._source_exception_ssa_propagation_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert CorrelationTable._source_exception_ssa_escalation_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert CorrelationTable._source_exception_ssa_handler_entry_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    finally:
+        end_identity_book(token)
+
+
 def test_raise_divides_try_arm_before_later_source_work(monkeypatch):
     source = """\
 def root(x: int) -> int:

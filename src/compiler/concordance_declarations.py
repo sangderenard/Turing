@@ -1268,6 +1268,31 @@ SOURCE_EXCEPTION_STATUS_ROUTE = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionRouteStepFact:
+    """One ordered handler search and its explicit enclosing successor."""
+
+    transfer: Ref
+    status_class: Ref
+    owner: Ref | None
+    examined_handlers: tuple[Ref, ...]
+    selected_handler: Ref | None
+    matched_declaration: Ref | None
+    successor: Ref | None
+    before_finalizers: tuple[Ref, ...]
+    after_finalizers: tuple[Ref, ...]
+
+
+SOURCE_EXCEPTION_ROUTE_STEP = declare_page(
+    "source_exception_route_step", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("source_node", K.VALUE_ID),
+        RowField("status", K.INDEX),
+        RowField("depth", K.INDEX),
+    ), ExceptionRouteStepFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionRegionSiteFact:
     """One source transfer whose exact canonical operation is deployed here."""
 
@@ -1411,7 +1436,7 @@ SOURCE_EXCEPTION_SSA_FINALIZER_INPUT = declare_page(
 
 @dataclass(frozen=True)
 class ExceptionSSAUnwindFact:
-    """An unmatched status crosses its own Try finalbody before bubbling."""
+    """A status crosses one Try finalbody on its enclosing route."""
 
     transfer: Ref
     exit_site: Ref
@@ -1427,6 +1452,29 @@ SOURCE_EXCEPTION_SSA_UNWIND = declare_page(
         RowField("transfer", K.PAGE_REF),
         RowField("try_control", K.PAGE_REF),
     ), ExceptionSSAUnwindFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionSSAPropagationFact:
+    """One SSA exit block continues at the next enclosing Try control."""
+
+    transfer: Ref
+    source_steps: tuple[Ref, ...]
+    successor_steps: tuple[Ref, ...]
+    from_control: Ref
+    to_control: Ref
+    exit_block: Ref
+    status_value: Ref
+
+
+SOURCE_EXCEPTION_SSA_PROPAGATION = declare_page(
+    "source_exception_ssa_propagation", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
+        RowField("from_control", K.PAGE_REF),
+        RowField("depth", K.INDEX),
+    ), ExceptionSSAPropagationFact,
 )
 
 
@@ -1458,6 +1506,16 @@ SOURCE_EXCEPTION_SSA_CONTROL_ROUTE = declare_page(
         RowField("ssa_scope", K.SCOPE),
         RowField("source_transfer", K.PAGE_REF),
         RowField("status", K.INDEX),
+    ), ExceptionSSARouteFact,
+)
+
+
+SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE = declare_page(
+    "source_exception_ssa_escalation_route", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
+        RowField("status", K.INDEX),
+        RowField("depth", K.INDEX),
     ), ExceptionSSARouteFact,
 )
 
@@ -1494,6 +1552,17 @@ SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM = declare_page(
 )
 
 
+SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_ARM = declare_page(
+    "source_exception_ssa_escalation_handler_arm", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
+        RowField("status", K.INDEX),
+        RowField("depth", K.INDEX),
+        RowField("canonical_phi", K.VALUE_ID),
+    ), ExceptionSSAHandlerArmFact,
+)
+
+
 @dataclass(frozen=True)
 class ExceptionSSAHandlerStateFact:
     """One live name captured on a matched native failure route."""
@@ -1520,6 +1589,17 @@ SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE = declare_page(
         RowField("ssa_scope", K.SCOPE),
         RowField("source_transfer", K.PAGE_REF),
         RowField("status", K.INDEX),
+        RowField("name", K.NAME),
+    ), ExceptionSSAHandlerStateFact,
+)
+
+
+SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_STATE = declare_page(
+    "source_exception_ssa_escalation_handler_state", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
+        RowField("status", K.INDEX),
+        RowField("depth", K.INDEX),
         RowField("name", K.NAME),
     ), ExceptionSSAHandlerStateFact,
 )

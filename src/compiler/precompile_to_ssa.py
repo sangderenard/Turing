@@ -12230,8 +12230,12 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_HANDLER_ENTRY,
             SOURCE_EXCEPTION_HANDLER_PHI,
             SOURCE_EXCEPTION_REGION_STATE, SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+            SOURCE_EXCEPTION_ROUTE_STEP,
             SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM,
             SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE,
+            SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_ARM,
+            SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_STATE,
+            SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE,
             SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
             SOURCE_EXCEPTION_SSA_HANDLER_PHI,
             SOURCE_EXCEPTION_SSA_HANDLER_STATE,
@@ -12239,6 +12243,7 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
             SOURCE_EXCEPTION_SSA_ROUTE,
+            SOURCE_EXCEPTION_SSA_PROPAGATION,
             SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
             SOURCE_EXCEPTION_STATUS_ROUTE,
             SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_SSA_UNWIND,
@@ -12247,12 +12252,14 @@ class _ControlSSABuilder(TiledObject):
             ExceptionContinuationPhiFact,
             ExceptionHandlerArmValueFact, ExceptionHandlerClassFact,
             ExceptionHandlerEntryFact, ExceptionHandlerPhiFact,
+            ExceptionRouteStepFact,
             ExceptionRegionStateFact,
             ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
             ExceptionSSAHandlerPhiFact, ExceptionSSAHandlerStateFact,
             ExceptionSSAContinuationArmFact,
             ExceptionSSAContinuationPhiFact, ExceptionSSARouteFact,
-            ExceptionStatusRouteFact, ExceptionSSAUnwindFact,
+            ExceptionSSAPropagationFact, ExceptionStatusRouteFact,
+            ExceptionSSAUnwindFact,
         )
 
         book = self._book()
@@ -12395,14 +12402,14 @@ class _ControlSSABuilder(TiledObject):
             )
             if exit_site is None:
                 raise ValueError(
-                    "unmatched status has no exact source exit: "
+                    "handler-search miss has no exact source exit: "
                     f"transfer={edge['transfer']!r}"
                 )
             before = self.current
             self._restore_native_finalizer_inputs(
                 frame, exit_site, edge["state"],
             )
-            self.lower(block.finalbody, path=f"{path}.unmatched_finally")
+            self.lower(block.finalbody, path=f"{path}.escalation_finally")
             before_cell = book.latest_ref(
                 SSA_BLOCK,
                 (self._scope(), self.function_name, before.name),
@@ -12413,7 +12420,7 @@ class _ControlSSABuilder(TiledObject):
             )
             if before_cell is None or after_cell is None:
                 raise ValueError(
-                    "unmatched finalizer lacks SSA block identities: "
+                    "escalation finalizer lacks SSA block identities: "
                     f"transfer={edge['transfer']!r}"
                 )
             book.post(
@@ -12432,6 +12439,94 @@ class _ControlSSABuilder(TiledObject):
                 )),
                 mode=Mode.CONCORD,
             )
+            depth = int(edge.get("route_depth", 0))
+            step_rows = tuple(
+                row for row in book.page(SOURCE_EXCEPTION_ROUTE_STEP).rows()
+                if row[:2] == edge["transfer"].row and row[3] == depth
+            )
+            steps = tuple(
+                book.page(SOURCE_EXCEPTION_ROUTE_STEP).latest(row)
+                for row in step_rows
+            )
+            if not steps or any(
+                not isinstance(step, ExceptionRouteStepFact)
+                or step.transfer != edge["transfer"]
+                for step in steps
+            ):
+                raise ValueError(
+                    "exception edge has no complete route step: "
+                    f"transfer={edge['transfer']!r}, depth={depth}"
+                )
+            next_owners = {
+                book.page(SOURCE_EXCEPTION_ROUTE_STEP).cell(
+                    step.successor.row, step.successor.column,
+                ).owner
+                for step in steps if step.successor is not None
+            }
+            if len(next_owners) != 1:
+                raise ValueError(
+                    "exception statuses disagree on next container: "
+                    f"transfer={edge['transfer']!r}, depth={depth}"
+                )
+            next_owner = next(iter(next_owners))
+            if next_owner is not None:
+                candidates = tuple(
+                    outer for outer in reversed(self._native_try_frames)
+                    for canonical in (
+                        book.latest_ref(
+                            CANONICAL_VALUE,
+                            (self.lexical_read_scope,
+                             int(outer["block"].source_try_node_id)),
+                        ),
+                    )
+                    if canonical is not None
+                    and reaches_canonical(next_owner, canonical)
+                )
+                if len(candidates) != 1:
+                    raise ValueError(
+                        "exception successor has no unique live Try frame: "
+                        f"transfer={edge['transfer']!r}, depth={depth}"
+                    )
+                outer = candidates[0]
+                source_steps = tuple(book.latest_ref(
+                    SOURCE_EXCEPTION_ROUTE_STEP, row,
+                ) for row in step_rows)
+                successor_steps = tuple(
+                    step.successor for step in steps
+                )
+                after_block = book.latest_ref(
+                    SSA_BLOCK,
+                    (self._scope(), self.function_name, self.current.name),
+                )
+                status_cell = self._value_cell(edge["status"])
+                if after_block is None or any(
+                    item is None for item in (*source_steps, *successor_steps)
+                ):
+                    raise ValueError(
+                        "exception successor lacks exact SSA edge cells: "
+                        f"transfer={edge['transfer']!r}, depth={depth}"
+                    )
+                book.post(
+                    SOURCE_EXCEPTION_SSA_PROPAGATION,
+                    (self._scope(), edge["transfer"], frame["owner"], depth),
+                    ExceptionSSAPropagationFact(
+                        edge["transfer"], source_steps, successor_steps,
+                        frame["owner"], outer["owner"], after_block,
+                        status_cell,
+                    ),
+                    stage=self._stage(),
+                    provenance=Derived((
+                        edge["transfer"], *source_steps, *successor_steps,
+                        frame["owner"], outer["owner"], after_block,
+                        status_cell,
+                    )),
+                    mode=Mode.CONCORD,
+                )
+                outer["edges"].append({
+                    **edge, "failure": self.current,
+                    "route_depth": depth + 1,
+                })
+                return
             self.emit(
                 Handler.Call, [edge["status"]],
                 attributes={
@@ -12459,15 +12554,21 @@ class _ControlSSABuilder(TiledObject):
                     "native Try route has no exact status checkpoint: "
                     f"site={edge['site']!r}"
                 )
+            depth = int(edge.get("route_depth", 0))
+            source_route_page = (
+                SOURCE_EXCEPTION_STATUS_ROUTE if depth == 0 else
+                SOURCE_EXCEPTION_ROUTE_STEP
+            )
             routes = sorted((
-                (route_row, book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(
-                    route_row,
-                ))
-                for route_row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
+                (route_row, book.page(source_route_page).latest(route_row))
+                for route_row in book.page(source_route_page).rows()
                 if route_row[:2] == edge["transfer"].row
+                and (depth == 0 or route_row[3] == depth)
             ), key=lambda item: int(item[0][2]))
             for route_row, route in routes:
-                if not isinstance(route, ExceptionStatusRouteFact) or (
+                if not isinstance(route, (
+                    ExceptionStatusRouteFact, ExceptionRouteStepFact,
+                )) or (
                     route.transfer != edge["transfer"]
                 ):
                     raise ValueError(
@@ -12516,7 +12617,7 @@ class _ControlSSABuilder(TiledObject):
                         f"control identity: route={route_row!r}"
                     )
                 route_cell = book.latest_ref(
-                    SOURCE_EXCEPTION_STATUS_ROUTE, route_row,
+                    source_route_page, route_row,
                 )
                 if route_cell is None:
                     raise ValueError(
@@ -12567,11 +12668,14 @@ class _ControlSSABuilder(TiledObject):
                         f"native Try route lacks SSA cells: {route_row!r}"
                     )
                 ssa_route_page = (
+                    SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE if depth > 0 else
                     SOURCE_EXCEPTION_SSA_CONTROL_ROUTE
-                    if control_checkpoint is not None
-                    else SOURCE_EXCEPTION_SSA_ROUTE
+                    if control_checkpoint is not None else
+                    SOURCE_EXCEPTION_SSA_ROUTE
                 )
                 ssa_route_row = (
+                    (self._scope(), edge["transfer"], int(route_row[2]), depth)
+                    if depth > 0 else
                     (self._scope(), edge["transfer"], int(route_row[2]))
                     if control_checkpoint is not None else
                     (self._scope(), edge["site"].row[1],
@@ -12624,7 +12728,9 @@ class _ControlSSABuilder(TiledObject):
                     # live y versions. Preserve every source name at each
                     # matched edge, not the successful path's final map.
                     book.post(
-                        (SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE
+                        (SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_STATE
+                         if depth > 0 else
+                         SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE
                          if control_checkpoint is not None else
                          SOURCE_EXCEPTION_SSA_HANDLER_STATE),
                         (*ssa_route_cell.row, name),
@@ -12713,7 +12819,9 @@ class _ControlSSABuilder(TiledObject):
                     # Each matched native code retains the source arm and
                     # the SSA value captured at its own deployed site.
                     book.post(
-                        (SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM
+                        (SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_ARM
+                         if depth > 0 else
+                         SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM
                          if control_checkpoint is not None else
                          SOURCE_EXCEPTION_SSA_HANDLER_ARM),
                         (*ssa_route_cell.row, int(arm.canonical_phi.row[1])),
@@ -12828,6 +12936,9 @@ class _ControlSSABuilder(TiledObject):
                 arm_cells = []
                 for route_cell in route_cells:
                     arm_page = (
+                        SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_ARM
+                        if route_cell.page == SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE
+                        else
                         SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM
                         if route_cell.page == SOURCE_EXCEPTION_SSA_CONTROL_ROUTE
                         else SOURCE_EXCEPTION_SSA_HANDLER_ARM
@@ -12941,7 +13052,7 @@ class _ControlSSABuilder(TiledObject):
                 SOURCE_EXCEPTION_HANDLER_ENTRY, source_entry_row,
             )
             route_owners = {
-                book.page(SOURCE_EXCEPTION_STATUS_ROUTE).cell(
+                book.page(route.source_route.page).cell(
                     route.source_route.row, route.source_route.column,
                 ).owner
                 for route in route_facts
@@ -12958,6 +13069,8 @@ class _ControlSSABuilder(TiledObject):
                     book.latest_ref(
                         (SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE
                          if route_cell.page == SOURCE_EXCEPTION_SSA_CONTROL_ROUTE
+                         else SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_STATE
+                         if route_cell.page == SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE
                          else SOURCE_EXCEPTION_SSA_HANDLER_STATE),
                         (*route_cell.row, name),
                     ) for route_cell in route_cells
@@ -13045,6 +13158,7 @@ class _ControlSSABuilder(TiledObject):
             finally:
                 self._native_try_frames.pop()
                 frame.pop("active_handler_status", None)
+            handler_exits = frame.pop("handler_exits", False)
             handled = tuple(
                 any(
                     fact.arm_kind == "handler"
@@ -13079,6 +13193,8 @@ class _ControlSSABuilder(TiledObject):
                     "native Try handler participates in only some joins: "
                     f"handler={source_handler!r}"
                 )
+            if handler_exits:
+                continue
             self.emit(
                 Handler.Call, [status_phi],
                 attributes={
@@ -13200,14 +13316,14 @@ class _ControlSSABuilder(TiledObject):
         # invents an input for the Phi and runs it only on the normal arm.
         self.lower(block.finalbody, path=f"{path}.try_finally")
         # The status is taken at the protected edge. Selected handlers with
-        # source continuation arms join normal control; unmatched status
-        # still reaches the fault exit without full finalizer unwinding.
+        # source continuation arms join normal control. Other finalizer
+        # outcomes still need complete SSA transfer handling.
         # Until every abrupt outcome and nested transfer is represented,
         # no public artifact may claim this Try is executable.
         self.shortfalls.append(SSALoweringShortfall(
             "control", "native_try_dispatch", path,
             "authored Try has source-owned handler joins but lacks "
-            "complete unmatched unwinding and pending finalizer outcomes",
+            "complete pending finalizer outcomes",
         ))
 
     def _lower_native_exception_check(
@@ -13309,6 +13425,10 @@ class _ControlSSABuilder(TiledObject):
                 1, transfer_cell, dtype="bool",
             )
             self.branch(failure)
+            for active in reversed(self._native_try_frames):
+                if "active_handler_status" in active:
+                    active["handler_exits"] = True
+                    break
         else:
             predicate = self.external_values.get(
                 int(block.predicate_value_id),

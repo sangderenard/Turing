@@ -1558,10 +1558,13 @@ class CorrelationTable:
         found.extend(self._source_exception_assert_control_findings(module))
         found.extend(self._source_exception_handler_class_findings(module))
         found.extend(self._source_exception_status_route_findings(module))
+        found.extend(self._source_exception_route_step_findings(module))
         found.extend(self._source_exception_region_site_findings(module))
         found.extend(self._source_exception_region_state_findings(module))
         found.extend(self._source_exception_ssa_checkpoint_findings(module))
         found.extend(self._source_exception_ssa_control_findings(module))
+        found.extend(self._source_exception_ssa_escalation_findings(module))
+        found.extend(self._source_exception_ssa_propagation_findings(module))
         found.extend(self._source_exception_ssa_return_finalizer_findings(module))
         found.extend(self._source_exception_ssa_route_findings(module))
         found.extend(self._source_exception_ssa_handler_arm_findings(module))
@@ -2510,6 +2513,150 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_exception_route_step_findings(module: Any) -> list[Finding]:
+        """Every handler search has one exact enclosing successor or top."""
+        from .concordance_declarations import (
+            NATIVE_STATUS_CLASS, SOURCE_EXCEPTION_HANDLER_CLASS,
+            SOURCE_EXCEPTION_ROUTE_STEP, SOURCE_EXCEPTION_STATUS_ROUTE,
+            SOURCE_EXCEPTION_TRANSFER,
+            ExceptionRouteStepFact, ExceptionStatusRouteFact,
+            ExceptionTransferFact, canonical_python_subtype_identities,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or SOURCE_EXCEPTION_ROUTE_STEP.name not in book.pages:
+            return []
+        steps = book.page(SOURCE_EXCEPTION_ROUTE_STEP)
+        handlers = book.page(SOURCE_EXCEPTION_HANDLER_CLASS)
+        found = []
+        expected_rows = set()
+        for route_row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows():
+            route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(route_row)
+            transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(
+                route_row[:2],
+            )
+            if not isinstance(route, ExceptionStatusRouteFact) or not isinstance(
+                transfer, ExceptionTransferFact,
+            ):
+                continue
+            owner_indices = tuple(
+                index for index in range(len(transfer.scopes) - 1, -1, -1)
+                if transfer.scopes[index][1] == "body"
+            )
+            for depth in range(len(owner_indices) + 1):
+                row = (*route_row, depth)
+                expected_rows.add(row)
+                step = steps.latest(row)
+                receipt = book.latest_ref(SOURCE_EXCEPTION_ROUTE_STEP, row)
+                owner_index = (
+                    owner_indices[depth]
+                    if depth < len(owner_indices) else None
+                )
+                owner = (
+                    transfer.scopes[owner_index][0]
+                    if owner_index is not None else None
+                )
+                successor = (
+                    book.latest_ref(SOURCE_EXCEPTION_ROUTE_STEP,
+                                    (*route_row, depth + 1))
+                    if depth < len(owner_indices) else None
+                )
+                next_index = (
+                    owner_indices[depth + 1]
+                    if depth + 1 < len(owner_indices) else -1
+                )
+                after = tuple(dict.fromkeys(
+                    scope_owner
+                    for scope_owner, arm, _handler, has_finally in reversed(
+                        transfer.scopes[next_index + 1:owner_index + 1]
+                    )
+                    if has_finally and arm != "finalbody"
+                )) if owner_index is not None else ()
+                before = transfer.unwind_finally if depth == 0 else ()
+                if not isinstance(step, ExceptionRouteStepFact) or (
+                    step.transfer != book.latest_ref(
+                        SOURCE_EXCEPTION_TRANSFER, route_row[:2],
+                    )
+                    or step.status_class != book.latest_ref(
+                        NATIVE_STATUS_CLASS, (route_row[2],),
+                    )
+                    or step.owner != owner
+                    or step.successor != successor
+                    or step.before_finalizers != before
+                    or step.after_finalizers != after
+                    or receipt is None
+                ):
+                    found.append(Finding(
+                        "source-exception-route-step-disagreement",
+                        str(row), None,
+                        "route step lacks its exact enclosing edge",
+                    ))
+                    continue
+                raised = book.page(NATIVE_STATUS_CLASS).latest((route_row[2],))
+                identity = ".".join(raised.row[:2])
+                ordered = sorted((
+                    (handlers.latest(handler_row).ordinal,
+                     book.latest_ref(SOURCE_EXCEPTION_HANDLER_CLASS,
+                                     handler_row),
+                     handlers.latest(handler_row))
+                    for handler_row in handlers.scope_rows(route_row[0])
+                    if handlers.latest(handler_row).owner == owner
+                ), key=lambda item: item[0]) if owner is not None else ()
+                examined = []
+                selected = matched = None
+                for _ordinal, handler_cell, handler in ordered:
+                    examined.append(handler_cell)
+                    if not handler.declarations:
+                        selected = handler.handler
+                        break
+                    for _value, definition in handler.declarations:
+                        if definition is not None and identity in (
+                            canonical_python_subtype_identities(
+                                ".".join(definition.row[:2]), book=book,
+                            )
+                        ):
+                            selected, matched = handler.handler, definition
+                            break
+                    if selected is not None:
+                        break
+                causes = {
+                    step.transfer, step.status_class,
+                    *((owner,) if owner is not None else ()),
+                    *step.examined_handlers,
+                    *((step.selected_handler,)
+                      if step.selected_handler is not None else ()),
+                    *((step.matched_declaration,)
+                      if step.matched_declaration is not None else ()),
+                    *((step.successor,)
+                      if step.successor is not None else ()),
+                    *before, *after,
+                }
+                if (
+                    tuple(examined) != step.examined_handlers
+                    or selected != step.selected_handler
+                    or matched != step.matched_declaration
+                    or {cause for cause, _stage in book.edges_into(receipt)}
+                    != causes
+                    or (depth == 0 and (
+                        step.owner != route.owner
+                        or step.examined_handlers != route.examined_handlers
+                        or step.selected_handler != route.selected_handler
+                        or step.matched_declaration != route.matched_declaration
+                    ))
+                ):
+                    found.append(Finding(
+                        "source-exception-route-step-disagreement",
+                        str(row), None,
+                        "route step disagrees with ordered handler selection",
+                    ))
+        for row in set(steps.rows()) - expected_rows:
+            found.append(Finding(
+                "source-exception-route-step-disagreement",
+                str(row), None, "route step has no source status route",
+            ))
+        return found
+
+    @staticmethod
     def _source_exception_region_site_findings(module: Any) -> list[Finding]:
         """A deployed failure operation has one source-to-region identity."""
         from .concordance_declarations import (
@@ -3068,6 +3215,201 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_exception_ssa_escalation_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """An outer handler route cites its source step and live SSA arms."""
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_CONTROL_STATE,
+            SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+            SOURCE_EXCEPTION_HANDLER_PHI,
+            SOURCE_EXCEPTION_REGION_STATE,
+            SOURCE_EXCEPTION_ROUTE_STEP,
+            SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_ARM,
+            SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_STATE,
+            SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE,
+            SSA_BLOCK, SSA_VALUE,
+            ExceptionSSAHandlerArmFact, ExceptionSSAHandlerStateFact,
+            ExceptionSSARouteFact, ExceptionRouteStepFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or (
+            SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE.name not in book.pages
+        ):
+            return []
+        page = book.page(SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE)
+        states = book.page(SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_STATE)
+        arms = book.page(SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_ARM)
+        found = []
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE,
+                                      row)
+            source_row = (*row[1].row, int(row[2]), int(row[3]))
+            source = book.page(SOURCE_EXCEPTION_ROUTE_STEP).latest(source_row)
+            if not isinstance(fact, ExceptionSSARouteFact) or (
+                not isinstance(source, ExceptionRouteStepFact)
+                or fact.source_route != book.latest_ref(
+                    SOURCE_EXCEPTION_ROUTE_STEP, source_row,
+                )
+                or fact.selected_handler != source.selected_handler
+                or fact.status_value.page != SSA_VALUE
+                or fact.predicate_value.page != SSA_VALUE
+                or fact.match_block.page != SSA_BLOCK
+                or fact.remainder_block.page != SSA_BLOCK
+                or receipt is None
+                or {cause for cause, _stage in book.edges_into(receipt)}
+                != {fact.checkpoint, fact.source_route, fact.status_value,
+                    fact.predicate_value, fact.match_block,
+                    fact.remainder_block, fact.selected_handler}
+            ):
+                found.append(Finding(
+                    "source-exception-ssa-escalation-disagreement",
+                    str(row), None,
+                    "outer SSA route differs from its concorded step",
+                ))
+                continue
+            for state_row in states.rows():
+                if state_row[:4] != row:
+                    continue
+                state = states.latest(state_row)
+                state_receipt = book.latest_ref(
+                    SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_STATE, state_row,
+                )
+                if not isinstance(state, ExceptionSSAHandlerStateFact) or (
+                    state.ssa_route != receipt
+                    or state.region_state.page not in {
+                        SOURCE_EXCEPTION_CONTROL_STATE,
+                        SOURCE_EXCEPTION_REGION_STATE,
+                    }
+                    or state.match_block != fact.match_block
+                    or state.incoming_value.page != SSA_VALUE
+                    or state_receipt is None
+                    or {cause for cause, _stage in book.edges_into(
+                        state_receipt,
+                    )} != {state.ssa_route, state.region_state,
+                           state.match_block, state.incoming_value}
+                ):
+                    found.append(Finding(
+                        "source-exception-ssa-escalation-state-disagreement",
+                        str(state_row), None,
+                        "outer handler state lacks its exact incoming value",
+                    ))
+            for arm_row in arms.rows():
+                if arm_row[:4] != row:
+                    continue
+                arm = arms.latest(arm_row)
+                arm_receipt = book.latest_ref(
+                    SOURCE_EXCEPTION_SSA_ESCALATION_HANDLER_ARM, arm_row,
+                )
+                source_arm = (
+                    book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).cell(
+                        arm.source_arm.row, arm.source_arm.column,
+                    ) if isinstance(arm, ExceptionSSAHandlerArmFact)
+                    else None
+                )
+                phi = (
+                    book.page(SOURCE_EXCEPTION_HANDLER_PHI).cell(
+                        source_arm.source_phi.row,
+                        source_arm.source_phi.column,
+                    ) if source_arm is not None else None
+                )
+                if not isinstance(arm, ExceptionSSAHandlerArmFact) or (
+                    arm.ssa_route != receipt
+                    or source_arm is None
+                    or source_arm.source_handler != source.selected_handler
+                    or int(source_arm.canonical_phi.row[1]) != int(arm_row[4])
+                    or phi is None
+                    or arm.region_state.page not in {
+                        SOURCE_EXCEPTION_CONTROL_STATE,
+                        SOURCE_EXCEPTION_REGION_STATE,
+                    }
+                    or arm.match_block != fact.match_block
+                    or arm.incoming_value.page != SSA_VALUE
+                    or arm_receipt is None
+                    or {cause for cause, _stage in book.edges_into(
+                        arm_receipt,
+                    )} != {arm.ssa_route, arm.source_arm, arm.region_state,
+                           arm.match_block, arm.incoming_value}
+                ):
+                    found.append(Finding(
+                        "source-exception-ssa-escalation-arm-disagreement",
+                        str(arm_row), None,
+                        "outer handler arm lacks its exact source value",
+                    ))
+        return found
+
+    @staticmethod
+    def _source_exception_ssa_propagation_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """An SSA continuation cites each source edge to the outer Try."""
+        from .concordance_declarations import (
+            CONTROL_BLOCK, SOURCE_EXCEPTION_ROUTE_STEP,
+            SOURCE_EXCEPTION_SSA_PROPAGATION, SSA_BLOCK, SSA_VALUE,
+            ExceptionRouteStepFact, ExceptionSSAPropagationFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or (
+            SOURCE_EXCEPTION_SSA_PROPAGATION.name not in book.pages
+        ):
+            return []
+        page = book.page(SOURCE_EXCEPTION_SSA_PROPAGATION)
+        found = []
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_PROPAGATION, row)
+            step_rows = tuple(
+                step_row for step_row in book.page(
+                    SOURCE_EXCEPTION_ROUTE_STEP
+                ).rows()
+                if step_row[:2] == row[1].row
+                and int(step_row[3]) == int(row[3])
+            )
+            source_steps = tuple(book.latest_ref(
+                SOURCE_EXCEPTION_ROUTE_STEP, step_row,
+            ) for step_row in step_rows)
+            steps = tuple(book.page(SOURCE_EXCEPTION_ROUTE_STEP).latest(
+                step_row,
+            ) for step_row in step_rows)
+            successors = tuple(
+                step.successor for step in steps
+                if isinstance(step, ExceptionRouteStepFact)
+            )
+            next_owners = {
+                book.page(SOURCE_EXCEPTION_ROUTE_STEP).cell(
+                    successor.row, successor.column,
+                ).owner
+                for successor in successors if successor is not None
+            }
+            if not isinstance(fact, ExceptionSSAPropagationFact) or (
+                fact.transfer != row[1]
+                or fact.from_control != row[2]
+                or fact.from_control.page != CONTROL_BLOCK
+                or fact.to_control.page != CONTROL_BLOCK
+                or fact.exit_block.page != SSA_BLOCK
+                or fact.status_value.page != SSA_VALUE
+                or set(fact.source_steps) != set(source_steps)
+                or set(fact.successor_steps) != set(successors)
+                or not source_steps
+                or len(next_owners) != 1
+                or next(iter(next_owners)) is None
+                or receipt is None
+                or {cause for cause, _stage in book.edges_into(receipt)}
+                != {fact.transfer, *fact.source_steps,
+                    *fact.successor_steps, fact.from_control,
+                    fact.to_control, fact.exit_block, fact.status_value}
+            ):
+                found.append(Finding(
+                    "source-exception-ssa-propagation-disagreement",
+                    str(row), None,
+                    "SSA edge lacks its exact source successor",
+                ))
+        return found
+
+    @staticmethod
     def _source_exception_ssa_route_findings(
         module: Any,
     ) -> list[Finding]:
@@ -3450,6 +3792,7 @@ class CorrelationTable:
             SOURCE_EXCEPTION_SSA_HANDLER_PHI,
             SOURCE_EXCEPTION_SSA_ROUTE,
             SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
+            SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE,
             SSA_BLOCK, SSA_VALUE,
             ExceptionHandlerArmValueFact, ExceptionHandlerPhiFact,
             ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
@@ -3468,6 +3811,8 @@ class CorrelationTable:
             (SOURCE_EXCEPTION_SSA_ROUTE, book.page(SOURCE_EXCEPTION_SSA_ROUTE)),
             (SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
              book.page(SOURCE_EXCEPTION_SSA_CONTROL_ROUTE)),
+            (SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE,
+             book.page(SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE)),
         )
         found = []
         canonical_successors = {}
@@ -3529,6 +3874,7 @@ class CorrelationTable:
                     cell.page not in {
                         SOURCE_EXCEPTION_SSA_ROUTE,
                         SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
+                        SOURCE_EXCEPTION_SSA_ESCALATION_ROUTE,
                     }
                     or book.latest_ref(cell.page, cell.row) != cell
                     or book.page(cell.page).latest(cell.row).selected_handler
