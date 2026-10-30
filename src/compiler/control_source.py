@@ -2560,7 +2560,9 @@ def _anchored_control(control: "ControlProgram") -> bool:
         return False
     root = control.root
     blocks = root.blocks if isinstance(root, SequenceBlock) else (root,)
-    return any(isinstance(block, (ConditionalBlock, NativeTryBlock))
+    return any(isinstance(block, (
+        ConditionalBlock, NativeTryBlock, NativeAssertBlock,
+    ))
                for block in blocks)
 
 
@@ -4564,6 +4566,14 @@ def overlay_scheduled_control(
                 placed_exact_children.add(child)
         for child in remaining_children:
             control = controls[child]
+            if (not control.region_indices
+                    and isinstance(control.root, NativeAssertBlock)):
+                root = place_authored_comprehension_control(
+                    root,
+                    nested_root(child, visiting | {index}),
+                    authored_control_sites.get((index, child)),
+                )
+                continue
             if (not control.region_indices
                     and isinstance(control.root, (LoopBlock, WhileBlock))):
                 root = place_authored_comprehension_control(

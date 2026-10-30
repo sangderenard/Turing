@@ -1,0 +1,6 @@
+2026-10-30 Authored exception nodes in dual IR control (MEASURED, exception-admission worktree):
+
+- The forked process graph now builds a `NativeAssertBlock` for each retained authored `raise` or `assert` with a `SOURCE_EXCEPTION_TRANSFER` cell. It posts that node through `post_control_program`; a missing transfer fails immediately. Existing `NativeTryBlock` arms retain their owned checks, so an authored check is represented once in the control tree.
+- Source nesting places checks and Try nodes in their authored conditional arms. The final shell control program is posted to the concordance. `_source_exception_control_coverage_findings` checks one control node per source transfer or admitted Try and verifies its reachability from the shell root.
+- Bounded cases verified root Assert, Assert under an `if` inside Try, and Try plus Assert in opposite arms of an outer `if`. `python -u -m pytest -q --tb=short tests/test_source_exception_admission.py tests/test_metadata_copy_control_ownership.py tests/test_native_float_int_status.py`: 39 passed, 2 warnings. `git diff --check`: passed.
+- Public execution remains closed by `native_try_dispatch`; pending finalizer outcomes and standalone exceptional exits still require SSA lowering. This receipt establishes the control half's retained source-node coverage, not executable exception parity.

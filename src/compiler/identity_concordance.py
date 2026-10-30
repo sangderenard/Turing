@@ -1556,6 +1556,7 @@ class CorrelationTable:
         found.extend(self._source_exception_finalizer_path_findings(module))
         found.extend(self._source_exception_transfer_findings(module))
         found.extend(self._source_exception_assert_control_findings(module))
+        found.extend(self._source_exception_control_coverage_findings(module))
         found.extend(self._source_exception_handler_class_findings(module))
         found.extend(self._source_exception_status_route_findings(module))
         found.extend(self._source_exception_route_step_findings(module))
@@ -2313,6 +2314,118 @@ class CorrelationTable:
                     str(row), None,
                     "exception check owner has no exact source origin",
                 ))
+        return found
+
+    @staticmethod
+    def _source_exception_control_coverage_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Each authored exceptional check and retained Try owns control IR."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CONTROL_BLOCK, CONTROL_BLOCK_PLACEMENT,
+            CONTROL_PROGRAM, SHELL,
+            SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_TRANSFER,
+            ControlBlockFact, ControlBlockKind, ControlProgramFact,
+            ExceptionTransferFact, Placement,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or CONTROL_BLOCK.name not in book.pages:
+            return []
+        controls = book.page(CONTROL_BLOCK)
+        programs = book.page(CONTROL_PROGRAM)
+        canonical_successors = {}
+        for row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, row)
+            for cause, _stage in book.edges_into(canonical):
+                canonical_successors.setdefault(cause, set()).add(canonical)
+
+        def identities(source: Ref) -> set[Ref]:
+            pending = [source]
+            reached = set()
+            while pending:
+                cell = pending.pop()
+                if cell in reached:
+                    continue
+                reached.add(cell)
+                pending.extend(canonical_successors.get(cell, ()))
+            return reached
+
+        program_scopes = {row[0] for row in programs.rows()}
+        found = []
+
+        def in_shell(scope: Any, block_row: tuple) -> bool:
+            shell = programs.latest((scope, SHELL))
+            if not isinstance(shell, ControlProgramFact):
+                return False
+            pending = [book.latest_ref(CONTROL_BLOCK, block_row)]
+            seen = set()
+            roots = set(shell.root_blocks)
+            while pending:
+                cell = pending.pop()
+                if cell is None or cell in seen:
+                    continue
+                if cell in roots:
+                    return True
+                seen.add(cell)
+                placement = book.page(CONTROL_BLOCK_PLACEMENT).latest((
+                    scope, cell,
+                ))
+                if isinstance(placement, Placement) and isinstance(
+                    placement.parent, Ref,
+                ) and placement.parent.page == CONTROL_BLOCK:
+                    pending.append(placement.parent)
+            return False
+
+        def check(source: Ref, kind: Any, transfer: Ref | None):
+            reached = identities(source)
+            scopes = {
+                cell.row[0] for cell in reached
+                if cell.page == CANONICAL_VALUE
+                and cell.row[0] in program_scopes
+            }
+            if not scopes:
+                scopes = {source.row[0]}
+            for scope in scopes:
+                matches = tuple(
+                    row for row in controls.rows()
+                    if row[0] == scope
+                    and isinstance(controls.latest(row), ControlBlockFact)
+                    and controls.latest(row).kind is kind
+                    and (
+                        controls.latest(row).sites == (transfer,)
+                        if transfer is not None else row[2] in reached
+                    )
+                )
+                if len(matches) != 1:
+                    found.append(Finding(
+                        "source-exception-control-coverage-disagreement",
+                        str((scope, source)), None,
+                        "authored exception has no unique control-half node",
+                    ))
+                elif programs.latest((scope, SHELL)) is not None and not (
+                    in_shell(scope, matches[0])
+                ):
+                    found.append(Finding(
+                        "source-exception-control-coverage-disagreement",
+                        str((scope, source)), None,
+                        "authored control node is outside the shell control tree",
+                    ))
+
+        check_sources = set()
+        for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows():
+            fact = book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+            if not isinstance(fact, ExceptionTransferFact) or (
+                fact.source_kind not in {"assert", "raise", "reraise"}
+            ):
+                continue
+            transfer = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+            check_sources.add(fact.source)
+            check(fact.source, ControlBlockKind.NATIVE_ASSERT, transfer)
+        for row in book.page(SOURCE_EXCEPTION_ADMISSION).rows():
+            source = row[0]
+            if source not in check_sources:
+                check(source, ControlBlockKind.NATIVE_TRY, None)
         return found
 
     @staticmethod

@@ -1632,12 +1632,28 @@ def root(x: int) -> int:
         end_identity_book(token)
 
 
-def test_authored_assert_without_try_refuses_unimplemented_status_exit():
+def test_authored_assert_without_try_refuses_unimplemented_status_exit(
+    monkeypatch,
+):
     source = """\
 def root(x: int) -> int:
     assert x > 0
     return x
 """
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.control_source import NativeAssertBlock
+    observed = []
+    original = strategy._overlay_control_or_require_subdivision
+
+    def capture(*args, **kwargs):
+        program = original(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", capture,
+    )
     book, token = begin_identity_book()
     try:
         with pytest.raises(CompilationSubdivisionRequired):
@@ -1648,10 +1664,156 @@ def root(x: int) -> int:
             for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
         )
         assert any(
+            book.page(CONTROL_BLOCK).latest(row).kind
+            is ControlBlockKind.NATIVE_ASSERT
+            for row in book.page(CONTROL_BLOCK).rows()
+        )
+        assert CorrelationTable._source_exception_control_coverage_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert any(
+            isinstance(block, NativeAssertBlock)
+            for block in observed[-1].root.blocks
+        )
+        assert any(
             isinstance(book.page(SOURCE_EXCEPTION_ADMISSION).latest(row),
                        Unresolved)
             for row in book.page(SOURCE_EXCEPTION_ADMISSION).rows()
         )
+    finally:
+        end_identity_book(token)
+
+
+def test_nested_assert_is_in_dual_ir_control_half(monkeypatch):
+    source = """\
+def root(x: int) -> int:
+    try:
+        if x > 0:
+            assert x < 10
+            return 1
+        return 2
+    except AssertionError:
+        return 3
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.control_source import (
+        ConditionalBlock, NativeAssertBlock, NativeTryBlock,
+    )
+    observed = []
+    original = strategy._overlay_control_or_require_subdivision
+
+    def capture(*args, **kwargs):
+        program = original(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", capture,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_nested_assert_control", identity_book=book)
+        assert_cells = tuple(
+            book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+            if book.page(SOURCE_EXCEPTION_TRANSFER).latest(row).source_kind
+            == "assert"
+        )
+        assert len(assert_cells) == 1
+        fork_scope = next(
+            row[0] for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+            and "|fork" in str(row[0])
+        )
+        assert_checks = tuple(
+            book.page(CONTROL_BLOCK).latest(row)
+            for row in book.page(CONTROL_BLOCK).rows()
+            if row[0] == fork_scope
+            if book.page(CONTROL_BLOCK).latest(row).kind
+            is ControlBlockKind.NATIVE_ASSERT
+        )
+        assert len(assert_checks) == 1
+        assert assert_checks[0].sites == assert_cells
+        assert CorrelationTable._source_exception_control_coverage_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        program = observed[-1]
+        from src.compiler.control_source import SequenceBlock
+
+        def conditionals(block):
+            if isinstance(block, ConditionalBlock):
+                yield block
+            if isinstance(block, SequenceBlock):
+                for child in block.blocks:
+                    yield from conditionals(child)
+
+        outer_try, = tuple(
+            block for block in program.root.blocks
+            if isinstance(block, NativeTryBlock)
+        )
+        conditional, = tuple(
+            conditionals(outer_try.body)
+        )
+        assert any(
+            isinstance(block, NativeAssertBlock)
+            for block in conditional.body.blocks
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_try_and_root_assert_in_conditional_control_arms(monkeypatch):
+    source = """\
+def root(x: int) -> int:
+    if x > 0:
+        try:
+            assert x < 10
+        except AssertionError:
+            return 1
+    else:
+        assert x < 0
+    return x
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.control_source import (
+        ConditionalBlock, NativeAssertBlock, NativeTryBlock, SequenceBlock,
+    )
+    observed = []
+    original = strategy._overlay_control_or_require_subdivision
+
+    def capture(*args, **kwargs):
+        program = original(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append(program)
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", capture,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_conditional_arms", identity_book=book)
+        program = observed[-1]
+
+        def children(block):
+            if isinstance(block, SequenceBlock):
+                return block.blocks
+            return (block,)
+
+        outer, = tuple(
+            block for block in children(program.root)
+            if isinstance(block, ConditionalBlock)
+        )
+        assert any(isinstance(block, NativeTryBlock)
+                   for block in children(outer.body))
+        assert any(isinstance(block, NativeAssertBlock)
+                   for block in children(outer.orelse))
+        assert CorrelationTable._source_exception_control_coverage_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
     finally:
         end_identity_book(token)
 

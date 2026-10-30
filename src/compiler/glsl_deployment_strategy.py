@@ -14469,6 +14469,134 @@ def _nest_region_less_tries(
     )
 
 
+def _source_exception_check_control_programs(
+    graph: Any,
+    retained_regions: Iterable[int],
+    dispatch_subgraphs: Iterable[Any],
+    try_programs: Sequence[ControlProgram],
+) -> tuple[ControlProgram, ...]:
+    """Retain each authored Raise/Assert absent from a Try control arm."""
+
+    from .concordance_declarations import (
+        CONTROL_PROGRAM_BUILD, SOURCE_EXCEPTION_TRANSFER,
+        ExceptionTransferFact,
+    )
+    from .control_source import (
+        ConditionalBlock, LoopBlock, NativeAssertBlock, NativeTryBlock,
+        SequenceBlock, WhileBlock, post_control_program,
+    )
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+
+    def represented(block: Any):
+        if isinstance(block, NativeAssertBlock):
+            yield block.transfer_cell
+        elif isinstance(block, SequenceBlock):
+            for child in block.blocks:
+                yield from represented(child)
+        elif isinstance(block, NativeTryBlock):
+            yield from represented(block.body)
+            for handler in block.handlers:
+                yield from represented(handler.body)
+            if block.orelse is not None:
+                yield from represented(block.orelse)
+            yield from represented(block.finalbody)
+        elif isinstance(block, ConditionalBlock):
+            yield from represented(block.body)
+            if block.orelse is not None:
+                yield from represented(block.orelse)
+        elif isinstance(block, (LoopBlock, WhileBlock)):
+            yield from represented(block.body)
+
+    covered = {
+        cell for program in try_programs
+        for cell in represented(program.root)
+    }
+    source_nodes = {
+        id(expression): expression
+        for _node_id, data in graph.G.nodes(data=True)
+        for expression in (data.get("expr_obj"),)
+        if isinstance(expression, (ast.Raise, ast.Assert))
+    }
+    for record in _source_control_records(graph.G).values():
+        expression = record.get("expression")
+        if isinstance(expression, ast.AST):
+            source_nodes.update({
+                id(member): member for member in ast.walk(expression)
+                if isinstance(member, (ast.Raise, ast.Assert))
+            })
+    transferred = {
+        int(fact.source.row[1])
+        for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+        for fact in (book.page(SOURCE_EXCEPTION_TRANSFER).latest(row),)
+        if isinstance(fact, ExceptionTransferFact)
+        and fact.source_kind in {"raise", "reraise", "assert"}
+    }
+    missing = set(source_nodes) - transferred
+    if missing:
+        raise ValueError(
+            "authored exceptional checks lack source transfer cells: "
+            f"{tuple(sorted(missing))!r}"
+        )
+    regions = tuple(map(int, retained_regions))
+    subgraphs = tuple(dispatch_subgraphs)
+    programs = []
+    for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows():
+        transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+        if not isinstance(transfer, ExceptionTransferFact) or (
+            transfer.source_kind not in {"raise", "reraise", "assert"}
+            or int(transfer.source.row[1]) not in source_nodes
+        ):
+            continue
+        transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+        if transfer_cell in covered:
+            continue
+        statement = source_nodes.get(int(transfer.source.row[1]))
+        if statement is None:
+            raise ValueError(
+                "authored exception has no retained control source: "
+                f"transfer={transfer_cell!r}"
+            )
+        check = _authored_arm_exception_check(graph, (statement,))
+        if not isinstance(check, NativeAssertBlock) or (
+            check.transfer_cell != transfer_cell
+        ):
+            raise ValueError(
+                "authored exception has no exact control block: "
+                f"transfer={transfer_cell!r}"
+            )
+        end = (
+            int(getattr(statement, "end_lineno", statement.lineno)),
+            int(getattr(statement, "end_col_offset", statement.col_offset)),
+        )
+        anchor = None
+        for region in regions:
+            starts = tuple(
+                (int(span["line"]), int(span.get("column", 0)))
+                for node_id in subgraphs[region].G.graph.get(
+                    "deployment_nodes", (),
+                )
+                for span in ((graph.G.nodes[int(node_id)].get(
+                    "source_span"
+                ) or {}),)
+                if span.get("line") is not None
+            )
+            if starts and min(starts) > end:
+                anchor = region
+                break
+        program = ControlProgram(
+            check, region_indices=(), anchor_region=anchor,
+        )
+        post_control_program(
+            graph, program, stage=CONTROL_PROGRAM_BUILD,
+            cause=(transfer_cell,), label=transfer_cell,
+        )
+        programs.append(program)
+        covered.add(transfer_cell)
+    return tuple(programs)
+
+
 def _nest_region_less_conditionals(
     graph: Any,
     programs: tuple[ControlProgram, ...],
@@ -14890,7 +15018,7 @@ def _source_control_nesting_hints(
             expressions[offset + local_index] = expression
             source_node_ids[offset + local_index] = int(block.source_node_id)
 
-    from .control_source import NativeTryBlock
+    from .control_source import NativeAssertBlock, NativeTryBlock
     try_offset = offset + len(conditionals)
     for local_index, program in enumerate(tries):
         block = next((
@@ -14899,17 +15027,23 @@ def _source_control_nesting_hints(
                 if isinstance(program.root, SequenceBlock)
                 else (program.root,)
             )
-            if isinstance(item, NativeTryBlock)
+            if isinstance(item, (NativeTryBlock, NativeAssertBlock))
         ), None)
         if block is None:
             raise ValueError(
-                "source Try control program has no NativeTryBlock owner"
+                "source exception control program has no authored owner"
             )
-        source_id = int(block.source_try_node_id)
+        source_id = int(
+            block.source_try_node_id
+            if isinstance(block, NativeTryBlock) else block.source_node_id
+        )
         expression = graph.G.nodes.get(source_id, {}).get("expr_obj")
-        if not isinstance(expression, ast.Try):
+        if not isinstance(expression, (
+            ast.Try if isinstance(block, NativeTryBlock)
+            else (ast.Raise, ast.Assert)
+        )):
             raise ValueError(
-                "source Try control owner has no exact authored Try: "
+                "source exception control owner has no exact authored node: "
                 f"node={source_id}"
             )
         expressions[try_offset + local_index] = expression
@@ -35784,6 +35918,7 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 id(graph.G.nodes[node_id].get("expr_obj"))
                 for node_id, _cell in pending_source_tries
             } if graph is not None else set()
+            source_try_programs = ()
             if (
                 pending_occurrences
                 and target.process_graph.G.graph.get("function_name")
@@ -35797,10 +35932,26 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 # its control nodes are canonical values in that fork. Build
                 # their exact control correlation before refusing admission;
                 # this block is not yet an executable exceptional successor.
-                target.source_try_control_programs = _source_try_control_programs(
+                source_try_programs = _source_try_control_programs(
                     target.process_graph, runtime_regions,
                     target.dispatch_subgraphs,
                 )
+            source_check_programs = (
+                _source_exception_check_control_programs(
+                    target.process_graph, runtime_regions,
+                    target.dispatch_subgraphs, source_try_programs,
+                ) if target.process_graph.G.graph.get(
+                    "lexical_read_scope"
+                ) is not None and (
+                    source_try_programs or pending_source_checks
+                    or any(isinstance(data.get("expr_obj"), (
+                        ast.Raise, ast.Assert,
+                    )) for _node, data in target.process_graph.G.nodes(data=True))
+                ) else ()
+            )
+            target.source_try_control_programs = (
+                *source_try_programs, *source_check_programs,
+            )
             # A blocked loop (real blockers, e.g. an authored ``raise``) has
             # no control_program and is silently excluded above. Its BODY
             # REGIONS were still compiled as ordinary numerical work and
@@ -36068,6 +36219,21 @@ class ProcessGraphGLSLDeployment(TiledObject):
                 runtime_regions,
                 target.dispatch_subgraphs,
             )
+            if try_controls:
+                from .concordance_declarations import (
+                    CONTROL_PROGRAM_BUILD, SHELL,
+                )
+                from .control_source import post_control_program
+
+                post_control_program(
+                    target.process_graph, shell_control,
+                    stage=CONTROL_PROGRAM_BUILD,
+                    cause=tuple(dict.fromkeys((
+                        *(cell for _node, cell in pending_source_tries),
+                        *(cell for _node, cell in pending_source_checks),
+                    ))),
+                    label=SHELL,
+                )
             target.shell_control_program = replace(
                 shell_control,
                 deployment_regions=tuple(dict.fromkeys((
