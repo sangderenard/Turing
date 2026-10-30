@@ -20,7 +20,12 @@ from src.compiler.concordance_declarations import (
     SOURCE_EXCEPTION_REGION_STATE,
     SOURCE_EXCEPTION_SSA_CHECKPOINT,
     SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
+    SOURCE_EXCEPTION_FINALIZER_BINDING,
+    SOURCE_EXCEPTION_FINALIZER_INPUT,
+    SOURCE_EXCEPTION_SSA_FINALIZER_INPUT,
     SOURCE_EXCEPTION_SSA_ROUTE,
+    SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+    SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
     SOURCE_EXCEPTION_SSA_HANDLER_ARM,
     SOURCE_EXCEPTION_SSA_HANDLER_STATE,
     SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
@@ -391,7 +396,11 @@ def root(x: float) -> int:
     try:
         with pytest.raises(CompilationSubdivisionRequired):
             _lower(source, "exception_site_binding", identity_book=book)
-        sites = tuple(book.page(SOURCE_EXCEPTION_SITE_STATE).rows())
+        sites = tuple(
+            row for row in book.page(SOURCE_EXCEPTION_SITE_STATE).rows()
+            if book.page(SOURCE_EXCEPTION_SITE_STATE).latest(row).action
+            == "exception"
+        )
         assert len(sites) == 1
         site = book.page(SOURCE_EXCEPTION_SITE_STATE).latest(sites[0])
         assert site.required_names == ("y",)
@@ -886,24 +895,45 @@ def root(x: float) -> float:
             if instruction.attributes.get("callee") == "numerical_region_1"
         )
         assert finalizer_call.args[0].id == continuation.result_value.row[1]
-        assert not any(
-            instruction.attributes.get("callee") == "numerical_region_1"
+        unmatched = tuple(
+            instruction
             for name, block in lowered.blocks.items()
             if name != join.name
             for instruction in block.instrs
+            if instruction.attributes.get("callee")
+            == "numerical_region_1"
         )
+        assert len(unmatched) == 1
+        input_rows = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_FINALIZER_INPUT
+        ).rows())
+        assert len(input_rows) == 1
+        restored = book.page(
+            SOURCE_EXCEPTION_SSA_FINALIZER_INPUT
+        ).latest(input_rows[0])
+        assert unmatched[0].args[0].id == restored.incoming_value.row[1]
+        assert CorrelationTable._source_exception_finalizer_path_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
     finally:
         end_identity_book(token)
 
 
-def test_regionless_authored_raise_keeps_try_control(monkeypatch):
-    source = """\
+@pytest.mark.parametrize("source", ["""\
 def root(x: int) -> int:
     try:
         raise ValueError("bad")
     except ValueError:
         return 2
-"""
+""", """\
+def root(x: int) -> int:
+    y = 2
+    try:
+        raise ValueError("bad")
+    except ValueError:
+        return y
+"""])
+def test_regionless_authored_raise_keeps_try_control(monkeypatch, source):
     from src.compiler import glsl_deployment_strategy as strategy
     from src.compiler.control_source import (
         LoopControlBlock, NativeAssertBlock, NativeTryBlock,
@@ -990,6 +1020,38 @@ def root(x: int) -> int:
             for child in retained_try.handlers[0].body.blocks
         )
         assert program.region_indices == ()
+        from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+
+        try_row, = tuple(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        constants = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("op")).casefold() == "const"
+        )
+        lowered, shortfalls = lower_control_program_to_ssa(
+            program, function_name="exception_regionless_raise_probe",
+            first_value_id=1000, lexical_read_scope=try_row[0],
+            planning_scope=graph.G.graph.get("planning_scope"),
+            constant_value_ids=constants,
+        )
+        assert lowered.blocks
+        assert any(item.name == "native_try_dispatch" for item in shortfalls)
+        checkpoint, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT
+        ).rows())
+        control_route, = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_CONTROL_ROUTE
+        ).rows())
+        assert checkpoint[1] == transfer_cell
+        assert control_route[1:] == (transfer_cell, int(route_row[2]))
+        assert CorrelationTable._source_exception_ssa_control_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert CorrelationTable._source_exception_ssa_handler_entry_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
     finally:
         end_identity_book(token)
 
@@ -1068,7 +1130,7 @@ def root(x: float) -> int:
         end_identity_book(token)
 
 
-def test_handler_return_refuses_finalizer_without_exceptional_entry_phi(monkeypatch):
+def test_handler_return_runs_finalizer_with_exceptional_entry_binding(monkeypatch):
     source = """\
 def root(x: float) -> float:
     y = 0.0
@@ -1117,10 +1179,7 @@ def root(x: float) -> float:
             ).canonical_value.row[1])
             for row in book.page(SOURCE_EXCEPTION_REGION_STATE).rows()
         )
-        with pytest.raises(ValueError, match=(
-            "pending return finalizer lacks source exceptional entry Phi"
-        )):
-            lower_control_program_to_ssa(
+        lowered, shortfalls = lower_control_program_to_ssa(
                 program,
                 function_name="exception_handler_finally_return_probe",
                 first_value_id=1000, lexical_read_scope=try_row[0],
@@ -1132,7 +1191,36 @@ def root(x: float) -> float:
                     )), (int(finalizer_node),)),
                 },
                 constant_value_ids=(*constants, *state_constants),
+        )
+        assert lowered.blocks
+        assert any(item.name == "native_try_dispatch" for item in shortfalls)
+        source_rows = tuple(book.page(
+            SOURCE_EXCEPTION_FINALIZER_BINDING
+        ).rows())
+        canonical_rows = tuple(book.page(
+            SOURCE_EXCEPTION_FINALIZER_INPUT
+        ).rows())
+        ssa_rows = tuple(book.page(
+            SOURCE_EXCEPTION_SSA_FINALIZER_INPUT
+        ).rows())
+        assert len(source_rows) == len(canonical_rows) == 1
+        assert len(ssa_rows) == 2
+        canonical = book.page(
+            SOURCE_EXCEPTION_FINALIZER_INPUT
+        ).latest(canonical_rows[0])
+        for row in ssa_rows:
+            ssa_fact = book.page(
+                SOURCE_EXCEPTION_SSA_FINALIZER_INPUT
+            ).latest(row)
+            assert ssa_fact.source_input == book.latest_ref(
+                SOURCE_EXCEPTION_FINALIZER_INPUT, canonical_rows[0],
             )
+            assert ssa_fact.canonical_incoming == dict(
+                canonical.site_values
+            )[ssa_fact.exit_site]
+        assert CorrelationTable._source_exception_finalizer_path_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
     finally:
         end_identity_book(token)
 
@@ -1176,7 +1264,7 @@ def root(x: int) -> int:
         end_identity_book(token)
 
 
-def test_raise_in_handler_uses_outer_try_body_as_catch_owner():
+def test_raise_in_handler_uses_outer_try_body_as_catch_owner(monkeypatch):
     source = """\
 def root(x: int) -> int:
     try:
@@ -1187,6 +1275,19 @@ def root(x: int) -> int:
     except TypeError:
         return 1
 """
+    from src.compiler import glsl_deployment_strategy as strategy
+    observed = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append((program, args[0]))
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
     book, token = begin_identity_book()
     try:
         with pytest.raises(CompilationSubdivisionRequired):
@@ -1234,6 +1335,40 @@ def root(x: int) -> int:
         assert len(routes) == 1
         assert routes[0].owner == handler_raise.catch_try
         assert routes[0].selected_handler is not None
+        (program, graph), = observed
+        from src.compiler.control_source import NativeTryBlock, SequenceBlock
+        outer_blocks = (
+            program.root.blocks
+            if isinstance(program.root, SequenceBlock) else (program.root,)
+        )
+        outer_try, = tuple(
+            block for block in outer_blocks
+            if isinstance(block, NativeTryBlock)
+        )
+        assert any(
+            isinstance(block, NativeTryBlock)
+            for block in outer_try.body.blocks
+        )
+        from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
+        try_row = next(
+            row for row in book.page(CONTROL_BLOCK).rows()
+            if row[1] is ControlBlockKind.NATIVE_TRY
+        )
+        constants = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if str(data.get("op")).casefold() == "const"
+        )
+        lowered, _shortfalls = lower_control_program_to_ssa(
+            program, function_name="exception_nested_raise_probe",
+            first_value_id=1000, lexical_read_scope=try_row[0],
+            planning_scope=graph.G.graph.get("planning_scope"),
+            constant_value_ids=constants,
+        )
+        assert lowered.blocks
+        assert any(
+            row[1] == transfer_cell
+            for row in book.page(SOURCE_EXCEPTION_SSA_CONTROL_ROUTE).rows()
+        )
     finally:
         end_identity_book(token)
 

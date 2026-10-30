@@ -86,6 +86,10 @@ def post_source_exception_transfers(
             raise ValueError(f"exception site has no exact state: {row!r}")
         source_id = int(row[1])
         expression = syntax.get(source_id)
+        if isinstance(expression, (ast.Return, ast.Break, ast.Continue)):
+            # These exits carry finalizer inputs but have no native
+            # exception status to dispatch through except handlers.
+            continue
         if not isinstance(expression, (ast.Call, ast.Raise, ast.Assert)):
             raise ValueError(
                 "exception site has no authored call, raise or assert: "

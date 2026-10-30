@@ -1157,18 +1157,55 @@ SOURCE_EXCEPTION_ADMISSION = declare_page("source_exception_admission", (
 
 @dataclass(frozen=True)
 class ExceptionSiteStateFact:
-    """Exact lexical binding versions needed by an exceptional successor."""
+    """Exact lexical bindings at a fallible operation or abrupt exit."""
 
     source: Ref
     scopes: tuple[tuple[Ref, str, Ref | None], ...]
     required_names: tuple[str, ...]
     bindings: tuple[tuple[str, Ref], ...]
+    action: str = "exception"
 
 
 SOURCE_EXCEPTION_SITE_STATE = declare_page("source_exception_site_state", (
     RowField("ingestion_scope", K.SCOPE),
     RowField("source_node", K.VALUE_ID),
 ), ExceptionSiteStateFact)
+
+
+@dataclass(frozen=True)
+class ExceptionFinalizerBindingFact:
+    """One finalbody read, correlated with every incoming source binding."""
+
+    owner: Ref
+    normal_binding: Ref
+    site_bindings: tuple[tuple[Ref, Ref | None], ...]
+
+
+SOURCE_EXCEPTION_FINALIZER_BINDING = declare_page(
+    "source_exception_finalizer_binding", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("try_node", K.VALUE_ID),
+        RowField("name", K.NAME),
+    ), ExceptionFinalizerBindingFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionFinalizerInputFact:
+    """Canonical finalbody input and each exact exit-site alternative."""
+
+    source_binding: Ref
+    normal_value: Ref
+    site_values: tuple[tuple[Ref, Ref | None], ...]
+
+
+SOURCE_EXCEPTION_FINALIZER_INPUT = declare_page(
+    "source_exception_finalizer_input", (
+        RowField("planning_scope", K.SCOPE),
+        RowField("try_node", K.VALUE_ID),
+        RowField("name", K.NAME),
+    ), ExceptionFinalizerInputFact,
+)
 
 
 @dataclass(frozen=True)
@@ -1271,6 +1308,25 @@ SOURCE_EXCEPTION_REGION_STATE = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionControlStateFact:
+    """One authored Raise/Assert exit's exact deployed source value."""
+
+    transfer: Ref
+    source_binding: Ref
+    source_value: Ref
+    canonical_value: Ref
+
+
+SOURCE_EXCEPTION_CONTROL_STATE = declare_page(
+    "source_exception_control_state", (
+        RowField("planning_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
+        RowField("name", K.NAME),
+    ), ExceptionControlStateFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionSSACheckpointFact:
     """A deployed source site branches on the status taken at its boundary."""
 
@@ -1287,6 +1343,25 @@ SOURCE_EXCEPTION_SSA_CHECKPOINT = declare_page(
         RowField("region", K.INDEX),
         RowField("canonical_site", K.VALUE_ID),
     ), ExceptionSSACheckpointFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionSSAControlCheckpointFact:
+    """An authored Raise or Assert branches on its source-owned status."""
+
+    transfer: Ref
+    status_value: Ref
+    failure_predicate: Ref
+    failure_block: Ref
+    resume_block: Ref
+
+
+SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT = declare_page(
+    "source_exception_ssa_control_checkpoint", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
+    ), ExceptionSSAControlCheckpointFact,
 )
 
 
@@ -1312,6 +1387,50 @@ SOURCE_EXCEPTION_SSA_RETURN_FINALIZER = declare_page(
 
 
 @dataclass(frozen=True)
+class ExceptionSSAFinalizerInputFact:
+    """One source finalbody input restored on a particular SSA exit edge."""
+
+    source_input: Ref
+    exit_site: Ref
+    canonical_input: Ref
+    canonical_incoming: Ref
+    incoming_value: Ref
+    before_block: Ref
+
+
+SOURCE_EXCEPTION_SSA_FINALIZER_INPUT = declare_page(
+    "source_exception_ssa_finalizer_input", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("try_control", K.PAGE_REF),
+        RowField("exit_site", K.PAGE_REF),
+        RowField("before_block", K.PAGE_REF),
+        RowField("name", K.NAME),
+    ), ExceptionSSAFinalizerInputFact,
+)
+
+
+@dataclass(frozen=True)
+class ExceptionSSAUnwindFact:
+    """An unmatched status crosses its own Try finalbody before bubbling."""
+
+    transfer: Ref
+    exit_site: Ref
+    try_control: Ref
+    before_block: Ref
+    after_block: Ref
+    status_value: Ref
+
+
+SOURCE_EXCEPTION_SSA_UNWIND = declare_page(
+    "source_exception_ssa_unwind", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("transfer", K.PAGE_REF),
+        RowField("try_control", K.PAGE_REF),
+    ), ExceptionSSAUnwindFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionSSARouteFact:
     """One native code comparison for a source-selected handler."""
 
@@ -1329,6 +1448,15 @@ SOURCE_EXCEPTION_SSA_ROUTE = declare_page(
         RowField("ssa_scope", K.SCOPE),
         RowField("region", K.INDEX),
         RowField("canonical_site", K.VALUE_ID),
+        RowField("status", K.INDEX),
+    ), ExceptionSSARouteFact,
+)
+
+
+SOURCE_EXCEPTION_SSA_CONTROL_ROUTE = declare_page(
+    "source_exception_ssa_control_route", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
         RowField("status", K.INDEX),
     ), ExceptionSSARouteFact,
 )
@@ -1356,6 +1484,16 @@ SOURCE_EXCEPTION_SSA_HANDLER_ARM = declare_page(
 )
 
 
+SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM = declare_page(
+    "source_exception_ssa_control_handler_arm", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
+        RowField("status", K.INDEX),
+        RowField("canonical_phi", K.VALUE_ID),
+    ), ExceptionSSAHandlerArmFact,
+)
+
+
 @dataclass(frozen=True)
 class ExceptionSSAHandlerStateFact:
     """One live name captured on a matched native failure route."""
@@ -1371,6 +1509,16 @@ SOURCE_EXCEPTION_SSA_HANDLER_STATE = declare_page(
         RowField("ssa_scope", K.SCOPE),
         RowField("region", K.INDEX),
         RowField("canonical_site", K.VALUE_ID),
+        RowField("status", K.INDEX),
+        RowField("name", K.NAME),
+    ), ExceptionSSAHandlerStateFact,
+)
+
+
+SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE = declare_page(
+    "source_exception_ssa_control_handler_state", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("source_transfer", K.PAGE_REF),
         RowField("status", K.INDEX),
         RowField("name", K.NAME),
     ), ExceptionSSAHandlerStateFact,

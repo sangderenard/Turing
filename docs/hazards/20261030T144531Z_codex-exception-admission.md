@@ -1,0 +1,6 @@
+2026-10-30 Authored exception SSA control remains fail closed (MEASURED, exception-admission worktree):
+
+- The restored `precompile_to_ssa.py::lower_native_try` now emits SSA failure and handler edges for retained Raise and Assert. It takes exact live handler inputs from `SOURCE_EXCEPTION_CONTROL_STATE` and records their SSA route and arm cells. A handler Return and an unmatched status run the finalbody using `SOURCE_EXCEPTION_FINALIZER_INPUT` at that exit site.
+- Direct nested Try controls with no deployment region are placed inside the authored parent arm before SSA lowering. In the bounded nested Raise case, a Raise in the inner handler reaches the outer Try handler route. The source Try/handler/transfer cells and their order determine that nesting and route.
+- `python -u -m pytest -q --tb=short tests/test_source_exception_admission.py tests/test_metadata_copy_control_ownership.py tests/test_native_float_int_status.py`: 36 passed. `git diff --check`: passed.
+- Public exception admission remains closed by `native_try_dispatch`. Unmatched inner statuses still go to the fault exit instead of bubbling through every enclosing Try; pending Break/Continue and all finalizer outcomes remain incomplete. These paths must be concorded and executable before removing the shortfall.

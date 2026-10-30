@@ -12030,6 +12030,98 @@ class _ControlSSABuilder(TiledObject):
         })
         self.current = resume
 
+    def _restore_native_finalizer_inputs(
+        self, frame: dict[str, Any], exit_site: Ref,
+        captured: Mapping[str, SSAValue] | None = None,
+    ) -> None:
+        """Bind finalbody reads from this edge's exact source site."""
+
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_FINALIZER_BINDING,
+            SOURCE_EXCEPTION_FINALIZER_INPUT,
+            SOURCE_EXCEPTION_SSA_FINALIZER_INPUT,
+            ExceptionFinalizerBindingFact, ExceptionFinalizerInputFact,
+            ExceptionSSAFinalizerInputFact,
+        )
+
+        book = self._book()
+        control = frame["block"]
+        for row in book.page(SOURCE_EXCEPTION_FINALIZER_INPUT).rows():
+            if row[:2] != (
+                self.planning_scope, int(control.source_try_node_id),
+            ):
+                continue
+            name = str(row[2])
+            source_input = book.latest_ref(
+                SOURCE_EXCEPTION_FINALIZER_INPUT, row,
+            )
+            fact = book.page(SOURCE_EXCEPTION_FINALIZER_INPUT).latest(row)
+            if not isinstance(fact, ExceptionFinalizerInputFact):
+                raise ValueError(
+                    "finalizer input lacks its planned fact: "
+                    f"try={control.source_try_node_id}, name={name!r}"
+                )
+            source_fact = book.page(
+                SOURCE_EXCEPTION_FINALIZER_BINDING
+            ).cell(fact.source_binding.row, fact.source_binding.column)
+            if (
+                not isinstance(source_fact, ExceptionFinalizerBindingFact)
+                or source_input is None
+            ):
+                raise ValueError(
+                    "finalizer input lacks its concordance source: "
+                    f"try={control.source_try_node_id}, name={name!r}"
+                )
+            alternatives = dict(fact.site_values)
+            if exit_site not in alternatives or alternatives[exit_site] is None:
+                raise ValueError(
+                    "finalizer has no value on its exact exit edge: "
+                    f"site={exit_site!r}, name={name!r}"
+                )
+            incoming_cell = alternatives[exit_site]
+            incoming = None if captured is None else captured.get(name)
+            if incoming is None:
+                incoming_id = int(incoming_cell.row[1])
+                incoming = self.external_values.get(incoming_id)
+                if incoming is None and incoming_id in self.constant_value_ids:
+                    incoming = self.external_value(incoming_id)
+            if incoming is None or not self._value_dominates_current_edge(
+                incoming,
+            ):
+                raise ValueError(
+                    "finalizer input has no live SSA value on exit edge: "
+                    f"site={exit_site!r}, name={name!r}"
+                )
+            self._bind(
+                int(fact.normal_value.row[1]), incoming,
+                BindingKind.RESTORED,
+                source_input, exit_site, incoming_cell,
+            )
+            before_block = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, self.current.name),
+            )
+            if before_block is None:
+                raise ValueError(
+                    "finalizer entry has no SSA block identity: "
+                    f"site={exit_site!r}"
+                )
+            book.post(
+                SOURCE_EXCEPTION_SSA_FINALIZER_INPUT,
+                (self._scope(), frame["owner"], exit_site,
+                 before_block, name),
+                ExceptionSSAFinalizerInputFact(
+                    source_input, exit_site, fact.normal_value,
+                    incoming_cell, self._value_cell(incoming), before_block,
+                ),
+                stage=self._stage(),
+                provenance=Derived((
+                    source_input, exit_site, fact.normal_value,
+                    incoming_cell, self._value_cell(incoming), before_block,
+                )),
+                mode=Mode.CONCORD,
+            )
+
     def _emit_native_return_finalizers(
         self, block: LoopControlBlock, edge_values: tuple[SSAValue | None, ...],
         path: str,
@@ -12043,6 +12135,7 @@ class _ControlSSABuilder(TiledObject):
                 f"{path}"
             )
         from .concordance_declarations import (
+            SOURCE_EXCEPTION_FINALIZER_INPUT,
             SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
             ExceptionSSAReturnFinalizerFact,
         )
@@ -12061,26 +12154,24 @@ class _ControlSSABuilder(TiledObject):
         for index in range(len(frames) - 1, -1, -1):
             frame = frames[index]
             before = self.current
-            for child in getattr(frame["block"].finalbody, "blocks", ()):
-                if not isinstance(child, StatementBlock):
-                    continue
-                for line in child.lines:
-                    marker = _REGION_MARKER.fullmatch(str(line))
-                    if marker is None:
-                        continue
-                    region = int(marker.group(1))
-                    # Program: `y=0; try:y=int(x); except ValueError:
-                    # return 1; finally:y=y+1`. The finalizer region's
-                    # authored feed is the successful cast, while the
-                    # handler return needs failed-site y=0. An SSA argument
-                    # stand-in can even make the cast appear to dominate.
-                    # Until a source finalizer-entry Phi correlates these
-                    # identities, no data-bearing finalizer is executable
-                    # on a pending return path.
+            finalizer_inputs = tuple(
+                row for row in book.page(
+                    SOURCE_EXCEPTION_FINALIZER_INPUT
+                ).rows()
+                if row[:2] == (
+                    self.planning_scope,
+                    int(frame["block"].source_try_node_id),
+                )
+            )
+            if finalizer_inputs:
+                if block.exception_exit_site_cell is None:
                     raise ValueError(
-                        "pending return finalizer lacks source exceptional "
-                        f"entry Phi: region={region}, path={path}"
+                        "pending return finalizer has no exact source exit: "
+                        f"{path}"
                     )
+                self._restore_native_finalizer_inputs(
+                    frame, block.exception_exit_site_cell,
+                )
             before_cell = book.latest_ref(
                 SSA_BLOCK, (self._scope(), self.function_name, before.name),
             )
@@ -12134,18 +12225,25 @@ class _ControlSSABuilder(TiledObject):
             CANONICAL_VALUE, SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
             SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
             SOURCE_EXCEPTION_CONTINUATION_PHI,
+            SOURCE_EXCEPTION_CONTROL_STATE,
             SOURCE_EXCEPTION_HANDLER_CLASS,
             SOURCE_EXCEPTION_HANDLER_ENTRY,
             SOURCE_EXCEPTION_HANDLER_PHI,
             SOURCE_EXCEPTION_REGION_STATE, SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+            SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM,
+            SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE,
             SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
             SOURCE_EXCEPTION_SSA_HANDLER_PHI,
             SOURCE_EXCEPTION_SSA_HANDLER_STATE,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
-            SOURCE_EXCEPTION_SSA_ROUTE, SOURCE_EXCEPTION_STATUS_ROUTE,
+            SOURCE_EXCEPTION_SSA_ROUTE,
+            SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
+            SOURCE_EXCEPTION_STATUS_ROUTE,
+            SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_SSA_UNWIND,
             ExceptionContinuationArmValueFact,
+            ExceptionControlStateFact,
             ExceptionContinuationPhiFact,
             ExceptionHandlerArmValueFact, ExceptionHandlerClassFact,
             ExceptionHandlerEntryFact, ExceptionHandlerPhiFact,
@@ -12154,7 +12252,7 @@ class _ControlSSABuilder(TiledObject):
             ExceptionSSAHandlerPhiFact, ExceptionSSAHandlerStateFact,
             ExceptionSSAContinuationArmFact,
             ExceptionSSAContinuationPhiFact, ExceptionSSARouteFact,
-            ExceptionStatusRouteFact,
+            ExceptionStatusRouteFact, ExceptionSSAUnwindFact,
         )
 
         book = self._book()
@@ -12292,6 +12390,48 @@ class _ControlSSABuilder(TiledObject):
         handler_ordinals: dict[Ref, int] = {}
 
         def propagate(edge: dict[str, Any]) -> None:
+            exit_site = book.latest_ref(
+                SOURCE_EXCEPTION_SITE_STATE, edge["transfer"].row,
+            )
+            if exit_site is None:
+                raise ValueError(
+                    "unmatched status has no exact source exit: "
+                    f"transfer={edge['transfer']!r}"
+                )
+            before = self.current
+            self._restore_native_finalizer_inputs(
+                frame, exit_site, edge["state"],
+            )
+            self.lower(block.finalbody, path=f"{path}.unmatched_finally")
+            before_cell = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, before.name),
+            )
+            after_cell = book.latest_ref(
+                SSA_BLOCK,
+                (self._scope(), self.function_name, self.current.name),
+            )
+            if before_cell is None or after_cell is None:
+                raise ValueError(
+                    "unmatched finalizer lacks SSA block identities: "
+                    f"transfer={edge['transfer']!r}"
+                )
+            book.post(
+                SOURCE_EXCEPTION_SSA_UNWIND,
+                (self._scope(), edge["transfer"], frame["owner"]),
+                ExceptionSSAUnwindFact(
+                    edge["transfer"], exit_site, frame["owner"],
+                    before_cell, after_cell,
+                    self._value_cell(edge["status"]),
+                ),
+                stage=self._stage(),
+                provenance=Derived((
+                    edge["transfer"], exit_site, frame["owner"],
+                    before_cell, after_cell,
+                    self._value_cell(edge["status"]),
+                )),
+                mode=Mode.CONCORD,
+            )
             self.emit(
                 Handler.Call, [edge["status"]],
                 attributes={
@@ -12308,7 +12448,8 @@ class _ControlSSABuilder(TiledObject):
 
         for edge in frame["edges"]:
             self.current = edge["failure"]
-            checkpoint = book.latest_ref(
+            control_checkpoint = edge.get("checkpoint")
+            checkpoint = control_checkpoint or book.latest_ref(
                 SOURCE_EXCEPTION_SSA_CHECKPOINT,
                 (self._scope(), edge["site"].row[1],
                  edge["site"].row[2]),
@@ -12425,10 +12566,19 @@ class _ControlSSABuilder(TiledObject):
                     raise ValueError(
                         f"native Try route lacks SSA cells: {route_row!r}"
                     )
-                ssa_route_cell = book.post(
-                    SOURCE_EXCEPTION_SSA_ROUTE,
+                ssa_route_page = (
+                    SOURCE_EXCEPTION_SSA_CONTROL_ROUTE
+                    if control_checkpoint is not None
+                    else SOURCE_EXCEPTION_SSA_ROUTE
+                )
+                ssa_route_row = (
+                    (self._scope(), edge["transfer"], int(route_row[2]))
+                    if control_checkpoint is not None else
                     (self._scope(), edge["site"].row[1],
-                     edge["site"].row[2], int(route_row[2])),
+                     edge["site"].row[2], int(route_row[2]))
+                )
+                ssa_route_cell = book.post(
+                    ssa_route_page, ssa_route_row,
                     ExceptionSSARouteFact(
                         checkpoint, route_cell, status_cell,
                         predicate_cell, match_cell, remainder_cell,
@@ -12444,14 +12594,23 @@ class _ControlSSABuilder(TiledObject):
                 )
                 self.current = match_block
                 for name, incoming in edge["state"].items():
-                    state_row = (*edge["site"].row, name)
+                    state_page = (
+                        SOURCE_EXCEPTION_CONTROL_STATE
+                        if control_checkpoint is not None else
+                        SOURCE_EXCEPTION_REGION_STATE
+                    )
+                    state_row = (
+                        (self.planning_scope, edge["transfer"], name)
+                        if control_checkpoint is not None else
+                        (*edge["site"].row, name)
+                    )
                     state_cell = book.latest_ref(
-                        SOURCE_EXCEPTION_REGION_STATE, state_row,
+                        state_page, state_row,
                     )
-                    state = book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
-                        state_row,
-                    )
-                    if not isinstance(state, ExceptionRegionStateFact) or (
+                    state = book.page(state_page).latest(state_row)
+                    if not isinstance(state, (
+                        ExceptionRegionStateFact, ExceptionControlStateFact,
+                    )) or (
                         state_cell is None
                         or state.transfer != edge["transfer"]
                         or not self._value_dominates_current_edge(incoming)
@@ -12465,7 +12624,9 @@ class _ControlSSABuilder(TiledObject):
                     # live y versions. Preserve every source name at each
                     # matched edge, not the successful path's final map.
                     book.post(
-                        SOURCE_EXCEPTION_SSA_HANDLER_STATE,
+                        (SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE
+                         if control_checkpoint is not None else
+                         SOURCE_EXCEPTION_SSA_HANDLER_STATE),
                         (*ssa_route_cell.row, name),
                         ExceptionSSAHandlerStateFact(
                             ssa_route_cell, state_cell, match_cell,
@@ -12509,12 +12670,21 @@ class _ControlSSABuilder(TiledObject):
                             f"route={route_row!r}, phi={source_phi!r}"
                         )
                     arm_row, arm = arms[0]
-                    state_row = (*edge["site"].row, phi.name)
-                    state = book.page(SOURCE_EXCEPTION_REGION_STATE).latest(
-                        state_row,
+                    state_page = (
+                        SOURCE_EXCEPTION_CONTROL_STATE
+                        if control_checkpoint is not None else
+                        SOURCE_EXCEPTION_REGION_STATE
                     )
+                    state_row = (
+                        (self.planning_scope, edge["transfer"], phi.name)
+                        if control_checkpoint is not None else
+                        (*edge["site"].row, phi.name)
+                    )
+                    state = book.page(state_page).latest(state_row)
                     incoming = edge["state"].get(phi.name)
-                    if not isinstance(state, ExceptionRegionStateFact) or (
+                    if not isinstance(state, (
+                        ExceptionRegionStateFact, ExceptionControlStateFact,
+                    )) or (
                         state.transfer != edge["transfer"]
                         or state.canonical_value != arm.canonical_value
                         or incoming is None
@@ -12529,7 +12699,7 @@ class _ControlSSABuilder(TiledObject):
                         SOURCE_EXCEPTION_HANDLER_ARM_VALUE, arm_row,
                     )
                     state_cell = book.latest_ref(
-                        SOURCE_EXCEPTION_REGION_STATE, state_row,
+                        state_page, state_row,
                     )
                     incoming_cell = self._value_cell(incoming)
                     if arm_cell is None or state_cell is None:
@@ -12543,7 +12713,9 @@ class _ControlSSABuilder(TiledObject):
                     # Each matched native code retains the source arm and
                     # the SSA value captured at its own deployed site.
                     book.post(
-                        SOURCE_EXCEPTION_SSA_HANDLER_ARM,
+                        (SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM
+                         if control_checkpoint is not None else
+                         SOURCE_EXCEPTION_SSA_HANDLER_ARM),
                         (*ssa_route_cell.row, int(arm.canonical_phi.row[1])),
                         ExceptionSSAHandlerArmFact(
                             ssa_route_cell, arm_cell, state_cell,
@@ -12588,7 +12760,7 @@ class _ControlSSABuilder(TiledObject):
             self.current = entry
             route_cells = tuple(handler_incoming[source_handler])
             route_facts = tuple(
-                book.page(SOURCE_EXCEPTION_SSA_ROUTE).cell(
+                book.page(cell.page).cell(
                     cell.row, cell.column,
                 ) for cell in route_cells
             )
@@ -12655,14 +12827,19 @@ class _ControlSSABuilder(TiledObject):
                     )
                 arm_cells = []
                 for route_cell in route_cells:
+                    arm_page = (
+                        SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM
+                        if route_cell.page == SOURCE_EXCEPTION_SSA_CONTROL_ROUTE
+                        else SOURCE_EXCEPTION_SSA_HANDLER_ARM
+                    )
                     candidates = tuple(
                         (row, book.page(
-                            SOURCE_EXCEPTION_SSA_HANDLER_ARM
+                            arm_page
                         ).latest(row))
                         for row in book.page(
-                            SOURCE_EXCEPTION_SSA_HANDLER_ARM
+                            arm_page
                         ).rows()
-                        if row[:4] == route_cell.row
+                        if row[:-1] == route_cell.row
                     )
                     selected = tuple(
                         row for row, fact in candidates
@@ -12680,11 +12857,11 @@ class _ControlSSABuilder(TiledObject):
                             f"route={route_cell!r}, phi={source_phi!r}"
                         )
                     arm_cells.append(book.latest_ref(
-                        SOURCE_EXCEPTION_SSA_HANDLER_ARM, selected[0],
+                        arm_page, selected[0],
                     ))
                 arm_cells = tuple(arm_cells)
                 arm_facts = tuple(
-                    book.page(SOURCE_EXCEPTION_SSA_HANDLER_ARM).cell(
+                    book.page(cell.page).cell(
                         cell.row, cell.column,
                     ) for cell in arm_cells
                 )
@@ -12779,7 +12956,9 @@ class _ControlSSABuilder(TiledObject):
             for name in source_entry.required_names:
                 state_cells = tuple(
                     book.latest_ref(
-                        SOURCE_EXCEPTION_SSA_HANDLER_STATE,
+                        (SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE
+                         if route_cell.page == SOURCE_EXCEPTION_SSA_CONTROL_ROUTE
+                         else SOURCE_EXCEPTION_SSA_HANDLER_STATE),
                         (*route_cell.row, name),
                     ) for route_cell in route_cells
                 )
@@ -12789,12 +12968,12 @@ class _ControlSSABuilder(TiledObject):
                         f"handler={source_handler!r}, name={name!r}"
                     )
                 route_states = tuple(
-                    book.page(SOURCE_EXCEPTION_SSA_HANDLER_STATE).cell(
+                    book.page(cell.page).cell(
                         cell.row, cell.column,
                     ) for cell in state_cells
                 )
                 region_states = tuple(
-                    book.page(SOURCE_EXCEPTION_REGION_STATE).cell(
+                    book.page(fact.region_state.page).cell(
                         fact.region_state.row, fact.region_state.column,
                     ) for fact in route_states
                 )
@@ -12856,6 +13035,7 @@ class _ControlSSABuilder(TiledObject):
                         "native handler differing name has no exact Phi: "
                         f"handler={source_handler!r}, name={name!r}"
                     )
+            frame["active_handler_status"] = status_phi
             self._native_try_frames.append(frame)
             try:
                 self.lower(
@@ -12864,6 +13044,7 @@ class _ControlSSABuilder(TiledObject):
                 )
             finally:
                 self._native_try_frames.pop()
+                frame.pop("active_handler_status", None)
             handled = tuple(
                 any(
                     fact.arm_kind == "handler"
@@ -13029,6 +13210,153 @@ class _ControlSSABuilder(TiledObject):
             "complete unmatched unwinding and pending finalizer outcomes",
         ))
 
+    def _lower_native_exception_check(
+        self, block: NativeAssertBlock, *, path: str,
+    ) -> None:
+        """Branch at the authored Raise or Assert using its transfer cell."""
+
+        from .concordance_declarations import (
+            SOURCE_EXCEPTION_CONTROL_STATE,
+            SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+            SOURCE_EXCEPTION_STATUS_ROUTE, SOURCE_EXCEPTION_TRANSFER,
+            ExceptionControlStateFact,
+            ExceptionSSAControlCheckpointFact, ExceptionStatusRouteFact,
+            ExceptionTransferFact,
+        )
+
+        book = self._book()
+        transfer_cell = block.transfer_cell
+        transfer = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+            transfer_cell.row, transfer_cell.column,
+        )
+        if not isinstance(transfer, ExceptionTransferFact) or (
+            transfer.source_kind not in {"raise", "assert", "reraise"}
+        ):
+            raise ValueError(
+                "authored exceptional check has no exact transfer: "
+                f"{transfer_cell!r}"
+            )
+        frame = next((
+            item for item in reversed(self._native_try_frames)
+            if transfer_cell in item["block"].protected_transfer_cells
+        ), None)
+        if frame is None:
+            raise ValueError(
+                "authored exceptional check lacks a live source edge: "
+                f"{transfer_cell!r}"
+            )
+        captured = {}
+        for name, _binding in transfer.entry_bindings:
+            row = (self.planning_scope, transfer_cell, name)
+            state = book.page(SOURCE_EXCEPTION_CONTROL_STATE).latest(row)
+            if not isinstance(state, ExceptionControlStateFact) or (
+                state.transfer != transfer_cell
+                or state.source_binding != _binding
+            ):
+                raise ValueError(
+                    "authored exceptional check lacks exact source state: "
+                    f"transfer={transfer_cell!r}, name={name!r}"
+                )
+            value_id = int(state.canonical_value.row[1])
+            value = self.external_values.get(value_id)
+            if value is None and value_id in self.constant_value_ids:
+                value = self.external_value(value_id)
+            if value is None or not self._value_dominates_current_edge(value):
+                raise ValueError(
+                    "authored exceptional check has no live SSA value: "
+                    f"transfer={transfer_cell!r}, name={name!r}"
+                )
+            captured[name] = value
+        route_rows = tuple(
+            row for row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
+            if row[:2] == transfer_cell.row
+        )
+        if not route_rows or any(not isinstance(
+            book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(row),
+            ExceptionStatusRouteFact,
+        ) for row in route_rows) or (
+            transfer.source_kind != "reraise" and len(route_rows) != 1
+        ):
+            raise ValueError(
+                "authored exceptional check needs concorded statuses: "
+                f"{transfer_cell!r}"
+            )
+        if transfer.source_kind == "reraise":
+            status = next((
+                item["active_handler_status"]
+                for item in reversed(self._native_try_frames)
+                if "active_handler_status" in item
+            ), None)
+            if status is None or not self._value_dominates_current_edge(status):
+                raise ValueError(
+                    "authored reraise has no active handler status: "
+                    f"{transfer_cell!r}"
+                )
+        else:
+            status = self.constant_value(
+                int(route_rows[0][2]), transfer_cell, dtype="int64",
+            )
+        failure = self.new_block(
+            "exception_site_failure", also=(transfer_cell,),
+            owner=frame["owner"],
+        )
+        resume = self.new_block(
+            "exception_site_resume", also=(transfer_cell,),
+            owner=frame["owner"],
+        )
+        if block.predicate_value_id is None:
+            failed = self.constant_value(
+                1, transfer_cell, dtype="bool",
+            )
+            self.branch(failure)
+        else:
+            predicate = self.external_values.get(
+                int(block.predicate_value_id),
+            )
+            if predicate is None:
+                raise ValueError(
+                    "authored Assert has no live predicate: "
+                    f"{transfer_cell!r}"
+                )
+            failed = self.fresh_value(
+                dtype="bool", transform=CONTROL_PREDICATE,
+                operands=(transfer_cell, predicate),
+            )
+            zero = self.constant_value(
+                0, transfer_cell, dtype=str(predicate.dtype),
+            )
+            self.emit(
+                Handler.Eq, [predicate, zero], failed,
+                attributes={"source_exception_transfer_cell": transfer_cell},
+            )
+            self.conditional_branch(failed, failure, resume)
+        failure_cell = book.latest_ref(
+            SSA_BLOCK, (self._scope(), self.function_name, failure.name),
+        )
+        resume_cell = book.latest_ref(
+            SSA_BLOCK, (self._scope(), self.function_name, resume.name),
+        )
+        checkpoint = book.post(
+            SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+            (self._scope(), transfer_cell),
+            ExceptionSSAControlCheckpointFact(
+                transfer_cell, self._value_cell(status),
+                self._value_cell(failed), failure_cell, resume_cell,
+            ),
+            stage=self._stage(),
+            provenance=Derived((
+                transfer_cell, self._value_cell(status),
+                self._value_cell(failed), failure_cell, resume_cell,
+            )),
+            mode=Mode.CONCORD,
+        )
+        frame["edges"].append({
+            "site": transfer_cell, "transfer": transfer_cell,
+            "status": status, "failure": failure, "state": captured,
+            "checkpoint": checkpoint,
+        })
+        self.current = resume
+
     def _lower(self, block: ControlBlock, *, path: str = "root") -> None:
         if isinstance(block, SequenceBlock):
             # Reordering is confined to straight-line context. Inside a loop
@@ -13112,13 +13440,7 @@ class _ControlSSABuilder(TiledObject):
             self.lower_native_try(block, path=path)
             return
         if isinstance(block, NativeAssertBlock):
-            # Both `assert predicate` and `raise` (predicate=false) need one
-            # exceptional SSA status edge backed by this source transfer.
-            self.shortfalls.append(SSALoweringShortfall(
-                "control", "native_assert", path,
-                f"authored exceptional check has no executable status edge: "
-                f"transfer={block.transfer_cell!r}",
-            ))
+            self._lower_native_exception_check(block, path=path)
             return
         if isinstance(block, LoopControlBlock) and block.action == "return":
             # Program: ``validate_batch_envelope``'s ``if not

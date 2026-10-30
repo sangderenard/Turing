@@ -51,6 +51,7 @@ from ...compiler.concordance_declarations import (
     INGESTION_VALUE as _INGESTION_VALUE,
     NAME_BINDING as _NAME_BINDING,
     ExceptionSiteStateFact as _ExceptionSiteStateFact,
+    ExceptionFinalizerBindingFact as _ExceptionFinalizerBindingFact,
     ExceptionContinuationPhiFact as _ExceptionContinuationPhiFact,
     NodeFact as _NodeFact,
     PARAMETER_ANNOTATION as _PARAMETER_ANNOTATION,
@@ -60,6 +61,7 @@ from ...compiler.concordance_declarations import (
     SCHEMA_NODE as _SCHEMA_NODE,
     SOURCE_CALL_RESULT_IDENTITY as _SOURCE_CALL_RESULT_IDENTITY,
     SOURCE_EXCEPTION_SITE_STATE as _SOURCE_EXCEPTION_SITE_STATE,
+    SOURCE_EXCEPTION_FINALIZER_BINDING as _SOURCE_EXCEPTION_FINALIZER_BINDING,
     SOURCE_EXCEPTION_CONTINUATION_PHI as _SOURCE_EXCEPTION_CONTINUATION_PHI,
     SOURCE_AGGREGATE_LAYOUT as _SOURCE_AGGREGATE_LAYOUT,
     SOURCE_GLYPH_SEQUENCE as _SOURCE_GLYPH_SEQUENCE,
@@ -8628,7 +8630,9 @@ def _normalize_lexical_values(
         """Publish lexical versions before a fallible source site finishes."""
 
         source_id = id(expression)
-        if source_id not in graph.G:
+        if source_id not in graph.G and not isinstance(
+            expression, (ast.Return, ast.Break, ast.Continue),
+        ):
             return
         demanded = set()
         for _owner, arm, _handler, handler_reads, finalizer_reads in exception_scope_demands:
@@ -8639,7 +8643,7 @@ def _normalize_lexical_values(
         demanded.difference_update(
             tuple(name for name in demanded if is_static_lexical_name(name))
         )
-        source_cell = node_identity_cell(graph, source_id)
+        source_cell = _posted_node_identity_cell(graph, source_id)
         if source_cell is None:
             raise ValueError(
                 f"exception site has no ingestion cell: source={source_id}"
@@ -8673,6 +8677,10 @@ def _normalize_lexical_values(
                 for owner, arm, handler, _h, _f in exception_scope_demands
             ),
             tuple(sorted(demanded)), tuple(bindings),
+            "return" if isinstance(expression, ast.Return) else
+            "break" if isinstance(expression, ast.Break) else
+            "continue" if isinstance(expression, ast.Continue) else
+            "exception",
         )
         book = current_identity_book()
         row = (ingestion_read_scope, source_id)
@@ -16571,6 +16579,8 @@ def _normalize_lexical_values(
                         span_positions=(None,) * 4, context_sha256="",
                         cells=(),
                     )
+            if exception_scope_demands:
+                capture_exception_site(body_statement)
             # Every return statement names its OWN value per output slot.
             # The identity history above is a single chain per slot, so any
             # consumer reading ``history[-1]`` sees only the last return;
@@ -17706,6 +17716,50 @@ def _normalize_lexical_values(
                             span_positions=(None,) * 4,
                             context_sha256="", cells=(),
                         )
+            if body_statement.finalbody and finalizer_reads:
+                book = current_identity_book()
+                page = book.page(_SOURCE_EXCEPTION_SITE_STATE)
+                incoming_sites = tuple(
+                    (book.latest_ref(_SOURCE_EXCEPTION_SITE_STATE, row),
+                     page.latest(row))
+                    for row in page.scope_rows(ingestion_read_scope)
+                    if any(
+                        owner == try_cell and arm != "finalbody"
+                        for owner, arm, _handler
+                        in page.latest(row).scopes
+                    )
+                )
+                for name in sorted(finalizer_reads):
+                    value = environment.get(name)
+                    normal_binding = (
+                        current_name_binding_cell(name, value)
+                        if isinstance(value, int) and not isinstance(value, bool)
+                        else None
+                    )
+                    if normal_binding is None:
+                        raise ValueError(
+                            "finalizer read lacks a normal source binding: "
+                            f"try={id(body_statement)}, name={name!r}"
+                        )
+                    site_bindings = tuple(
+                        (site_cell, dict(site.bindings).get(name))
+                        for site_cell, site in incoming_sites
+                    )
+                    book.post(
+                        _SOURCE_EXCEPTION_FINALIZER_BINDING,
+                        (ingestion_read_scope, id(body_statement), name),
+                        _ExceptionFinalizerBindingFact(
+                            try_cell, normal_binding, site_bindings,
+                        ),
+                        stage=_REDUCTION,
+                        provenance=_Derived(tuple(dict.fromkeys((
+                            try_cell, normal_binding,
+                            *(site for site, _binding in site_bindings),
+                            *(binding for _site, binding in site_bindings
+                              if binding is not None),
+                        )))),
+                        mode=_Mode.CONCORD,
+                    )
             reduce_exception_arm(body_statement.finalbody, "finalbody")
             return id(body_statement)
         if isinstance(body_statement, (ast.For, ast.While)):
@@ -18757,6 +18811,8 @@ def _normalize_lexical_values(
                     )
             return id(body_statement)
         if isinstance(body_statement, (ast.Break, ast.Continue)):
+            if exception_scope_demands:
+                capture_exception_site(body_statement)
             # A loop-control site leaves its arm with the arm's OWN bindings
             # (``if c: dt_try = ...; break`` reaches the loop exit with that
             # dt_try).  The ``if`` merge below deliberately drops a terminal

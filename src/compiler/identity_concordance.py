@@ -1552,6 +1552,8 @@ class CorrelationTable:
         found.extend(self._name_binding_capture_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_exception_site_state_findings(module))
+        found.extend(self._source_exception_finalizer_binding_findings(module))
+        found.extend(self._source_exception_finalizer_path_findings(module))
         found.extend(self._source_exception_transfer_findings(module))
         found.extend(self._source_exception_assert_control_findings(module))
         found.extend(self._source_exception_handler_class_findings(module))
@@ -1559,6 +1561,7 @@ class CorrelationTable:
         found.extend(self._source_exception_region_site_findings(module))
         found.extend(self._source_exception_region_state_findings(module))
         found.extend(self._source_exception_ssa_checkpoint_findings(module))
+        found.extend(self._source_exception_ssa_control_findings(module))
         found.extend(self._source_exception_ssa_return_finalizer_findings(module))
         found.extend(self._source_exception_ssa_route_findings(module))
         found.extend(self._source_exception_ssa_handler_arm_findings(module))
@@ -2036,6 +2039,133 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_exception_finalizer_binding_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """A finalbody input must name the same binding on every exit."""
+
+        from .concordance_declarations import (
+            ExceptionFinalizerBindingFact, NAME_BINDING,
+            SOURCE_EXCEPTION_FINALIZER_BINDING, SOURCE_EXCEPTION_SITE_STATE,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or (
+            SOURCE_EXCEPTION_FINALIZER_BINDING.name not in book.pages
+        ):
+            return []
+        page = book.page(SOURCE_EXCEPTION_FINALIZER_BINDING)
+        sites = book.page(SOURCE_EXCEPTION_SITE_STATE)
+        found = []
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_FINALIZER_BINDING, row)
+            problem = None
+            if not isinstance(fact, ExceptionFinalizerBindingFact) or (
+                int(fact.owner.row[1]) != int(row[1])
+                or fact.normal_binding.page != NAME_BINDING
+                or fact.normal_binding.row[:2] != (row[0], row[2])
+            ):
+                problem = "finalbody has no exact normal binding"
+            else:
+                for site_cell, binding in fact.site_bindings:
+                    site = sites.cell(site_cell.row, site_cell.column) if (
+                        site_cell.page == SOURCE_EXCEPTION_SITE_STATE
+                    ) else None
+                    if site is None or not any(
+                        owner == fact.owner and arm != "finalbody"
+                        for owner, arm, _handler in site.scopes
+                    ) or binding != dict(site.bindings).get(row[2]):
+                        problem = "finalbody site binding disagrees with exit"
+                        break
+                if problem is None:
+                    causes = {
+                        cell for cell, _stage in book.edges_into(receipt)
+                    }
+                    expected = {
+                        fact.owner, fact.normal_binding,
+                        *(site for site, _binding in fact.site_bindings),
+                        *(binding for _site, binding in fact.site_bindings
+                          if binding is not None),
+                    }
+                    if causes != expected:
+                        problem = "finalbody binding provenance disagrees"
+            if problem is not None:
+                found.append(Finding(
+                    "source-exception-finalizer-binding-disagreement",
+                    str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_finalizer_path_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Planned and SSA finalizer inputs retain their source exit cells."""
+
+        from .concordance_declarations import (
+            ExceptionFinalizerInputFact, ExceptionSSAFinalizerInputFact,
+            ExceptionSSAUnwindFact, SOURCE_EXCEPTION_FINALIZER_BINDING,
+            SOURCE_EXCEPTION_FINALIZER_INPUT,
+            SOURCE_EXCEPTION_SSA_FINALIZER_INPUT,
+            SOURCE_EXCEPTION_SSA_UNWIND,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        source_page = book.page(SOURCE_EXCEPTION_FINALIZER_BINDING)
+        planned_page = book.page(SOURCE_EXCEPTION_FINALIZER_INPUT)
+        ssa_page = book.page(SOURCE_EXCEPTION_SSA_FINALIZER_INPUT)
+        for row in planned_page.rows():
+            fact = planned_page.latest(row)
+            source = source_page.cell(
+                fact.source_binding.row, fact.source_binding.column,
+            ) if isinstance(fact, ExceptionFinalizerInputFact) else None
+            if source is None or (
+                fact.source_binding.page != SOURCE_EXCEPTION_FINALIZER_BINDING
+                or str(row[2]) != str(fact.source_binding.row[2])
+                or tuple(site for site, _value in fact.site_values)
+                != tuple(site for site, _binding in source.site_bindings)
+            ):
+                found.append(Finding(
+                    "source-finalizer-input-disagreement", str(row), None,
+                    "planned finalizer inputs omit or change source exits",
+                ))
+        for row in ssa_page.rows():
+            fact = ssa_page.latest(row)
+            planned = planned_page.cell(
+                fact.source_input.row, fact.source_input.column,
+            ) if isinstance(fact, ExceptionSSAFinalizerInputFact) else None
+            if planned is None or (
+                fact.source_input.page != SOURCE_EXCEPTION_FINALIZER_INPUT
+                or planned.normal_value != fact.canonical_input
+                or dict(planned.site_values).get(fact.exit_site)
+                != fact.canonical_incoming
+                or fact.incoming_value is None
+                or fact.before_block != row[3]
+            ):
+                found.append(Finding(
+                    "ssa-finalizer-input-disagreement", str(row), None,
+                    "SSA finalizer input differs from its source edge",
+                ))
+        for row in book.page(SOURCE_EXCEPTION_SSA_UNWIND).rows():
+            fact = book.page(SOURCE_EXCEPTION_SSA_UNWIND).latest(row)
+            if not isinstance(fact, ExceptionSSAUnwindFact) or (
+                fact.transfer != row[1]
+                or fact.try_control != row[2]
+                or fact.before_block is None
+                or fact.after_block is None
+                or fact.status_value is None
+            ):
+                found.append(Finding(
+                    "ssa-exception-unwind-disagreement", str(row), None,
+                    "unmatched finalizer lacks its source transfer or SSA edge",
+                ))
+        return found
+
+    @staticmethod
     def _source_exception_transfer_findings(module: Any) -> list[Finding]:
         """Each route is derived from its site's exact lexical scopes."""
         from .concordance_declarations import (
@@ -2051,6 +2181,10 @@ class CorrelationTable:
         transfer_page = book.page(SOURCE_EXCEPTION_TRANSFER)
         for row in site_page.rows():
             site = site_page.latest(row)
+            if isinstance(site, ExceptionSiteStateFact) and (
+                site.action in {"return", "break", "continue"}
+            ):
+                continue
             site_cell = book.latest_ref(SOURCE_EXCEPTION_SITE_STATE, row)
             transfer = transfer_page.latest(row)
             transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
@@ -2732,6 +2866,208 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_exception_ssa_control_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """Authored checks branch to the same status route as their source."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, NAME_BINDING,
+            SOURCE_EXCEPTION_CONTROL_STATE,
+            SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
+            SOURCE_EXCEPTION_HANDLER_PHI,
+            SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM,
+            SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE,
+            SOURCE_EXCEPTION_TRANSFER,
+            ExceptionControlStateFact,
+            ExceptionSSAHandlerArmFact, ExceptionSSAHandlerStateFact,
+            ExceptionTransferFact,
+            ExceptionSSAControlCheckpointFact, ExceptionSSARouteFact,
+            SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
+            SOURCE_EXCEPTION_STATUS_ROUTE, SSA_BLOCK, SSA_VALUE,
+            SSABlockKind,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        checkpoints = book.page(SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT)
+        routes = book.page(SOURCE_EXCEPTION_SSA_CONTROL_ROUTE)
+        states = book.page(SOURCE_EXCEPTION_CONTROL_STATE)
+        found = []
+        for row in states.rows():
+            fact = states.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_CONTROL_STATE, row)
+            transfer = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                row[1].row, row[1].column,
+            )
+            if not isinstance(fact, ExceptionControlStateFact) or (
+                not isinstance(transfer, ExceptionTransferFact)
+                or fact.transfer != row[1]
+                or fact.source_binding != dict(transfer.entry_bindings).get(row[2])
+                or fact.source_binding.page != NAME_BINDING
+                or fact.canonical_value.page != CANONICAL_VALUE
+                or receipt is None
+                or {cause for cause, _stage in book.edges_into(receipt)}
+                != {fact.transfer, fact.source_binding,
+                    fact.source_value, fact.canonical_value}
+            ):
+                found.append(Finding(
+                    "source-exception-control-state-disagreement",
+                    str(row), None,
+                    "authored exit state differs from its source binding",
+                ))
+        for row in checkpoints.rows():
+            fact = checkpoints.latest(row)
+            receipt = book.latest_ref(
+                SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT, row,
+            )
+            if not isinstance(fact, ExceptionSSAControlCheckpointFact) or (
+                fact.transfer != row[1]
+                or fact.status_value.page != SSA_VALUE
+                or fact.failure_predicate.page != SSA_VALUE
+                or fact.failure_block.page != SSA_BLOCK
+                or fact.resume_block.page != SSA_BLOCK
+                or book.page(SSA_BLOCK).latest(fact.failure_block.row)
+                is not SSABlockKind.EXCEPTION_SITE_FAILURE
+                or book.page(SSA_BLOCK).latest(fact.resume_block.row)
+                is not SSABlockKind.EXCEPTION_SITE_RESUME
+                or receipt is None
+                or {source for source, _stage in book.edges_into(receipt)}
+                != {
+                    fact.transfer, fact.status_value,
+                    fact.failure_predicate, fact.failure_block,
+                    fact.resume_block,
+                }
+            ):
+                found.append(Finding(
+                    "source-exception-ssa-control-checkpoint-disagreement",
+                    str(row), None,
+                    "authored check disagrees with its SSA status edge",
+                ))
+        for row in routes.rows():
+            fact = routes.latest(row)
+            checkpoint = checkpoints.latest((row[0], row[1]))
+            source_route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(
+                (*row[1].row, row[2]),
+            )
+            if not isinstance(fact, ExceptionSSARouteFact) or (
+                not isinstance(checkpoint, ExceptionSSAControlCheckpointFact)
+                or source_route is None
+                or fact.checkpoint != book.latest_ref(
+                    SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+                    (row[0], row[1]),
+                )
+                or fact.status_value != checkpoint.status_value
+                or fact.selected_handler != source_route.selected_handler
+                or fact.source_route != book.latest_ref(
+                    SOURCE_EXCEPTION_STATUS_ROUTE,
+                    (*row[1].row, row[2]),
+                )
+            ):
+                found.append(Finding(
+                    "source-exception-ssa-control-route-disagreement",
+                    str(row), None,
+                    "authored check route differs from source status route",
+                ))
+            if not isinstance(fact, ExceptionSSARouteFact) or (
+                fact.selected_handler is None
+            ):
+                continue
+            transfer = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                row[1].row, row[1].column,
+            )
+            if not isinstance(transfer, ExceptionTransferFact):
+                continue
+            for name, _binding in transfer.entry_bindings:
+                candidates = tuple(
+                    state_row for state_row in states.rows()
+                    if state_row[1:] == (row[1], name)
+                )
+                if len(candidates) != 1:
+                    found.append(Finding(
+                        "source-exception-ssa-control-state-disagreement",
+                        str((*row, name)), None,
+                        "selected control route lacks one exact source state",
+                    ))
+                    continue
+                state_cell = book.latest_ref(
+                    SOURCE_EXCEPTION_CONTROL_STATE, candidates[0],
+                )
+                ssa_row = (*row, name)
+                ssa = book.page(
+                    SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE
+                ).latest(ssa_row)
+                receipt = book.latest_ref(
+                    SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_STATE, ssa_row,
+                )
+                if not isinstance(ssa, ExceptionSSAHandlerStateFact) or (
+                    ssa.ssa_route != book.latest_ref(
+                        SOURCE_EXCEPTION_SSA_CONTROL_ROUTE, row,
+                    )
+                    or ssa.region_state != state_cell
+                    or ssa.match_block != fact.match_block
+                    or ssa.incoming_value.page != SSA_VALUE
+                    or receipt is None
+                    or {cause for cause, _stage in book.edges_into(receipt)}
+                    != {ssa.ssa_route, ssa.region_state,
+                        ssa.match_block, ssa.incoming_value}
+                ):
+                    found.append(Finding(
+                        "source-exception-ssa-control-state-disagreement",
+                        str(ssa_row), None,
+                        "selected control route lacks its live SSA value",
+                    ))
+            for arm_row in book.page(SOURCE_EXCEPTION_HANDLER_ARM_VALUE).rows():
+                source_arm = book.page(
+                    SOURCE_EXCEPTION_HANDLER_ARM_VALUE
+                ).latest(arm_row)
+                if source_arm.source_transfer != row[1] or (
+                    source_arm.source_handler != fact.selected_handler
+                ):
+                    continue
+                ssa_row = (*row, int(source_arm.canonical_phi.row[1]))
+                ssa = book.page(
+                    SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM
+                ).latest(ssa_row)
+                receipt = book.latest_ref(
+                    SOURCE_EXCEPTION_SSA_CONTROL_HANDLER_ARM, ssa_row,
+                )
+                source_state = tuple(
+                    book.latest_ref(SOURCE_EXCEPTION_CONTROL_STATE, state_row)
+                    for state_row in states.rows()
+                    if state_row[1:] == (
+                        row[1], book.page(SOURCE_EXCEPTION_HANDLER_PHI).cell(
+                            source_arm.source_phi.row,
+                            source_arm.source_phi.column,
+                        ).name,
+                    )
+                )
+                if not isinstance(ssa, ExceptionSSAHandlerArmFact) or (
+                    len(source_state) != 1
+                    or ssa.ssa_route != book.latest_ref(
+                        SOURCE_EXCEPTION_SSA_CONTROL_ROUTE, row,
+                    )
+                    or ssa.source_arm != book.latest_ref(
+                        SOURCE_EXCEPTION_HANDLER_ARM_VALUE, arm_row,
+                    )
+                    or ssa.region_state != source_state[0]
+                    or ssa.match_block != fact.match_block
+                    or ssa.incoming_value.page != SSA_VALUE
+                    or receipt is None
+                    or {cause for cause, _stage in book.edges_into(receipt)}
+                    != {ssa.ssa_route, ssa.source_arm, ssa.region_state,
+                        ssa.match_block, ssa.incoming_value}
+                ):
+                    found.append(Finding(
+                        "source-exception-ssa-control-arm-disagreement",
+                        str(ssa_row), None,
+                        "selected control route lacks its exact handler arm",
+                    ))
+        return found
+
+    @staticmethod
     def _source_exception_ssa_route_findings(
         module: Any,
     ) -> list[Finding]:
@@ -3112,7 +3448,9 @@ class CorrelationTable:
             SOURCE_EXCEPTION_SSA_HANDLER_ARM,
             SOURCE_EXCEPTION_SSA_HANDLER_ENTRY,
             SOURCE_EXCEPTION_SSA_HANDLER_PHI,
-            SOURCE_EXCEPTION_SSA_ROUTE, SSA_BLOCK, SSA_VALUE,
+            SOURCE_EXCEPTION_SSA_ROUTE,
+            SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
+            SSA_BLOCK, SSA_VALUE,
             ExceptionHandlerArmValueFact, ExceptionHandlerPhiFact,
             ExceptionSSAHandlerArmFact, ExceptionSSAHandlerEntryFact,
             ExceptionSSAHandlerPhiFact, ExceptionSSARouteFact,
@@ -3126,7 +3464,11 @@ class CorrelationTable:
             return []
         entries = book.page(SOURCE_EXCEPTION_SSA_HANDLER_ENTRY)
         phis = book.page(SOURCE_EXCEPTION_SSA_HANDLER_PHI)
-        routes = book.page(SOURCE_EXCEPTION_SSA_ROUTE)
+        route_pages = (
+            (SOURCE_EXCEPTION_SSA_ROUTE, book.page(SOURCE_EXCEPTION_SSA_ROUTE)),
+            (SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
+             book.page(SOURCE_EXCEPTION_SSA_CONTROL_ROUTE)),
+        )
         found = []
         canonical_successors = {}
         for canonical_row in book.page(CANONICAL_VALUE).rows():
@@ -3146,12 +3488,13 @@ class CorrelationTable:
             return target in seen
 
         selected_by_handler = {}
-        for route_row in routes.rows():
-            fact = routes.latest(route_row)
-            if isinstance(fact, ExceptionSSARouteFact):
-                selected_by_handler.setdefault(
-                    fact.selected_handler, set(),
-                ).add(book.latest_ref(SOURCE_EXCEPTION_SSA_ROUTE, route_row))
+        for route_declaration, routes in route_pages:
+            for route_row in routes.rows():
+                fact = routes.latest(route_row)
+                if isinstance(fact, ExceptionSSARouteFact):
+                    selected_by_handler.setdefault(
+                        fact.selected_handler, set(),
+                    ).add(book.latest_ref(route_declaration, route_row))
         for row in entries.rows():
             fact = entries.latest(row)
             receipt = book.latest_ref(SOURCE_EXCEPTION_SSA_HANDLER_ENTRY, row)
@@ -3183,9 +3526,12 @@ class CorrelationTable:
                     cell for cell in fact.incoming_routes
                 } != selected_by_handler.get(fact.source_handler, set())
                 or any(
-                    cell.page != SOURCE_EXCEPTION_SSA_ROUTE
+                    cell.page not in {
+                        SOURCE_EXCEPTION_SSA_ROUTE,
+                        SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
+                    }
                     or book.latest_ref(cell.page, cell.row) != cell
-                    or routes.latest(cell.row).selected_handler
+                    or book.page(cell.page).latest(cell.row).selected_handler
                     != fact.source_handler
                     for cell in fact.incoming_routes
                 )

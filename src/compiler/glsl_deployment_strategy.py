@@ -12815,12 +12815,32 @@ def _authored_arm_return_control(
     )
     if inside_loop and site_id is None:
         return None
+    from .concordance_declarations import SOURCE_EXCEPTION_SITE_STATE
+    from .identity_concordance import current_identity_book
+
+    exception_rows = tuple(
+        row for row in current_identity_book().page(
+            SOURCE_EXCEPTION_SITE_STATE
+        ).rows()
+        if int(row[1]) == id(terminal)
+        and current_identity_book().page(
+            SOURCE_EXCEPTION_SITE_STATE
+        ).latest(row).action == "return"
+    )
+    if len(exception_rows) > 1:
+        raise ValueError("source return has multiple exception exit states")
+    exception_exit_site = (
+        current_identity_book().latest_ref(
+            SOURCE_EXCEPTION_SITE_STATE, exception_rows[0],
+        ) if exception_rows else None
+    )
     # The return site, rather than a returned value or lexical position,
     # identifies this edge when the control overlay composes loop exits.
     return LoopControlBlock(
         "return", None, True, None,
         source_action="return", site_node_id=site_id,
         return_value_ids=tuple(slots), return_site_cell=site_cell,
+        exception_exit_site_cell=exception_exit_site,
     )
 
 
@@ -13583,16 +13603,21 @@ def _source_try_control_programs(
         INGESTION_VALUE, NAME_BINDING,
         SOURCE_EXCEPTION_CONTINUATION_ARM_VALUE,
         SOURCE_EXCEPTION_CONTINUATION_PHI,
+        SOURCE_EXCEPTION_CONTROL_STATE,
+        SOURCE_EXCEPTION_FINALIZER_BINDING,
+        SOURCE_EXCEPTION_FINALIZER_INPUT,
         SOURCE_EXCEPTION_HANDLER_CLASS,
         SOURCE_EXCEPTION_HANDLER_ARM_VALUE,
         SOURCE_EXCEPTION_HANDLER_PHI,
         SOURCE_EXCEPTION_REGION_SITE,
         SOURCE_EXCEPTION_REGION_STATE,
         SOURCE_EXCEPTION_TRANSFER,
+        ExceptionControlStateFact,
         ExceptionContinuationArmValueFact, ExceptionHandlerArmValueFact,
         ExceptionHandlerPhiFact, ExceptionRegionSiteFact,
         ExceptionRegionStateFact,
         ExceptionContinuationPhiFact, ExceptionHandlerClassFact,
+        ExceptionFinalizerInputFact,
         ExceptionTransferFact, MemberRole,
     )
     from .control_source import (
@@ -13672,6 +13697,7 @@ def _source_try_control_programs(
     planning_scope = graph.G.graph.get("planning_scope")
     memberships = _branch_compartments(graph)
     programs = []
+    program_expressions = []
     for try_id, record in _source_control_records(graph.G).items():
         expression = record.get("expression")
         if (
@@ -14043,6 +14069,63 @@ def _source_try_control_programs(
                     )),
                     mode=Mode.CONCORD,
                 )
+        for binding_row in book.page(
+            SOURCE_EXCEPTION_FINALIZER_BINDING
+        ).rows():
+            if int(binding_row[1]) != id(expression):
+                continue
+            source_fact = book.page(
+                SOURCE_EXCEPTION_FINALIZER_BINDING
+            ).latest(binding_row)
+            if (canonical_from_source(source_fact.owner) != int(try_id)
+                    or planning_scope is None):
+                raise ValueError(
+                    "Try finalizer binding lacks exact control owner: "
+                    f"try={try_id}, binding={binding_row!r}"
+                )
+            name = str(binding_row[2])
+            source_cell = book.latest_ref(
+                SOURCE_EXCEPTION_FINALIZER_BINDING, binding_row,
+            )
+            normal_source = source_value_for_binding(
+                source_fact.normal_binding, name,
+            )
+            normal = book.latest_ref(
+                CANONICAL_VALUE,
+                (canonical_scope, canonical_from_source(normal_source)),
+            )
+            sites = tuple(
+                (site, None if binding is None else book.latest_ref(
+                    CANONICAL_VALUE,
+                    (canonical_scope, canonical_from_source(
+                        source_value_for_binding(binding, name),
+                    )),
+                ))
+                for site, binding in source_fact.site_bindings
+            )
+            if source_cell is None or normal is None or any(
+                value is None and dict(source_fact.site_bindings)[site]
+                is not None for site, value in sites
+            ):
+                raise ValueError(
+                    "Try finalizer input has no canonical source value: "
+                    f"try={try_id}, name={name!r}"
+                )
+            book.post(
+                SOURCE_EXCEPTION_FINALIZER_INPUT,
+                (planning_scope, int(try_id), name),
+                ExceptionFinalizerInputFact(
+                    source_cell, normal, sites,
+                ),
+                stage=CONTROL_PROGRAM_BUILD,
+                provenance=Derived(tuple(dict.fromkeys((
+                    source_cell, normal,
+                    *(site for site, _value in sites),
+                    *(value for _site, value in sites
+                      if value is not None),
+                )))),
+                mode=Mode.CONCORD,
+            )
         protected_transfers = []
         transfer_page = book.page(SOURCE_EXCEPTION_TRANSFER)
         for row in transfer_page.rows():
@@ -14063,6 +14146,32 @@ def _source_try_control_programs(
                     f"source exception transfer has no fact cell: {row!r}"
                 )
             protected_transfers.append(transfer_cell)
+            if transfer.source_kind in {"raise", "assert", "reraise"}:
+                for name, binding in transfer.entry_bindings:
+                    source_value = source_value_for_binding(binding, name)
+                    canonical_value = book.latest_ref(
+                        CANONICAL_VALUE,
+                        (canonical_scope, canonical_from_source(source_value)),
+                    )
+                    if canonical_value is None:
+                        raise ValueError(
+                            "authored exceptional exit lacks canonical state: "
+                            f"transfer={row!r}, name={name!r}"
+                        )
+                    book.post(
+                        SOURCE_EXCEPTION_CONTROL_STATE,
+                        (planning_scope, transfer_cell, name),
+                        ExceptionControlStateFact(
+                            transfer_cell, binding, source_value,
+                            canonical_value,
+                        ),
+                        stage=CONTROL_PROGRAM_BUILD,
+                        provenance=Derived((
+                            transfer_cell, binding, source_value,
+                            canonical_value,
+                        )),
+                        mode=Mode.CONCORD,
+                    )
             canonical_id = canonical_from_source(transfer.source)
             canonical_site = book.latest_ref(
                 CANONICAL_VALUE, (canonical_scope, canonical_id),
@@ -14196,11 +14305,168 @@ def _source_try_control_programs(
             region_indices=regions,
             anchor_region=anchor_region,
         )
+        programs.append(program)
+        program_expressions.append((expression, owner))
+    nested = _nest_region_less_tries(
+        graph, tuple(programs), tuple(program_expressions), subgraphs,
+    )
+    for program, owner in nested:
         post_control_program(
             graph, program, stage=CONTROL_PROGRAM_BUILD, cause=(owner,),
         )
-        programs.append(program)
-    return tuple(programs)
+    return tuple(program for program, _owner in nested)
+
+
+def _nest_region_less_tries(
+    graph: Any,
+    programs: tuple[ControlProgram, ...],
+    expressions: tuple[tuple[ast.Try, Any], ...],
+    subgraphs: tuple[Any, ...],
+) -> tuple[tuple[ControlProgram, Any], ...]:
+    """Put a direct child Try at its authored statement in the parent arm."""
+
+    from .control_source import (
+        LoopControlBlock, NativeAssertBlock, NativeTryBlock, SequenceBlock,
+    )
+    from .concordance_declarations import SOURCE_EXCEPTION_TRANSFER
+    from .identity_concordance import current_identity_book
+
+    book = current_identity_book()
+    retained = {index: program for index, program in enumerate(programs)}
+
+    def root_blocks(program: ControlProgram) -> tuple[Any, ...]:
+        return (
+            program.root.blocks if isinstance(program.root, SequenceBlock)
+            else (program.root,)
+        )
+
+    source_by_try_id = {
+        next(block.source_try_node_id for block in root_blocks(program)
+             if isinstance(block, NativeTryBlock)): expression
+        for program, (expression, _owner) in zip(programs, expressions)
+    }
+
+    def direct_arm(parent: ast.Try, child: ast.Try):
+        arms = [("body", 0, parent.body),
+                ("orelse", 0, parent.orelse),
+                ("finalbody", 0, parent.finalbody)]
+        arms.extend(("handler", index, handler.body)
+                    for index, handler in enumerate(parent.handlers))
+        return next((
+            (kind, index, statements, position)
+            for kind, index, statements in arms
+            for position, statement in enumerate(statements)
+            if statement is child
+        ), None)
+
+    def statement_rank(block: Any, statements: list[ast.stmt]) -> int:
+        if isinstance(block, NativeTryBlock):
+            sources = (source_by_try_id[int(block.source_try_node_id)],)
+        elif isinstance(block, NativeAssertBlock):
+            transfer = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                block.transfer_cell.row, block.transfer_cell.column,
+            )
+            sources = tuple(
+                node for statement in statements for node in ast.walk(statement)
+                if id(node) == int(transfer.source.row[1])
+            )
+        elif isinstance(block, LoopControlBlock):
+            site_id = (
+                int(block.return_site_cell.row[1])
+                if block.return_site_cell is not None else
+                block.site_node_id
+            )
+            sources = tuple(
+                node for statement in statements for node in ast.walk(statement)
+                if id(node) == site_id
+            )
+        elif isinstance(block, StatementBlock) and len(block.lines) == 1 and (
+            block.lines[0].startswith("__scheduled_region_")
+        ):
+            region = int(block.lines[0][len("__scheduled_region_"):-2])
+            sources = tuple(
+                graph.G.nodes[int(node_id)].get("authored_expr_obj")
+                or graph.G.nodes[int(node_id)].get("expr_obj")
+                for node_id in subgraphs[region].G.graph.get(
+                    "deployment_nodes", (),
+                )
+            )
+        else:
+            raise ValueError(
+                "nested Try arm contains a block without source identity: "
+                f"{block!r}"
+            )
+        ranks = tuple(
+            position for position, statement in enumerate(statements)
+            if any(source is member for source in sources
+                   for member in ast.walk(statement))
+        )
+        if len(ranks) != 1:
+            raise ValueError(
+                "nested Try arm block has no unique authored statement: "
+                f"block={block!r}, ranks={ranks!r}"
+            )
+        return ranks[0]
+
+    for child_index in sorted(
+        retained,
+        key=lambda index: sum(1 for _ in ast.walk(expressions[index][0])),
+    ):
+        child = retained.get(child_index)
+        if child is None or child.region_indices:
+            continue
+        child_expression = expressions[child_index][0]
+        parents = tuple(
+            (sum(1 for _ in ast.walk(expressions[index][0])), index, arm)
+            for index in retained if index != child_index
+            for arm in (direct_arm(expressions[index][0], child_expression),)
+            if arm is not None
+        )
+        if not parents:
+            continue
+        _size, parent_index, (kind, handler_index, statements, child_rank) = min(
+            parents, key=lambda item: item[0],
+        )
+        parent = retained[parent_index]
+        roots = list(root_blocks(parent))
+        try_positions = tuple(
+            position for position, block in enumerate(roots)
+            if isinstance(block, NativeTryBlock)
+        )
+        if len(try_positions) != 1:
+            raise ValueError("nested Try parent has no unique control block")
+        position = try_positions[0]
+        control = roots[position]
+        arm = (control.handlers[handler_index].body
+               if kind == "handler" else getattr(control, kind))
+        existing = list(arm.blocks) if isinstance(arm, SequenceBlock) else []
+        insertion = next((
+            offset for offset, block in enumerate(existing)
+            if statement_rank(block, statements) > child_rank
+        ), len(existing))
+        nested_arm = SequenceBlock((
+            *existing[:insertion], *root_blocks(child), *existing[insertion:],
+        ))
+        if kind == "handler":
+            handlers = list(control.handlers)
+            handlers[handler_index] = replace(
+                handlers[handler_index], body=nested_arm,
+            )
+            control = replace(control, handlers=tuple(handlers))
+        else:
+            control = replace(control, **{kind: nested_arm})
+        roots[position] = control
+        retained[parent_index] = replace(
+            parent, root=(
+                SequenceBlock(tuple(roots))
+                if isinstance(parent.root, SequenceBlock) else control
+            ),
+        )
+        del retained[child_index]
+    return tuple(
+        (retained[index], expressions[index][1])
+        for index in sorted(retained)
+    )
 
 
 def _nest_region_less_conditionals(

@@ -351,6 +351,8 @@ class LoopControlBlock(TiledObject):
     # it on the return edge beside ``return_source_value_ids`` so a merge
     # predecessor names its own site.  None when no site row exists.
     return_site_cell: Any = None
+    # The return statement's lexical exit-state cell, when it crosses Try.
+    exception_exit_site_cell: Any = None
 
     def __post_init__(self) -> None:
         if self.action not in {"break", "continue", "return"}:
