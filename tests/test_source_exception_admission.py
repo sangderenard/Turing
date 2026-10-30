@@ -905,7 +905,9 @@ def root(x: int) -> int:
         return 2
 """
     from src.compiler import glsl_deployment_strategy as strategy
-    from src.compiler.control_source import LoopControlBlock, NativeTryBlock
+    from src.compiler.control_source import (
+        LoopControlBlock, NativeRaiseBlock, NativeTryBlock,
+    )
 
     observed = []
     original_overlay = strategy._overlay_control_or_require_subdivision
@@ -949,6 +951,22 @@ def root(x: int) -> int:
             transfer_cell.row, transfer_cell.column,
         )
         assert transfer.source_kind == "raise"
+        raise_block, = tuple(
+            child for child in retained_try.body.blocks
+            if isinstance(child, NativeRaiseBlock)
+        )
+        assert raise_block.source_raise_node_id == raise_id
+        assert raise_block.transfer_cell == transfer_cell
+        raise_control, = tuple(
+            book.page(CONTROL_BLOCK).latest(row)
+            for row in book.page(CONTROL_BLOCK).rows()
+            if book.page(CONTROL_BLOCK).latest(row).kind
+            is ControlBlockKind.NATIVE_RAISE
+        )
+        assert raise_control.sites == (transfer_cell,)
+        assert not CorrelationTable._source_exception_raise_control_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        )
         route_row, = tuple(
             row for row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
             if row[:2] == transfer_cell.row
@@ -1177,6 +1195,13 @@ def root(x: int) -> int:
             == "raise"
         )
         assert len(transfers) == 2
+        raise_controls = tuple(
+            book.page(CONTROL_BLOCK).latest(row)
+            for row in book.page(CONTROL_BLOCK).rows()
+            if book.page(CONTROL_BLOCK).latest(row).kind
+            is ControlBlockKind.NATIVE_RAISE
+        )
+        assert len(raise_controls) == 2
         inner_raise, = tuple(
             transfer for transfer in transfers
             if len(transfer.scopes) == 2
@@ -1206,6 +1231,112 @@ def root(x: int) -> int:
         assert len(routes) == 1
         assert routes[0].owner == handler_raise.catch_try
         assert routes[0].selected_handler is not None
+    finally:
+        end_identity_book(token)
+
+
+def test_raise_divides_try_arm_before_later_source_work(monkeypatch):
+    source = """\
+def root(x: int) -> int:
+    try:
+        y = x + 1
+        raise ValueError("stop")
+        z = x + 2
+    except ValueError:
+        return y
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+    from src.compiler.control_source import (
+        NativeRaiseBlock, NativeTryBlock, StatementBlock,
+    )
+
+    observed = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            observed.append((program, args[0]))
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_raise_frontier", identity_book=book)
+        (program, graph), = observed
+        retained_try, = tuple(
+            block for block in program.root.blocks
+            if isinstance(block, NativeTryBlock)
+        )
+        raise_positions = tuple(
+            index for index, block in enumerate(retained_try.body.blocks)
+            if isinstance(block, NativeRaiseBlock)
+        )
+        assert len(raise_positions) == 1
+        assert any(
+            isinstance(block, StatementBlock)
+            and block.lines[0].startswith("__scheduled_region_")
+            for block in retained_try.body.blocks[:raise_positions[0]]
+        )
+        raise_block = retained_try.body.blocks[raise_positions[0]]
+        transfer = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+            raise_block.transfer_cell.row,
+            raise_block.transfer_cell.column,
+        )
+        assert transfer.source_kind == "raise"
+    finally:
+        end_identity_book(token)
+
+
+def test_raise_is_a_region_frontier_for_reachable_later_work(monkeypatch):
+    source = """\
+def root(x: int) -> int:
+    try:
+        if x:
+            raise ValueError("stop")
+        y = x + 2
+    except ValueError:
+        y = 1
+    return y
+"""
+    from src.compiler import glsl_deployment_strategy as strategy
+
+    graphs = []
+    original_overlay = strategy._overlay_control_or_require_subdivision
+
+    def observe_overlay(*args, **kwargs):
+        program = original_overlay(*args, **kwargs)
+        if kwargs.get("try_controls"):
+            graphs.append(args[0])
+        return program
+
+    monkeypatch.setattr(
+        strategy, "_overlay_control_or_require_subdivision", observe_overlay,
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_raise_frontier_live", identity_book=book)
+        graph, = graphs
+        raise_id, = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Raise)
+        )
+        later_nodes = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.BinOp)
+            and getattr(data["expr_obj"], "lineno", None) == 5
+        )
+        assert later_nodes
+        keys = strategy._control_partition_keys(graph, (), later_nodes)
+        assert all(raise_id in keys[node_id][6] for node_id in later_nodes)
+        assert any(
+            row[1] is ControlBlockKind.NATIVE_RAISE
+            for row in book.page(CONTROL_BLOCK).rows()
+        )
     finally:
         end_identity_book(token)
 

@@ -572,6 +572,14 @@ class NativeTryBlock(TiledObject):
 
 
 @dataclass(frozen=True)
+class NativeRaiseBlock(TiledObject):
+    """An authored abrupt exit, owned by its exact source transfer."""
+
+    source_raise_node_id: int
+    transfer_cell: Any
+
+
+@dataclass(frozen=True)
 class ValidationBlock(TiledObject):
     """Device-side predicate whose failure is reported through shell errors."""
 
@@ -728,6 +736,7 @@ ControlBlock = (
     | ResourceScopeBlock
     | ExternalReferenceCallBlock
     | NativeTryBlock
+    | NativeRaiseBlock
     | ValidationBlock
     | SequenceMutationBlock
     | SequenceQueryBlock
@@ -1030,6 +1039,7 @@ def _control_block_kind(block: Any) -> Any:
         ResourceScopeBlock: Kind.RESOURCE_SCOPE,
         ExternalReferenceCallBlock: Kind.EXTERNAL_REFERENCE_CALL,
         NativeTryBlock: Kind.NATIVE_TRY,
+        NativeRaiseBlock: Kind.NATIVE_RAISE,
         ValidationBlock: Kind.VALIDATION,
         SequenceMutationBlock: Kind.SEQUENCE_MUTATION,
         SequenceQueryBlock: Kind.SEQUENCE_QUERY,
@@ -1253,6 +1263,9 @@ def _describe_control_block(
             int(handler.source_handler_node_id)
             for handler in block.handlers
         )
+    elif isinstance(block, NativeRaiseBlock):
+        owner = cell(block.source_raise_node_id)
+        sites = (block.transfer_cell,)
     elif isinstance(block, ValidationBlock):
         owner = predicate = cell(block.predicate_value_id)
         diagnostics = cells(block.diagnostic_value_ids)
@@ -5188,6 +5201,7 @@ __all__ = [
     "ExternalReferenceCallBlock",
     "NativeExceptionHandler",
     "NativeTryBlock",
+    "NativeRaiseBlock",
     "DispatchBlock",
     "ResourceScopeBlock",
     "ValidationBlock",

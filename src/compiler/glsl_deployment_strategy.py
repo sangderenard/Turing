@@ -12824,6 +12824,78 @@ def _authored_arm_return_control(
     )
 
 
+def _authored_arm_raise_control(
+    graph: Any, statements: Sequence[ast.stmt],
+) -> Any:
+    """Retain an authored Raise as its own control consequence."""
+
+    if not statements or not isinstance(statements[-1], ast.Raise):
+        return None
+    from .concordance_declarations import (
+        CANONICAL_VALUE, SOURCE_EXCEPTION_TRANSFER,
+    )
+    from .control_source import NativeRaiseBlock
+    from .identity_concordance import current_identity_book
+
+    statement = statements[-1]
+    book = current_identity_book()
+    transfer_rows = tuple(
+        row for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+        if int(row[1]) == id(statement)
+        and book.page(SOURCE_EXCEPTION_TRANSFER).latest(row).source_kind
+        in {"raise", "reraise"}
+    )
+    matches = []
+    for row in transfer_rows:
+        transfer_cell = book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+        transfer = book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+        # The live conditional graph may still retain this same AST object;
+        # its source id is then already the exact transfer source id. A
+        # forked Try graph instead requires the canonical-value edge below.
+        direct_nodes = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if data.get("expr_obj") is statement
+            and int(node_id) == int(transfer.source.row[1])
+        )
+        if direct_nodes:
+            matches.extend((node_id, transfer_cell)
+                           for node_id in direct_nodes)
+            continue
+        canonical_scope = graph.G.graph.get("lexical_read_scope")
+        successors = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for cause, _stage in book.edges_into(canonical):
+                successors.setdefault(cause, set()).add(canonical)
+        pending = [transfer.source]
+        reached = set()
+        while pending:
+            source_cell = pending.pop()
+            if source_cell in reached:
+                continue
+            reached.add(source_cell)
+            pending.extend(successors.get(source_cell, ()))
+        canonical_ids = tuple(dict.fromkeys(
+            int(canonical_row[1])
+            for canonical_row in book.page(CANONICAL_VALUE).rows()
+            if canonical_row[0] == canonical_scope
+            for canonical in (book.latest_ref(
+                CANONICAL_VALUE, canonical_row,
+            ),)
+            if canonical in reached
+            and int(canonical_row[1]) in graph.G
+            and isinstance(graph.G.nodes[int(canonical_row[1])].get(
+                "expr_obj"), ast.Raise)
+        ))
+        matches.extend((node_id, transfer_cell) for node_id in canonical_ids)
+    if len(matches) != 1 or matches[0][1] is None:
+        raise ValueError(
+            "authored Raise has no unique source transfer: "
+            f"source={id(statement)}, matches={matches!r}"
+        )
+    return NativeRaiseBlock(*matches[0])
+
+
 def _ordinary_conditional_control_programs(
     graph: Any,
     retained_regions: Iterable[int],
@@ -13122,7 +13194,7 @@ def _ordinary_conditional_control_programs(
             return _authored_arm_return_control(
                 graph, statements, return_slot_values,
                 inside_loop=inside_loop,
-            )
+            ) or _authored_arm_raise_control(graph, statements)
 
         body_return_control = (
             arm_return_control(body_statements)
@@ -13643,10 +13715,73 @@ def _source_try_control_programs(
         def arm_body(
             key: tuple[str, int], statements: Sequence[ast.stmt],
         ) -> SequenceBlock:
-            children = tuple(
-                StatementBlock((f"__scheduled_region_{region}__",))
-                for region in owned.get(key, ())
+            arm_regions = tuple(owned.get(key, ()))
+            raises = tuple(
+                statement for statement in statements
+                if isinstance(statement, ast.Raise)
             )
+            if raises:
+                # A Raise is an exit at its authored site. Put each region
+                # before or after that exit using its source span; refuse a
+                # region crossing the boundary instead of moving work past it.
+                buckets: dict[int, list[Any]] = {
+                    index: [] for index in range(len(raises) + 1)
+                }
+                for region in arm_regions:
+                    positions = tuple(
+                        (int(source.lineno), int(source.col_offset),
+                         int(getattr(source, "end_lineno", source.lineno)),
+                         int(getattr(source, "end_col_offset",
+                                     source.col_offset)))
+                        for node_id in subgraphs[region].G.graph.get(
+                            "deployment_nodes", ()
+                        )
+                        for data in (graph.G.nodes[int(node_id)],)
+                        for source in (data.get("authored_expr_obj")
+                                       or data.get("expr_obj"),)
+                        if getattr(source, "lineno", None) is not None
+                    )
+                    if not positions:
+                        raise ValueError(
+                            "source Raise arm has an unpositioned region: "
+                            f"try={try_id}, region={region}"
+                        )
+                    start = min((line, column)
+                                for line, column, _end, _end_column
+                                in positions)
+                    end = max((line, column)
+                              for _line, _column, line, column in positions)
+                    for statement in raises:
+                        raise_end = (int(statement.end_lineno),
+                                     int(statement.end_col_offset))
+                        if start <= raise_end and end > raise_end:
+                            raise ValueError(
+                                "deployment region crosses source Raise: "
+                                f"try={try_id}, region={region}"
+                            )
+                    bucket = sum(
+                        start > (int(statement.end_lineno),
+                                 int(statement.end_col_offset))
+                        for statement in raises
+                    )
+                    buckets[bucket].append(StatementBlock((
+                        f"__scheduled_region_{region}__",
+                    )))
+                children = tuple(
+                    child
+                    for index in range(len(raises) + 1)
+                    for child in (
+                        *buckets[index],
+                        *((_authored_arm_raise_control(
+                            graph, (raises[index],),
+                        ),) if index < len(raises) else ()),
+                    )
+                )
+            else:
+                children = tuple(
+                    StatementBlock((f"__scheduled_region_{region}__",))
+                    for region in arm_regions
+                )
             # Program: `try: raise ValueError(); except ValueError:
             # return 2`. The handler has no deployment region; dropping its
             # source return made the selected edge fall through. Use the
@@ -14994,22 +15129,33 @@ def _control_partition_keys(
                        and _ast_source_signature(data["expr_obj"]) in signatures)
         for node_id in members:
             condition_owners_by_node.setdefault(node_id, []).append(int(plan.loop.node_id))
-    ordinary_if_frontiers = tuple(
+    # Program: `try: a=x+1; raise ValueError(); b=x+2`.
+    # The Raise is an abrupt control exit. A region containing work on both
+    # sides would execute b before the exit; the Raise node's identity is the
+    # same frontier key already used for an authored If boundary.
+    ordinary_control_frontiers = tuple(
         (
             int(control_id),
-            int(getattr(expression, "end_lineno", expression.lineno)),
+            (
+                int(getattr(expression, "end_lineno", expression.lineno)),
+                int(getattr(expression, "end_col_offset",
+                            expression.col_offset)),
+            ),
         )
         for control_id, data in graph.G.nodes(data=True)
         for expression in (data.get("expr_obj"),)
-        if isinstance(expression, ast.If)
+        if isinstance(expression, (ast.If, ast.Raise))
     )
     branch_frontiers_by_node: dict[int, list[int]] = {}
-    for control_id, end_line in ordinary_if_frontiers:
+    for control_id, end_position in ordinary_control_frontiers:
         for node_id, data in graph.G.nodes(data=True):
             expression = data.get("expr_obj")
             if not isinstance(expression, ast.AST):
                 continue
-            if int(getattr(expression, "lineno", -1)) > end_line:
+            if (
+                int(getattr(expression, "lineno", -1)),
+                int(getattr(expression, "col_offset", -1)),
+            ) > end_position:
                 branch_frontiers_by_node.setdefault(
                     int(node_id), []
                 ).append(int(control_id))

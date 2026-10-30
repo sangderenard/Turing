@@ -1553,6 +1553,7 @@ class CorrelationTable:
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_exception_site_state_findings(module))
         found.extend(self._source_exception_transfer_findings(module))
+        found.extend(self._source_exception_raise_control_findings(module))
         found.extend(self._source_exception_handler_class_findings(module))
         found.extend(self._source_exception_status_route_findings(module))
         found.extend(self._source_exception_region_site_findings(module))
@@ -2109,6 +2110,60 @@ class CorrelationTable:
                 found.append(Finding(
                     "source-exception-transfer-disagreement",
                     str(row), None, problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_raise_control_findings(module: Any) -> list[Finding]:
+        """A native Raise block must cite its authored transfer as a site."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CONTROL_BLOCK, SOURCE_EXCEPTION_TRANSFER,
+            ControlBlockFact, ControlBlockKind,
+            ExceptionTransferFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or CONTROL_BLOCK.name not in book.pages:
+            return []
+        found = []
+        for row in book.page(CONTROL_BLOCK).rows():
+            fact = book.page(CONTROL_BLOCK).latest(row)
+            if not isinstance(fact, ControlBlockFact) or (
+                fact.kind is not ControlBlockKind.NATIVE_RAISE
+            ):
+                continue
+            sites = fact.sites
+            transfer = (
+                book.page(SOURCE_EXCEPTION_TRANSFER).cells.get(
+                    (sites[0].row, sites[0].column)
+                ) if len(sites) == 1 and isinstance(sites[0], Ref)
+                and sites[0].page == SOURCE_EXCEPTION_TRANSFER else None
+            )
+            if not isinstance(transfer, ExceptionTransferFact) or (
+                transfer.source_kind not in {"raise", "reraise"}
+            ):
+                found.append(Finding(
+                    "source-exception-raise-control-disagreement",
+                    str(row), None,
+                    "native Raise block lacks its exact authored transfer",
+                ))
+                continue
+            pending = [row[2]]
+            ancestors = set()
+            while pending:
+                cell = pending.pop()
+                if cell in ancestors:
+                    continue
+                ancestors.add(cell)
+                if isinstance(cell, Ref) and cell.page == CANONICAL_VALUE:
+                    pending.extend(
+                        cause for cause, _stage in book.edges_into(cell)
+                    )
+            if transfer.source not in ancestors:
+                found.append(Finding(
+                    "source-exception-raise-control-disagreement",
+                    str(row), None,
+                    "native Raise owner has no exact source transfer origin",
                 ))
         return found
 

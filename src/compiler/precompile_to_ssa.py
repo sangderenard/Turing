@@ -158,6 +158,7 @@ from .control_source import (
     LoopControlBlock,
     LoopBlock,
     NativeTryBlock,
+    NativeRaiseBlock,
     ParallelDeployment,
     SequenceBlock,
     SequenceMutationBlock,
@@ -13109,6 +13110,15 @@ class _ControlSSABuilder(TiledObject):
             return
         if isinstance(block, NativeTryBlock):
             self.lower_native_try(block, path=path)
+            return
+        if isinstance(block, NativeRaiseBlock):
+            # The source transfer identifies the catch and unwind path, but
+            # there is no SSA status edge for this authored Raise yet.
+            self.shortfalls.append(SSALoweringShortfall(
+                "control", "native_raise", path,
+                f"authored Raise has no executable status edge: "
+                f"transfer={block.transfer_cell!r}",
+            ))
             return
         if isinstance(block, LoopControlBlock) and block.action == "return":
             # Program: ``validate_batch_envelope``'s ``if not
