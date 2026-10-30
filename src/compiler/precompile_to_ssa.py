@@ -12552,7 +12552,9 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_SSA_PROPAGATION,
             SOURCE_EXCEPTION_SSA_CONTROL_ROUTE,
             SOURCE_EXCEPTION_STATUS_ROUTE,
-            SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_SSA_UNWIND,
+            SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_TRANSFER,
+            SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT,
+            SOURCE_EXCEPTION_SSA_UNWIND,
             ExceptionContinuationArmValueFact,
             ExceptionControlStateFact,
             ExceptionContinuationPhiFact,
@@ -12572,6 +12574,8 @@ class _ControlSSABuilder(TiledObject):
             ExceptionSSAPropagationFact, ExceptionStatusRouteFact,
             ExceptionSSAUnwindFact,
             ExceptionSiteStateFact,
+            ExceptionContainedAdmissionFact,
+            ExceptionSSAUnreachableExitFact,
             ExceptionTryAdmissionFact,
             ExceptionSSACheckpointFact,
             ExceptionSSAControlCheckpointFact,
@@ -13758,6 +13762,21 @@ class _ControlSSABuilder(TiledObject):
             (transfer, checkpoint_evidence(transfer))
             for transfer in block.protected_transfer_cells
         )
+        canonical_try = book.latest_ref(
+            CANONICAL_VALUE,
+            (self.lexical_read_scope, int(block.source_try_node_id)),
+        )
+        admission_rows = tuple(
+            row for row in book.page(SOURCE_EXCEPTION_ADMISSION).rows()
+            if canonical_try is not None
+            and reaches_canonical(row[0], canonical_try)
+        )
+        if len(admission_rows) != 1:
+            raise ValueError(
+                "executable Try has no unique source admission row: "
+                f"try={block.source_try_node_id}"
+            )
+        source = admission_rows[0][0]
         abrupt_exit_proofs = []
         abrupt_exit_actions = []
         for site in block.abrupt_exit_site_cells:
@@ -13792,6 +13811,55 @@ class _ControlSSABuilder(TiledObject):
                 ).try_control == frame["owner"]
             )
             if len(receipts) != 1:
+                # Program: inner `raise ValueError()` with only an inner
+                # `except TypeError: return 1`. The source return is a real
+                # lexical exit, but no status route selects that handler;
+                # SSA correctly emits no return block. Record this absence
+                # from the complete source route set, not from a guess about
+                # which instruction happened to be emitted.
+                handler_scopes = tuple(
+                    (owner, handler)
+                    for owner, kind, handler in reversed(source_site.scopes)
+                    if kind == "handler" and handler is not None
+                )
+                if len(receipts) == 0 and any(
+                    owner == source for owner, _kind, _handler
+                    in source_site.scopes
+                ):
+                    for handler_try, handler in handler_scopes:
+                        routes = tuple(
+                            book.latest_ref(SOURCE_EXCEPTION_ROUTE_STEP, row)
+                            for row in book.page(
+                                SOURCE_EXCEPTION_ROUTE_STEP
+                            ).rows()
+                            if book.page(SOURCE_EXCEPTION_ROUTE_STEP).latest(
+                                row
+                            ).owner == handler_try
+                        )
+                        if not all(
+                            book.page(SOURCE_EXCEPTION_ROUTE_STEP).cell(
+                                route.row, route.column,
+                            ).selected_handler != handler
+                            for route in routes
+                        ):
+                            continue
+                        absence = book.post(
+                            SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT,
+                            (self._scope(), frame["owner"], site),
+                            ExceptionSSAUnreachableExitFact(
+                                site, handler_try, handler, routes,
+                            ),
+                            stage=self._stage(),
+                            provenance=Derived((
+                                site, source, frame["owner"], handler_try,
+                                handler, *routes,
+                            )), mode=Mode.CONCORD,
+                        )
+                        abrupt_exit_proofs.append((site, absence))
+                        break
+                    else:
+                        break
+                    continue
                 break
             abrupt_exit_proofs.append((site, receipts[0]))
         finalbody_regions = tuple(
@@ -13802,16 +13870,6 @@ class _ControlSSABuilder(TiledObject):
             row[:2] == (self.planning_scope, int(region))
             for region in finalbody_regions if region is not None
             for row in book.page(SOURCE_EXCEPTION_REGION_SITE).rows()
-        )
-        protected_region_transfers = {
-            fact.transfer
-            for row in book.page(SOURCE_EXCEPTION_REGION_SITE).rows()
-            for fact in (book.page(SOURCE_EXCEPTION_REGION_SITE).latest(row),)
-            if isinstance(fact, ExceptionRegionSiteFact)
-        }
-        return_transfer_proof = all(
-            transfer in protected_region_transfers
-            for transfer in block.protected_transfer_cells
         )
         pending_return_outputs_proved = True
         for site, proof in abrupt_exit_proofs:
@@ -13851,7 +13909,10 @@ class _ControlSSABuilder(TiledObject):
                     int(region), ((), ()),
                 )[1]
             }
-            if not expected or expected != observed or expected != planned:
+            # An output-free finalbody has three empty sets. The equality is
+            # the proof; requiring a member would invent a value it never
+            # produced.
+            if expected != observed or expected != planned:
                 pending_return_outputs_proved = False
         if (
             finalbody_is_numeric
@@ -13861,29 +13922,16 @@ class _ControlSSABuilder(TiledObject):
                 )
                 and all(
                     action in {"break", "continue"}
+                    # `raise ValueError()` is a control transfer. Its exact
+                    # SSA control checkpoint above proves execution; a
+                    # numerical-region site is neither expected nor needed.
                     or (pending_return_outputs_proved
-                        and not finalbody_can_fail
-                        and return_transfer_proof)
+                        and not finalbody_can_fail)
                     for action in abrupt_exit_actions
                 )
             ))
             and all(evidence for _transfer, evidence in checkpoint_proofs)
         ):
-            canonical_try = book.latest_ref(
-                CANONICAL_VALUE,
-                (self.lexical_read_scope, int(block.source_try_node_id)),
-            )
-            admission_rows = tuple(
-                row for row in book.page(SOURCE_EXCEPTION_ADMISSION).rows()
-                if canonical_try is not None
-                and reaches_canonical(row[0], canonical_try)
-            )
-            if len(admission_rows) != 1:
-                raise ValueError(
-                    "executable Try has no unique source admission row: "
-                    f"try={block.source_try_node_id}"
-                )
-            source = admission_rows[0][0]
             proofs = checkpoint_proofs
             continuation_proofs = tuple(
                 book.latest_ref(SOURCE_EXCEPTION_SSA_CONTINUATION_PHI, row)
@@ -13932,7 +13980,7 @@ class _ControlSSABuilder(TiledObject):
                 *(unwind_proofs if block.finalbody.blocks else ()),
                 *((finalizer_entry,) if block.finalbody.blocks else ()),
             )))
-            book.post(
+            try_admission = book.post(
                 SOURCE_EXCEPTION_ADMISSION, (source,),
                 ExceptionTryAdmissionFact(
                     source, frame["owner"], normal_exit,
@@ -13944,6 +13992,35 @@ class _ControlSSABuilder(TiledObject):
                 stage=EXCEPTION_ADMISSION,
                 provenance=Derived(causes), mode=Mode.REVISE,
             )
+            # `raise ValueError()` inside this Try has its own source
+            # admission row. Its control checkpoint is discharged by this
+            # Try route, not by a root fault block.
+            for transfer, checkpoints in proofs:
+                transfer_fact = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                    transfer.row, transfer.column,
+                )
+                if transfer_fact.source_kind not in {"raise", "assert", "reraise"}:
+                    continue
+                control_checkpoints = tuple(
+                    checkpoint for checkpoint in checkpoints
+                    if checkpoint.page == SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT
+                )
+                if len(control_checkpoints) != 1:
+                    raise ValueError(
+                        "contained authored check lacks one control checkpoint"
+                    )
+                book.post(
+                    SOURCE_EXCEPTION_ADMISSION, (transfer_fact.source,),
+                    ExceptionContainedAdmissionFact(
+                        transfer_fact.source, control_checkpoints[0],
+                        try_admission,
+                    ),
+                    stage=EXCEPTION_ADMISSION,
+                    provenance=Derived((
+                        transfer_fact.source, control_checkpoints[0],
+                        try_admission,
+                    )), mode=Mode.REVISE,
+                )
             return
         # A data-bearing finalbody or pending return/break/continue still
         # requires complete outcome dispatch before native admission.

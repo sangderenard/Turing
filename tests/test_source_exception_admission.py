@@ -18,6 +18,7 @@ from src.compiler.concordance_declarations import (
     NAME_BINDING, SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_SITE_STATE,
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
     SOURCE_EXCEPTION_INERT_CONSTRUCTOR,
+    SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT,
     SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
     SOURCE_EXCEPTION_REGION_SITE,
     SOURCE_EXCEPTION_REGION_STATE,
@@ -2152,21 +2153,57 @@ def root(x: int) -> int:
 """,
 ], ids=["handled-raise-finally", "assert-finally",
         "nested-propagation"])
-def test_production_exception_control_reaches_ssa_frontier(source):
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+def test_production_exception_control_executes(source, backend, tmp_path):
     book, token = begin_identity_book()
     try:
-        with pytest.raises(CompilationSubdivisionRequired) as error:
-            _lower(
-                source, "exception_production_matrix", complete=True,
-                identity_book=book,
-            )
-        assert "native_try_dispatch" in str(error.value)
+        module, _outputs, exports = _lower(
+            source, f"exception_production_matrix_{backend}",
+            complete=True, identity_book=book,
+        )
         assert book.page(SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT).rows() or (
             book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).rows()
         )
         assert CorrelationTable._source_exception_control_coverage_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
+        if "except TypeError" in source:
+            assert len(book.page(SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT).rows()) == 2
+        function = module.functions[exports[0]]
+        parameter = dict(function.metadata["parameter_names"]).get("x")
+        returns = tuple(
+            instruction for basic in function.blocks.values()
+            for instruction in basic.instrs if str(instruction.op) == "Ret"
+        )
+        assert len(returns) == 1 and len(returns[0].args) == 1
+        output = int(returns[0].args[0].id)
+        if backend == "c":
+            from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+            artifact = emit_ssa_to_c(module, function.name)
+            assert artifact.complete, artifact.shortfalls
+            artifact.compile(tmp_path / "c")
+            run = lambda value: artifact.prepare_execution(
+                {parameter: np.array([value], dtype=np.int64)}
+                if parameter is not None else {}
+            ).run()
+        else:
+            from src.compiler.ssa_llvm_backend import (
+                compile_artifact, emit_ssa_function_to_llvm,
+                prepare_artifact_execution,
+            )
+
+            emitted = emit_ssa_function_to_llvm(module, function.name)
+            assert not emitted.shortfalls, emitted.shortfalls
+            artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+            run = lambda value: prepare_artifact_execution(
+                artifact,
+                {parameter: np.array([value], dtype=np.int64)}
+                if parameter is not None else {},
+            ).run()
+        expect_positive = 3 if "assert x > 0" in source else 2
+        assert int(run(0).buffers[output].reshape(-1)[0]) == 2
+        assert int(run(3).buffers[output].reshape(-1)[0]) == expect_positive
     finally:
         end_identity_book(token)
 
@@ -2193,11 +2230,10 @@ def test_exact_builtin_raise_has_only_raise_transfer(nested):
     )
     book, token = begin_identity_book()
     try:
-        with pytest.raises(CompilationSubdivisionRequired):
-            _lower(
-                source, f"exact_builtin_raise_{nested}", complete=True,
-                identity_book=book,
-            )
+        _lower(
+            source, f"exact_builtin_raise_{nested}", complete=True,
+            identity_book=book,
+        )
         transfers = tuple(
             book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
             for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()

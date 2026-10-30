@@ -5213,11 +5213,15 @@ class CorrelationTable:
             SOURCE_EXCEPTION_SSA_FINALIZER_OUTPUT,
             SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
             SOURCE_EXCEPTION_SSA_LOOP_EXIT_FINALIZER,
+            SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT,
+            SOURCE_EXCEPTION_ROUTE_STEP,
             SOURCE_EXCEPTION_SSA_UNWIND,
             SOURCE_EXCEPTION_SITE_STATE,
             SOURCE_EXCEPTION_REGION_SITE,
             ExceptionAdmissionFact, ExceptionSSAControlCheckpointFact,
-            ExceptionTryAdmissionFact, ExceptionSSACheckpointFact,
+            ExceptionContainedAdmissionFact, ExceptionTryAdmissionFact,
+            ExceptionSSAUnreachableExitFact, ExceptionRouteStepFact,
+            ExceptionSSACheckpointFact,
             ExceptionSSAUnwindFact,
             ExceptionSSAReturnFinalizerFact,
             ExceptionSSALoopExitFinalizerFact, ExceptionSiteStateFact,
@@ -5260,6 +5264,7 @@ class CorrelationTable:
 
         found = []
         page = book.page(SOURCE_EXCEPTION_ADMISSION)
+        cited_unreachable_exits = set()
         for row in page.rows():
             source_cell = row[0]
             admission = page.latest(row)
@@ -5317,6 +5322,42 @@ class CorrelationTable:
                     }
                 ):
                     problem = "exception admission has no exact SSA fault proof"
+            elif isinstance(admission, ExceptionContainedAdmissionFact):
+                checkpoint = (
+                    book.page(SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT).cell(
+                        admission.checkpoint.row, admission.checkpoint.column,
+                    ) if admission.checkpoint.page
+                    == SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT else None
+                )
+                owner = (
+                    book.page(SOURCE_EXCEPTION_ADMISSION).cell(
+                        admission.try_admission.row,
+                        admission.try_admission.column,
+                    ) if admission.try_admission.page
+                    == SOURCE_EXCEPTION_ADMISSION else None
+                )
+                transfer = (
+                    book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                        checkpoint.transfer.row, checkpoint.transfer.column,
+                    ) if isinstance(checkpoint,
+                                    ExceptionSSAControlCheckpointFact) else None
+                )
+                if (
+                    admission.source != source_cell
+                    or not isinstance(owner, ExceptionTryAdmissionFact)
+                    or not isinstance(transfer, ExceptionTransferFact)
+                    or transfer.source != source_cell
+                    or not any(
+                        transfer_cell == checkpoint.transfer
+                        and admission.checkpoint in proofs
+                        for transfer_cell, proofs in owner.exit_proofs
+                    )
+                    or causes != {
+                        source_cell, admission.checkpoint,
+                        admission.try_admission,
+                    }
+                ):
+                    problem = "contained check lacks its Try SSA exit"
             elif isinstance(admission, ExceptionTryAdmissionFact):
                 control = (
                     book.page(CONTROL_BLOCK).cell(
@@ -5373,7 +5414,50 @@ class CorrelationTable:
                         if isinstance(fact,
                                       ExceptionSSAFinalizerOutputFact)
                     }
-                    return bool(planned) and planned == emitted
+                    return planned == emitted
+                def unreachable_exit_matches(site: Ref, proof: Ref) -> bool:
+                    if proof.page != SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT:
+                        return False
+                    fact = book.page(proof.page).cell(
+                        proof.row, proof.column,
+                    )
+                    if not isinstance(fact, ExceptionSSAUnreachableExitFact):
+                        return False
+                    source_site = book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                        site.row, site.column,
+                    )
+                    routes = tuple(
+                        book.latest_ref(SOURCE_EXCEPTION_ROUTE_STEP, row)
+                        for row in book.page(SOURCE_EXCEPTION_ROUTE_STEP).rows()
+                        if isinstance(book.page(
+                            SOURCE_EXCEPTION_ROUTE_STEP
+                        ).latest(row), ExceptionRouteStepFact)
+                        and book.page(SOURCE_EXCEPTION_ROUTE_STEP).latest(
+                            row
+                        ).owner == fact.source_try
+                    )
+                    return (
+                        proof.row[1:] == (admission.control, site)
+                        and fact.source_site == site
+                        and isinstance(source_site, ExceptionSiteStateFact)
+                        and any(owner == source_cell for owner, _kind, _handler
+                                in source_site.scopes)
+                        and (fact.source_try, "handler", fact.handler)
+                        in source_site.scopes
+                        and fact.route_steps == routes
+                        and all(
+                            book.page(SOURCE_EXCEPTION_ROUTE_STEP).cell(
+                                route.row, route.column,
+                            ).selected_handler != fact.handler
+                            for route in routes
+                        )
+                        and {
+                            cause for cause, _stage in book.edges_into(proof)
+                        } == {
+                            site, source_cell, admission.control,
+                            fact.source_try, fact.handler, *routes,
+                        }
+                    )
                 if (
                     admission.source != source_cell
                     or not isinstance(control, ControlBlockFact)
@@ -5436,8 +5520,10 @@ class CorrelationTable:
                             and book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
                                 site.row, site.column,
                             ).action in {"break", "continue"}
+                            or unreachable_exit_matches(site, proof)
                         )
-                        or book.page(proof.page).cell(
+                        or proof.page != SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT
+                        and book.page(proof.page).cell(
                             proof.row, proof.column,
                         ).try_control != admission.control
                         for site, proof in admission.abrupt_exit_proofs
@@ -5465,12 +5551,24 @@ class CorrelationTable:
                     or causes != expected
                 ):
                     problem = "Try admission lacks exact control and SSA exits"
+                cited_unreachable_exits.update(
+                    proof for _site, proof in admission.abrupt_exit_proofs
+                    if proof.page == SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT
+                )
             else:
                 problem = "exception admission claims an unproven discharge"
             if problem is not None:
                 found.append(Finding(
                     "source-exception-admission-disagreement",
                     str(source_cell), None, problem,
+                ))
+        for row in book.page(SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT).rows():
+            proof = book.latest_ref(SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT, row)
+            if proof not in cited_unreachable_exits:
+                found.append(Finding(
+                    "source-exception-unreachable-exit-orphan",
+                    str(row), None,
+                    "unreachable source exit has no Try admission owner",
                 ))
         return found
 

@@ -1164,8 +1164,36 @@ class ExceptionAdmissionFact:
 
 
 @dataclass(frozen=True)
+class ExceptionContainedAdmissionFact:
+    """An authored check discharged by its enclosing Try's SSA route."""
+
+    source: Ref
+    checkpoint: Ref
+    try_admission: Ref
+
+
+@dataclass(frozen=True)
+class ExceptionSSAUnreachableExitFact:
+    """A handler exit excluded by every concorded route into its Try."""
+
+    source_site: Ref
+    source_try: Ref
+    handler: Ref
+    route_steps: tuple[Ref, ...]
+
+
+SOURCE_EXCEPTION_SSA_UNREACHABLE_EXIT = declare_page(
+    "source_exception_ssa_unreachable_exit", (
+        RowField("ssa_scope", K.SCOPE),
+        RowField("try_control", K.PAGE_REF),
+        RowField("source_site", K.PAGE_REF),
+    ), ExceptionSSAUnreachableExitFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionTryAdmissionFact:
-    """A Try whose source exits all have executable SSA successors."""
+    """A Try whose source exits execute or have an exact unreachable proof."""
 
     source: Ref
     control: Ref
