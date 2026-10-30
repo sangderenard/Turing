@@ -12147,12 +12147,26 @@ class _ControlSSABuilder(TiledObject):
             )
         book = self._book()
         frames = tuple(self._native_try_frames)
+        if block.exception_exit_site_cell is None:
+            raise ValueError(
+                "pending return has no exact exception exit site: "
+                f"{path}"
+            )
+        selected = tuple(
+            (index, frame) for index, frame in enumerate(frames)
+            if block.exception_exit_site_cell in
+            frame["block"].abrupt_exit_site_cells
+        )
+        if len(selected) != len(frames):
+            raise ValueError(
+                "pending return has an active Try without its source edge: "
+                f"{path}"
+            )
         pending = tuple(
             self._value_cell(value) if value is not None else None
             for value in edge_values
         )
-        for index in range(len(frames) - 1, -1, -1):
-            frame = frames[index]
+        for index, frame in reversed(selected):
             before = self.current
             finalizer_inputs = tuple(
                 row for row in book.page(
@@ -12202,7 +12216,8 @@ class _ControlSSABuilder(TiledObject):
                     f"native return finalizer lacks exit block: {path}"
                 )
             causes = (
-                block.return_site_cell, frame["owner"], before_cell,
+                block.return_site_cell, block.exception_exit_site_cell,
+                frame["owner"], before_cell,
                 after_cell, *(cell for cell in pending if cell is not None),
             )
             book.post(
@@ -12211,7 +12226,7 @@ class _ControlSSABuilder(TiledObject):
                  frame["owner"], before_cell),
                 ExceptionSSAReturnFinalizerFact(
                     block.return_site_cell, frame["owner"], before_cell,
-                    after_cell, pending,
+                    after_cell, pending, block.exception_exit_site_cell,
                 ),
                 stage=self._stage(), provenance=Derived(causes),
                 mode=Mode.CONCORD,
@@ -12354,6 +12369,7 @@ class _ControlSSABuilder(TiledObject):
             SOURCE_EXCEPTION_SSA_HANDLER_STATE,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
+            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
             SOURCE_EXCEPTION_SSA_CONTINUATION_ARM,
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
             SOURCE_EXCEPTION_SSA_ROUTE,
@@ -12373,8 +12389,10 @@ class _ControlSSABuilder(TiledObject):
             ExceptionSSAHandlerPhiFact, ExceptionSSAHandlerStateFact,
             ExceptionSSAContinuationArmFact,
             ExceptionSSAContinuationPhiFact, ExceptionSSARouteFact,
+            ExceptionSSAReturnFinalizerFact,
             ExceptionSSAPropagationFact, ExceptionStatusRouteFact,
             ExceptionSSAUnwindFact,
+            ExceptionSiteStateFact,
             ExceptionTryAdmissionFact,
             ExceptionSSACheckpointFact,
             ExceptionSSAControlCheckpointFact,
@@ -13488,8 +13506,41 @@ class _ControlSSABuilder(TiledObject):
             (transfer, checkpoint_evidence(transfer))
             for transfer in block.protected_transfer_cells
         )
+        abrupt_exit_proofs = []
+        for site in block.abrupt_exit_site_cells:
+            source_site = book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                site.row, site.column,
+            )
+            if not isinstance(source_site, ExceptionSiteStateFact) or (
+                source_site.action != "return"
+            ):
+                break
+            receipts = tuple(
+                book.latest_ref(SOURCE_EXCEPTION_SSA_RETURN_FINALIZER, row)
+                for row in book.page(
+                    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                ).rows()
+                if isinstance(book.page(
+                    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                ).latest(row), ExceptionSSAReturnFinalizerFact)
+                and book.page(
+                    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                ).latest(row).exception_exit_site == site
+                and book.page(
+                    SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                ).latest(row).try_control == frame["owner"]
+            )
+            if len(receipts) != 1:
+                break
+            abrupt_exit_proofs.append((site, receipts[0]))
         if (
-            finalbody_is_numeric and not block.abrupt_exit_site_cells
+            finalbody_is_numeric
+            and (not block.abrupt_exit_site_cells or (
+                not block.finalbody.blocks
+                and len(abrupt_exit_proofs) == len(
+                    block.abrupt_exit_site_cells
+                )
+            ))
             and all(evidence for _transfer, evidence in checkpoint_proofs)
         ):
             canonical_try = book.latest_ref(
@@ -13551,6 +13602,7 @@ class _ControlSSABuilder(TiledObject):
                 *(proof for _transfer, items in proofs for proof in items),
                 *(transfer for transfer, _items in proofs),
                 *continuation_proofs,
+                *(cell for pair in abrupt_exit_proofs for cell in pair),
                 *(unwind_proofs if block.finalbody.blocks else ()),
                 *((finalizer_entry,) if block.finalbody.blocks else ()),
             )))
@@ -13561,6 +13613,7 @@ class _ControlSSABuilder(TiledObject):
                     tuple(proofs), continuation_proofs,
                     finalizer_entry if block.finalbody.blocks else None,
                     unwind_proofs if block.finalbody.blocks else (),
+                    tuple(abrupt_exit_proofs),
                 ),
                 stage=EXCEPTION_ADMISSION,
                 provenance=Derived(causes), mode=Mode.REVISE,

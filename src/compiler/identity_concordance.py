@@ -3229,9 +3229,10 @@ class CorrelationTable:
     ) -> list[Finding]:
         """A pending return cites its source site, Try, blocks and slots."""
         from .concordance_declarations import (
-            CONTROL_BLOCK, SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
+            CONTROL_BLOCK, SOURCE_EXCEPTION_SITE_STATE,
+            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
             SSA_BLOCK, SSA_VALUE, ControlBlockKind,
-            ExceptionSSAReturnFinalizerFact,
+            ExceptionSiteStateFact, ExceptionSSAReturnFinalizerFact,
         )
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
@@ -3251,6 +3252,19 @@ class CorrelationTable:
                 )
                 or fact.try_control.page != CONTROL_BLOCK
                 or fact.try_control.row[1] is not ControlBlockKind.NATIVE_TRY
+                or fact.exception_exit_site is None
+                or fact.exception_exit_site.page != SOURCE_EXCEPTION_SITE_STATE
+                or not isinstance(book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                    fact.exception_exit_site.row,
+                    fact.exception_exit_site.column,
+                ), ExceptionSiteStateFact)
+                or book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                    fact.exception_exit_site.row,
+                    fact.exception_exit_site.column,
+                ).action != "return"
+                or fact.exception_exit_site not in book.page(
+                    CONTROL_BLOCK
+                ).cell(fact.try_control.row, fact.try_control.column).sites
                 or any(
                     cell.page != SSA_BLOCK or cell.row[0] != row[0]
                     or book.latest_ref(SSA_BLOCK, cell.row) != cell
@@ -3259,7 +3273,9 @@ class CorrelationTable:
                 or any(
                     cell is not None and (
                         cell.page != SSA_VALUE or cell.row[0] != row[0]
-                        or book.latest_ref(SSA_VALUE, cell.row) != cell
+                        or not CorrelationTable._current_or_revised_value(
+                            book, cell,
+                        )
                     ) for cell in fact.pending_values
                 )
                 or any(
@@ -3271,7 +3287,8 @@ class CorrelationTable:
             elif receipt is None or {
                 cause for cause, _stage in book.edges_into(receipt)
             } != {
-                fact.return_site, fact.try_control, fact.before_block,
+                fact.return_site, fact.exception_exit_site,
+                fact.try_control, fact.before_block,
                 fact.after_block,
                 *(cell for cell in fact.pending_values if cell is not None),
             }:
@@ -4993,11 +5010,14 @@ class CorrelationTable:
             SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CHECKPOINT,
             SOURCE_EXCEPTION_SSA_CONTINUATION_PHI,
+            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER,
             SOURCE_EXCEPTION_SSA_UNWIND,
+            SOURCE_EXCEPTION_SITE_STATE,
             SOURCE_EXCEPTION_REGION_SITE,
             ExceptionAdmissionFact, ExceptionSSAControlCheckpointFact,
             ExceptionTryAdmissionFact, ExceptionSSACheckpointFact,
             ExceptionSSAUnwindFact,
+            ExceptionSSAReturnFinalizerFact, ExceptionSiteStateFact,
             ExceptionRegionSiteFact, ControlBlockFact, ControlBlockKind,
             ExceptionTransferFact, SOURCE_EXCEPTION_TRANSFER,
         )
@@ -5106,6 +5126,8 @@ class CorrelationTable:
                       in admission.exit_proofs),
                     *(proof for _transfer, proofs
                       in admission.exit_proofs for proof in proofs),
+                    *(cell for pair in admission.abrupt_exit_proofs
+                      for cell in pair),
                     *admission.continuation_phis,
                     *admission.unwind_paths,
                     *((admission.normal_finalizer_entry,)
@@ -5118,6 +5140,9 @@ class CorrelationTable:
                     or set(control.sites) != {
                         transfer for transfer, _proofs
                         in admission.exit_proofs
+                    } | {
+                        site for site, _proof
+                        in admission.abrupt_exit_proofs
                     }
                     or admission.normal_exit.page != SSA_BLOCK
                     or book.page(SSA_BLOCK).cells.get((
@@ -5134,6 +5159,34 @@ class CorrelationTable:
                     or any(
                         cell.page != SOURCE_EXCEPTION_SSA_CONTINUATION_PHI
                         for cell in admission.continuation_phis
+                    )
+                    or len({site for site, _proof in
+                            admission.abrupt_exit_proofs}) != len(
+                                admission.abrupt_exit_proofs
+                            )
+                    or any(
+                        site.page != SOURCE_EXCEPTION_SITE_STATE
+                        or not isinstance(book.page(
+                            SOURCE_EXCEPTION_SITE_STATE
+                        ).cell(site.row, site.column),
+                            ExceptionSiteStateFact)
+                        or book.page(SOURCE_EXCEPTION_SITE_STATE).cell(
+                            site.row, site.column,
+                        ).action != "return"
+                        or proof.page != SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                        or not isinstance(book.page(
+                            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                        ).cell(proof.row, proof.column),
+                            ExceptionSSAReturnFinalizerFact)
+                        or book.page(
+                            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                        ).cell(proof.row, proof.column).exception_exit_site
+                        != site
+                        or book.page(
+                            SOURCE_EXCEPTION_SSA_RETURN_FINALIZER
+                        ).cell(proof.row, proof.column).try_control
+                        != admission.control
+                        for site, proof in admission.abrupt_exit_proofs
                     )
                     or (
                         admission.normal_finalizer_entry is not None

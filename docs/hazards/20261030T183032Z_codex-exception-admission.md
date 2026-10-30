@@ -1,0 +1,7 @@
+2026-10-30 TRY RETURN EXIT ADMISSION (MEASURED, exception-admission worktree):
+
+- A return under an active Try now traverses only the Try frames that own its exact `SOURCE_EXCEPTION_SITE_STATE` exit cell. Each `SOURCE_EXCEPTION_SSA_RETURN_FINALIZER` receipt cites that cell as well as the existing return slot site, control owner, SSA blocks, and pending values.
+- `ExceptionTryAdmissionFact` cites each abrupt return exit and its exact SSA finalizer receipt. The concordance audit checks that the Try control sites equal the protected transfers plus proved return sites, and that each receipt names that Try and site. The return receipt audit follows exact SSA_VALUE revision provenance after dtype refinement.
+- `python -u -m pytest -q --tb=short tests/test_source_exception_admission.py tests/test_metadata_copy_control_ownership.py tests/test_native_float_int_status.py`: 61 passed, 2 warnings in 20.30s. New native C and LLVM tests execute `try: return int(x); except ValueError: return 2` for finite, NaN, and infinity inputs.
+- `python -u tools/audit_identity_concordance.py view`: same pre-existing `ValueError: selected return has no exact source call reachability authority` during lowering; not green.
+- Remaining: return with nonempty Finally, break/continue admission, authored Raise/Assert with Finally, and nested propagation remain fail-closed. This entry proves only empty-Finally return admission.

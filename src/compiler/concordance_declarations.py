@@ -1174,6 +1174,7 @@ class ExceptionTryAdmissionFact:
     continuation_phis: tuple[Ref, ...]
     normal_finalizer_entry: Ref | None = None
     unwind_paths: tuple[Ref, ...] = ()
+    abrupt_exit_proofs: tuple[tuple[Ref, Ref], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1457,6 +1458,7 @@ class ExceptionSSAReturnFinalizerFact:
     before_block: Ref
     after_block: Ref
     pending_values: tuple[Ref | None, ...]
+    exception_exit_site: Ref | None = None
 
 
 SOURCE_EXCEPTION_SSA_RETURN_FINALIZER = declare_page(

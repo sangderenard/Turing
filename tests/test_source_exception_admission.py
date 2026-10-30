@@ -617,9 +617,10 @@ def root(x: float) -> int:
             region_signatures={row[1]: ((), ()) for row in site_rows},
             constant_value_ids=literal_ids,
         )
-        assert any(
-            shortfall.name == "native_try_dispatch" for shortfall in shortfalls
-        )
+        assert all(
+            shortfall.name != "native_try_dispatch"
+            for shortfall in shortfalls
+        ), shortfalls
         assert len(tuple(book.page(SOURCE_EXCEPTION_SSA_CHECKPOINT).rows())) == 2
         route_rows = tuple(book.page(SOURCE_EXCEPTION_SSA_ROUTE).rows())
         source_route_rows = tuple(
@@ -1960,7 +1961,8 @@ def root(x: float) -> int:
         run(float("inf"))
 
 
-def test_production_try_return_has_concorded_ssa_dominance_observations():
+@pytest.mark.parametrize("backend", ["c", "llvm"])
+def test_production_try_return_matches_native_status(backend, tmp_path):
     source = """\
 def root(x: float) -> int:
     try:
@@ -1968,9 +1970,49 @@ def root(x: float) -> int:
     except ValueError:
         return 2
 """
-    with pytest.raises(CompilationSubdivisionRequired) as error:
-        _lower(source, "exception_try_return_ssa", complete=True)
-    assert "native_try_dispatch" in str(error.value)
+    module, _outputs, exports = _lower(
+        source, f"exception_try_return_{backend}", complete=True,
+    )
+    function = module.functions[exports[0]]
+    book = module.metadata["identity_book"]
+    admission_rows = tuple(book.page(SOURCE_EXCEPTION_ADMISSION).rows())
+    assert len(admission_rows) == 1
+    admission = book.page(SOURCE_EXCEPTION_ADMISSION).latest(
+        admission_rows[0]
+    )
+    assert len(admission.abrupt_exit_proofs) == 2
+    parameter = dict(function.metadata["parameter_names"])["x"]
+    returns = tuple(
+        instruction for basic in function.blocks.values()
+        for instruction in basic.instrs if str(instruction.op) == "Ret"
+    )
+    assert len(returns) == 1 and len(returns[0].args) == 1
+    output = int(returns[0].args[0].id)
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, function.name)
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "c")
+        run = lambda value: artifact.prepare_execution({
+            parameter: np.array([value], dtype=np.float64),
+        }).run()
+    else:
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact, emit_ssa_function_to_llvm,
+            prepare_artifact_execution,
+        )
+
+        emitted = emit_ssa_function_to_llvm(module, function.name)
+        assert not emitted.shortfalls, emitted.shortfalls
+        artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+        run = lambda value: prepare_artifact_execution(artifact, {
+            parameter: np.array([value], dtype=np.float64),
+        }).run()
+    assert int(run(1.9).buffers[output].reshape(-1)[0]) == 1
+    assert int(run(float("nan")).buffers[output].reshape(-1)[0]) == 2
+    with pytest.raises(NativeOverflowError):
+        run(float("inf"))
 
 
 @pytest.mark.parametrize("source", [
