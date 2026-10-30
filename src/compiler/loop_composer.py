@@ -4730,14 +4730,12 @@ def analyze_shader_loop_reductions(
             (graph.G.graph.get("recursion_table") or {}).items()
         )
     )
-    # An authored ``ast.Try`` has source state and transfer records, but no
-    # executable control owner here. ``SOURCE_EXCEPTION_ADMISSION`` refuses
-    # every retained Try before SSA emission until its body, handlers, else,
-    # finalizer, and exceptional successors are all composed. A reducer Phi
-    # for a post-Try name does not make the exceptional path executable.
-    # Raise remains forbidden when no admitted native Try owns its control.
+    # Program: a Raise in a loop's Try handler leaves that loop on its
+    # source-concorded exceptional edge. The old AST veto stopped loop
+    # construction before the source exception overlay could nest the Try
+    # under it. Loop eligibility does not decide authored Raise ownership;
+    # the later control overlay and exception admission do.
     forbidden = (
-        ast.Raise,
         ast.With,
         ast.AsyncWith,
         ast.Await,
@@ -5638,7 +5636,8 @@ def analyze_shader_loop_reductions(
         # A guard whose only true-arm action is raise is compiled validation,
         # including when it is lexically inside a retained loop.  Record it at
         # its source position so it runs on every iteration, not once after the
-        # loop.  Other Raise shapes remain blockers.
+        # loop. Other Raise shapes are handled by the source exception
+        # overlay; they are not loop eligibility vetoes.
         #
         # The mirror shape -- `if cond: body else: raise` -- is the same
         # guard clause with the branches swapped: the loop's real work is
@@ -5650,7 +5649,6 @@ def analyze_shader_loop_reductions(
         # make the whole statement compile.
         validations: list[tuple[int, int, bool, tuple[int, ...]]] = []
         nested_validations: list[tuple[int, int, bool, tuple[int, ...]]] = []
-        validated_raise_signatures: set[tuple[Any, ...]] = set()
         # Only a guard that is a direct statement of THIS loop's body is the
         # composer's; a guard nested in another ``if`` of the body is placed
         # inside that arm by the producer-region placement
@@ -5716,9 +5714,6 @@ def analyze_shader_loop_reductions(
                         raise_items[0], node_for_expression,
                     ),
                 ))
-                validated_raise_signatures.update(
-                    expression_signature(item) for item in raise_items
-                )
                 continue
             validations.append((
                 int(raise_node_id),
@@ -5728,9 +5723,6 @@ def analyze_shader_loop_reductions(
                     raise_items[0], node_for_expression,
                 ),
             ))
-            validated_raise_signatures.update(
-                expression_signature(item) for item in raise_items
-            )
         def earliest_member(index: int) -> int:
             return min(
                 lexical_position[node_id]
@@ -6458,12 +6450,6 @@ def analyze_shader_loop_reductions(
             if node_id not in graph.G:
                 continue
             expression = graph.G.nodes[node_id].get("expr_obj")
-            if (
-                isinstance(expression, ast.Raise)
-                and expression_signature(expression)
-                in validated_raise_signatures
-            ):
-                continue
             if isinstance(expression, forbidden):
                 blockers.append(type(expression).__name__)
         blockers = list(dict.fromkeys(blockers))

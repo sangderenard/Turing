@@ -1291,6 +1291,27 @@ def test_raise_guard_inside_retained_loop_becomes_lexical_validation():
     ) == frozenset((diagnostic_id,))
 
 
+def test_handler_raise_does_not_block_loop_reduction():
+    graph = _function_graph(
+        "def kernel(count, value):\n"
+        "    result = 0\n"
+        "    for index in range(count):\n"
+        "        try:\n"
+        "            result = int(value)\n"
+        "        except ValueError as error:\n"
+        "            raise ValueError('bad') from error\n"
+        "    return result\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,)
+    )
+    assert reduction.blockers == ()
+    assert reduction.control_program is not None
+    assert reduction.control_program.root.source_loop_node_id == plan.loop.node_id
+
+
 def test_shape_index_range_is_recovered_as_bound_not_range_object():
     graph = _function_graph(
         "def kernel(frames):\n"

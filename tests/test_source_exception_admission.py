@@ -1891,6 +1891,57 @@ def test_root_exception_control_executes_on_native_backends(
 
 
 @pytest.mark.parametrize("backend", ["c", "llvm"])
+def test_handler_raise_leaves_loop_on_native_backends(backend, tmp_path):
+    source = """\
+def root(count: int, value: float) -> int:
+    result = 0
+    for index in range(count):
+        try:
+            result = int(value)
+        except ValueError as error:
+            raise ValueError() from error
+    return result
+"""
+    module, _outputs, exports = _lower(
+        source, f"exception_handler_loop_{backend}", complete=True,
+    )
+    function = module.functions[exports[0]]
+    parameters = dict(function.metadata["parameter_names"])
+    returns = tuple(
+        instruction for basic in function.blocks.values()
+        for instruction in basic.instrs if str(instruction.op) == "Ret"
+    )
+    assert len(returns) == 1 and len(returns[0].args) == 1
+    output = int(returns[0].args[0].id)
+    if backend == "c":
+        from src.compiler.ssa_c_backend import emit_ssa_to_c
+
+        artifact = emit_ssa_to_c(module, function.name)
+        assert artifact.complete, artifact.shortfalls
+        artifact.compile(tmp_path / "c")
+        run = lambda count, value: artifact.prepare_execution({
+            parameters["count"]: np.array([count], dtype=np.int64),
+            parameters["value"]: np.array([value], dtype=np.float64),
+        }).run()
+    else:
+        from src.compiler.ssa_llvm_backend import (
+            compile_artifact, emit_ssa_function_to_llvm,
+            prepare_artifact_execution,
+        )
+
+        emitted = emit_ssa_function_to_llvm(module, function.name)
+        assert not emitted.shortfalls, emitted.shortfalls
+        artifact = compile_artifact(emitted, directory=tmp_path / "llvm")
+        run = lambda count, value: prepare_artifact_execution(artifact, {
+            parameters["count"]: np.array([count], dtype=np.int64),
+            parameters["value"]: np.array([value], dtype=np.float64),
+        }).run()
+    assert int(run(2, 1.5).buffers[output].reshape(-1)[0]) == 1
+    with pytest.raises(NativeValueError):
+        run(2, float("nan"))
+
+
+@pytest.mark.parametrize("backend", ["c", "llvm"])
 def test_unconditional_root_raise_has_empty_native_buffer_abi(
     backend, tmp_path,
 ):
