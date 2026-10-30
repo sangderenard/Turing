@@ -1195,6 +1195,25 @@ SOURCE_EXCEPTION_SITE_STATE = declare_page("source_exception_site_state", (
 
 
 @dataclass(frozen=True)
+class ExceptionInertConstructorFact:
+    """Exact builtin zero-argument raise constructor with no call exit."""
+
+    raise_source: Ref
+    constructor_source: Ref
+    class_definition: Ref
+    positional_count: int
+    keyword_count: int
+
+
+SOURCE_EXCEPTION_INERT_CONSTRUCTOR = declare_page(
+    "source_exception_inert_constructor", (
+        RowField("ingestion_scope", K.SCOPE),
+        RowField("constructor_node", K.VALUE_ID),
+    ), ExceptionInertConstructorFact,
+)
+
+
+@dataclass(frozen=True)
 class ExceptionFinalizerBindingFact:
     """One finalbody read, correlated with every incoming source binding."""
 

@@ -51,6 +51,7 @@ from ...compiler.concordance_declarations import (
     INGESTION_VALUE as _INGESTION_VALUE,
     NAME_BINDING as _NAME_BINDING,
     ExceptionSiteStateFact as _ExceptionSiteStateFact,
+    ExceptionInertConstructorFact as _ExceptionInertConstructorFact,
     ExceptionFinalizerBindingFact as _ExceptionFinalizerBindingFact,
     ExceptionFinalizerOutputBindingFact as _ExceptionFinalizerOutputBindingFact,
     ExceptionContinuationPhiFact as _ExceptionContinuationPhiFact,
@@ -62,6 +63,7 @@ from ...compiler.concordance_declarations import (
     SCHEMA_NODE as _SCHEMA_NODE,
     SOURCE_CALL_RESULT_IDENTITY as _SOURCE_CALL_RESULT_IDENTITY,
     SOURCE_EXCEPTION_SITE_STATE as _SOURCE_EXCEPTION_SITE_STATE,
+    SOURCE_EXCEPTION_INERT_CONSTRUCTOR as _SOURCE_EXCEPTION_INERT_CONSTRUCTOR,
     SOURCE_EXCEPTION_FINALIZER_BINDING as _SOURCE_EXCEPTION_FINALIZER_BINDING,
     SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING as _SOURCE_EXCEPTION_FINALIZER_OUTPUT_BINDING,
     SOURCE_EXCEPTION_CONTINUATION_PHI as _SOURCE_EXCEPTION_CONTINUATION_PHI,
@@ -10097,11 +10099,68 @@ def _normalize_lexical_values(
         )
         return True
 
-    def resolve_expression(expression: ast.AST | None) -> int | None:
+    def resolve_expression(
+        expression: ast.AST | None, *, raise_owner: ast.Raise | None = None,
+    ) -> int | None:
         result = resolve_expression_value(expression)
         if isinstance(expression, ast.Call):
+            inert_raise_constructor = False
+            if (
+                raise_owner is not None
+                and raise_owner.exc is expression
+                and not expression.args
+                and not expression.keywords
+            ):
+                # Program: `try: raise ValueError(); except ValueError:
+                # return 2`. The generic Call rule posted a second fallible
+                # source transfer for the exact builtin constructor, but
+                # native Raise consumes only its concorded class status and
+                # no instance value. That invented transfer had no executable
+                # region or checkpoint and blocked the actual Raise route.
+                # Only the exact static class edge and the repository's
+                # authored status table may prove this zero-argument call
+                # inert; a shadowed class retains the ordinary Call site.
+                from ...compiler.exception_topology import (
+                    _raised_class_definition,
+                )
+                from ...compiler.native_faults import authored_raise_status
+
+                definition = _raised_class_definition(
+                    graph, ingestion_read_scope, raise_owner,
+                )
+                inert_raise_constructor = (
+                    definition is not None
+                    and authored_raise_status(
+                        ".".join(definition.row[:2])
+                    ) is not None
+                )
             if exception_scope_demands:
-                capture_exception_site(expression)
+                if inert_raise_constructor:
+                    constructor_cell = _posted_node_identity_cell(
+                        graph, id(expression),
+                    )
+                    raise_cell = _posted_node_identity_cell(
+                        graph, id(raise_owner),
+                    )
+                    if constructor_cell is None or raise_cell is None:
+                        raise ValueError(
+                            "inert raise constructor lacks exact source cells"
+                        )
+                    current_identity_book().post(
+                        _SOURCE_EXCEPTION_INERT_CONSTRUCTOR,
+                        (ingestion_read_scope, id(expression)),
+                        _ExceptionInertConstructorFact(
+                            raise_cell, constructor_cell, definition,
+                            len(expression.args), len(expression.keywords),
+                        ),
+                        stage=_REDUCTION,
+                        provenance=_Derived((
+                            raise_cell, constructor_cell, definition,
+                        )),
+                        mode=_Mode.CONCORD,
+                    )
+                else:
+                    capture_exception_site(expression)
             # IdentityBook.project_cells evaluates clock=projected.clock
             # before IdentityPage(..., book=projected) can touch the book.
             # Publish possible call stores only after resolving that call's
@@ -18888,7 +18947,13 @@ def _normalize_lexical_values(
             return resolve_expression(body_statement.value)
         for child in source_child_nodes(body_statement):
             if isinstance(child, ast.expr):
-                resolve_expression(child)
+                resolve_expression(
+                    child,
+                    raise_owner=(
+                        body_statement if isinstance(body_statement, ast.Raise)
+                        and child is body_statement.exc else None
+                    ),
+                )
         if isinstance(body_statement, (ast.Raise, ast.Assert)):
             capture_exception_site(body_statement)
         return id(body_statement) if id(body_statement) in graph.G else None

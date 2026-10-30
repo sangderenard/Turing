@@ -1578,6 +1578,7 @@ class CorrelationTable:
         found.extend(self._name_binding_capture_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_exception_site_state_findings(module))
+        found.extend(self._source_exception_inert_constructor_findings(module))
         found.extend(self._source_exception_finalizer_binding_findings(module))
         found.extend(self._source_exception_finalizer_output_findings(module))
         found.extend(self._source_exception_finalizer_path_findings(module))
@@ -1975,6 +1976,56 @@ class CorrelationTable:
                 found.append(Finding(
                     "value-type-tag-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_exception_inert_constructor_findings(
+        module: Any,
+    ) -> list[Finding]:
+        """An omitted constructor exit cites the exact builtin class."""
+        from .concordance_declarations import (
+            ExceptionInertConstructorFact, INGESTION_VALUE,
+            SOURCE_EXCEPTION_INERT_CONSTRUCTOR,
+            SOURCE_EXCEPTION_SITE_STATE, SOURCE_EXCEPTION_TRANSFER,
+            STATIC_SYMBOL_DEFINITION,
+        )
+        from .native_faults import authored_raise_status
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None or (
+            SOURCE_EXCEPTION_INERT_CONSTRUCTOR.name not in book.pages
+        ):
+            return []
+        found = []
+        page = book.page(SOURCE_EXCEPTION_INERT_CONSTRUCTOR)
+        for row in page.rows():
+            fact = page.latest(row)
+            receipt = book.latest_ref(SOURCE_EXCEPTION_INERT_CONSTRUCTOR, row)
+            if not isinstance(fact, ExceptionInertConstructorFact) or (
+                fact.raise_source.page != INGESTION_VALUE
+                or fact.constructor_source.page != INGESTION_VALUE
+                or int(fact.constructor_source.row[1]) != int(row[1])
+                or fact.class_definition.page != STATIC_SYMBOL_DEFINITION
+                or authored_raise_status(
+                    ".".join(fact.class_definition.row[:2])
+                ) is None
+                or fact.positional_count != 0
+                or fact.keyword_count != 0
+                or book.page(SOURCE_EXCEPTION_SITE_STATE).latest(row)
+                is not None
+                or book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+                is not None
+                or set(cause for cause, _stage in book.edges_into(receipt))
+                != {
+                    fact.raise_source, fact.constructor_source,
+                    fact.class_definition,
+                }
+            ):
+                found.append(Finding(
+                    "source-exception-inert-constructor-disagreement",
+                    str(row), None,
+                    "constructor omission lacks exact source/class evidence",
                 ))
         return found
 

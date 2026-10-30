@@ -17,6 +17,7 @@ from src.compiler.concordance_declarations import (
     CONTROL_VALUE_BINDING, BindingKind,
     NAME_BINDING, SOURCE_EXCEPTION_ADMISSION, SOURCE_EXCEPTION_SITE_STATE,
     SOURCE_EXCEPTION_TRANSFER, SOURCE_EXCEPTION_HANDLER_CLASS,
+    SOURCE_EXCEPTION_INERT_CONSTRUCTOR,
     SOURCE_EXCEPTION_STATUS_ROUTE, NATIVE_STATUS_CLASS,
     SOURCE_EXCEPTION_REGION_SITE,
     SOURCE_EXCEPTION_REGION_STATE,
@@ -2166,6 +2167,76 @@ def test_production_exception_control_reaches_ssa_frontier(source):
         assert CorrelationTable._source_exception_control_coverage_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
+    finally:
+        end_identity_book(token)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_exact_builtin_raise_has_only_raise_transfer(nested):
+    source = (
+        "def root(x: int) -> int:\n"
+        "    try:\n"
+        "        try:\n"
+        "            raise ValueError()\n"
+        "        except TypeError:\n"
+        "            return 1\n"
+        "    except ValueError:\n"
+        "        return 2\n"
+        if nested else
+        "def root(x: int) -> int:\n"
+        "    try:\n"
+        "        raise ValueError()\n"
+        "    except ValueError:\n"
+        "        return 2\n"
+        "    finally:\n"
+        "        x = x + 1\n"
+    )
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(
+                source, f"exact_builtin_raise_{nested}", complete=True,
+                identity_book=book,
+            )
+        transfers = tuple(
+            book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+        )
+        assert tuple(fact.source_kind for fact in transfers) == ("raise",)
+        assert len(tuple(book.page(
+            SOURCE_EXCEPTION_INERT_CONSTRUCTOR
+        ).rows())) == 1
+        assert book.page(SOURCE_EXCEPTION_SSA_CONTROL_CHECKPOINT).rows()
+        assert CorrelationTable._source_exception_inert_constructor_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+        assert CorrelationTable._source_exception_route_step_findings(
+            SimpleNamespace(metadata={"identity_book": book})
+        ) == []
+    finally:
+        end_identity_book(token)
+
+
+def test_message_constructor_keeps_its_separate_call_transfer():
+    source = """\
+def root(x: int) -> int:
+    try:
+        raise ValueError("bad")
+    except ValueError:
+        return 2
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(
+                source, "message_constructor_transfer", complete=True,
+                identity_book=book,
+            )
+        kinds = tuple(sorted(
+            book.page(SOURCE_EXCEPTION_TRANSFER).latest(row).source_kind
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+        ))
+        assert kinds == ("call", "raise")
     finally:
         end_identity_book(token)
 
