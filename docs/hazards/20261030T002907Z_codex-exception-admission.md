@@ -1,0 +1,7 @@
+2026-10-30 Authored raise graph and catch-route edges (MEASURED, exception-admission worktree):
+
+- `test_regionless_authored_raise_keeps_try_control` observes the retained source graph during lowering. It has a `Raise -> Try` edge with role `body` and an `ExceptHandler -> Try` edge with role `handlers`. The `SOURCE_EXCEPTION_TRANSFER` fact for that exact raise has a `SOURCE_EXCEPTION_STATUS_ROUTE` whose owner is the catch try and whose selected handler is the handler class fact. The `ValueError(...)` constructor call has its own transfer, so the test selects the raise transfer by `source_kind`.
+- `test_raise_in_handler_uses_outer_try_body_as_catch_owner` observes two authored raises. The raise in the inner try body selects the inner try. The raise in the inner handler bypasses that same try and selects the outer try and its matching handler. The test joins the route through the exact transfer cell.
+- `python -m pytest -q --tb=short tests/test_source_exception_admission.py tests/test_metadata_copy_control_ownership.py tests/test_native_float_int_status.py`: 31 passed, 2 warnings, 7.22 seconds. `git diff --check` passed.
+- `python -u tools/audit_identity_concordance.py view` still fails at `selected return has no exact source call reachability authority`, the existing audit failure. These tests do not establish a passing broad audit.
+- No graph-edge repair was needed. The remaining compiler defect is that the native try-control builder does not emit an executable action for an authored `Raise`; public admission remains closed.

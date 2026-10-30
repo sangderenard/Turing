@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -912,7 +913,7 @@ def root(x: int) -> int:
     def observe_overlay(*args, **kwargs):
         program = original_overlay(*args, **kwargs)
         if kwargs.get("try_controls"):
-            observed.append(program)
+            observed.append((program, args[0]))
         return program
 
     monkeypatch.setattr(
@@ -922,12 +923,45 @@ def root(x: int) -> int:
     try:
         with pytest.raises(CompilationSubdivisionRequired):
             _lower(source, "exception_regionless_raise", identity_book=book)
-        program, = observed
+        (program, graph), = observed
         retained_try, = tuple(
             child for child in program.root.blocks
             if isinstance(child, NativeTryBlock)
         )
         assert retained_try.protected_transfer_cells
+        raise_id, = tuple(
+            int(node_id) for node_id, data in graph.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.Raise)
+        )
+        handler_id = retained_try.handlers[0].source_handler_node_id
+        try_id = retained_try.source_try_node_id
+        assert graph.G.has_edge(raise_id, try_id)
+        assert graph.G.has_edge(handler_id, try_id)
+        assert graph.G.edges[raise_id, try_id]["role"] == "body"
+        assert graph.G.edges[handler_id, try_id]["role"] == "handlers"
+        transfer_cell, = tuple(
+            cell for cell in retained_try.protected_transfer_cells
+            if book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+                cell.row, cell.column,
+            ).source_kind == "raise"
+        )
+        transfer = book.page(SOURCE_EXCEPTION_TRANSFER).cell(
+            transfer_cell.row, transfer_cell.column,
+        )
+        assert transfer.source_kind == "raise"
+        route_row, = tuple(
+            row for row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
+            if row[:2] == transfer_cell.row
+        )
+        route = book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(route_row)
+        assert route.owner == transfer.catch_try
+        handler_fact, = tuple(
+            book.page(SOURCE_EXCEPTION_HANDLER_CLASS).latest(row)
+            for row in book.page(SOURCE_EXCEPTION_HANDLER_CLASS).rows()
+            if book.page(SOURCE_EXCEPTION_HANDLER_CLASS).latest(row).owner
+            == transfer.catch_try
+        )
+        assert route.selected_handler == handler_fact.handler
         assert any(
             isinstance(child, LoopControlBlock)
             and child.action == "return"
@@ -1117,6 +1151,61 @@ def root(x: int) -> int:
         assert CorrelationTable._source_exception_status_route_findings(
             SimpleNamespace(metadata={"identity_book": book})
         ) == []
+    finally:
+        end_identity_book(token)
+
+
+def test_raise_in_handler_uses_outer_try_body_as_catch_owner():
+    source = """\
+def root(x: int) -> int:
+    try:
+        try:
+            raise ValueError("inner")
+        except ValueError:
+            raise TypeError("outer")
+    except TypeError:
+        return 1
+"""
+    book, token = begin_identity_book()
+    try:
+        with pytest.raises(CompilationSubdivisionRequired):
+            _lower(source, "exception_nested_raise_owner", identity_book=book)
+        transfers = tuple(
+            book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+            if book.page(SOURCE_EXCEPTION_TRANSFER).latest(row).source_kind
+            == "raise"
+        )
+        assert len(transfers) == 2
+        inner_raise, = tuple(
+            transfer for transfer in transfers
+            if len(transfer.scopes) == 2
+            and transfer.scopes[-1][1] == "body"
+        )
+        handler_raise, = tuple(
+            transfer for transfer in transfers
+            if len(transfer.scopes) == 2
+            and transfer.scopes[-1][1] == "handler"
+        )
+        assert inner_raise.catch_try == inner_raise.scopes[-1][0]
+        assert handler_raise.catch_try == handler_raise.scopes[0][0]
+        assert handler_raise.catch_try != inner_raise.catch_try
+        transfer_cell, = tuple(
+            book.latest_ref(SOURCE_EXCEPTION_TRANSFER, row)
+            for row in book.page(SOURCE_EXCEPTION_TRANSFER).rows()
+            if book.page(SOURCE_EXCEPTION_TRANSFER).latest(row)
+            == handler_raise
+        )
+        routes = tuple(
+            book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(row)
+            for row in book.page(SOURCE_EXCEPTION_STATUS_ROUTE).rows()
+            if book.page(SOURCE_EXCEPTION_STATUS_ROUTE).latest(
+                row
+            ).transfer == transfer_cell
+        )
+        assert len(routes) == 1
+        assert routes[0].owner == handler_raise.catch_try
+        assert routes[0].selected_handler is not None
     finally:
         end_identity_book(token)
 
