@@ -1,0 +1,5 @@
+2026-10-30 Full-native extension ABI admission (MEASURED, exception-admission worktree):
+
+- `tests/test_extraction_contract.py::test_full_native_extension_requires_declared_non_python_abi[None-reject]` failed in this worktree and in untouched `C:/dev/Powershell/turing`: a `native_extension` selected as `USE_NATIVE` with no `native_abi` was admitted under `execution.require_full_native`.
+- `ExtractionContract.decide` already refused `cpython-c-api` and Python shell profiles under that contract. The same rule now refuses an extension whose selected extraction parameters have no declared `native_abi`; it retains the existing `native_extension_requires_non_python_abi` decision reason and rule ID. A declared `c` ABI remains admitted.
+- Targeted `python -u -m pytest -q --tb=short tests/test_extraction_contract.py`: 33 passed, 1 warning in 14.49s. `python -u tools/audit_identity_concordance.py view`: 348 rows, 0 findings, unsourced latch closed. `git diff --check` passed. The separate five failures in `tests/test_operator_domain_concordance.py` remain unchanged in the untouched canonical checkout; they were not treated as an ABI-admission fix.

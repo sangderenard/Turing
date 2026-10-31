@@ -1632,6 +1632,11 @@ class ExtractionContract:
             self.execution.require_full_native
             and action is ExtractionAction.USE_NATIVE
             and (
+                (
+                    subject.classification == "native_extension"
+                    and not str(parameters.get("native_abi") or "")
+                )
+                or
                 str(parameters.get("native_abi") or "") == "cpython-c-api"
                 or any(
                     str(profile) in {"python", "cpython-c"}
@@ -1639,8 +1644,9 @@ class ExtractionContract:
                 )
             )
         ):
-            # A CPython call ABI is never a full-native dependency, regardless
-            # of whether the Python callable happens to be classified as a
+            # A native extension without a declared ABI has no proved native
+            # call boundary. A CPython call ABI is never a full-native
+            # dependency, regardless of whether the callable is classified as a
             # native extension or as a Python/stdlib definition by source
             # discovery.  The ordinary extraction sheet keeps this explicit
             # product capability; only a full-native execution contract refuses
