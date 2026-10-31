@@ -1,0 +1,6 @@
+2026-10-31 Ordinary extraction defaults to full native (MEASURED, exception-admission worktree):
+
+- `program_extraction.yaml` previously made Python the host and kept unlowered work in Python by default. It now requires a native host, whole-program lowering, refusal of unlowered work, and refusal of Python callbacks. The old execution policy is available only through an explicit `python_hosted_execution.yaml` overlay.
+- A broader proposed `native_abi` check on every `use_native` decision was removed after review. This change does not add a backend-ABI requirement to SSA or to general source admission. The existing native-extension ABI refusal remains unchanged.
+- Existing extraction tests that intentionally inspect Python-hosted filesystem, print, and external-reference choices now select the hosted overlay explicitly. `python -u -m pytest -q --tb=short tests/test_extraction_contract.py`: 34 passed, 1 warning in 14.48s.
+- `python -u tools/audit_identity_concordance.py view` before and after: 348 rows across 21 functions, 0 findings, unsourced latch closed. `git diff --check` passed. This verifies contract selection and extraction decisions; it does not prove a complete Token Orchard native compile.

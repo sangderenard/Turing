@@ -1,0 +1,15 @@
+version: 1
+
+# Explicit opt-in to the former Python-hosted execution policy. This is an
+# execution overlay; callable extraction choices remain in program_extraction.yaml.
+execution:
+  host_runtime: python
+  dependency_search: reachable
+  native_lowering: opportunistic
+  dispatch_unit: isolated_numeric_subgraph
+  unlowered_behavior: execute_in_python
+  require_full_native: false
+  backward_source: process_graph
+  python_callbacks: contract_only
+  numeric_semantics: abstract_tensor
+  scalar_promotion: all_numeric

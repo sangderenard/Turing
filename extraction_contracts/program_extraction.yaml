@@ -1,20 +1,18 @@
 version: 1
 mode: exhaustive
 
-# Python is the complete execution context. Dependency pursuit discovers the
-# semantic program, while proven numerical compartments may be replaced by
-# modular native dispatches. Failure to lower one compartment leaves an
-# explicit Python-resident boundary; it is not a failed Python program and it
-# is never reported as full-native coverage.
+# The ordinary contract is a full native product. Python source is input to
+# compilation, never an implicit runtime dependency. Python-hosted execution
+# requires the explicitly selected python_hosted_execution.yaml overlay.
 execution:
-  host_runtime: python
+  host_runtime: native
   dependency_search: reachable
-  native_lowering: opportunistic
-  dispatch_unit: isolated_numeric_subgraph
-  unlowered_behavior: execute_in_python
-  require_full_native: false
+  native_lowering: required
+  dispatch_unit: whole_program
+  unlowered_behavior: reject
+  require_full_native: true
   backward_source: process_graph
-  python_callbacks: contract_only
+  python_callbacks: reject
   numeric_semantics: abstract_tensor
   scalar_promotion: all_numeric
 

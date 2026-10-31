@@ -140,15 +140,16 @@ def test_source_availability_is_probed_once_per_exact_definition(monkeypatch):
     assert len(probes) == before + 1
 
 
-def test_default_contract_draws_python_native_and_decompile_lines():
+def test_default_contract_refuses_python_runtime():
     contract = ExtractionContract(CONTRACT)
 
-    assert contract.execution.host_runtime == "python"
+    assert contract.execution.host_runtime == "native"
     assert contract.execution.dependency_search == "reachable"
-    assert contract.execution.native_lowering == "opportunistic"
-    assert contract.execution.dispatch_unit == "isolated_numeric_subgraph"
-    assert contract.execution.unlowered_behavior == "execute_in_python"
-    assert contract.execution.require_full_native is False
+    assert contract.execution.native_lowering == "required"
+    assert contract.execution.dispatch_unit == "whole_program"
+    assert contract.execution.unlowered_behavior == "reject"
+    assert contract.execution.require_full_native is True
+    assert contract.execution.python_callbacks == "reject"
     assert contract.execution.backward_source == "process_graph"
     assert contract.execution.numeric_semantics == "abstract_tensor"
     assert contract.execution.scalar_promotion == "all_numeric"
@@ -184,13 +185,24 @@ def test_default_contract_draws_python_native_and_decompile_lines():
 
     assert contract.decide(Adam).action is ExtractionAction.INGEST_PYTHON
     assert contract.decide(range).action is ExtractionAction.INTRINSIC
-    assert contract.decide(print).action is ExtractionAction.PYTHON_HOST_CALL
-    assert contract.decide(math.sin).action is ExtractionAction.USE_NATIVE
-    assert not contract.decide(math.sin).ingest_parent
+    assert contract.decide(print).action is ExtractionAction.REJECT
     assert all(
         receipt["action"] != ExtractionAction.DECOMPILE_MACHINE.value
         for receipt in contract.receipts()
     )
+
+
+def test_python_hosted_policy_requires_explicit_overlay():
+    native = ExtractionContract(CONTRACT)
+    hosted = native.with_execution_file(
+        CONTRACT.with_name("python_hosted_execution.yaml")
+    )
+    assert native.execution.host_runtime == "native"
+    assert hosted.execution.host_runtime == "python"
+    assert hosted.execution.unlowered_behavior == "execute_in_python"
+    assert hosted.execution.python_callbacks == "contract_only"
+    assert hosted.decide(print).action is ExtractionAction.PYTHON_HOST_CALL
+    assert hosted.fingerprint != native.fingerprint
 
 
 def test_program_abi_input_accepts_closed_type_expectation_union():
@@ -316,7 +328,9 @@ def test_full_native_link_gate_rejects_python_and_unresolved_boundaries():
 
 @pytest.mark.parametrize("target", [open, io.open, Path.open, Path.read_bytes])
 def test_python_filesystem_uses_the_existing_shell_file_broker(target):
-    decision = ExtractionContract(CONTRACT).decide(target)
+    decision = ExtractionContract(CONTRACT).with_execution_file(
+        CONTRACT.with_name("python_hosted_execution.yaml")
+    ).decide(target)
 
     assert decision.action is ExtractionAction.PYTHON_HOST_CALL
     assert decision.rule_id == "python-filesystem-is-a-shell-boundary"
@@ -326,7 +340,9 @@ def test_python_filesystem_uses_the_existing_shell_file_broker(target):
 
 
 def test_process_graph_retains_filesystem_call_as_a_shell_boundary():
-    contract = ExtractionContract(CONTRACT)
+    contract = ExtractionContract(CONTRACT).with_execution_file(
+        CONTRACT.with_name("python_hosted_execution.yaml")
+    )
     graph = ProcessGraph(materialize_memory=False)
     graph.build_from_ast(
         """
@@ -500,7 +516,9 @@ def test_intrinsic_candidate_can_retain_an_ingested_semantic_fallback(tmp_path):
 def test_python_boundary_keeps_call_arguments_but_never_ingests_callee(
     source, action, identity,
 ):
-    contract = ExtractionContract(CONTRACT)
+    contract = ExtractionContract(CONTRACT).with_execution_file(
+        CONTRACT.with_name("python_hosted_execution.yaml")
+    )
     graph = ProcessGraph(materialize_memory=False)
     graph.build_from_ast(
         source,
@@ -525,7 +543,9 @@ def test_python_boundary_keeps_call_arguments_but_never_ingests_callee(
 
 
 def test_native_boundary_receipt_survives_function_graph_reduction():
-    contract = ExtractionContract(CONTRACT)
+    contract = ExtractionContract(CONTRACT).with_execution_file(
+        CONTRACT.with_name("python_hosted_execution.yaml")
+    )
     graph = ProcessGraph(materialize_memory=False)
     graph.build_from_ast(
         "import pickle\ndef kernel(stream):\n    return pickle.load(stream)\n",
@@ -562,7 +582,9 @@ def test_native_boundary_receipt_survives_function_graph_reduction():
 
 
 def test_first_live_call_event_is_already_contract_classified():
-    contract = ExtractionContract(CONTRACT)
+    contract = ExtractionContract(CONTRACT).with_execution_file(
+        CONTRACT.with_name("python_hosted_execution.yaml")
+    )
     with record_evolution() as metagraph:
         graph = ProcessGraph(materialize_memory=False)
         graph.build_from_ast(
@@ -606,7 +628,9 @@ def test_admitted_python_call_keeps_definition_link_and_receipt():
 
 
 def test_print_host_boundary_uses_existing_stream_operator():
-    contract = ExtractionContract(CONTRACT)
+    contract = ExtractionContract(CONTRACT).with_execution_file(
+        CONTRACT.with_name("python_hosted_execution.yaml")
+    )
     graph = ProcessGraph(materialize_memory=False)
     graph.build_from_ast(
         "def kernel():\n    print('ready')\n",

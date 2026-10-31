@@ -1,7 +1,8 @@
 # Program extraction contracts
 
-`program_extraction.yaml` is the default exhaustive contract used by the live
-compiler visualizer. It answers a different question from an OOP boundary
+`program_extraction.yaml` is the default exhaustive, full-native contract used by
+the live compiler visualizer. It refuses unlowered Python execution and Python
+callbacks. It answers a different question from an OOP boundary
 namespace: the namespace can spoof a particular program node, while this sheet
 decides whether the compiler may cross from a resolved callable into its
 implementation at all.
@@ -60,7 +61,11 @@ python -m src.rendering.precompiled_graph_demo `
 ```
 
 `vehicle_full_native_execution.yaml` is an execution overlay used by the
-Python-authored vehicle module. It deliberately reuses the exhaustive callable
-classification rules above while changing success to native whole-program
-closure: unlowered behavior and Python callbacks are rejected. The overlay
+Python-authored vehicle module. Its explicit vehicle receipt currently agrees
+with the ordinary contract's full-native execution requirements. The overlay
 text participates in the derived extraction fingerprint.
+
+`python_hosted_execution.yaml` is the explicit alternative for programs that
+intentionally retain a Python host and Python-resident unlowered behavior. Load
+it with `ExtractionContract(...).with_execution_file(...)`; the ordinary
+contract never selects it automatically.
