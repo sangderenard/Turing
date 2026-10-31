@@ -510,6 +510,7 @@ class DispatchBlock(TiledObject):
     keyword_argument_value_ids: tuple[tuple[str, int], ...] = ()
     result_value_id: int | None = None
     result_dtype: str = "opaque_ref"
+    target_function_cell: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -1164,6 +1165,7 @@ def _describe_control_block(
     extra: tuple = ()
     cases: tuple = ()
     diagnostics: tuple = ()
+    target = None
     if isinstance(block, StatementBlock):
         region = _region_marker(block)
         callsite_ordinal = _callsite_marker(block)
@@ -1222,6 +1224,8 @@ def _describe_control_block(
         extra = (str(block.action), block.source_action)
     elif isinstance(block, (CallBlock, DispatchBlock, ExternalReferenceCallBlock)):
         owner = callsite = callsite_cell(block.callsite_id)
+        if isinstance(block, DispatchBlock):
+            target = block.target_function_cell
         extra = (
             getattr(block, "operation", None),
             getattr(block, "identity", None),
@@ -1310,7 +1314,7 @@ def _describe_control_block(
         reason = CONTROL_OWNER_UNKNOWN
     return kind, owner, reason, (
         predicate, carried, sites, regions, callsite, extra, cases,
-        diagnostics,
+        diagnostics, target,
     )
 
 
@@ -1470,12 +1474,12 @@ def post_control_program(
     def fact_cells(fields: tuple) -> tuple:
         (
             predicate, carried, sites, regions, callsite, _extra, cases,
-            diagnostics,
+            diagnostics, target,
         ) = fields
         return tuple(
             item for item in (
                 predicate, *carried, *sites, *regions, callsite, *cases,
-                *diagnostics,
+                *diagnostics, target,
             )
             if isinstance(item, Ref)
         )

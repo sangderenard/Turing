@@ -1029,6 +1029,13 @@ SOURCE_CALLSITE_ACTIVATION = declare_page(
         RowField("caller_identity", K.SCOPE), RowField("callsite", K.VALUE_ID),
     ), tuple,                          # mode CONCORD
 )
+# The exact function-table address passed as a thread dispatch target.  The
+# callsite row derives from the call node, its target operand, and the held
+# function address; control and SSA consume this fact rather than re-reading
+# a graph attribute or interpreting an untyped machine-word value.
+SOURCE_DISPATCH_TARGET = declare_page("source_dispatch_target", (
+    RowField("caller_scope", K.SCOPE), RowField("callsite", K.VALUE_ID),
+), int)
 #: ``("proven", value, caller)`` or ``Unresolved(FORMAL_LITERAL_CONFLICT)``.
 FORMAL_LITERAL = declare_page("formal_literal", (
     RowField("function", K.NAME), RowField("parameter", K.NAME),
@@ -2644,7 +2651,8 @@ class ControlBlockFact:
     ``cases``: for a ``StateMachineTick``, the case literals' node cells in
     case order (a literal with no node has no cell here); ``diagnostics``: for
     validation, source-value cells used only by the authored exception message
-    and not consumed by native control.
+    and not consumed by native control; ``target``: the resolved thread
+    target's source-dispatch-target cell when this is a dispatcher block.
     """
 
     kind: ControlBlockKind
@@ -2656,6 +2664,7 @@ class ControlBlockFact:
     extra: tuple
     cases: tuple = ()
     diagnostics: tuple = ()
+    target: Ref | None = None
 
 
 @dataclass(frozen=True)

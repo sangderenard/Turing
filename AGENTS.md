@@ -212,6 +212,11 @@ Before running tests, read the hazards log newest first:
 `python tools/hazards_log.py` prints the entry files in
 [docs/hazards/](docs/hazards/) and then
 [TEST_BASELINE_AND_HAZARDS.md](TEST_BASELINE_AND_HAZARDS.md).
+Use old logs to find prior reproductions and hazards, not to diagnose the
+present checkout. A recorded refusal or missing capability may have changed.
+Reproduce the issue against the current source and inspect its current graph,
+concordance cells, and failing descriptor before naming the cause or proposing
+a repair. State explicitly when an old result has not been remeasured.
 Write a new log entry as its own file in docs/hazards/
 (`python tools/hazards_log.py new`), never by prepending to
 TEST_BASELINE_AND_HAZARDS.md; two PRs that prepend conflict. Where other

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -35,6 +36,44 @@ def test_string_table_token_row_is_a_content_label(tmp_path):
         assert book.page(STRING_TABLE_ENTRY).latest((value,)) == "content-row"
     finally:
         end_identity_book(token)
+
+
+def test_string_table_interning_can_feed_token_orchard_instead_of_fnv(
+    tmp_path, monkeypatch,
+):
+    """A test-only switch probes the table's interning seam, not SSA linking."""
+    core_root = Path(__file__).resolve().parents[2] / "string_core"
+    if not (core_root / "token_orchard/core.py").is_file():
+        pytest.skip("Token Orchard source is not checked out")
+    monkeypatch.syspath_prepend(str(core_root))
+    from token_orchard.contract import DOMAIN_TEXT, STATUS_OK
+    from token_orchard.core import Vocabulary
+
+    vocabulary = Vocabulary()
+
+    def orchard_token(text):
+        status, token = vocabulary.intern(DOMAIN_TEXT, [ord(ch) for ch in text])
+        assert status == STATUS_OK
+        return token
+
+    book, context_token = begin_identity_book()
+    try:
+        table = StringTable(root=tmp_path)
+        with monkeypatch.context() as switched:
+            switched.setattr(string_table_module, "string_token", orchard_token)
+            first = table.intern("ab")
+            repeated = table.intern("ab")
+            atom = table.intern("Ω")
+        assert first == repeated
+        assert first != string_token("ab")
+        assert atom != string_token("Ω")
+        assert vocabulary.epoch == 1
+        assert table.get(first) == "ab"
+        assert table.get(atom) == "Ω"
+        assert book.page(STRING_TABLE_ENTRY).latest((first,)) == "ab"
+        assert book.page(STRING_TABLE_ENTRY).latest((atom,)) == "Ω"
+    finally:
+        end_identity_book(context_token)
 
 
 def test_string_table_refuses_a_second_word_for_one_token(tmp_path, monkeypatch):

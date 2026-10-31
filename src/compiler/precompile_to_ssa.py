@@ -12246,6 +12246,19 @@ class _ControlSSABuilder(TiledObject):
             self.lower(block.callee, path=f"{path}.callee")
             return
         if isinstance(block, DispatchBlock):
+            target_function_ref = None
+            if block.target_function_cell is not None:
+                from .concordance_declarations import SOURCE_DISPATCH_TARGET
+
+                target_cell = block.target_function_cell
+                if (target_cell.page != SOURCE_DISPATCH_TARGET or
+                        int(target_cell.row[1]) != int(block.callsite_id)):
+                    raise ValueError("thread dispatch target cell disagrees with its callsite")
+                target_function_ref = self._book().page(
+                    SOURCE_DISPATCH_TARGET,
+                ).cell(target_cell.row, target_cell.column)
+                if target_function_ref is None:
+                    raise ValueError("thread dispatch target has no concordance fact")
             arguments = [self.external_value(value_id)
                          for value_id in block.argument_value_ids]
             arguments.extend(self.external_value(value_id)
@@ -12262,6 +12275,8 @@ class _ControlSSABuilder(TiledObject):
                 "effectful": True,
                 "ordered_effect": True,
                 "extraction_identity": "turing.dispatch." + str(block.operation),
+                **({"target_function_ref": int(target_function_ref)}
+                   if target_function_ref is not None else {}),
             })
             if result is not None:
                 # CALL_RESULT: the dispatch's argument cells are the cause.

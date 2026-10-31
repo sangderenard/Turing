@@ -16126,11 +16126,67 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
                 ))
         if any(record[0] == int(node_id) for record in unplaced):
             continue
+        target_function_cell = None
+        if dispatch and str(dispatch["operation"]) == "thread_create":
+            target_parents = tuple(
+                int(parent_id)
+                for parent_id, role in parents
+                if str(role) in {"kw:target", "arg:1"}
+            )
+            if len(target_parents) == 1:
+                target_attributes = (
+                    graph_obj.nodes[target_parents[0]].get("attributes") or {}
+                )
+                resolved_ref = target_attributes.get(
+                    "first_class_function_ref",
+                    target_attributes.get("function_ref"),
+                )
+                if resolved_ref is not None:
+                    from ..common.tensors.topological_reducer import node_identity_cell
+                    from ..transmogrifier.function_table import function_address_identity
+                    from .concordance_declarations import (
+                        CONTROL_PROGRAM_BUILD, FUNCTION_ADDRESS,
+                        SOURCE_DISPATCH_TARGET,
+                    )
+                    from .identity_concordance import Derived, Mode, current_identity_book
+
+                    book = current_identity_book()
+                    entry = graph.function_table.entry(int(resolved_ref))
+                    address_row = (function_address_identity(entry),)
+                    address_cell = book.latest_ref(FUNCTION_ADDRESS, address_row)
+                    if (address_cell is None or
+                            book.page(FUNCTION_ADDRESS).latest(address_row) != int(resolved_ref)):
+                        raise FortranEmissionError(
+                            "thread_create target has no concorded function address"
+                        )
+                    scope = graph_obj.graph.get("lexical_read_scope")
+                    if scope is None:
+                        raise FortranEmissionError(
+                            "thread_create target has no source read scope"
+                        )
+                    row = (tuple(scope), int(node_id))
+                    target_function_cell = book.post(
+                        SOURCE_DISPATCH_TARGET, row, int(resolved_ref),
+                        stage=CONTROL_PROGRAM_BUILD,
+                        provenance=Derived((
+                            node_identity_cell(graph, int(node_id)),
+                            node_identity_cell(graph, target_parents[0]),
+                            address_cell,
+                        )),
+                        mode=Mode.CONCORD,
+                    )
+                else:
+                    span = data.get("source_span") or {}
+                    raise FortranEmissionError(
+                        "thread_create target has no resolved function identity "
+                        f"at line {span.get('line', '?')}"
+                    )
         external = DispatchBlock(
             callsite_id=int(node_id), operation=str(dispatch["operation"]),
             argument_value_ids=arguments, keyword_argument_value_ids=keywords,
             result_value_id=int(data.get("value_id", node_id)),
             result_dtype=str(result_dtype),
+            target_function_cell=target_function_cell,
         ) if dispatch else ExternalReferenceCallBlock(
             callsite_id=int(node_id),
             identity=str(contract["identity"]),

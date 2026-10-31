@@ -4831,7 +4831,11 @@ def _expand_unresolved_ast_parents(
                 # identity on every discovered definition; use that durable
                 # source record before considering any spelling fallback.
                 definition = definitions_by_source_identity.get(identity)
-        if definition is None and isinstance(call.func, ast.Name):
+        # Program: Token Orchard's _byte_values calls builtins.bytes(payload),
+        # but the lexical fallback linked it to String.bytes. An already
+        # resolved callable owns this edge even when its source is unavailable.
+        if (definition is None and not callable(target)
+                and isinstance(call.func, ast.Name)):
             # A lexical function name can be matched to its unique in-scope
             # definition.  An attribute spelling cannot: ``items.append`` is
             # not a reference to an unrelated discovered class's ``append``
