@@ -4924,6 +4924,16 @@ def _builtin_scalar_operator_class(expression: Any, operand_classes: tuple) -> s
     classes.
     """
     classes = tuple(operand_classes)
+    # Program: ``xs = [7]; for i in range(n): xs = xs + [i, i * 2]``.  Wrong
+    # record: the ``+`` of two lists had no class row, so the loop carried
+    # the rebound list as a scalar handle and ``len(xs)`` after the loop had
+    # no producer.  Rule: Python's ``list + list`` is a new ``list``.
+    if (
+        isinstance(expression, ast.BinOp)
+        and isinstance(expression.op, ast.Add)
+        and classes == ("builtins.list", "builtins.list")
+    ):
+        return "builtins.list"
     if any(item not in {"builtins.int", "builtins.bool", "builtins.float"}
            for item in classes):
         return None

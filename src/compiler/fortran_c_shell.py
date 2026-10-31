@@ -29065,6 +29065,36 @@ def _class_surface_ssa_program(
         control = _retarget_forwarded_sequence_effects(
             control, returned_formal_sequence_aliases,
         )
+        from .control_source import (
+            CallBlock as _ControlCallBlock,
+            ConditionalBlock as _ControlConditionalBlock,
+            LoopBlock as _ControlLoopBlock,
+            SequenceBlock as _ControlSequenceBlock,
+            SequenceMutationBlock as _ControlSequenceMutationBlock,
+            SequenceQueryBlock as _ControlSequenceQueryBlock,
+            WhileBlock as _ControlWhileBlock,
+        )
+
+        def _control_sequence_mutations(block):
+            """Yield every resident mutation retained by the coordinator."""
+
+            if isinstance(block, _ControlSequenceMutationBlock):
+                yield block.mutation
+            elif isinstance(block, (_ControlLoopBlock, _ControlWhileBlock)):
+                yield from block.sequence_mutations
+                if isinstance(block, _ControlWhileBlock):
+                    yield from _control_sequence_mutations(block.condition)
+                yield from _control_sequence_mutations(block.body)
+            elif isinstance(block, _ControlSequenceBlock):
+                for child in block.blocks:
+                    yield from _control_sequence_mutations(child)
+            elif isinstance(block, _ControlConditionalBlock):
+                yield from _control_sequence_mutations(block.body)
+                if block.orelse is not None:
+                    yield from _control_sequence_mutations(block.orelse)
+            elif isinstance(block, _ControlCallBlock):
+                yield from _control_sequence_mutations(block.callee)
+
         (
             sequence_concats,
             sequence_concat_aliases,
@@ -29077,6 +29107,33 @@ def _class_surface_ssa_program(
                 **conditional_sequence_aliases,
             },
         )
+        # Program: ``xs = [7]; for i in range(n): xs = xs + [i, i * 2]``.
+        # Wrong record: the concatenation read ``[7]`` as an immutable
+        # singleton and appended its one leaf, but inside the loop that
+        # arena is the carried ``xs``, which the promotion's ``replace``
+        # overwrites every iteration (``len(xs)`` 3 for 7).  Rule: a
+        # resident a ``replace`` writes holds rows, not its display's leaf.
+        replaced_residents = {
+            int(mutation.sequence_value_id)
+            for mutation in _control_sequence_mutations(control.root)
+            if str(mutation.operator) == "replace"
+        }
+        resident_of = dict(sequence_concat_aliases)
+        sequence_concats = tuple(
+            (
+                result_id, lhs_id, rhs_id, kind,
+                None if int(lhs_id) in replaced_residents else lhs_scalar,
+                None if int(rhs_id) in replaced_residents else rhs_scalar,
+            )
+            for result_id, lhs_id, rhs_id, kind, lhs_scalar, rhs_scalar
+            in sequence_concats
+        )
+        sequence_singleton_values = {
+            int(value_id): int(leaf_id)
+            for value_id, leaf_id in sequence_singleton_values.items()
+            if int(resident_of.get(int(value_id), int(value_id)))
+            not in replaced_residents
+        }
         structural_byte_sequence_ids = tuple(
             int(value_id)
             for (
@@ -29251,36 +29308,6 @@ def _class_surface_ssa_program(
                     int(sequence_id), "duplicates", 1, False,
                 ))
                 declared_sequence_ids.add(int(sequence_id))
-        from .control_source import (
-            CallBlock as _ControlCallBlock,
-            ConditionalBlock as _ControlConditionalBlock,
-            LoopBlock as _ControlLoopBlock,
-            SequenceBlock as _ControlSequenceBlock,
-            SequenceMutationBlock as _ControlSequenceMutationBlock,
-            SequenceQueryBlock as _ControlSequenceQueryBlock,
-            WhileBlock as _ControlWhileBlock,
-        )
-
-        def _control_sequence_mutations(block):
-            """Yield every resident mutation retained by the coordinator."""
-
-            if isinstance(block, _ControlSequenceMutationBlock):
-                yield block.mutation
-            elif isinstance(block, (_ControlLoopBlock, _ControlWhileBlock)):
-                yield from block.sequence_mutations
-                if isinstance(block, _ControlWhileBlock):
-                    yield from _control_sequence_mutations(block.condition)
-                yield from _control_sequence_mutations(block.body)
-            elif isinstance(block, _ControlSequenceBlock):
-                for child in block.blocks:
-                    yield from _control_sequence_mutations(child)
-            elif isinstance(block, _ControlConditionalBlock):
-                yield from _control_sequence_mutations(block.body)
-                if block.orelse is not None:
-                    yield from _control_sequence_mutations(block.orelse)
-            elif isinstance(block, _ControlCallBlock):
-                yield from _control_sequence_mutations(block.callee)
-
         control_mutations = tuple(_control_sequence_mutations(control.root))
         from .identity_concordance import (
             commit_sequence_contract,
