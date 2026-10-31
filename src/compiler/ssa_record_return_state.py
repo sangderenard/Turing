@@ -369,6 +369,12 @@ def publish_declared_scalar_abi(function, value, source, *, stage, book=None):
     publish_ssa_value_type(
         function, value, dtype=physical.dtype, shape=(), sources=(cell,),
         stage=stage, book=book,
+        # Walker.run's unary `-i` had a provisional `int` physical dtype.
+        # The exact VALUE_TYPE_ABI arm settles its SSA dtype to int64 here;
+        # retaining the old physical dtype made one value claim both layouts.
+        # The arm owns all three scalar physical fields at this revision.
+        physical={"physical_dtype": str(physical.dtype),
+                  "storage": "scalar", "rank": 0},
     )
 
 

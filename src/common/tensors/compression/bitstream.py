@@ -181,7 +181,13 @@ def tensor_octets_to_bytes(
     return bytes(serialized)
 
 
-tensor_octets_to_bytes.__process_graph_boundary__ = "host_materialization"
+# This was called a "boundary" while it quietly sent a tensor conversion back
+# through Python. That is a bad contract: it hides an executable host call
+# behind metadata and lets graph compilation skip the function's actual work.
+# Encoding belongs in concordance-owned SSA so every native backend sees the
+# same source value, validation rule, output sequence, and length. Until that
+# lowering exists, do not advertise this Python callback as native coverage.
+# tensor_octets_to_bytes.__process_graph_boundary__ = "host_materialization"
 
 
 @dataclass(frozen=True)

@@ -4550,15 +4550,14 @@ def _expand_unresolved_ast_parents(
                 None,
             )
         if process_graph_boundary is not None:
-                # Preserve an explicitly declared terminal boundary while the
-                # callable is still available for source discovery.  Ordinary
-                # discovered functions retain AST only; this callable marker
-                # is intentionally limited to the declared host crossing.
-                source_definition._process_graph_boundary = (
-                    process_graph_boundary
-                )
-                source_definition._process_graph_boundary_callable = (
-                    source_target
+                # A callable marker is not an extraction contract. Passing it
+                # through discovery used to skip the authored body and execute
+                # Python while reporting the graph as compiled. Reject the
+                # undeclared crossing where its source identity is still known.
+                raise ValueError(
+                    "ProcessGraph callable boundary has no native SSA or "
+                    f"extraction-contract authority: {identity!r} "
+                    f"({process_graph_boundary!r})"
                 )
         source_definition = _filter_discovered_definition(source_definition, module)
         if source_ast_normalizers:

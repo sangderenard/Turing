@@ -126,6 +126,48 @@ def _edge_count(graph_obj: Any) -> int:
     return sum(map(len, adjacency.values()))
 
 
+def audit_host_callback_reference_reads(graph_obj: Any) -> None:
+    """Check each lowered host call against its source binding transition."""
+
+    from ..common.tensors.topological_reducer import _operand_position_scope
+    from .concordance_declarations import IDENTITY_TRANSITION, OperandRetire
+    from types import SimpleNamespace
+
+    scope = _operand_position_scope(SimpleNamespace(G=graph_obj))
+    page = current_identity_book().page(IDENTITY_TRANSITION)
+    for call_id, data in graph_obj.nodes(data=True):
+        if str(data.get("type")) != "HostCallback":
+            continue
+        attributes = data.get("attributes") or {}
+        read_id = attributes.get("host_callback_reference_read_id")
+        field = attributes.get("host_callback_field")
+        if read_id is None or scope is None:
+            raise ConcordanceRefusal(
+                f"host callback {call_id} has no exact source binding identity"
+            )
+        transition = page.latest((scope, call_id, "callee", 0))
+        # Source graph forks may prune a read after its consumed callee
+        # position has been recorded. The transition remains authoritative.
+        if read_id in graph_obj:
+            read_attributes = graph_obj.nodes[read_id].get("attributes") or {}
+            field_matches = (
+                bool(read_attributes.get("callable_reference_field"))
+                and tuple(read_attributes.get("record_field") or ())
+                == tuple(field or ())
+            )
+        else:
+            field_matches = True
+        if (
+            not field_matches
+            or not isinstance(transition, OperandRetire)
+            or transition.cause != "host_callback_call"
+        ):
+            raise ConcordanceRefusal(
+                f"host callback {call_id} binding read {read_id} disagrees "
+                "with its field or retired callee position"
+            )
+
+
 def publish_program_abi_graph_identities(
     graph_obj: Any, *, force: bool = False,
 ) -> None:

@@ -20233,14 +20233,10 @@ def _coordinate_scheduled_capture_impl(
                             },
                         )
                     if nested.process_graph_boundary:
-                        if nested.python_callable is None:
-                            raise RuntimeError(
-                                "host-boundary ProcessGraph function has no "
-                                f"Python implementation: {callee_ref}"
-                            )
-                        result = nested.python_callable(*args, **kwargs)
-                        values[node_id] = result
-                        return result
+                        raise RuntimeError(
+                            "ProcessGraph callable boundary has no native "
+                            f"lowering authority: {callee_ref}"
+                        )
                     nested_graph_metadata = nested.process_graph.G.graph
                     receiver_parameter, positional_parameters, _ = (
                         _method_parameter_layout(
@@ -22861,9 +22857,10 @@ def _compile_whole_process_graph(
     _visited: set[int] | None = None,
 ) -> Any:
     if getattr(shell, "process_graph_boundary", None):
-        shell.whole_program_compiled = True
-        shell.whole_program_device = device
-        return shell
+        raise RuntimeError(
+            "ProcessGraph callable boundary cannot count as compiled: "
+            f"{shell.process_graph.G.graph.get('function_name', '<module>')}"
+        )
     """Prepare every planned dispatch and validate complete graph coverage.
 
     ``GraphDeepCompiler`` produces Python callables composed from the
@@ -29415,23 +29412,35 @@ def _stored_callable_field_call(graph: Any, data: Mapping[str, Any]):
     if graph.graph.get("method_binding") != "instance":
         return None
     expression = data.get("expr_obj")
-    if not (
-        isinstance(expression, ast.Call)
-        and isinstance(expression.func, ast.Attribute)
-    ):
+    if not isinstance(expression, ast.Call):
         return None
     owner = str(graph.graph.get("method_owner") or "")
     record = dict((graph.graph.get("class_table") or {}).get(owner) or {})
     positional = tuple(graph.graph.get("positional_parameters") or ())
     if not record or not positional:
         return None
-    name = str(expression.func.attr)
+    callee_ids = tuple(
+        int(parent) for parent, role in data.get("parents") or ()
+        if str(role) in {"callee", "func", "function"} and parent in graph
+    )
+    if len(callee_ids) != 1:
+        return None
+    callee = graph.nodes[callee_ids[0]]
+    callee_attributes = callee.get("attributes") or {}
+    if not callee_attributes.get("callable_reference_field"):
+        return None
+    field = callee_attributes.get("record_field")
+    if not isinstance(field, tuple) or len(field) != 2:
+        return None
+    name = str(field[1])
+    if str(field[0]) != owner:
+        return None
     if name not in set(map(str, record.get("fields") or ())) or name in set(
         map(str, dict(record.get("methods") or {}))
     ):
         return None
-    for parent, role in data.get("parents") or ():
-        if str(role) not in {"operand", "receiver"} or parent not in graph:
+    for parent, role in callee.get("parents") or ():
+        if str(role) not in {"value", "object", "base", "receiver"} or parent not in graph:
             continue
         receiver = graph.nodes[parent]
         if (
@@ -35373,7 +35382,6 @@ class ProcessGraphGLSLDeployment(TiledObject):
     loop_shader_reductions = None
     control_deployment_regions = None
     process_graph_boundary = None
-    python_callable = None
     dispatch_subgraphs = None
     deep_compilers = None
     ephemeral_callables = None
@@ -39744,9 +39752,6 @@ def strategize_shell_deployment(
         if function_entry is None
         else function_entry.metadata.get("process_graph_boundary")
     )
-    python_callable = (
-        None if function_entry is None else function_entry.python_callable
-    )
     selection_phase(
         "resolve-grounded-method-references-after-loops",
         lambda: _resolve_grounded_method_references(graph),
@@ -40029,7 +40034,6 @@ def strategize_shell_deployment(
             "control_deployment_regions": control_deployment_regions,
             "loop_region_indices": loop_region_indices,
             "process_graph_boundary": process_graph_boundary,
-            "python_callable": staticmethod(python_callable),
             "dispatch_subgraphs": dispatch_subgraphs,
             "deep_compilers": deep_compilers,
             "ephemeral_callables": ephemeral_callables,

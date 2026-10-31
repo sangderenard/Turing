@@ -18,9 +18,12 @@ cannot live in a native record slot, so the host keeps it:
 - `self.log is None` / `is not None` tests the pointer against null.  A null
   pointer means the field is `None`.
 
-Any other use of the field (`f = self.log`, passing it on, rebinding it
-outside `__init__`) refuses.  The C and LLVM buffer-vector lanes refuse every
-host callback; only the Fortran class surface carries these inputs.
+A local alias such as `f = self.log; f(i)` retains the same source callable
+binding.  When the execution contract admits `Class.log`, the graph's exact
+callee edge lowers that call through the same function pointer and context as
+`self.log(i)`.  Passing the callable on or rebinding it outside `__init__`
+still refuses.  The C and LLVM buffer-vector lanes refuse every host
+callback; only the Fortran class surface carries these inputs.
 
 ## C shape
 

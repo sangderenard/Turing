@@ -5517,10 +5517,16 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
     from types import SimpleNamespace as _Namespace
 
     from ..common.tensors.topological_reducer import (
-        _set_operands, node_identity_cell, post_derived_node_identity,
+        _operand_position_scope, _set_operands, node_identity_cell,
+        post_derived_node_identity,
     )
-    from .concordance_declarations import PLANNER_STRUCTURAL_FOLD
+    from .concordance_declarations import (
+        IDENTITY_TRANSITION, PLANNER_STRUCTURAL_FOLD, OperandRetire,
+    )
     from .glsl_deployment_strategy import _stored_callable_field_call
+    from .identity_concordance import (
+        audit_host_callback_reference_reads, current_identity_book,
+    )
     from .process_graph_value_ids import next_process_value_id
 
     graph = graph_obj
@@ -5599,6 +5605,17 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
             graph.graph["host_callback_bindings"] = bindings
     calls: dict[str, list[Any]] = {}
     presence: dict[str, list[tuple[Any, Any, bool]]] = {}
+    consumed_reads: dict[int, set[int]] = {}
+    for existing_id, existing in graph.nodes(data=True):
+        if str(existing.get("type")) != "HostCallback":
+            continue
+        read_id = (existing.get("attributes") or {}).get(
+            "host_callback_reference_read_id"
+        )
+        if read_id is not None:
+            consumed_reads.setdefault(int(read_id), set()).add(
+                int(existing_id)
+            )
     for node_id, data in tuple(graph.nodes(data=True)):
         field = _stored_callable_field_call(graph, data)
         if field is not None and field[1] in callables:
@@ -5672,9 +5689,19 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
             parts[part] = new
         for node_id in calls.get(name, ()):
             data = graph.nodes[node_id]
+            callee_reads = tuple(
+                int(parent) for parent, role in data.get("parents") or ()
+                if str(role) in {"callee", "func", "function"}
+            )
+            if len(callee_reads) != 1:
+                raise ValueError(
+                    f"{owner}.{name} host callback call has no exact "
+                    "callable value edge"
+                )
             arguments = [
                 (parent, role) for parent, role in data.get("parents") or ()
                 if parent not in receivers
+                and str(role) not in {"callee", "func", "function"}
             ]
             if len(arguments) != len(signature["arguments"]):
                 raise ValueError(
@@ -5696,6 +5723,7 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
                 (parts["context"], "callback_context"),
                 *arguments,
             ], cause="host_callback_call")
+            consumed_reads.setdefault(callee_reads[0], set()).add(int(node_id))
             data["type"] = data["op"] = "HostCallback"
             # The field's name can spell a tensor operator (``trace``,
             # ``log``); a host call is not one, so it carries no candidate.
@@ -5706,6 +5734,7 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
             }
             data.setdefault("attributes", {}).update({
                 "host_callback_field": (owner, name),
+                "host_callback_reference_read_id": callee_reads[0],
                 "host_callback_signature": signature,
             })
             lowered += 1
@@ -5747,12 +5776,34 @@ def _lower_host_callback_field_calls_graph(graph_obj: Any) -> int:
             continue
         if not any(int(receiver) == int(read[1]) for receiver in receivers):
             continue
+        # Program: Walker.run's direct self.log(i), and Escape.poke's
+        # f = self.log; f(n). The lexical graph gives both calls an exact
+        # callee edge from the callable field read. HostCallback replaces
+        # that operand with its physical function/context inputs; the source
+        # read remains as the uncalled binding identity. Its retired callee
+        # position in the concordance proves consumption. A read with any
+        # other live use still refuses below.
+        uses = consumed_reads.get(int(node_id), set())
+        scope = _operand_position_scope(view)
+        if uses and scope is not None and not any(graph.successors(node_id)):
+            transitions = current_identity_book().page(IDENTITY_TRANSITION)
+            if all(
+                isinstance(
+                    transitions.latest((scope, call_id, "callee", 0)),
+                    OperandRetire,
+                )
+                and transitions.latest((scope, call_id, "callee", 0)).cause
+                == "host_callback_call"
+                for call_id in uses
+            ):
+                continue
         expression = data.get("expr_obj")
         raise ValueError(
             f"{owner}.{read[2]} is a host callback field; only a direct call "
             f"or an `is None` test of it lowers, not this use at line "
             f"{getattr(expression, 'lineno', '?')}"
         )
+    audit_host_callback_reference_reads(graph)
     return lowered
 
 
@@ -5932,6 +5983,14 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
             continue
         for field_name, field in dict(record.get("fields") or {}).items():
             if not bool(field.get("optional", False)):
+                continue
+            if field.get("callable_signature") is not None:
+                # Program: Walker.run's `self.score is not None`. The
+                # callback field is a host binding, not a resident optional
+                # record payload. Its presence is the function address's
+                # null test, which HostCallbackPresent owns. Replacing the
+                # comparison with a generic record-presence input here
+                # erases the callable-read edge before that lowering sees it.
                 continue
             if (str(parameter), str(field_name)) in completed_fields:
                 continue

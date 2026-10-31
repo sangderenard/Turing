@@ -77,7 +77,10 @@ def walker(tmp_path_factory):
     )
     route = output / "class_route"
     api = yaml.safe_load((route / "Walker.api.yaml").read_text())
-    library = ctypes.CDLL(str(next(route.glob("Walker.so"))))
+    library = ctypes.CDLL(str(next(
+        path for path in route.iterdir()
+        if path.name in {"Walker.so", "Walker.dll", "Walker.dylib"}
+    )))
     namespace: dict = {}
     exec(compile(WALKER, str(source), "exec"), namespace)
     return api, library, namespace["Walker"]
@@ -234,13 +237,51 @@ class Escape:
 
 
 def test_a_callable_field_used_as_a_value_refuses(tmp_path):
-    # It used to compile, with the call through the local pruned: the host
-    # was never called.
-    with pytest.raises(Exception, match="host callback field"):
+    # Without a contract entry the external binding is not admitted.
+    with pytest.raises(Exception, match="not in execution.python_callback_whitelist"):
         compile_class_to_dll(
             ESCAPE, "Escape", str(tmp_path / "class_route"),
             progress=lambda _message: None,
         )
+
+
+def test_whitelisted_callable_field_alias_calls_host(tmp_path):
+    route = tmp_path / "class_route"
+    compile_class_to_dll(
+        ESCAPE, "Escape", str(route), progress=lambda _message: None,
+        extraction_contract=_whitelisting("Escape.log"),
+    )
+    api = yaml.safe_load((route / "Escape.api.yaml").read_text())
+    library = ctypes.CDLL(str(next(
+        path for path in route.iterdir()
+        if path.name in {"Escape.so", "Escape.dll", "Escape.dylib"}
+    )))
+    seen = []
+    callback = LOG(lambda context, value: seen.append((context, value)))
+    entry = _entry(api, "Escape__poke")
+    arguments, types = [], []
+    result = ctypes.c_int64()
+    for parameter in entry["parameters"]:
+        name = parameter.get("source_name")
+        if parameter["role"] == "output":
+            arguments.append(ctypes.byref(result))
+            types.append(ctypes.POINTER(ctypes.c_int64))
+        elif name == "n":
+            arguments.append(4)
+            types.append(ctypes.c_int64)
+        elif name == "log.__callback_function":
+            arguments.append(ctypes.cast(callback, ctypes.c_void_p).value)
+            types.append(ctypes.c_int64)
+        elif name == "log.__callback_context":
+            arguments.append(17)
+            types.append(ctypes.c_int64)
+        else:
+            raise AssertionError(name)
+    native = getattr(library, entry["symbol"])
+    native.argtypes = types
+    native(*arguments)
+    assert result.value == 5
+    assert seen == [(17, 4)]
 
 
 BYTES_LOADER = '''

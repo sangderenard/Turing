@@ -12509,9 +12509,14 @@ def _normalize_lexical_values(
                     if (
                         isinstance(callee, int)
                         and callee in graph.G
-                        and (graph.G.nodes[callee].get("attributes") or {}).get(
-                            "method_ref"
-                        ) is not None
+                        and (
+                            (graph.G.nodes[callee].get("attributes") or {}).get(
+                                "method_ref"
+                            ) is not None
+                            or (graph.G.nodes[callee].get("attributes") or {}).get(
+                                "callable_reference_field"
+                            )
+                        )
                     ):
                         resolved_inputs.append((callee, "callee"))
                 elif not (
@@ -22519,16 +22524,6 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 ),
                 **(
                     {
-                        "process_graph_boundary": getattr(
-                            statement,
-                            "_process_graph_boundary",
-                        )
-                    }
-                    if hasattr(statement, "_process_graph_boundary")
-                    else {}
-                ),
-                **(
-                    {
                         "host_ssa_module": getattr(
                             statement, "_linked_repository_ssa_module"
                         ),
@@ -22552,13 +22547,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 ),
             },
         )
-        boundary_callable = getattr(
-            statement,
-            "_process_graph_boundary_callable",
-            None,
-        )
-        if boundary_callable is not None:
-            function_table.resolve_callable(reference, boundary_callable)
+        if hasattr(statement, "_process_graph_boundary"):
+            raise ValueError(
+                "ProcessGraph source boundary cannot bypass native lowering: "
+                f"{statement.name}"
+            )
         data.setdefault("attributes", {})[
             "function_ref"
         ] = reference.address
