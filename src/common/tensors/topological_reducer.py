@@ -676,7 +676,7 @@ def _drop_spelled_tensor_operation(attributes: dict, expression: Any) -> None:
     attributes.pop("tensor_candidate", None)
 
 
-def node_identity_cell(graph: Any, node_id: int) -> Any:
+def node_identity_cell(graph: Any, node_id: int, *, book: Any = None) -> Any:
     """The cell that identifies graph node ``node_id`` (plan 60, seam 1).
 
     After the canonical relabel it is the node's ``canonical_value`` row
@@ -691,7 +691,7 @@ def node_identity_cell(graph: Any, node_id: int) -> Any:
         CANONICAL_VALUE, INGESTION_VALUE,
     )
 
-    book = current_identity_book()
+    book = current_identity_book() if book is None else book
     metadata = getattr(getattr(graph, "G", graph), "graph", {}) or {}
     node_id = int(node_id)
     if metadata.get("canonical_value_ids"):
@@ -3559,6 +3559,8 @@ def _set_operands(
     if not forks and not appends and all(
         source == target for source, target in moves.items()
     ):
+        from ...compiler.process_graph_facts import publish_operands
+        publish_operands(graph, node_id)
         return
     from ...compiler.concordance_declarations import (
         IDENTITY_TRANSITION, LEXICAL_READ_BINDING, OPERAND_FORK, OPERAND_MOVE,
@@ -3746,6 +3748,9 @@ def _set_operands(
                     )))),
                     mode=_Mode.REVISE,
                 )
+
+    from ...compiler.process_graph_facts import publish_operands
+    publish_operands(graph, node_id, tuple(transitions.values()))
 
 
 def _post_copy_on_read_fork(
@@ -4872,6 +4877,19 @@ def _link_integer_glyph_formatter_calls(
                 format_spec_cell,
             )))),
         )
+        # A dynamic raised message exposed this also for ordinary f-strings:
+        # the formatter is expansion work of this exact glyph expression,
+        # not an unrelated late Python call. Publish its enclosing activity
+        # at creation; placement readers must not guess from its operands.
+        from ...compiler.control_activity import binding
+        from ...compiler.concordance_declarations import SOURCE_ACTIVITY_BINDING
+        points, activity_cell = binding(graph, int(row[1]), book=book, scope=value_class_scope)
+        if points is None:
+            raise ValueError('glyph formatter expansion has no source activity owner')
+        formatter_cell = node_identity_cell(graph, int(call_id))
+        book.post(SOURCE_ACTIVITY_BINDING, (value_class_scope, formatter_cell),
+                  points, stage=_REDUCTION,
+                  provenance=_Derived((glyph_cell, activity_cell, formatter_cell, *points)), mode=_Mode.CONCORD)
         rewritten_components[ordinal] = _dataclass_replace(
             component,
             formatted_sequence_value_id=int(call_id),
@@ -6854,6 +6872,7 @@ def _normalize_lexical_values(
     authored_definitions_by_name: Mapping[
         str, tuple[ast.FunctionDef | ast.AsyncFunctionDef, ...]
     ] | None = None,
+    closure_environment_cells: dict | None = None,
 ) -> dict[int, tuple[str, ...]]:
     """Resolve unique lexical occurrences into a monotonic value DAG.
 
@@ -6873,6 +6892,26 @@ def _normalize_lexical_values(
         else None
     )
     graph = function_graph
+    # This cursor carries book cells between lexical function reductions;
+    # it never resolves a free name against another function's name table.
+    if closure_environment_cells is None:
+        closure_environment_cells = {}
+    pending_closure_environments = []
+    closure_assignment_counts: dict[str, int] = {}
+    for member in source_walk(statement):
+        binding_names = ()
+        if isinstance(member, ast.Name) and isinstance(member.ctx, (ast.Store, ast.Del)):
+            binding_names = (member.id,)
+        elif isinstance(member, ast.arg):
+            binding_names = (member.arg,)
+        elif member is not statement and isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            binding_names = (member.name,)
+        elif isinstance(member, (ast.Import, ast.ImportFrom)):
+            binding_names = tuple(alias.asname or alias.name.split(".")[0] for alias in member.names)
+        elif isinstance(member, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and member.name:
+            binding_names = (member.name,)
+        for binding_name in binding_names:
+            closure_assignment_counts[binding_name] = closure_assignment_counts.get(binding_name, 0) + 1
     # The formal Python binds this method's receiver to, whatever it is
     # named (``def __init__(me, n)``); ``None`` outside a class.
     receiver_formal = (
@@ -7202,6 +7241,13 @@ def _normalize_lexical_values(
     value_class_scope = _source_numeric_scope(
         graph, getattr(statement, "name", "<function>")
     )
+    from ...compiler.source_control_ingestion import ingest_control_activity
+    ingest_control_activity(graph, statement, value_class_scope)
+    from ...compiler.concordance_declarations import SOURCE_FORMAL_ORDER
+    current_identity_book().post(
+        SOURCE_FORMAL_ORDER, (value_class_scope,), function_parameter_names(statement),
+        stage=_REDUCTION, provenance=_Derived((_post_source_span(statement),)), mode=_Mode.CONCORD,
+    )
     from ...compiler.concordance_declarations import SOURCE_LITERAL_VALUE
     for literal_id, literal_data in tuple(graph.G.nodes(data=True)):
         literal_expression = literal_data.get("expr_obj")
@@ -7254,6 +7300,11 @@ def _normalize_lexical_values(
         f"lexical_reads:{value_class_scope}"
     )
     ingestion_read_scope = (read_scope, "ingestion")
+    from ...compiler.concordance_declarations import SOURCE_ACTIVITY_SCOPE, SOURCE_ACTIVITY_NODE
+    function_activity = current_identity_book().latest_ref(
+        SOURCE_ACTIVITY_NODE, (value_class_scope, _post_source_span(statement), "enter"))
+    current_identity_book().post(SOURCE_ACTIVITY_SCOPE, (read_scope,), value_class_scope,
+        stage=_REDUCTION, provenance=_Derived((function_activity,)), mode=_Mode.CONCORD)
     # The operand-position scope the graph arrived with: an extracted
     # subgraph's own fork (``fork_operand_position_scope``), else the build
     # scope.  The canonical relabel continues ITS rows, not the source's.
@@ -8305,10 +8356,34 @@ def _normalize_lexical_values(
             provenance=_Derived(cells),
             mode=_Mode.CONCORD,
         )
+        if source is not None:
+            from ...compiler.source_control_ingestion import bind_activity
+            occurrence = _post_source_span(source)
+            if occurrence is not None:
+                bind_activity(node_identity_cell(graph, node_id), value_class_scope, occurrence)
+        if node_type == "Input":
+            from ...compiler.concordance_declarations import SOURCE_ACTIVITY_BINDING, SOURCE_ACTIVITY_NODE
+            entry_point = current_identity_book().latest_ref(
+                SOURCE_ACTIVITY_NODE, (value_class_scope, _post_source_span(statement), "enter"))
+            identity = node_identity_cell(graph, node_id)
+            if current_identity_book().latest_ref(SOURCE_ACTIVITY_BINDING, (value_class_scope, identity)) is None:
+                current_identity_book().post(SOURCE_ACTIVITY_BINDING, (value_class_scope, identity),
+                    (entry_point, entry_point), stage=_REDUCTION,
+                    provenance=_Derived((identity, entry_point)), mode=_Mode.CONCORD)
         # The operand edges after the node's row exists: each Append
         # derives from the operand cell and this consumer cell (plan 100,
         # 1.2); the one writer materializes ``children`` and the edges.
         _set_operands(graph, node_id, list(parents), cause=cause)
+        if node_type in {"Const", "Constant"}:
+            # Resolved enum/attribute constants enter the same literal page
+            # as authored literals. Downstream readers must not inspect AST
+            # or a mutable graph payload to rediscover their value.
+            current_identity_book().post(
+                SOURCE_LITERAL_VALUE, (value_class_scope, int(node_id)),
+                (attributes or {}).get("value"), stage=_REDUCTION,
+                provenance=_Derived((node_identity_cell(graph, node_id),)),
+                mode=_Mode.CONCORD,
+            )
         return node_id
 
     def aggregate_position_cell(
@@ -11575,6 +11650,60 @@ def _normalize_lexical_values(
                 if key not in argument_values:
                     argument_values[key] = resolve_expression(argument)
                 return argument_values[key]
+            if getattr(expression, "_turing_dispatch_operation", None) is not None:
+                # Ingestion has already replaced this Python callable with
+                # a compiler-owned operation. Resolving its synthetic func
+                # name again resurrected turing_dispatch_thread_create as
+                # a runtime Input and lost the semantic boundary. Resolve
+                # only authored operand expressions, through normal edges.
+                if node_id not in graph.G:
+                    raise ValueError("ingested dispatcher operation lost its graph identity")
+                operands = tuple(
+                    (resolved_call_argument(argument), f"arg:{index}")
+                    for index, argument in enumerate(expression.args)
+                ) + tuple(
+                    (resolved_call_argument(keyword.value),
+                     f"kw:{keyword.arg}" if keyword.arg else "kwargs")
+                    for keyword in expression.keywords
+                )
+                if any(not isinstance(value, int) for value, _role in operands):
+                    raise ValueError("ingested dispatcher operation has an unresolved operand identity")
+                _set_operands(graph, node_id, operands, cause=_REPLACE_INPUTS)
+                from ...compiler.concordance_declarations import SOURCE_PROCESS_OPERATION, REDUCTION
+                from ...compiler.identity_concordance import Mode, _canonical_identity_base
+                from ...compiler.thread_operations import PROCESS_OPERATORS, PROCESS_RESULT_DTYPES
+                operation = expression._turing_dispatch_operation
+                semantic = PROCESS_OPERATORS.get(operation["operation"])
+                result_dtype = PROCESS_RESULT_DTYPES.get(semantic)
+                if operation["operation"].startswith("sync_"):
+                    from ...compiler.synchronization import SYNCHRONIZATION_SPECS
+                    kind = operation["operation"].removeprefix("sync_")
+                    semantic = SYNCHRONIZATION_SPECS[kind].operator
+                    result_dtype = ("opaque_ref" if kind.endswith("_create") else
+                                    "bool" if kind in {"mutex_acquire", "mutex_locked"} else
+                                    "ssa.sync_token")
+                if semantic is not None:
+                    book = current_identity_book()
+                    source = _canonical_identity_base(book, node_identity_cell(graph, node_id))
+                    cell = book.post(SOURCE_PROCESS_OPERATION, (source,), (
+                        operation["operation"], semantic, result_dtype,
+                        operation["source_identity"], tuple(operation.get("control_scopes", ())),
+                    ), stage=REDUCTION, provenance=_Derived(tuple(filter(None, (
+                        source, (graph.G.nodes[node_id].get("attributes") or {}).get("source_process_identity_cell"),
+                    )))), mode=Mode.CONCORD)
+                    if operation["operation"].startswith("exception_"):
+                        from ...compiler.concordance_declarations import SOURCE_EXCEPTION_OPERATION
+                        exception = book.post(SOURCE_EXCEPTION_OPERATION, (source,), (
+                            operation["operation"], operation.get("exception_type"),
+                            operation.get("exception_message"), int(operation.get("error_code", 100)), cell,
+                        ), stage=REDUCTION, provenance=_Derived((source, cell)), mode=Mode.CONCORD)
+                        graph.G.nodes[node_id].setdefault("attributes", {})["exception_operation_cell"] = exception
+                    graph.G.nodes[node_id].setdefault("attributes", {})["source_process_cell"] = cell
+                    # The authored call is now a typed process operator on
+                    # the dependency side of dual IR, before any carving.
+                    graph.G.nodes[node_id]["type"] = semantic
+                    graph.G.nodes[node_id]["op"] = semantic.lower()
+                return node_id
             if (
                 isinstance(expression.func, ast.Name)
                 and expression.func.id
@@ -11632,6 +11761,63 @@ def _normalize_lexical_values(
                     if isinstance(receiver_value, int)
                     else ()
                 )
+                # gate.wait() in a worker is a method on the captured
+                # constructor result, not an arbitrary method named wait.
+                # Consume the exact environment cell retained by its parent.
+                # This identifies the call only; it grants no memory policy
+                # and adds no rendezvous or effect-order edge.
+                if isinstance(receiver_value, int):
+                    from ...compiler.concordance_declarations import (
+                        SOURCE_CLOSURE_ENVIRONMENT, SOURCE_CLOSURE_CALLABLE,
+                    )
+                    receiver_attributes = graph.G.nodes[receiver_value].get("attributes") or {}
+                    environment_cell = (
+                        closure_environment_cells.get((
+                            int(graph.G.graph["function_ref"]),
+                            receiver_attributes.get("binding_name"),
+                        ))
+                        if receiver_attributes.get("binding_kind") == "closure"
+                        else None
+                    )
+                    if environment_cell is not None:
+                        book = current_identity_book()
+                        parent_binding, _definition, _address = book.page(
+                            SOURCE_CLOSURE_ENVIRONMENT
+                        ).latest(environment_cell.row)
+                        parent_graph = next((
+                            entry.graph for entry in function_table
+                            if getattr(entry, "graph", None) is not None
+                            and entry.graph.G.graph.get("lexical_read_scope")
+                            == parent_binding.row[0]
+                        ), None)
+                        if parent_graph is not None:
+                            parent_value = book.page(_NAME_BINDING).latest(
+                                parent_binding.row
+                            ).value_id
+                            parent_attributes = parent_graph.G.nodes[parent_value].get("attributes") or {}
+                            # Only this known constructor contract is admitted
+                            # here. Other classes, aliases without a capture
+                            # proof and dynamic attributes remain unresolved.
+                            if (
+                                parent_attributes.get("extraction_identity") == "threading.Barrier"
+                                and expression.func.attr == "wait"
+                            ):
+                                receiver_cell = node_identity_cell(graph, receiver_value)
+                                identity = "threading.Barrier.wait"
+                                book.post(
+                                    SOURCE_CLOSURE_CALLABLE,
+                                    (value_class_scope, int(node_id)),
+                                    (identity, environment_cell, parent_binding, receiver_cell),
+                                    stage=_REDUCTION,
+                                    provenance=_Derived((
+                                        environment_cell, parent_binding,
+                                        receiver_cell, node_identity_cell(parent_graph, parent_value),
+                                        node_identity_cell(graph, int(node_id)),
+                                    )), mode=_Mode.CONCORD,
+                                )
+                                graph.G.nodes[node_id].setdefault("attributes", {})[
+                                    "extraction_identity"
+                                ] = identity
                 receiver_class = (
                     None
                     if not isinstance(receiver_value, int)
@@ -11893,6 +12079,23 @@ def _normalize_lexical_values(
                             source="resolved Python identity result",
                             provenance=_Derived((identity_cell,)),
                         )
+            if isinstance(callee, _StaticPythonReference) and node_id in graph.G:
+                from ...transmogrifier.graph.python_special_cases import (
+                    _THREADING_CONSTRUCTORS, extraction_receipt,
+                )
+                if identity in _THREADING_CONSTRUCTORS and (extraction_receipt(expression) or {}).get("action") != "reject":
+                    # Initializer source can resolve its imported callable
+                    # only here. Feed that exact static identity through the
+                    # same frontend replacement as module-level ingestion.
+                    expression._extraction_contract = {
+                        "action": "intrinsic", "identity": identity,
+                        "rule_id": "resolved-process-constructor",
+                    }
+                    special = interpret_python_special_case(expression)
+                    graph.G.nodes[node_id].update(type=special.type, op=special.type)
+                    graph.G.nodes[node_id].setdefault("attributes", {}).update(special.attributes)
+                    graph.G.nodes[node_id]["attributes"]["source_process_identity_cell"] = identity_cell
+                    return resolve_expression_value(expression)
             if (
                 isinstance(callee, _StaticPythonReference)
                 and any(
@@ -15435,6 +15638,7 @@ def _normalize_lexical_values(
         target: ast.AST,
         value: int | _StaticPythonReference | None,
         *, value_occurrence: ast.AST | None = None,
+        effect_occurrence: ast.AST | None = None,
     ) -> None:
         if value is None:
             return
@@ -15748,6 +15952,10 @@ def _normalize_lexical_values(
                 )
                 node_id = new_node(
                     "IndexedStore", "indexed_store", source_cell=site_cell,
+                    # AugAssign's target occurrence is the read. Its minted
+                    # store must carry the owning statement's completion
+                    # activity, after the arithmetic, before a later notify.
+                    source=effect_occurrence,
                 )
                 # Program: ``d[1] += 5`` (scratch c201).  Wrong record: the
                 # minted store carried its site only as a cell, while
@@ -16219,6 +16427,11 @@ def _normalize_lexical_values(
                         entry_values[key] = (str(target.value.id), int(value))
         loop_field_entry_values.append(entry_values)
 
+    def loop_site_fact(site):
+        from ...compiler.concordance_declarations import SOURCE_LOOP_CONTROL_SITE
+        cell = site['site_cell']
+        return current_identity_book().page(SOURCE_LOOP_CONTROL_SITE).cell(cell.row, cell.column)
+
     def reduce_statement(body_statement: ast.stmt) -> int | None:
         # Individual Call resolution publishes stores after its operands;
         # premarking a whole statement invalidates reads before the call.
@@ -16239,6 +16452,36 @@ def _normalize_lexical_values(
         return result
 
     def reduce_statement_body(body_statement: ast.stmt) -> int | None:
+        from ...compiler.exception_graph import require_exception_control
+        require_exception_control(graph, id(body_statement))
+        if isinstance(body_statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # In root/shared/worker, the defining environment knows which
+            # binding the worker closes over. Record it here, before folding
+            # or relabeling can separate the two graphs. This first slice
+            # admits only single-assignment enclosing cells: rebinding needs
+            # a cell/value-flow model, not a snapshot of the initializer.
+            reference = (lexical_function_bindings or {}).get(body_statement.name)
+            if reference is not None:
+                from ...compiler.concordance_declarations import SOURCE_CLOSURE_ENVIRONMENT
+                address = int(reference.address)
+                for name in lexical_free_names_by_reference.get(address, ()):
+                    value = environment.get(name)
+                    binding = (
+                        current_name_binding_cell(name, value)
+                        if isinstance(value, int) else None
+                    )
+                    if binding is None or closure_assignment_counts.get(name) != 1:
+                        continue
+                    definition = _post_source_span(body_statement)
+                    address_cell = function_address_cell(address)
+                    fact = (binding, definition, address_cell)
+                    cell = current_identity_book().post(
+                        SOURCE_CLOSURE_ENVIRONMENT,
+                        (ingestion_read_scope, address, name), fact,
+                        stage=_REDUCTION, provenance=_Derived(fact),
+                        mode=_Mode.CONCORD,
+                    )
+                    pending_closure_environments.append((address, name, cell))
         if isinstance(body_statement, (ast.Nonlocal, ast.Global)):
             # Scope declarations affect name binding while parsing; they are
             # not runtime operations and must never reach an execution
@@ -16261,7 +16504,8 @@ def _normalize_lexical_values(
                 else (body_statement.target,)
             )
             for target in targets:
-                bind_target(target, value, value_occurrence=body_statement.value)
+                bind_target(target, value, value_occurrence=body_statement.value,
+                            effect_occurrence=body_statement)
             _remove_node(graph, id(body_statement))
             return value
         if isinstance(body_statement, ast.AugAssign):
@@ -16395,7 +16639,7 @@ def _normalize_lexical_values(
                 )
                 bind_target(body_statement.target.value, where_id)
                 return where_id
-            bind_target(body_statement.target, node_id)
+            bind_target(body_statement.target, node_id, effect_occurrence=body_statement)
             return node_id
         if isinstance(body_statement, ast.Return):
             returned = body_statement.value
@@ -17345,19 +17589,13 @@ def _normalize_lexical_values(
                     if len(values) == 1:
                         environment[name] = values.pop()
                     elif id(body_statement) in graph.G:
-                        # The branches genuinely disagree (a body assignment
-                        # vs. a handler's fallback) -- exactly the case
-                        # ``ast.If`` resolves with a ``Phi``.  A Try node has
-                        # no single test expression to point a Phi at, but it
-                        # doesn't need one: this Try's own graph node already
-                        # evaluates to "whichever arm actually ran" (see
-                        # ``evaluate_node``'s ``ast.Try`` handling, which
-                        # re-runs body/handlers and keeps the last value) --
-                        # so binding the name straight to the Try node's own
-                        # id gives every later reference the same on-demand
-                        # resolution a Phi would, without inventing a second
-                        # node or a synthetic "did-raise" boolean.
-                        environment[name] = id(body_statement)
+                        # A native value merge requires explicit control
+                        # arms. The old Try-node alias re-evaluated Python
+                        # to choose the value, which is not an SSA mechanism.
+                        raise ValueError(
+                            "try value merge requires explicit native exception arms; "
+                            "Python evaluation cannot supply a basic SSA value"
+                        )
             for nested in body_statement.finalbody:
                 reduce_statement(nested)
             return id(body_statement)
@@ -18004,7 +18242,8 @@ def _normalize_lexical_values(
                 # different edges carry different values, a latch Phi must be
                 # constructed explicitly and this source-level pass must not
                 # guess which value wins.
-                loop_start = int(getattr(body_statement, "lineno", -1))
+                from ...transmogrifier.graph.graph_express2 import post_source_span
+                loop_occurrence = post_source_span(None, body_statement)
                 continue_sites = tuple(
                     site
                     for site_span, site in (
@@ -18012,15 +18251,15 @@ def _normalize_lexical_values(
                     ).items()
                     if (
                         site.get("loop_id") is None
-                        and site.get("action") == "continue"
-                        and loop_start <= int(site_span[0]) <= loop_end
+                        and loop_site_fact(site)[0] == "continue"
+                        and loop_site_fact(site)[2] == loop_occurrence
                     )
                 )
                 for name, initial in before_loop.items():
                     if name in loop_carried_bindings or not continue_sites:
                         continue
                     continuation_values = {
-                        int(site.get("bindings", {}).get(name, initial))
+                        int(dict((binding, value.row[1]) for binding, value in loop_site_fact(site)[1]).get(name, initial))
                         for site in continue_sites
                     }
                     if (
@@ -18045,16 +18284,14 @@ def _normalize_lexical_values(
                 # rebinds it) yet still needs a post-loop identity: its
                 # continuation is the last break site's value, which the loop
                 # port materialization rewires onto a LoopResult port.
-                loop_break_sites: dict[
-                    tuple[int, int, int, int], dict[tuple[int, int], int]
-                ] = {}
+                loop_break_sites: dict[Any, dict[tuple[int, int], int]] = {}
                 loop_break_bindings: dict[str, tuple[int, int]] = {}
                 for site_span, site in (
                     graph.G.graph.get("loop_control_site_bindings") or {}
                 ).items():
                     if (
                         site.get("loop_id") is not None
-                        or not (loop_start <= int(site_span[0]) <= loop_end)
+                        or loop_site_fact(site)[2] != loop_occurrence
                     ):
                         continue
                     site["loop_id"] = loop_id
@@ -18065,9 +18302,10 @@ def _normalize_lexical_values(
                     # ``if dt > 0.2: dt = dt * 0.5; continue``: unrecorded,
                     # the continue value had no consumer but a conditional
                     # merge synthesized from ``dt``'s identity history.)
-                    is_break = site["action"] == "break"
+                    is_break = loop_site_fact(site)[0] == "break"
                     site_values: dict[tuple[int, int], int] = {}
-                    for name, value in site["bindings"].items():
+                    for name, value_cell in loop_site_fact(site)[1]:
+                        value = int(value_cell.row[1])
                         if (
                             name in loop_target_bindings
                             and name not in loop_carried_bindings
@@ -18134,6 +18372,15 @@ def _normalize_lexical_values(
                         ] = int(value)
                         if is_break and name not in loop_carried_bindings:
                             loop_break_bindings[name] = (int(initial), int(value))
+                    from ...compiler.concordance_declarations import SOURCE_LOOP_SITE_EDGE
+                    from ...compiler.identity_concordance import Mode
+                    loop_cell = node_identity_cell(graph, loop_id)
+                    triples = tuple((node_identity_cell(graph, initial), node_identity_cell(graph, updated),
+                                     node_identity_cell(graph, value))
+                                    for (initial, updated), value in site_values.items())
+                    current_identity_book().post(SOURCE_LOOP_SITE_EDGE, (loop_cell, site_span), triples,
+                        stage=_REDUCTION, provenance=_Derived((loop_cell, site['site_cell'],
+                            *(cell for triple in triples for cell in triple))), mode=Mode.CONCORD)
                     loop_break_sites[site_span] = site_values
                     # The break edge CONSUMES these values (the loop-exit
                     # merge reads them), so the Break node records them as
@@ -18410,30 +18657,29 @@ def _normalize_lexical_values(
                     )
             return id(body_statement)
         if isinstance(body_statement, (ast.Break, ast.Continue)):
-            # A loop-control site leaves its arm with the arm's OWN bindings
-            # (``if c: dt_try = ...; break`` reaches the loop exit with that
-            # dt_try).  The ``if`` merge below deliberately drops a terminal
-            # arm's bindings from the fall-through environment, so the exit
-            # edge must carry them explicitly.  Record the environment at the
-            # site, keyed by source span (AST ids do not survive reduction);
-            # the enclosing loop claims the site when it finishes reducing.
-            graph.G.graph.setdefault("loop_control_site_bindings", {})[(
-                int(getattr(body_statement, "lineno", -1)),
-                int(getattr(body_statement, "col_offset", -1)),
-                int(getattr(body_statement, "end_lineno", -1)),
-                int(getattr(body_statement, "end_col_offset", -1)),
-            )] = {
-                "action": (
-                    "break" if isinstance(body_statement, ast.Break)
-                    else "continue"
-                ),
-                "bindings": {
-                    str(name): int(value)
-                    for name, value in environment.items()
-                    if isinstance(value, int) and not isinstance(value, bool)
-                },
-                "loop_id": None,
-                "node_id": id(body_statement),
+            from ...compiler.identity_concordance import Mode
+            from ...compiler.concordance_declarations import SOURCE_LOOP_CONTROL_SITE, SOURCE_ACTIVITY_NODE
+            from ...transmogrifier.graph.graph_express2 import post_source_span
+            source = node_identity_cell(graph, id(body_statement))
+            occurrence = post_source_span(None, body_statement)
+            activity = current_identity_book().latest_ref(SOURCE_ACTIVITY_NODE, (value_class_scope, occurrence, 'enter'))
+            _kind, owners = current_identity_book().page(SOURCE_ACTIVITY_NODE).cell(activity.row, activity.column)
+            owner = next((occurrence for occurrence, arm in reversed(owners)
+                          if arm == 'body' and current_identity_book().page(SOURCE_ACTIVITY_NODE).latest(
+                              (value_class_scope, occurrence, 'enter'))[0] in {'For', 'AsyncFor', 'While'}), None)
+            bindings = {str(name): int(value) for name, value in environment.items()
+                        if isinstance(value, int) and not isinstance(value, bool)}
+            action = 'break' if isinstance(body_statement, ast.Break) else 'continue'
+            named_cells = tuple((name, node_identity_cell(graph, value)) for name, value in bindings.items())
+            site_cell = current_identity_book().post(SOURCE_LOOP_CONTROL_SITE, (source,),
+                (action, named_cells, owner), stage=_REDUCTION,
+                provenance=_Derived((source, activity, *(cell for _name, cell in named_cells))), mode=Mode.CONCORD)
+            # A source occurrence is the site key. Equal diagnostic spans
+            # occur for multiple generated exits and cannot own live state.
+            graph.G.graph.setdefault('loop_control_site_bindings', {})[source] = {
+                'action': action, 'bindings': bindings, 'loop_id': None,
+                'node_id': id(body_statement), 'owner_occurrence': owner,
+                'site_cell': site_cell,
             }
             return id(body_statement) if id(body_statement) in graph.G else None
         if isinstance(body_statement, ast.Expr):
@@ -19053,6 +19299,19 @@ def _normalize_lexical_values(
             ordered_graph.nodes[mapping[node_id]].setdefault(
                 "attributes", {}
             )["source_python_identity_row"] = identity_row
+    from ...compiler.concordance_declarations import SOURCE_CLOSURE_CALLABLE
+    closure_callable_page = book.page(SOURCE_CLOSURE_CALLABLE)
+    for row in tuple(closure_callable_page.scope_rows(numeric_scope)):
+        if row[1] not in mapping:
+            continue
+        book.post(
+            SOURCE_CLOSURE_CALLABLE, (numeric_scope, mapping[row[1]]),
+            closure_callable_page.latest(row), stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived((
+                book.latest_ref(SOURCE_CLOSURE_CALLABLE, row),
+                canonical_cells[row[1]],
+            )), mode=_Mode.REVISE,
+        )
     ordered_graph.add_edges_from(
         (
             mapping[source], mapping[target], attributes.copy()
@@ -19102,6 +19361,49 @@ def _normalize_lexical_values(
                     mode=_Mode.CONCORD,
                 )
     canonical_bindings: dict[str, list[tuple[int, Any]]] = {}
+    from ...compiler.concordance_declarations import (
+        SOURCE_CLOSURE_ENVIRONMENT, SOURCE_CLOSURE_CAPTURE,
+    )
+    for address, name, source_cell in pending_closure_environments:
+        parent, definition, address_cell = book.page(
+            SOURCE_CLOSURE_ENVIRONMENT
+        ).latest(source_cell.row)
+        parent_cell = book.latest_ref(
+            _NAME_BINDING, (read_scope, parent.row[1], parent.row[2]),
+        )
+        if parent_cell is None:
+            continue
+        environment_cell = book.post(
+            SOURCE_CLOSURE_ENVIRONMENT, (read_scope, address, name),
+            (parent_cell, definition, address_cell),
+            stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived((source_cell, parent_cell, definition, address_cell)),
+            mode=_Mode.CONCORD,
+        )
+        closure_environment_cells[(address, name)] = environment_cell
+    for (name, version), _cell in ingestion_binding_cells.items():
+        input_cell = book.latest_ref(_NAME_BINDING, (read_scope, name, version))
+        if input_cell is None:
+            continue
+        value = binding_page.latest(input_cell.row).value_id
+        attributes = graph.G.nodes[value].get("attributes") or {}
+        if attributes.get("binding_kind") != "closure":
+            continue
+        environment_cell = closure_environment_cells.get((
+            int(graph.G.graph["function_ref"]), name,
+        ))
+        if environment_cell is None:
+            continue
+        parent_cell, _definition, _address = book.page(
+            SOURCE_CLOSURE_ENVIRONMENT
+        ).latest(environment_cell.row)
+        book.post(
+            SOURCE_CLOSURE_CAPTURE, (read_scope, name, version),
+            (environment_cell, parent_cell, input_cell),
+            stage=_CANONICAL_RELABEL_STAGE,
+            provenance=_Derived((environment_cell, parent_cell, input_cell)),
+            mode=_Mode.CONCORD,
+        )
     for row in binding_page.scope_rows(read_scope):
         canonical_bindings.setdefault(str(row[1]), []).append(
             (int(row[2]), binding_page.latest(row))
@@ -25891,6 +26193,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         function_table.entry(owner).recursive = True
 
     lexical_free_names_by_function: dict[int, tuple[str, ...]] = {}
+    closure_environment_cells: dict = {}
     compile_substage("topology: extract lexical function graphs")
     # The bootstrap's 621 function entries share one reduced source graph.
     # Its terminal merges are already installed; function normalization below
@@ -26091,6 +26394,8 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 )
             )
         }
+        from ...transmogrifier.graph.python_special_cases import record_python_control_scopes
+        record_python_control_scopes(statement)
         for _member_id, member_data in function_graph.G.nodes(data=True):
             expression = member_data.get("expr_obj")
             if not isinstance(expression, ast.Call):
@@ -26112,6 +26417,9 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 member_data.setdefault("attributes", {}).update(
                     special_case.attributes
                 )
+                if getattr(expression, "_turing_dispatch_operation", None):
+                    member_data["type"] = special_case.type
+                    member_data["op"] = special_case.type
         # The definition may carry literal module constants and source-local
         # imports beyond the root graph's generic binding set.  Preserve that
         # exact static environment on the function graph consumed by compiled
@@ -26445,6 +26753,7 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             class_field_classes=class_field_classes,
             static_parameter_bindings=static_parameter_bindings,
             authored_definitions_by_name=authored_definitions_by_name,
+            closure_environment_cells=closure_environment_cells,
         )
         lexical_free_names_by_function.update(nested_lexical_free_names)
         generator_yields = tuple(

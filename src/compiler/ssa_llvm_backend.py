@@ -7772,8 +7772,13 @@ def emit_ssa_function_to_llvm(
     pi_epsilon: float | None = None,
     watch: _Sequence[int] = (),
     history: int = 0,
+    c_shell_control=None,
 ) -> LLVMFunctionArtifact:
     """Render one SSA function of table-covered instructions as LLVM IR.
+
+    ``c_shell_control=CShellControl(...)`` explicitly selects a mixed AOT
+    product and returns a CModuleArtifact: C orchestration with the named
+    scalar numerical sections emitted as LLVM. The default stays pure LLVM.
 
     ``text_sink`` states the target's publication capability. A shell-class
     target links ``turing_stream_buffer.c`` and takes publications as calls
@@ -7799,6 +7804,12 @@ def emit_ssa_function_to_llvm(
     shipped artifact depends on this existing.
     """
 
+    if c_shell_control is not None:
+        if watch or history or text_sink or pi_solver is not None or pi_epsilon is not None:
+            raise ValueError('C-shell control does not accept LLVM-only diagnostic/solver options')
+        from .c_shell_sections import emit_c_shell_sections
+        return emit_c_shell_sections(module, function_name, 'llvm', c_shell_control,
+                                     entry_name=entry_name)
     from .native_code_retention import build_target_from_metadata
     artifact_build_target = build_target_from_metadata(module.metadata)
     from .ssa_object_operations import validate_object_operations

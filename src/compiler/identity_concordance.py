@@ -1550,6 +1550,14 @@ class CorrelationTable:
         found.extend(self._sequence_descriptor_findings(module))
         found.extend(self._binding_kind_findings(module))
         found.extend(self._name_binding_capture_findings(module))
+        found.extend(self._source_closure_findings(module))
+        found.extend(self._source_thread_region_findings(module))
+        found.extend(self._control_activity_findings(module))
+        found.extend(self._process_graph_fact_findings(module))
+        found.extend(self._operator_safety_findings(module))
+        found.extend(self._thread_operation_findings(module))
+        found.extend(self._thread_table_findings(module))
+        found.extend(self._synchronization_findings(module))
         found.extend(self._conditional_binding_preservation_findings(module))
         found.extend(self._source_page_declaration_findings(module))
         found.extend(self._graph_work_publication_findings(module))
@@ -1590,6 +1598,915 @@ class CorrelationTable:
         # per-page kinds first; ``concordance_report`` counts these two kinds
         # on their own line.
         found.extend(self._unsourced_findings(module))
+        return found
+
+    @staticmethod
+    def _control_activity_findings(module: Any) -> list[Finding]:
+        from .concordance_declarations import (
+            SOURCE_ACTIVITY_NODE, SOURCE_ACTIVITY_EDGE, SOURCE_ACTIVITY_BINDING, SOURCE_ACTIVITY_ARM_RELATION,
+            SOURCE_ACTIVITY_SCOPE, SOURCE_ACTIVITY_POLICY, SOURCE_ACTIVITY_SCHEDULE, SOURCE_SPAN,
+            SOURCE_RESOURCE_CONVERSION, SOURCE_RESOURCE_SCOPE, SOURCE_RESOURCE_CONTROL, SOURCE_PROCESS_OPERATION, SOURCE_LOOP_CONTROL_WORK,
+            SOURCE_ACTIVITY_CHILD, SOURCE_ACTIVITY_CALL, SOURCE_ACTIVITY_CUT, SOURCE_CONTROL_OPERATOR,
+            SOURCE_CONTROL_IR, CONTROL_PROGRAM, CONTROL_BLOCK, CONTROL_BLOCK_PLACEMENT,
+            ControlBlockKind, Placement, SOURCE_LOOP_CONTROL_SITE, SOURCE_LOOP_SITE_EDGE, SOURCE_LOOP_SITE_VIEW, SOURCE_LOOP_EXIT_READ, PROCESS_GRAPH_OPERANDS, INGESTION_VALUE, SSA_CONTROL_EDGE, SSA_ARM_CONTINUATION, SSA_BLOCK,
+            DEPLOYMENT_REGION_MEMBER, MemberRole,
+        )
+        import networkx as nx
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found, graphs = [], {}
+        def value(cell):
+            return book.page(cell.page).cell(cell.row, cell.column)
+        for row in book.page(SOURCE_RESOURCE_CONVERSION).rows():
+            cell = book.latest_ref(SOURCE_RESOURCE_CONVERSION, row)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if row[0].page != SOURCE_SPAN or value(row[0]).kind != 'With' or row[0] not in sources:
+                found.append(Finding('resource-conversion', '<source>', None,
+                                     'resource conversion lost its exact authored With occurrence'))
+        for row in book.page(SOURCE_RESOURCE_SCOPE).rows():
+            cell = book.latest_ref(SOURCE_RESOURCE_SCOPE, row)
+            conversion, entry, cleanup = value(cell)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (conversion.page != SOURCE_RESOURCE_CONVERSION or row[0].page != INGESTION_VALUE
+                    or value(row[0]).type != 'Try' or entry.page != SOURCE_SPAN or cleanup.page != SOURCE_SPAN
+                    or not {row[0], conversion, entry, cleanup} <= sources):
+                found.append(Finding('resource-ingestion', '<source>', None,
+                                     'resource scope lost its conversion and exact entry/cleanup occurrences'))
+        for row in book.page(SOURCE_RESOURCE_CONTROL).rows():
+            cell = book.latest_ref(SOURCE_RESOURCE_CONTROL, row)
+            source, control, entry, cleanup, receiver = value(cell)
+            base = _canonical_identity_base(book, cell)
+            sources = {item for item, _stage in book.edges_into(base)}
+            conversion = value(source)[0]
+            recipe = value(conversion)
+            if (source.page != SOURCE_RESOURCE_SCOPE or control.page != CONTROL_BLOCK
+                    or value(control).kind != ControlBlockKind.RESOURCE_SCOPE
+                    or entry.page != SOURCE_PROCESS_OPERATION or cleanup.page != SOURCE_PROCESS_OPERATION
+                    or value(entry)[0] != recipe[1] or value(cleanup)[0] != recipe[2]
+                    or not {source, control, entry, cleanup, receiver} <= sources
+                    or source not in value(control).extra):
+                found.append(Finding('resource-control', str(row[0]), int(row[1]),
+                                     'resource control lost its placed scope, receiver or process contracts'))
+        for row in book.page(SOURCE_ACTIVITY_ARM_RELATION).rows():
+            cell = book.latest_ref(SOURCE_ACTIVITY_ARM_RELATION, row)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (row[2:] != ('body', 'finalbody') or value(cell) != 'resource_cleanup'
+                    or not any(source.page == SOURCE_RESOURCE_CONVERSION for source in sources)):
+                found.append(Finding('resource-arm-relation', str(row[0]), None,
+                                     'ordered cleanup arms lack their exact resource conversion'))
+        for row in book.page(SOURCE_LOOP_CONTROL_WORK).rows():
+            cell = book.latest_ref(SOURCE_LOOP_CONTROL_WORK, row)
+            sites, operations = value(cell)
+            base = _canonical_identity_base(book, cell)
+            sources = {source for source, _stage in book.edges_into(base)}
+            if (not sites and not operations or not {*sites, *operations} <= sources
+                    or any(operation.page != SOURCE_PROCESS_OPERATION for operation in operations)):
+                found.append(Finding('loop-control-work', str(row[0]), int(row[1]),
+                                     'region-less loop retention lacks its exact process/exit work'))
+        for row in book.page(SOURCE_ACTIVITY_NODE).rows():
+            cell = book.latest_ref(SOURCE_ACTIVITY_NODE, row)
+            kind, owners = value(cell)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (row[1].page != SOURCE_SPAN or row[1] not in sources
+                    or not isinstance(kind, str)
+                    or any(owner.page != SOURCE_SPAN or not isinstance(arm, str) for owner, arm in owners)):
+                found.append(Finding("activity-node-source", str(row[0]), None,
+                                     "activity node lacks its exact ingested source/owner identity"))
+            graphs.setdefault(row[0], nx.DiGraph()).add_node(cell)
+        for row in book.page(SOURCE_ACTIVITY_EDGE).rows():
+            scope, before, after, relation = row
+            cell = book.latest_ref(SOURCE_ACTIVITY_EDGE, row)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (before.page != SOURCE_ACTIVITY_NODE or after.page != SOURCE_ACTIVITY_NODE
+                    or before.row[0] != scope or after.row[0] != scope
+                    or not {before, after} <= sources):
+                found.append(Finding("activity-edge-source", str(scope), None,
+                                     "control edge crosses an undeclared activity scope or lacks its endpoints"))
+                continue
+            left, right = dict(value(before)[1]), dict(value(after)[1])
+            incompatible = []
+            for owner in left.keys() & right.keys():
+                if left[owner] == right[owner]:
+                    continue
+                declaration = book.latest_ref(SOURCE_ACTIVITY_ARM_RELATION,
+                    (scope, owner, left[owner], right[owner]))
+                if declaration is None or declaration not in sources or value(declaration) != relation:
+                    incompatible.append(owner)
+            if relation != "repeat" and incompatible:
+                found.append(Finding("activity-exclusive-arms", str(scope), None,
+                                     "control edge orders two mutually exclusive arms"))
+            if relation not in {"repeat", "unadmitted"}:
+                graphs[scope].add_edge(before, after)
+        for scope, graph in graphs.items():
+            if not nx.is_directed_acyclic_graph(graph):
+                found.append(Finding("activity-region-cycle", str(scope), None,
+                                     "static activity graph has an undeclared recurrence"))
+        for row in book.page(SOURCE_ACTIVITY_SCOPE).rows():
+            cell = book.latest_ref(SOURCE_ACTIVITY_SCOPE, row)
+            if value(cell) not in graphs:
+                found.append(Finding("activity-scope-view", str(row[0]), None,
+                                     "read scope names no ingested activity graph"))
+        for row in book.page(SOURCE_ACTIVITY_CHILD).rows():
+            cell = book.latest_ref(SOURCE_ACTIVITY_CHILD, row)
+            enter, leave = value(cell)
+            if (enter.row[0] != row[0] or leave.row[0] != row[0]
+                    or value(row[1])[0] not in {"List", "Tuple", "Set"}
+                    or not {row[1], enter, leave} <= {source for source, _stage in book.edges_into(cell)}):
+                found.append(Finding("activity-display-member", str(row[0]), None,
+                                     "display member lost its exact evaluation points"))
+        for row in book.page(SOURCE_ACTIVITY_CALL).rows():
+            cell = book.latest_ref(SOURCE_ACTIVITY_CALL, row)
+            arity, names = value(cell)
+            if arity < 0 or any(name is not None and not isinstance(name, str) for name in names):
+                found.append(Finding("activity-call-signature", str(row[0]), None,
+                                     "call arity/keyword facts are invalid"))
+        for row in book.page(SOURCE_ACTIVITY_BINDING).rows():
+            cell = book.latest_ref(SOURCE_ACTIVITY_BINDING, row)
+            first, last = value(cell)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (first.row[0] != row[0] or last.row[0] != row[0]
+                    or not {row[1], first, last} <= sources):
+                found.append(Finding("activity-process-binding", str(row[0]), None,
+                                     "process node lost its exact entry/completion binding"))
+        for row in book.page(SOURCE_ACTIVITY_SCHEDULE).rows():
+            cell = book.latest_ref(SOURCE_ACTIVITY_SCHEDULE, row)
+            levels = dict(value(cell)[0])
+            graph = graphs[row[0]]
+            sources = {source for source, _stage in book.edges_into(cell)}
+            policies = [source for source in sources if source.page == SOURCE_ACTIVITY_POLICY]
+            if (not any(value(policy) == row[1] for policy in policies)
+                    or set(levels) != set(graph)
+                    or any(levels.get(before, -1) >= levels.get(after, -1) for before, after in graph.edges)):
+                found.append(Finding("activity-schedule", str(row[0]), None,
+                                     "ASAP/ALAP activity arrangement violates its configured graph edges"))
+        from .control_source import DispatchBlock
+        for row in book.page(SOURCE_CONTROL_IR).rows():
+            cell = book.latest_ref(SOURCE_CONTROL_IR, row)
+            program, operators, regions, placements = value(cell)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (program.page != CONTROL_PROGRAM or not {program, *operators, *regions, *placements} <= sources):
+                found.append(Finding("source-control-ir", str(row[0]), None,
+                                     "dual IR lost its actual control program or placed block identities"))
+        for row in book.page(SOURCE_CONTROL_OPERATOR).rows():
+            cell = book.latest_ref(SOURCE_CONTROL_OPERATOR, row)
+            program, control, placement, block = value(cell)
+            if (not isinstance(block, DispatchBlock) or block.callsite_id != row[1]
+                    or control.page != CONTROL_BLOCK or value(control).kind != ControlBlockKind.DISPATCH
+                    or placement.page != CONTROL_BLOCK_PLACEMENT or not isinstance(value(placement), Placement)
+                    or placement.row[1] != control or block.operand_graph_cell is None
+                    or block.process_operation_cell not in value(control).extra
+                    or block.operand_graph_cell not in value(control).extra):
+                found.append(Finding("ingested-process-control", str(row[0]), int(row[1]),
+                                     "process operation lacks its control-IR block, placement or explicit operand graph"))
+        for row in book.page(SOURCE_ACTIVITY_CUT).rows():
+            cell = book.latest_ref(SOURCE_ACTIVITY_CUT, row)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (not any(source.page == SOURCE_ACTIVITY_SCHEDULE for source in sources)
+                    or not any(source.page == SOURCE_ACTIVITY_BINDING for source in sources)
+                    or any(source.page != SOURCE_CONTROL_OPERATOR or source not in sources for source in value(cell))):
+                found.append(Finding("activity-partition-proof", str(row[0]), int(row[1]),
+                                     "region partition lacks its exact process/activity proof"))
+        for row in book.page(SSA_CONTROL_EDGE).rows():
+            cell = book.latest_ref(SSA_CONTROL_EDGE, row)
+            scope, function, before, after, arm = row
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (before.page != SSA_BLOCK or after.page != SSA_BLOCK
+                    or before.row[:2] != (scope, function) or after.row[:2] != (scope, function)
+                    or not {before, after} <= sources or arm not in {'flow', 'body', 'orelse'}
+                    or value(cell) is not True):
+                found.append(Finding("ssa-control-edge", str(function), None,
+                                     "SSA branch lacks its exact registered endpoints"))
+        for row in book.page(SSA_ARM_CONTINUATION).rows():
+            cell = book.latest_ref(SSA_ARM_CONTINUATION, row)
+            scope, function, entry, tip = row
+            sources = {source for source, _stage in book.edges_into(cell)}
+            graph = nx.DiGraph()
+            graph.add_nodes_from((entry, tip))
+            graph.add_edges_from((source.row[2], source.row[3]) for source in sources
+                                 if source.page == SSA_CONTROL_EDGE)
+            if not {entry, tip} <= sources or value(cell) != nx.has_path(graph, entry, tip):
+                found.append(Finding("ssa-arm-continuation", str(function), None,
+                                     "arm fall-through disagrees with its concorded CFG snapshot"))
+        for row in book.page(SOURCE_LOOP_CONTROL_SITE).rows():
+            cell = book.latest_ref(SOURCE_LOOP_CONTROL_SITE, row)
+            action, bindings, owner = value(cell)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            if (row[0].page != INGESTION_VALUE or action not in {'break', 'continue'}
+                    or row[0] not in sources or owner is None or owner.page != SOURCE_SPAN
+                    or any(identity not in sources for _name, identity in bindings)):
+                found.append(Finding("loop-site-origin", "<source>", None,
+                                     "loop exit lost its exact site, lexical state or owner"))
+        for row in book.page(SOURCE_LOOP_SITE_EDGE).rows():
+            cell = book.latest_ref(SOURCE_LOOP_SITE_EDGE, row)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            site = book.latest_ref(SOURCE_LOOP_CONTROL_SITE, (row[1],))
+            if (site is None or site not in sources or row[0] not in sources
+                    or any(identity not in sources for triple in value(cell) for identity in triple)):
+                found.append(Finding("loop-site-state", "<source>", None,
+                                     "loop exit lacks its exact captured state and carried identities"))
+        for row in book.page(SOURCE_LOOP_SITE_VIEW).rows():
+            cell = book.latest_ref(SOURCE_LOOP_SITE_VIEW, row)
+            edge, triples = value(cell)
+            base = _canonical_identity_base(book, cell)
+            sources = {source for source, _stage in book.edges_into(base)}
+            if edge.page != SOURCE_LOOP_SITE_EDGE or edge not in sources:
+                found.append(Finding("loop-site-projection", str(row[0]), int(row[1]),
+                                     "local loop exit state lacks its source graph edge"))
+        for row in book.page(SOURCE_LOOP_EXIT_READ).rows():
+            cell = book.latest_ref(SOURCE_LOOP_EXIT_READ, row)
+            base = _canonical_identity_base(book, cell)
+            sources = {source for source, _stage in book.edges_into(base)}
+            if any(operands.page != PROCESS_GRAPH_OPERANDS or operands not in sources
+                   or binding.page != SOURCE_ACTIVITY_BINDING or binding not in sources
+                   for operands, binding in value(cell)):
+                found.append(Finding("loop-exit-read", str(row[0]), int(row[1]),
+                                     "loop exit read lacks its operand and control ownership proof"))
+        regions = {}
+        for row in book.page(DEPLOYMENT_REGION_MEMBER).rows():
+            if book.page(DEPLOYMENT_REGION_MEMBER).latest(row) not in {MemberRole.NODE, MemberRole.OUTPUT}:
+                continue
+            cut = book.latest_ref(SOURCE_ACTIVITY_CUT, (row[0], row[2]))
+            if cut is not None:
+                regions.setdefault(row[:2], set()).add(value(cut))
+        for row, cuts in regions.items():
+            if len(cuts) > 1:
+                found.append(Finding("activity-region-crossing", str(row[0]), int(row[1]),
+                                     "atomic region spans an authored process boundary"))
+        return found
+
+    @staticmethod
+    def _process_graph_fact_findings(module: Any) -> list[Finding]:
+        from .concordance_declarations import (
+            PROCESS_GRAPH_OPERANDS, SYNCHRONIZATION_LITERAL, SOURCE_OPERATOR_KIND,
+            SOURCE_THREAD_ARGUMENT_PACK, SOURCE_THREAD_ARGUMENT,
+            SSA_PROCESS_CALL, SOURCE_PROCESS_OPERATION,
+        )
+        from ..transmogrifier.ssa_registry import Handler
+        from .concorded_literals import _INTEGER_OPERATORS
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        def ancestors(cell):
+            visited, pending = set(), [cell]
+            while pending:
+                current = pending.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                pending.extend(source for source, _stage in book.edges_into(current))
+            return visited
+        for row in book.page(PROCESS_GRAPH_OPERANDS).rows():
+            cell = book.latest_ref(PROCESS_GRAPH_OPERANDS, row)
+            edges = book.page(PROCESS_GRAPH_OPERANDS).cell(cell.row, cell.column)
+            # Ask the exact reachability question this check needs. A region
+            # copy legitimately has the whole control graph in its ancestry;
+            # expanding that graph once per operand snapshot is quadratic.
+            # Stop only after every required identity has actually been seen.
+            required = {identity for identity, _role in edges if isinstance(identity, Ref)}
+            sources, pending = {cell}, [cell]
+            while pending and not required <= sources:
+                current = pending.pop()
+                for source, _stage in book.edges_into(current):
+                    if source not in sources:
+                        sources.add(source)
+                        pending.append(source)
+            if any(not isinstance(identity, Ref) or identity not in sources
+                   or not isinstance(role, str) for identity, role in edges):
+                found.append(Finding("process-operand-provenance", str(row[0]), row[1],
+                                     "operand snapshot lacks its exact identity causes"))
+        from .concordance_declarations import PROCESS_ESCAPE_CLASSIFICATION
+        for row in book.page(PROCESS_ESCAPE_CLASSIFICATION).rows():
+            cell = book.latest_ref(PROCESS_ESCAPE_CLASSIFICATION, row)
+            semantic, classification = book.page(PROCESS_ESCAPE_CLASSIFICATION).latest(row)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            operation = row[0]
+            if (operation.page != SOURCE_PROCESS_OPERATION or operation not in sources
+                    or classification != 'typed_graph_operation'
+                    or book.page(SOURCE_PROCESS_OPERATION).cell(operation.row, operation.column)[1] != semantic):
+                found.append(Finding('process-escape-classification', str(row), None,
+                                     'escape analysis did not read the exact typed graph operation'))
+        for row in book.page(SYNCHRONIZATION_LITERAL).rows():
+            cell = book.latest_ref(SYNCHRONIZATION_LITERAL, row)
+            operator, operands, _value = book.page(SYNCHRONIZATION_LITERAL).cell(cell.row, cell.column)
+            sources = ancestors(cell)
+            kinds = [source for source in sources if source.page == SOURCE_OPERATOR_KIND]
+            if (Handler(operator) not in _INTEGER_OPERATORS
+                    or not any(book.page(SOURCE_OPERATOR_KIND).cell(kind.row, kind.column) == operator
+                               for kind in kinds)
+                    or any(operand not in sources for operand in operands)
+                    or not any(source.page == PROCESS_GRAPH_OPERANDS for source in sources)):
+                found.append(Finding("synchronization-literal-provenance", str(row), None,
+                                     "literal decision lacks its operator and operand graph proof"))
+        from .ssa_record_return_state import ssa_value_identity_cell
+        for name, function in module.functions.items():
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.res is None:
+                        continue
+                    result = ssa_value_identity_cell(function, instruction.res.id, book=book)
+                    cell = book.latest_ref(SSA_PROCESS_CALL, (result,))
+                    if cell is None:
+                        continue
+                    call = book.page(SSA_PROCESS_CALL).cell(cell.row, cell.column)
+                    source = book.page(SOURCE_PROCESS_OPERATION).cell(call.source.row, call.source.column)
+                    if (call.semantic != instruction.op or source[1] != call.semantic
+                            or source[2] != call.result_dtype or call.result_dtype != instruction.res.dtype
+                            or call.argument_ids != tuple(value.id for value in instruction.args)):
+                        found.append(Finding("ssa-process-call", str(name), instruction.res.id,
+                                             "SSA process instruction disagrees with its concorded call contract"))
+        for row in book.page(SOURCE_THREAD_ARGUMENT_PACK).rows():
+            cell = book.latest_ref(SOURCE_THREAD_ARGUMENT_PACK, row)
+            bindings = book.page(SOURCE_THREAD_ARGUMENT_PACK).cell(cell.row, cell.column)
+            sources = ancestors(cell)
+            if any(binding.page != SOURCE_THREAD_ARGUMENT or binding.row != (row[0], position)
+                   or binding not in sources for position, binding in enumerate(bindings)):
+                found.append(Finding("thread-argument-pack", str(row), None,
+                                     "worker argument pack disagrees with its ordered binding cells"))
+        return found
+
+    @staticmethod
+    def _operator_safety_findings(module: Any) -> list[Finding]:
+        from .concordance_declarations import (
+            COMPILE_POLICY, C_OPERATOR_SAFETY, SOURCE_EXCEPTION_OPERATION,
+            SOURCE_PROCESS_OPERATION, C_EXCEPTION_OPERATION, SOURCE_EXCEPTION_INGESTION, SOURCE_EXCEPTION_NODE, INGESTION_VALUE, SOURCE_SPAN,
+        )
+        from ..transmogrifier.operator_safety import OPERATOR_FAILURE_ARMS
+        from .thread_operations import PROCESS_OPERATORS
+        from .emission_concordance import value_cell
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found, instructions = [], {}
+        def fact(cell):
+            return book.page(cell.page).cell(cell.row, cell.column)
+        for row in book.page(SOURCE_EXCEPTION_INGESTION).rows():
+            cell = book.latest_ref(SOURCE_EXCEPTION_INGESTION, row)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            import hashlib
+            original, _converted, _checks = fact(cell)
+            if (row[0].page != SOURCE_SPAN or row[0] not in sources
+                    or hashlib.sha256(original.encode()).hexdigest() != fact(row[0]).dump_sha256):
+                found.append(Finding("exception-ingestion-origin", "<source>", None,
+                                     "exception conversion lost its exact authored definition"))
+        for row in book.page(SOURCE_EXCEPTION_NODE).rows():
+            cell = book.latest_ref(SOURCE_EXCEPTION_NODE, row)
+            conversion = fact(cell)
+            if (row[0].page != INGESTION_VALUE or conversion.page != SOURCE_EXCEPTION_INGESTION
+                    or conversion not in {source for source, _stage in book.edges_into(row[0])}
+                    or not {row[0], conversion} <= {source for source, _stage in book.edges_into(cell)}):
+                found.append(Finding("exception-ingestion-node", "<source>", None,
+                                     "generated exception node lacks its ingestion conversion"))
+        for name, fn in module.functions.items():
+            for block in fn.blocks.values():
+                for instruction in block.instrs:
+                    attrs = instruction.attributes or {}
+                    if instruction.op in OPERATOR_FAILURE_ARMS and "operator_safety_arms" in attrs:
+                        policy = attrs.get("operator_safety_policy")
+                        enabled = attrs["operator_safety_arms"]
+                        if (not isinstance(policy, Ref) or policy.page != COMPILE_POLICY
+                                or policy.row != ("operator_safety_arms",)
+                                or fact(policy) != ("on" if enabled else "off")):
+                            found.append(Finding("ssa-operator-safety-policy", name, instruction.res.id,
+                                                 "division safety arms disagree with their compiler option"))
+                        if enabled and (not attrs.get("effectful") or not attrs.get("ordered_effect")):
+                            found.append(Finding("ssa-operator-safety-effect", name, instruction.res.id,
+                                                 "division lost its ordered failure effect"))
+                        cell = value_cell(book, fn, instruction.res)
+                        if cell is not None: instructions[(cell, name)] = instruction
+                    source = attrs.get("exception_operation_cell")
+                    if source is not None:
+                        data = fact(source)
+                        if (source.page != SOURCE_EXCEPTION_OPERATION or not data
+                                or data[0] != attrs.get("dispatch_operation")
+                                or not isinstance(data[4], Ref)
+                                or data[4].page != SOURCE_PROCESS_OPERATION
+                                or data[4] not in {x for x, _stage in book.edges_into(source)}):
+                            found.append(Finding("ssa-exception-provenance", name, instruction.res.id,
+                                                 "exception operation lost its process-graph origin"))
+        for row in book.page(C_OPERATOR_SAFETY).rows():
+            data = book.page(C_OPERATOR_SAFETY).latest(row)
+            instruction = instructions.get(row)
+            if (instruction is None or data != (instruction.op, tuple(a.id for a in instruction.args),
+                                                instruction.failure_arms_for(book), instruction.attributes["operator_safety_policy"])):
+                found.append(Finding("c-operator-safety", str(row[1]), None,
+                                     "C division arms disagree with the SSA operator definition"))
+        for row in book.page(C_EXCEPTION_OPERATION).rows():
+            source, name, _result = row
+            data = book.page(C_EXCEPTION_OPERATION).latest(row)
+            if (source.page != SOURCE_EXCEPTION_OPERATION
+                    or PROCESS_OPERATORS.get(fact(source)[0]) != data[0]):
+                found.append(Finding("c-exception-provenance", str(name), None,
+                                     "C exception operation disagrees with its source identity"))
+        return found
+
+    @staticmethod
+    def _thread_table_findings(module: Any) -> list[Finding]:
+        from .concordance_declarations import (
+            SOURCE_THREAD_BODY, SOURCE_THREAD_ACTIVATION, SSA_THREAD_BODY,
+            SOURCE_CLOSURE_CAPTURE, SOURCE_THREAD_ARGUMENT, SOURCE_AGGREGATE_LAYOUT, NAME_BINDING,
+        )
+        table = getattr(module, "thread_table", None)
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if table is None:
+            return []
+        found = []
+        if table.book is not book or table.module is not module:
+            found.append(Finding("thread-table-owner", "<module>", None,
+                                 "thread table does not use this module's concordance"))
+            return found
+        def value(cell):
+            return book.page(cell.page).cell(cell.row, cell.column)
+        for row in book.page(SOURCE_THREAD_ARGUMENT).rows():
+            activation, position = row
+            actual, formal, layout_cell = book.page(SOURCE_THREAD_ARGUMENT).latest(row)
+            cell = book.latest_ref(SOURCE_THREAD_ARGUMENT, row)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            layout = value(layout_cell)
+            if (activation.page != SOURCE_THREAD_ACTIVATION or formal.page != NAME_BINDING
+                    or layout_cell.page != SOURCE_AGGREGATE_LAYOUT
+                    or layout.aggregate_kind != "tuple" or not 0 <= position < len(layout.members)
+                    or layout.members[position].value_cell != actual
+                    or not {activation, actual, formal, layout_cell} <= sources):
+                found.append(Finding("thread-argument-provenance", str(activation), None,
+                                     "worker argument disagrees with its exact tuple member or formal binding"))
+        for body, (reference, nodes, captures) in table.bodies.items():
+            sources = {source for source, _stage in book.edges_into(body)}
+            if not {body.row[0], *nodes, *captures} <= sources:
+                found.append(Finding("thread-body-provenance", str(reference), None,
+                                     "worker body lacks its address, source nodes or captures"))
+            if value(body.row[0]) != reference:
+                found.append(Finding("thread-body-address", str(reference), None,
+                                     "worker body disagrees with its function address"))
+            for capture in captures:
+                if capture.page != SOURCE_CLOSURE_CAPTURE or value(capture) is None:
+                    found.append(Finding("thread-body-capture", str(reference), None,
+                                         "worker body has no exact closure binding"))
+        from .concordance_declarations import LOWERED_SOURCE_FUNCTION
+        for cell, (reference, _captures, entry) in table.ssa_bodies.items():
+            body, name = cell.row
+            function = module.functions.get(name)
+            materialized = book.page(LOWERED_SOURCE_FUNCTION).latest((name,))
+            if (body.page != SOURCE_THREAD_BODY or value(body)[0] != reference
+                    or function is None or materialized is None
+                    or value(materialized[0]) != reference or materialized[2] != entry
+                    or entry not in function.blocks):
+                found.append(Finding("thread-body-ssa", str(name), None,
+                                     "worker table does not identify its actual SSA function"))
+        for cell, (source, handle, arguments, targets) in table.ssa_activations.items():
+            name, site = cell.row
+            creates = [i for b in module.functions[name].blocks.values() for i in b.instrs
+                       if i.op == "ThreadCreate" and i.attributes.get("source_callsite_id") == site]
+            source_fact = value(source)
+            if (source.page != SOURCE_THREAD_ACTIVATION or source_fact is None or len(creates) != 1
+                    or not targets or any(t.page != SSA_THREAD_BODY or t.row[0] != source_fact[0] for t in targets)
+                    or creates[0].res.id != handle or tuple(a.id for a in creates[0].args) != arguments):
+                found.append(Finding("thread-activation-ssa", str(name), int(site),
+                                     "thread handle or context disagrees with its body table"))
+        indexed_sites = {cell.row for cell in table.ssa_activations}
+        for name, function in module.functions.items():
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.op == "ThreadCreate" and (name, instruction.attributes.get("source_callsite_id")) not in indexed_sites:
+                        found.append(Finding("thread-activation-missing", name, instruction.res.id,
+                                             "SSA ThreadCreate has no thread-table row"))
+        for cell, (actual, formal, actual_members, formal_members, status) in table.contexts.items():
+            activation, capture, caller, worker = cell.row
+            _environment, parent_binding, input_binding = value(capture)
+            from .concordance_declarations import NAME_BINDING
+            if (actual != book.page(NAME_BINDING).cell(parent_binding.row, parent_binding.column).value_id
+                    or formal != book.page(NAME_BINDING).cell(input_binding.row, input_binding.column).value_id
+                    or status not in {"live", "unused"}):
+                found.append(Finding("thread-context-binding", str(caller), int(actual),
+                                     "thread context disagrees with its exact source capture"))
+            has_formal = bool(
+                {member for member, _roles in formal_members} & {a.id for a in module.functions[worker].args}
+            )
+            if (status == "live") != has_formal:
+                found.append(Finding("thread-context-formal", str(worker), int(formal),
+                                     "thread context liveness disagrees with the worker signature"))
+        from .concordance_declarations import C_THREAD_ACTIVATION, SSA_THREAD_ACTIVATION
+        for row in book.page(C_THREAD_ACTIVATION).rows():
+            activation = row[0]
+            worker, bindings, lifetime = book.page(C_THREAD_ACTIVATION).latest(row)
+            source = book.page(SSA_THREAD_ACTIVATION).cell(activation.row, activation.column)
+            if (source is None or worker not in {target.row[1] for target in source[3]}
+                    or worker not in module.functions
+                    or tuple(binding[0] for binding in bindings) != tuple(v.id for v in module.functions[worker].args)
+                    or lifetime != "join_before_owner_return"):
+                found.append(Finding("c-thread-policy", str(worker), None,
+                                     "C thread entry or context disagrees with its SSA table"))
+        from .concordance_declarations import C_THREAD_EXTENTS
+        for row in book.page(C_THREAD_EXTENTS).rows():
+            caller, worker, mode, lifetime = book.page(C_THREAD_EXTENTS).latest(row)
+            policy = book.page(C_THREAD_ACTIVATION).latest(row)
+            if (policy is None or policy[0] != worker or row[0].row[0] != caller
+                    or mode != "borrow_invocation_extents" or lifetime != policy[2]):
+                found.append(Finding("c-thread-extents", str(worker), None,
+                                     "worker extent context lacks its exact joined activation"))
+        return found
+
+    @staticmethod
+    def _thread_operation_findings(module: Any) -> list[Finding]:
+        from .thread_operations import PROCESS_OPERATORS, PROCESS_RESULT_DTYPES
+        from .concordance_declarations import SOURCE_PROCESS_OPERATION
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        found = []
+        for name, function in module.functions.items():
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    attributes = instruction.attributes or {}
+                    operation = attributes.get("dispatch_operation")
+                    semantic = PROCESS_OPERATORS.get(operation)
+                    from .synchronization import SYNCHRONIZATION_SPECS
+                    if (instruction.op in {spec.operator for spec in SYNCHRONIZATION_SPECS.values()}
+                            and attributes.get('synchronization_receipt') is not None):
+                        # Composed synchronization uses SSA_SYNCHRONIZATION,
+                        # not the single-instruction SSA_PROCESS_CALL contract.
+                        # Its exact source/projections/effects are checked by
+                        # _synchronization_findings below.
+                        continue
+                    if semantic is None and instruction.op not in PROCESS_RESULT_DTYPES:
+                        continue
+                    if instruction.op != semantic:
+                        found.append(Finding("ssa-thread-operation", name, None,
+                                             "source thread operation did not retain its semantic SSA operator"))
+                    if instruction.res is None or instruction.res.dtype != PROCESS_RESULT_DTYPES.get(semantic):
+                        found.append(Finding("ssa-thread-result", name, None,
+                                             "thread operation result disagrees with its declared handle/status contract"))
+                    if not attributes.get("effectful") or not attributes.get("ordered_effect"):
+                        found.append(Finding("ssa-thread-effect", name, None,
+                                             "thread operation lost its ordered effect contract"))
+                    if book is not None:
+                        cell = attributes.get("source_process_cell")
+                        fact = (None if cell is None or cell.page != SOURCE_PROCESS_OPERATION else
+                                book.page(SOURCE_PROCESS_OPERATION).cell(cell.row, cell.column))
+                        if fact is None or fact[:3] != (operation, semantic, PROCESS_RESULT_DTYPES.get(semantic)):
+                            found.append(Finding("ssa-process-provenance", name, None,
+                                                 "process operation lost its exact ingestion contract"))
+        return found
+
+    @staticmethod
+    def _synchronization_findings(module: Any) -> list[Finding]:
+        from .concordance_declarations import SOURCE_SYNCHRONIZATION, SSA_SYNCHRONIZATION, LOCK_BOX_ENTRY, SOURCE_MUTEX_BINDING, SOURCE_PROCESS_OPERATION
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        lock_box = getattr(module, "lock_box", None)
+        if lock_box is not None and lock_box.book is not book:
+            found.append(Finding("ssa-lock-box-owner", "<module>", None, "lock box belongs to a different concordance"))
+        for row in book.page(SOURCE_MUTEX_BINDING).rows():
+            entry = book.page(SOURCE_MUTEX_BINDING).latest(row)
+            if entry.page != LOCK_BOX_ENTRY or book.page(LOCK_BOX_ENTRY).cell(entry.row, entry.column) is None:
+                found.append(Finding("source-mutex-binding", str(row[0]), int(row[1]), "mutex binding has no lock-box entry"))
+        operators = {"MemoryBarrier", "ControlBarrier", "LatchCreate", "LatchArrive",
+                     "LatchWait", "LatchSignal", "LatchReset", "CompletionWait",
+                     "MutexCreate", "MutexAcquire", "MutexAcquired", "MutexToken", "MutexRelease", "MutexLocked"}
+        operators.update({"WorkerToken", "BarrierCreate", "BarrierWait", "BarrierAbort", "BarrierReset"})
+        operators.update({"MutexSuspend", "MutexRestore", "WaiterRegister", "WaiterSelect",
+                          "WaiterRetire", "LatchWaitTimeout", "LatchDestroy", "WaitQueueCreate", "WaitQueueMutex"})
+        live_projections = {}
+        for name, function in module.functions.items():
+            literals = {instruction.res.id: instruction.attributes.get("value")
+                        for block in function.blocks.values() for instruction in block.instrs
+                        if instruction.op == "Const" and instruction.res is not None}
+            for block in function.blocks.values():
+                previous = None
+                for instruction in block.instrs:
+                    if instruction.op not in operators:
+                        continue
+                    attributes = instruction.attributes or {}
+                    entry = attributes.get("lock_box_entry")
+                    if instruction.op.startswith(("Mutex", "WaitQueue", "Waiter")):
+                        if entry is None or entry.page != LOCK_BOX_ENTRY or book.page(LOCK_BOX_ENTRY).cell(entry.row, entry.column) is None:
+                            found.append(Finding("ssa-lock-box-binding", name, None,
+                                                 "mutex operation has no authoritative token-lock entry"))
+                    contract = attributes.get("synchronization_contract")
+                    receipt = attributes.get("synchronization_receipt")
+                    if contract is None or receipt is None:
+                        found.append(Finding("ssa-sync-provenance", name, None,
+                                             "synchronization operation has no source contract/SSA receipt"))
+                        continue
+                    live_projections[receipt] = (name, instruction)
+                    fact = book.page(SSA_SYNCHRONIZATION).cell(receipt.row, receipt.column)
+                    source = book.page(SOURCE_SYNCHRONIZATION).cell(contract.row, contract.column)
+                    if source[0].startswith('barrier_'):
+                        from .concordance_declarations import SOURCE_THREAD_BARRIER_POLICY
+                        policy = book.latest_ref(SOURCE_THREAD_BARRIER_POLICY, ('threading.Barrier.wait',))
+                        causes = {cause for cause, _stage in book.edges_into(contract)}
+                        constants = dict(source[3])
+                        if (policy is None or policy not in causes or constants.get('execution_scope') != 257
+                                or source[0] == 'barrier_wait' and (
+                                    constants.get('memory_scope') != 257 or constants.get('memory_semantics') != 8)):
+                            found.append(Finding('ssa-host-barrier-policy', name, instruction.res.id,
+                                                 'native barrier source lost its declared host object/effect policy'))
+                    if source[0].startswith("condition_"):
+                        identities = {
+                            "condition_create": {"threading.Condition"},
+                            "condition_acquire": {"threading.Condition.acquire", "threading.Condition.__enter__"},
+                            "condition_release": {"threading.Condition.release", "threading.Condition.__exit__"},
+                            "condition_wait": {"threading.Condition.wait"},
+                            "condition_notify": {"threading.Condition.notify"},
+                            "condition_notify_all": {"threading.Condition.notify_all"},
+                        }
+                        process_causes = [book.page(SOURCE_PROCESS_OPERATION).cell(cell.row, cell.column)
+                                          for cell, _stage in book.edges_into(contract)
+                                          if cell.page == SOURCE_PROCESS_OPERATION]
+                        if not any(cause[0] == source[0] and cause[3] in identities[source[0]]
+                                   for cause in process_causes):
+                            found.append(Finding("ssa-condition-source", name, instruction.res.id,
+                                                 "Condition projection lacks its exact Python process identity"))
+                    if source[0] == "condition_create":
+                        from ..transmogrifier.ssa import SSALockBox
+                        descriptor = (None if entry is None else book.page(LOCK_BOX_ENTRY).cell(
+                            entry.row, entry.column))
+                        constants = dict(source[3])
+                        arguments = dict(zip(instruction.arg_roles, instruction.args))
+                        owned = constants["owns_mutex"]
+                        invalid = (descriptor is None or
+                            (owned and (instruction.op != "MutexCreate" or entry.row != (source[5],)
+                                or len(descriptor) != 5 or descriptor[0] is not True
+                                or descriptor[3] != SSALockBox.CONDITION_STATE_COLUMNS
+                                or descriptor[4] != SSALockBox.CONDITION_INITIAL_STATE
+                                or descriptor[1][0] != constants.get("execution_scope"))))
+                        if not owned:
+                            supplied = source[4][source[1].index("lock")]
+                            invalid = invalid or instruction.op != "WaitQueueCreate" or (
+                                book.page(SOURCE_MUTEX_BINDING).latest((contract.row[0], int(supplied.row[1]))) != entry)
+                        if invalid or any(role not in arguments or literals.get(arguments[role].id) != constants.get(role)
+                                          for role in (("execution_scope", "reentrant") if owned else ("execution_scope",))):
+                            found.append(Finding("ssa-condition-state", name, instruction.res.id,
+                                                 "Condition constructor disagrees with its lock-box layout/initial state"))
+                    expected = (contract, instruction.op, attributes.get("synchronization_phase"),
+                                tuple(instruction.arg_roles), tuple(value.id for value in instruction.args),
+                                None if instruction.res is None else instruction.res.id)
+                    if fact != expected or (instruction.op, attributes.get("synchronization_phase")) not in {
+                        (operator, phase) for operator, phase, _semantics in source[2]
+                    }:
+                        found.append(Finding("ssa-sync-contract", name, None,
+                                             "synchronization instruction disagrees with its exact source projection"))
+                    if previous is not None and (not instruction.arg_roles or instruction.arg_roles[-1] != "after"
+                                                 or instruction.args[-1].id != previous):
+                        found.append(Finding("ssa-sync-order", name, None,
+                                             "synchronization chain lost its preceding activity"))
+                    previous = None if instruction.res is None else instruction.res.id
+                    if not attributes.get("effectful") or not attributes.get("ordered_effect"):
+                        found.append(Finding("ssa-sync-effect", name, previous,
+                                             "synchronization operation lost its effect boundary"))
+        from .concordance_declarations import SSA_SYNCHRONIZATION_PROCEDURE, SSA_CONTROL_EDGE, C_SYNCHRONIZATION_POLICY
+        for row in book.page(SSA_SYNCHRONIZATION_PROCEDURE).rows():
+            contract, name, entry = row
+            kind, result_id, exit_cell, receipts, edges = book.page(SSA_SYNCHRONIZATION_PROCEDURE).latest(row)
+            source = book.page(SOURCE_SYNCHRONIZATION).cell(contract.row, contract.column)
+            actual = {(live_projections[cell][1].op,
+                       live_projections[cell][1].attributes.get("synchronization_phase"))
+                      for cell in receipts if cell in live_projections}
+            expected = {(op, phase) for op, phase, _semantics in source[2]}
+            function = module.functions.get(name)
+            from .ssa_record_return_state import function_scope_of
+            from .concordance_declarations import SSA_VALUE
+            result_cell = (None if function is None else book.latest_ref(
+                SSA_VALUE, (function_scope_of(function), result_id)))
+            result_fact = (None if result_cell is None else book.page(SSA_VALUE).cell(
+                result_cell.row, result_cell.column))
+            # The source outcome remains a typed value identity even when its
+            # unused pure Phi/None materialization is reduced away. Procedure
+            # effects and CFG must survive; a discarded return value need not
+            # retain a physical register/definition in the reduced body.
+            expected_dtype = "bool" if kind == "condition_wait" else "none"
+            if (kind != source[0] or actual != expected or any(
+                    cell not in live_projections or live_projections[cell][0] != name for cell in receipts)
+                    or function is None or entry.row[2] not in function.blocks
+                    or exit_cell.row[2] not in function.blocks
+                    or result_fact is None or result_fact.dtype != expected_dtype):
+                found.append(Finding("ssa-sync-procedure", name, result_id,
+                                     "synchronization body lost its exact projections/result/control extent"))
+            for edge in edges:
+                if (edge.page != SSA_CONTROL_EDGE or edge.row[1] != name
+                        or not book.page(SSA_CONTROL_EDGE).cell(edge.row, edge.column)
+                        or function is None or edge.row[3].row[2] not in function.blocks[edge.row[2].row[2]].successors):
+                    found.append(Finding("ssa-sync-procedure-edge", name, result_id,
+                                         "synchronization procedure disagrees with an actual CFG edge"))
+        from .c_synchronization import NATIVE_PRIMITIVES
+        for row in book.page(C_SYNCHRONIZATION_POLICY).rows():
+            policy = book.page(C_SYNCHRONIZATION_POLICY).latest(row)
+            if policy[4] != "host_synchronization":
+                continue
+            selected = live_projections.get(row[0])
+            if selected is None or NATIVE_PRIMITIVES.get(selected[1].op) != policy[0] or policy[2] not in {4, 256, 257}:
+                found.append(Finding("c-sync-policy", "<module>", None,
+                                     "native synchronization selection lost its exact SSA projection"))
+                continue
+            instruction = selected[1]
+            contract = instruction.attributes["synchronization_contract"]
+            source = book.page(SOURCE_SYNCHRONIZATION).cell(contract.row, contract.column)
+            constants = dict(source[3])
+            order = constants.get("memory_semantics", 0) if "memory_semantics" in instruction.arg_roles else 0
+            for operator, phase, semantics in source[2]:
+                if (operator, phase) == (instruction.op, instruction.attributes["synchronization_phase"]) and semantics is not None:
+                    order = semantics
+            if policy[3] != order or policy[2] != constants.get("memory_scope", constants.get("execution_scope", 257)):
+                found.append(Finding("c-sync-order", selected[0], instruction.res.id,
+                                     "native synchronization changed its explicit source scope/order"))
+        return found
+
+    @staticmethod
+    def _source_thread_region_findings(module: Any) -> list[Finding]:
+        """Check each retained graph view against its authoritative cells."""
+        from .concordance_declarations import (
+            SOURCE_THREAD_REGION_MEMBER, SOURCE_THREAD_REGION_EDGE,
+            SOURCE_SYNC_OPERATOR, SOURCE_THREAD_REGION_SCHEDULE,
+            SOURCE_THREAD_REGION_CONTROL, SOURCE_ACTIVITY_BINDING, SOURCE_ACTIVITY_NODE,
+            SOURCE_ACTIVITY_EDGE, SOURCE_CONTROL_IR, SOURCE_THREAD_BARRIER_POLICY,
+            SOURCE_EXTRACTION_IDENTITY, SOURCE_CLOSURE_CALLABLE,
+        )
+        metadata = getattr(module, "metadata", {}) or {}
+        book = metadata.get("identity_book")
+        if book is None:
+            return []
+        found = []
+        for region in metadata.get("source_thread_regions", ()):
+            scope = region.dependency_graph.G.graph["thread_region_scope"]
+            expected_tokens = []
+            for create, start, join, _target in region.activations:
+                parent_key = next(key for key in region.member_ids if key[0] is None and key[2] == create)
+                create_member = region.member_ids[parent_key]
+                token = book.page(SOURCE_THREAD_REGION_MEMBER).latest((scope, create_member))[0]
+                expected_tokens.append(token)
+                for source in (create, start, join):
+                    node = region.member_ids[(None, parent_key[1], source)]
+                    for graph in (region.dependency_graph, region.control_graph):
+                        if graph.G.nodes[node]["attributes"].get("dispatch_worker_token") != token:
+                            found.append(Finding("source-thread-worker-token", str(scope), node,
+                                                 "lifecycle operation disagrees with its exact worker token"))
+            for half, graph in (("dependency", region.dependency_graph), ("control", region.control_graph)):
+                if graph.G.graph.get("worker_tokens") != tuple(expected_tokens):
+                    found.append(Finding("source-thread-worker-token", str(scope), None,
+                                         f"{half} worker identities disagree with source activations"))
+                declared = {(row[2], row[3]) for row in book.page(SOURCE_THREAD_REGION_EDGE).scope_rows(scope)
+                            if row[1] == half}
+                declared_nodes = {row[1] for row in book.page(SOURCE_THREAD_REGION_MEMBER).scope_rows(scope)}
+                if declared_nodes != set(graph.G):
+                    found.append(Finding('source-thread-region-members', str(scope), None,
+                                         f'{half} membership disagrees with its concorded node set'))
+                if declared != set(graph.G.edges):
+                    found.append(Finding("source-thread-region-edges", str(scope), None,
+                                         f"{half} topology disagrees with its concorded edges"))
+                for node, data in graph.G.nodes(data=True):
+                    member = book.latest_ref(SOURCE_THREAD_REGION_MEMBER, (scope, node))
+                    if member is None:
+                        found.append(Finding("source-thread-region-member", str(scope), node,
+                                             "graph operation has no concorded source membership"))
+                    elif (data.get("attributes") or {}).get("worker_token") != book.page(SOURCE_THREAD_REGION_MEMBER).cell(member.row, member.column)[1]:
+                        found.append(Finding("source-thread-worker-token", str(scope), node,
+                                             "graph operation disagrees with its concorded worker owner"))
+                    projection = (data.get("attributes") or {}).get("control_projection")
+                    if projection is not None:
+                        program, binding, enter, leave = book.page(SOURCE_THREAD_REGION_CONTROL).cell(projection.row, projection.column)
+                        points = book.page(SOURCE_ACTIVITY_BINDING).cell(binding.row, binding.column)
+                        enter_source = book.page(SOURCE_THREAD_REGION_MEMBER).latest((scope, enter))[0]
+                        leave_source = book.page(SOURCE_THREAD_REGION_MEMBER).latest((scope, leave))[0]
+                        causes = {source for source, _stage in book.edges_into(projection)}
+                        if (program.page != SOURCE_CONTROL_IR or tuple(points) != (enter_source, leave_source)
+                                or not {program, binding, member} <= causes
+                                or not region.control_graph.G.has_edge(leave, node)):
+                            found.append(Finding('source-thread-control-projection', str(scope), node,
+                                                 'resident control ports disagree with ingested ownership'))
+                    if data.get('type') == 'ControlActivity':
+                        source = (data.get('attributes') or {}).get('source_activity')
+                        fact = None if source is None else book.page(SOURCE_ACTIVITY_NODE).cell(source.row, source.column)
+                        if (source is None or member is None
+                                or source != book.page(SOURCE_THREAD_REGION_MEMBER).cell(member.row, member.column)[0]
+                                or fact[1] != data['attributes'].get('control_owners')
+                                or fact[0] != data['attributes'].get('source_kind')):
+                            found.append(Finding('source-thread-control-owner', str(scope), node,
+                                                 'copied control activity lost its source region/arm'))
+                    sync = (data.get("attributes") or {}).get("sync_operator")
+                    # A copied standalone memory fence has no rendezvous
+                    # projection. Only the paired authored Barrier.wait facts
+                    # require one shared SOURCE_SYNC_OPERATOR identity.
+                    paired = sync is not None or (data.get("attributes") or {}).get(
+                        "extraction_identity") == "threading.Barrier.wait"
+                    if data.get("type") in {"ControlBarrier", "MemoryBarrier"} and paired:
+                        other = region.control_graph if half == "dependency" else region.dependency_graph
+                        if sync is None or (other.G.nodes[node].get("attributes") or {}).get("sync_operator") != sync:
+                            found.append(Finding("source-sync-projection", str(scope), node,
+                                                 "control/memory projections do not share one operator identity"))
+                        elif book.page(SOURCE_SYNC_OPERATOR).cell(sync.row, sync.column)[3][1] != book.page(SOURCE_SYNC_OPERATOR).cell(sync.row, sync.column)[2]:
+                            found.append(Finding("source-sync-scope", str(scope), node,
+                                                 "barrier scope disagrees with its exact source object"))
+            # An excluded recurrence must come from an actual source repeat
+            # edge, not a role assigned to conceal a scheduling cycle.
+            for row in book.page(SOURCE_THREAD_REGION_EDGE).scope_rows(scope):
+                roles, causes = book.page(SOURCE_THREAD_REGION_EDGE).latest(row)
+                roles = (roles,) if isinstance(roles, str) else roles
+                if any(role in {'repeat', 'control:repeat'} for role in roles):
+                    pending, seen, repeats = list(causes), set(), []
+                    while pending:
+                        cause = pending.pop()
+                        if cause in seen:
+                            continue
+                        seen.add(cause)
+                        if cause.page == SOURCE_ACTIVITY_EDGE and cause.row[3] == 'repeat':
+                            repeats.append(cause)
+                        elif cause.page == SOURCE_THREAD_REGION_EDGE:
+                            pending.extend(book.page(cause.page).cell(cause.row, cause.column)[1])
+                    left = book.page(SOURCE_THREAD_REGION_MEMBER).latest((scope, row[2]))[0]
+                    right = book.page(SOURCE_THREAD_REGION_MEMBER).latest((scope, row[3]))[0]
+                    completion = book.page(SOURCE_THREAD_REGION_CONTROL).latest((scope, row[2]))
+                    if completion is not None:
+                        left = book.page(SOURCE_THREAD_REGION_MEMBER).latest((scope, completion[3]))[0]
+                    if not any(repeat.row[1:3] == (left, right) for repeat in repeats):
+                        found.append(Finding('source-thread-repeat', str(scope), row[2],
+                                             'repeat endpoints disagree with their ingested loop backedge'))
+            for row in book.page(SOURCE_SYNC_OPERATOR).scope_rows(scope):
+                sync = book.latest_ref(SOURCE_SYNC_OPERATOR, row)
+                fact = book.page(SOURCE_SYNC_OPERATOR).latest(row)
+                if fact[6] == 'source_host_participant_policy':
+                    policy = book.latest_ref(SOURCE_THREAD_BARRIER_POLICY, ('threading.Barrier.wait',))
+                    causes = {source for source, _stage in book.edges_into(sync)}
+                    callable_proofs = {book.page(source.page).cell(source.row, source.column)
+                                       if source.page == SOURCE_EXTRACTION_IDENTITY
+                                       else book.page(source.page).cell(source.row, source.column)[0]
+                                       for source in causes if source.page in {SOURCE_EXTRACTION_IDENTITY, SOURCE_CLOSURE_CALLABLE}}
+                    if (policy is None or policy not in causes
+                            or not {'threading.Barrier', 'threading.Barrier.wait'} <= callable_proofs
+                            or fact[3:6] != (('barrier_participants', fact[2]),
+                                            ('barrier_participant_effects', fact[2]), 8)):
+                        found.append(Finding('source-thread-barrier-policy', str(scope), row[1],
+                                             'host barrier lost its exact participant scope or acquire/release policy'))
+            for row in book.page(SOURCE_THREAD_REGION_SCHEDULE).scope_rows(scope):
+                schedules = book.page(SOURCE_THREAD_REGION_SCHEDULE).latest(row)
+                for half, levels in zip(('dependency', 'control'), schedules):
+                    graph = region.scheduling_graph(half)
+                    levels = dict(levels)
+                    if (set(levels) != set(graph)
+                            or any(levels[a] >= levels[b] for a, b in graph.edges if a in levels and b in levels)):
+                        found.append(Finding("source-thread-region-schedule", str(scope), None,
+                                             f"{row[1]} levels violate the retained graph constraints"))
+        return found
+
+    @staticmethod
+    def _source_closure_findings(module: Any) -> list[Finding]:
+        """A closure capture must join the exact parent and input bindings.
+
+        These pages are ingestion facts even when the worker has no SSA
+        body yet. Audit the book itself rather than reconstructing captures
+        from function names or signature positions.
+        """
+        from .concordance_declarations import (
+            NAME_BINDING, SOURCE_CLOSURE_ENVIRONMENT, SOURCE_CLOSURE_CAPTURE,
+            SOURCE_CLOSURE_CALLABLE, SOURCE_EXTRACTION_IDENTITY, INGESTION_VALUE,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+
+        def value(ref):
+            return book.page(ref.page).cell(ref.row, ref.column)
+
+        def check(page, row, required, detail):
+            cell = book.latest_ref(page, row)
+            sources = {source for source, _ in book.edges_into(cell)}
+            if not set(required) <= sources:
+                found.append(Finding("source-closure-provenance", str(row[0]), None, detail))
+
+        for row in book.page(SOURCE_EXTRACTION_IDENTITY).rows():
+            identity = value(book.latest_ref(SOURCE_EXTRACTION_IDENTITY, row))
+            check(SOURCE_EXTRACTION_IDENTITY, row, (row[0],),
+                  'external callable identity lacks its ingested source node')
+            if row[0].page != INGESTION_VALUE or not isinstance(identity, str) or not identity:
+                found.append(Finding('source-extraction-identity', str(row), None,
+                                     'external callable identity is not an ingested classification'))
+        for row in book.page(SOURCE_CLOSURE_ENVIRONMENT).rows():
+            parent, definition, address = book.page(SOURCE_CLOSURE_ENVIRONMENT).latest(row)
+            check(SOURCE_CLOSURE_ENVIRONMENT, row, (parent, definition, address),
+                  "closure environment lacks its parent binding, definition or function address")
+            if parent.page != NAME_BINDING or value(parent) is None:
+                found.append(Finding("source-closure-parent", str(row[0]), None,
+                                     "closure environment has no exact parent binding"))
+        for row in book.page(SOURCE_CLOSURE_CAPTURE).rows():
+            environment, parent, input_binding = book.page(SOURCE_CLOSURE_CAPTURE).latest(row)
+            check(SOURCE_CLOSURE_CAPTURE, row, (environment, parent, input_binding),
+                  "capture does not derive from both binding identities and their environment")
+            if (value(environment)[0] != parent or input_binding.row != row
+                    or input_binding.page != NAME_BINDING):
+                found.append(Finding("source-closure-binding", str(row[0]), None,
+                                     "capture disagrees with its environment or input binding"))
+        for row in book.page(SOURCE_CLOSURE_CALLABLE).rows():
+            identity, environment, parent, receiver = book.page(SOURCE_CLOSURE_CALLABLE).latest(row)
+            # Canonical rows additionally derive through their ingestion row.
+            cell = book.latest_ref(SOURCE_CLOSURE_CALLABLE, row)
+            sources = {source for source, _ in book.edges_into(cell)}
+            direct = {environment, parent, receiver} <= sources
+            relabeled = any(source.page == SOURCE_CLOSURE_CALLABLE for source in sources)
+            if (identity != "threading.Barrier.wait" or value(environment)[0] != parent
+                    or not (direct or relabeled)):
+                found.append(Finding("source-closure-callable", str(row[0]), int(row[1]),
+                                     "captured callable lacks exact environment provenance"))
         return found
 
     @staticmethod

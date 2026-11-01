@@ -22,6 +22,7 @@
 // joins need a dedicated consumer and are refused at the deploy call.
 #ifndef TURING_POOL_H
 #define TURING_POOL_H
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -84,6 +85,7 @@ turing_dispatch_task* turing_task_start(turing_task_fn fn, void* context);
 // Wait for completion: timeout_ms < 0 means indefinitely. Returns 1 when
 // complete, 0 on timeout, -1 on invalid/OS error, -2 for a self-wait.
 int turing_task_wait(turing_dispatch_task* task, long timeout_ms);
+int turing_task_is_alive(turing_dispatch_task* task);
 // Join and free the handle. Caller must own its lifetime exclusively; captured
 // storage must remain alive until this succeeds. Returns 0, or a negative error.
 int turing_task_destroy(turing_dispatch_task* task);
@@ -93,6 +95,45 @@ int turing_task_destroy(turing_dispatch_task* task);
 // depth before returning. notify requires ownership and does not release it.
 // This is communicating-task synchronization, never a numerical pool barrier.
 typedef struct turing_dispatch_condition turing_dispatch_condition;
+/* Fundamental synchronization ABI. Condition's compatibility procedures below
+ * delegate to these same objects; SSA composes these primitives directly. */
+typedef struct turing_sync_latch turing_sync_latch;
+uint64_t turing_sync_worker_token(void);
+void turing_sync_set_worker_context(uint64_t source_worker);
+/* Handles are opaque native identities. Mutex acquire returns a positive
+ * ownership-generation token, 0 for unsuccessful try/timeout, -1 runtime error,
+ * -2 timeout overflow, -3 invalid timeout. Token/suspend/restore use 0 for
+ * invalid ownership/state. Suspend returns the complete saved recursion depth.
+ * Latch wait returns 1 released, 0 timeout, or the same negative error classes.
+ * Register/select/retire require ownership of the queue's exact guard. Select
+ * returns NULL for an empty pending set. Other transitions return 1/-1.
+ * Latches may be destroyed only after their registrations are retired and no
+ * concurrent user remains. Scopes and memory ordering are checked by lowering;
+ * these host mutex transitions implement acquire/release, not a global fence. */
+turing_dispatch_condition* turing_sync_mutex_create(int reentrant);
+turing_dispatch_condition* turing_sync_wait_queue_create(turing_dispatch_condition* mutex);
+turing_dispatch_condition* turing_sync_wait_queue_mutex(turing_dispatch_condition* queue);
+int64_t turing_sync_mutex_acquire(turing_dispatch_condition*, uint64_t worker, int blocking, double timeout);
+int64_t turing_sync_mutex_token(turing_dispatch_condition*, uint64_t worker);
+int turing_sync_mutex_release(turing_dispatch_condition*, uint64_t worker, uint64_t token);
+int64_t turing_sync_mutex_suspend(turing_dispatch_condition*, uint64_t worker, uint64_t token);
+int64_t turing_sync_mutex_restore(turing_dispatch_condition*, uint64_t worker, uint64_t depth);
+int turing_sync_mutex_locked(turing_dispatch_condition*);
+turing_sync_latch* turing_sync_latch_create(uint64_t participants, uint64_t generation);
+int turing_sync_latch_signal(turing_sync_latch*, uint64_t generation);
+int turing_sync_latch_arrive(turing_sync_latch*, uint64_t generation, uint64_t count);
+int turing_sync_latch_reset(turing_sync_latch*, uint64_t previous, uint64_t generation, uint64_t participants);
+int turing_sync_control_barrier(turing_sync_latch*, uint64_t generation, uint64_t participants);
+
+int turing_sync_latch_wait(turing_sync_latch*, uint64_t generation, double timeout, int finite);
+int turing_sync_latch_destroy(turing_sync_latch*);
+int turing_sync_barrier_configure(turing_sync_latch*, double timeout, int finite);
+int64_t turing_sync_barrier_wait(turing_sync_latch*, double timeout, int finite);
+int turing_sync_barrier_abort(turing_sync_latch*);
+int turing_sync_barrier_reset(turing_sync_latch*);
+int turing_sync_waiter_register(turing_dispatch_condition*, uint64_t worker, uint64_t token, turing_sync_latch*);
+turing_sync_latch* turing_sync_waiter_select(turing_dispatch_condition*, uint64_t worker, uint64_t token);
+int turing_sync_waiter_retire(turing_dispatch_condition*, uint64_t worker, turing_sync_latch*);
 turing_dispatch_condition* turing_dispatch_condition_create(void);
 int turing_dispatch_condition_acquire(turing_dispatch_condition* condition);
 int turing_dispatch_condition_release(turing_dispatch_condition* condition);

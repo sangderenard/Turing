@@ -345,6 +345,7 @@ class LoopControlBlock(TiledObject):
     # site did not rebind that name.
     site_node_id: int | None = None
     site_values: tuple[tuple[tuple[int, int], int], ...] = ()
+    site_state_cell: Any | None = None
     # ``return``: the return SITE's identity cell -- the cell the reducer
     # keys the ``return_site_slot`` / ``return_site_field_state`` rows by
     # (the return construct, never the value it returns).  Lowering stamps
@@ -488,6 +489,7 @@ class ResourceScopeBlock(TiledObject):
     body: "ControlBlock"
     cleanup: tuple["DispatchBlock", ...]
     source_scope_id: int
+    resource_contract_cell: Any | None = None
 
     def __post_init__(self):
         if any(not isinstance(operation, DispatchBlock)
@@ -511,6 +513,15 @@ class DispatchBlock(TiledObject):
     result_value_id: int | None = None
     result_dtype: str = "opaque_ref"
     target_function_cell: Any | None = None
+    synchronization_cell: Any | None = None
+    process_operation_cell: Any | None = None
+    thread_activation_cell: Any | None = None
+    capture_argument_value_ids: tuple[int, ...] = ()
+    worker_argument_bindings: tuple = ()
+    worker_argument_pack_expanded: bool = False
+    exception_operation_cell: Any | None = None
+    ingestion_control_cell: Any | None = None
+    operand_graph_cell: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -708,8 +719,25 @@ class StreamPublishBlock(TiledObject):
     payload_value_ids: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True)
+class SourceRegionBlock(TiledObject):
+    """Ingested structured control before numerical regions are carved.
+
+    The source control operator and its exact activity ports survive while
+    loop/predicate planning specializes its header. This is not executable
+    Python and is not a lowered LoopBlock with invented iteration bounds.
+    """
+    source_kind: str
+    source_node_id: int
+    entry_cell: Any
+    exit_cell: Any
+    arms: tuple[tuple[str, "ControlBlock"], ...] = ()
+    operand_graph_cell: Any | None = None
+
+
 ControlBlock = (
     StatementBlock
+    | SourceRegionBlock
     | SequenceBlock
     | ConditionalBlock
     | LoopBlock
@@ -1013,6 +1041,7 @@ def _control_block_kind(block: Any) -> Any:
 
     return {
         StatementBlock: Kind.STATEMENT,
+        SourceRegionBlock: Kind.SOURCE_REGION,
         ConditionalBlock: Kind.CONDITIONAL,
         LoopBlock: Kind.LOOP,
         WhileBlock: Kind.WHILE,
@@ -1052,7 +1081,11 @@ def _control_block_arms(block: Any) -> tuple:
 
     from .concordance_declarations import Arm
 
-    if isinstance(block, ConditionalBlock):
+    if isinstance(block, SourceRegionBlock):
+        kinds = {"body": Arm.BODY, "orelse": Arm.ORELSE, "test": Arm.CONDITION,
+                 "iter": Arm.ITERABLE, "target": Arm.TARGET}
+        arms = [(kinds[name], index, body) for index, (name, body) in enumerate(block.arms)]
+    elif isinstance(block, ConditionalBlock):
         arms = [(Arm.BODY, 0, block.body)]
         if block.orelse is not None:
             arms.append((Arm.ORELSE, 0, block.orelse))
@@ -1182,6 +1215,9 @@ def _describe_control_block(
                 reason = REGION_CELL_UNROUTED
         else:
             extra = ("lines", tuple(block.lines))
+    elif isinstance(block, SourceRegionBlock):
+        owner = cell(block.source_node_id)
+        extra = (block.source_kind, block.entry_cell, block.exit_cell, block.operand_graph_cell)
     elif isinstance(block, ConditionalBlock):
         owner = cell(block.source_node_id)
         predicate = cell(block.predicate_value_id)
@@ -1221,7 +1257,7 @@ def _describe_control_block(
             else cell(block.site_node_id)
         )
         predicate = cell(block.predicate_value_id)
-        extra = (str(block.action), block.source_action)
+        extra = (str(block.action), block.source_action, block.site_state_cell)
     elif isinstance(block, (CallBlock, DispatchBlock, ExternalReferenceCallBlock)):
         owner = callsite = callsite_cell(block.callsite_id)
         if isinstance(block, DispatchBlock):
@@ -1230,8 +1266,23 @@ def _describe_control_block(
             getattr(block, "operation", None),
             getattr(block, "identity", None),
         )
+        if isinstance(block, DispatchBlock) and block.operand_graph_cell is not None:
+            extra = (*extra, block.operand_graph_cell)
+        if isinstance(block, DispatchBlock) and block.ingestion_control_cell is not None:
+            extra = (*extra, block.ingestion_control_cell)
+        if isinstance(block, DispatchBlock) and block.synchronization_cell is not None:
+            extra = (*extra, block.synchronization_cell)
+        if isinstance(block, DispatchBlock) and block.process_operation_cell is not None:
+            extra = (*extra, block.process_operation_cell)
+        if isinstance(block, DispatchBlock) and block.thread_activation_cell is not None:
+            extra = (*extra, block.thread_activation_cell)
+        if isinstance(block, DispatchBlock) and block.worker_argument_pack_expanded:
+            extra = (*extra, *block.worker_argument_bindings)
+        if isinstance(block, DispatchBlock) and block.exception_operation_cell is not None:
+            extra = (*extra, block.exception_operation_cell)
     elif isinstance(block, ResourceScopeBlock):
         owner = cell(block.source_scope_id)
+        extra = (block.resource_contract_cell,)
     elif isinstance(block, NativeTryBlock):
         owner = cell(block.source_try_node_id)
         carried = cells(
@@ -1476,10 +1527,16 @@ def post_control_program(
             predicate, carried, sites, regions, callsite, _extra, cases,
             diagnostics, target,
         ) = fields
+        def referenced_extra(value):
+            if isinstance(value, Ref):
+                yield value
+            elif isinstance(value, (tuple, list)):
+                for member in value:
+                    yield from referenced_extra(member)
         return tuple(
             item for item in (
                 predicate, *carried, *sites, *regions, callsite, *cases,
-                *diagnostics, target,
+                *diagnostics, target, *referenced_extra(_extra),
             )
             if isinstance(item, Ref)
         )

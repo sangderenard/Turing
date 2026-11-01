@@ -5,6 +5,8 @@ import operator
 import numpy as np
 import sympy
 
+from ..compiler.thread_operations import PROCESS_OPERATORS, THREAD_OPERATORS
+
 from ..common.tensors.fused_ir import (
     ELEMENTWISE_BINARY,
     ELEMENTWISE_UNARY,
@@ -108,6 +110,50 @@ array_sig = {
 # Operation name -> signature mapping
 # -------------------------------------------------
 operator_signatures = {
+    **{name: {
+        'min_inputs': 0 if name.endswith('Create') else 1, 'max_inputs': None,
+        'min_outputs': 1, 'max_outputs': 1,
+        'concurrency': None, 'allows_inplace': False,
+        'hardware_specific': name in THREAD_OPERATORS.values(),
+        'requires_concurrent_progress': name in {'ThreadStart', 'ThreadJoin'},
+    } for name in PROCESS_OPERATORS.values()},
+    **{name: {
+        'min_inputs': count, 'max_inputs': count + 1,
+        'min_outputs': 1, 'max_outputs': 1,
+        'concurrency': None, 'allows_inplace': False,
+        # These are semantic substrate operations requiring a target mapping,
+        # never Python runtime calls or ordinary numerical-lane operators.
+        'hardware_specific': True, 'effectful': True,
+        'requires_concurrent_progress': name in {
+            'ControlBarrier', 'CompletionWait', 'LatchWait', 'LatchWaitTimeout',
+            'BarrierWait', 'MutexAcquire', 'MutexRestore',
+        },
+    } for name, count in {
+        'MemoryBarrier': 3, 'ControlBarrier': 4, 'LatchCreate': 3,
+        'LatchArrive': 3, 'LatchWait': 2, 'LatchSignal': 2,
+        'LatchReset': 4, 'CompletionWait': 1,
+        'BarrierCreate': 4, 'BarrierWait': 3, 'BarrierAbort': 1, 'BarrierReset': 1,
+        'MutexCreate': 2, 'MutexAcquire': 6, 'MutexAcquired': 1,
+        'MutexToken': 2, 'MutexRelease': 5, 'MutexLocked': 1, 'WorkerToken': 0,
+        'MutexSuspend': 5, 'MutexRestore': 5, 'WaiterRegister': 4,
+        'WaiterSelect': 3, 'WaiterRetire': 3, 'LatchWaitTimeout': 4, 'LatchDestroy': 1,
+        'WaitQueueCreate': 2, 'WaitQueueMutex': 1,
+    }.items()},
+    **{name: {
+        'min_inputs': count, 'max_inputs': count,
+        'min_outputs': 1, 'max_outputs': 1,
+        'concurrency': None, 'allows_inplace': False,
+    } for name, count in {
+        'ExceptionNone': 0, 'ExceptionTake': 0,
+        'ExceptionActive': 1, 'ExceptionMatch': 1, 'ExceptionRaise': 1,
+        'ExceptionIndexType': 1, 'ExceptionLength': 1,
+    }.items()},
+    # A nonliteral raised message is a real dependency operand at ingestion.
+    # Native selection must provide its ownership/rendering ABI or refuse it.
+    'ExceptionMake': {
+        'min_inputs': 0, 'max_inputs': 1, 'min_outputs': 1, 'max_outputs': 1,
+        'concurrency': None, 'allows_inplace': False,
+    },
     # Structural concurrency framing. Deploy and Join do not perform numeric
     # work; a Join reduction names an existing operator in its metadata.
     'Deploy': {

@@ -3326,6 +3326,11 @@ def _planned_scalar_dtypes_from_graph(
             node_id = int(node_id)
             op = operation(data)
             attributes = data.get("attributes") or {}
+            from .process_graph_facts import operation as process_operation
+            process_fact, _process_cell = process_operation(graph, node_id)
+            process_dtype = None if process_fact is None else process_fact[2]
+            if process_dtype is not None and process_dtype != "none":
+                settle(scalar, node_id, process_dtype)
             expression = data.get("expr_obj")
             proven_width = range_dtype(node_id)
             if (
@@ -3570,8 +3575,25 @@ def _planned_scalar_dtypes_from_graph(
                 if op == "generatorexp":
                     continue
             if op == "input":
+                from .process_graph_facts import captured_input_contract
+                capture_fact, capture_cell = captured_input_contract(graph, node_id)
+                if capture_cell is not None:
+                    from .concordance_declarations import SOURCE_CLOSURE_CAPTURE, SOURCE_AGGREGATE_LAYOUT, NAME_BINDING
+                    from .identity_concordance import current_identity_book
+                    capture_book = current_identity_book()
+                    capture = capture_cell.row[0]
+                    binding = capture_book.page(SOURCE_CLOSURE_CAPTURE).cell(capture.row, capture.column)[1]
+                    actual = capture_book.page(NAME_BINDING).cell(binding.row, binding.column).value_id
+                    layout = capture_book.page(SOURCE_AGGREGATE_LAYOUT).latest((binding.row[0], actual))
+                    settle(element if layout is not None else scalar, node_id,
+                           classes.get(str(capture_fact[0]).removeprefix("builtins.")))
+                    continue
                 kind = attributes.get("binding_kind")
                 if kind == "parameter":
+                    # A table-bound worker capture is an input onto the
+                    # parent's exact storage. Its concorded element TYPE
+                    # follows the same writer-checked rules as a formal;
+                    # it is not a copied literal or an unknown external.
                     # ``builtins.int`` and ``int`` are one class reference.
                     # Program: ``first(xs)`` over the caller's ``(n, 4)``
                     # (scratch c_g4t).  Wrong record: a member formal has no
@@ -5189,6 +5211,15 @@ def _dtype_producer_cells(graph: Any, value_id: int, *extra: Any) -> tuple:
     book = current_identity_book()
     metadata = graph.G.graph
     cells = []
+    from .process_graph_facts import operation as process_operation
+    _process_fact, process_cell = process_operation(graph, int(value_id))
+    if process_cell is not None:
+        cells.append(process_cell)
+    from .process_graph_facts import captured_input_contract, captured_columns
+    cells.extend(cell for cell in (
+        captured_input_contract(graph, int(value_id))[1],
+        captured_columns(graph, int(value_id))[1],
+    ) if cell is not None)
     try:
         cells.append(node_identity_cell(graph, int(value_id)))
     except ValueError:
@@ -7240,6 +7271,12 @@ def _build_shell_hierarchy_plan(
                 return record, _dtype_producer_cells(graph, int(value_id))
             node = graph.G.nodes.get(int(value_id), {})
             attributes = node.get("attributes") or {}
+            from .process_graph_facts import operation as process_operation
+            process_fact, process_cell = process_operation(graph, int(value_id))
+            if process_fact is not None:
+                return (record[0], record[1], process_fact[2]), (
+                    _dtype_producer_cells(graph, int(value_id))
+                )
             # A collection the callsite specialization folded from its
             # actual (an unannotated ``atoms`` bound to ``[a, b]``) keeps
             # the element class the call edge settled
@@ -11016,6 +11053,10 @@ def _dispatch_metadata_rule(graph: Any, node_id: int) -> Any:
     from .concordance_declarations import MetadataRule as Rule
 
     data = graph.G.nodes[node_id]
+    from .process_graph_facts import operation as process_operation
+    process_fact, _process_cell = process_operation(graph, int(node_id))
+    if process_fact is not None:
+        return Rule.THREAD_OPERATION
     if str(data.get("type")) in {"HostCallback", "HostCallbackPresent"}:
         return Rule.HOST_CALLBACK
     precision_operator = (data.get("attributes") or {}).get(
@@ -12370,184 +12411,9 @@ def _optional_presence_control_expression(
 
 
 def _branch_compartments(graph: Any) -> dict[int, frozenset[tuple[int, str]]]:
-    """Map every node to the conditional branches that guard it.
-
-    A branch body only runs when its test selects it.  The coordinator honours
-    that by withholding controlled nodes from the ordinary topological sweep,
-    but a shader region is executed as a unit: pulling any of its members
-    forces every member to run.  Recording branch membership lets region
-    planning refuse to mix guarded work with work that runs unconditionally,
-    or to mix two branches of the same test with each other.
-    """
-
-    # ``ast.Load``/``ast.Store`` and operator/context nodes are locationless
-    # singleton helpers.  They are shared by otherwise unrelated expressions,
-    # so correlating them by object identity (or by their identical dump)
-    # makes one small branch appear to guard every name load in the function.
-    # Branch ownership belongs only to source-positioned syntax.  Real names,
-    # calls, expressions, and statements all carry ``lineno``; helper tokens
-    # do not.
-    def source_positioned(expression: Any) -> bool:
-        return (
-            isinstance(expression, ast.AST)
-            and getattr(expression, "lineno", None) is not None
-        )
-
-    expression_nodes = {
-        id(data.get("expr_obj")): node_id
-        for node_id, data in graph.G.nodes(data=True)
-        if source_positioned(data.get("expr_obj"))
-    }
-    location_nodes = {}
-    signatures = {}
-
-    def signature(expression):
-        key = id(expression)
-        if key not in signatures:
-            signatures[key] = _ast_source_signature(expression)
-        return signatures[key]
-    effect_span_nodes: dict[tuple[Any, ...], set[int]] = {}
-    for node_id, data in graph.G.nodes(data=True):
-        expression = data.get("expr_obj")
-        for source_expression in (expression, data.get("authored_expr_obj")):
-            if source_positioned(source_expression):
-                location_nodes.setdefault(_ast_source_location(source_expression), []).append((source_expression, int(node_id)))
-        if not source_positioned(expression) and str(data.get("type") or "").casefold() == "setattr":
-            span = data.get("source_span") or {}
-            if span.get("line") is not None:
-                effect_span_nodes.setdefault(tuple(span.get(key) for key in
-                    ("line", "column", "end_line", "end_column")), set()).add(int(node_id))
-        if not source_positioned(expression) and str(data.get("type") or "") == "IndexedStore":
-            # An indexed store with no authored node of its own: its site
-            # is the ``indexed_store_site`` book cell its identity derives
-            # from; the site's span only places it.
-            site_span = indexed_store_site_span(graph, int(node_id))
-            if site_span is not None:
-                effect_span_nodes.setdefault(site_span, set()).add(int(node_id))
-    memberships: dict[int, set[tuple[int, str]]] = {}
-    structurally_specialized = frozenset(map(
-        int,
-        graph.G.graph.get(
-            "structurally_specialized_conditional_node_ids", ()
-        ),
-    ))
-    for control_id, record in _source_control_records(graph.G).items():
-        if int(control_id) in structurally_specialized:
-            # Structural folding has selected one arm and made its producer
-            # unconditional. Keeping the old branch compartment would withhold
-            # that producer from the topological sweep even though the matching
-            # ControlProgram is deliberately omitted below. A later live
-            # branch can then consume an unavailable value (the selected
-            # ``self.dt_min`` payload in ``pi_update`` exposed this).
-            continue
-        expression = record.get("expression")
-        if isinstance(expression, ast.If):
-            branches = {
-                "body": tuple(expression.body),
-                "orelse": tuple(expression.orelse),
-            }
-        elif isinstance(expression, ast.IfExp):
-            branches = {
-                "body": (expression.body,),
-                "orelse": (expression.orelse,),
-            }
-        elif isinstance(expression, ast.Try):
-            branches = {
-                "body": tuple(expression.body),
-                "handlers": tuple(expression.handlers),
-                "orelse": tuple(expression.orelse),
-                "finalbody": tuple(expression.finalbody),
-            }
-        elif isinstance(expression, ast.BoolOp):
-            # Only the first operand of a short-circuiting operator is
-            # guaranteed to run; the rest are guarded by its outcome.  The
-            # operator is the conditional ``b if a else a`` (``and``) or
-            # ``a if a else b`` (``or``): its guarded operands ARE that
-            # conditional's body or orelse arm (``_short_circuit_control_
-            # program``), so they carry that arm's role.
-            branches = {
-                "body" if isinstance(expression.op, ast.And) else "orelse": tuple(
-                    expression.values[1:]
-                ),
-            }
-        else:
-            continue
-        # Program: ``for x in range(6): if x > 0 and x * 2 > n: ...``
-        # (scratch c83).  The reducer unrolled the loop; each iteration's
-        # ``and`` is its own BoolOp node, all at one source location.  Wrong
-        # record: membership fell back to location + signature, so every
-        # iteration's guarded ``x * 2 > n`` belonged to EVERY copy's arm (and
-        # to the unrolled-away original), one region held them all, and five
-        # short-circuit controls claimed it ("maximal control blocks overlap
-        # without containment").  Rule: edges are authoritative -- a BoolOp
-        # owns the guarded nodes that are graph ancestors of its own guarded
-        # operand edges (``value:1`` ...); a BoolOp record with no such edge
-        # (unrolled away, or folded to a constant) owns nothing.
-        boolean_scope = None
-        if isinstance(expression, ast.BoolOp):
-            control_node = graph.G.nodes.get(int(control_id)) or {}
-            guarded_operands = tuple(
-                int(parent)
-                for parent, edge_role in control_node.get("parents") or ()
-                if str(edge_role).startswith("value:")
-                and str(edge_role) != "value:0"
-                and int(parent) in graph.G
-            )
-            boolean_scope = set(guarded_operands)
-            for operand in guarded_operands:
-                boolean_scope.update(nx.ancestors(graph.G, operand))
-        for role, statements in branches.items():
-            for statement in statements:
-                for member in ast.walk(statement):
-                    if not source_positioned(member):
-                        continue
-                    guarded_nodes = (
-                        (int(expression_nodes[id(member)]),)
-                        if id(member) in expression_nodes
-                        else tuple(sorted({candidate_id
-                            for candidate, candidate_id in location_nodes.get(_ast_source_location(member), ())
-                            if signature(candidate) == signature(member)}))
-                    )
-                    if boolean_scope is not None:
-                        guarded_nodes = tuple(
-                            node for node in guarded_nodes
-                            if int(node) in boolean_scope
-                        )
-                    guarded_nodes = (*guarded_nodes, *effect_span_nodes.get(
-                        (member.lineno, member.col_offset,
-                         getattr(member, "end_lineno", None), getattr(member, "end_col_offset", None)), ()))
-                    for guarded in guarded_nodes:
-                        if guarded != control_id:
-                            memberships.setdefault(guarded, set()).add(
-                                (control_id, role)
-                            )
-    # Reducer-authored Phi values do not own an AST expression, but they run
-    # at the continuation of their exact source conditional.  When that
-    # conditional is itself nested in another branch, its merge is therefore
-    # guarded by the enclosing branch and must be a candidate outgoing value
-    # for the enclosing Phi.  Inherit only the source conditional's outer
-    # memberships; never mark the merge as belonging to either of its own
-    # mutually exclusive arms.
-    for node_id, data in graph.G.nodes(data=True):
-        source_conditional_id = int((data.get("attributes") or {}).get(
-            "source_conditional_id", -1
-        ))
-        if source_conditional_id in memberships:
-            memberships.setdefault(int(node_id), set()).update(
-                memberships[source_conditional_id]
-            )
-        # An optional call's presence comparison (``call is not None``,
-        # synthesized for an optional IfExp arm) runs exactly where the call
-        # runs: it inherits the call's branch membership.
-        presence_of = (data.get("attributes") or {}).get("call_presence_of")
-        if presence_of is not None and int(presence_of) in memberships:
-            memberships.setdefault(int(node_id), set()).update(
-                memberships[int(presence_of)]
-            )
-    return {
-        node_id: frozenset(roles)
-        for node_id, roles in memberships.items()
-    }
+    """Read exact conditional owner/arm edges posted at source ingestion."""
+    from .control_activity import conditional_memberships
+    return conditional_memberships(graph)
 
 
 def _record_field_state_keys(
@@ -12785,6 +12651,7 @@ def _ordinary_conditional_control_programs(
     ))
     programs = []
     optional_glyph_candidates = []
+    activity_retention_cells = []
     program_expressions: list[tuple[int, ast.AST]] = []
     for control_id, record in _source_control_records(graph.G).items():
         if int(control_id) in structurally_specialized:
@@ -12926,20 +12793,6 @@ def _ordinary_conditional_control_programs(
         # the edge only inside the arm.  Place it there (the loop schedule
         # skips arm-owned sites, `LoopDescriptor.control_sites`), with the
         # site's live bindings from the owning loop's ``loop_break_sites``.
-        enclosing_loops = tuple(
-            (
-                int(loop_expression.lineno),
-                int(getattr(
-                    loop_expression, "end_lineno", loop_expression.lineno
-                )),
-                dict((loop_data.get("attributes") or {}).get(
-                    "loop_break_sites"
-                ) or {}),
-            )
-            for _loop_id, loop_data in graph.G.nodes(data=True)
-            for loop_expression in (loop_data.get("expr_obj"),)
-            if isinstance(loop_expression, (ast.For, ast.While))
-        )
         retained_region_nodes = {
             int(member)
             for region_index in sorted(retained)
@@ -12962,23 +12815,11 @@ def _ordinary_conditional_control_programs(
             if not isinstance(terminal, (ast.Break, ast.Continue)):
                 return None
             action = "break" if isinstance(terminal, ast.Break) else "continue"
-            line = int(getattr(terminal, "lineno", -1))
-            span = (
-                line,
-                int(getattr(terminal, "col_offset", -1)),
-                int(getattr(terminal, "end_lineno", -1)),
-                int(getattr(terminal, "end_col_offset", -1)),
-            )
-            # Innermost loop whose source range holds the site owns it.
-            owner = min(
-                (
-                    (end - start, break_sites)
-                    for start, end, break_sites in enclosing_loops
-                    if start <= line <= end
-                ),
-                key=lambda item: item[0],
-                default=None,
-            )
+            site_id = control_node_by_statement.get(id(terminal))
+            if site_id is None:
+                return None
+            from .loop_site_facts import site_values as read_site_values
+            exact_values, site_cell = read_site_values(graph, site_id)
             declared_identity_ids = {
                 int(value_id)
                 for history in (graph.G.graph.get("identity_table") or {}).values()
@@ -12986,40 +12827,15 @@ def _ordinary_conditional_control_programs(
             }
             site_values = {
                 (int(initial), int(updated)): int(value)
-                for (initial, updated), value in (
-                    (owner[1].get(span) or {}) if owner else {}
-                ).items()
+                for (initial, updated), value in exact_values.items()
                 if int(value) in graph.G
                 and (int(initial) in graph.G or int(initial) in declared_identity_ids)
             }
-            # Same rule as the loop schedule (``arm_owned_site`` in
-            # loop_composer): the arm owns the site only when a value it
-            # carries is produced by a retained region INSIDE this arm.
-            owned = any(
-                int(value) in retained_region_nodes
-                and int(value) in node_by_value
-                and (int(control_id), arm_name) in memberships.get(
-                    node_by_value[int(value)], ()
-                )
-                for value in site_values.values()
-            )
-            # A ``break`` ending one arm of a conditional whose OTHER arm
-            # runs retained regions: the reducer lets the surviving arm's
-            # bindings stand after the ``if`` without a merge (its terminal-
-            # arm rule), so every later value defined in that arm reaches the
-            # loop's controls only if the break leaves the loop FROM its arm.
-            # Placed after the merge instead, the surviving arm's values do
-            # not dominate it (``break-edge-value``).  Same rule as the loop
-            # schedule's ``arm_owned_site``.
-            if not owned and action == "break":
-                sibling_arm = "orelse" if arm_name == "body" else "body"
-                owned = any(
-                    (int(control_id), sibling_arm) in memberships.get(
-                        node_by_value[int(node)], ()
-                    )
-                    for node in retained_region_nodes
-                    if int(node) in node_by_value
-                )
+            # The ingested branch edge owns a terminal exit even when its
+            # carried values are Phis or record operations rather than
+            # numerical-region results. Region membership cannot decide
+            # which predecessor carries a loop exit's state.
+            owned = (int(control_id), str(arm_name)) in memberships.get(int(site_id), ())
             if os.environ.get("TURING_DEBUG_BREAK_EDGE"):
                 print(
                     "DEBUG-ARM-OWNED builder "
@@ -13035,6 +12851,7 @@ def _ordinary_conditional_control_programs(
                 action, None, True, None,
                 source_action=action,
                 site_node_id=control_node_by_statement.get(id(terminal)),
+                site_state_cell=site_cell,
                 site_values=tuple(sorted(
                     ((int(initial), int(updated)), int(value))
                     for (initial, updated), value in site_values.items()
@@ -13221,6 +13038,25 @@ def _ordinary_conditional_control_programs(
             )
             for _phi_node_id, phi_data in graph.G.nodes(data=True)
         )
+        from .control_activity import memberships as activity_memberships, binding as activity_binding
+        from .process_graph_facts import operation as process_operation
+        # The module catalogue contains definitions, not an executing
+        # function activity graph. Only a declared read scope can retain
+        # process effects as runtime control here.
+        from .concordance_declarations import SOURCE_ACTIVITY_SCOPE
+        from .identity_concordance import current_identity_book
+        read_scope = graph.G.graph.get("lexical_read_scope")
+        activity_view = (None if read_scope is None else
+                         current_identity_book().latest_ref(SOURCE_ACTIVITY_SCOPE, (read_scope,)))
+        activity_guards = {} if activity_view is None else activity_memberships(graph)
+        process_effect_cells = []
+        for member in graph.G:
+            if any((int(control_id), arm) in activity_guards.get(int(member), ())
+                   for arm in ("body", "orelse")):
+                process_fact, process_cell = process_operation(graph, int(member))
+                if process_fact is not None:
+                    process_effect_cells.extend((process_cell, activity_binding(graph, int(member))[1]))
+        activity_retention_cells.extend(process_effect_cells)
         if (
             not body_regions
             and not else_regions
@@ -13231,6 +13067,7 @@ def _ordinary_conditional_control_programs(
             and not result_aliases
             and not (predicate_regions and has_structural_branch_effect)
             and not source_owned_merge
+            and not process_effect_cells
         ):
             if os.environ.get("TURING_DEBUG_CONTROL_OVERLAY"):
                 print(
@@ -13440,7 +13277,8 @@ def _ordinary_conditional_control_programs(
     from .control_source import post_control_program
 
     for program in nested:
-        post_control_program(graph, program, stage=CONTROL_PROGRAM_BUILD)
+        post_control_program(graph, program, stage=CONTROL_PROGRAM_BUILD,
+                             cause=tuple(dict.fromkeys(activity_retention_cells)))
     return nested
 
 
@@ -14351,6 +14189,9 @@ def _control_partition_keys(
     if not node_ids:
         return {}
 
+    node_ids = tuple(map(int, node_ids))
+    from .control_activity import process_partition_frontiers
+    process_frontiers = process_partition_frontiers(graph, node_ids)
     plans = tuple(loop_plans)
     branches = _branch_compartments(graph)
     expression_nodes = {
@@ -14519,6 +14360,7 @@ def _control_partition_keys(
             tuple(frontiers_by_node.get(int(node_id), ())),
             tuple(branch_frontiers_by_node.get(int(node_id), ())),
             tuple(condition_owners_by_node.get(int(node_id), ())),
+            process_frontiers[int(node_id)],
         )
         for node_id in node_ids
     }
@@ -27982,6 +27824,25 @@ def _mutated_sequence_node_ids(
             graph_obj.graph.get("source_sequence_mutation_records") or {}
         ).values()
     }
+    # An authored worker retains its exact captured storage, like a callee
+    # escape. Even a read-only worker needs that storage in its context;
+    # scalarizing the initializer would give it a different object. This
+    # adds no ordering between workers or synchronization operation.
+    if include_call_escapes:
+        from .identity_concordance import current_identity_book, _canonical_identity_base
+        from .concordance_declarations import SOURCE_THREAD_CAPTURE_USE, SOURCE_AGGREGATE_LAYOUT
+        from ..common.tensors.topological_reducer import node_identity_cell
+        book = current_identity_book()
+        residents = {_canonical_identity_base(book, node_identity_cell(graph_obj, int(node))): int(node)
+                     for node in graph_obj}
+        for row in book.page(SOURCE_THREAD_CAPTURE_USE).rows():
+            actual, _formal, writes = book.page(SOURCE_THREAD_CAPTURE_USE).latest(row)
+            node = residents.get(_canonical_identity_base(book, actual))
+            if node is None:
+                continue
+            layout = book.page(SOURCE_AGGREGATE_LAYOUT).latest((actual.row[0], actual.row[1]))
+            if writes or layout is not None and layout.aggregate_kind in {"list", "set", "dict", "tuple"}:
+                mutated_sequence_ids.add(node)
     # Program: ``xs = []; fill(xs, n); return len(xs)``.  Wrong record: the
     # empty literal was folded as ``xs``'s contents because only direct
     # mutation records and indexed stores counted; ``fill`` appends to its
@@ -30227,40 +30088,54 @@ def _fold_callsite_structural_values(
     # ``found = -1``.  Rule: after a loop, a name is the loop's EXIT merge,
     # not the body value; a read of a loop's continuation or carried update
     # from outside the loop's source span is unresolved here.
-    loop_exit_values: list[tuple[frozenset[int], int, int]] = []
-    for _loop_id, loop_data in graph.G.nodes(data=True):
-        loop_expression = loop_data.get("expr_obj")
-        if not isinstance(loop_expression, (ast.For, ast.AsyncFor, ast.While)):
+    # Loop backedge/exit values already are real graph operands, published
+    # at the reducer's ledger writer. A consumer outside that loop reads
+    # its exit state, even when generated syntax shares diagnostic lines.
+    # The old span check folded `not broke` from the break-site True and
+    # removed the loop-else arm (84 instead of 91, and 100 instead of 107).
+    from .process_graph_facts import local_operands
+    from .control_activity import binding, activity_scope
+    from .concordance_declarations import SOURCE_ACTIVITY_NODE, SOURCE_LOOP_EXIT_READ
+    from .identity_concordance import Derived, Mode, current_identity_book
+    loop_exit_values = []
+    activity_book = current_identity_book()
+    for loop_id, loop_data in graph.G.nodes(data=True):
+        if str(loop_data.get('type')) not in {'For', 'AsyncFor', 'While'}:
             continue
-        loop_attributes = loop_data.get("attributes") or {}
-        exit_values = {
-            int(value)
-            for _name, (_initial, value) in dict(
-                loop_attributes.get("loop_break_bindings") or {}
-            ).items()
-        } | {
-            int(updated)
-            for _name, (initial, updated) in dict(
-                loop_attributes.get("loop_carried_bindings") or {}
-            ).items()
-            if int(updated) != int(initial)
-        }
-        if exit_values:
-            loop_exit_values.append((
-                frozenset(exit_values),
-                int(loop_expression.lineno),
-                int(getattr(loop_expression, "end_lineno", loop_expression.lineno)),
-            ))
+        operands, operand_cell = local_operands(graph, int(loop_id))
+        values = frozenset(int(parent) for parent, role in operands
+                           if role in {'carried_update', 'break_value'})
+        if not values:
+            continue
+        points, binding_cell = binding(graph, int(loop_id))
+        if points is None:
+            raise ValueError('loop exit state has no ingested control ownership')
+        loop_exit_values.append((values, points[0].row[1], operand_cell, binding_cell))
 
-    def reads_loop_exit(data: Mapping[str, Any]) -> bool:
-        line = getattr(data.get("expr_obj"), "lineno", None)
-        if line is None or not loop_exit_values:
+    def reads_loop_exit(node_id: int) -> bool:
+        if not loop_exit_values:
             return False
-        parents = {int(parent) for parent, _role in data.get("parents") or ()}
-        return any(
-            parents & values and not (start <= int(line) <= end)
-            for values, start, end in loop_exit_values
-        )
+        operands, operand_cell = local_operands(graph, int(node_id))
+        parents = {int(parent) for parent, _role in operands}
+        candidate_loops = [item for item in loop_exit_values if parents & item[0]]
+        if not candidate_loops:
+            return False
+        points, binding_cell = binding(graph, int(node_id))
+        if points is None:
+            return False  # A synthesized LoopResult already owns its merge.
+        _kind, owners = activity_book.page(SOURCE_ACTIVITY_NODE).cell(points[0].row, points[0].column)
+        owned = {occurrence for occurrence, arm in owners if arm in {'body', 'test'}}
+        outside = tuple(item for item in candidate_loops if item[1] not in owned)
+        if not outside:
+            return False
+        row = (graph.G.graph['lexical_read_scope'], int(node_id))
+        cause = (operand_cell, binding_cell, *(cell for item in outside for cell in item[2:]))
+        previous = activity_book.latest_ref(SOURCE_LOOP_EXIT_READ, row)
+        fact = tuple((item[2], item[3]) for item in outside)
+        if previous is None or activity_book.page(SOURCE_LOOP_EXIT_READ).cell(previous.row, previous.column) != fact:
+            activity_book.post(SOURCE_LOOP_EXIT_READ, row, fact, stage=PLANNER_STRUCTURAL_FOLD,
+                               provenance=Derived(cause), mode=Mode.CONCORD if previous is None else Mode.REVISE)
+        return True
 
     changed = True
     while changed:
@@ -31184,7 +31059,7 @@ def _fold_callsite_structural_values(
                     data["attributes"] = attributes
             if str(data.get("type")) in {"Constant", "Const", "const"}:
                 value = constant(data)
-            elif reads_loop_exit(data):
+            elif reads_loop_exit(int(node_id)):
                 value = unresolved
             else:
                 value = evaluate(node_id, data)
@@ -33855,8 +33730,29 @@ class ProcessGraphGLSLDeployment(TiledObject):
             from .memory_regulation import pressure_checkpoint
             recursive_signature_owners.add(id(owner))
             owner.callsite_function_shells = {}
+            owner.thread_worker_shells = {}
             for node_id, data in owner.process_graph.G.nodes(data=True):
                 attributes = data.get("attributes") or {}
+                from .process_graph_facts import thread_activation as activation_fact
+                thread_activation = activation_fact(owner.process_graph, int(node_id))
+                if thread_activation is not None:
+                    # ThreadCreate activates a body through the thread table,
+                    # not an ordinary call edge or a public entrypoint.
+                    from .concordance_declarations import SOURCE_THREAD_ACTIVATION, SOURCE_THREAD_BODY
+                    from .identity_concordance import current_identity_book
+                    book = current_identity_book()
+                    body = book.page(SOURCE_THREAD_ACTIVATION).cell(thread_activation.row, thread_activation.column)[0]
+                    reference = book.page(SOURCE_THREAD_BODY).cell(body.row, body.column)[0]
+                    worker = self.function_shells.get(int(reference))
+                    if worker is None:
+                        raise ValueError("thread-table target has no planned function shell")
+                    owner.thread_worker_shells[int(node_id)] = worker
+                    if int(reference) not in active_references:
+                        plan_callsites(worker, (*active_references, int(reference)))
+                        worker.hierarchy_plan, worker.hierarchy_value_table = assign_hierarchy_ids(
+                            _build_shell_hierarchy_plan(worker), shell=worker,
+                        )
+                    continue
                 # A resolved method selector and its invocation both carry
                 # the same method-table reference, but only the Call is an
                 # activation.  Planning the selector as a second PlanCall
@@ -37647,6 +37543,14 @@ def strategize_shell_deployment(
         "schedule_preference": schedule_preference,
     }
     graph.G.graph["deployment_schedule_preference"] = schedule_preference
+    from .concordance_declarations import SOURCE_ACTIVITY_POLICY, SOURCE_ACTIVITY_NODE, POLICY_DECLARATION, CONTROL_PROGRAM_BUILD
+    from .identity_concordance import current_identity_book, Novel, Mode
+    from .control_activity import activity_scope, configure_activity_schedule
+    activity_book = current_identity_book()
+    activity_scopes = ({activity_scope(graph)} if graph.G.graph.get("function_ref") is not None else
+                       {row[0] for row in activity_book.page(SOURCE_ACTIVITY_NODE).rows()})
+    for source_scope in activity_scopes:
+        configure_activity_schedule(source_scope, schedule_preference, book=activity_book)
     runtime_catalogue = bool(
         runtime_closure_only
         and not graph.G.graph.get("function_name")

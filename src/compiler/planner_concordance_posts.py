@@ -27,7 +27,7 @@ def _post_deployment_region(graph: Any, subgraph: Any, region_index: int) -> Non
     from .concordance_declarations import (
         DEPLOYMENT_REGION, DEPLOYMENT_REGION_MEMBER, DISPATCH_STORE,
         DISPATCH_STORE_PAGE, EXECUTABLE_NODE, MemberRole,
-        PLANNER_REGION_CARVE, RegionFact,
+        PLANNER_REGION_CARVE, RegionFact, SOURCE_ACTIVITY_CUT,
     )
     from .identity_concordance import (
         Derived, Mode, Novel, current_identity_book,
@@ -60,6 +60,12 @@ def _post_deployment_region(graph: Any, subgraph: Any, region_index: int) -> Non
     }
     if not member_cells:
         return
+    cut_cells = tuple(cell for node in nodes
+                      for cell in (book.latest_ref(SOURCE_ACTIVITY_CUT, (planning_scope, node)),)
+                      if cell is not None)
+    cuts = {book.page(SOURCE_ACTIVITY_CUT).cell(cell.row, cell.column) for cell in cut_cells}
+    if len(cuts) > 1:
+        raise ValueError('atomic region crosses a concorded process activity boundary')
     region_row = (planning_scope, int(region_index))
     fact = RegionFact(
         str(metadata.get("compartment_schedule_preference") or "asap"),
@@ -70,13 +76,13 @@ def _post_deployment_region(graph: Any, subgraph: Any, region_index: int) -> Non
         # this graph without a new classifier pass) restates the region.
         book.post(
             DEPLOYMENT_REGION, region_row, fact, stage=PLANNER_REGION_CARVE,
-            provenance=Derived(tuple(member_cells.values())),
+            provenance=Derived((*member_cells.values(), *cut_cells)),
             mode=Mode.CONCORD,
         )
         return
     region_cell = book.post(
         DEPLOYMENT_REGION, region_row, fact, stage=PLANNER_REGION_CARVE,
-        provenance=Derived(tuple(member_cells.values())), mode=Mode.CONCORD,
+        provenance=Derived((*member_cells.values(), *cut_cells)), mode=Mode.CONCORD,
     )
     output_member_cells: dict[int, Any] = {}
     for node_id, cell in member_cells.items():

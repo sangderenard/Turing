@@ -153,7 +153,10 @@ _DECLARED: tuple[DTypeLayout, ...] = (
         numpy_dtype="int64", nodus_code=6,
         # ``opaque_ref`` is a repository dtype (an opaque handle) that every
         # lane lowers as a 64-bit integer.
-        aliases=("int64", "i64", "long", "opaque_ref"),
+        # An SSA synchronization result is an inert ordering carrier. It
+        # does not encode a native lock, memory address or hardware lane.
+        # A lock token is the per-object ownership generation, also i64.
+        aliases=("int64", "i64", "long", "opaque_ref", "ssa.sync_token", "ssa.lock_token"),
     ),
     DTypeLayout(
         name="uint64", kind="uint", byte_size=8, alignment=8,

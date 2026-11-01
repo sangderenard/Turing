@@ -554,12 +554,21 @@ def interpret_python_static_value(
     )
 
 
-_THREADING_CONSTRUCTORS = {"threading.Thread": "thread", "threading.Condition": "condition",
-                 "threading.Event": "event"}
+_THREADING_CONSTRUCTORS = {"threading.Thread": "thread", "threading.Condition": "condition", "threading.Barrier": "barrier",
+                 "threading.Event": "event", "collections.deque": "byte_queue", "_collections.deque": "byte_queue"}
 _THREADING_METHODS = {
     "thread": {"start", "join", "is_alive"},
     "condition": {"acquire", "release", "wait", "notify", "notify_all"},
+    "barrier": {"wait", "abort", "reset"},
     "event": {"set", "clear", "wait", "is_set"},
+}
+_MUTEX_CONSTRUCTORS = {
+    "threading.Lock": False, "_thread.allocate_lock": False,
+    "threading.RLock": True, "_thread.RLock": True,
+}
+_MUTEX_METHOD_IDENTITIES = {
+    "_thread.lock.acquire": "mutex", "_thread.lock.release": "mutex", "_thread.lock.locked": "mutex",
+    "_thread.RLock.acquire": "rmutex", "_thread.RLock.release": "rmutex",
 }
 
 
@@ -574,7 +583,12 @@ def python_dispatch_entry_expressions(call: ast.Call, identity: str) -> tuple[as
     return (call.args[1],) if len(call.args) > 1 else ()
 
 
-def lower_python_threading(tree: ast.AST) -> ast.AST:
+def lower_python_threading(tree: ast.AST, *, lower_resources: bool = True) -> ast.AST:
+    # Standalone syntax callers and real source ingestion use the same
+    # source-root writer. Existing stamped occurrences retain their owner.
+    from .graph_express2 import post_source_span, _annotate_visual_source_owners, _source_module_identity
+    if isinstance(tree, ast.Module) and not hasattr(tree, '_turing_source_span_row'):
+        _annotate_visual_source_owners(tree, module_name=_source_module_identity(tree))
     class Lowerer(ast.NodeTransformer):
         def __init__(self):
             self.bindings = {}
@@ -592,6 +606,14 @@ def lower_python_threading(tree: ast.AST) -> ast.AST:
                       "line": getattr(source, "lineno", None),
                       "column": getattr(source, "col_offset", None),
                       "requires_concurrent_progress": True}
+            if kind == "sync":
+                from ...compiler.synchronization import SYNCHRONIZATION_SPECS
+                spec = SYNCHRONIZATION_SPECS[action]
+                record["requires_concurrent_progress"] = spec.progress
+                record["required_capability"] = (
+                    "compiler_ordering" if spec.domain == "compiler" else
+                    "memory_ordering" if spec.domain == "memory" else "communicating_tasks"
+                )
             # A ``Thread`` in authored source is a request for CONCURRENT
             # PROGRESS, not a request for an operating-system thread. Taken
             # literally it would mean spawn-and-destroy per unit of work,
@@ -614,7 +636,7 @@ def lower_python_threading(tree: ast.AST) -> ast.AST:
             call._turing_dispatch_operation = record
             parameters = {"lowering_namespace": "dispatcher",
                           "operation": operation,
-                          "required_capability": "communicating_tasks"}
+                          "required_capability": record.get("required_capability", "communicating_tasks")}
             if kind == "thread":
                 parameters["dispatch_disposition"] = "pooled_job"
                 parameters["pool_residency"] = "persistent"
@@ -628,21 +650,60 @@ def lower_python_threading(tree: ast.AST) -> ast.AST:
             return call
 
         def visit_Call(self, node):
+            existing = getattr(node, '_turing_dispatch_operation', None)
+            if existing is not None:
+                # Re-entering the ingestion visitor after exception conversion
+                # preserves the operation, visits only operands, and retains
+                # its summary fact. Its synthetic func is never a Python callee.
+                node.args = [self.visit(argument) for argument in node.args]
+                node.keywords = [ast.keyword(arg=keyword.arg, value=self.visit(keyword.value))
+                                 for keyword in node.keywords]
+                self.records.append(existing)
+                return node
             receipt = extraction_receipt(node) or {}
             identity = receipt.get("identity")
             # Rejected extraction decisions never become an authorized intrinsic.
             if receipt.get("action") == "reject":
                 return self.generic_visit(node)
             node = self.generic_visit(node)
+            if identity in _MUTEX_CONSTRUCTORS:
+                if node.args or node.keywords:
+                    raise ValueError("mutex constructor arguments require an explicit supported policy")
+                from ...compiler.synchronization import Scope
+                return self.operation("sync", "mutex_create", [
+                    ast.copy_location(ast.Constant(int(Scope.OBJECT)), node),
+                    ast.copy_location(ast.Constant(_MUTEX_CONSTRUCTORS[identity]), node),
+                ], [], node, identity)
+            from ...compiler.synchronization import synchronization_identity
+            synchronization = synchronization_identity(identity)
+            if synchronization is not None:
+                return self.operation("sync", synchronization, node.args, node.keywords, node, identity)
+            if identity == 'threading.Barrier':
+                keywords = [ast.keyword(arg='participants' if keyword.arg == 'parties' else keyword.arg,
+                                        value=keyword.value) for keyword in node.keywords]
+                return self.operation('barrier', 'create', node.args, keywords, node, identity)
             if identity in _THREADING_CONSTRUCTORS:
                 return self.operation(_THREADING_CONSTRUCTORS[identity], "create", node.args,
                                       node.keywords, node, identity)
             # Condition installs acquire/release from its lock on the
             # instance, so class-member source discovery cannot resolve them.
             # A locally constructed/aliased handle is the exact receiver proof.
-            if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-                kind = self.bindings.get(node.func.value.id)
-                if kind and node.func.attr in _THREADING_METHODS[kind]:
+            if isinstance(node.func, ast.Attribute):
+                kind = self.bindings.get(node.func.value.id) if isinstance(node.func.value, ast.Name) else None
+                if kind is None:
+                    kind = _MUTEX_METHOD_IDENTITIES.get(identity)
+                mutex_methods = {"acquire", "release", "locked"} if kind == "mutex" else {"acquire", "release"}
+                if kind in {"mutex", "rmutex"} and node.func.attr in mutex_methods:
+                    keywords = list(node.keywords)
+                    if node.func.attr == "acquire":
+                        supplied = {keyword.arg for keyword in keywords}
+                        for index, (name, default) in enumerate((("blocking", True), ("timeout", -1))):
+                            if len(node.args) <= index and name not in supplied:
+                                keywords.append(ast.keyword(arg=name, value=ast.copy_location(ast.Constant(default), node)))
+                    return self.operation("sync", "mutex_" + node.func.attr,
+                                          [node.func.value, *node.args], keywords, node,
+                                          "threading." + ("RLock" if kind == "rmutex" else "Lock") + "." + node.func.attr)
+                if kind in _THREADING_METHODS and node.func.attr in _THREADING_METHODS[kind]:
                     return self.operation(kind, node.func.attr, [node.func.value, *node.args],
                                           node.keywords, node,
                                           f"threading.{kind.title()}.{node.func.attr}")
@@ -660,6 +721,8 @@ def lower_python_threading(tree: ast.AST) -> ast.AST:
             record = getattr(node.value, "_turing_dispatch_operation", {})
             operation = record.get("operation", "")
             kind = operation[:-7] if operation.endswith("_create") else None
+            if operation == "sync_mutex_create":
+                kind = "rmutex" if _MUTEX_CONSTRUCTORS.get(record.get("source_identity"), False) else "mutex"
             if isinstance(node.value, ast.Name):
                 kind = self.bindings.get(node.value.id)
             for target in node.targets:
@@ -715,12 +778,33 @@ def lower_python_threading(tree: ast.AST) -> ast.AST:
 
         def visit_With(self, node):
             recognized = all(isinstance(item.context_expr, ast.Name)
-                             and self.bindings.get(item.context_expr.id) == "condition"
+                             and self.bindings.get(item.context_expr.id) in {"condition", "mutex", "rmutex"}
                              for item in node.items)
             if not recognized:
                 return self.generic_visit(node)
+            from ...compiler.concordance_declarations import SOURCE_RESOURCE_CONVERSION, INGESTION
+            from ...compiler.identity_concordance import current_identity_book, Derived, Mode
+            # Concord the authored scope before the first call-only pass
+            # rewrites anything in its body. Later resource conversion reads
+            # these exact recipe cells, not a new hash of rewritten syntax.
+            conversions = getattr(node, '_turing_resource_conversions', None)
+            kinds = tuple(self.bindings[item.context_expr.id] for item in node.items)
+            if conversions is None:
+                source = post_source_span(None, node)
+                if source is None:
+                    raise ValueError('resource scope has no ingested source occurrence')
+                conversions = tuple(current_identity_book().post(
+                    SOURCE_RESOURCE_CONVERSION, (source, ordinal),
+                    (kind, 'condition_acquire' if kind == 'condition' else 'sync_mutex_acquire',
+                     'condition_release' if kind == 'condition' else 'sync_mutex_release'), stage=INGESTION,
+                    provenance=Derived((source,)), mode=Mode.CONCORD)
+                    for ordinal, kind in enumerate(kinds))
+                node._turing_resource_conversions = conversions
+            if not lower_resources:
+                return self.generic_visit(node)
             body = self.statements(node.body)
-            for item in reversed(node.items):
+            for ordinal, item in reversed(tuple(enumerate(node.items))):
+                conversion = conversions[ordinal]
                 # Bind once, before entry. A body may reassign the source name;
                 # cleanup must still release the condition actually acquired.
                 while True:
@@ -732,17 +816,30 @@ def lower_python_threading(tree: ast.AST) -> ast.AST:
                 capture = ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())],
                                      value=copy.deepcopy(item.context_expr))
                 handle = ast.Name(id=name, ctx=ast.Load())
-                enter = self.operation("condition", "acquire", [copy.deepcopy(handle)],
-                                       [], node, "threading.Condition.__enter__")
+                kind = kinds[ordinal]
+                owner = "threading.Condition" if kind == "condition" else "threading.RLock" if kind == "rmutex" else "threading.Lock"
+                keywords = ([] if kind == "condition" else [
+                    ast.keyword(arg="blocking", value=ast.Constant(True)),
+                    ast.keyword(arg="timeout", value=ast.Constant(-1))])
+                enter = self.operation("condition" if kind == "condition" else "sync",
+                                       "acquire" if kind == "condition" else "mutex_acquire",
+                                       [copy.deepcopy(handle)], keywords, node, owner + ".__enter__")
                 acquire = (ast.Expr(value=enter) if item.optional_vars is None else
                            ast.Assign(targets=[copy.deepcopy(item.optional_vars)], value=enter))
-                release = self.operation("condition", "release", [handle], [], node,
-                                         "threading.Condition.__exit__")
+                release = self.operation("condition" if kind == "condition" else "sync",
+                                         "release" if kind == "condition" else "mutex_release", [handle], [], node,
+                                         owner + ".__exit__")
                 body = context_scope_statements(
                     [capture, acquire], body, cleanup=[ast.Expr(value=release)],
                 )
                 scope = body[2]
                 scope._turing_resource_scope = name
+                scope._turing_resource_contract = conversion
+                scope._turing_resource_operations = (enter, release)
+                for root in (capture, acquire, scope):
+                    for generated in ast.walk(root):
+                        if isinstance(generated, (ast.expr, ast.stmt)) and getattr(generated, '_turing_resource_conversion', None) is None:
+                            generated._turing_resource_conversion = conversion
             return [ast.copy_location(statement, node) for statement in body]
 
         def visit_For(self, node):
@@ -765,27 +862,30 @@ def lower_python_threading(tree: ast.AST) -> ast.AST:
     # Preserve lexical control ownership independently of source locations.
     # In particular, generated acquire and finally-release share a location
     # but must never be scheduled as adjacent straight-line calls.
-    def record_scopes(node, scopes=()):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            scopes = ()
-        operation = getattr(node, "_turing_dispatch_operation", None)
-        if operation is not None:
-            operation["control_scopes"] = scopes
-        for field, value in ast.iter_fields(node):
-            children = value if isinstance(value, list) else (value,)
-            nested = scopes
-            if isinstance(node, (ast.If, ast.IfExp, ast.For, ast.AsyncFor,
-                                 ast.While, ast.Try, ast.TryStar, ast.With,
-                                 ast.AsyncWith, ast.BoolOp, ast.comprehension,
-                                 ast.ListComp, ast.SetComp, ast.DictComp,
-                                 ast.GeneratorExp, ast.Call)):
-                nested += ((type(node).__name__, getattr(node, "lineno", None), field),)
-            for child in children:
-                if isinstance(child, ast.AST):
-                    record_scopes(child, nested)
-    record_scopes(tree)
+    record_python_control_scopes(tree)
     tree._turing_dispatch_operations = tuple(lowerer.records)
     return tree
+
+
+def record_python_control_scopes(node, scopes=()):
+    """Retain source control ownership, including late-bound source calls."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        scopes = ()
+    if isinstance(node, ast.Call):
+        node._turing_control_scopes = scopes
+    operation = getattr(node, "_turing_dispatch_operation", None)
+    if operation is not None:
+        operation["control_scopes"] = scopes
+    for field, value in ast.iter_fields(node):
+        nested = scopes
+        if isinstance(node, (ast.If, ast.IfExp, ast.For, ast.AsyncFor,
+                             ast.While, ast.Try, ast.TryStar, ast.With,
+                             ast.AsyncWith, ast.BoolOp, ast.comprehension,
+                             ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            nested += ((type(node).__name__, getattr(node, "lineno", None), field),)
+        for child in value if isinstance(value, list) else (value,):
+            if isinstance(child, ast.AST):
+                record_python_control_scopes(child, nested)
 
 
 def interpret_python_special_case(node: Any) -> SpecialCase | None:
@@ -812,16 +912,40 @@ def interpret_python_special_case(node: Any) -> SpecialCase | None:
         return None
 
     receipt = extraction_receipt(node)
+    if (receipt or {}).get("action") != "reject" and (receipt or {}).get("identity") in _THREADING_CONSTRUCTORS and not getattr(node, "_turing_dispatch_operation", None):
+        # Source pursuit can deliver an initializer's exact boundary receipt
+        # only when its function graph is extracted. Use the same frontend
+        # replacement there, retaining the original occurrence identity.
+        scopes = getattr(node, "_turing_control_scopes", ())
+        lowered = lower_python_threading(ast.Expression(body=node)).body
+        node._turing_dispatch_operation = dict(lowered._turing_dispatch_operation)
+        node._turing_dispatch_operation["control_scopes"] = scopes
+        node._extraction_contract = lowered._extraction_contract
+        receipt = extraction_receipt(node)
     attributes = _receipt_attributes(receipt) if receipt is not None else {}
     dispatch_operation = getattr(node, "_turing_dispatch_operation", None)
     if dispatch_operation is not None:
         attributes.update({
             "dispatch_operation": dict(dispatch_operation),
+            **({"extraction_identity": dispatch_operation['source_identity']}
+               if dispatch_operation['operation'].startswith('barrier_') else {}),
             "ordered_effect": True,
             "deployment_owner": "dispatcher",
-            "required_capability": "communicating_tasks",
+            "required_capability": dispatch_operation.get("required_capability", "communicating_tasks"),
         })
-        return SpecialCase("Call", attributes, None)
+        # Dispatcher arguments are still authored expressions. A terminal
+        # overlay dropped e.g. ACQUIRE_RELEASE | WORKGROUP_MEMORY entirely;
+        # lexical reduction could recreate simple literals but not that
+        # missing expression. Keep the incumbent Call role traversal.
+        from ...compiler.thread_operations import PROCESS_OPERATORS
+        return SpecialCase(
+            PROCESS_OPERATORS.get(dispatch_operation["operation"], "Call"),
+            attributes, None, terminal=False,
+            # The Python callable has been replaced by the semantic operation.
+            # Its source identity remains in the extraction receipt; only
+            # actual operands belong in the executable dependency graph.
+            role_schema={"up": {"args": "many", "keywords": "many"}, "down": {}},
+        )
     spelling = _call_spelling(node)
     identity = receipt.get("identity") if receipt is not None else None
     shell_operation = (

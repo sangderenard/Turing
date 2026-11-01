@@ -1,7 +1,5 @@
 """Probe source ingestion of two ordinary threads using one shared cell."""
 
-import pytest
-
 from src.compiler.concordance_declarations import SOURCE_DISPATCH_TARGET
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
@@ -93,10 +91,6 @@ def test_ssa_thread_target_identity_reads_the_concordance():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="thread lifecycle Dispatch survives SSA, but the worker's shared-cell access does not",
-)
 def test_ssa_retains_both_threads_and_the_shared_cell_access():
     module, _, _ = lower_ast_source_to_ssa(
         SOURCE, "root", extraction_contract=CONTRACT, progress_bars=False,
@@ -106,7 +100,7 @@ def test_ssa_retains_both_threads_and_the_shared_cell_access():
         instruction.attributes["dispatch_operation"]
         for block in root.blocks.values()
         for instruction in block.instrs
-        if instruction.op == "Dispatch"
+        if instruction.attributes.get("dispatch_operation") in OPERATIONS
     )
     assert operations == OPERATIONS
     assert any("worker" in name for name in module.functions), "worker function is absent from SSA"

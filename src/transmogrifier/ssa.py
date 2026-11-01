@@ -81,6 +81,32 @@ class Instr(TiledObject):
     attributes: Dict[str, Any] = field(default_factory=dict)
     source_span: Optional[Dict[str, Any]] = None
 
+    def __post_init__(self):
+        from .operator_safety import instruction_safety_attributes
+        for key, value in instruction_safety_attributes(self.op).items():
+            self.attributes.setdefault(key, value)
+
+    def failure_arms_for(self, book):
+        """Read the compile policy from its concordance cell, never a mirror."""
+        from .operator_safety import OPERATOR_FAILURE_ARMS
+        from ..compiler.concordance_declarations import COMPILE_POLICY
+        from ..compiler.identity_concordance import Ref
+        arms = OPERATOR_FAILURE_ARMS.get(str(self.op), ())
+        if not arms:
+            return ()
+        policy = self.attributes.get("operator_safety_policy")
+        if policy is None:
+            if "operator_safety_arms" in self.attributes:
+                raise ValueError("operator safety has no concorded compile policy")
+            return ()
+        if (not isinstance(policy, Ref) or policy.page != COMPILE_POLICY
+                or policy.row != ("operator_safety_arms",)):
+            raise ValueError("operator safety has an invalid compile policy identity")
+        setting = book.page(COMPILE_POLICY).cell(policy.row, policy.column)
+        if setting not in {"on", "off"}:
+            raise ValueError("operator safety compile policy is unavailable")
+        return arms if setting == "on" else ()
+
 from enum import Enum
 
 from .ssa_registry import Handler, sympy_ssa_name_map, sympy_ssa_disambig, SSARegistry
@@ -2998,6 +3024,83 @@ class SSAMachineIndirectTable:
         )
 
 
+class SSAThreadTable:
+    """Concorded worker definitions and per-create-site activation contexts.
+
+    A source site can create many runtime handles. State columns are per
+    handle; the source definition and its lowered SSA functions are shared.
+    """
+    STATE_COLUMNS = ("worker_token", "body", "arguments", "closure_context",
+                     "lifecycle", "completion", "waiters", "result")
+
+    def __init__(self, *, module, book):
+        self.module = module
+        self.book = book
+
+    def _rows(self, page_name):
+        from ..compiler import concordance_declarations as declarations
+        declaration = getattr(declarations, page_name.upper())
+        page = self.book.page(page_name)
+        return {self.book.latest_ref(declaration, row): page.latest(row) for row in page.rows()}
+
+    @property
+    def bodies(self):
+        return self._rows("source_thread_body")
+
+    @property
+    def activations(self):
+        return self._rows("source_thread_activation")
+
+    @property
+    def ssa_bodies(self):
+        return self._rows("ssa_thread_body")
+
+    @property
+    def ssa_activations(self):
+        return self._rows("ssa_thread_activation")
+
+    @property
+    def contexts(self):
+        return self._rows("ssa_thread_context")
+
+    def source_body(self, body):
+        reference = self.book.page(body.page).cell(body.row, body.column)[0]
+        return self.module.function_table.entry(reference).graph
+
+    def worker_functions(self, body):
+        return tuple(self.module.functions[cell.row[1]] for cell in self.ssa_bodies
+                     if cell.row[0] == body)
+
+
+class SSALockBox:
+    """Authoritative mutex binding descriptors for runtime token-lock rows.
+
+    Rows describe source identities; runtime instances are keyed by their
+    opaque mutex handle, so repeated factories and aliased external handles
+    cannot be confused with distinct compile-time table slots.
+    """
+    STATE_COLUMNS = ("object_token", "held_token", "owner_token", "depth", "generation",
+                     "waiters", "policy_flags", "execution_scope")
+    # Condition notification registrations are not mutex acquisition waiters.
+    # A condition uses the same handle/ownership row, with separate FIFO links.
+    CONDITION_STATE_COLUMNS = (*STATE_COLUMNS, "notification_head", "notification_tail")
+    CONDITION_INITIAL_STATE = (("notification_head", 0), ("notification_tail", 0))
+
+    def __init__(self, *, book=None):
+        from ..compiler.identity_concordance import current_identity_book
+        self.book = current_identity_book() if book is None else book
+
+    @property
+    def entries(self):
+        from ..compiler.concordance_declarations import LOCK_BOX_ENTRY
+        page = self.book.page(LOCK_BOX_ENTRY)
+        return {self.book.latest_ref(LOCK_BOX_ENTRY, row): page.latest(row) for row in page.rows()}
+
+    def entry_for(self, mutex_identity):
+        from ..compiler.concordance_declarations import LOCK_BOX_ENTRY
+        return self.book.latest_ref(LOCK_BOX_ENTRY, (mutex_identity,))
+
+
 @dataclass
 class IRModule(TiledObject):
     __live_storage_root__ = True
@@ -3065,6 +3168,8 @@ class IRModule(TiledObject):
     # relationship among several lowered functions and must remain observable
     # even when a backend selects only one function for emission.
     metadata: Dict[str, Any] = field(default_factory=dict)
+    lock_box: SSALockBox | None = None
+    thread_table: SSAThreadTable | None = None
 
     def __setattr__(self, name: str, value: Any) -> None:
         # The module's call table is stored on the identity book whatever a
@@ -3302,6 +3407,11 @@ class OperatorDef:
     handler: Optional[Callable]
     earliest_page: Optional[int] = None
     latest_page: Optional[int] = None
+
+    @property
+    def failure_arms(self):
+        from .operator_safety import OPERATOR_FAILURE_ARMS
+        return OPERATOR_FAILURE_ARMS.get(self.name, ())
 
 # Central registry: op-name -> OperatorDef
 operator_definitions: Dict[str, OperatorDef] = {}

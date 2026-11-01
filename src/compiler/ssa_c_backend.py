@@ -442,6 +442,35 @@ def _python_int_statement(
     return statement
 
 
+def _division_safety_statement(instruction, args, target, book):
+    """Materialize division's SSA failure/success arms before evaluating it."""
+    op = str(instruction.op)
+    kind = _scalar_c_type(instruction.res.dtype)
+    left, right = args
+    success = target + "_success"
+    if _python_int_true_division(instruction):
+        compute = _python_int_true_division_statement(args, success)
+    elif (_python_int_work_kind(instruction) is not None
+          and _python_int_spelled(op, instruction)):
+        work = _python_int_work_kind(instruction)
+        compute = _python_int_statement(op, args, success if work == kind else success + "_wide", work)
+        if work != kind:
+            compute = _python_int_narrowed_statement(instruction, compute, success)
+    elif op == "Div":
+        compute = f"{kind} {success} = ({kind})({left}) / ({kind})({right});"
+    elif all(_is_unsigned_dtype(a.dtype) for a in instruction.args):
+        symbol = "/" if op == "FloorDiv" else "%"
+        compute = f"{kind} {success} = ({left}) {symbol} ({right});"
+    else:
+        integral = all(_is_integer_dtype(a.dtype) for a in instruction.args)
+        helper = (_floored_integer_helper(op, instruction.args) if integral else _FLOORED[op][1])
+        compute = f"{kind} {success} = {helper}({left}, {right});"
+    zero = next(arm for arm in instruction.failure_arms_for(book) if arm.condition == 'divisor_zero')
+    return (f"{kind} {target} = 0; if (({right}) == 0) {{ "
+            f"turing_validation_error({zero.code}u); }} else {{ "
+            f"{compute} {target} = {success}; }}")
+
+
 def _python_int_work_kind(instruction) -> str | None:
     """The C type a Python ``int`` op computes in, else ``None``.
 
@@ -1334,6 +1363,7 @@ class CModuleArtifact:
     #: source always carries its own serial fallback, so a build without the
     #: pool is still correct -- just undeployed.
     pool_required: bool = False
+    thread_runtime_required: bool = False
     pooled_regions: tuple[tuple[str, int], ...] = ()
     #: LLVM pieces this module calls as externs: (symbol, llvm_ir).  Each is
     #: written beside the C source and handed to the same compiler
@@ -1477,7 +1507,7 @@ class CModuleArtifact:
         source_path.write_text(self.source, encoding="utf-8")
         layout_sources = self.write_layout_header(destination)
         pool_sources: list[str] = []
-        if self.pool_required:
+        if self.pool_required or self.thread_runtime_required:
             pool_home = (
                 Path(__file__).resolve().parent.parent
                 / "common" / "tensors" / "accelerator_backends" / "c_backend"
@@ -1488,6 +1518,12 @@ class CModuleArtifact:
                     encoding="utf-8",
                 )
             pool_sources.append(str(destination / "turing_pool.c"))
+            if self.thread_runtime_required:
+                for runtime_name in ("turing_thread_table.c", "turing_thread_table.h", "turing_validation_runtime.h"):
+                    (destination / runtime_name).write_text((pool_home / runtime_name).read_text(), encoding="utf-8")
+                pool_sources.append(str(destination / "turing_thread_table.c"))
+            if sys.platform != "win32":
+                flags = (*flags, "-pthread")
         pieces: list[tuple[str, str, Any]] = []
         for object_path, digest in self.linked_objects:
             import hashlib
@@ -1773,6 +1809,23 @@ class CModuleArtifact:
             "#include <time.h>",
             "",
             f"void {self.name}(void **buffers, long long *extents);",
+            *(("#include \"turing_validation_runtime.h\"",) if self.needs_validation_runtime else ()),
+            "static int invoke_entry(void **buffers, long long *extents) {",
+            *(("    turing_validation_error_reset();",) if self.needs_validation_runtime else ()),
+            f"    {self.name}(buffers, extents);",
+            *((
+                "    turing_error_packet packet;",
+                "    if (turing_validation_error_take_packet(&packet)) {",
+                "        fprintf(stderr, \"native validation error code=%u worker=%llu function=%s type=%s message=%s\\n\",",
+                "            (unsigned)packet.code, (unsigned long long)packet.worker_token,",
+                "            packet.worker_function ? packet.worker_function : \"\",",
+                "            packet.exception_type ? packet.exception_type : \"\",",
+                "            packet.message ? packet.message : \"\");",
+                "        return 0;",
+                "    }",
+            ) if self.needs_validation_runtime else ()),
+            "    return 1;",
+            "}",
             f"enum {{ BUFFER_COUNT = {len(self.buffer_order)} }};",
             f"static const size_t element_counts[BUFFER_COUNT] = {{{count_literals}}};",
             f"static const size_t element_sizes[BUFFER_COUNT] = {{{size_literals}}};",
@@ -1851,14 +1904,14 @@ class CModuleArtifact:
             f"    long long extents[{max(1, len(extent_values))}] = "
             f"{{{extent_literals}}};",
             "    for (unsigned long long frame = 0; frame < warmup; ++frame)",
-            f"        {self.name}(buffers, extents);",
+            "        if (!invoke_entry(buffers, extents)) return 7;",
             "    double started = wall_seconds();",
             "    if (started < 0.0) {",
             "        fputs(\"native wall clock unavailable\\n\", stderr);",
             "        return 6;",
             "    }",
             "    for (unsigned long long frame = 0; frame < frames; ++frame)",
-            f"        {self.name}(buffers, extents);",
+            "        if (!invoke_entry(buffers, extents)) return 7;",
             "    double elapsed = wall_seconds() - started;",
             "    FILE *output = fopen(output_path, \"wb\");",
             "    if (!output || !transfer_buffers(output, buffers, 1)) {",
@@ -1886,8 +1939,26 @@ class CModuleArtifact:
                 f"unsupported C optimization level {optimization!r}"
             )
         linked_sources: list[str] = []
+        if self.pool_required or self.thread_runtime_required:
+            runtime_home = Path(__file__).resolve().parents[1] / "common/tensors/accelerator_backends/c_backend"
+            runtime_names = ("turing_pool.c", "turing_pool.h") + (
+                ("turing_thread_table.c", "turing_thread_table.h", "turing_validation_runtime.h") if self.thread_runtime_required else ())
+            for runtime_name in runtime_names:
+                (destination / runtime_name).write_text((runtime_home / runtime_name).read_text(), encoding="utf-8")
+                if runtime_name.endswith(".c"):
+                    linked_sources.append(str(destination / runtime_name))
+            if sys.platform != "win32":
+                flags = (*flags, "-pthread")
         if self.needs_validation_runtime:
-            raise ValueError("standalone tile validation requires host error handling; use prepare_execution")
+            validation_home = Path(__file__).resolve().parents[1] / "common/tensors/accelerator_backends/c_backend"
+            (destination / "turing_validation_runtime.h").write_text(
+                (validation_home / "turing_validation_runtime.h").read_text(), encoding="utf-8")
+            # Authored integer loops already emit checked SSA/C arithmetic.
+            # The standalone host must observe the same runtime fault as
+            # CModuleExecution, instead of refusing the program or publishing
+            # partial buffers as a successful benchmark run.
+            linked_sources.append(str(Path(__file__).resolve().parents[1] /
+                "common/tensors/accelerator_backends/c_backend/turing_validation_runtime.c"))
         for object_path, digest in self.linked_objects:
             import hashlib
             path = Path(object_path)
@@ -1964,6 +2035,8 @@ def _module_call_closure(module: IRModule, root: str) -> tuple[str, ...]:
         if name in seen or name not in module.functions:
             continue
         seen.append(name)
+        from .c_threading import worker_targets
+        pending.extend(worker_targets(module, name))
         if module.functions[name].metadata.get("llvm_piece"):
             # An LLVM piece is called, never emitted: its callees are
             # inside the linked module and must not be re-lowered here.
@@ -2129,6 +2202,8 @@ def emit_ssa_module_to_c(
     trace: bool = False,
     trace_full_values: bool = False,
     batch: int | None = None,
+    native_sections: Mapping[str, Any] | None = None,
+    deployment_cores: int | None = None,
 ) -> CModuleArtifact:
     """Emit ``function_name`` and its call closure as one C module.
 
@@ -2166,11 +2241,25 @@ def emit_ssa_module_to_c(
         post_api_contract, post_program_abi_field_slots, value_cell,
     )
 
+    from .work_contract import active_contract
+    if deployment_cores is not None and (not isinstance(deployment_cores, int) or isinstance(deployment_cores, bool) or deployment_cores < 1):
+        raise ValueError('deployment_cores must be a positive total execution-slot budget')
+    if active_contract().deployment == 'auto':
+        from .deployment_outlining import discover_disjoint_store_iterations, outline_independent_iteration_lanes
+        discover_disjoint_store_iterations(module)
+        outline_independent_iteration_lanes(module)
     emission = emission_book(module, "emit_ssa_module_to_c")
     recorders: dict[str, Any] = {}
 
     name = str(entry_name or function_name)
     reachable = _module_call_closure(module, function_name)
+    from .c_synchronization import NATIVE_PRIMITIVES
+    thread_runtime_required = any(
+        str(i.op).startswith("Thread") or i.op in NATIVE_PRIMITIVES for fn in reachable
+        for block in module.functions[fn].blocks.values() for i in block.instrs
+    )
+    exception_runtime_required = any(str(i.op).startswith("Exception") for fn in reachable
+                                    for block in module.functions[fn].blocks.values() for i in block.instrs)
     # Declared externals (``external_functions``): runtime-slot leaves called
     # through the slot table this module exports and the host fills at load.
     from .external_functions import (
@@ -2749,6 +2838,9 @@ def emit_ssa_module_to_c(
                 for block in module.functions[owner].blocks.values()
                 for instruction in block.instrs
             )
+            from .c_threading import worker_targets
+            calls_extent_user = calls_extent_user or any(
+                target in extent_users for target in worker_targets(module, owner))
             if calls_extent_user:
                 extent_users.add(owner)
                 growing = True
@@ -2825,7 +2917,10 @@ def emit_ssa_module_to_c(
     linked_llvm: list[tuple[str, str]] = []
     linked_libraries: list[tuple[str, str]] = []
     linked_objects = []
-    needs_validation_runtime = False
+    needs_validation_runtime = exception_runtime_required
+    thread_support: list[str] = []
+    thread_trampolines: list[str] = []
+    thread_site_count = 0
     effect_guard_used = [False]
     deployment_outlines = {
         key: record
@@ -2857,6 +2952,8 @@ def emit_ssa_module_to_c(
             if instruction.res is not None
         }
         frame_allocations: list[tuple[str, str, int]] = []
+        owns_threads = any(i.op == "ThreadCreate" for b in function.blocks.values() for i in b.instrs)
+        owns_sync = any(i.op in {"MutexCreate", "WaitQueueCreate", "LatchCreate", "BarrierCreate"} for b in function.blocks.values() for i in b.instrs)
 
         def activation_array(element_type: str, count: int) -> str:
             """Spell LLVM's per-activation alloca as owned C storage."""
@@ -2972,7 +3069,11 @@ def emit_ssa_module_to_c(
         )
         recorder = recorders[fn] = recorder_for(fn)
         recorder.header(header, args=function.args)
-        piece = function.metadata.get("llvm_piece")
+        section = (native_sections or {}).get(fn)
+        if section is not None:
+            from .c_shell_sections import validate_section
+            validate_section(module, function_name, fn, section)
+        piece = section.piece if section is not None else function.metadata.get("llvm_piece")
         if piece:
             symbol = str(piece["symbol"])
             output_values_by_id = {
@@ -3028,6 +3129,8 @@ def emit_ssa_module_to_c(
                     linked_libraries.append((symbol, str(piece.get("library_path") or "")))
                 call_lines = [f"    {symbol}(piece_buffers, piece_extents);"]
             shim = [
+                *([f"    /* {section.backend} compute section; orchestration remains C. */"]
+                  if section is not None else []),
                 f"    void *piece_buffers[{max(len(slots), 1)}] = {{"
                 + ", ".join(slots or ["NULL"]) + "};",
                 f"    int32_t piece_extents[{max(len(extent_values), 1)}] = {{"
@@ -3047,9 +3150,9 @@ def emit_ssa_module_to_c(
                 # A slot call is the emission of every lowered call of this
                 # external leaf: DERIVED from their ``external_call_lowering``
                 # rows (which derive from the symbolic callsite rows).
-                extra_cells=(lowered_external_call_cells(
-                    emission, leaf=str(piece.get("leaf") or fn))
-                    if runtime_slot else ()),
+                extra_cells=((section.receipt,) if section is not None else (
+                    lowered_external_call_cells(emission, leaf=str(piece.get("leaf") or fn))
+                    if runtime_slot else ())),
             )
             recorder.unit(UnitKind.RETURN, "}")
             definitions.append("\n".join((
@@ -3646,6 +3749,11 @@ def emit_ssa_module_to_c(
             # code 86 (NativeIntOverflow) for the lane Python's ``int``
             # would carry past int64.
             lane_statement = None
+            if instruction.failure_arms_for(emission):
+                shortfalls.append(CEmissionShortfall(
+                    op, f"C shaped operator safety arms require a per-lane failure contract in {fn}",
+                ))
+                return
             if lane_checked and op in {"Add", "Sub", "Mul", "Neg", "Abs"}:
                 prototype = "void turing_validation_error(uint32_t error_code);"
                 if prototype not in prototypes:
@@ -4457,6 +4565,319 @@ def emit_ssa_module_to_c(
                     instruction.attributes.get("tensor_operation")
                     or instruction.op
                 )
+                if op.startswith("Exception"):
+                    from .concordance_declarations import SOURCE_EXCEPTION_OPERATION, C_EXCEPTION_OPERATION
+                    from .identity_concordance import Derived, Mode
+                    source_cell = instruction.attributes.get("exception_operation_cell")
+                    if source_cell is None:
+                        shortfalls.append(CEmissionShortfall(op, "exception operation has no source contract"))
+                        continue
+                    operation, exception_type, message, error_code, _normalization = emission.page(SOURCE_EXCEPTION_OPERATION).cell(source_cell.row, source_cell.column)
+                    result_id = int(instruction.res.id)
+                    policy = "native_record_and_control_edges"
+                    try:
+                        if op == "ExceptionNone":
+                            expressions[result_id] = "INT64_C(0)"
+                        elif op in {"ExceptionMake", "ExceptionTake"}:
+                            if op == "ExceptionMake" and instruction.args:
+                                raise ValueError("dynamic raised message requires an owned native message ABI")
+                            body.append(f"        turing_error_packet exception_{result_id} = {{0}};")
+                            if op == "ExceptionMake":
+                                body.append(f"        turing_error_packet_init(&exception_{result_id}, {int(error_code)}u, "
+                                            f"{_trace_text(exception_type) if exception_type else 'NULL'}, {_trace_text(message) if message is not None else 'NULL'});")
+                            else:
+                                body.append(f"        (void)turing_validation_error_take_active(&exception_{result_id});")
+                            body.append(f"        int64_t t{result_id} = (int64_t)(uintptr_t)&exception_{result_id};")
+                            expressions[result_id] = f"t{result_id}"
+                        elif op in {"ExceptionActive", "ExceptionMatch", "ExceptionRaise"}:
+                            held = scalar_operand(instruction.args[0])
+                            if held is None: continue
+                            packet = f"(const turing_error_packet *)(uintptr_t)({held})"
+                            if op == "ExceptionActive":
+                                body.append(f"        uint8_t t{result_id} = ({held}) != 0 && ({packet})->code != 0;")
+                            elif op == "ExceptionMatch":
+                                body.append(f"        uint8_t t{result_id} = (uint8_t)turing_error_packet_matches({packet}, {_trace_text(exception_type)});")
+                            else:
+                                body.append(f"        turing_validation_error_raise_packet({packet});")
+                            expressions[result_id] = "INT64_C(0)" if op == "ExceptionRaise" else f"t{result_id}"
+                        elif op == "ExceptionIndexType":
+                            actual = instruction.args[0]
+                            layout = resolve_dtype(str(actual.dtype))
+                            integer_index = layout is not None and layout.kind in {"int", "uint", "bool"} and not tuple(actual.shape or ())
+                            expressions[result_id] = "1" if integer_index else "0"
+                        elif op == "ExceptionLength":
+                            descriptor = None if sequence_table is None else sequence_table.by_id(int(instruction.args[0].id))
+                            if descriptor is None:
+                                raise ValueError("protected indexing requires a bounded sequence storage descriptor")
+                            length = values_by_id.get(int(descriptor.length_address_id))
+                            if length is None: raise ValueError("protected indexing has no resident length cell")
+                            held = scalar_operand(length)
+                            if held is None: continue
+                            body.append(f"        int64_t t{result_id} = (int64_t)({held});")
+                            expressions[result_id] = f"t{result_id}"
+                        else:
+                            raise ValueError("exception operation has no C materialization")
+                        policy_cell = emission.post(C_EXCEPTION_OPERATION, (source_cell, fn, result_id),
+                            (op, tuple(v.id for v in instruction.args), policy), stage=EMISSION_C,
+                            provenance=Derived((source_cell,)), mode=Mode.CONCORD)
+                        span.take(UnitKind.STATEMENT, result=instruction.res, args=instruction.args,
+                                  instruction=instruction, extra_cells=(policy_cell,))
+                        span.pending = None
+                    except ValueError as error:
+                        emission.post(C_EXCEPTION_OPERATION, (source_cell, fn, result_id),
+                            (op, tuple(v.id for v in instruction.args), 'refused: ' + str(error)),
+                            stage=EMISSION_C, provenance=Derived((source_cell,)), mode=Mode.CONCORD)
+                        shortfalls.append(CEmissionShortfall(op, str(error)))
+                    continue
+                if op == "ThreadCreate":
+                    from .c_threading import activation_plan
+                    try:
+                        policy_cell, (worker_name, bindings, _lifetime) = activation_plan(module, fn, instruction)
+                        worker = module.functions[worker_name]
+                        uid = thread_site_count
+                        thread_site_count += 1
+                        context_type = f"turing_thread_ctx_{uid}"
+                        trampoline = f"turing_thread_entry_{uid}"
+                        fields = ["    turing_error_packet fault;"]
+                        setup = []
+                        call_args = []
+                        worker_values = {int(v.id): v for v in worker.args}
+                        for index, (formal_id, kind, actual_id, pack_index) in enumerate(bindings):
+                            formal = worker_values[formal_id]
+                            actual = values_by_id.get(actual_id)
+                            if actual is None:
+                                raise ValueError(f"C thread context member {actual_id} has no resident SSA producer")
+                            fields.append(f"    void *a{index};")
+                            call_args.append(f"ctx->a{index}")
+                            if kind == "alias":
+                                held = address_operand(actual)
+                                if held is None:
+                                    raise ValueError("C thread capture has no emitted storage address")
+                                setup.append(f"        ctx_{uid}->a{index} = (void *)({held});")
+                            else:
+                                if _declared_span_rank(formal) > 0 or tuple(formal.shape or ()):
+                                    raise ValueError("C thread copied arguments must be scalar")
+                                ctype = solved_buffer_type(worker_name, formal)
+                                fields.append(f"    {ctype} c{index};")
+                                if kind == "pack":
+                                    address = address_operand(actual)
+                                    held = None if address is None else f"(({buffer_type(actual)} *)({address}))[{pack_index}]"
+                                else:
+                                    held = scalar_operand(actual)
+                                if held is None:
+                                    raise ValueError("C thread copied argument has no emitted value")
+                                setup.extend((f"        ctx_{uid}->c{index} = ({ctype})({held});",
+                                              f"        ctx_{uid}->a{index} = &ctx_{uid}->c{index};"))
+                        formal_ids_worker = {int(v.id) for v in worker.args}
+                        for index, output in enumerate(native_outputs[worker_name]):
+                            if int(output.id) in formal_ids_worker:
+                                continue
+                            shape = tuple(output.shape or ())
+                            if any(not isinstance(e, int) or e < 0 for e in shape):
+                                raise ValueError("C worker returned storage must have a static discard layout")
+                            fields.append(f"    {solved_buffer_type(worker_name, output)} out{index}[{max(1, math.prod(shape))}];")
+                            call_args.append(f"ctx->out{index}")
+                        if worker_name in extent_users:
+                            from .concordance_declarations import C_THREAD_EXTENTS
+                            from .identity_concordance import Derived, Mode
+                            extent_cell = emission.post(C_THREAD_EXTENTS, (policy_cell.row[0],),
+                                (fn, worker_name, "borrow_invocation_extents", "join_before_owner_return"),
+                                stage=EMISSION_C, provenance=Derived((policy_cell,)), mode=Mode.CONCORD)
+                            fields.append("    long long *extents;")
+                            setup.append(f"        ctx_{uid}->extents = extents;")
+                            call_args.append("ctx->extents")
+                            recorder.unit(UnitKind.DECLARATION, fields[-1], extra_cells=(extent_cell,))
+                        support = "\n".join((f"typedef struct {{", *fields, f"}} {context_type};",
+                                              f"static void {trampoline}(void *raw);"))
+                        thread_support.append(support)
+                        recorder.unit(UnitKind.DECLARATION, support, extra_cells=(policy_cell,))
+                        trampoline_text = "\n".join((f"static void {trampoline}(void *raw) {{",
+                            f"    {context_type} *ctx = ({context_type} *)raw;",
+                            "    turing_validation_error_set_worker(ctx->fault.worker_token, ctx->fault.worker_function);",
+                            "    turing_sync_set_worker_context(ctx->fault.worker_token);",
+                            "    turing_validation_error_reset();",
+                            f"    {_c_symbol(worker_name)}({', '.join(call_args)});",
+                            "    (void)turing_validation_error_take_packet(&ctx->fault);",
+                            "    turing_sync_set_worker_context(0);", "}"))
+                        thread_trampolines.append(trampoline_text)
+                        recorder.unit(UnitKind.KERNEL_TEXT, trampoline_text, extra_cells=(policy_cell,))
+                        body.extend((f"        {context_type} *ctx_{uid} = ({context_type} *)calloc(1, sizeof({context_type}));",
+                                     f"        if (!ctx_{uid}) {{ turing_validation_error(97); goto cleanup_{_c_symbol(fn)}; }}",
+                                     *setup,
+                                     f"        ctx_{uid}->fault.worker_function = {_trace_text(worker_name)};",
+                                     f"        int64_t t{instruction.res.id} = (int64_t)(uintptr_t)turing_source_thread_create(&source_threads, {trampoline}, ctx_{uid}, &ctx_{uid}->fault);",
+                                     f"        if (!t{instruction.res.id}) {{ free(ctx_{uid}); turing_validation_error(97); goto cleanup_{_c_symbol(fn)}; }}"))
+                        expressions[int(instruction.res.id)] = f"t{instruction.res.id}"
+                        span.take(UnitKind.CALL, result=instruction.res, args=instruction.args,
+                                  instruction=instruction, extra_cells=(policy_cell,))
+                        span.pending = None
+                        needs_validation_runtime = True
+                    except ValueError as error:
+                        shortfalls.append(CEmissionShortfall(op, str(error)))
+                    continue
+                if op in {"ThreadStart", "ThreadJoin", "ThreadIsAlive"}:
+                    if (len(instruction.args) != 1 or not any(
+                        i.op == "ThreadCreate" and i.res.id == instruction.args[0].id
+                        for b in function.blocks.values() for i in b.instrs
+                    )):
+                        shortfalls.append(CEmissionShortfall(op, "C thread lifecycle requires its exact local handle and default wait policy"))
+                        continue
+                    held = scalar_operand(instruction.args[0])
+                    if held is None:
+                        continue
+                    handle = f"(turing_source_thread *)(uintptr_t)({held})"
+                    result_id = int(instruction.res.id)
+                    if op == "ThreadIsAlive":
+                        body.append(f"        uint8_t t{result_id} = (uint8_t)turing_source_thread_is_alive({handle});")
+                    else:
+                        intrinsic = "turing_source_thread_start" if op == "ThreadStart" else "turing_source_thread_join"
+                        body.extend((f"        int thread_status_{result_id} = {intrinsic}({handle});",
+                                     f"        if (thread_status_{result_id} != 0) {{ turing_validation_error(thread_status_{result_id} > 0 ? (uint32_t)thread_status_{result_id} : 97); goto cleanup_{_c_symbol(fn)}; }}",
+                                     f"        int64_t t{result_id} = 0;"))
+                    expressions[result_id] = f"t{result_id}"
+                    needs_validation_runtime = True
+                    continue
+                if op in NATIVE_PRIMITIVES:
+                    from .c_synchronization import native_policy
+                    try:
+                        policy_cell, policy = native_policy(module, fn, instruction)
+                        args = {role: scalar_operand(value) for role, value in zip(instruction.arg_roles, instruction.args)
+                                if role != "after"}
+                        if any(value is None for value in args.values()):
+                            raise ValueError("native synchronization requires scalar ABI operands")
+                        result_id = int(instruction.res.id)
+                        mutex = f"(turing_dispatch_condition *)(uintptr_t)({args.get('mutex', args.get('wait_queue', '0'))})"
+                        latch = f"(turing_sync_latch *)(uintptr_t)({args.get('latch', args.get('barrier', '0'))})"
+                        intrinsic = policy[0]
+                        error_type = "builtins.RuntimeError"
+                        failure = None
+                        if op == "WorkerToken":
+                            call = f"{intrinsic}()"
+                        elif op == "MutexCreate":
+                            call = f"(intptr_t){intrinsic}(&source_threads, {args['reentrant']})"
+                            failure, error_type = "== 0", "builtins.MemoryError"
+                        elif op == "WaitQueueCreate":
+                            call = f"(intptr_t){intrinsic}(&source_threads, {mutex})"
+                            failure, error_type = "== 0", "builtins.MemoryError"
+                        elif op == "WaitQueueMutex":
+                            call = f"(intptr_t){intrinsic}({mutex})"
+                            failure = "== 0"
+                        elif op == "MutexAcquire":
+                            call = f"{intrinsic}({mutex}, {args['worker']}, {args['blocking']}, (double)({args['timeout']}))"
+                            failure = "< 0"
+                        elif op == "MutexAcquired":
+                            call = f"({args['acquisition']} > 0)"
+                        elif op == "MutexToken":
+                            call = f"{intrinsic}({mutex}, {args['worker']})"
+                            failure = "== 0"
+                        elif op in {"MutexRelease", "MutexSuspend"}:
+                            call = f"{intrinsic}({mutex}, {args['worker']}, {args['token']})"
+                            failure = "<= 0"
+                        elif op == "MutexRestore":
+                            call = f"{intrinsic}({mutex}, {args['worker']}, {args['depth']})"
+                            failure = "<= 0"
+                        elif op == "MutexLocked":
+                            call = f"{intrinsic}({mutex})"
+                            failure = "< 0"
+                        elif op == "LatchCreate":
+                            invalid = f"(({args['participants']}) < 0 || ({args['generation']}) < 0)"
+                            call = f"({invalid} ? 0 : (intptr_t){intrinsic}(&source_threads, {args['participants']}, {args['generation']}))"
+                            failure, error_type = "== 0", "builtins.MemoryError"
+                        elif op == 'BarrierCreate':
+                            invalid = f"(({args['participants']}) <= 0 || (uint64_t)({args['participants']}) > INT64_MAX)"
+                            call = f"({invalid} ? 0 : (intptr_t){intrinsic}(&source_threads, {args['participants']}, (double)({args['timeout']}), {args['finite']}))"
+                            failure, error_type = '== 0', 'builtins.MemoryError'
+                        elif op == 'BarrierWait':
+                            call = f"{intrinsic}({latch}, (double)({args['timeout']}), {args['finite']})"
+                            failure = '< 0'
+                        elif op in {'BarrierAbort', 'BarrierReset'}:
+                            call = f"{intrinsic}({latch})"
+                            failure = '< 0'
+                        elif op == "LatchArrive":
+                            call = f"{intrinsic}({latch}, {args['generation']}, {args['count']})"
+                            failure = "< 0"
+                        elif op == "LatchReset":
+                            call = f"{intrinsic}({latch}, {args['previous_generation']}, {args['generation']}, {args['participants']})"
+                            failure = "< 0"
+                        elif op == "ControlBarrier":
+                            call = f"{intrinsic}({latch}, {args['generation']}, {args['participants']})"
+                            if policy[2] == 4:
+                                call = f"(({args['participants']}) != 1 ? -1 : ({call}))"
+                            failure = "< 0"
+                        elif op == "CompletionWait":
+                            if not any(item.op == 'ThreadCreate' and item.res.id == instruction.args[0].id
+                                       for part in function.blocks.values() for item in part.instrs):
+                                raise ValueError('C CompletionWait requires an exact source thread handle')
+                            call = f"{intrinsic}((turing_source_thread *)(uintptr_t)({args['handle']}))"
+                            failure = "< 0"
+                        elif op == "LatchSignal":
+                            call = f"{intrinsic}({latch}, {args['generation']})"
+                            failure = "< 0"
+                        elif op in {"LatchWait", "LatchWaitTimeout"}:
+                            call = (f"{intrinsic}({latch}, {args['generation']}, "
+                                    f"(double)({args.get('timeout', '0')}), {args.get('finite', '0')})")
+                            failure = "< 0"
+                        elif op == "LatchDestroy":
+                            call = f"{intrinsic}(&source_threads, {latch})"
+                            failure = "< 0"
+                        elif op == "WaiterRegister":
+                            call = f"{intrinsic}({mutex}, {args['worker']}, {args['token']}, {latch})"
+                            failure = "< 0"
+                        elif op == "WaiterSelect":
+                            call = f"(intptr_t){intrinsic}({mutex}, {args['worker']}, {args['token']})"
+                        elif op == "WaiterRetire":
+                            call = f"{intrinsic}({mutex}, {args['worker']}, {latch})"
+                            failure = "< 0"
+                        else:
+                            raise ValueError("native synchronization primitive has no materialization")
+                        if op in {'ControlBarrier', 'LatchArrive', 'LatchReset', 'LatchWait', 'LatchWaitTimeout', 'LatchSignal'}:
+                            invalid_counts = [f"(({args[role]}) < 0)" for role in
+                                              ('generation', 'previous_generation', 'participants', 'count') if role in args]
+                            if invalid_counts:
+                                call = f"(({' || '.join(invalid_counts)}) ? -1 : ({call}))"
+                        body.append(f"        int64_t sync_status_{result_id} = (int64_t)({call});")
+                        if op in {"MutexAcquire", "LatchWaitTimeout"}:
+                            body.append(f'        if (sync_status_{result_id} < 0) turing_validation_error_named(97u, sync_status_{result_id} == -2 ? "builtins.OverflowError" : sync_status_{result_id} == -3 ? "builtins.ValueError" : "builtins.RuntimeError", "{op} failed");')
+                        elif op in {'BarrierReset', 'LatchReset'}:
+                            body.append(f'        if (sync_status_{result_id} < 0) turing_validation_error_named(97u, sync_status_{result_id} == -5 ? "builtins.MemoryError" : sync_status_{result_id} == -2 ? "builtins.OverflowError" : "builtins.RuntimeError", "{op} failed");')
+                        elif op == 'BarrierWait':
+                            body.append(f'        if (sync_status_{result_id} < 0) turing_validation_error_named(97u, sync_status_{result_id} == -4 ? "threading.BrokenBarrierError" : sync_status_{result_id} == -2 ? "builtins.OverflowError" : sync_status_{result_id} == -3 ? "builtins.ValueError" : sync_status_{result_id} == -5 ? "builtins.MemoryError" : "builtins.RuntimeError", "BarrierWait failed");')
+                        elif op in {"LatchCreate", 'BarrierCreate'}:
+                            body.append(f'        if (sync_status_{result_id} == 0) turing_validation_error_named(97u, {invalid} ? "builtins.ValueError" : "builtins.MemoryError", "{op} failed");')
+                        elif failure is not None:
+                            body.append(f'        if (sync_status_{result_id} {failure}) turing_validation_error_named(97u, "{error_type}", "{op} failed");')
+                        if op == "MutexAcquire":
+                            expression = f"(sync_status_{result_id} > 0 ? sync_status_{result_id} : 0)"
+                        elif op in {"WaiterRegister", "MutexLocked"}:
+                            expression = f"(sync_status_{result_id} > 0)"
+                        elif instruction.res.dtype == "none":
+                            expression = "0"
+                        else:
+                            expression = f"sync_status_{result_id}"
+                        body.append(f"        {buffer_type(instruction.res)} t{result_id} = {expression};")
+                        expressions[result_id] = f"t{result_id}"
+                        integer_ids.add(result_id)
+                        needs_validation_runtime = True
+                        span.take(UnitKind.STATEMENT, result=instruction.res, args=instruction.args,
+                                  instruction=instruction, extra_cells=(policy_cell,))
+                        span.pending = None
+                    except ValueError as error:
+                        shortfalls.append(CEmissionShortfall(op, str(error)))
+                    continue
+                if op == "MemoryBarrier":
+                    from .c_synchronization import fence_policy
+                    try:
+                        intrinsic, order, _scope, _semantics, _domain = fence_policy(module, instruction)
+                    except ValueError as error:
+                        shortfalls.append(CEmissionShortfall(op, str(error)))
+                        continue
+                    body.append(f"        {intrinsic}({order});")
+                    # The dependency token is intentionally inert. Ordering
+                    # comes from the emitted C11 fence and SSA dependencies.
+                    result_id = int(instruction.res.id)
+                    body.append(f"        const int64_t t{result_id} = 0;")
+                    expressions[result_id] = f"t{result_id}"
+                    continue
                 if id(instruction) in aggregate_projection_instruction_ids:
                     # The native call binds these abstract tuple projections
                     # directly to caller-owned output storage.
@@ -6057,6 +6478,18 @@ def emit_ssa_module_to_c(
                     ))
                     if outline_record is None:
                         continue
+                    if emission is not None:
+                        from .concordance_declarations import C_DEPLOYMENT_POLICY, SSA_DEPLOYMENT_OUTLINE
+                        from .identity_concordance import Derived, Mode
+                        outline_cell = emission.latest_ref(SSA_DEPLOYMENT_OUTLINE, (fn, int(outline_record.region_id)))
+                        if outline_cell is None:
+                            raise ValueError('C pooled deployment lacks its concorded outline')
+                        from .deployment_outlining import _geometry_fact
+                        accepted_outline = emission.page(SSA_DEPLOYMENT_OUTLINE).cell(outline_cell.row, outline_cell.column)
+                        if (accepted_outline[-1] != outline_record
+                                or accepted_outline[1] != _geometry_fact(function)
+                                or accepted_outline[3] != _geometry_fact(module.functions[outline_record.outline_name])):
+                            raise ValueError('C pooled deployment disagrees with its accepted outline and SSA edges')
                     deploy_callee = module.functions.get(
                         outline_record.outline_name
                     )
@@ -6148,11 +6581,30 @@ def emit_ssa_module_to_c(
                     step_scalar = scalar_operand(step_value)
                     if None in (start_scalar, stop_scalar, step_scalar):
                         continue
+                    from .deployment_lowering import select_deployment_strategy
+                    deployment_choice = select_deployment_strategy(
+                        backend='c', execution_class='thread-workers', join_mode='barrier',
+                        cores=deployment_cores if deployment_cores is not None else _DEFAULT_POOL_WORKERS + 1)
+                    parked_workers = deployment_choice.workers
+                    if deployment_choice.strategy == 'pool' and parked_workers is None:
+                        raise ValueError('C pooled deployment lacks its explicit worker budget')
+                    deployment_cells = ()
+                    if emission is not None:
+                        policy_row = (fn, int(outline_record.region_id))
+                        prior_policy = emission.latest_ref(C_DEPLOYMENT_POLICY, policy_row)
+                        deployment_cells = (emission.post(C_DEPLOYMENT_POLICY, policy_row,
+                            (deployment_choice.strategy, deployment_cores, parked_workers, 'caller_participates'),
+                            stage=EMISSION_C, provenance=Derived((outline_cell, *((prior_policy,) if prior_policy else ()))),
+                            mode=Mode.REVISE if prior_policy else Mode.CONCORD),)
+                    if deployment_choice.strategy != 'pool':
+                        body.append('        /* deployment policy retains the serial loop */')
+                        span.take(UnitKind.STATEMENT, instruction=instruction, extra_cells=deployment_cells)
+                        continue
                     body.extend((
                         "        {",
                         "        static int turing_pool_started = 0;",
                         "        if (!turing_pool_started) { "
-                        f"turing_pool_start({_DEFAULT_POOL_WORKERS}); "
+                        f"turing_pool_start({parked_workers}); "
                         "turing_pool_started = 1; }",
                         f"        turing_deploy_ctx_{uid} turing_ctx = {{ "
                         f"(long long)({start_scalar}), "
@@ -6172,6 +6624,7 @@ def emit_ssa_module_to_c(
                     pooled_regions.append(
                         (str(fn), int(outline_record.region_id))
                     )
+                    span.take(UnitKind.CALL, instruction=instruction, extra_cells=deployment_cells)
                     continue
                 if op == "string_token" and instruction.res is not None:
                     result_id = int(instruction.res.id)
@@ -6736,6 +7189,22 @@ def emit_ssa_module_to_c(
                         )
                         + ";"
                     )
+                elif op in {"Div", "FloorDiv", "Mod"} and instruction.failure_arms_for(emission):
+                    prototype = "void turing_validation_error(uint32_t error_code);"
+                    if prototype not in prototypes:
+                        prototypes.append(prototype)
+                    needs_validation_runtime = True
+                    declared_storage_type = _scalar_c_type(instruction.res.dtype)
+                    declared = _division_safety_statement(instruction, args, f"t{result_id}", emission)
+                    from .concordance_declarations import C_OPERATOR_SAFETY, EMISSION_C
+                    from .identity_concordance import Derived, Mode
+                    policy = instruction.attributes["operator_safety_policy"]
+                    source = value_cell(emission, function, instruction.res)
+                    if source is None:
+                        raise ValueError("division safety arm lacks its exact SSA identity")
+                    emission.post(C_OPERATOR_SAFETY, (source, fn),
+                                  (op, tuple(a.id for a in instruction.args), instruction.failure_arms_for(emission), policy),
+                                  stage=EMISSION_C, provenance=Derived((source, policy)), mode=Mode.CONCORD)
                 elif _python_int_true_division(instruction):
                     prototype = "void turing_validation_error(uint32_t error_code);"
                     if prototype not in prototypes:
@@ -7165,6 +7634,8 @@ def emit_ssa_module_to_c(
                 spelling=f"t{phi_id}",
             )
         declarations.extend(local_tensor_declarations)
+        if owns_threads or owns_sync:
+            declarations.append("    turing_thread_scope source_threads = {0};")
         declarations.extend(
             f"    {element_type} *{storage_name} = NULL;"
             for element_type, storage_name, _count in frame_allocations
@@ -7185,6 +7656,7 @@ def emit_ssa_module_to_c(
         ]
         cleanup = [
             f"cleanup_{_c_symbol(fn)}:",
+            *(("    turing_thread_scope_clear(&source_threads);",) if owns_threads or owns_sync else ()),
             *(
                 f"    free({storage_name});"
                 for _element_type, storage_name, _count
@@ -7687,6 +8159,7 @@ def emit_ssa_module_to_c(
         "#include <limits.h>",
         "#include <stddef.h>",
         "#include <stdint.h>",
+        "#include <stdatomic.h>",
         "#include <stdlib.h>",
         "#include <string.h>",
         # Same rationale as the scalar lane: C grants no reassociation
@@ -7701,6 +8174,11 @@ def emit_ssa_module_to_c(
         "",
         *_FLOORED_HELPERS,
         *_HEAP_HELPERS,
+        *(("#include \"turing_validation_runtime.h\"",) if exception_runtime_required and not thread_runtime_required else ()),
+        *(("#include \"turing_thread_table.h\"",
+           "extern void turing_validation_error(uint32_t);",
+           "extern void turing_validation_error_reset(void);",
+           "extern uint32_t turing_validation_error_take(void);") if thread_runtime_required else ()),
         "",
         *(_TRACE_HELPERS if trace else ()),
         "",
@@ -7709,6 +8187,7 @@ def emit_ssa_module_to_c(
             if pooled_regions or effect_guard_used[0] else ()
         ),
         *deployment_support,
+        *thread_support,
         "",
         *(c_slot_runtime(name, len(slot_functions)) if slot_functions else ()),
         "",
@@ -7717,6 +8196,7 @@ def emit_ssa_module_to_c(
         *definitions,
         "",
         *deployment_trampolines,
+        *thread_trampolines,
         "",
         wrapper_header,
         *entry_lines,
@@ -7787,12 +8267,15 @@ def emit_ssa_module_to_c(
         buffer_roles=public_roles,
         precision_sections=precision_present,
         pool_required=bool(pooled_regions) or effect_guard_used[0],
+        thread_runtime_required=thread_runtime_required,
         pooled_regions=tuple(pooled_regions),
         emission=(
             None if emission is None
             else ArtifactEmission(
                 emission, Backend.C_MODULE, module_text, buffer_order_cell,
                 api_contract=api_contract_cell,
+                piece_sources={str(section.piece['symbol']): (section.receipt,)
+                               for section in (native_sections or {}).values()},
             )
         ),
     )

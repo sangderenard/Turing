@@ -423,6 +423,251 @@ NAME_BINDING_CAPTURE = declare_page("name_binding_capture", (
     RowField("read_scope", K.SCOPE), RowField("name", K.NAME),
     RowField("version", K.INDEX),
 ), tuple)  # (source binding, source version, owning loop or None); CONCORD
+SOURCE_CLOSURE_ENVIRONMENT = declare_page("source_closure_environment", (
+    RowField("read_scope", K.SCOPE), RowField("function_ref", K.INDEX),
+    RowField("name", K.NAME),
+), tuple)  # (exact parent binding cell, definition span cell, function address cell)
+SOURCE_CLOSURE_CAPTURE = declare_page("source_closure_capture", (
+    RowField("read_scope", K.SCOPE), RowField("name", K.NAME),
+    RowField("version", K.INDEX),
+), tuple)  # (environment cell, exact parent binding cell, exact input binding cell)
+SOURCE_EXTRACTION_IDENTITY = declare_page("source_extraction_identity", (
+    RowField("source", K.PAGE_REF),
+), str)  # exact external callable identity established by source extraction
+SOURCE_CLOSURE_CALLABLE = declare_page("source_closure_callable", (
+    RowField("numeric_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), tuple)  # (exact callable identity, environment cell, parent binding, receiver cell)
+THREAD_REGION_BUILD = declare_transform("thread_region_build", 1)
+SOURCE_THREAD_REGION = declare_page("source_thread_region", (
+    RowField("read_scope", K.SCOPE),
+), tuple)  # (activation create/start/join source cells, status)
+SOURCE_THREAD_REGION_MEMBER = declare_page("source_thread_region_member", (
+    RowField("read_scope", K.SCOPE), RowField("node", K.VALUE_ID),
+), tuple)  # (source node cell, activation create cell or None, source function ref)
+SOURCE_THREAD_REGION_EDGE = declare_page("source_thread_region_edge", (
+    RowField("read_scope", K.SCOPE), RowField("half", K.LABEL),
+    RowField("source", K.VALUE_ID), RowField("target", K.VALUE_ID),
+), tuple)  # (role or tuple of roles for shared endpoints, cause cells)
+SOURCE_THREAD_REGION_SCHEDULE = declare_page("source_thread_region_schedule", (
+    RowField("read_scope", K.SCOPE), RowField("preference", K.LABEL),
+), tuple)  # (dependency levels, control levels); graph arrangements, not authored edges
+SOURCE_THREAD_REGION_CONTROL = declare_page("source_thread_region_control", (
+    RowField("read_scope", K.SCOPE), RowField("member", K.VALUE_ID),
+), tuple)  # (source control IR, source binding, entry member, completion member)
+SOURCE_THREAD_REGION_GAP = declare_page("source_thread_region_gap", (
+    RowField("read_scope", K.SCOPE), RowField("member", K.VALUE_ID),
+), tuple)  # (reason, exact source cells); prevents scheduling an incomplete region
+SOURCE_SYNC_OPERATOR = declare_page("source_sync_operator", (
+    RowField("read_scope", K.SCOPE), RowField("member", K.VALUE_ID),
+), tuple)  # (source wait cell, activation, barrier object, execution scope, memory scope, semantics, status)
+SOURCE_THREAD_BARRIER_POLICY = declare_page("source_thread_barrier_policy", (
+    RowField("identity", K.LABEL),
+), tuple)  # execution selector, memory-effect selector, ordering; no hardware scope
+SOURCE_CONTROL_RENDEZVOUS = declare_page("source_control_rendezvous", (
+    RowField("read_scope", K.SCOPE), RowField("barrier", K.PAGE_REF), RowField("phase", K.INDEX),
+), tuple)  # (participant sync cells, authored party count, count operand cell)
+SOURCE_CONTROL_IR = declare_page("source_control_ir", (
+    RowField("read_scope", K.SCOPE),
+), tuple)  # actual ControlProgram cell and its ingested operator/region/placement cells
+SOURCE_CONTROL_OPERATOR = declare_page("source_control_operator", (
+    RowField("read_scope", K.SCOPE), RowField("node", K.VALUE_ID),
+), tuple)  # (ControlProgram, ControlBlock, placement, immutable DispatchBlock)
+SOURCE_ACTIVITY_CUT = declare_page("source_activity_cut", (
+    RowField("planning_scope", K.SCOPE), RowField("node", K.VALUE_ID),
+), tuple)  # exact completed process boundaries constraining atomic region fusion
+SOURCE_ACTIVITY_SCOPE = declare_page("source_activity_scope", (
+    RowField("read_scope", K.SCOPE),
+), tuple)  # declared source activity graph of this read scope; inherited by forks
+SOURCE_ACTIVITY_NODE = declare_page("source_activity_node", (
+    RowField("source_scope", K.SCOPE), RowField("occurrence", K.PAGE_REF), RowField("phase", K.LABEL),
+), tuple)  # (source operation kind, exact control-owner/arm cells)
+SOURCE_ACTIVITY_EDGE = declare_page("source_activity_edge", (
+    RowField("source_scope", K.SCOPE), RowField("before", K.PAGE_REF),
+    RowField("after", K.PAGE_REF), RowField("relation", K.LABEL),
+), bool)  # source evaluation/control edges; repeat edges are region backedges
+SOURCE_ACTIVITY_CHILD = declare_page("source_activity_child", (
+    RowField("source_scope", K.SCOPE), RowField("owner", K.PAGE_REF), RowField("ordinal", K.INDEX),
+), tuple)  # exact evaluation entry/completion of an authored display member
+SOURCE_ACTIVITY_CALL = declare_page("source_activity_call", (
+    RowField("source_scope", K.SCOPE), RowField("occurrence", K.PAGE_REF),
+), tuple)  # authored positional arity and exact keyword names
+SOURCE_ACTIVITY_BINDING = declare_page("source_activity_binding", (
+    RowField("source_scope", K.SCOPE), RowField("process_node", K.PAGE_REF),
+), tuple)  # (entry activity cell, completion activity cell)
+SOURCE_ACTIVITY_POLICY = declare_page("source_activity_policy", (
+    RowField("source_scope", K.SCOPE),
+), str)
+SOURCE_ACTIVITY_SCHEDULE = declare_page("source_activity_schedule", (
+    RowField("source_scope", K.SCOPE), RowField("preference", K.LABEL),
+), tuple)  # (exact activity cell/level pairs, existing scheduler provider)
+SOURCE_OPERATOR_KIND = declare_page("source_operator_kind", (
+    RowField("node", K.PAGE_REF),
+), str)  # registered SSA semantic operator, captured at source-node ingestion
+PROCESS_ESCAPE_CLASSIFICATION = declare_page("process_escape_classification", (
+    RowField("operation", K.PAGE_REF),
+), tuple)  # (typed graph semantic, classification); excludes diagnostic Python-call escape inference
+PROCESS_GRAPH_OPERANDS = declare_page("process_graph_operands", (
+    RowField("read_scope", K.SCOPE), RowField("consumer", K.VALUE_ID),
+), tuple)  # ordered (operand identity cell, role) graph edges; one writer
+SYNCHRONIZATION_LITERAL = declare_page("synchronization_literal", (
+    RowField("operation", K.PAGE_REF),
+), tuple)  # (registered SSA operator, exact operand cells, literal result)
+SOURCE_SYNCHRONIZATION = declare_page("source_synchronization", (
+    RowField("read_scope", K.SCOPE), RowField("callsite", K.VALUE_ID),
+), tuple)  # (kind, roles, ordered projections, constants, operand cells, source cell)
+SOURCE_PROCESS_OPERATION = declare_page("source_process_operation", (
+    RowField("source", K.PAGE_REF),
+), tuple)  # (operation, semantic operator, result dtype, exact Python identity, control scopes)
+@dataclass(frozen=True)
+class ProcessCallFact:
+    source: Ref
+    activation: Ref | None
+    callsite: int
+    semantic: str
+    result_dtype: str
+    argument_ids: tuple
+    keyword_names: tuple
+    capture_value_ids: tuple
+    worker_arguments: tuple
+    worker_argument_pack_expanded: bool
+
+
+LOWERED_SOURCE_FUNCTION = declare_page("lowered_source_function", (
+    RowField("symbol", K.NAME),
+), tuple)  # (exact address cell, shape variant, entry block, capture binding cells)
+SSA_PROCESS_CALL = declare_page("ssa_process_call", (
+    RowField("result", K.PAGE_REF),
+), ProcessCallFact)
+SOURCE_FORMAL_ORDER = declare_page("source_formal_order", (
+    RowField("source_scope", K.SCOPE),
+), tuple)  # ordered authored parameter names; grammar captured at ingestion
+SOURCE_THREAD_ARGUMENT_PACK = declare_page("source_thread_argument_pack", (
+    RowField("activation", K.PAGE_REF),
+), tuple)  # exact ordered SOURCE_THREAD_ARGUMENT binding cells (including empty pack)
+SOURCE_THREAD_BODY = declare_page("source_thread_body", (
+    RowField("address", K.PAGE_REF),
+), tuple)  # (function ref, source node cells, exact closure capture cells)
+THREAD_CONTEXT_BINDING = declare_transform("thread_context_binding", 1)
+SOURCE_THREAD_ACTIVATION = declare_page("source_thread_activation", (
+    RowField("create", K.PAGE_REF),
+), tuple)  # (body cell, parent function ref, operand cells/roles, start cells, join cells, control scopes)
+SOURCE_THREAD_CAPTURE_USE = declare_page("source_thread_capture_use", (
+    RowField("activation", K.PAGE_REF), RowField("capture", K.PAGE_REF),
+), tuple)  # (exact parent storage cell, worker input cell, worker may mutate)
+SOURCE_THREAD_ARGUMENT = declare_page("source_thread_argument", (
+    RowField("activation", K.PAGE_REF), RowField("position", K.INDEX),
+), tuple)  # (actual source member cell, exact formal binding cell, aggregate layout cell)
+NATIVE_EXCEPTION_CONTROL_GAP = declare_page("native_exception_control_gap", (
+    RowField("source", K.PAGE_REF),
+), tuple)  # (ingested operation kind, missing graph-edge contracts)
+SSA_CONTROL_EDGE = declare_page("ssa_control_edge", (
+    RowField("scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("before", K.PAGE_REF), RowField("after", K.PAGE_REF), RowField("arm", K.LABEL),
+), bool)  # actual control-builder branch edge
+SSA_ARM_CONTINUATION = declare_page("ssa_arm_continuation", (
+    RowField("scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("entry", K.PAGE_REF), RowField("tip", K.PAGE_REF),
+), bool)  # whether the arm's current tip is reachable from its entry
+SOURCE_LOOP_CONTROL_SITE = declare_page("source_loop_control_site", (
+    RowField("source", K.PAGE_REF),
+), tuple)  # action, exact lexical (name, value identity) bindings, owner occurrence
+SOURCE_LOOP_SITE_EDGE = declare_page("source_loop_site_edge", (
+    RowField("loop", K.PAGE_REF), RowField("site", K.PAGE_REF),
+), tuple)  # carried (initial, updated, site value) identity triples
+SOURCE_LOOP_SITE_VIEW = declare_page("source_loop_site_view", (
+    RowField("scope", K.SCOPE), RowField("site", K.VALUE_ID),
+), tuple)  # exact source edge and its local (initial, updated, value) projection
+SOURCE_LOOP_EXIT_READ = declare_page("source_loop_exit_read", (
+    RowField("scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), tuple)  # exact loop operand snapshot(s) whose exit state this read consumes
+SOURCE_LOOP_CONTROL_WORK = declare_page("source_loop_control_work", (
+    RowField("scope", K.SCOPE), RowField("loop", K.VALUE_ID),
+), tuple)  # exact terminal-site and process-operation facts retained without numerical regions
+RESOURCE_CLEANUP_RESULT = declare_transform("resource_cleanup_result", 1)
+SOURCE_ACTIVITY_ARM_RELATION = declare_page("source_activity_arm_relation", (
+    RowField("scope", K.SCOPE), RowField("owner", K.PAGE_REF),
+    RowField("before", K.LABEL), RowField("after", K.LABEL),
+), str)  # declared ordered relationship between non-exclusive control arms
+SOURCE_RESOURCE_CONVERSION = declare_page("source_resource_conversion", (
+    RowField("source", K.PAGE_REF), RowField("item", K.INDEX),
+), tuple)  # admitted context kind, acquire operation, cleanup operation
+SOURCE_RESOURCE_SCOPE = declare_page("source_resource_scope", (
+    RowField("source", K.PAGE_REF),
+), tuple)  # conversion, exact entry-call occurrence, exact cleanup-call occurrence
+SOURCE_RESOURCE_CONTROL = declare_page("source_resource_control", (
+    RowField("scope", K.SCOPE), RowField("node", K.VALUE_ID),
+), tuple)  # source scope, placed resource block, entry/cleanup source operations, receiver cell
+SOURCE_EXCEPTION_INGESTION = declare_page("source_exception_ingestion", (
+    RowField("source", K.PAGE_REF),
+), tuple)  # exact source body, proposed primitive/control body, check count
+SOURCE_EXCEPTION_NODE = declare_page("source_exception_node", (
+    RowField("source", K.PAGE_REF),
+), object)  # exact generated ingestion node -> exception conversion
+SOURCE_EXCEPTION_OPERATION = declare_page("source_exception_operation", (
+    RowField("source", K.PAGE_REF),
+), tuple)  # (operation, exception type, message, code, process-operation origin cell)
+C_EXCEPTION_OPERATION = declare_page("c_exception_operation", (
+    RowField("source", K.PAGE_REF), RowField("function", K.NAME), RowField("result", K.VALUE_ID),
+), tuple)  # (semantic operator, input ids, materialization policy)
+C_OPERATOR_SAFETY = declare_page("c_operator_safety", (
+    RowField("result", K.PAGE_REF), RowField("function", K.NAME),
+), tuple)  # (operator, exact input ids, fundamental failure arms, compile policy)
+THREAD_CAPTURE_CONTRACT = declare_page("thread_capture_contract", (
+    RowField("capture", K.PAGE_REF),
+), tuple)  # (exact element class, source class cells); storage remains shared
+THREAD_CAPTURE_COLUMNS = declare_page("thread_capture_columns", (
+    RowField("contract", K.PAGE_REF),
+), tuple)  # writer-checked physical column dtypes
+SSA_THREAD_BODY = declare_page("ssa_thread_body", (
+    RowField("body", K.PAGE_REF), RowField("function", K.NAME),
+), tuple)  # (source function ref, closure formal ids, entry block)
+SSA_THREAD_ACTIVATION = declare_page("ssa_thread_activation", (
+    RowField("function", K.NAME), RowField("create", K.VALUE_ID),
+), tuple)  # (source activation cell, handle id, argument ids, target body cells)
+SSA_THREAD_CONTEXT = declare_page("ssa_thread_context", (
+    RowField("activation", K.PAGE_REF), RowField("capture", K.PAGE_REF),
+    RowField("function", K.NAME), RowField("worker", K.NAME),
+), tuple)  # (parent storage id, worker input id, actual members, formal members, live/unused)
+SSA_SYNCHRONIZATION = declare_page("ssa_synchronization", (
+    RowField("function", K.NAME), RowField("block", K.NAME), RowField("site", K.INDEX),
+), tuple)  # (source contract cell, operator, phase, roles, operand ids, result id)
+SYNCHRONIZATION_TOKEN = declare_transform("synchronization_token", 1)
+SSA_SYNCHRONIZATION_PROCEDURE = declare_page("ssa_synchronization_procedure", (
+    RowField("source", K.PAGE_REF), RowField("function", K.NAME), RowField("entry", K.PAGE_REF),
+), tuple)  # (kind, result id, exit block, exact primitive receipts, exact CFG edges)
+C_SYNCHRONIZATION_POLICY = declare_page("c_synchronization_policy", (
+    RowField("receipt", K.PAGE_REF),
+), tuple)  # (intrinsic, C memory order, exact scope, exact semantics, domain)
+C_SHELL_SECTION = declare_page("c_shell_section", (
+    RowField("entry", K.NAME), RowField("function", K.NAME), RowField("backend", K.NAME),
+), tuple)  # explicit approval, accepted geometry, native ABI and emission digest
+C_SHELL_SECTION_DEMAND = declare_page("c_shell_section_demand", (
+    RowField("entry", K.NAME), RowField("function", K.NAME), RowField("backend", K.NAME),
+), tuple)  # explicit selection and exact accepted scalar SSA boundary
+C_SHELL_SECTION_BUILD = declare_page("c_shell_section_build", (
+    RowField("demand", K.PAGE_REF), RowField("part", K.NAME),
+), tuple)  # source, command, destination and optional completed object hash
+SSA_DEPLOYMENT_DISCOVERY = declare_page("ssa_deployment_discovery", (
+    RowField("function", K.NAME), RowField("header", K.NAME),
+), tuple)  # exact counted loop and interprocedural disjoint-store proof
+SSA_DEPLOYMENT_OUTLINE = declare_page("ssa_deployment_outline", (
+    RowField("function", K.NAME), RowField("region", K.INDEX),
+), tuple)  # before/after topology and actual outlined function
+C_DEPLOYMENT_POLICY = declare_page("c_deployment_policy", (
+    RowField("function", K.NAME), RowField("region", K.INDEX),
+), tuple)  # exact strategy/core budget/parked workers; caller also participates
+C_THREAD_ACTIVATION = declare_page("c_thread_activation", (
+    RowField("activation", K.PAGE_REF),
+), tuple)  # (worker symbol, exact formal bindings, joined-lifetime policy)
+C_THREAD_EXTENTS = declare_page("c_thread_extents", (
+    RowField("activation", K.PAGE_REF),
+), tuple)  # (caller, worker, borrowed invocation extent ABI, joined lifetime)
+LOCK_BOX_ENTRY = declare_page("lock_box_entry", (
+    RowField("mutex_identity", K.PAGE_REF),
+), tuple)  # (reentrant or None, execution scope, runtime key, required state columns)
+SOURCE_MUTEX_BINDING = declare_page("source_mutex_binding", (
+    RowField("read_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), Ref)  # exact lock-box entry; aliases/captures consume the same entry
 CLASS_DECLARATION = declare_page("class_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
 ), ClassFact)
@@ -932,6 +1177,7 @@ class MetadataRule(Enum):
     CONTEXTUAL_REQUIREMENT = "contextual_requirement"
     AST_METADATA = "ast_metadata"
     PYTHON_SYNTAX = "python_syntax"
+    THREAD_OPERATION = "thread_operation"
     ATTRIBUTE = "attribute"
     PYTHON_ROUTING_INDEX = "python_routing_index"
     PYTHON_SHAPE_INDEX = "python_shape_index"
@@ -1321,6 +1567,12 @@ FORK_READ_SCOPE = declare_transform("fork_read_scope", 1)
 #: by node (``name_binding`` by name, ``return_site_*`` by return-site cell,
 #: ``reducer_field_state`` by receiver, ...) and is carried whole.
 READ_SCOPE_NODE_KEYED_PAGES = (
+    "source_control_operator",
+    "source_resource_control",
+    "source_loop_control_work",
+    "source_loop_exit_read",
+    "source_loop_site_view",
+    "process_graph_operands",
     "identity_transition",
     "lexical_read_binding",
     "consumer_operand",
@@ -2605,6 +2857,8 @@ class ControlBlockKind(Enum):
     PARALLEL_DEPLOYMENT = "parallel_deployment"
     CALL = "call"
     DISPATCH = "dispatch"
+    SOURCE_REGION = "source_region"
+    CONTROL_BARRIER = "control_barrier"
     RESOURCE_SCOPE = "resource_scope"
     EXTERNAL_REFERENCE_CALL = "external_reference_call"
     NATIVE_TRY = "native_try"
@@ -2622,6 +2876,8 @@ class Arm(Enum):
     BODY = "body"
     ORELSE = "orelse"
     CONDITION = "condition"
+    ITERABLE = "iterable"
+    TARGET = "target"
     CALLEE = "callee"
     CLEANUP = "cleanup"
     HANDLER = "handler"
@@ -2970,6 +3226,14 @@ PROGRAM_ABI_FIELD_SLOT = declare_page("program_abi_field_slot", (
 #: stem ``_ControlSSABuilder.new_block`` is called with (the label is the stem,
 #: suffixed ``.N`` for the N-th repeat).
 class SSABlockKind(Enum):
+    SYNC_READY = "sync_ready"
+    SYNC_FAILED = "sync_failed"
+    SYNC_CLEANUP = "sync_cleanup"
+    SYNC_MERGE = "sync_merge"
+    SYNC_NOTIFY_HEADER = "sync_notify_header"
+    SYNC_NOTIFY_SELECT = "sync_notify_select"
+    SYNC_NOTIFY_BODY = "sync_notify_body"
+    EXCEPTION_FAULT_EXIT = "exception_fault_exit"
     ENTRY = "entry"
     FUNCTION_EXIT = "function_exit"
     IF_TRUE = "if_true"

@@ -11056,7 +11056,51 @@ class _ControlSSABuilder(TiledObject):
         record["deploy_site" if op is Handler.Deploy else "join_site"] = site
         return site
 
+    def _control_edge(self, target, arm, condition=None):
+        from .concordance_declarations import SSA_BLOCK, SSA_CONTROL_EDGE
+        book = self._book()
+        before = book.latest_ref(SSA_BLOCK, (self._scope(), self.function_name, self.current.name))
+        after = book.latest_ref(SSA_BLOCK, (self._scope(), self.function_name, target.name))
+        if before is None or after is None:
+            raise ValueError('SSA control edge has no registered endpoint')
+        return book.post(SSA_CONTROL_EDGE,
+            (self._scope(), self.function_name, before, after, arm), True,
+            stage=self._stage(), provenance=Derived(self._cells(before, after, condition, *self._control_cells)),
+            mode=Mode.CONCORD)
+
+    def _arm_continuation(self, entry):
+        """Read actual branch topology; an unconnected dead tip cannot fall through.
+
+        Break/return lowering leaves a fresh, unreachable tip for subsequent
+        syntax. Testing only that tip's empty successor list let a terminal
+        arm leak its local scalar bindings into the surviving arm.
+        """
+        from .concordance_declarations import SSA_BLOCK, SSA_CONTROL_EDGE, SSA_ARM_CONTINUATION
+        book = self._book()
+        entry_cell = book.latest_ref(SSA_BLOCK, (self._scope(), self.function_name, entry.name))
+        tip = book.latest_ref(SSA_BLOCK, (self._scope(), self.function_name, self.current.name))
+        edges = {}
+        for row in book.page(SSA_CONTROL_EDGE).scope_rows(self._scope()):
+            if row[1] == self.function_name:
+                edges.setdefault(row[2], []).append((row[3], book.latest_ref(SSA_CONTROL_EDGE, row)))
+        pending, visited, causes = [entry_cell], set(), [entry_cell, tip]
+        while pending:
+            source = pending.pop()
+            if source in visited:
+                continue
+            visited.add(source)
+            for target, edge in edges.get(source, ()):
+                causes.append(edge)
+                pending.append(target)
+        row = (self._scope(), self.function_name, entry_cell, tip)
+        previous = book.latest_ref(SSA_ARM_CONTINUATION, row)
+        cell = book.post(SSA_ARM_CONTINUATION, row, tip in visited, stage=self._stage(),
+                         provenance=Derived(tuple(dict.fromkeys(causes))),
+                         mode=Mode.CONCORD if previous is None else Mode.REVISE)
+        return book.page(SSA_ARM_CONTINUATION).cell(cell.row, cell.column), cell
+
     def branch(self, target: BasicBlock) -> None:
+        self._control_edge(target, 'flow')
         self.emit(
             Handler.Br,
             [],
@@ -11070,6 +11114,8 @@ class _ControlSSABuilder(TiledObject):
         if_true: BasicBlock,
         if_false: BasicBlock,
     ) -> None:
+        self._control_edge(if_true, 'body', condition)
+        self._control_edge(if_false, 'orelse', condition)
         self.emit(
             Handler.CondBr,
             [condition],
@@ -12246,6 +12292,20 @@ class _ControlSSABuilder(TiledObject):
             self.lower(block.callee, path=f"{path}.callee")
             return
         if isinstance(block, DispatchBlock):
+            from .concordance_declarations import SOURCE_PROCESS_OPERATION, SOURCE_THREAD_ARGUMENT_PACK
+            if block.process_operation_cell is None:
+                raise ValueError("process operation lacks its ingested concordance identity")
+            process_fact = self._book().page(SOURCE_PROCESS_OPERATION).cell(
+                block.process_operation_cell.row, block.process_operation_cell.column)
+            if (process_fact[0] != block.operation or process_fact[2] != block.result_dtype):
+                raise ValueError("control dispatch disagrees with its ingested process operation")
+            pack_cell = (None if block.thread_activation_cell is None else self._book().latest_ref(
+                SOURCE_THREAD_ARGUMENT_PACK, (block.thread_activation_cell,)))
+            bindings = (() if pack_cell is None else self._book().page(SOURCE_THREAD_ARGUMENT_PACK).cell(
+                pack_cell.row, pack_cell.column))
+            if (bool(block.worker_argument_pack_expanded) != (pack_cell is not None)
+                    or block.worker_argument_bindings != bindings):
+                raise ValueError("control worker arguments disagree with their source pack")
             target_function_ref = None
             if block.target_function_cell is not None:
                 from .concordance_declarations import SOURCE_DISPATCH_TARGET
@@ -12259,30 +12319,123 @@ class _ControlSSABuilder(TiledObject):
                 ).cell(target_cell.row, target_cell.column)
                 if target_function_ref is None:
                     raise ValueError("thread dispatch target has no concordance fact")
-            arguments = [self.external_value(value_id)
-                         for value_id in block.argument_value_ids]
+            positional = tuple(block.argument_value_ids)
+            keywords = tuple(block.keyword_argument_value_ids)
+            worker_arguments = []
+            if block.worker_argument_pack_expanded:
+                from .concordance_declarations import SOURCE_THREAD_ARGUMENT, NAME_BINDING
+                keywords = tuple((name, value_id) for name, value_id in keywords if name != "args")
+                for argument_cell in block.worker_argument_bindings:
+                    actual, formal, _layout = self._book().page(SOURCE_THREAD_ARGUMENT).cell(
+                        argument_cell.row, argument_cell.column)
+                    formal_id = int(self._book().page(NAME_BINDING).cell(formal.row, formal.column).value_id)
+                    # Read at this activation, through the builder's ordinary
+                    # loop-carried bindings. A tuple Input lost i's current
+                    # Phi and left a dtype-less host formal at native emission.
+                    worker_arguments.append((formal_id, self.external_value(int(actual.row[1])), argument_cell))
+            if block.operation == "thread_create" and target_function_ref is not None:
+                # The exact target address is a table identity, not a host
+                # callable argument. Keep its source operand in the table;
+                # only runtime context operands become SSA values.
+                keywords = tuple((name, value_id) for name, value_id in keywords if name != "target")
+                if not any(name == "target" for name, _value in block.keyword_argument_value_ids):
+                    positional = tuple(value_id for index, value_id in enumerate(positional) if index != 1)
+            def process_argument(value_id):
+                from .concordance_declarations import SOURCE_MUTEX_BINDING, SOURCE_THREAD_CAPTURE_USE, CANONICAL_VALUE
+                from .process_graph_facts import operation_from_identity
+                from .identity_concordance import _canonical_identity_base
+                scope = self.lexical_read_scope
+                mutex = self._book().latest_ref(SOURCE_MUTEX_BINDING, (scope, int(value_id)))
+                handle_causes = []
+                for row in self._book().page(SOURCE_THREAD_CAPTURE_USE).rows():
+                    actual, formal, _written = self._book().page(SOURCE_THREAD_CAPTURE_USE).latest(row)
+                    local = self._book().latest_ref(CANONICAL_VALUE, (scope, int(value_id)))
+                    if local is None or _canonical_identity_base(self._book(), formal) != _canonical_identity_base(self._book(), local):
+                        continue
+                    fact, factory = operation_from_identity(actual, book=self._book())
+                    if fact is not None and fact[2] == 'opaque_ref':
+                        handle_causes.extend((self._book().latest_ref(SOURCE_THREAD_CAPTURE_USE, row), factory, actual, formal))
+                # A captured Condition's exact binding already declares a
+                # native synchronization handle. The argument writer formerly
+                # exposed it as dtype=None even though its parent factory and
+                # closure edge retained the type. Carry that authority into
+                # the formal, instead of asking C to reconstruct the identity.
+                value = self.external_value(value_id, dtype="opaque_ref" if mutex is not None or handle_causes else None)
+                if mutex is not None or handle_causes:
+                    self._revise_value(value, *(cause for cause in (mutex, block.process_operation_cell, *handle_causes) if cause is not None))
+                return value
+            arguments = [process_argument(value_id) for value_id in positional]
+            arguments.extend(process_argument(value_id) for _name, value_id in keywords)
+            arguments.extend(value for _formal, value, _cell in worker_arguments)
             arguments.extend(self.external_value(value_id)
-                             for _name, value_id in block.keyword_argument_value_ids)
-            result = None if block.result_value_id is None else SSAValue(
-                int(block.result_value_id), dtype=str(block.result_dtype)
-            )
-            self.emit(Handler.Dispatch, arguments, result, attributes={
+                             for value_id in block.capture_argument_value_ids)
+            if block.synchronization_cell is not None:
+                from .synchronization import emit_ssa_synchronization
+                emit_ssa_synchronization(self, block, arguments)
+                return
+            if block.result_value_id is None:
+                from .concordance_declarations import RESOURCE_CLEANUP_RESULT
+                # Cleanup has no source-visible result. Each actual CFG edge
+                # still receives its own SSA None/status definition, under
+                # the same process contract, rather than duplicating the
+                # authored call's result identity on several exit paths.
+                result = self.fresh_value(dtype=process_fact[2], transform=RESOURCE_CLEANUP_RESULT,
+                    operands=(block.process_operation_cell, block.ingestion_control_cell, *arguments))
+            else:
+                result = self.produced_value(
+                    int(block.result_value_id), dtype=str(block.result_dtype),
+                    claim_provisional_definition=True,
+                    cause=(*arguments, block.process_operation_cell),
+                )
+            from .thread_operations import PROCESS_OPERATORS
+            self.emit(Handler(process_fact[1]), arguments, result, attributes={
                 "dispatch_operation": str(block.operation),
                 "source_callsite_id": int(block.callsite_id),
-                "keyword_names": tuple(name for name, _ in block.keyword_argument_value_ids),
-                "deployment_owner": "dispatcher",
-                "required_capability": "communicating_tasks",
+                "keyword_names": tuple(name for name, _ in keywords),
+                "worker_arguments": tuple((formal, value.id, cell) for formal, value, cell in worker_arguments),
+                "worker_argument_pack_expanded": bool(block.worker_argument_pack_expanded),
+                "capture_value_ids": tuple(block.capture_argument_value_ids),
+                **({"exception_operation_cell": block.exception_operation_cell}
+                   if block.exception_operation_cell is not None else {}),
+                "deployment_owner": "control_graph" if block.exception_operation_cell is not None else "dispatcher",
+                "required_capability": "native_exception_records" if block.exception_operation_cell is not None else "communicating_tasks",
                 "effectful": True,
                 "ordered_effect": True,
                 "extraction_identity": "turing.dispatch." + str(block.operation),
+                **({"source_process_cell": block.process_operation_cell}
+                   if block.process_operation_cell is not None else {}),
+                **({"source_thread_activation": block.thread_activation_cell}
+                   if block.thread_activation_cell is not None else {}),
                 **({"target_function_ref": int(target_function_ref)}
                    if target_function_ref is not None else {}),
             })
             if result is not None:
+                from .concordance_declarations import SSA_PROCESS_CALL, ProcessCallFact, FRAME_BINDING
+                call = ProcessCallFact(
+                    block.process_operation_cell, block.thread_activation_cell, int(block.callsite_id),
+                    process_fact[1], process_fact[2], tuple(value.id for value in arguments),
+                    tuple(name for name, _ in keywords), tuple(block.capture_argument_value_ids),
+                    tuple((formal, value.id, cell) for formal, value, cell in worker_arguments),
+                    pack_cell is not None,
+                )
+                self._book().post(SSA_PROCESS_CALL, (self._value_cell(result),), call,
+                    stage=FRAME_BINDING, provenance=Derived(self._cells(
+                        block.process_operation_cell, block.thread_activation_cell, pack_cell,
+                        block.ingestion_control_cell, block.operand_graph_cell,
+                        *bindings, *arguments, result)), mode=Mode.CONCORD)
                 # CALL_RESULT: the dispatch's argument cells are the cause.
                 self._bind(
                     int(result.id), result, BindingKind.CALL_RESULT, *arguments,
                 )
+            if block.operation == "exception_raise":
+                # The native record is already active. An unhandled raise
+                # terminates this SSA path through the existing fault-exit
+                # contract, after the same resource cleanup as a return.
+                self._emit_resource_cleanup("return", path)
+                if self._fault_exit is None:
+                    self._fault_exit = self.new_block("exception_fault_exit")
+                self.branch(self._fault_exit)
+                self.current = self.new_block("unreachable_return_control")
             return
         if isinstance(block, ExternalReferenceCallBlock):
             arguments = [
@@ -18323,7 +18476,7 @@ class _ControlSSABuilder(TiledObject):
             from ..transmogrifier.dtype_layout import resolve as dtype_layout
             for value, row_dtype in zip(
                 mutation_values, destination.column_dtypes, strict=True,
-            ):
+            ) if deferred_record_row is None and not deferred_record_slots else ():
                 layout = dtype_layout(row_dtype)
                 if (layout is not None and layout.kind == "float"
                         and str(value.dtype) == "int64"):
@@ -18391,7 +18544,12 @@ class _ControlSSABuilder(TiledObject):
                                 "binding": range_binding},
                 )
                 converted_values.append(narrowed)
-            mutation_values = tuple(converted_values)
+            # A record argument has not yet been expanded into field columns.
+            # Its source-linked row expansion applies the field contracts;
+            # comparing one semantic argument to N physical columns here
+            # rejected channels.append(Channel(...)) before linking could run.
+            if deferred_record_row is None and not deferred_record_slots:
+                mutation_values = tuple(converted_values)
             if (
                 deferred_record_row is None and not deferred_record_slots
                 and indexed_record_row_source is None
@@ -19590,9 +19748,9 @@ class _ControlSSABuilder(TiledObject):
                 cause=(conditional_cell,),
             )
             self.lower_control_expression(expression, result_override=result)
-        body_falls_through = (
-            not self.current.successors
-            or merge_block.name in self.current.successors
+        body_reachable, body_continuation_cell = self._arm_continuation(true_block)
+        body_falls_through = body_reachable and (
+            not self.current.successors or merge_block.name in self.current.successors
         )
         # Name-carried arms (decision 7.2): an arm that did not rebind the
         # name takes the entered version; an arm whose version the builder
@@ -19680,7 +19838,7 @@ class _ControlSSABuilder(TiledObject):
         if not true_exit.successors:
             self.branch(merge_block)
         if not body_falls_through:
-            self._restore_view(values_before_body, conditional_cell)
+            self._restore_view(values_before_body, conditional_cell, body_continuation_cell)
 
         # Each arm starts with the same incumbent versions.  Retain the true
         # arm's exact values above, then restore these identities before
@@ -19703,10 +19861,11 @@ class _ControlSSABuilder(TiledObject):
                 cause=(conditional_cell,),
             )
             self.lower_control_expression(expression, result_override=result)
-        if self.current.successors and (
+        false_reachable, false_continuation_cell = self._arm_continuation(false_block)
+        if not false_reachable or self.current.successors and (
             merge_block.name not in self.current.successors
         ):
-            self._restore_view(values_before_orelse, conditional_cell)
+            self._restore_view(values_before_orelse, conditional_cell, false_continuation_cell)
         false_results = {
             int(result_id): self.external_value(int(false_id))
             for _true_id, false_id, result_id in conditional.result_aliases
@@ -25343,6 +25502,18 @@ def lower_control_program_to_ssa(
             ):
                 continue
             if len(helper.args) != len(instruction.args):
+                deferred = instruction.attributes.get("ssa_deferred_record_row")
+                slots = instruction.attributes.get("ssa_deferred_record_slots")
+                expansion = (
+                    int(deferred[2]) - 1 if deferred is not None else
+                    sum(int(width) - 1 for _position, _identity, _name, width in slots[1])
+                    if slots is not None else 0
+                )
+                if expansion > 0 and len(instruction.args) + expansion == len(helper.args):
+                    # The declared record-row expansion is still pending;
+                    # physical argument IDs cannot be stamped until that
+                    # existing link-time transaction expands its fields.
+                    continue
                 raise ValueError(
                     "heap sequence helper call does not bind every live "
                     f"formal: {helper.name!r} has {len(helper.args)} "

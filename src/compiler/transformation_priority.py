@@ -272,11 +272,13 @@ def frame_transformation_ledger(scope: Hashable = None) -> TransformationLedger:
         TransformationRule("linked_record_member", 1),
         TransformationRule("distinct_owner", 2),
         TransformationRule("exact_argument_binding", 3),
+        TransformationRule("exact_sequence_member_binding", 3),
         TransformationRule("distinct_result", 4),
     ), {
         "linked_record_member": (
-            "distinct_owner", "exact_argument_binding", "distinct_result",
+            "distinct_owner", "exact_argument_binding", "exact_sequence_member_binding", "distinct_result",
         ),
-        "distinct_owner": ("exact_argument_binding", "distinct_result"),
+        "distinct_owner": ("exact_argument_binding", "exact_sequence_member_binding", "distinct_result"),
         "exact_argument_binding": ("distinct_result",),
+        "exact_sequence_member_binding": ("distinct_result",),
     }, scope=scope or "frame_transformation")

@@ -312,6 +312,7 @@ def _lower_controller_untyped(*, process_graph_sink=None):
 
 def _lower_mapping(*, process_graph_sink=None):
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+    from src.compiler.called_inventory import MappingClass
 
     source = (
         "def root(channels):\n"
@@ -323,6 +324,10 @@ def _lower_mapping(*, process_graph_sink=None):
     module, _outputs, _exports = lower_ast_source_to_ssa(
         source, "root", name="concordance_mapping",
         extraction_contract=CONTRACTS / "program_extraction.yaml",
+        # This entry's caller supplies the str -> float mapping used by
+        # repro_loop_dominance. State that host contract; the unannotated
+        # source cannot prove a value dtype from items() alone.
+        root_calls=[{"channels": MappingClass(str, float)}],
         resolved_process_graph_sink=process_graph_sink, progress=lambda _: None,
     )
     return module

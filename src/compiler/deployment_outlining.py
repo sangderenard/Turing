@@ -131,11 +131,12 @@ def outline_independent_iteration_lanes(module: Any) -> OutlineReport:
                 or region.iteration_space is None
             ):
                 continue
-            result = _outline_one(module, function, region)
+            result = _concorded_outline(module, function, region)
             if isinstance(result, str):
                 refused.append((str(function_name), int(region.region_id), result))
                 continue
             record, replacement_region = result
+            function = module.functions[str(function_name)]
             regions[position] = replacement_region
             module.deployment_table[function_name] = tuple(regions)
             outlines[(str(function_name), int(region.region_id))] = record
@@ -556,3 +557,200 @@ __all__ = [
     "OutlineReport",
     "outline_independent_iteration_lanes",
 ]
+
+
+def _geometry_fact(function):
+    return tuple((name, (tuple((str(i.op), tuple(int(v.id) for v in i.args),
+        None if i.res is None else int(i.res.id), tuple(i.attributes.get('incoming_blocks') or ()))
+        for i in block.instrs), tuple(block.successors))) for name, block in function.blocks.items())
+
+
+def _geometry_causes(module, function):
+    from .concordance_declarations import SSA_BLOCK_GEOMETRY
+    from .ssa_record_return_state import function_scope_of
+    book = module.metadata['identity_book']
+    cells=[]
+    for label,fact in _geometry_fact(function):
+        row=(function_scope_of(function),function.name,label)
+        cell=book.latest_ref(SSA_BLOCK_GEOMETRY,row)
+        if cell is None or book.page(SSA_BLOCK_GEOMETRY).cell(cell.row,cell.column)!=fact:
+            raise ValueError(f'deployment geometry disagrees with concordance: {function.name}.{label}')
+        cells.append(cell)
+    return cells
+
+
+def _publish_deployment_geometry(module, function, cause):
+    from .concordance_declarations import SSA_BLOCK_GEOMETRY, SSA_BLOCK, SSABlockKind, CONTROL_SSA_FINISH
+    from .ssa_record_return_state import function_scope_of
+    from .identity_concordance import Derived,Mode
+    book=module.metadata['identity_book']
+    for label,fact in _geometry_fact(function):
+        row=(function_scope_of(function),function.name,label)
+        if book.latest_ref(SSA_BLOCK,row) is None:
+            book.post(SSA_BLOCK,row,SSABlockKind.LOOP_BODY,stage=CONTROL_SSA_FINISH,
+                      provenance=Derived((cause,)),mode=Mode.CONCORD)
+        book.post(SSA_BLOCK_GEOMETRY,row,fact,stage=CONTROL_SSA_FINISH,
+                  provenance=Derived((cause,)),mode=Mode.REVISE)
+
+
+def _concorded_outline(module, function, region):
+    """Propose using the existing outliner, record, then install actual SSA."""
+    if module.metadata.get('identity_book') is None:
+        return _outline_one(module,function,region)
+    import copy
+    from .concordance_declarations import SSA_DEPLOYMENT_OUTLINE, CONTROL_SSA_FINISH
+    from .identity_concordance import Derived,Mode
+    from .ssa_record_return_state import function_scope_of
+    proposal=copy.copy(module)
+    proposal.functions=dict(module.functions)
+    proposal.metadata=dict(module.metadata)
+    for table_name in ('tensor_tables','sequence_tables','record_tables','reference_tables'):
+        setattr(proposal,table_name,dict(getattr(module,table_name,{})))
+    proposed=copy.copy(function)
+    proposed.metadata=dict(function.metadata)
+    proposed.blocks={name:BasicBlock(name,[copy.copy(i) for i in block.instrs],list(block.successors))
+                     for name,block in function.blocks.items()}
+    for block in proposed.blocks.values():
+        for i in block.instrs:
+            i.attributes=dict(i.attributes)
+    proposal.functions[function.name]=proposed
+    result=_outline_one(proposal,proposed,region)
+    if isinstance(result,str):return result
+    record,replacement=result
+    outline=proposal.functions[record.outline_name]
+    outline.metadata.update(tensor_shape_concordance_scope=function_scope_of(function),
+        parameter_names=tuple((f'lane_arg{j}',v.id) for j,v in enumerate(outline.args)))
+    from .concordance_declarations import SSA_DEPLOYMENT_DISCOVERY
+    causes=_geometry_causes(module,function)
+    permission=module.metadata['identity_book'].latest_ref(SSA_DEPLOYMENT_DISCOVERY,
+        (function.name,record.header_block))
+    if permission is not None:causes.append(permission)
+    fact=(_geometry_fact(function),_geometry_fact(proposed),outline.name,_geometry_fact(outline),repr(replacement),record)
+    cell=module.metadata['identity_book'].post(SSA_DEPLOYMENT_OUTLINE,(function.name,int(region.region_id)),
+        fact,stage=CONTROL_SSA_FINISH,provenance=Derived(tuple(causes)),mode=Mode.CONCORD)
+    module.functions[function.name]=proposed
+    module.functions[outline.name]=outline
+    for table_name in ('tensor_tables','sequence_tables','record_tables','reference_tables'):
+        table=getattr(module,table_name,{})
+        if function.name in table:table[outline.name]=table[function.name]
+    _publish_deployment_geometry(module,proposed,cell)
+    _publish_deployment_geometry(module,outline,cell)
+    return record,replacement
+
+
+def discover_disjoint_store_iterations(module):
+    """Discover a narrow, proven passive deployment from actual ingested SSA.
+
+    Unit-stride counted loops may call scalar numerical regions and write one
+    rank-one span exactly at the induction index. Shared reads, arbitrary
+    calls, unproven bounds, aliases/extra stores, and exceptional control refuse
+    discovery. No authored task/locking operation grants this permission.
+    """
+    from ..transmogrifier.ssa import SSADeploymentLane,SSADeploymentRegion
+    from .concordance_declarations import (SSA_DEPLOYMENT_DISCOVERY,CONTROL_SSA_FINISH,
+        SSA_BLOCK,CONTROL_BLOCK,ControlBlockKind)
+    from .identity_concordance import Derived,Mode
+    from .ssa_record_return_state import function_scope_of
+    if module.metadata.get('identity_book') is None:return ()
+    discovered=[]
+    pure={'Const','const','Add','Sub','Mul','Neg','Cast','Fma','Ret'}
+    for name,function in list(module.functions.items()):
+        if module.deployment_table.get(name):continue
+        producers={i.res.id:i for b in function.blocks.values() for i in b.instrs if i.res is not None}
+        def constant(value,seen=frozenset()):
+            if value.id in seen:return None
+            i=producers.get(value.id)
+            if i is None:return None
+            if i.op in {'Const','const'}:return i.attributes.get('value')
+            if i.op=='Cast' and len(i.args)==1:return constant(i.args[0],seen|{value.id})
+            return None
+        for header_name,header in list(function.blocks.items()):
+            if len(header.instrs)!=3:continue
+            phi,compare,cond=header.instrs
+            if phi.op!='Phi' or phi.attributes.get('source_loop_node_id') is None or compare.op!='Lt' or cond.op!='CondBr':continue
+            header_cell=module.metadata['identity_book'].latest_ref(SSA_BLOCK,
+                (function_scope_of(function),name,header_name))
+            if header_cell is None:continue
+            controls=tuple(cell for cell,_stage in module.metadata['identity_book'].edges_into(header_cell)
+                if cell.page==CONTROL_BLOCK and cell.row[1] is ControlBlockKind.LOOP)
+            if len(controls)!=1:continue
+            control=module.metadata['identity_book'].page(CONTROL_BLOCK).cell(controls[0].row,controls[0].column)
+            preference=control.extra[5]
+            incoming=tuple(phi.attributes.get('incoming_blocks',()))
+            if len(incoming)!=2 or len(phi.args)!=2:continue
+            pre_name,latch_name=incoming
+            pre,latch=function.blocks.get(pre_name),function.blocks.get(latch_name)
+            if pre is None or latch is None or len(latch.instrs)!=2:continue
+            advance,back=latch.instrs
+            if (advance.op!='Add' or len(advance.args)!=2 or advance.args[0].id!=phi.res.id
+                or advance.res.id!=phi.args[1].id or back.op!='Br'
+                or back.attributes.get('target')!=header_name or constant(phi.args[0])!=0
+                or constant(advance.args[1])!=1):continue
+            if compare.args[0].id!=phi.res.id:continue
+            stop=constant(compare.args[1])
+            if not isinstance(stop,int) or stop<2:continue
+            body_name=str(cond.attributes.get('true_target'))
+            exit_name=str(cond.attributes.get('false_target'))
+            body=function.blocks.get(body_name)
+            if body is None or not body.instrs or body.instrs[-1].op!='Br' or body.instrs[-1].attributes.get('target')!=latch_name:continue
+            if pre.instrs[-1].op!='Br' or pre.instrs[-1].attributes.get('target')!=header_name:continue
+            # Symbolic address provenance across actual call/formal edges.
+            env={v.id:('span',v.id) if tuple(v.shape or ())==(stop,) else ('scalar',v.id) for v in function.args}
+            env[phi.res.id]=('index',)
+            writes=[];visited=[];valid=True
+            def inspect(fn,bindings,allow_calls,blocks=None):
+                local=dict(bindings)
+                blocks=tuple(fn.blocks.values()) if blocks is None else blocks
+                if len(blocks)!=1:return False
+                for block in blocks:
+                    for i in block.instrs:
+                        args=[local.get(v.id,('scalar',v.id)) for v in i.args]
+                        if i.op in {'Call','call'} and allow_calls:
+                            callee=module.functions.get(str(i.attributes.get('callee')))
+                            if callee is None or len(callee.args)!=len(args):return False
+                            visited.append(callee)
+                            if not inspect(callee,dict(zip((v.id for v in callee.args),args)),False):return False
+                            if i.res is not None:local[i.res.id]=('frame',i.res.id)
+                        elif i.op=='GetElementPtr' and len(args)==2:
+                            if args[0][0]=='span' and args[1]==('index',):kind=('address',args[0][1])
+                            elif args[0][0]=='frame':kind=('frame_address',i.res.id)
+                            else:return False
+                            local[i.res.id]=kind
+                        elif i.op=='Load':
+                            if not args or args[0][0]!='frame_address':return False
+                            local[i.res.id]=('scalar',i.res.id)
+                        elif i.op=='Store':
+                            if len(args)!=2 or args[1][0]!='address' or args[0][0] not in {'scalar','index'}:return False
+                            writes.append(args[1][1])
+                        elif i.op in pure:
+                            if any(arg[0] not in {'scalar','index'} for arg in args):return False
+                            if i.op not in {'Const','const','Ret'} and (
+                                    i.res is None or i.res.dtype not in {'float32','float64'}):return False
+                            if i.res is not None:local[i.res.id]=('scalar',i.res.id)
+                        elif i.op=='Br' and allow_calls:pass
+                        else:return False
+                return True
+            # Inspect actual body without replacing its identity or graph.
+            valid=inspect(function,env,True,(body,))
+            if not valid or not writes or len(set(writes))!=1:continue
+            causes=_geometry_causes(module,function)
+            causes.append(controls[0])
+            for callee in visited:causes.extend(_geometry_causes(module,callee))
+            region_id=max((int(r.region_id) for r in module.deployment_table.get(name,())),default=-1)+1
+            region=SSADeploymentRegion(region_id=region_id,function=name,kind='parallel_candidate',schedule='independent_iterations',
+                schedule_preference=preference,source_loop_node_id=phi.attributes['source_loop_node_id'],
+                lanes=(SSADeploymentLane(0,tuple((body_name,j) for j in range(len(body.instrs))),()),),
+                iteration_space=('0',str(stop),'1'),origin='source_ssa_disjoint_store',
+                deploy_site=(pre_name,len(pre.instrs)-1),join_site=(exit_name,0))
+            fact=(header_name,pre_name,body_name,latch_name,exit_name,phi.res.id,stop,
+                  tuple(writes),tuple(c.name for c in visited),repr(region))
+            cell=module.metadata['identity_book'].post(SSA_DEPLOYMENT_DISCOVERY,(name,header_name),fact,
+                stage=CONTROL_SSA_FINISH,provenance=Derived(tuple(dict.fromkeys(causes))),mode=Mode.CONCORD)
+            pre.instrs.insert(len(pre.instrs)-1,Instr('Deploy',[],None,attributes={'deployment_frame':True,'region_id':region_id}))
+            function.blocks[exit_name].instrs.insert(0,Instr('Join',[],None,attributes={'deployment_frame':True,'region_id':region_id}))
+            for i in body.instrs:i.attributes={**i.attributes,'deployment_memberships':((region_id,0),)}
+            module.deployment_table[name]=(*module.deployment_table.get(name,()),region)
+            _publish_deployment_geometry(module,function,cell)
+            discovered.append((name,region_id))
+            break
+    return tuple(discovered)

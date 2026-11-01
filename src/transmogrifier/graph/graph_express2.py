@@ -226,7 +226,12 @@ def _annotate_visual_source_owners(tree: ast.AST, *, module_name=None):
             # stamp left by another tree's build would otherwise be read here
             # (edges lane C: an ``Is`` in ``_energy_time_limit`` derived from
             # ``bw_clamp``).
-            if cells_by_name:
+            conversion = (getattr(node, "_turing_ingestion_conversion_cell", None)
+                          or (getattr(node, '_turing_resource_conversion', None)
+                              if isinstance(node, (ast.expr, ast.stmt)) else None))
+            if conversion is not None:
+                node._turing_source_cells = (conversion,)
+            elif cells_by_name:
                 cell = cells_by_name.get(self.qualname.split(".")[0])
                 node._turing_source_cells = (
                     (cell,) if cell is not None
@@ -5558,12 +5563,47 @@ class ProcessGraph(TiledObject):
                 f"{INGESTION_VALUE.name}: no source cell for "
                 f"{(scope, int(nid))!r} -- the node carries no source span"
             )
-        book.post(
+        identity = book.post(
             INGESTION_VALUE, (scope, int(nid)),
             NodeFact(str(semantic_type), str(op), str(label)),
             stage=INGESTION,
-            provenance=Derived((span,)), mode=Mode.CONCORD,
+            provenance=Derived((span, *(() if getattr(node, "_turing_ingestion_conversion_cell", None) is None
+                                         else (node._turing_ingestion_conversion_cell,)))), mode=Mode.CONCORD,
         )
+        # External callable classification is an ingestion fact. Downstream
+        # dual-IR projections must not reclassify a same-spelled method from
+        # a mutable node attribute or retained Python syntax.
+        extraction_identity = (self.G.nodes[nid].get('attributes') or {}).get('extraction_identity')
+        if isinstance(extraction_identity, str) and extraction_identity:
+            from ...compiler.concordance_declarations import SOURCE_EXTRACTION_IDENTITY
+            book.post(SOURCE_EXTRACTION_IDENTITY, (identity,), extraction_identity,
+                      stage=INGESTION, provenance=Derived((identity, span)), mode=Mode.CONCORD)
+        conversion = getattr(node, "_turing_ingestion_conversion_cell", None)
+        if conversion is not None:
+            from ...compiler.concordance_declarations import SOURCE_EXCEPTION_NODE
+            book.post(SOURCE_EXCEPTION_NODE, (identity,), conversion, stage=INGESTION,
+                      provenance=Derived((identity, conversion)), mode=Mode.CONCORD)
+        resource = getattr(node, '_turing_resource_contract', None)
+        if resource is not None:
+            from ...compiler.concordance_declarations import SOURCE_RESOURCE_SCOPE
+            enter, cleanup = node._turing_resource_operations
+            entry_source, cleanup_source = post_source_span(None, enter), post_source_span(None, cleanup)
+            if entry_source is None or cleanup_source is None:
+                raise ValueError('resource scope lost its exact entry or cleanup occurrence')
+            book.post(SOURCE_RESOURCE_SCOPE, (identity,), (resource, entry_source, cleanup_source),
+                      stage=INGESTION, provenance=Derived((identity, resource, entry_source, cleanup_source)),
+                      mode=Mode.CONCORD)
+        # AST opcode information is converted here, at node ingestion.
+        # No consumer after conversion needs node.op from the source AST.
+        if isinstance(node, (ast.BinOp, ast.UnaryOp)):
+            from ...compiler.concordance_declarations import SOURCE_OPERATOR_KIND
+            from ..ssa_registry import ssa_name_map
+            family = "binop" if isinstance(node, ast.BinOp) else "unaryop"
+            handler = ssa_name_map.get(f"{family}:{type(node.op).__name__.lower()}")
+            if handler is not None:
+                node_cell = book.latest_ref(INGESTION_VALUE, (scope, int(nid)))
+                book.post(SOURCE_OPERATOR_KIND, (node_cell,), handler.value,
+                          stage=INGESTION, provenance=Derived((node_cell,)), mode=Mode.CONCORD)
         if span is None:
             return
         module_name, qualname, path = span.row
@@ -6078,6 +6118,7 @@ class ProcessGraph(TiledObject):
         activation_roots=None,
         tensor_code_references=None,
         source_ast_normalizers=(),
+        source_control_normalizers=(),
         retained_ast_normalizers=(),
         retain=(),
         source_record_classes=(),
@@ -6551,6 +6592,13 @@ class ProcessGraph(TiledObject):
             # resource scope only now, from that exact receipt; doing it before
             # pursuit would have to guess from spelling and doing it after graph
             # construction would leave a false control-divergence ``With``.
+            if source_control_normalizers:
+                # Resolve basic native operation/result contracts before
+                # converting exception syntax. Resources still retain their
+                # authored With until that conversion has captured cleanup.
+                tree = lower_python_threading(tree, lower_resources=False)
+                for normalize in source_control_normalizers:
+                    normalize(tree)
             tree = lower_python_shell_file_contexts(tree)
             tree = lower_python_threading(tree)
             # Pursuit has gathered every definition that can name a
@@ -6700,6 +6748,16 @@ class ProcessGraph(TiledObject):
                                     or (inventory[0] in ("bool", "int")
                                         and "float" in admitted)
                                 )
+                            # Mapping[str, float] supplied by the host is
+                            # also the exact annotation this ingestion path
+                            # installed. Splitting at '[' treated 'str, float'
+                            # as one class and rejected a record against
+                            # itself. Exact annotation structure is sufficient
+                            # evidence; no member type is inferred or widened.
+                            spelled_ok = spelled_ok or ast.dump(
+                                ast.parse(inventory[0], mode="eval").body,
+                                include_attributes=False,
+                            ) == ast.dump(parameter.annotation, include_attributes=False)
                             if not spelled_ok:
                                 raise ValueError(
                                     f"formal {parameter.arg} of {identity} is "

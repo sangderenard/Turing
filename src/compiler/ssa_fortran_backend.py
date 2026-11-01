@@ -6293,8 +6293,15 @@ def emit_module(
     extra_roots: Sequence[str] = (),
     trig_solver: str = "intrinsic",
     progress: "Callable[[str], None] | None" = None,
+    c_shell_control=None,
+    entrypoint: str | None = None,
 ) -> FortranModule:
     """Translate an SSA module into one Fortran module.
+
+    ``c_shell_control=CShellControl(...)`` with ``entrypoint`` instead returns
+    a CModuleArtifact using C orchestration and selected AOT Fortran scalar
+    sections. This opt-in route requires a Fortran compiler/build directory;
+    ordinary Fortran emission remains compiler-independent.
 
     ``outputs`` maps a function name to the SSA values it returns.
     ``extra_roots`` names additional functions to keep and export (each becomes
@@ -6310,6 +6317,14 @@ def emit_module(
     suppress it.
     """
 
+    if c_shell_control is not None:
+        if not isinstance(module, IRModule) or entrypoint is None:
+            raise ValueError('C-shell control requires an IRModule and explicit entrypoint')
+        if dtype != DEFAULT_DTYPE or trig_solver != 'intrinsic' or extra_roots:
+            raise ValueError('C-shell control requires default Fortran dialect and one explicit root')
+        from .c_shell_sections import emit_c_shell_sections
+        return emit_c_shell_sections(module, entrypoint, 'fortran', c_shell_control,
+                                     entry_name=name)
     functions = module.functions if isinstance(module, IRModule) else module
     from .ssa_object_operations import validate_object_operations
     from types import SimpleNamespace

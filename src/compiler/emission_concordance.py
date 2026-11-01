@@ -1051,15 +1051,17 @@ class ArtifactEmission:
 
     __slots__ = (
         "book", "backend", "module_text", "buffer_order", "root",
-        "function_cell", "api_contract",
+        "function_cell", "api_contract", "piece_sources",
     )
 
     def __init__(
         self, book: Any, backend: Backend, module_text: Ref | None,
         buffer_order: Ref | None = None, *, root: Any = None,
         function_cell: Ref | None = None, api_contract: Ref | None = None,
+        piece_sources: Any = None,
     ) -> None:
         self.book = book
+        self.piece_sources = dict(piece_sources or {})
         self.backend = backend
         self.module_text = module_text
         self.buffer_order = buffer_order
@@ -1117,7 +1119,7 @@ class ArtifactEmission:
                 book, artifact, self.backend,
                 part(ArtifactPart.PIECE_FILE, str(symbol)), data=text,
                 location=path_location(path) if path is not None else (),
-                sources=(None,), reason=PIECE_ARTIFACT_UNROUTED,
+                sources=self.piece_sources.get(str(symbol), (None,)), reason=PIECE_ARTIFACT_UNROUTED,
             ))
         command = tuple(map(str, command))
         compile_command = post_artifact_part(
