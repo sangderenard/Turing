@@ -5256,7 +5256,6 @@ def _resolved_unit_references(
 
 def project_process_graph_acceptance(graph, references, book=None):
     """The source records' exact Ref roots, projected through existing edges."""
-    import ast
     from dataclasses import fields, is_dataclass
     from .identity_concordance import Ref, current_identity_book
     from ..transmogrifier.ssa import IRModule
@@ -5287,8 +5286,6 @@ def project_process_graph_acceptance(graph, references, book=None):
         elif isinstance(value, (tuple, list, set, frozenset)):
             for item in value:
                 visit(item)
-        elif isinstance(value, ast.AST):
-            visit(vars(value))
         elif is_dataclass(value) and not isinstance(value, type):
             for declared in fields(value):
                 visit(getattr(value, declared.name))
@@ -5303,6 +5300,14 @@ def project_process_graph_acceptance(graph, references, book=None):
         SOURCE_ENUM_GLYPH_TABLE, SourceEnumGlyphTable,
         SOURCE_PYTHON_IDENTITY, SOURCE_RECORD_VIEW_SCHEMA,
         SOURCE_SORT_CONTRACT, SOURCE_VALUE_CLASS, VALUE_TYPE_ABI,
+        SOURCE_CONTROL_IR, SOURCE_CONTROL_OPERATOR, SOURCE_RESOURCE_CONTROL, SOURCE_RESOURCE_SCOPE, SOURCE_ACTIVITY_ARM_RELATION, SOURCE_LOOP_CONTROL_WORK,
+        SOURCE_ACTIVITY_SCOPE, SOURCE_ACTIVITY_NODE, SOURCE_ACTIVITY_EDGE,
+        SOURCE_ACTIVITY_CHILD, SOURCE_ACTIVITY_CALL, SOURCE_ACTIVITY_BINDING,
+        SOURCE_ACTIVITY_POLICY, SOURCE_ACTIVITY_SCHEDULE, SOURCE_OPERATOR_KIND,
+        PROCESS_GRAPH_OPERANDS, SOURCE_LITERAL_VALUE, SOURCE_FORMAL_ORDER,
+        SOURCE_PROCESS_OPERATION, SOURCE_CLOSURE_CAPTURE, SOURCE_EXCEPTION_NODE, SOURCE_EXCEPTION_OPERATION, SOURCE_LOOP_EXIT_READ, SOURCE_LOOP_CONTROL_SITE, SOURCE_LOOP_SITE_EDGE, SOURCE_LOOP_SITE_VIEW,
+        SOURCE_THREAD_ACTIVATION, SOURCE_THREAD_ARGUMENT_PACK, SOURCE_THREAD_CAPTURE_USE,
+        THREAD_CAPTURE_CONTRACT, THREAD_CAPTURE_COLUMNS, SOURCE_MUTEX_BINDING, SOURCE_SYNCHRONIZATION,
     )
 
     def root_record_declarations(records: Any) -> None:
@@ -5425,6 +5430,54 @@ def project_process_graph_acceptance(graph, references, book=None):
                     cell = owner.latest_ref(LEXICAL_READ_BINDING, row)
                     if cell is not None:
                         roots.add(cell)
+        # Activity/operand contracts are semantic graph roots. They are
+        # successors of source identities, so predecessor projection cannot
+        # discover them from canonical_value alone. In particular a sealed
+        # memory-fence unit must retain its argument evaluation graph without
+        # walking source AST or relying on cached attribute Ref objects.
+        if scope is not None:
+            for page in (SOURCE_CONTROL_IR, SOURCE_CONTROL_OPERATOR, PROCESS_GRAPH_OPERANDS, SOURCE_MUTEX_BINDING, SOURCE_SYNCHRONIZATION, SOURCE_LOOP_EXIT_READ, SOURCE_LOOP_SITE_VIEW, SOURCE_RESOURCE_CONTROL, SOURCE_LOOP_CONTROL_WORK):
+                for row in owner.page(page).scope_rows(scope):
+                    roots.add(owner.latest_ref(page, row))
+            view = owner.latest_ref(SOURCE_ACTIVITY_SCOPE, (scope,))
+            if view is not None:
+                roots.add(view)
+                activity_scope = owner.page(SOURCE_ACTIVITY_SCOPE).cell(view.row, view.column)
+                for page in (SOURCE_ACTIVITY_NODE, SOURCE_ACTIVITY_EDGE, SOURCE_ACTIVITY_CHILD,
+                             SOURCE_ACTIVITY_CALL, SOURCE_ACTIVITY_BINDING, SOURCE_ACTIVITY_POLICY, SOURCE_ACTIVITY_ARM_RELATION,
+                             SOURCE_ACTIVITY_SCHEDULE, SOURCE_LITERAL_VALUE, SOURCE_FORMAL_ORDER):
+                    for row in owner.page(page).scope_rows(activity_scope):
+                        roots.add(owner.latest_ref(page, row))
+                        if page == SOURCE_ACTIVITY_BINDING:
+                            for contract_page in (SOURCE_OPERATOR_KIND, SOURCE_PROCESS_OPERATION, SOURCE_EXCEPTION_NODE, SOURCE_EXCEPTION_OPERATION, SOURCE_LOOP_CONTROL_SITE, SOURCE_RESOURCE_SCOPE):
+                                contract = owner.latest_ref(contract_page, (row[1],))
+                                if contract is not None:
+                                    roots.add(contract)
+                            for edge_row in owner.page(SOURCE_LOOP_SITE_EDGE).scope_rows(row[1]):
+                                roots.add(owner.latest_ref(SOURCE_LOOP_SITE_EDGE, edge_row))
+            for row in owner.page(SOURCE_CLOSURE_CAPTURE).scope_rows(scope):
+                capture = owner.latest_ref(SOURCE_CLOSURE_CAPTURE, row)
+                roots.add(capture)
+                contract = owner.latest_ref(THREAD_CAPTURE_CONTRACT, (capture,))
+                if contract is not None:
+                    roots.add(contract)
+                    columns = owner.latest_ref(THREAD_CAPTURE_COLUMNS, (contract,))
+                    if columns is not None:
+                        roots.add(columns)
+            from .identity_concordance import _canonical_identity_base
+            for node in body.G:
+                identity = owner.latest_ref(CANONICAL_VALUE, (scope, int(node)))
+                if identity is None:
+                    continue
+                identity = _canonical_identity_base(owner, identity)
+                activation = owner.latest_ref(SOURCE_THREAD_ACTIVATION, (identity,))
+                if activation is not None:
+                    roots.add(activation)
+                    pack = owner.latest_ref(SOURCE_THREAD_ARGUMENT_PACK, (activation,))
+                    if pack is not None:
+                        roots.add(pack)
+                    for row in owner.page(SOURCE_THREAD_CAPTURE_USE).scope_rows(activation):
+                        roots.add(owner.latest_ref(SOURCE_THREAD_CAPTURE_USE, row))
         # The reducer's return-site rows (``return_site_slot`` /
         # ``return_site_container`` / ``return_site_field_state``, keyed by
         # the site's node cell under the read scope the canonical relabel

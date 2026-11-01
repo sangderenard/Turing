@@ -48,47 +48,52 @@ class ILPScheduler(TiledObject):
     # ----------------------
     # Integer level scheduling
     # ----------------------
+    def _dependency_finish_order(self, relation):
+        """The existing dependency DFS, with an explicit stack.
+
+        The real loop/try activity graph has 577 points and a 570-edge
+        acyclic path. Recursive DFS plus generator frames exhausted Python's
+        stack before scheduling it. Keep the same traversal, recurrence and
+        cycle refusal without imposing the interpreter's recursion limit.
+        """
+        state, finished = {}, []
+        for root in self.G.nodes:
+            if state.get(root) == 'black':
+                continue
+            state[root] = 'gray'
+            stack = [(root, iter(self.G.nodes[root][relation]))]
+            while stack:
+                node, neighbours = stack[-1]
+                neighbour = next(neighbours, None)
+                if neighbour is None:
+                    state[node] = 'black'
+                    finished.append(node)
+                    stack.pop()
+                    continue
+                adjacent, _role = neighbour
+                if state.get(adjacent) == 'gray':
+                    raise ValueError(f"Cycle detected during scheduling; node in cycle: {adjacent}")
+                if state.get(adjacent) != 'black':
+                    state[adjacent] = 'gray'
+                    stack.append((adjacent, iter(self.G.nodes[adjacent][relation])))
+        return finished
+
     def compute_asap_levels(self):
         levels = {}
-        state = {}  # white (default), gray, black
-
-        def dfs(n):
-            st = state.get(n, 'white')
-            if st == 'gray':
-                raise ValueError(f"Cycle detected during scheduling; node in cycle: {n}")
-            if st == 'black':
-                return levels[n]
-
-            state[n] = 'gray'
-            preds = [p for p, _ in self.G.nodes[n]['parents']]
-            lvl = 0 if not preds else 1 + max(dfs(p) for p in preds)
-            levels[n] = lvl
-            state[n] = 'black'
-            return lvl
-
-        for nid in list(self.G.nodes):
-            if state.get(nid, 'white') == 'white':
-                dfs(nid)
+        for node in self._dependency_finish_order('parents'):
+            parents = [parent for parent, _role in self.G.nodes[node]['parents']]
+            levels[node] = 0 if not parents else 1 + max(levels[parent] for parent in parents)
         self.levels_asap = levels
         return levels
 
     def compute_alap_levels(self):
         asap = self.compute_asap_levels()
-        max_level = max(asap.values())
         alap = {}
-
-        def dfs(node):
-            if node in alap:
-                return alap[node]
-            children = [c for c, _ in self.G.nodes[node]['children']]
-            if not children:
-                alap[node] = asap[node]  # keep output at its ASAP level to preserve makespan
-            else:
-                alap[node] = min(dfs(c) - 1 for c in children)
-            return alap[node]
-
-        for nid in self.G.nodes:
-            dfs(nid)
+        for node in self._dependency_finish_order('children'):
+            children = [child for child, _role in self.G.nodes[node]['children']]
+            # Preserve this scheduler's established output-local deadline:
+            # each output remains at its own ASAP level, not a global max.
+            alap[node] = min(alap[child] - 1 for child in children) if children else asap[node]
         self.levels_alap = alap
         return alap
 

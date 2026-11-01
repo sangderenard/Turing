@@ -177,9 +177,6 @@ def test_descriptor_adapter_rebuilds_verification_from_authored_contract(
     deployed = lambda value: value + 1
     observed = {}
 
-    class Product:
-        links = {"leaf": {"source_module": "compiler_leaf_module"}}
-
     monkeypatch.setattr(
         project_compilation_product,
         "_resolve_product_callable",
@@ -193,7 +190,17 @@ def test_descriptor_adapter_rebuilds_verification_from_authored_contract(
         ),
     )
 
-    product = Product()
+    # The adapter selects its verifier from the persisted receipt. Use the
+    # real product API and layout; the verifier remains mocked in this unit
+    # test of adapter routing, not a claim of native execution.
+    native = tmp_path / 'native'
+    native.mkdir()
+    (native / 'native-verification.json').write_text(json.dumps({
+        'verification_oracle': 'authored-source',
+    }))
+    product = project_compilation_product.ProjectCompilationProduct(
+        tmp_path, {}, {'leaf': {'source_module': 'compiler_leaf_module',
+                               'native_library': 'native/leaf.dll'}})
     selected_owner, selected = runtime._activate_descriptor_call(product, "leaf")
 
     assert selected_owner is owner

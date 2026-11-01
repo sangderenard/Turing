@@ -20,6 +20,19 @@ def _ast_source_location(expression: ast.AST) -> tuple[Any, ...]:
 def _ast_source_signature(expression: ast.AST) -> tuple[Any, ...]:
     """Stable authored-occurrence key for reduced/copied AST nodes."""
 
+    # Once ingestion has declared the occurrence, its source_span row is
+    # its identity. Equal text at equal diagnostic coordinates is not: the
+    # real return/finally program has four distinct ExceptionNone calls on
+    # the try span. Text matching deleted all four while rejecting one arm,
+    # severing active-record operands and Phi arms in unrelated regions.
+    from .concordance_declarations import SOURCE_SPAN
+    from .identity_concordance import current_identity_book
+    row = getattr(expression, "_turing_source_span_row", None)
+    if row is not None:
+        cell = current_identity_book().latest_ref(SOURCE_SPAN, row)
+        if cell is not None:
+            return (SOURCE_SPAN, cell.row)
+    # Source normalization may use this helper before nodes are ingested.
     return (*_ast_source_location(expression), ast.dump(expression, include_attributes=False))
 
 

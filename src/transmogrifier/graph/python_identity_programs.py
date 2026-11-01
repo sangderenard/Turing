@@ -327,6 +327,32 @@ PYTHON_IDENTITY_PROGRAMS: tuple[PythonIdentityProgram, ...] = (
 )
 
 
+from ...compiler.synchronization import SYNCHRONIZATION_SPECS
+
+PYTHON_IDENTITY_PROGRAMS += (
+    PythonIdentityProgram(
+        identities=("threading.Thread", "threading.Condition", "threading.Event"),
+        kind="object", object_type="ProcessHandle", effects=("ordered:coordination",),
+        description="compiler-owned process operation with explicit handle lifetime",
+    ),
+    PythonIdentityProgram(
+        identities=("collections.deque", "_collections.deque"),
+        kind="object", object_type="ByteQueue",
+        effects=("ordered:queue",),
+        description="compiler-owned queue handle; payload and capacity policy remain explicit",
+    ),
+)
+
+PYTHON_IDENTITY_PROGRAMS += tuple(
+    PythonIdentityProgram(
+        identities=("src.compiler.synchronization." + name,),
+        kind="object", object_type="SynchronizationOperation",
+        effects=("ordered:synchronization",),
+        description="explicit scoped synchronization, lowered through dispatcher control",
+    ) for name in SYNCHRONIZATION_SPECS
+)
+
+
 def resolve_python_identity(identity: str | None) -> PythonIdentityProgram | None:
     """Return the first exact or glob identity replacement."""
 

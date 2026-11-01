@@ -71,13 +71,18 @@ reaches a real consumer):
   2026-08-17 crash). ``lower_ast_source_to_ssa`` consults this when its own
   ``extraction_contract`` argument is None, so per-call still wins.
 
-Declared with a single honored value (asking for anything else refuses,
+Deployment execution policy:
+
+* ``deployment`` — ``"serial"`` retains the source schedule; ``"auto"`` lets
+  general C SSA emission discover proven disjoint-store iterations and use
+  the existing concorded outliner/native pool. Backend strategy selection
+  supplies the worker budget; the caller participates. Explicit authored
+  threads retain their separate progress/synchronization contracts.
+
+Other axes declared with a single honored value (asking for anything else refuses,
 same doctrine as ``fusion_levels`` -- these become real when their layer
 is wired):
 
-* ``deployment`` — threading/deployment policy. Only ``"serial"`` is
-  honored: ``turing_pool.c`` exists but no shell routes work through it
-  yet (P3).
 * ``destination`` — only ``"native"``; destination-language and shell
   options (``source_language``, ``shell_language``) remain per-call
   parameters until routed through here.

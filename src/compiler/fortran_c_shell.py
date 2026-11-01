@@ -8054,13 +8054,15 @@ def _graph_receiver_formal(graph: Any) -> str | None:
 
 
 def _reduced_initializer_list_fields(graph: Any) -> dict:
-    """Read physical list fields from the reducer's existing identity rows."""
+    """Read list/primitive-handle fields from the reducer's exact identities."""
 
     from ..common.tensors.topological_reducer import _source_numeric_scope
     from .concordance_declarations import (
         SOURCE_AGGREGATE_LAYOUT, SOURCE_VALUE_CLASS, SourceAggregateLayout,
     )
     from .identity_concordance import current_identity_book
+    from .thread_operations import PROCESS_OPERATORS, PROCESS_RESULT_DTYPES
+    from ..common.tensors.topological_reducer import node_identity_cell
 
     book = current_identity_book()
     proven = {}
@@ -8087,6 +8089,22 @@ def _reduced_initializer_list_fields(graph: Any) -> dict:
             if len(sources) != 1:
                 continue
             attrs = target.nodes[sources[0]].get("attributes") or {}
+            from .process_graph_facts import operation as process_operation
+            process_fact, process_cell = process_operation(entry.graph, int(sources[0]))
+            if process_fact is not None and process_fact[2] == "opaque_ref":
+                receipt = {"storage": "reference", "dtype": "opaque_ref", "rank": 0,
+                           "mutable": True}
+                previous = proven.get(field_cell)
+                if previous is not None and previous[0] != receipt:
+                    unproved.add(field_cell)
+                else:
+                    cells = tuple(dict.fromkeys((
+                        *((previous[1]) if previous else ()),
+                        node_identity_cell(entry.graph, int(sources[0])),
+                        process_cell,
+                    )))
+                    proven[field_cell] = receipt, cells
+                continue
             if attrs.get("aggregate_kind") != "list":
                 continue
             row = attrs.get("source_aggregate_layout_row")
@@ -13870,16 +13888,12 @@ def _attach_graph_control_expressions(
 def _nest_lexical_conditionals_in_loops(
     control: Any, graph: Any, dispatch_subgraphs: Iterable[Any],
 ):
-    """Move a conditional authored inside a retained loop into that loop.
+    """Place retained conditionals by their ingested loop-body ownership.
 
-    The control overlay embeds a nested conditional by replacing its region
-    span inside the parent.  A conditional that owns no numerical region
-    (its arm holds only effects or calls) has no span to replace, so it fell
-    to the root sequence after the loop: its predicate then read loop-local
-    values in ``while_exit`` and nothing it guarded ran per iteration.  The
-    authored span is the identity: a conditional whose source position lies
-    inside a retained loop's span belongs in that loop's body, ordered among
-    the body's statements by source position.
+    Generated try guards can share a diagnostic span with the loop they
+    enclose. Coordinates then falsely move the guard INSIDE its own loop
+    and remove that loop from the tree. Only exact activity owner edges
+    decide containment; diagnostics do not participate.
     """
 
     from .control_source import (
@@ -13887,8 +13901,13 @@ def _nest_lexical_conditionals_in_loops(
         SequenceBlock, SequenceMutationBlock, StatementBlock, WhileBlock,
     )
 
+    from .control_activity import ActivitySchedule, binding
+    from .concordance_declarations import SOURCE_ACTIVITY_NODE
+    activity = ActivitySchedule(graph)
+    book = activity.book
+
     def node_position(node_id: int) -> tuple[int, int, int]:
-        return _authored_node_position(graph.G, int(node_id))
+        return activity.position(int(node_id), 'enter')
 
     # Sequence effects and numerical regions share one authored ordering.
     # A region is atomic, so its position is the last authored member it must
@@ -13902,24 +13921,14 @@ def _nest_lexical_conditionals_in_loops(
     def block_position(block) -> tuple[int, int, int]:
         return _control_block_position(graph.G, block, region_positions)
 
-    def loop_span(block) -> tuple[int, int] | None:
-        source_id = getattr(block, "source_loop_node_id", None)
-        if source_id is None:
-            return None
-        expression = graph.G.nodes.get(int(source_id), {}).get("expr_obj")
-        start = getattr(expression, "lineno", None)
-        end = getattr(expression, "end_lineno", None)
-        if start is None or end is None:
-            return None
-        return int(start), int(end)
-
-    spans: list[tuple[int, int, int]] = []  # (start, end, loop source id)
+    loop_occurrences = {}
 
     def collect_loops(block):
         if isinstance(block, (LoopBlock, WhileBlock)):
-            span = loop_span(block)
-            if span is not None:
-                spans.append((span[0], span[1], int(block.source_loop_node_id)))
+            points, _cell = binding(graph, int(block.source_loop_node_id))
+            if points is None:
+                raise FortranEmissionError('retained loop has no ingested control ownership')
+            loop_occurrences[points[0].row[1]] = int(block.source_loop_node_id)
             collect_loops(block.body)
         elif isinstance(block, SequenceBlock):
             for child in block.blocks:
@@ -13932,15 +13941,16 @@ def _nest_lexical_conditionals_in_loops(
             collect_loops(block.callee)
 
     collect_loops(control.root)
-    if not spans:
+    if not loop_occurrences:
         return control
 
-    def innermost_loop(line: int) -> int | None:
-        candidates = [
-            (end - start, loop_id) for start, end, loop_id in spans
-            if start <= line <= end
-        ]
-        return min(candidates)[1] if candidates else None
+    def innermost_loop(node_id: int) -> int | None:
+        points, _cell = binding(graph, node_id)
+        if points is None:
+            raise FortranEmissionError('conditional has no ingested control ownership')
+        _kind, owners = book.page(SOURCE_ACTIVITY_NODE).cell(points[0].row, points[0].column)
+        return next((loop_occurrences[occurrence] for occurrence, arm in reversed(owners)
+                     if arm == 'body' and occurrence in loop_occurrences), None)
 
     misplaced: list = []
 
@@ -13956,9 +13966,7 @@ def _nest_lexical_conditionals_in_loops(
             return SequenceBlock(tuple(kept))
         if isinstance(block, ConditionalBlock):
             if block.source_node_id is not None:
-                owner = innermost_loop(
-                    node_position(int(block.source_node_id))[0]
-                )
+                owner = innermost_loop(int(block.source_node_id))
                 if owner is not None and owner not in ancestors:
                     misplaced.append((owner, block))
                     return None
@@ -14035,7 +14043,10 @@ def _nest_lexical_conditionals_in_loops(
                 f"conditional {block.source_node_id} is authored inside loop "
                 f"{loop_id} but that loop is absent from the control tree"
             )
-    return replace(control, root=root)
+    proposed = replace(control, root=root)
+    from .control_source import post_control_rewrite
+    post_control_rewrite(graph, proposed, cause=(activity.cell,), previous=control)
+    return proposed
 
 
 def _plan_callsite_projection_ids(graph_obj: Any, hierarchy_plan: Any) -> dict[int, tuple[int, ...]]:
@@ -15886,69 +15897,69 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
         CallBlock, ConditionalBlock, DispatchBlock, ExternalReferenceCallBlock, LoopBlock,
         ResourceScopeBlock, SequenceBlock, StatementBlock, WhileBlock,
     )
-    from .glsl_deployment_strategy import _ast_source_signature, _branch_compartments
-
+    from .control_activity import ActivitySchedule, memberships as activity_memberships
+    from .control_source import (ValidationBlock, SequenceMutationBlock, ScalarFieldWriteBlock,
+                                 SequenceQueryBlock, LoopControlBlock)
     graph_obj = graph.G
-    memberships = {node: set(owners) for node, owners in _branch_compartments(graph).items()}
-    expression_nodes = {id(data.get("expr_obj")): int(node_id)
-                        for node_id, data in graph_obj.nodes(data=True)
-                        if isinstance(data.get("expr_obj"), ast.AST)}
-    signature_nodes = {}
-    for node_id, data in graph_obj.nodes(data=True):
-        expression = data.get("expr_obj")
-        if isinstance(expression, ast.AST) and getattr(expression, "lineno", None) is not None:
-            signature_nodes.setdefault(_ast_source_signature(expression), []).append(int(node_id))
-    resource_nodes = {
-        int(node_id): data["expr_obj"]
-        for node_id, data in graph_obj.nodes(data=True)
-        if isinstance(data.get("expr_obj"), ast.Try)
-        and getattr(data["expr_obj"], "_turing_resource_scope", None)
-    }
-    source_order = {}
-    node_source_order = {}
-    def index_source(node, loop_owners=()):
-        if not isinstance(node, ast.AST):
-            return
-        source_order[id(node)] = len(source_order)
-        node_id = expression_nodes.get(id(node))
-        if node_id is None and getattr(node, "lineno", None) is not None:
-            candidates = signature_nodes.get(_ast_source_signature(node), ())
-            if len(candidates) == 1:
-                node_id = candidates[0]
-        if node_id is not None:
-            node_source_order[node_id] = source_order[id(node)]
-            memberships.setdefault(node_id, set()).update(loop_owners)
-        for field, value in ast.iter_fields(node):
-            owners = loop_owners
-            if isinstance(node, (ast.For, ast.While)) and node_id is not None:
-                owners += ((node_id, field),)
-            for child in value if isinstance(value, list) else (value,):
-                if isinstance(child, ast.AST):
-                    index_source(child, owners)
-    for statement in graph_obj.graph.get("function_body", ()):
-        index_source(statement)
+    activity = ActivitySchedule(graph)
+    memberships = {node: set(owners) for node, owners in activity_memberships(graph).items()}
+    from .concordance_declarations import SOURCE_RESOURCE_CONTROL
+    resource_cells = {int(row[1]): activity.book.latest_ref(SOURCE_RESOURCE_CONTROL, row)
+                      for row in activity.book.page(SOURCE_RESOURCE_CONTROL).scope_rows(
+                          graph_obj.graph['lexical_read_scope'])}
+    resource_nodes = {node: activity.book.page(SOURCE_RESOURCE_CONTROL).cell(cell.row, cell.column)
+                      for node, cell in resource_cells.items()}
 
     def node_position(node_id):
-        data = graph_obj.nodes.get(int(node_id), {})
-        expression = data.get("expr_obj")
-        span = data.get("source_span") or {}
-        return (
-            int(getattr(expression, "lineno", span.get("line", 1 << 30)) or (1 << 30)),
-            int(getattr(expression, "col_offset", span.get("column", 0)) or 0),
-            node_source_order.get(int(node_id), int(node_id)),
-        )
+        return activity.position(int(node_id))
 
-    # One placement rule for an atomic region: where its last authored
-    # member completes (``_dispatch_region_completion_positions``).
-    # Taking the first member here placed ``c = abs(n - 3)`` fused with
-    # the later ``xs[0]`` read before ``xs.reverse()`` (fuzzer p1_26:
-    # effect-order cycle).
-    region_positions = _dispatch_region_completion_positions(
-        graph.G, dispatch_subgraphs,
-    )
+    region_positions = {
+        index: max(activity.position(int(node)) for node in region.G.graph.get('deployment_nodes', ()))
+        for index, region in enumerate(dispatch_subgraphs)
+        if region.G.graph.get('deployment_nodes', ())
+    }
 
-    def block_position(block) -> tuple[int, int, int]:
-        return _control_block_position(graph.G, block, region_positions)
+    def block_position(block):
+        if isinstance(block, StatementBlock):
+            if len(block.lines) == 1:
+                match = re.fullmatch(r"__scheduled_region_(\d+)__", block.lines[0])
+                if match:
+                    return region_positions[int(match[1])]
+                match = re.fullmatch(r"__plan_callsite_(\d+)__", block.lines[0])
+                if match:
+                    return node_position(int(match[1]))
+            if not block.lines:
+                return (-1, 0, 0)  # the empty sequence has no activity
+            raise FortranEmissionError('statement has no concorded control activity')
+        if isinstance(block, SequenceMutationBlock):
+            mutation = block.mutation
+            if mutation.display_member is not None:
+                return activity.member_position(*mutation.display_member)
+            owner = _sequence_mutation_owner_id(mutation)
+            phase = ('enter' if mutation.operator == 'clear' and activity.kind(owner)
+                     in {'List', 'Tuple', 'Set', 'Dict'} else 'exit')
+            return activity.position(owner, phase)
+        if isinstance(block, ScalarFieldWriteBlock):
+            return node_position(block.effect_node_id)
+        if isinstance(block, (DispatchBlock, ExternalReferenceCallBlock, CallBlock)):
+            return node_position(block.callsite_id)
+        if isinstance(block, ConditionalBlock):
+            return activity.position(block.source_node_id, 'select')
+        if isinstance(block, LoopBlock):
+            return activity.position(block.source_loop_node_id, 'select')
+        if isinstance(block, WhileBlock):
+            return activity.position(block.source_loop_node_id, 'enter')
+        if isinstance(block, LoopControlBlock):
+            return node_position(block.site_node_id)
+        if isinstance(block, SequenceQueryBlock):
+            return node_position(block.source_call_node_id)
+        if isinstance(block, ResourceScopeBlock):
+            return activity.position(block.source_scope_id, 'enter')
+        if isinstance(block, ValidationBlock):
+            return node_position(block.predicate_value_id)
+        if isinstance(block, SequenceBlock):
+            return min((block_position(child) for child in block.blocks), default=(-1, 0, 0))
+        raise FortranEmissionError(f'control block has no activity contract: {type(block).__name__}')
 
     def insert_ordered(block, external):
         decorated = [
@@ -16018,13 +16029,15 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
     unplaced = []
     installed = []
     pending_dispatch = {}
-    for node_id, data in sorted(graph_obj.nodes(data=True), key=lambda item: node_position(item[0])):
-        expression = data.get("expr_obj")
+    for node_id, data in graph_obj.nodes(data=True):
         contract = _native_boundary_contract(data)
-        dispatch = (data.get("attributes") or {}).get("dispatch_operation")
-        if not isinstance(expression, ast.Call) or (
-            contract.get("action") != "use_native" and not dispatch
-        ):
+        from .process_graph_facts import operation as process_operation, local_operands
+        process_fact, process_cell = process_operation(graph, int(node_id))
+        dispatch = (None if process_fact is None else {
+            "operation": process_fact[0], "control_scopes": process_fact[4],
+        })
+        if not dispatch and (activity.kind(node_id) != 'Call'
+                             or contract.get("action") != "use_native"):
             continue
         if dispatch and (
             any(not (
@@ -16032,11 +16045,6 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
                 or scope[0] in {"For", "While"} and scope[2] == "body"
                 or scope[0] == "While" and scope[2] == "test"
             ) for scope in dispatch.get("control_scopes", ()))
-            or any(
-                isinstance(graph_obj.nodes.get(owner, {}).get("expr_obj"), ast.Try)
-                and owner not in resource_nodes
-                for owner, _arm in memberships.get(int(node_id), ())
-            )
         ):
             raise FortranEmissionError(
                 "dispatcher operation requires retained control scope lowering: "
@@ -16054,19 +16062,13 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
         parameters = dict(contract.get("parameters") or {})
         result_dtype = parameters.get("result_dtype")
         if dispatch:
-            operation = str(dispatch["operation"])
-            result_dtype = (
-                "opaque_ref" if operation.endswith("_create") else
-                "bool" if operation in {
-                    "condition_acquire", "condition_wait", "event_wait",
-                    "event_is_set", "thread_is_alive",
-                } else "none"
-            )
+            result_dtype = process_fact[2]
         if result_dtype is None:
             unplaced.append((int(node_id), "native boundary has no recorded result_dtype"))
             continue
 
-        parents = tuple(data.get("parents") or ())
+        parents = (local_operands(graph, int(node_id))[0] if dispatch
+                   else tuple(data.get("parents") or ()))
 
         def parent_value_id(parent_id):
             if parent_id not in graph_obj:
@@ -16085,7 +16087,11 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             for result in (parent_value_id(parent_id),)
             if result is not None
         )
-        if len(arguments) != len(expression.args) or len(keywords) != len(expression.keywords):
+        call_signature = activity.call_signature(node_id)
+        if ((not dispatch and (call_signature is None or len(arguments) != call_signature[0]
+                               or len(keywords) != len(call_signature[1])))
+                or (dispatch and len(arguments) + len(keywords) != sum(
+                    str(role).startswith(("arg:", "kw:")) for _parent, role in parents))):
             if dispatch:
                 raise FortranEmissionError(
                     f"dispatcher arguments lack SSA identities: {dispatch['operation']} at node {node_id}"
@@ -16126,67 +16132,44 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
                 ))
         if any(record[0] == int(node_id) for record in unplaced):
             continue
-        target_function_cell = None
-        if dispatch and str(dispatch["operation"]) == "thread_create":
-            target_parents = tuple(
-                int(parent_id)
-                for parent_id, role in parents
-                if str(role) in {"kw:target", "arg:1"}
+        source_block = early_cell = None
+        if dispatch:
+            from .source_control_ir import source_operator
+            early, early_cell = source_operator(graph, int(node_id))
+            source_block = early[3]
+            if source_block.operation != dispatch['operation'] or source_block.result_dtype != result_dtype:
+                raise FortranEmissionError('planned process operation disagrees with ingested control IR')
+        synchronization_cell = None
+        if dispatch and str(dispatch["operation"]).startswith(("sync_", "condition_", "barrier_")):
+            from .synchronization import concord_source_synchronization
+            synchronization_cell = concord_source_synchronization(
+                graph, int(node_id), str(dispatch["operation"]), ordered_parent_ids,
+                tuple(name for name, _value in keywords),
             )
-            if len(target_parents) == 1:
-                target_attributes = (
-                    graph_obj.nodes[target_parents[0]].get("attributes") or {}
-                )
-                resolved_ref = target_attributes.get(
-                    "first_class_function_ref",
-                    target_attributes.get("function_ref"),
-                )
-                if resolved_ref is not None:
-                    from ..common.tensors.topological_reducer import node_identity_cell
-                    from ..transmogrifier.function_table import function_address_identity
-                    from .concordance_declarations import (
-                        CONTROL_PROGRAM_BUILD, FUNCTION_ADDRESS,
-                        SOURCE_DISPATCH_TARGET,
-                    )
-                    from .identity_concordance import Derived, Mode, current_identity_book
-
-                    book = current_identity_book()
-                    entry = graph.function_table.entry(int(resolved_ref))
-                    address_row = (function_address_identity(entry),)
-                    address_cell = book.latest_ref(FUNCTION_ADDRESS, address_row)
-                    if (address_cell is None or
-                            book.page(FUNCTION_ADDRESS).latest(address_row) != int(resolved_ref)):
-                        raise FortranEmissionError(
-                            "thread_create target has no concorded function address"
-                        )
-                    scope = graph_obj.graph.get("lexical_read_scope")
-                    if scope is None:
-                        raise FortranEmissionError(
-                            "thread_create target has no source read scope"
-                        )
-                    row = (tuple(scope), int(node_id))
-                    target_function_cell = book.post(
-                        SOURCE_DISPATCH_TARGET, row, int(resolved_ref),
-                        stage=CONTROL_PROGRAM_BUILD,
-                        provenance=Derived((
-                            node_identity_cell(graph, int(node_id)),
-                            node_identity_cell(graph, target_parents[0]),
-                            address_cell,
-                        )),
-                        mode=Mode.CONCORD,
-                    )
-                else:
-                    span = data.get("source_span") or {}
-                    raise FortranEmissionError(
-                        "thread_create target has no resolved function identity "
-                        f"at line {span.get('line', '?')}"
-                    )
-        external = DispatchBlock(
+        from .identity_concordance import current_identity_book
+        book = current_identity_book()
+        from .process_graph_facts import thread_activation
+        from .concordance_declarations import SOURCE_THREAD_ARGUMENT_PACK
+        activation_cell = thread_activation(graph, int(node_id)) if dispatch else None
+        pack_cell = (None if activation_cell is None else
+                     book.latest_ref(SOURCE_THREAD_ARGUMENT_PACK, (activation_cell,)))
+        argument_bindings = (() if pack_cell is None else
+                             book.page(SOURCE_THREAD_ARGUMENT_PACK).cell(pack_cell.row, pack_cell.column))
+        external = replace(source_block,
             callsite_id=int(node_id), operation=str(dispatch["operation"]),
             argument_value_ids=arguments, keyword_argument_value_ids=keywords,
             result_value_id=int(data.get("value_id", node_id)),
             result_dtype=str(result_dtype),
-            target_function_cell=target_function_cell,
+            ingestion_control_cell=early_cell,
+            synchronization_cell=synchronization_cell,
+            process_operation_cell=process_cell,
+            operand_graph_cell=local_operands(graph, int(node_id))[1],
+            thread_activation_cell=activation_cell,
+            capture_argument_value_ids=tuple(int(graph_obj.nodes[parent].get("value_id", parent))
+                                             for parent, role in parents if str(role).startswith("capture:")),
+            worker_argument_bindings=argument_bindings,
+            worker_argument_pack_expanded=pack_cell is not None,
+            exception_operation_cell=source_block.exception_operation_cell,
         ) if dispatch else ExternalReferenceCallBlock(
             callsite_id=int(node_id),
             identity=str(contract["identity"]),
@@ -16233,6 +16216,8 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             return {block.source_node_id} if block.source_node_id is not None else set()
         if isinstance(block, (LoopBlock, WhileBlock)):
             return {block.source_loop_node_id} if block.source_loop_node_id is not None else set()
+        if isinstance(block, LoopControlBlock):
+            return {block.site_node_id} if block.site_node_id is not None else set()
         if isinstance(block, SequenceBlock):
             return set().union(*(anchors(child) for child in block.blocks))
         if isinstance(block, StatementBlock) and len(block.lines) == 1:
@@ -16249,14 +16234,14 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
                 raise FortranEmissionError("resource scope crosses a compiled region boundary")
             return bool(nodes) and inside == nodes
         if owned(block):
-            return ResourceScopeBlock(block, cleanup, scope_id), True
+            return ResourceScopeBlock(block, cleanup, scope_id, resource_cells[scope_id]), True
         if isinstance(block, SequenceBlock):
             indices = [index for index, child in enumerate(block.blocks) if owned(child)]
             if indices:
                 first, last = indices[0], indices[-1]
                 if indices != list(range(first, last + 1)):
                     raise FortranEmissionError("resource scope has noncontiguous control ownership")
-                grouped = ResourceScopeBlock(SequenceBlock(block.blocks[first:last + 1]), cleanup, scope_id)
+                grouped = ResourceScopeBlock(SequenceBlock(block.blocks[first:last + 1]), cleanup, scope_id, resource_cells[scope_id])
                 return SequenceBlock((*block.blocks[:first], grouped, *block.blocks[last + 1:])), True
             for index, child in enumerate(block.blocks):
                 projected, found = wrap_scope(child, scope_id, cleanup)
@@ -16279,8 +16264,18 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
                                       key=lambda item: len(memberships.get(item[0], ())), reverse=True):
         cleanup_ids = [node_id for node_id in pending_dispatch
                        if (scope_id, "finalbody") in memberships.get(node_id, ())]
-        if len(cleanup_ids) != 1 or pending_dispatch[cleanup_ids[0]].operation != "condition_release":
+        if len(cleanup_ids) != 1 or pending_dispatch[cleanup_ids[0]].operation not in {"condition_release", "sync_mutex_release"}:
             raise FortranEmissionError("resource scope has no exact condition release cleanup")
+        _source_scope, _control, entry_source, cleanup_source, receiver = resource_nodes[scope_id]
+        entries = [operation for operation in pending_dispatch.values()
+                   if operation.process_operation_cell == entry_source]
+        cleanup_operation = pending_dispatch[cleanup_ids[0]]
+        from .process_graph_facts import local_value
+        captured_receiver = local_value(graph, receiver)
+        if (len(entries) != 1 or cleanup_operation.process_operation_cell != cleanup_source
+                or entries[0].argument_value_ids != (captured_receiver,)
+                or cleanup_operation.argument_value_ids != (captured_receiver,)):
+            raise FortranEmissionError('resource entry/cleanup disagree with the concorded captured receiver')
         cleanup = (replace(pending_dispatch.pop(cleanup_ids[0]), result_value_id=None),)
         root, found = wrap_scope(root, scope_id, cleanup)
         if not found:
@@ -16289,7 +16284,7 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             # branch/loop must not be guessed into existence here.
             if any(owner not in resource_nodes for owner, _ in memberships.get(scope_id, ())):
                 raise FortranEmissionError("resource scope's enclosing control is not retained")
-            root = insert_ordered(root, ResourceScopeBlock(SequenceBlock(()), cleanup, scope_id))
+            root = insert_ordered(root, ResourceScopeBlock(SequenceBlock(()), cleanup, scope_id, resource_cells[scope_id]))
     for node_id, operation in pending_dispatch.items():
         guarded = [(owner, arm) for owner, arm in memberships.get(node_id, ())
                    if arm in {"body", "orelse", "test"}]
@@ -16303,7 +16298,15 @@ def _install_external_reference_calls(control: Any, graph: Any, dispatch_subgrap
             raise FortranEmissionError("dispatcher operation's control owner is not retained")
         if not inserted:
             root = insert_ordered(root, operation)
-    return replace(control, root=root), tuple(installed), tuple(unplaced)
+    projected = replace(control, root=root)
+    # The two-thread source retained DispatchBlocks for starts and joins,
+    # but this last control rewrite never published their placement. Post
+    # the actual tree at its writer; a later SSA Dispatch annotation cannot
+    # substitute for the control-owned boundary facts.
+    from .control_source import post_control_rewrite
+    post_control_rewrite(graph, projected, previous=control,
+                         cause=(activity.cell, *resource_cells.values()))
+    return projected, tuple(installed), tuple(unplaced)
 
 
 def _control_block_consumes_values(block: Any, value_ids: Iterable[int]) -> bool:
@@ -18998,9 +19001,11 @@ def _sequence_column_dtype_contracts(
             "compile_time_mapping_items"
         )
         attrs = data.get("attributes") or {}
-        explicit_dtypes = tuple(map(
+        from .process_graph_facts import captured_columns
+        capture_dtypes, capture_columns_cell = captured_columns(graph_obj, int(node_id))
+        explicit_dtypes = (tuple(capture_dtypes) if capture_columns_cell is not None else tuple(map(
             str, attrs.get("sequence_column_dtypes", ())
-        ))
+        )))
         if (
             explicit_dtypes
             and len(explicit_dtypes) == declared[value_id]
@@ -21293,6 +21298,17 @@ def _rehome_structured_while_predicate_regions(
 
     loop_candidates: dict[int, set[int]] = {}
 
+    def retained_regions(block: Any) -> set[int]:
+        region = marker_region(block)
+        found = set() if region is None else {region}
+        for child in getattr(block, "blocks", ()):
+            found.update(retained_regions(child))
+        for field in ("condition", "body", "orelse", "callee"):
+            child = getattr(block, field, None)
+            if child is not None:
+                found.update(retained_regions(child))
+        return found
+
     def discover(block: Any) -> None:
         region = marker_region(block)
         if region is not None:
@@ -21310,10 +21326,17 @@ def _rehome_structured_while_predicate_regions(
             loop_id = block.source_loop_node_id
             computed = computed_expression_ids(block.predicate_expression)
             if loop_id is not None and computed:
+                # Condition handshake: region1 loads shared[1], region2
+                # compares it. Both already belong to this exact test. Taking
+                # region2 out and prepending it inverted their dependency.
+                # Rehome only work actually outside the owning condition;
+                # preserve its already-concorded internal topology.
+                incumbent = retained_regions(block.condition)
                 loop_candidates[int(loop_id)] = {
                     region_index
                     for region_index, nodes in region_nodes.items()
                     if nodes and nodes.issubset(computed)
+                    and region_index not in incumbent
                 }
             discover(block.condition)
             discover(block.body)
@@ -30606,32 +30629,46 @@ def _class_surface_ssa_program(
                 extra_mutations=held_table_deletes,
             )
             lexical_sequence_shortfalls = (*lexical_sequence_shortfalls, *held_delete_shortfalls)
-        # Numerical region order alone does not represent reads of mutable
-        # fields. Restore authored sibling order before the dependency
-        # scheduler: an early bool(field) must precede the conditional
-        # that updates the field and publishes its continuation version.
+        # Program: a thread lifecycle in ``if flag > 0`` and a store in
+        # the other arm. The private source-coordinate sort moved the If
+        # keyword before region0 computing flag>0, despite its declared
+        # predicate prerequisite. Read the ingested activity select port and
+        # region completion ports in one configured scheduling space instead.
         from .control_source import SequenceBlock, StatementBlock, ConditionalBlock, LoopBlock, WhileBlock
-        # A dispatch region is atomic and may contain early input casts
-        # together with a later authored update.  Place it where the
-        # whole region becomes complete.  Using the earliest member here
-        # undid the dependency-safe atomic region order: pi_update's
-        # final self.acc region also contains line-5 casts, so it
-        # overtook the line-7 normalization and read stale resident state.
-        region_positions = _dispatch_region_completion_positions(
-            graph_obj, getattr(shell, "dispatch_subgraphs", ()),
-        )
+        from .control_activity import ActivitySchedule, binding as activity_binding
+        field_activity = ActivitySchedule(graph)
+        unknown_position = (1 << 30, 0, 0)
+
+        def activity_position(node, phase='exit'):
+            if node is None or int(node) not in graph_obj:
+                return unknown_position
+            points, _cell = activity_binding(graph, int(node))
+            if points is None:
+                return unknown_position
+            return field_activity.position(int(node), phase)
+
+        region_positions = {
+            index: max((activity_position(node) for node in subgraph.G.graph.get('deployment_nodes', ())
+                        if activity_position(node) != unknown_position), default=unknown_position)
+            for index, subgraph in enumerate(getattr(shell, 'dispatch_subgraphs', ()))
+        }
         def source_position(block):
             if isinstance(block, StatementBlock) and len(block.lines) == 1:
                 line = block.lines[0]
                 if line.startswith("__scheduled_region_") and line.endswith("__"):
-                    return region_positions.get(int(line[len("__scheduled_region_"):-2]), (1 << 30, 0, 0))
+                    return region_positions.get(int(line[len("__scheduled_region_"):-2]), unknown_position)
+            if isinstance(block, ConditionalBlock):
+                node = block.source_node_id
+                if node is not None and int(node) in graph_obj and field_activity.kind(int(node)) in {'If', 'IfExp'}:
+                    return activity_position(node, 'select')
+                # A short-circuit block tests its first operand; its source
+                # BoolOp has no select port. Use that operand's exact exit.
+                return activity_position(block.predicate_value_id)
             node_id = (block.effect_node_id if isinstance(block, ScalarFieldWriteBlock)
-                       else getattr(block, "source_node_id", None))
+                       else getattr(block, 'source_node_id', None))
             if node_id is None:
-                node_id = getattr(block, "source_loop_node_id", None)
-            if node_id is not None:
-                return _authored_node_position(graph_obj, int(node_id))
-            return (1 << 30, 0, 0)
+                node_id = getattr(block, 'source_loop_node_id', None)
+            return activity_position(node_id, 'enter' if isinstance(block, (LoopBlock, WhileBlock)) else 'exit')
         def order_field_effects(block):
             if isinstance(block, SequenceBlock):
                 children = [order_field_effects(child) for child in block.blocks]
@@ -30653,7 +30690,8 @@ def _class_surface_ssa_program(
                 return replace(block, body=order_field_effects(block.body))
             return block
         control = replace(control, root=order_field_effects(control.root))
-        from .control_source import post_control_rewrite as _post_control_rewrite; _post_control_rewrite(graph, control)
+        from .control_source import post_control_rewrite as _post_control_rewrite
+        _post_control_rewrite(graph, control, cause=(field_activity.cell,))
         # Keyed values consumed directly by control have no numerical region
         # to schedule their reads.  This includes direct return operands, but
         # also branch predicates and resident sequence mutations (notably the
@@ -32669,6 +32707,8 @@ def _class_surface_ssa_program(
             ).class_table
         section_outputs.update(shell_section_outputs)
         module_ir.functions[symbol].metadata["source_callsite_variant"] = shape_scope_is_variant(graph_obj)
+        from .thread_table import publish_source_function
+        publish_source_function(module_ir.functions[symbol], graph_obj, source_function_table)
         # Retained dependencies stay linkable module functions, while the
         # ordinary public surface is the exact activation catalogue.
         # Explicit linked ProcessGraphs preserve their established exported
@@ -51958,6 +51998,23 @@ def _class_surface_ssa_program(
                         int(callee_id): int(caller_id)
                         for caller_id, callee_id in record.argument_bindings
                     }
+                    # make(n) -> rows -> change(rows): the returned sequence
+                    # owns the same length/capacity/status/heap cells later
+                    # passed to change. Argument-only ownership classified
+                    # the factory's cells as private leases and split them at
+                    # change, despite matching sequence-member identities.
+                    # Result edges prove membership just as argument edges do.
+                    exact_sequence_bindings = dict(exact_argument_bindings)
+                    result_sequence_bindings = {}
+                    for callee_result, caller_result in record.result_bindings:
+                        result_sequence_bindings.setdefault(int(callee_result), set()).add(int(caller_result))
+                    for callee_result, caller_results in result_sequence_bindings.items():
+                        # A returned argument may have another SSA view id;
+                        # its authored input remains the ownership anchor.
+                        # Multiple distinct result views require their own
+                        # storage proof rather than choosing the first one.
+                        if len(caller_results) == 1:
+                            exact_sequence_bindings.setdefault(callee_result, next(iter(caller_results)))
                     distinct_bindings = []
                     for callee_id, kind, source in record.frame_bindings:
                         if str(kind) != "caller_storage":
@@ -52040,7 +52097,7 @@ def _class_surface_ssa_program(
                                     int(callee_id)
                                 )
                             ):
-                                caller_sequence_id = exact_argument_bindings.get(
+                                caller_sequence_id = exact_sequence_bindings.get(
                                     int(callee_sequence_id)
                                 )
                                 if (
@@ -52058,8 +52115,22 @@ def _class_surface_ssa_program(
                                 source_id, sequence_owner,
                             )
                             if first_owner == sequence_owner:
+                                identity = (
+                                    str(caller_symbol), int(record.callsite_id),
+                                    str(record.callee_symbol), int(callee_id),
+                                )
+                                retained = frame_ledger.propose(
+                                    identity, "exact_sequence_member_binding",
+                                    sequence_owner, before=source_id, after=source_id,
+                                    sources=_frame_cells(
+                                        getattr(record, "cell", None),
+                                        _frame_table_cell(callee_sequence_table, callee_id, SEQUENCE_MEMBER),
+                                        _frame_table_cell(caller_sequence_table, source_id, SEQUENCE_MEMBER),
+                                    ),
+                                )
                                 distinct_bindings.append(
-                                    (callee_id, kind, source)
+                                    (callee_id, kind, source if retained else
+                                     int(frame_ledger.incumbent_target(identity)))
                                 )
                                 continue
                         # A slot's owner is its link: the caller record
@@ -62464,6 +62535,7 @@ def _lower_resolved_process_graph_deployment(
     activation_function_references: tuple[int, ...] | None = None,
     name: str | None = None,
     runtime_closure_only: bool = True,
+    schedule_preference: str | None = None,
     tensor_ssa_reference: Any = None,
     linked_source_region_ssa: Mapping[
         tuple[str, ...], tuple[Any, Mapping[str, Any], Mapping[str, Any]]
@@ -62593,6 +62665,7 @@ def _lower_resolved_process_graph_deployment(
         deployment_graph,
         backend="fortran",
         runtime_closure_only=(runtime_closure_only and not whole_source),
+        schedule_preference=schedule_preference,
         _selection_progress=report,
     )
     compile_stage("deployment-instantiate")
@@ -62819,6 +62892,7 @@ def _lower_resolved_process_graph_unit_to_ssa_impl(
     name: str | None = None,
     tensor_ssa_reference: Any = None,
     allow_function_shell_cut: bool = False,
+    schedule_preference: str | None = None,
     progress: Callable[[str], None] | None = None,
 ):
     """Compile one exact unit from a serialized post-reduction ProcessGraph."""
@@ -62887,6 +62961,7 @@ def _lower_resolved_process_graph_unit_to_ssa_impl(
         activation_function_references=selected,
         name=name,
         runtime_closure_only=True,
+        schedule_preference=schedule_preference,
         tensor_ssa_reference=tensor_ssa_reference,
         allow_authored_source_callees=allow_function_shell_cut,
         progress=progress,
@@ -62985,6 +63060,7 @@ def _lower_ast_source_to_ssa_impl(
     tensor_ssa_reference: Any = None,
     name: str | None = None,
     runtime_closure_only: bool = True,
+    schedule_preference: str | None = None,
     progress: Callable[[str], None] | None = None,
     boundary_namespace: Any = None,
     source_language: str = "python",
@@ -64174,6 +64250,9 @@ def _lower_ast_source_to_ssa_impl(
     chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
     chained_comparison_receipts.extend(_normalize_mapping_get(tree))
     chained_comparison_receipts.extend(_normalize_set_constructor(tree))
+    from .source_exception_ingestion import ingest_exception_syntax
+    # Exception conversion runs after source pursuit has resolved native call
+    # identities, before ProcessGraph ingestion; see source_control_normalizers.
     short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
     loop_else_receipts = list(_normalize_loop_else(tree))
     if chained_comparison_receipts:
@@ -64729,6 +64808,11 @@ def _lower_ast_source_to_ssa_impl(
     # already-closed nul stream, so its post-build PROBE_ELAPSED print failed.
     # Stdout belongs to the outer terminal compositor, never an ingestion
     # worker. The graph's verbosity gates and report callback own diagnostics.
+    def normalize_resolved_exception_control(resolved_tree):
+        ingest_exception_syntax(resolved_tree, module_name=source_module)
+        short_circuit_receipts.extend(_normalize_binary_short_circuit(resolved_tree))
+        loop_else_receipts.extend(_normalize_loop_else(resolved_tree))
+
     graph.build_from_ast(
         tree,
         filename=source_module,
@@ -64751,6 +64835,7 @@ def _lower_ast_source_to_ssa_impl(
         # It selects executable roots; it does not narrow catalogue policy.
         activation_roots=compile_targets,
         tensor_code_references=source_tensor_references,
+        source_control_normalizers=(normalize_resolved_exception_control,),
         source_ast_normalizers=(
             normalize_discovered_short_circuit,
             _normalize_none_default_assignments,
@@ -65260,6 +65345,14 @@ def _lower_ast_source_to_ssa_impl(
     compile_stage("topology-reduction")
     report("ssa-source: reducing source topology")
     reduce_abstract_tensor_topology(graph)
+    from .lock_box import ingest_mutex_bindings
+    ingest_mutex_bindings(graph)
+    from .thread_table import ingest_thread_table
+    ingest_thread_table(graph)
+    from .source_control_ir import ingest_source_control_ir
+    ingest_source_control_ir(graph, schedule_preference)
+    from .thread_regions import ingest_thread_regions
+    ingest_thread_regions(graph)
     _install_concorded_type_expectation_vocabularies(graph)
     reduced_initializer_fields = _reduced_initializer_list_fields(graph)
     if reduced_initializer_fields:
@@ -65488,6 +65581,7 @@ def _lower_ast_source_to_ssa_impl(
         dependency_seeds=dependency_seeds,
         name=artifact_name,
         runtime_closure_only=runtime_closure_only,
+        schedule_preference=schedule_preference,
         tensor_ssa_reference=tensor_ssa_reference,
         linked_source_region_ssa=linked_source_region_ssa,
         assignment_normalization=assignment_receipts,
@@ -65534,6 +65628,7 @@ def _lower_ast_source_to_ssa_impl(
         "decisions": decision_records,
     }
     module.metadata["loop_interchange"] = receipt
+    module.metadata["source_thread_regions"] = graph.G.graph.get("thread_regions", ())
     module.metadata["single_exit_guard_normalization"] = (
         single_exit_receipts
     )
@@ -66369,6 +66464,10 @@ def lower_ast_source_to_ssa(*args: Any, **kwargs: Any):
     ``progress`` behaves as it always did.  The choice is a ``compile_policy``
     row on the book.
 
+    ``schedule_preference="asap"`` or ``"alap"`` configures the existing
+    deployment/dependency scheduler and its source activity graph arrangement.
+    It preserves authored control/dependency edges and selects no native lanes.
+
     ``compile_profile=True`` retains source-to-SSA stage wall times, existing
     planner timings and completed work counts in ``module.metadata['compile_profile']``
     even without bars. ``shell_telemetry.compile_profile_dataframe(module)``
@@ -66584,7 +66683,9 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
             _bars.inherit_completed_stages(completed_stage_keys)
         for root in live_roots:
             _regulator.register_live_root(root)
-        result = lowering(*args, **kwargs)
+        from ..transmogrifier.operator_safety import operator_safety_configuration
+        with operator_safety_configuration(kwargs.pop("operator_safety_arms", True), _book):
+            result = lowering(*args, **kwargs)
         # The late dominance repairs run inside the implementation, before
         # the full-native gate and its first frame-formal concordance (see
         # ``_settle_late_dominance_repairs``).  A module that never reached
@@ -66592,6 +66693,10 @@ def _run_source_lowering(lowering, *args: Any, **kwargs: Any):
         # others every substitution is already made and this finds none.
         module = result[0] if isinstance(result, tuple) else result
         if module is not None:
+            from ..transmogrifier.ssa import SSALockBox
+            module.lock_box = SSALockBox(book=_book)
+            from .thread_table import publish_ssa_thread_table
+            publish_ssa_thread_table(module, _book)
             compile_stage("compiler-finalization")
         _bars.substage("native object requirements")
         from .ssa_object_context import publish_native_object_requirements

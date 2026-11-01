@@ -954,6 +954,30 @@ def _replace_parent_value(
     ]
 
 
+def _source_loop_control_work(graph: Any, loop: LoopDescriptor):
+    """The incumbent loop-work fact, also required before unroll selection."""
+    from .process_graph_facts import operation as process_operation
+    from .concordance_declarations import SOURCE_LOOP_CONTROL_WORK, CONTROL_PROGRAM_BUILD
+    from .identity_concordance import current_identity_book, Derived, Mode
+    from ..common.tensors.topological_reducer import node_identity_cell
+    process_cells = tuple(cell for node in loop.body_nodes if node in graph.G
+                          for _operation, cell in (process_operation(graph, int(node)),)
+                          if cell is not None)
+    site_cells = tuple(node_identity_cell(graph, int(site))
+                       for site, _action, _chain, _values, _arm in loop.control_sites)
+    if not process_cells and not site_cells:
+        return None
+    book = current_identity_book()
+    row = (graph.G.graph['lexical_read_scope'], int(loop.node_id))
+    fact = (site_cells, process_cells)
+    previous = book.latest_ref(SOURCE_LOOP_CONTROL_WORK, row)
+    if previous is not None and book.page(SOURCE_LOOP_CONTROL_WORK).cell(previous.row, previous.column) == fact:
+        return previous
+    return book.post(SOURCE_LOOP_CONTROL_WORK, row, fact, stage=CONTROL_PROGRAM_BUILD,
+        provenance=Derived((node_identity_cell(graph, int(loop.node_id)), *site_cells, *process_cells)),
+        mode=Mode.CONCORD if previous is None else Mode.REVISE)
+
+
 def loop_requires_iterative_control(graph: Any, plan: LoopPlan) -> bool:
     """The evaporator's existing terminal/conditional control boundary.
 
@@ -962,7 +986,7 @@ def loop_requires_iterative_control(graph: Any, plan: LoopPlan) -> bool:
     boundary; its retained realization must consult the same predicate or an
     UNROLL plan with no emitted iterations erases the loop's carried value.
     """
-    return bool(plan.loop.control_sites or plan.loop.return_controls) or any(
+    return bool(_source_loop_control_work(graph, plan.loop) or plan.loop.return_controls) or any(
         isinstance(member_expression, ast.If)
         for loop_expression in (
             graph.G.nodes.get(int(plan.loop.node_id), {}).get("expr_obj"),
@@ -3417,12 +3441,8 @@ class LoopComposer:
                             None if guard is None else guard[0],
                             True if guard is None else guard[1],
                         ))
-                        site_values = loop_break_sites.get((
-                            int(getattr(statement, "lineno", -1)),
-                            int(getattr(statement, "col_offset", -1)),
-                            int(getattr(statement, "end_lineno", -1)),
-                            int(getattr(statement, "end_col_offset", -1)),
-                        )) or {}
+                        from .loop_site_facts import site_values as read_site_values
+                        site_values, _site_cell = read_site_values(graph, statement_id, int(node_id))
                         control_sites.append((
                             int(statement_id),
                             action,
@@ -4431,7 +4451,8 @@ class LoopComposer:
             int(plan.loop.node_id)
             for plan in plans
             if (
-                len(plan.loop.carried_bindings) > 1
+                _source_loop_control_work(graph, plan.loop) is not None
+                or len(plan.loop.carried_bindings) > 1
                 or (
                     plan.loop.carried_bindings
                     and int(plan.loop.node_id) in nested_loop_ids
@@ -4468,7 +4489,7 @@ class LoopComposer:
                 plan,
                 strategy=strategy,
                 reason=(
-                    "coordinated multi-carried recurrence preservation "
+                    "authored control/effect or coordinated recurrence preservation "
                     "outranks loop unrolling"
                 ),
             )
@@ -6429,7 +6450,12 @@ def analyze_shader_loop_reductions(
         # as region-less and dropped with its authored return; the function
         # always fell through (silent 0 for 70 in a dict-of-lists ``.get``
         # read).  Rule: a source ``return`` edge is loop work too.
-        if not region_indices and not sequence_mutations and not source_linked_calls and not loop.carried_bindings and not loop.return_controls:
+        control_work = _source_loop_control_work(graph, loop)
+        # A loop containing a source exit or dispatcher operation is control
+        # work even with zero numerical regions. The nested Condition-with/
+        # break source previously lost its complete loop as 'no-shader-region'.
+        if (not region_indices and not sequence_mutations and not source_linked_calls
+                and not loop.carried_bindings and not loop.return_controls and control_work is None):
             blockers.append("no-shader-region")
         if (
             loop.source_type == "While"
@@ -6580,47 +6606,31 @@ def analyze_shader_loop_reductions(
                         return span_of(other)
             return None
 
-        def arm_owned_site(
-            arm_span: tuple[int, int] | None,
-            site_values: tuple[tuple[tuple[int, int], int], ...],
-            action: str = "",
-        ) -> bool:
-            if arm_span is None:
-                return False
-            first, last = arm_span
-            owned = False
-            for _initial, value in site_values:
-                if int(value) not in body_region_nodes:
+        def arm_owned_site(site_id):
+            from .control_activity import binding, _ingested_kind
+            from .concordance_declarations import SOURCE_ACTIVITY_NODE
+            from .identity_concordance import current_identity_book
+            book = current_identity_book()
+            points, _cell = binding(graph, int(site_id))
+            loop_points, _loop_cell = binding(graph, int(loop.node_id))
+            if points is None or loop_points is None:
+                raise ValueError('loop control site has no ingested ownership')
+            controls = {}
+            for node in graph.G:
+                if _ingested_kind(graph, int(node)) not in {'If', 'IfExp', 'BoolOp'}:
                     continue
-                line = node_line(value)
-                if line is not None and first <= line <= last:
-                    owned = True
-                    break
-            if not owned and action == "break":
-                # A ``break`` ending one arm of a conditional whose OTHER arm
-                # runs body regions: the surviving arm's bindings stand after
-                # the ``if`` unmerged (the reducer's terminal-arm rule), so
-                # the break leaves from its own arm or nothing downstream
-                # dominates it.  Same rule as the conditional builder's
-                # ``arm_loop_control``.
-                sibling = sibling_arm_span(arm_span)
-                if sibling is not None:
-                    owned = any(
-                        int(member) in body_region_nodes
-                        and (line := node_line(member)) is not None
-                        and sibling[0] <= line <= sibling[1]
-                        for member in body_region_nodes
-                    )
-            if os.environ.get("TURING_DEBUG_BREAK_EDGE"):
-                print(
-                    "DEBUG-ARM-OWNED composer "
-                    f"fn={graph.G.graph.get('function_name')} "
-                    f"loop={loop.node_id} arm_span={arm_span} "
-                    f"site_values={site_values} owned={owned}",
-                    file=sys.stderr, flush=True,
-                )
-            return owned
+                control_points, _binding = binding(graph, int(node))
+                if control_points is not None:
+                    controls[control_points[0].row[1]] = int(node)
+            _kind, owners = book.page(SOURCE_ACTIVITY_NODE).cell(points[0].row, points[0].column)
+            for occurrence, arm in reversed(owners):
+                if occurrence == loop_points[0].row[1]:
+                    return False
+                if occurrence in controls and arm in {'body', 'orelse'}:
+                    return True
+            return False
 
+        from .loop_site_facts import site_values as read_site_values
         body_items.extend(
             (
                 lexical_position[site_id],
@@ -6632,12 +6642,13 @@ def analyze_shader_loop_reductions(
                     source_action=action,
                     site_node_id=int(site_id),
                     site_values=tuple(site_values),
+                    site_state_cell=read_site_values(graph, int(site_id), int(loop.node_id))[1],
                 ),
             )
             for site_id, action, chain, site_values, arm_span
             in loop.control_sites
             if site_id in lexical_position
-            and not arm_owned_site(arm_span, site_values, action)
+            and not arm_owned_site(int(site_id))
         )
 
 
@@ -7110,6 +7121,11 @@ def analyze_shader_loop_reductions(
             ),
             domain_region_indices=tuple(sorted(domain_regions)),
         ))
+        if control_work is not None and reductions[-1].control_program is not None:
+            from .concordance_declarations import CONTROL_PROGRAM_BUILD
+            from .control_source import post_control_program
+            post_control_program(graph, reductions[-1].control_program, stage=CONTROL_PROGRAM_BUILD,
+                                 cause=(control_work,), label=('loop_control', int(loop.node_id)))
     return tuple(reductions)
 
 

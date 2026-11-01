@@ -75,6 +75,7 @@ def _walk_planned_shells(
         pending.extend(
             getattr(current, "callsite_function_shells", {}).values()
         )
+        pending.extend(getattr(current, "thread_worker_shells", {}).values())
         # A recursive call is an activation without a callsite clone.  Walking
         # only the tree left right() absent from left()->right()->left(), so
         # the linker dereferenced a missing callee. Admit just these exact
@@ -139,6 +140,8 @@ def _deployment_program_table_lines(shell: Any) -> tuple[str, ...]:
             key=lambda item: item[0],
         ):
             visit(child, depth + 1, f"callsite-{node_id}")
+        for node_id, child in sorted(getattr(current, "thread_worker_shells", {}).items()):
+            visit(child, depth + 1, f"worker-{node_id}")
 
     visit(shell, 0, "root")
     lines = [

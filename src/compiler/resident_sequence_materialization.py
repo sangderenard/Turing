@@ -2437,7 +2437,22 @@ def _call_escaped_argument_edges(graph_obj: Any) -> frozenset[tuple[int, int]]:
     names: the same definition, keeping which call each value escapes into."""
 
     escaped: set[tuple[int, int]] = set()
+    from .process_graph_facts import operation as process_operation
     for _node_id, data in graph_obj.nodes(data=True):
+        if graph_obj.graph.get('canonical_value_ids'):
+            fact, _cell = process_operation(graph_obj, int(_node_id))
+            if fact is not None:
+                from .concordance_declarations import PROCESS_ESCAPE_CLASSIFICATION, CONTROL_PROGRAM_BUILD
+                from .identity_concordance import current_identity_book, Derived, Mode
+                current_identity_book().post(PROCESS_ESCAPE_CLASSIFICATION, (_cell,),
+                    (fact[1], 'typed_graph_operation'), stage=CONTROL_PROGRAM_BUILD,
+                    provenance=Derived((_cell,)), mode=Mode.CONCORD)
+                # This is an ingested graph operation, not an opaque Python
+                # callee. A fence's retained diagnostic ast.Call formerly
+                # made its storage operand escape and erased the literal's
+                # capacity proof. Actual task captures/effects are represented
+                # by their thread-table edges, not this arbitrary-call rule.
+                continue
         expression = data.get("expr_obj")
         if not isinstance(expression, ast.Call):
             continue

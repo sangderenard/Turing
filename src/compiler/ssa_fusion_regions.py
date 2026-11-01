@@ -19,7 +19,17 @@ CONTROL_BARRIERS = frozenset({
     "Ret", "Br", "CondBr", "Switch", "Phi", "Call", "Invoke",
 })
 EFFECT_BARRIERS = frozenset({
+    "ExceptionNone", "ExceptionMake", "ExceptionTake", "ExceptionActive", "ExceptionMatch", "ExceptionRaise",
+    "ExceptionIndexType", "ExceptionLength",
+    "ThreadCreate", "ThreadStart", "ThreadJoin", "ThreadIsAlive",
+    "ConditionCreate", "ConditionAcquire", "ConditionRelease", "ConditionWait",
+    "ConditionNotify", "ConditionNotifyAll", "EventCreate", "EventSet", "EventClear",
+    "EventWait", "EventIsSet", "ByteQueueCreate",
     "Store", "SetAttr", "SetItem", "Publish", "Raise", "Yield", "Dispatch",
+    "MemoryBarrier", "ControlBarrier", "LatchCreate", "LatchArrive", "LatchWait",
+    "LatchSignal", "LatchReset", "CompletionWait",
+    "MutexCreate", "MutexAcquire", "MutexAcquired", "MutexToken", "MutexRelease", "MutexLocked",
+    "WorkerToken",
 })
 
 
