@@ -79,6 +79,7 @@ _REAL_TRANSLATED_SYMBOLS = {
     "sum_double",
     "create_arange",
     "create_arange_int64",
+    "topk_int64_dim",
 }
 
 

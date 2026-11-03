@@ -161,3 +161,16 @@ interpret, and required another edit to restore the requested state. The
 lambda has been restored exactly. The preventing constraint is to report an
 investigative finding as a finding and make no source edit when the user has
 asked only for investigation.
+
+## 2026-11-03 — unbooked top-k aggregate probe
+
+The agent was told to validate the imported top-k kernel through existing SSA
+constructor and concordance APIs. It first hand-assigned caller SSA IDs and
+emitted C without an attached identity book. The generated DLL was an unusable
+proof because emission reported `no_book_at_emission` and posted no cells.
+That shortcut cost one extra probe build and a rewrite of the scratch fixture.
+The agent then minted the caller values with `mint_ssa_value`, posted the entry
+block from its function-root cell, attached an owned book, and reran emission,
+native compilation, and the audit. The preventing constraint is to establish
+the owned book and mint every SSA value and block origin before using an
+emitter result as evidence.

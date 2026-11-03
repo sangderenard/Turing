@@ -2158,13 +2158,14 @@ def _call_projection_scope(graph) -> str:
 
 
 def _post_call_result_projections(graph, node_id):
-    """Find the call's ``Indexed`` projections and post their CALL_RESULT_PROJECTION rows.
+    """Post the call's exact positional and declared named projections.
 
     The projection path is relative to the call's one result value.  Every
     binding lane (authored body, accepted native header, declared union)
     posts through here, so the rows exist whichever lane binds the call.
     """
     caller_paths = {}
+    projection_causes = {}
     # ``r = pair(n); while i < 2: total += r[i]``: inside the loop the graph
     # reads the carried ``i`` through its initial literal, which is not a
     # literal path onto the call's result (``_loop_carried_initial_ids``).
@@ -2172,10 +2173,47 @@ def _post_call_result_projections(graph, node_id):
 
     carried_initials = _loop_carried_initial_ids(graph.G)
 
+    from .intrinsic_result_layouts import intrinsic_result_fields
+    from .process_graph_facts import operands as projection_operands
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    has_named_projection = any(
+        str(graph.G.nodes[successor].get("op") or "").casefold() == "getattr"
+        for successor in graph.G.successors(int(node_id))
+    )
+    named_fields, named_proof = (
+        intrinsic_result_fields(graph, int(node_id))
+        if has_named_projection else ((), ())
+    )
+    named_slots = {str(name): (index, cell)
+                   for index, (name, cell) in enumerate(named_fields)}
+
     def collect(path, value_id):
         for successor in graph.G.successors(int(value_id)):
             data = graph.G.nodes[int(successor)]
-            if str(data.get("op", "")).lower() != "indexed":
+            operation = str(data.get("op", "")).lower()
+            if operation == "getattr" and int(value_id) == int(node_id):
+                # topk(...).indices already names one member of its authored
+                # NamedTuple result. Requiring an Indexed node lost that slot
+                # before region ownership. The admitted return declaration,
+                # not the field spelling alone, owns its position.
+                name = str((data.get("attributes") or {}).get("attribute") or "")
+                selected = named_slots.get(name)
+                if selected is None:
+                    continue
+                edges, operand_cell = projection_operands(graph, int(successor))
+                receiver = node_identity_cell(graph, int(value_id))
+                if edges != ((receiver, "value"),):
+                    continue
+                index, field_cell = selected
+                projection_path = (*path, int(index))
+                caller_paths[projection_path] = int(successor)
+                projection_causes[int(successor)] = (
+                    *named_proof, field_cell, operand_cell,
+                )
+                collect(projection_path, int(successor))
+                continue
+            if operation != "indexed":
                 continue
             indices = tuple(int(parent) for parent, role in data.get("parents") or ()
                             if str(role) == "index")
@@ -2210,6 +2248,7 @@ def _post_call_result_projections(graph, node_id):
                 cell for cell in (
                     node_identity_cell(graph, int(node_id)),
                     node_identity_cell(graph, int(value_id)),
+                    *projection_causes.get(int(value_id), ()),
                 )
                 if cell is not None
             ))),

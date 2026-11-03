@@ -620,7 +620,65 @@ def ingest_class_declaration_by_reference(owner):
     if not isinstance(definition, ast.ClassDef):
         return None
     _stamp_reference_class_identity(owner, definition)
-    return _class_schema_from_ast(definition)
+    schema = _class_schema_from_ast(definition)
+    _post_referenced_named_tuple_layout(owner, definition, schema)
+    return schema
+
+
+def _post_referenced_named_tuple_layout(owner, definition, schema):
+    """Record the exact authored field order of a referenced NamedTuple."""
+
+    from typing import NamedTuple
+    from ...compiler.concordance_declarations import (
+        CLASS_DECLARATION, CLASS_FIELD_DECLARATION, INGESTION,
+        SOURCE_NAMED_TUPLE_LAYOUT,
+    )
+    from ...compiler.identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    bindings = _ast_definition_bindings(owner, definition)
+    bases = tuple(
+        base for base in definition.bases
+        if _resolve_ast_parent_reference(base, bindings) is NamedTuple
+    )
+    if len(bases) != 1 or not issubclass(owner, tuple):
+        return
+    declarations = tuple(
+        item for item in definition.body
+        if isinstance(item, ast.AnnAssign)
+        and isinstance(item.target, ast.Name)
+    )
+    names = tuple(item.target.id for item in declarations)
+    if not names or tuple(getattr(owner, "_fields", ())) != names:
+        return
+    book = current_identity_book()
+    class_cell = book.latest_ref(
+        CLASS_DECLARATION,
+        (schema["class_node_id"][0], schema["class_identity"]),
+    )
+    base_cell = post_source_span(definition, bases[0])
+    if class_cell is None or base_cell is None:
+        return
+    members = []
+    for item in declarations:
+        field_cell = book.latest_ref(CLASS_FIELD_DECLARATION, (
+            schema["class_node_id"][0], schema["class_identity"],
+            item.target.id,
+        ))
+        statement_cell = post_source_span(definition, item)
+        if field_cell is None or statement_cell is None:
+            return
+        members.append((item.target.id, field_cell, statement_cell))
+    book.post(
+        SOURCE_NAMED_TUPLE_LAYOUT, (class_cell,),
+        (base_cell, tuple(members)), stage=INGESTION,
+        provenance=Derived((
+            class_cell, base_cell,
+            *(cell for _, cell, _ in members),
+            *(cell for _, _, cell in members),
+        )), mode=Mode.CONCORD,
+    )
 
 
 def _source_class_field_reference(definition, attribute, bindings, seen):
@@ -1760,12 +1818,20 @@ def ingest_callable_signature_by_reference(target):
             else None,
             default,
         ))
-    return book.post(
+    signature_cell = book.post(
         SOURCE_CALLABLE_SIGNATURE, (symbol,),
         (definition_cell, tuple(chain), tuple(formal_schema)),
         stage=INGESTION, provenance=Derived(tuple(dict.fromkeys(causes))),
         mode=Mode.CONCORD,
     )
+    # Intrinsic admission retains the public wrapper chain but does not pursue
+    # the callable body. Its authored return class still belongs to that
+    # callable's declared API, through the same source declaration path used
+    # for pursued callables.
+    _source_owner_annotation_declaration_shells(
+        current, source_definition=definition,
+    )
+    return signature_cell
 
 
 def _source_enum_declaration(definition):

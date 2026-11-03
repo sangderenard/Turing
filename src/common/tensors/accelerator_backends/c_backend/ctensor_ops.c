@@ -67,7 +67,12 @@
                             best = j;
                         }
                     }
-                    int out_pos = (ctx->out_index * ctx->cell_len + i) * ctx->k + t;
+                    /* Program: topk on [[1,3,2],[4,6,5]], dim=0, k=2.
+                       The old offset interleaved rank within each lane and
+                       wrote [4,1,6,3,5,2] into row-major shape (2,3).
+                       Replacing the selected axis by k makes rank precede
+                       the trailing lane: (outer*k+rank)*after+lane. */
+                    int out_pos = (ctx->out_index * ctx->k + t) * ctx->cell_len + i;
                     if (best != -1) {
                         used[best] = 1;
                         ctx->indices[out_pos] = best;
@@ -1095,6 +1100,47 @@
         topk_dim_ctx ctx = {out, indices, k, shape[dim], after, 0, buffer};
         for_each_cell_along_dim(a, shape, ndim, dim, topk_dim_callback, &ctx);
         free(buffer);
+    }
+
+    void topk_int64_dim(
+        const int64_t* input, const int* shape, int ndim, int dim, int k,
+        int64_t* indices, int64_t* values) {
+        /* The same strict-greater, first-index tie rule as topk_double_dim.
+           Priority remains signed int64 through selection, including values
+           above 2^53. The caller normalizes dim and bounds k to shape[dim].
+           Output is row-major with the selected axis replaced by k. */
+        int outer = 1;
+        int after = 1;
+        for (int axis = 0; axis < dim; ++axis) outer *= shape[axis];
+        for (int axis = dim + 1; axis < ndim; ++axis) after *= shape[axis];
+        int axis_size = shape[dim];
+        for (int batch = 0; batch < outer; ++batch) {
+            for (int lane = 0; lane < after; ++lane) {
+                for (int rank = 0; rank < k; ++rank) {
+                    int best = -1;
+                    int64_t best_value = 0;
+                    for (int candidate = 0; candidate < axis_size; ++candidate) {
+                        int used = 0;
+                        for (int prior = 0; prior < rank; ++prior) {
+                            int previous = (batch * k + prior) * after + lane;
+                            if (indices[previous] == candidate) {
+                                used = 1;
+                                break;
+                            }
+                        }
+                        int source = (batch * axis_size + candidate) * after + lane;
+                        int64_t value = input[source];
+                        if (!used && (best < 0 || value > best_value)) {
+                            best = candidate;
+                            best_value = value;
+                        }
+                    }
+                    int destination = (batch * k + rank) * after + lane;
+                    indices[destination] = best;
+                    values[destination] = best < 0 ? 0 : best_value;
+                }
+            }
+        }
     }
 
     void log_softmax_dim(

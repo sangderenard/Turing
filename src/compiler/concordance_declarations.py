@@ -738,6 +738,13 @@ CLASS_FIELD_DECLARATION = declare_page("class_field_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
     RowField("field", K.NAME),
 ), FieldFact)
+#: The authored body order of fields in an admitted NamedTuple class.
+#: Row is its exact CLASS_DECLARATION cell; fact is (NamedTuple base span,
+#: ordered (field name, CLASS_FIELD_DECLARATION cell, AnnAssign span) members).
+#: This is a class-schema facet, not a dtype or physical return layout.
+SOURCE_NAMED_TUPLE_LAYOUT = declare_page("source_named_tuple_layout", (
+    RowField("class_declaration", K.PAGE_REF),
+), tuple)
 SOURCE_RECORD_VIEW_SCHEMA = declare_page("source_record_view_schema", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
 ), tuple)
@@ -5021,9 +5028,11 @@ TENSOR_SHAPE_ENRICHMENT = declare_page("tensor_shape_enrichment", (
     RowField("function", K.NAME), RowField("value", K.VALUE_ID),
     RowField("field", K.LABEL),
 ), tuple)
-#: ``_call_result_bindings``: the Indexed projection node of one output path
+#: ``_call_result_bindings``: the Indexed or declared named projection of one output path
 #: of a call, ``(calling function, call node, projection node)`` -> path;
-#: CONCORD, DERIVED(the call node's cell, the projection node's cell).  Node
+#: CONCORD, DERIVED(the call node's cell, the projection node's cell). Named
+#: intrinsic members additionally cite their admitted return class/layout,
+#: selected field and exact projection operand snapshot. Node
 #: ids are local to one function's graph, so the calling function is part of
 #: the row: two functions' calls of one callee share node ids and differ in
 #: what each projection reads.

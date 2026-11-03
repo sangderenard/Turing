@@ -1,6 +1,8 @@
 #ifndef TURING_CTENSOR_OPS_H
 #define TURING_CTENSOR_OPS_H
 
+#include <stdint.h>
+
 /*
  * Canonical primitive vocabulary for the C lowering target.
  * CFFI reads these values from the compiled library; Python does not maintain
@@ -229,6 +231,9 @@ void cast_int64_to_double_values(
     const int64_t* input, double* output, int n);
 void create_arange_int64(
     int64_t start, int64_t step, int n, int64_t* output);
+void topk_int64_dim(
+    const int64_t* input, const int* shape, int ndim, int dim, int k,
+    int64_t* indices, int64_t* values);
 
 int ctensor_execute_primitive_program(
     const CTensorPrimitiveInstruction* instructions,

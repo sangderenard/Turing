@@ -53,6 +53,7 @@ PRECOMPILE_INTERNAL_OPERATORS = frozenset({
 })
 
 # Explicit output-buffer positions in the authored low-level SSA signatures.
+# Multi-result kernels carry ordered (name, argument position) pairs.
 # Scalar-returning helpers (binary_value, sum_double, count_true_double) carry
 # a repository-SSA ``return_value`` instead and therefore do not appear here.
 C_SSA_OUTPUT_ARGUMENTS = {
@@ -96,6 +97,7 @@ C_SSA_OUTPUT_ARGUMENTS = {
     "cast_double_to_bool_values": 1,
     "create_arange": 3,
     "create_arange_int64": 3,
+    "topk_int64_dim": (("values", 6), ("indices", 5)),
 }
 
 # LLVM opaque pointers erase pointee types.  Repository SSA and its Fortran
@@ -122,6 +124,7 @@ C_SSA_I32_POINTER_ARGUMENTS = {
     "broadcast_int64": (2, 4),
     "stack_double": (2,),
     "cat_double": (1, 3),
+    "topk_int64_dim": (1,),
 }
 
 C_SSA_I64_POINTER_ARGUMENTS = {
@@ -135,6 +138,7 @@ C_SSA_I64_POINTER_ARGUMENTS = {
     "scatter_mean_double": (5,),
     "scatter_max_double": (5,),
     "scatter_min_double": (5,),
+    "topk_int64_dim": (0, 5, 6),
 }
 
 # Opaque LLVM ``ptr`` does not state whether one address names tensor values
@@ -277,6 +281,7 @@ _C_FUNCTION_ROLES = {
     "create_arange_int64": "tensor_kernel",
     "topk_double": "tensor_kernel",
     "topk_double_dim": "tensor_kernel",
+    "topk_int64_dim": "tensor_kernel",
     "log_softmax_dim": "tensor_kernel",
     "for_each_cell_along_dim": "traversal_helper",
     "stack_double": "tensor_kernel",
@@ -2261,6 +2266,138 @@ exit:
   ret void
 }
 
+define internal void @topk_int64_dim(
+    ptr %input, ptr %shape, i32 %ndim, i32 %dim, i32 %k,
+    ptr %indices, ptr %values) {
+entry:
+  br label %outer.header
+
+outer.header:
+  %outer.axis = phi i32 [ 0, %entry ], [ %outer.axis.next, %outer.body ]
+  %outer.product = phi i32 [ 1, %entry ], [ %outer.product.next, %outer.body ]
+  %outer.more = icmp slt i32 %outer.axis, %dim
+  br i1 %outer.more, label %outer.body, label %after.entry
+
+outer.body:
+  %outer.axis64 = sext i32 %outer.axis to i64
+  %outer.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %outer.axis64
+  %outer.extent = load i32, ptr %outer.shape.ptr, align 4
+  %outer.product.next = mul i32 %outer.product, %outer.extent
+  %outer.axis.next = add i32 %outer.axis, 1
+  br label %outer.header
+
+after.entry:
+  %after.first = add i32 %dim, 1
+  br label %after.header
+
+after.header:
+  %after.axis = phi i32 [ %after.first, %after.entry ], [ %after.axis.next, %after.body ]
+  %after.product = phi i32 [ 1, %after.entry ], [ %after.product.next, %after.body ]
+  %after.more = icmp slt i32 %after.axis, %ndim
+  br i1 %after.more, label %after.body, label %axis.load
+
+after.body:
+  %after.axis64 = sext i32 %after.axis to i64
+  %after.shape.ptr = getelementptr inbounds i32, ptr %shape, i64 %after.axis64
+  %after.extent = load i32, ptr %after.shape.ptr, align 4
+  %after.product.next = mul i32 %after.product, %after.extent
+  %after.axis.next = add i32 %after.axis, 1
+  br label %after.header
+
+axis.load:
+  %dim64 = sext i32 %dim to i64
+  %axis.ptr = getelementptr inbounds i32, ptr %shape, i64 %dim64
+  %axis.size = load i32, ptr %axis.ptr, align 4
+  br label %batch.header
+
+batch.header:
+  %batch = phi i32 [ 0, %axis.load ], [ %batch.next, %lane.done ]
+  %batch.more = icmp slt i32 %batch, %outer.product
+  br i1 %batch.more, label %lane.header, label %exit
+
+lane.header:
+  %lane = phi i32 [ 0, %batch.header ], [ %lane.next, %rank.done ]
+  %lane.more = icmp slt i32 %lane, %after.product
+  br i1 %lane.more, label %rank.header, label %lane.done
+
+rank.header:
+  %rank = phi i32 [ 0, %lane.header ], [ %rank.next, %rank.store ]
+  %rank.more = icmp slt i32 %rank, %k
+  br i1 %rank.more, label %candidate.header, label %rank.done
+
+candidate.header:
+  %candidate = phi i32 [ 0, %rank.header ], [ %candidate.next, %candidate.check ]
+  %best = phi i32 [ -1, %rank.header ], [ %best.next, %candidate.check ]
+  %best.value = phi i64 [ 0, %rank.header ], [ %best.value.next, %candidate.check ]
+  %candidate.more = icmp slt i32 %candidate, %axis.size
+  br i1 %candidate.more, label %prior.header, label %rank.store
+
+prior.header:
+  %prior = phi i32 [ 0, %candidate.header ], [ %prior.next, %prior.body ]
+  %used = phi i1 [ false, %candidate.header ], [ %used.next, %prior.body ]
+  %prior.more = icmp slt i32 %prior, %rank
+  br i1 %prior.more, label %prior.body, label %candidate.check
+
+prior.body:
+  %previous.batch.rank = mul i32 %batch, %k
+  %previous.axis = add i32 %previous.batch.rank, %prior
+  %previous.base = mul i32 %previous.axis, %after.product
+  %previous.offset = add i32 %previous.base, %lane
+  %previous.offset64 = sext i32 %previous.offset to i64
+  %previous.ptr = getelementptr inbounds i64, ptr %indices, i64 %previous.offset64
+  %previous.index = load i64, ptr %previous.ptr, align 8
+  %candidate64 = sext i32 %candidate to i64
+  %previous.matches = icmp eq i64 %previous.index, %candidate64
+  %used.next = or i1 %used, %previous.matches
+  %prior.next = add i32 %prior, 1
+  br label %prior.header
+
+candidate.check:
+  %source.batch.axis = mul i32 %batch, %axis.size
+  %source.axis = add i32 %source.batch.axis, %candidate
+  %source.base = mul i32 %source.axis, %after.product
+  %source.offset = add i32 %source.base, %lane
+  %source.offset64 = sext i32 %source.offset to i64
+  %source.ptr = getelementptr inbounds i64, ptr %input, i64 %source.offset64
+  %candidate.value = load i64, ptr %source.ptr, align 8
+  %best.missing = icmp slt i32 %best, 0
+  %greater = icmp sgt i64 %candidate.value, %best.value
+  %improves = or i1 %best.missing, %greater
+  %available = xor i1 %used, true
+  %choose = and i1 %available, %improves
+  %best.next = select i1 %choose, i32 %candidate, i32 %best
+  %best.value.next = select i1 %choose, i64 %candidate.value, i64 %best.value
+  %candidate.next = add i32 %candidate, 1
+  br label %candidate.header
+
+rank.store:
+  %destination.batch.rank = mul i32 %batch, %k
+  %destination.axis = add i32 %destination.batch.rank, %rank
+  %destination.base = mul i32 %destination.axis, %after.product
+  %destination.offset = add i32 %destination.base, %lane
+  %destination.offset64 = sext i32 %destination.offset to i64
+  %indices.ptr = getelementptr inbounds i64, ptr %indices, i64 %destination.offset64
+  %values.ptr = getelementptr inbounds i64, ptr %values, i64 %destination.offset64
+  %best64 = sext i32 %best to i64
+  %value.present = icmp sge i32 %best, 0
+  %stored.value = select i1 %value.present, i64 %best.value, i64 0
+  store i64 %best64, ptr %indices.ptr, align 8
+  store i64 %stored.value, ptr %values.ptr, align 8
+  %rank.next = add i32 %rank, 1
+  br label %rank.header
+
+rank.done:
+  %lane.next = add i32 %lane, 1
+  br label %lane.header
+
+lane.done:
+  %batch.next = add i32 %batch, 1
+  br label %batch.header
+
+exit:
+  ret void
+}
+
 define internal void @matmul_double(
     ptr %a, ptr %b, ptr %out, i32 %m, i32 %n, i32 %p) {
 entry:
@@ -3356,6 +3493,12 @@ TRANSLATIONS = (
         "signed-int64 arithmetic sequence construction",
     ),
     CBackendLLVMSSA(
+        "topk_int64_dim",
+        "topk_int64_dim",
+        ("topk",),
+        "exact signed-int64 top-k values and indices along an axis",
+    ),
+    CBackendLLVMSSA(
         "matmul_double",
         "matmul_double",
         ("matmul",),
@@ -4210,11 +4353,19 @@ def c_backend_repository_ssa_reference():
     )
     if not imported.complete:
         raise ValueError(imported.shortfall_report())
-    for symbol, output_index in C_SSA_OUTPUT_ARGUMENTS.items():
+    for symbol, output_specification in C_SSA_OUTPUT_ARGUMENTS.items():
         function = imported.module.functions[symbol]
-        output = function.args[int(output_index)]
-        function.metadata["named_outputs"] = (("out", int(output.id)),)
-        function.metadata["ssa_output_argument"] = int(output_index)
+        named_positions = (
+            (("out", int(output_specification)),)
+            if isinstance(output_specification, int)
+            else tuple(output_specification)
+        )
+        function.metadata["named_outputs"] = tuple(
+            (str(name), int(function.args[int(position)].id))
+            for name, position in named_positions
+        )
+        if isinstance(output_specification, int):
+            function.metadata["ssa_output_argument"] = int(output_specification)
     for symbol, argument_indices in C_SSA_I32_POINTER_ARGUMENTS.items():
         function = imported.module.functions[symbol]
         for argument_index in argument_indices:

@@ -1566,6 +1566,8 @@ class CorrelationTable:
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._source_parameter_default_findings(module))
         found.extend(self._source_callable_signature_findings(module))
+        found.extend(self._source_named_tuple_layout_findings(module))
+        found.extend(self._named_intrinsic_result_projection_findings(module))
         found.extend(self._source_intrinsic_admission_findings(module))
         found.extend(self._source_call_parameter_default_findings(module))
         found.extend(self._numerical_constructor_default_findings(module))
@@ -6582,6 +6584,211 @@ class CorrelationTable:
                     "source-callable-signature", str(row), None,
                     "intrinsic signature lacks exact public symbol, authored "
                     "definition, wrapper digest, or formal/default causes",
+                ))
+        return found
+
+    @staticmethod
+    def _source_named_tuple_layout_findings(module: Any) -> list[Finding]:
+        """Check a referenced NamedTuple's ordered authored field cells."""
+
+        from .concordance_declarations import (
+            CLASS_DECLARATION, CLASS_FIELD_DECLARATION,
+            SOURCE_NAMED_TUPLE_LAYOUT, SOURCE_SPAN,
+        )
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(SOURCE_NAMED_TUPLE_LAYOUT)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_NAMED_TUPLE_LAYOUT, row)
+            fact = page.latest(row)
+            valid = (
+                isinstance(row, tuple) and len(row) == 1
+                and isinstance(row[0], Ref)
+                and row[0].page == CLASS_DECLARATION
+                and isinstance(fact, tuple) and len(fact) == 2
+                and isinstance(fact[0], Ref)
+                and fact[0].page == SOURCE_SPAN
+                and isinstance(fact[1], tuple) and bool(fact[1])
+                and cell is not None
+            )
+            if valid:
+                class_cell = row[0]
+                base, members = fact
+                direct = {source for source, _ in book.edges_into(cell)}
+                class_scope = class_cell.row
+                valid = (
+                    class_cell in direct and base in direct
+                    and base.row[:2] == class_scope
+                    and len(base.row[2]) == 1
+                    and base.row[2][0][0] == "bases"
+                    and book.page(SOURCE_SPAN).cell(
+                        base.row, base.column,
+                    ).kind in {"Name", "Attribute"}
+                )
+            if valid:
+                positions = []
+                names = set()
+                for member in members:
+                    if not (
+                        isinstance(member, tuple) and len(member) == 3
+                        and isinstance(member[0], str)
+                        and isinstance(member[1], Ref)
+                        and member[1].page == CLASS_FIELD_DECLARATION
+                        and isinstance(member[2], Ref)
+                        and member[2].page == SOURCE_SPAN
+                    ):
+                        valid = False
+                        break
+                    name, field, statement = member
+                    path = statement.row[2]
+                    if not (
+                        name not in names
+                        and field.row == (*class_scope, name)
+                        and field in direct and statement in direct
+                        and statement in {
+                            source for source, _ in book.edges_into(field)
+                        }
+                        and statement.row[:2] == class_scope
+                        and len(path) == 1 and path[0][0] == "body"
+                        and isinstance(path[0][1], int)
+                        and book.page(SOURCE_SPAN).cell(
+                            statement.row, statement.column,
+                        ).kind == "AnnAssign"
+                    ):
+                        valid = False
+                        break
+                    names.add(name)
+                    positions.append(path[0][1])
+                valid = valid and positions == sorted(positions)
+            if not valid:
+                found.append(Finding(
+                    "source-named-tuple-layout", str(row), None,
+                    "named tuple layout lacks ordered authored class, base, "
+                    "field or statement causes",
+                ))
+        return found
+
+    @staticmethod
+    def _named_intrinsic_result_projection_findings(module: Any) -> list[Finding]:
+        """Check named call projections against the admitted class slot."""
+
+        from .concordance_declarations import (
+            CALL_RESULT_PROJECTION, CANONICAL_VALUE,
+            CLASS_DECLARATION, FUNCTION_RETURN_ANNOTATION,
+            PROCESS_GRAPH_OPERANDS, SOURCE_CALLABLE_SIGNATURE,
+            SOURCE_INTRINSIC_ADMISSION, SOURCE_NAMED_TUPLE_LAYOUT,
+        )
+        from .concorded_literals import origin_cell
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(CALL_RESULT_PROJECTION)
+        for row in page.rows():
+            cell = book.latest_ref(CALL_RESULT_PROJECTION, row)
+            if cell is None:
+                continue
+            direct = {source for source, _ in book.edges_into(cell)}
+            layouts = tuple(source for source in direct
+                            if source.page == SOURCE_NAMED_TUPLE_LAYOUT)
+            if not layouts:
+                continue
+            path = page.latest(row)
+            valid = (
+                len(layouts) == 1 and isinstance(path, tuple)
+                and len(path) == 1 and isinstance(path[0], int)
+                and not isinstance(path[0], bool)
+            )
+            if valid:
+                layout = book.page(SOURCE_NAMED_TUPLE_LAYOUT).cell(
+                    layouts[0].row, layouts[0].column,
+                )
+                members = layout[1] if isinstance(layout, tuple) and len(layout) == 2 else ()
+                valid = 0 <= path[0] < len(members)
+            if valid:
+                selected_field = members[path[0]][1]
+                operands = tuple(source for source in direct
+                                 if source.page == PROCESS_GRAPH_OPERANDS)
+                admissions = tuple(source for source in direct
+                                   if source.page == SOURCE_INTRINSIC_ADMISSION)
+                annotations = tuple(source for source in direct
+                                    if source.page == FUNCTION_RETURN_ANNOTATION)
+                signatures = tuple(source for source in direct
+                                   if source.page == SOURCE_CALLABLE_SIGNATURE)
+                canonical = tuple(source for source in direct
+                                  if source.page == CANONICAL_VALUE)
+                valid = (
+                    selected_field in direct
+                    and len(operands) == 1
+                    and len(admissions) == 1
+                    and len(annotations) == 1
+                    and len(signatures) == 1
+                    and len(canonical) >= 2
+                )
+            if valid:
+                receiver_edges = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                    operands[0].row, operands[0].column,
+                )
+                operand_causes = {
+                    source for source, _ in book.edges_into(operands[0])
+                }
+                receiver = receiver_edges[0][0] if (
+                    isinstance(receiver_edges, tuple)
+                    and len(receiver_edges) == 1
+                    and isinstance(receiver_edges[0], tuple)
+                    and len(receiver_edges[0]) == 2
+                    and receiver_edges[0][1] == "value"
+                ) else None
+                projection = tuple(
+                    source for source in operand_causes
+                    if source.page == CANONICAL_VALUE
+                    and source.row == operands[0].row
+                )
+                admission_fact = book.page(SOURCE_INTRINSIC_ADMISSION).cell(
+                    admissions[0].row, admissions[0].column,
+                )
+                signature_fact = book.page(SOURCE_CALLABLE_SIGNATURE).cell(
+                    signatures[0].row, signatures[0].column,
+                )
+                annotation_causes = {
+                    source for source, _ in book.edges_into(annotations[0])
+                }
+                try:
+                    exact_origin = None if receiver is None else origin_cell(
+                        book, receiver,
+                    )
+                except ValueError:
+                    exact_origin = None
+                valid = (
+                    receiver in canonical
+                    and receiver in operand_causes
+                    and len(projection) == 1
+                    and projection[0] in direct
+                    and receiver.row[:-1] == projection[0].row[:-1]
+                    and projection[0].row == operands[0].row
+                    and row[1:] == (
+                        receiver.row[-1], projection[0].row[-1],
+                    )
+                    and isinstance(admission_fact, tuple)
+                    and len(admission_fact) == 3
+                    and admission_fact[2] == signatures[0]
+                    and admissions[0].row == (exact_origin,)
+                    and isinstance(signature_fact, tuple)
+                    and bool(signature_fact)
+                    and isinstance(signature_fact[0], Ref)
+                    and signature_fact[0].row[:2] == annotations[0].row
+                    and layouts[0].row[0].page == CLASS_DECLARATION
+                    and layouts[0].row[0] in annotation_causes
+                )
+            if not valid:
+                found.append(Finding(
+                    "named-intrinsic-result-projection", str(row), None,
+                    "named projection lacks the declared slot, exact call "
+                    "receiver, projection operand or admission causes",
                 ))
         return found
 
