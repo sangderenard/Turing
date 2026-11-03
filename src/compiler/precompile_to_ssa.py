@@ -13450,13 +13450,47 @@ class _ControlSSABuilder(TiledObject):
             if self.value_name_histories.get(name, ())
             and int(self.value_name_histories[name][0]) == int(value_id)
         ), None)
+        _owner_kind = (
+            None if parameter_owner is None or self.lexical_read_scope is None
+            else self._book().latest_ref(
+                PARAMETER_ABI_KIND,
+                (tuple(self.lexical_read_scope), str(parameter_owner)),
+            )
+        )
+        _owner_fact = (
+            None if _owner_kind is None else self._book().page(
+                PARAMETER_ABI_KIND
+            ).cell(_owner_kind.row, _owner_kind.column)
+        )
+        _data_cell = self._book().latest_ref(
+            SSA_VALUE, (self._scope(), int(data.id)),
+        )
+        _data_fact = (
+            None if _data_cell is None else self._book().page(
+                SSA_VALUE
+            ).cell(_data_cell.row, _data_cell.column)
+        )
+        # _octets' bytes input is already an authored rank-one int64 span.
+        # list(data) borrows that exact data cell, even before a sequence
+        # row writer knows its element layout. The posted parameter kind and
+        # physical SSA row prove this native arena; a provisional text-key
+        # sequence has neither span proof and keeps the old refusal.
+        _proved_span_owner = (
+            _owner_fact is ParameterAbiKind.SPAN
+            and getattr(_data_fact, "storage", None) == "span"
+            and int(getattr(_data_fact, "rank", 0) or 0) >= 1
+            and getattr(_data_fact, "physical_dtype", None)
+                not in {None, "", "unknown"}
+        )
         # The parameter identity alone is NOT a native arena declaration.
         # A text-key formal also gets a provisional unknown sequence view;
         # promoting that view redirected keyed tensor payloads to its scalar
-        # key storage. Require the explicit row-layout contract supplied to
-        # this descriptor constructor, not its provisional inferred dtype.
-        if parameter_owner is not None and column_dtypes and all(
-            dtype not in {None, "", "unknown"} for dtype in column_dtypes
+        # key storage. Require either an explicit row-layout contract or the
+        # posted physical span of the exact authored parameter.
+        if parameter_owner is not None and (
+            (column_dtypes and all(
+                dtype not in {None, "", "unknown"} for dtype in column_dtypes
+            )) or _proved_span_owner
         ):
             members = (
                 *self.sequence_storage_values[value_id],
@@ -13483,13 +13517,6 @@ class _ControlSSABuilder(TiledObject):
             # from the sequence contract cell, the owner's
             # ``parameter_abi_kind`` cell and the member's own row, and the
             # accounting is set FROM the posted fact.
-            _owner_kind = (
-                None if self.lexical_read_scope is None
-                else self._book().latest_ref(
-                    PARAMETER_ABI_KIND,
-                    (tuple(self.lexical_read_scope), str(parameter_owner)),
-                )
-            )
             for member in members:
                 span = int(member.id) in arena_ids or bool(member.shape)
                 _storage = "span" if span else "scalar"
@@ -13523,6 +13550,7 @@ class _ControlSSABuilder(TiledObject):
                 _member_cell = self._revise_value(
                     member,
                     self._sequence_contract_cell(value_id), _owner_kind,
+                    _data_cell,
                     stage=self._stage(),
                     physical={
                         "storage": _storage,

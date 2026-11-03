@@ -278,7 +278,21 @@ def require_physical_layout(scope: Any, value_id: int, *, book: Any = None):
             if isinstance(abi, ValueTypeABIFact) else ())
     views = {(arm.storage, arm.dtype, tuple(arm.shape), arm.rank)
              for arm in arms}
-    if views != {("span", fact.physical_dtype, tuple(fact.shape), fact.rank)}:
+    # _octets' authored bytes span has one unknown extent. VALUE_TYPE_ABI
+    # encodes it as (-1,), while the SSA formal retains no static shape and
+    # posts rank=1. The dynamic ABI cell proves these are the same physical
+    # span; no partial or conflicting shape is admitted by this equivalence.
+    dynamic_unknown_extent = (
+        len(arms) == 1
+        and arms[0].metadata_state == "dynamic"
+        and arms[0].storage == "span"
+        and arms[0].dtype == fact.physical_dtype
+        and arms[0].rank == fact.rank
+        and tuple(arms[0].shape) == (-1,) * fact.rank
+        and tuple(fact.shape) == ()
+    )
+    if (views != {("span", fact.physical_dtype, tuple(fact.shape), fact.rank)}
+            and not dynamic_unknown_extent):
         return UnresolvedSourceDemand(
             scope, value_id, "physical_layout", "span_abi_disagreement",
             subject, proof_cells=tuple(dict.fromkeys(proof)))

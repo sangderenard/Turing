@@ -214,3 +214,17 @@ The selected public top-k module audit and five focused tests were already
 green; the broad result was recorded without attribution. The preventing
 constraint is to run only the specified short audit gate for a narrow slice
 and widen it only for a concrete unresolved risk.
+
+## 2026-11-03 — wrong packet ABI in the linked `_split` fixture
+
+The agent was instructed to reproduce the actual `_read_header` to `_split`
+linked path under the original compressor contract, whose packet is an int64
+span. It initially declared that packet as a uint8 span in the scratch
+fixture. The resulting fresh plan and selected leaf/caller replay took 12.25
+seconds and reached a physical-formal refusal, but could not establish that
+the same refusal occurred under the instructed contract. A second compiler
+edit freeze and fresh int64 plan/replay took 11.45 seconds to establish the
+exact comparison, delaying validation and the freeze release. The earlier
+uint8 result remains labelled as a different-contract observation in its
+hazard receipt. The preventing constraint is to copy the measured ProgramABI
+from the original product before launching a fresh comparison fixture.

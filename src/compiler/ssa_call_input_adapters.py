@@ -16,6 +16,7 @@ from .ssa_record_return_state import (
     mint_ssa_value, ssa_value_identity_cell, identity_cells,
     posted_ssa_value_fact, revise_ssa_value,
 )
+from .frame_identity_book import _frame_owner_book, _frame_cite, _frame_value_cell
 from ..transmogrifier.ssa import Instr, SSAValue
 
 
@@ -1508,6 +1509,7 @@ def _adapt_physical_call_inputs_round(
                 if (instruction.op in {'Call', 'call'} and callee is not None
                         and len(instruction.args) == len(callee.args)):
                     for index, (actual, formal) in enumerate(zip(instruction.args, callee.args)):
+                        formal_physical_cells = ()
                         diagnostics['call_operands'] += 1
                         if (
                             defer_unsettled_region_call_results
@@ -1558,8 +1560,16 @@ def _adapt_physical_call_inputs_round(
                             # formal's target width is posted on its own SSA
                             # row from VALUE_TYPE_ABI; resident accounting is
                             # only a view of that physical contract.
+                            # A linked _read_header(packet) formal 2 has its
+                            # int64 span SSA/ABI proof in the accepted leaf's
+                            # retained book.  Read that exact owner and cite
+                            # every physical cause into this caller's book.
+                            from .ssa_record_return_state import accepted_ssa_component
+                            accepted_ssa_component(callee)
+                            formal_book, formal_digest = _frame_owner_book(callee)
                             formal_physical = require_physical_layout(
                                 function_scope_of(callee), int(formal.id),
+                                book=formal_book,
                             )
                             if not isinstance(formal_physical, PhysicalLayoutEvidence):
                                 from .identity_concordance import ConcordanceRefusal
@@ -1568,6 +1578,13 @@ def _adapt_physical_call_inputs_round(
                                     f'{callee.name} value {int(formal.id)}: '
                                     f'{formal_physical.missing}'
                                 )
+                            formal_physical_cells = tuple(dict.fromkeys(
+                                _frame_cite(formal_book, cell, formal_digest)
+                                for cell in (
+                                    formal_physical.subject_cell,
+                                    *formal_physical.proof_cells,
+                                )
+                            ))
                             target_dtype = formal_physical.physical_dtype
                         else:
                             target_dtype = (formal.accounting or {}).get('physical_dtype')
@@ -1765,7 +1782,8 @@ def _adapt_physical_call_inputs_round(
                             CONTROL_CAST,
                             (
                                 conversion_source,
-                                ssa_value_identity_cell(callee, formal.id),
+                                _frame_value_cell(callee, formal.id),
+                                *formal_physical_cells,
                             ),
                             dtype=target_dtype,
                             shape=actual.shape,
@@ -1890,8 +1908,9 @@ def _adapt_physical_call_inputs_round(
                             conversion_fact += (int(instruction.attributes['plan_callsite_id']), str(block_name))
                         conversion_cell = current_identity_book().post(CALL_INPUT_CONVERSION, row, conversion_fact,
                             stage=PHYSICAL_CALL_INPUT_ADAPTATION,
-                            provenance=Derived(identity_cells(caller, actual, converted,
-                                ssa_value_identity_cell(callee, formal.id))),
+                            provenance=Derived((*identity_cells(caller, actual, converted,
+                                _frame_value_cell(callee, formal.id)),
+                                *formal_physical_cells)),
                             mode=Mode.REVISE)
                         _publish_converted_frame_binding(call_records, caller, callee, instruction,
                                                          formal, actual, converted, conversion_cell)
@@ -1915,7 +1934,7 @@ def _adapt_physical_call_inputs_round(
                         # its physical record, DERIVED from the original's cell
                         # and the callee formal's cell.
                         temporary_id = mint_ssa_value(caller, CONTROL_CAST,
-                            (original, ssa_value_identity_cell(callee, formal.id)),
+                            (original, _frame_value_cell(callee, formal.id)),
                             dtype=backend_dtype, shape=original.shape,
                             stage=PHYSICAL_CALL_INPUT_ADAPTATION,
                             physical={'physical_dtype': backend_dtype,
@@ -2072,7 +2091,7 @@ def adapt_physical_call_inputs(
                 if owner is None:
                     continue
                 for value in values:
-                    sources.append(ssa_value_identity_cell(owner, int(value.id), book=book))
+                    sources.append(_frame_value_cell(owner, int(value.id)))
                     for declaration in (EXACT_REGION_FEED_DTYPE, EXACT_FORMAL_DTYPE):
                         sources.append(book.latest_ref(declaration, (str(owner.name), int(value.id))))
             if callee is not None:
