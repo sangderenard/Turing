@@ -2995,15 +2995,24 @@ def lower_sequence_append_slice(
     value = builder.fresh(source.column_dtypes[0])
     destination_index = builder.fresh("int64")
     destination_address = builder.fresh("ptr")
+    # Program: ``header + encoded_length + coded_commands + coded_literals``.
+    # A dynamic column's helper formal is pointer storage even when its row
+    # dtype is int64. Recreating that formal from column_dtypes gave the same
+    # value ID an int64 GetElementPtr base after reserve had passed it as ptr.
+    # Read the exact storage formal used by the helper and reserve call.
+    source_column = next(
+        item for item in source_storage
+        if int(item.id) == int(source.column_value_ids[0])
+    )
+    destination_column = next(
+        item for item in destination_storage
+        if int(item.id) == int(destination.column_value_ids[0])
+    )
     builder.emit(body, "Add", [normalized_lower, index], source_index)
-    builder.emit(body, "GetElementPtr", [SSAValue(
-        source.column_value_ids[0], dtype=source.column_dtypes[0]
-    ), source_index], source_address)
+    builder.emit(body, "GetElementPtr", [source_column, source_index], source_address)
     builder.emit(body, "Load", [source_address], value)
     builder.emit(body, "Add", [old_length, index], destination_index)
-    builder.emit(body, "GetElementPtr", [SSAValue(
-        destination.column_value_ids[0], dtype=destination.column_dtypes[0]
-    ), destination_index], destination_address)
+    builder.emit(body, "GetElementPtr", [destination_column, destination_index], destination_address)
     builder.emit(body, "Store", [value, destination_address])
     builder.branch(body, latch)
     builder.emit(latch, "Add", [index, one], next_index)

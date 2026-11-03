@@ -1089,6 +1089,16 @@ def test_dynamic_sequence_append_slice_reserves_clipped_result_before_copy():
     assert [call.attributes.get("callee") for call in calls] == [reserve.name]
     assert "append_slice_reserve" in function.blocks
     assert "capacity_exhausted" in function.blocks
+    storage_formals = {int(formal.id): formal for formal in function.args}
+    for instruction in function.blocks["append_slice_body"].instrs:
+        if instruction.op != "GetElementPtr":
+            continue
+        base = instruction.args[0]
+        if int(base.id) not in (230, 240):
+            continue
+        # The column row is int64; the dynamic column storage is a ptr.
+        assert base is storage_formals[int(base.id)]
+        assert base.dtype == "ptr"
     assert not any(
         instruction.attributes.get("failure") == "fixed_capacity_exhausted"
         for block in function.blocks.values()

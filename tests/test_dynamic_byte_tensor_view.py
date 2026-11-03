@@ -110,7 +110,7 @@ def test_public_octets_same_dtype_uses_proved_dynamic_sequence_view(tmp_path):
         data = np.asarray(list(payload), dtype=np.int64)
         execution = native.prepare_execution({
             0: data,
-            sequence.length_address_id: np.asarray([len(payload)], dtype=np.int64),
-            sequence.capacity_value_id: np.asarray(len(payload), dtype=np.int64),
         }).run()
         assert execution.buffers[0].tolist() == octet_huffman._octets(payload).tolist()
+        assert execution.buffers[sequence.length_address_id].item() == len(payload)
+        assert execution.buffers[sequence.capacity_value_id].item() == len(payload)
