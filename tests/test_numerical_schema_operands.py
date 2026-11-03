@@ -217,7 +217,8 @@ def test_record_cast_target_type_does_not_require_settled_reshape_geometry():
         ) == "int64"
 
 
-def test_dynamic_constructor_region_reads_its_settled_explicit_dtype(monkeypatch):
+@pytest.mark.parametrize("explicit_dtype", [True, False])
+def test_dynamic_constructor_region_reads_its_settled_explicit_dtype(monkeypatch, explicit_dtype):
     from src.compiler import hierarchical_plan
 
     class ObservedConstructorRegion(Exception):
@@ -232,6 +233,15 @@ def test_dynamic_constructor_region_reads_its_settled_explicit_dtype(monkeypatch
             result_id = constructors[0].outputs[0]
             assert (result_id, (), "float64") in region.value_shapes
             assert dict(constructors[0].attributes)["dtype"] == "float64"
+            if not explicit_dtype:
+                from types import SimpleNamespace
+                from src.compiler.concordance_declarations import NUMERICAL_CONSTRUCTOR_DEFAULT
+                from src.compiler.identity_concordance import CorrelationTable, current_identity_book
+
+                book = current_identity_book()
+                assert tuple(book.page(NUMERICAL_CONSTRUCTOR_DEFAULT).rows())
+                module = SimpleNamespace(metadata={"identity_book": book})
+                assert CorrelationTable._numerical_constructor_default_findings(module) == []
             raise ObservedConstructorRegion
         return original(region, **kwargs)
 
@@ -245,10 +255,11 @@ def test_dynamic_constructor_region_reads_its_settled_explicit_dtype(monkeypatch
                     "storage": "span", "dtype": "int64", "rank": 1,
                     "python_type": "src.common.tensors.abstraction.AbstractTensor"}],
     })
+    dtype_argument = ", dtype='float64'" if explicit_dtype else ""
     with pytest.raises(ObservedConstructorRegion):
         lower_ast_source_to_ssa(
             "def root(like, count: int):\n"
-            "    return AbstractTensor.zeros((count + 1,), cls=type(like), dtype='float64')\n",
+            f"    return AbstractTensor.zeros((count + 1,), cls=type(like){dtype_argument})\n",
             "root", python_bindings={"AbstractTensor": AbstractTensor},
             name="explicit_constructor_type_record", extraction_contract=policy,
             progress=lambda _: None, progress_bars=False,

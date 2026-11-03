@@ -6369,6 +6369,20 @@ def _build_shell_hierarchy_plan(
             operation = str(
                 node_data.get("op") or node_data.get("type") or ""
             )
+            if operation.casefold() in {"zeros", "ones", "empty", "full"}:
+                from .numerical_constructor_defaults import constructor_default_dtype
+
+                default_dtype, default_cells = constructor_default_dtype(graph, int(node_id))
+                if default_dtype is not None:
+                    # compact_codewords' omitted-dtype zeros had runtime
+                    # geometry and no region dtype. The admitted canonical
+                    # implementation declares its physical output type; use
+                    # that exact receipt, independently of shape settlement.
+                    _post_region_value_obligation(graph, int(node_id))
+                    _settle_region_value_obligation(
+                        graph, int(node_id), default_dtype, default_cells,
+                    )
+                    numerical_dtype_metadata[int(node_id)] = default_dtype
             expanded: list[tuple[int, str]] = []
             for parent, role in node_data.get("parents") or ():
                 parent = int(parent)
@@ -26529,6 +26543,10 @@ def _tensor_descriptor(
                     )))
             if answer is not None:
                 source_cells: tuple = ()
+                if operation.casefold() in {"zeros", "ones", "empty", "full"}:
+                    from .numerical_constructor_defaults import constructor_default_dtype
+
+                    _default_dtype, source_cells = constructor_default_dtype(graph, int(node_id))
                 loop_owner = _arithmetic_loop_target_owner(graph, int(node_id))
                 if not semantic_sources and loop_owner is not None:
                     # A ``range`` target is the loop's own product: the edge
@@ -26577,7 +26595,7 @@ def _tensor_descriptor(
                     # this result across lexical forks. A transformation owns
                     # its exact output identity as well as its input causes.
                     edge_source_cells = tuple(dict.fromkeys((
-                        *(source_cells or tuple(operand_cells)),
+                        *source_cells, *operand_cells,
                         _descriptor_source_cell(graph, int(node_id)),
                     )))
                     record_shape_transformation(
@@ -28819,6 +28837,18 @@ def _tensor_descriptor_rule(
                 **({} if static_shape else {"metadata_state": "dynamic"}),
             }
         if operation in {"zeros", "ones", "empty", "full"}:
+            from .numerical_constructor_defaults import constructor_default_dtype
+
+            named_dtype = next((
+                named
+                for parent, role in data.get("parents") or ()
+                if str(role).casefold() == "kw:dtype"
+                and int(parent) in graph.G
+                for named in (_dtype_argument_name(graph, int(parent), seen),)
+                if named is not None
+            ), None)
+            native_dtype, _native_cells = constructor_default_dtype(graph, int(node_id))
+            constructor_dtype = named_dtype or native_dtype
             shape_source = next((
                 int(parent)
                 for parent, role in data.get("parents") or ()
@@ -28846,7 +28876,7 @@ def _tensor_descriptor_rule(
                 if extents is not None and all(extent >= 0 for extent in extents):
                     return {
                         "shape": extents,
-                        "dtype": "float64",
+                        "dtype": constructor_dtype or "float64",
                         "rank": len(extents),
                     }
                 shape_expression = graph.G.nodes[shape_source].get("expr_obj")
@@ -28865,21 +28895,19 @@ def _tensor_descriptor_rule(
                     # authored aggregate fixes the constructor rank.  The
                     # repository compressor's ``_zeros`` relies on exactly
                     # this contract before its explicit ``to_dtype('int64')``
-                    # supplies element type.  Losing the rank here made the
-                    # call return ``AbstractTensor[Any]`` and left the
-                    # conditional token union unresolved.  Do not invent the
-                    # backend's default dtype: the constructor states rank;
-                    # the following cast is the dtype writer.
+                    # supplies element type. A proved canonical native
+                    # default may also state physical dtype; geometry remains
+                    # dynamic. With neither proof the type remains unknown.
                     return {
                         "shape": (),
-                        "dtype": "unknown",
+                        "dtype": constructor_dtype or "unknown",
                         "rank": len(shape_expression.elts),
                         "metadata_state": "dynamic",
                     }
                 if shape_members:
                     return {
                         "shape": (),
-                        "dtype": "unknown",
+                        "dtype": constructor_dtype or "unknown",
                         "rank": len(shape_members),
                         "metadata_state": "dynamic",
                     }

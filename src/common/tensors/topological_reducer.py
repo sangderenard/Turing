@@ -9694,6 +9694,73 @@ def _normalize_lexical_values(
             reference.occurrence, node_id, reference.path,
         )
 
+    def post_intrinsic_parameter_defaults(
+        expression: ast.Call, node_id: int, reference: _StaticPythonReference,
+    ) -> None:
+        """Bind omitted intrinsic parameters through their admitted signature."""
+
+        from ...compiler.concordance_declarations import (
+            SOURCE_CALLABLE_SIGNATURE, SOURCE_CALL_PARAMETER_DEFAULT,
+            SOURCE_ACTIVITY_CALL, STATIC_REFERENCE_USE,
+        )
+        from ...compiler.process_graph_facts import operands
+
+        signature = getattr(expression, "_intrinsic_signature_cell", None)
+        if signature is None:
+            return
+        # An expanded argument can fill any remaining formal. Source activity
+        # counts alone do not prove omission for f(*args) or f(**kwargs).
+        if any(isinstance(argument, ast.Starred) for argument in expression.args):
+            return
+        if any(keyword.arg is None for keyword in expression.keywords):
+            return
+        book = current_identity_book()
+        definition, _wrappers, formals = book.page(SOURCE_CALLABLE_SIGNATURE).cell(
+            signature.row, signature.column,
+        )
+        call_span = _post_source_span(expression)
+        callee_span = _post_source_span(expression.func)
+        activity = book.latest_ref(SOURCE_ACTIVITY_CALL, (value_class_scope, call_span))
+        if activity is None:
+            raise ValueError("intrinsic default has no authored call argument inventory")
+        positional_count, keywords = book.page(SOURCE_ACTIVITY_CALL).cell(
+            activity.row, activity.column,
+        )
+        reference_id = static_reference_node(reference)
+        reference_use = book.latest_ref(STATIC_REFERENCE_USE, (
+            ingestion_read_scope, int(id(reference.occurrence)), int(reference_id),
+        ))
+        symbol = signature.row[0]
+        if reference_use is None or symbol not in {
+            source for source, _stage in book.edges_into(reference_use)
+        }:
+            raise ValueError("intrinsic signature has no exact static callable use")
+        _edges, edge_cell = operands(graph, int(node_id))
+        call_cell = node_identity_cell(graph, int(node_id))
+        attributes = graph.G.nodes[node_id].setdefault("attributes", {})
+        attributes["source_signature_cell"] = signature
+        defaults = attributes.setdefault("source_parameter_default_cells", {})
+        for name, kind, position, default in formals:
+            if default is None:
+                continue
+            if position is not None and int(position) < int(positional_count):
+                continue
+            if kind != "POSITIONAL_ONLY" and name in keywords:
+                continue
+            # compact_codewords' zeros((capacity+1,), cls=type(bits)) is an
+            # intrinsic, so ordinary callee specialization never saw dtype's
+            # authored None. Bind that omission from the complete source call
+            # inventory and exact public callable, retaining the default cell.
+            receipt = book.post(
+                SOURCE_CALL_PARAMETER_DEFAULT, (call_cell, str(name)),
+                (default, signature), stage=_REDUCTION,
+                provenance=_Derived(tuple(dict.fromkeys((
+                    call_cell, call_span, callee_span, activity, edge_cell,
+                    reference_use, symbol, signature, definition, default,
+                )))), mode=_Mode.CONCORD,
+            )
+            defaults[str(name)] = receipt
+
     def first_class_function_node(
         name: str, reference: Any, *, occurrence: Any = None,
     ) -> int:
@@ -13078,6 +13145,8 @@ def _normalize_lexical_values(
                     graph, node_id, tuple(resolved_inputs),
                     fork_from=receiver_fork or None,
                 )
+                if isinstance(callee, _StaticPythonReference):
+                    post_intrinsic_parameter_defaults(expression, node_id, callee)
                 if (
                     isinstance(expression.func, ast.Attribute)
                     and expression.func.attr == "strip"

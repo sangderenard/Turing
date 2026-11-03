@@ -1642,6 +1642,132 @@ def post_source_parameter_defaults(function):
         )
 
 
+def ingest_callable_signature_by_reference(target):
+    """Ingest an intrinsic's authored signature without pursuing its body.
+
+    The public function can be wrapped.  Its static symbol names the public
+    callable, while the source AST belongs to the final ``__wrapped__``
+    function.  Record every direct wrapper link by its declared identity and
+    code digest so one equal module/qualname never substitutes for another.
+    """
+
+    if not inspect.isfunction(target):
+        return None
+    from ...common.tensors.topological_reducer import (
+        _static_symbol_definition_cell,
+    )
+    from ...compiler.concordance_declarations import (
+        INGESTION, SOURCE_CALLABLE_SIGNATURE, SOURCE_PARAMETER_DEFAULT,
+        STATIC_SYMBOL_DEFINITION, SpecializationFact,
+        SpecializationSource,
+    )
+    from ...compiler.identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+
+    chain = []
+    seen = set()
+    current = target
+    while True:
+        if not inspect.isfunction(current) or id(current) in seen:
+            return None
+        seen.add(id(current))
+        code = getattr(current, "__code__", None)
+        if not isinstance(code, types.CodeType):
+            return None
+        digest = hashlib.sha256(
+            code.co_code + repr(tuple(code.co_names)).encode("utf-8")
+        ).hexdigest()
+        chain.append((
+            str(getattr(current, "__module__", "")),
+            str(getattr(current, "__qualname__", "")), digest,
+        ))
+        wrapped = getattr(current, "__wrapped__", None)
+        if wrapped is None:
+            break
+        current = wrapped
+
+    symbol = _static_symbol_definition_cell(target)
+    if symbol is None or symbol.page != STATIC_SYMBOL_DEFINITION:
+        return None
+    book = current_identity_book()
+    symbol_fact = book.page(STATIC_SYMBOL_DEFINITION).cell(
+        symbol.row, symbol.column,
+    )
+    if symbol_fact.digest != chain[0][2]:
+        return None
+    definition = _source_ast_definition(current)
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    definition._turing_source_module = chain[-1][0]
+    definition._turing_source_qualname = chain[-1][1]
+    _annotate_visual_source_owners(definition, module_name=chain[-1][0])
+    definition_cell = post_source_span(definition, definition)
+    if definition_cell is None or definition_cell.row[:2] != chain[-1][:2]:
+        return None
+    post_source_parameter_defaults(definition)
+
+    arguments = [
+        *((argument, "POSITIONAL_ONLY")
+          for argument in definition.args.posonlyargs),
+        *((argument, "POSITIONAL_OR_KEYWORD")
+          for argument in definition.args.args),
+    ]
+    if definition.args.vararg is not None:
+        arguments.append((definition.args.vararg, "VAR_POSITIONAL"))
+    arguments.extend(
+        (argument, "KEYWORD_ONLY")
+        for argument in definition.args.kwonlyargs
+    )
+    if definition.args.kwarg is not None:
+        arguments.append((definition.args.kwarg, "VAR_KEYWORD"))
+    try:
+        public_parameters = tuple(inspect.signature(target).parameters.values())
+    except (TypeError, ValueError):
+        return None
+    if len(public_parameters) != len(arguments):
+        return None
+    default_scope = tuple(definition_cell.row[:2])
+    formal_schema = []
+    causes = [symbol, definition_cell]
+    for index, ((argument, kind), public) in enumerate(
+        zip(arguments, public_parameters, strict=True)
+    ):
+        if (public.name != argument.arg or public.kind.name != kind):
+            return None
+        argument_cell = post_source_span(definition, argument)
+        if argument_cell is None:
+            return None
+        causes.append(argument_cell)
+        default = book.latest_ref(
+            SOURCE_PARAMETER_DEFAULT, (default_scope, str(argument.arg)),
+        )
+        if public.default is not inspect.Parameter.empty and default is None:
+            return None
+        if default is not None:
+            if public.default is inspect.Parameter.empty:
+                return None
+            if book.page(SOURCE_PARAMETER_DEFAULT).cell(
+                default.row, default.column,
+            ) != SpecializationFact(
+                public.default, SpecializationSource.DEFAULT,
+            ):
+                return None
+            causes.append(default)
+        formal_schema.append((
+            str(argument.arg), kind,
+            index if kind in {"POSITIONAL_ONLY", "POSITIONAL_OR_KEYWORD"}
+            else None,
+            default,
+        ))
+    return book.post(
+        SOURCE_CALLABLE_SIGNATURE, (symbol,),
+        (definition_cell, tuple(chain), tuple(formal_schema)),
+        stage=INGESTION, provenance=Derived(tuple(dict.fromkeys(causes))),
+        mode=Mode.CONCORD,
+    )
+
+
 def _source_enum_declaration(definition):
     """Return the authored Enum base and literal members, if complete.
 
@@ -3793,6 +3919,22 @@ def _expand_unresolved_ast_parents(
             # operations instead of opening their Python dispatch bodies.
             # Only the catalog's explicit compositional references are source
             # programs (for example linalg.solve).
+            # AbstractTensor.zeros reaches this boundary before the later
+            # extraction loop.  Keep its exact public wrapper and authored
+            # default signature here while the lexical callable is known.
+            if include is not None and hasattr(include, "decide"):
+                decision = include.decide(lexical_target)
+                if decision.action.value == "intrinsic":
+                    signature = ingest_callable_signature_by_reference(
+                        lexical_target,
+                    )
+                    if signature is not None:
+                        call._intrinsic_signature_cell = signature
+                        receipt = decision.receipt()
+                        call._extraction_contract = receipt
+                        call._intrinsic_admission = (
+                            str(tensor_name), receipt, signature,
+                        )
             referenced = tensor_code_references.get(str(tensor_name))
             if referenced is not None:
                 call._tensor_code_reference = str(tensor_name)
@@ -4510,6 +4652,11 @@ def _expand_unresolved_ast_parents(
             # and makes the helper's constructor/backend internals part of the
             # submitted program.
             continue
+        if (extraction_decision is not None
+                and extraction_decision.action.value == "intrinsic"):
+            signature = ingest_callable_signature_by_reference(identity_target)
+            if signature is not None:
+                node._intrinsic_signature_cell = signature
         if include is not None and not (
             extraction_decision.ingest_parent
             if extraction_decision is not None
@@ -5744,6 +5891,24 @@ class ProcessGraph(TiledObject):
             from ...compiler.concordance_declarations import SOURCE_EXTRACTION_IDENTITY
             book.post(SOURCE_EXTRACTION_IDENTITY, (identity,), extraction_identity,
                       stage=INGESTION, provenance=Derived((identity, span)), mode=Mode.CONCORD)
+        admission = getattr(node, "_intrinsic_admission", None)
+        if isinstance(node, ast.Call) and admission is not None:
+            from ...compiler.concordance_declarations import (
+                INGEST_SOURCE, SOURCE_INTRINSIC_ADMISSION,
+            )
+            from ...compiler.identity_concordance import Novel
+
+            canonical_op, decision_receipt, signature = admission
+            if (not isinstance(decision_receipt, dict)
+                    or decision_receipt.get("action") != "intrinsic"
+                    or extraction_identity != decision_receipt.get("identity")):
+                raise ValueError("intrinsic admission lost its exact source decision")
+            book.post(
+                SOURCE_INTRINSIC_ADMISSION, (identity,),
+                (canonical_op, decision_receipt, signature),
+                stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+                mode=Mode.CONCORD,
+            )
         conversion = getattr(node, "_turing_ingestion_conversion_cell", None)
         if conversion is not None:
             from ...compiler.concordance_declarations import SOURCE_EXCEPTION_NODE

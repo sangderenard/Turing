@@ -4326,6 +4326,48 @@ STATIC_REFERENCE_USE = declare_page("static_reference_use", (
     RowField("ingestion_scope", K.SCOPE), RowField("use_id", K.VALUE_ID),
     RowField("reference_id", K.VALUE_ID),
 ), StaticReferenceUseFact)             # DERIVED(use, definition, node); CONCORD
+#: An intrinsic public function's exact wrapper chain and authored signature.
+#: Row is its public STATIC_SYMBOL_DEFINITION cell, never the raw wrapped
+#: function's potentially colliding module/qualname.  Fact is
+#: (FunctionDef SOURCE_SPAN, ordered (module, qualname, code digest) chain,
+#:  ordered (parameter, inspect.Parameter.kind.name, positional index or None,
+#:  SOURCE_PARAMETER_DEFAULT cell or None) schema).  INGESTION derives from
+#: the public symbol, authored definition and all admitted default cells.
+SOURCE_CALLABLE_SIGNATURE = declare_page("source_callable_signature", (
+    RowField("public_symbol", K.PAGE_REF),
+), tuple)
+#: The accepted source-policy root for one exact tensor primitive Call.
+#: Row is its INGESTION_VALUE cell.  Fact is (canonical operator, full
+#: ExtractionDecision receipt, SOURCE_CALLABLE_SIGNATURE cell).  The authored
+#: Call's SOURCE_SPAN and SOURCE_EXTRACTION_IDENTITY are checked separately.
+SOURCE_INTRINSIC_ADMISSION = declare_page("source_intrinsic_admission", (
+    RowField("source_call", K.PAGE_REF),
+), tuple)
+#: A source call's proved omitted argument to an intrinsic.  The writer joins
+#: SOURCE_CALLABLE_SIGNATURE, SOURCE_PARAMETER_DEFAULT, the authored Call
+#: occurrence and complete activity/operand inventories; no backend value is
+#: inferred from the default.  Fact is (default cell, signature cell).
+SOURCE_CALL_PARAMETER_DEFAULT = declare_page("source_call_parameter_default", (
+    RowField("call", K.PAGE_REF), RowField("parameter", K.NAME),
+), tuple)
+#: The canonical tensor code reference's explicit operation-to-entrypoint
+#: declaration.  It is an INGEST_SOURCE root distinct from the imported
+#: kernel text: canonical operation membership is declared by the reference.
+#: Fact is the ordered tuple of entrypoint names declared by the reference.
+NUMERICAL_CONSTRUCTOR_CODE_REFERENCE = declare_page(
+    "numerical_constructor_code_reference", (
+        RowField("code_source", K.NAME), RowField("operation", K.NAME),
+    ), tuple,
+)
+#: One source constructor Call with omitted semantic dtype whose canonical
+#: native implementation stores a physical scalar type into its named output.
+#: Fact is (operation, omitted-default Ref, intrinsic-admission Ref,
+#: current PROCESS_GRAPH_OPERANDS Ref, code-reference Ref, kernel Ref,
+#: output-value Ref, stored-scalar Refs, physical dtype). The call itself is
+#: the row key and all of these exact cells are direct causes.
+NUMERICAL_CONSTRUCTOR_DEFAULT = declare_page(
+    "numerical_constructor_default", (RowField("call", K.PAGE_REF),), tuple,
+)
 #: A compiler-only reference whose object declares neither a module nor a
 #: name: there is no definition to derive from.
 STATIC_SYMBOL_UNDECLARED = declare_reason("static_symbol_undeclared")

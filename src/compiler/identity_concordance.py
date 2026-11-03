@@ -1565,6 +1565,10 @@ class CorrelationTable:
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._source_parameter_default_findings(module))
+        found.extend(self._source_callable_signature_findings(module))
+        found.extend(self._source_intrinsic_admission_findings(module))
+        found.extend(self._source_call_parameter_default_findings(module))
+        found.extend(self._numerical_constructor_default_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._numerical_schema_operand_findings(module))
         found.extend(self._numerical_dtype_operand_findings(module))
@@ -6472,6 +6476,306 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_callable_signature_findings(module: Any) -> list[Finding]:
+        """Check the public symbol, wrapper chain and authored formal causes."""
+
+        from .concordance_declarations import (
+            SOURCE_CALLABLE_SIGNATURE, SOURCE_PARAMETER_DEFAULT, SOURCE_SPAN,
+            STATIC_SYMBOL_DEFINITION, SpecializationFact,
+            SpecializationSource,
+        )
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(SOURCE_CALLABLE_SIGNATURE)
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_CALLABLE_SIGNATURE, row)
+            fact = page.latest(row)
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            valid = (
+                isinstance(row, tuple) and len(row) == 1
+                and isinstance(row[0], Ref)
+                and row[0].page == STATIC_SYMBOL_DEFINITION
+                and isinstance(fact, tuple) and len(fact) == 3
+                and row[0] in sources
+            )
+            if valid:
+                definition, chain, formals = fact
+                valid = (
+                    isinstance(definition, Ref)
+                    and definition.page == SOURCE_SPAN
+                    and definition in sources
+                    and book.page(SOURCE_SPAN).cell(
+                        definition.row, definition.column,
+                    ).kind in {"FunctionDef", "AsyncFunctionDef"}
+                    and isinstance(chain, tuple) and bool(chain)
+                    and all(isinstance(link, tuple) and len(link) == 3
+                            and all(isinstance(item, str) and item
+                                    for item in link)
+                            for link in chain)
+                    and isinstance(formals, tuple)
+                )
+            if valid:
+                symbol_fact = book.page(STATIC_SYMBOL_DEFINITION).cell(
+                    row[0].row, row[0].column,
+                )
+                valid = (
+                    chain[0][:2] == row[0].row[:2]
+                    and chain[0][2] == symbol_fact.digest
+                    and chain[-1][:2] == definition.row[:2]
+                )
+            if valid:
+                names = set()
+                positional = 0
+                default_scope = definition.row[:2]
+                for formal in formals:
+                    if not (isinstance(formal, tuple) and len(formal) == 4):
+                        valid = False
+                        break
+                    name, kind, index, default = formal
+                    if not isinstance(name, str) or not name or name in names:
+                        valid = False
+                        break
+                    names.add(name)
+                    if kind in {"POSITIONAL_ONLY", "POSITIONAL_OR_KEYWORD"}:
+                        if index != positional:
+                            valid = False
+                            break
+                        positional += 1
+                    elif kind in {"KEYWORD_ONLY", "VAR_POSITIONAL", "VAR_KEYWORD"}:
+                        if index is not None:
+                            valid = False
+                            break
+                    else:
+                        valid = False
+                        break
+                    if default is None:
+                        continue
+                    if not (
+                        isinstance(default, Ref)
+                        and default.page == SOURCE_PARAMETER_DEFAULT
+                        and default.row == (default_scope, name)
+                        and default in sources
+                        and isinstance(book.page(SOURCE_PARAMETER_DEFAULT).cell(
+                            default.row, default.column,
+                        ), SpecializationFact)
+                        and book.page(SOURCE_PARAMETER_DEFAULT).cell(
+                            default.row, default.column,
+                        ).source is SpecializationSource.DEFAULT
+                    ):
+                        valid = False
+                        break
+                argument_spans = tuple(
+                    source for source in sources
+                    if source.page == SOURCE_SPAN and source != definition
+                    and source.row[:2] == definition.row[:2]
+                    and book.page(SOURCE_SPAN).cell(
+                        source.row, source.column,
+                    ).kind == "arg"
+                )
+                valid = valid and len(argument_spans) == len(formals)
+            if not valid:
+                found.append(Finding(
+                    "source-callable-signature", str(row), None,
+                    "intrinsic signature lacks exact public symbol, authored "
+                    "definition, wrapper digest, or formal/default causes",
+                ))
+        return found
+
+    @staticmethod
+    def _source_intrinsic_admission_findings(module: Any) -> list[Finding]:
+        """Check accepted policy, exact source Call and public signature."""
+
+        from .concordance_declarations import (
+            INGESTION_VALUE, SOURCE_CALLABLE_SIGNATURE,
+            SOURCE_EXTRACTION_IDENTITY, SOURCE_INTRINSIC_ADMISSION,
+            SOURCE_SPAN, STATIC_SYMBOL_DEFINITION,
+        )
+        from ..common.tensors.operator_catalog import (
+            CANONICAL_ABSTRACT_TENSOR_OPERATORS, canonical_operator_name,
+        )
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(SOURCE_INTRINSIC_ADMISSION)
+        for row in page.rows():
+            fact = page.latest(row)
+            valid = (
+                isinstance(row, tuple) and len(row) == 1
+                and isinstance(row[0], Ref)
+                and row[0].page == INGESTION_VALUE
+                and isinstance(fact, tuple) and len(fact) == 3
+            )
+            if valid:
+                op, decision, signature = fact
+                valid = (
+                    isinstance(op, str)
+                    and op in CANONICAL_ABSTRACT_TENSOR_OPERATORS
+                    and isinstance(decision, dict)
+                    and decision.get("action") == "intrinsic"
+                    and isinstance(decision.get("identity"), str)
+                    and isinstance(decision.get("rule_id"), str)
+                    and isinstance(signature, Ref)
+                    and signature.page == SOURCE_CALLABLE_SIGNATURE
+                )
+            if valid:
+                source_call = row[0]
+                signature_fact = book.page(SOURCE_CALLABLE_SIGNATURE).cell(
+                    signature.row, signature.column,
+                )
+                symbol = signature.row[0]
+                spans = tuple(
+                    source for source, _stage in book.edges_into(source_call)
+                    if source.page == SOURCE_SPAN
+                    and book.page(SOURCE_SPAN).cell(
+                        source.row, source.column,
+                    ).kind == "Call"
+                )
+                extracted = book.latest_ref(
+                    SOURCE_EXTRACTION_IDENTITY, (source_call,),
+                )
+                valid = (
+                    len(spans) == 1
+                    and isinstance(symbol, Ref)
+                    and symbol.page == STATIC_SYMBOL_DEFINITION
+                    and isinstance(signature_fact, tuple)
+                    and len(signature_fact) == 3
+                    and signature_fact[1][0][:2] == symbol.row[:2]
+                    and decision.get("module") == symbol.row[0]
+                    and decision.get("qualname") == symbol.row[1]
+                    and decision.get("identity") == ".".join(symbol.row[:2])
+                    and canonical_operator_name(
+                        symbol.row[1].rsplit(".", 1)[-1]
+                    ) == op
+                    and extracted is not None
+                    and book.page(SOURCE_EXTRACTION_IDENTITY).cell(
+                        extracted.row, extracted.column,
+                    ) == decision["identity"]
+                    and source_call in {
+                        source for source, _stage in book.edges_into(extracted)
+                    }
+                )
+            if not valid:
+                found.append(Finding(
+                    "source-intrinsic-admission", str(row), None,
+                    "intrinsic lacks exact accepted source policy, authored "
+                    "Call, public wrapper signature or operator identity",
+                ))
+        return found
+
+    @staticmethod
+    def _source_call_parameter_default_findings(module: Any) -> list[Finding]:
+        """Check an intrinsic omitted argument against its source call."""
+
+        from .concordance_declarations import (
+            PROCESS_GRAPH_OPERANDS, SOURCE_ACTIVITY_CALL,
+            SOURCE_CALLABLE_SIGNATURE, SOURCE_CALL_PARAMETER_DEFAULT,
+            SOURCE_PARAMETER_DEFAULT, SOURCE_SPAN, STATIC_REFERENCE_USE,
+        )
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(SOURCE_CALL_PARAMETER_DEFAULT)
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_CALL_PARAMETER_DEFAULT, row)
+            fact = page.latest(row)
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            valid = (
+                isinstance(row, tuple) and len(row) == 2
+                and isinstance(row[0], Ref) and isinstance(row[1], str)
+                and isinstance(fact, tuple) and len(fact) == 2
+                and isinstance(fact[0], Ref)
+                and fact[0].page == SOURCE_PARAMETER_DEFAULT
+                and isinstance(fact[1], Ref)
+                and fact[1].page == SOURCE_CALLABLE_SIGNATURE
+                and {row[0], *fact} <= sources
+            )
+            if valid:
+                default, signature = fact
+                schema = book.page(SOURCE_CALLABLE_SIGNATURE).cell(
+                    signature.row, signature.column,
+                )[2]
+                matches = tuple(item for item in schema
+                                if item[0] == row[1] and item[3] == default)
+                valid = len(matches) == 1
+            if valid:
+                call_spans = tuple(source for source in sources
+                                   if source.page == SOURCE_SPAN
+                                   and book.page(SOURCE_SPAN).cell(
+                                       source.row, source.column,
+                                   ).kind == "Call")
+                activities = tuple(source for source in sources
+                                   if source.page == SOURCE_ACTIVITY_CALL)
+                operands = tuple(source for source in sources
+                                 if source.page == PROCESS_GRAPH_OPERANDS)
+                uses = tuple(source for source in sources
+                             if source.page == STATIC_REFERENCE_USE)
+                valid = (len(call_spans) == len(activities) == len(operands)
+                         == len(uses) == 1)
+                callee_spans = tuple(
+                    source for source in sources
+                    if source.page == SOURCE_SPAN and source not in call_spans
+                    and book.page(SOURCE_SPAN).cell(
+                        source.row, source.column,
+                    ).kind in {"Name", "Attribute"}
+                    and source.row[:2] == call_spans[0].row[:2]
+                    and source.row[2] == (*call_spans[0].row[2], ("func", -1))
+                ) if valid else ()
+                valid = valid and len(callee_spans) == 1
+            if valid:
+                call_span, activity, operand, use = (
+                    call_spans[0], activities[0], operands[0], uses[0]
+                )
+                # The exact authored Call.func is the source occurrence of
+                # this static reference. The static reference's reduction
+                # cell can sit between the use and its SOURCE_SPAN cause.
+                frontier = [use]
+                ancestry = set()
+                while frontier:
+                    current = frontier.pop()
+                    if current in ancestry:
+                        continue
+                    ancestry.add(current)
+                    frontier.extend(
+                        source for source, _stage in book.edges_into(current)
+                        if source not in ancestry
+                    )
+                activity_fact = book.page(SOURCE_ACTIVITY_CALL).cell(
+                    activity.row, activity.column,
+                )
+                name, kind, index, _default = matches[0]
+                valid = (
+                    activity.row[1] == call_span
+                    and isinstance(activity_fact, tuple)
+                    and len(activity_fact) == 2
+                    and isinstance(activity_fact[0], int)
+                    and isinstance(activity_fact[1], tuple)
+                    and (kind == "POSITIONAL_ONLY"
+                         or name not in activity_fact[1])
+                    and (index is None or index >= activity_fact[0])
+                    and row[0] in {
+                        source for source, _stage in book.edges_into(operand)
+                    }
+                    and signature.row[0] in {
+                        source for source, _stage in book.edges_into(use)
+                    }
+                    and callee_spans[0] in ancestry
+                )
+            if not valid:
+                found.append(Finding(
+                    "source-call-parameter-default", str(row), None,
+                    "intrinsic call default lacks exact signature, omitted "
+                    "argument inventory, or static callable provenance",
+                ))
+        return found
+
+    @staticmethod
     def _numerical_schema_operand_findings(module: Any) -> list[Finding]:
         """Check that a numerical ABI exclusion has an exact schema cause."""
 
@@ -6546,6 +6850,183 @@ class CorrelationTable:
                     "numerical-schema-operand", str(row), None,
                     "numerical ABI exclusion lacks its exact source schema "
                     "identity and operand edge",
+                ))
+        return found
+
+    @staticmethod
+    def _numerical_constructor_default_findings(module: Any) -> list[Finding]:
+        """Check physical constructor dtype against imported SSA output stores."""
+
+        from .concordance_declarations import (
+            NUMERICAL_CONSTRUCTOR_CODE_REFERENCE,
+            NUMERICAL_CONSTRUCTOR_DEFAULT, REPOSITORY_KERNEL_DEFINITION,
+            REPOSITORY_KERNEL_VALUE, SOURCE_CALLABLE_SIGNATURE,
+            SOURCE_CALL_PARAMETER_DEFAULT, SOURCE_INTRINSIC_ADMISSION,
+            SOURCE_PARAMETER_DEFAULT, PROCESS_GRAPH_OPERANDS,
+            SSA_VALUE, SpecializationFact, SpecializationSource,
+        )
+        from .numerical_constructor_defaults import _stored_output_values
+        from .concorded_literals import origin_cell
+        from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
+            c_backend_repository_ssa_reference,
+        )
+        from .ssa_record_return_state import function_scope_of
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        code_reference = c_backend_repository_ssa_reference()
+        declarations = book.page(NUMERICAL_CONSTRUCTOR_CODE_REFERENCE)
+        for row in declarations.rows():
+            cell = book.latest_ref(NUMERICAL_CONSTRUCTOR_CODE_REFERENCE, row)
+            fact = declarations.latest(row)
+            op = code_reference.operation(row[1]) if len(row) == 2 else None
+            valid = (
+                isinstance(row, tuple) and len(row) == 2
+                and row[0] == code_reference.source_identity
+                and op is not None and op.canonical_op == row[1]
+                and fact == tuple(op.entrypoints)
+                and len(fact) == 1
+            )
+            if valid:
+                valid = code_reference.module.functions.get(fact[0]) is not None
+            if not valid:
+                found.append(Finding(
+                    "numerical-constructor-code-reference", str(row), None,
+                    "constructor operation lacks its exact repository SSA entrypoint",
+                ))
+        page = book.page(NUMERICAL_CONSTRUCTOR_DEFAULT)
+        for row in page.rows():
+            receipt = book.latest_ref(NUMERICAL_CONSTRUCTOR_DEFAULT, row)
+            fact = page.latest(row)
+            valid = (
+                isinstance(row, tuple) and len(row) == 1
+                and isinstance(row[0], Ref)
+                and isinstance(fact, tuple) and len(fact) == 9
+            )
+            if valid:
+                (op, default, admission, operand, declaration, root,
+                 output, stored, dtype) = fact
+                valid = (
+                    isinstance(op, str) and op in {"zeros", "ones", "empty", "full"}
+                    and isinstance(default, Ref)
+                    and default.page == SOURCE_CALL_PARAMETER_DEFAULT
+                    and isinstance(admission, Ref)
+                    and admission.page == SOURCE_INTRINSIC_ADMISSION
+                    and isinstance(operand, Ref)
+                    and operand.page == PROCESS_GRAPH_OPERANDS
+                    and isinstance(declaration, Ref)
+                    and declaration.page == NUMERICAL_CONSTRUCTOR_CODE_REFERENCE
+                    and isinstance(root, Ref)
+                    and root.page == REPOSITORY_KERNEL_DEFINITION
+                    and isinstance(output, Ref)
+                    and output.page == REPOSITORY_KERNEL_VALUE
+                    and isinstance(stored, tuple) and bool(stored)
+                    and all(isinstance(item, Ref) and item.page == SSA_VALUE
+                            for item in stored)
+                    and isinstance(dtype, str)
+                    and default.row[1] == "dtype"
+                    and declaration.row == (code_reference.source_identity, op)
+                )
+            if valid:
+                try:
+                    valid = (origin_cell(book, default.row[0])
+                             == origin_cell(book, row[0])
+                             == admission.row[0])
+                except ValueError:
+                    valid = False
+            if valid:
+                causes = {source for source, _stage in book.edges_into(receipt)}
+                valid = {row[0], default, admission, operand,
+                         declaration, root, output, *stored} <= causes
+            if valid:
+                default_fact = book.page(SOURCE_CALL_PARAMETER_DEFAULT).cell(
+                    default.row, default.column,
+                )
+                valid = (isinstance(default_fact, tuple)
+                         and len(default_fact) == 2
+                         and default_fact[0].page == SOURCE_PARAMETER_DEFAULT
+                         and default_fact[1].page == SOURCE_CALLABLE_SIGNATURE
+                         and set(default_fact) <= causes)
+            if valid:
+                admitted_op, decision, admitted_signature = book.page(
+                    SOURCE_INTRINSIC_ADMISSION,
+                ).cell(admission.row, admission.column)
+                public_symbol = default_fact[1].row[0]
+                valid = (
+                    admitted_op == op
+                    and admitted_signature == default_fact[1]
+                    and isinstance(decision, dict)
+                    and decision.get("action") == "intrinsic"
+                    and (decision.get("parameters") or {}).get(
+                        "lowering_namespace") == "abstract_tensor"
+                    and decision.get("module") == public_symbol.row[0]
+                    and decision.get("qualname") == public_symbol.row[1]
+                    and decision.get("identity")
+                        == ".".join(public_symbol.row[:2])
+                    and operand == book.latest_ref(
+                        PROCESS_GRAPH_OPERANDS, operand.row,
+                    )
+                    and row[0] in {
+                        source for source, _stage in book.edges_into(operand)
+                    }
+                )
+            if valid:
+                default_value = book.page(SOURCE_PARAMETER_DEFAULT).cell(
+                    default_fact[0].row, default_fact[0].column,
+                )
+                schema = book.page(SOURCE_CALLABLE_SIGNATURE).cell(
+                    default_fact[1].row, default_fact[1].column,
+                )[2]
+                valid = (
+                    isinstance(default_value, SpecializationFact)
+                    and default_value.source == SpecializationSource.DEFAULT
+                    and default_value.value is None
+                    and sum(name == "dtype" and cell == default_fact[0]
+                            for name, _kind, _position, cell in schema) == 1
+                )
+            if valid:
+                position = next(index for name, _kind, index, cell in schema
+                                if name == "dtype" and cell == default_fact[0])
+                edges = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                    operand.row, operand.column,
+                )
+                valid = not any(
+                    role == "kw:dtype"
+                    or (position is not None and role == f"arg:{position}")
+                    for _parent, role in edges
+                )
+            if valid:
+                declaration_fact = declarations.cell(
+                    declaration.row, declaration.column,
+                )
+                valid = len(declaration_fact) == 1
+            if valid:
+                entrypoint = declaration_fact[0]
+                function = code_reference.module.functions.get(entrypoint)
+                output_stores = (_stored_output_values(function)
+                                 if function is not None else None)
+                valid = (root.row == ("llvm_repository", entrypoint)
+                         and output_stores is not None)
+            if valid:
+                output_value, stored_values = output_stores
+                origins = function.metadata["llvm_repository_kernel"][1]
+                expected_output = book.latest_ref(
+                    REPOSITORY_KERNEL_VALUE,
+                    (root.row, origins[int(output_value.id)][0]),
+                )
+                scope = function_scope_of(function)
+                expected_stored = tuple(book.latest_ref(
+                    SSA_VALUE, (scope, int(value.id)),
+                ) for value in stored_values)
+                valid = (output == expected_output
+                         and stored == expected_stored
+                         and all(value.dtype == dtype for value in stored_values))
+            if not valid:
+                found.append(Finding(
+                    "numerical-constructor-default", str(row), None,
+                    "physical dtype lacks exact omitted source default or native output store",
                 ))
         return found
 

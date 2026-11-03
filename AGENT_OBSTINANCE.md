@@ -21,6 +21,21 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-03 — full concordance audit outside the signature slice
+
+The agent was assigned a bounded intrinsic-signature declaration bridge and
+focused tests. It started `python tools/audit_identity_concordance.py` with no
+case selection, which begins the full lowering audit. It did so while trying
+to verify the new audit methods. The run spent about 30 seconds on `view`,
+`toplevel`, and the start of `energy`; the first two reported lowering failures
+outside the signature gate. Their cause and baseline status were not measured.
+The agent stopped its Python
+process before `energy` completed. That time produced no usable signature
+regression result, so the agent ran the bounded `mapping` case separately;
+it completed with zero findings. The preventing constraint is to select the
+short named audit case for a narrow compiler slice and leave the full audit
+to an explicitly scheduled gate.
+
 ## 2026-11-02 — `book.borrowed(name)` concordance identity
 
 The agent was told to do one thing: make exception-context handling discover
