@@ -2265,6 +2265,29 @@ def propagate_repository_ssa_call_metadata(
     from .ssa_record_return_state import (
         ssa_block_identity_cell, ssa_value_identity_cell,
     )
+    from .frame_identity_book import _frame_owner_book
+
+    def reference_witness(owner_name, *, value_id=None, label=None):
+        # _split composes the accepted _read_header regions. Their shared
+        # value 5 and block witnesses remain in the dependency's own book;
+        # looking in this unit's book lost every cause of the reference row.
+        # Transport those exact cells through the existing imported-proof
+        # edge, without copying foreign value rows into the caller's scope.
+        function = module.functions[owner_name]
+        destination = identity_book(module)
+        owner, digest = (
+            _frame_owner_book(function)
+            if function.metadata.get("accepted_ssa_component")
+            else (destination, None)
+        )
+        cell = (
+            ssa_value_identity_cell(function, value_id, book=owner)
+            if value_id is not None
+            else ssa_block_identity_cell(function, label, book=owner)
+        )
+        if cell is not None and owner is not destination:
+            cell = destination.import_cell(owner, cell, digest)
+        return cell
 
     for key, owners in reference_counts.items():
         if len(owners) > 1:
@@ -2279,17 +2302,11 @@ def propagate_repository_ssa_call_metadata(
                 module, CROSS_FUNCTION_REFERENCES, key, tuple(sorted(owners)),
                 (
                     *(
-                        ssa_value_identity_cell(
-                            module.functions[owner], int(key[1]),
-                            book=identity_book(module),
-                        )
+                        reference_witness(owner, value_id=int(key[1]))
                         for owner in sorted(owners)
                     ),
                     *(
-                        ssa_block_identity_cell(
-                            module.functions[owner], label,
-                            book=identity_book(module),
-                        )
+                        reference_witness(owner, label=label)
                         for owner, label in sorted(reference_blocks.get(key, ()))
                         if owner in module.functions
                     ),
@@ -4064,8 +4081,20 @@ def lower_tensor_calls_to_repository_ssa(
                     or instruction.attributes.get("tensor")
                     or instruction.attributes.get("tensor_candidate")
                     or (
+                        # Program: `_header(*values)` widens an integer before
+                        # `Shr`/`BitAnd`.  The Cast records the source opcode
+                        # for provenance, but is still a native conversion;
+                        # treating `source_operator='shr'` as the Cast's tensor
+                        # operation stamped float64 and demanded an extent.
+                        # Only an authored cast operation selects a tensor
+                        # conversion here.  The following scalar opcode keeps
+                        # its own rank and physical proof.
                         instruction.attributes.get("source_operator")
-                        if instruction.op in {"Cast", "cast"} else None
+                        if instruction.op in {"Cast", "cast"}
+                        and str(instruction.attributes.get(
+                            "source_operator") or ""
+                        ).casefold() in _CAST_OPERATIONS
+                        else None
                     )
                 )
                 # ProcessGraph spells Python arithmetic as ordinary SSA
@@ -4172,7 +4201,14 @@ def lower_tensor_calls_to_repository_ssa(
                     from ..common.tensors.accelerator_backends.llvm_repository_ssa import (
                         post_repository_kernel_identity,
                     )
-                    from .concordance_declarations import SSA_VALUE, TENSOR_SSA_LOWERING
+                    from .concordance_declarations import (
+                        CALLSITE_RETURN_MEMBER, CANONICAL_VALUE,
+                        PROCESS_GRAPH_OPERANDS,
+                        SSA_VALUE, TENSOR_SSA_LOWERING,
+                    )
+                    from .concorded_literals import (
+                        MISSING as MISSING_LITERAL, literal_from_identity,
+                    )
                     from .ssa_record_return_state import (
                         function_scope_of, revise_ssa_value,
                     )
@@ -4191,6 +4227,75 @@ def lower_tensor_calls_to_repository_ssa(
                         ))
                         rewritten.append(instruction)
                         continue
+                    # The source's two named leaf descriptors are the
+                    # accepted output extents. Read their exact member cells
+                    # and require the authored static axis/k to agree before
+                    # binding a native count. In root(values[3], k=4), the
+                    # old Call sent 4 while its allocated output had shape
+                    # (4,); CBackend.topk_ selects min(3, 4) = 3.
+                    member_receipts = tuple(
+                        next((cell for cell in member.source_cells
+                              if cell.page == CALLSITE_RETURN_MEMBER), None)
+                        for member in layout.members
+                    )
+                    if any(cell is None for cell in member_receipts):
+                        raise ValueError("named topk leaf has no descriptor receipt")
+                    member_shapes = tuple(
+                        tuple(book.page(CALLSITE_RETURN_MEMBER).cell(
+                            cell.row, cell.column,
+                        )[0]) for cell in member_receipts
+                    )
+                    static_shape = tuple(source.shape or ())
+                    operand_cell = book.latest_ref(
+                        PROCESS_GRAPH_OPERANDS, layout_proof[0].row,
+                    )
+                    source_operands = (
+                        () if operand_cell is None else
+                        book.page(PROCESS_GRAPH_OPERANDS).cell(
+                            operand_cell.row, operand_cell.column,
+                        )
+                    )
+                    def literal_actual(role):
+                        matches = tuple(parent for parent, name in source_operands
+                                        if name == role)
+                        actual = by_role[role]
+                        if (len(matches) != 1
+                                or matches[0].page != CANONICAL_VALUE
+                                or matches[0].row[-1] != int(actual.id)):
+                            return None
+                        value, _literal_cells = literal_from_identity(
+                            book, matches[0],
+                        )
+                        if value is MISSING_LITERAL or type(value) is not int:
+                            return None
+                        local = constants.get(int(actual.id))
+                        if local is not None and local != value:
+                            raise ValueError("topk SSA constant disagrees with source literal")
+                        return value
+                    k_literal = literal_actual("kw:k")
+                    dim_literal = literal_actual("kw:dim")
+                    selected_count = None
+                    selected_axis = None
+                    if (static_shape and all(member_shapes)
+                            and (k_literal is None or dim_literal is None)):
+                        raise ValueError(
+                            "named topk static extents lack exact literal selection proof"
+                        )
+                    if (static_shape and isinstance(k_literal, int)
+                            and not isinstance(k_literal, bool)
+                            and isinstance(dim_literal, int)
+                            and not isinstance(dim_literal, bool)):
+                        if (k_literal < 0 or not -len(static_shape) <= dim_literal
+                                < len(static_shape)):
+                            raise ValueError("named topk has no admitted static k or axis")
+                        selected_axis = dim_literal % len(static_shape)
+                        selected_count = min(k_literal, static_shape[selected_axis])
+                        expected_shape = list(static_shape)
+                        expected_shape[selected_axis] = selected_count
+                        if member_shapes != (tuple(expected_shape),) * 2:
+                            raise ValueError(
+                                "named topk source extents disagree with selected count"
+                            )
                     prefix = []
                     dynamic = ensure_dynamic(prefix, source)
                     def prove_native_actual(actual, formal, *, storage, rank):
@@ -4234,10 +4339,31 @@ def lower_tensor_calls_to_repository_ssa(
                             attributes={"target_dtype": "int32"},
                         ))
                         return converted
+                    native_k = by_role["kw:k"]
+                    native_dim = by_role["kw:dim"]
+                    if selected_count is not None:
+                        # Keep the selected count as ordinary SSA, so the
+                        # native actual computes the same bounded count that
+                        # the two booked output leaves state. The bound and
+                        # k are the original exact SSA operands.
+                        axis_bound, axis_definition = constant(
+                            static_shape[selected_axis], str(native_k.dtype),
+                        )
+                        bounded_k = fresh(dtype=str(native_k.dtype))
+                        prefix.extend((axis_definition, Instr(
+                            "Min", [native_k, axis_bound], bounded_k,
+                            attributes={"source_operator": "topk"},
+                        )))
+                        native_k = bounded_k
+                        if dim_literal != selected_axis:
+                            native_dim, dim_definition = constant(
+                                selected_axis, str(native_dim.dtype),
+                            )
+                            prefix.append(dim_definition)
                     actuals = [
                         source, dynamic["shape"], dynamic["rank"],
-                        i32_actual(by_role["kw:dim"]),
-                        i32_actual(by_role["kw:k"]),
+                        i32_actual(native_dim),
+                        i32_actual(native_k),
                     ]
                     for position, actual in enumerate(actuals[1:], 1):
                         prove_native_actual(
@@ -5858,7 +5984,7 @@ def lower_tensor_calls_to_repository_ssa(
                         rewritten.append(instruction)
                         continue
                     result.dtype = source.dtype
-                if operation in {"tensor", "real"} and source is not None:
+                if operation in {"tensor", "real", "to_dtype"} and source is not None:
                     sequence = resident_sequence(source)
                     row_shape: tuple[int, ...] | None = None
                     if sequence is not None:
@@ -5899,15 +6025,35 @@ def lower_tensor_calls_to_repository_ssa(
                             outer_extent = sequence_outer_extent(sequence)
                             if outer_extent is not None:
                                 result.shape = (outer_extent, *row_shape)
-                    requested_dtype = str(result.dtype or source.dtype or "")
+                    requested_dtype = str(
+                        _attribute(instruction.attributes, "dtype", "target_dtype")
+                        if operation == "to_dtype"
+                        else result.dtype or source.dtype or ""
+                    ).lower()
+                    # _octets' list(data) has one concorded int64 column and
+                    # a runtime length but no static outer extent. Its
+                    # tensor(...).to_dtype('int64') keeps that exact storage;
+                    # selecting cast_double_to_int_values by target alone
+                    # binds int64 buffers to float64 kernel formals.
+                    dynamic_sequence_view = (
+                        sequence is not None
+                        and not tuple(result.shape or ())
+                        and declared_rank == 1 + len(row_shape)
+                        and sequence.length_address_id is not None
+                        and str((sequence.column_dtypes or (None,))[0])
+                        == requested_dtype
+                    )
                     shape_preserving = (
                         tuple(result.shape or ()) == tuple(source.shape or ())
                         if sequence is None
-                        else bool(tuple(result.shape or ()))
-                        and tuple(result.shape or ())[1:] == row_shape
+                        else (
+                            bool(tuple(result.shape or ()))
+                            and tuple(result.shape or ())[1:] == row_shape
+                        ) or dynamic_sequence_view
                     )
                     if (
                         shape_preserving
+                        and (operation != "to_dtype" or sequence is not None)
                         and requested_dtype == str(source.dtype or "")
                     ):
                         if sequence is not None:
