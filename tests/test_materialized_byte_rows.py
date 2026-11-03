@@ -10,12 +10,17 @@ import pytest
 from src.common.tensors.compression import octet_huffman
 from src.compiler import glsl_deployment_strategy as strategy
 from src.compiler.concordance_declarations import (
-    BUILTIN_ITERABLE_ELEMENT, SEQUENCE_ROW_DTYPE, SOURCE_PYTHON_IDENTITY,
+    BUILTIN_ITERABLE_ELEMENT, PROCESS_GRAPH_OPERANDS, REDUCTION,
+    SEQUENCE_ROW_DTYPE, SOURCE_PYTHON_IDENTITY, SOURCE_VALUE_CLASS,
 )
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
-from src.compiler.identity_concordance import CorrelationTable, current_identity_book
-from src.compiler.planner_concordance_posts import materialized_sequence_row_dtype
+from src.compiler.identity_concordance import (
+    CorrelationTable, Derived, Mode, current_identity_book,
+)
+from src.compiler.planner_concordance_posts import (
+    _class_proves_value, materialized_sequence_row_dtype,
+)
 
 
 def _policy(values):
@@ -88,6 +93,23 @@ def test_octets_byte_materializer_posts_one_concorded_int64_row(monkeypatch):
                 assert CorrelationTable._materialized_byte_row_findings(module)
             finally:
                 identity_page.cells[(identity.row, identity.column)] = identity_fact
+            operand = next(cell for cell in proof
+                           if cell.page == PROCESS_GRAPH_OPERANDS)
+            input_cell = next(source for source, role in
+                              book.page(PROCESS_GRAPH_OPERANDS).cell(
+                                  operand.row, operand.column,
+                              ) if role == "arg:0")
+            owner_cell = next(cell for cell in proof
+                              if cell.page.name == "canonical_value"
+                              and cell.row[-1] == node_id)
+            # A peer class row with the same numeric value ID, sourced from
+            # a different canonical value, cannot prove this input.
+            forged_class = book.post(
+                SOURCE_VALUE_CLASS, (("unrelated-peer",), input_cell.row[-1]),
+                ("builtins.bytes", 1, "forged peer"), stage=REDUCTION,
+                provenance=Derived((owner_cell,)), mode=Mode.CONCORD,
+            )
+            assert not _class_proves_value(book, forged_class, input_cell)
             observed.append(receipt)
             raise Captured
         return original(shell, *args, **kwargs)
