@@ -7,7 +7,7 @@ from src.common.tensors.compression import octet_lz
 from src.compiler.concordance_declarations import CONTROL_VALUE_BINDING
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import (
-    ConcordanceRefusal, CorrelationTable, current_identity_book,
+    CorrelationTable, current_identity_book,
 )
 import src.compiler.precompile_to_ssa as precompile_to_ssa
 
@@ -41,16 +41,27 @@ def test_authored_header_break_keeps_the_integer_binding(monkeypatch):
         inspect.getsource(octet_lz._header)
         + "\ndef root(x: int) -> bytes:\n    return _header(x)\n"
     )
-    try:
-        lower_ast_source_to_ssa(
-            source, "root", name="authored_header_break",
-            extraction_contract=CONTRACT, progress=lambda _message: None,
-        )
-    except ConcordanceRefusal as error:
-        # This exact source currently reaches a later native element-layout
-        # audit refusal; the control-stage result is the regression subject.
-        assert "loop_body: Load int64 from column 1" in str(error)
-        assert captured
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        source, "root", name="authored_header_break",
+        extraction_contract=CONTRACT, progress=lambda _message: None,
+    )
+    header = next(
+        function for function in module.functions.values()
+        if "_header__specialized_" in function.name
+        and "__planned_region_" not in function.name
+        and "__ssa_sequence_" not in function.name
+    )
+    descriptor = module.sequence_tables[header.name].sequences[1]
+    assert descriptor.column_value_ids == (1,)
+    assert descriptor.column_dtypes == ("int64",)
+    assert any(
+        instruction.op == "Load"
+        and instruction.attributes.get("binding") == "iterable"
+        and instruction.res.dtype == "int64"
+        for block in header.blocks.values()
+        for instruction in block.instrs
+    )
+    assert CorrelationTable.build(module).findings(module) == []
     assert captured
     (root, shortfalls), book = captured[-1]
     assert not any(item.name == "break-edge-value" for item in shortfalls)

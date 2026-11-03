@@ -13322,9 +13322,17 @@ class _ControlSSABuilder(TiledObject):
         # Rule: the descriptor's column dtypes are posted to the row
         # concordance at birth, derived from the arena cells they came from;
         # the two records state one row layout.
+        # Program: ``_header(*values: int)`` called from ``root(x: int)``.
+        # The iterable target gave the borrowed arena semantic dtype ``int``;
+        # copying that dtype into its native row made the descriptor int32,
+        # while scalar settlement made the indexed Load int64.  An inferred
+        # arena row uses the same native sequence width canonicalization as
+        # the descriptor proposal.  An authored row contract remains exact.
         born_column_dtypes = tuple(
-            _sequence_column_element_dtype(column)
-            for column in (data, *extra_columns)
+            _canonicalize_column(
+                _sequence_column_element_dtype(column), position,
+            ) or "unknown"
+            for position, column in enumerate((data, *extra_columns))
         )
         if born_column_dtypes != tuple(concorded_column_dtypes):
             concord_sequence_row_dtypes(
