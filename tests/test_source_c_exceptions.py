@@ -1,4 +1,5 @@
 """Authored exception/control combinations compiled to standalone C shells."""
+import ast
 import subprocess
 
 import numpy as np
@@ -52,6 +53,21 @@ def root(n: int) -> int:
     task.join()
     return shared[0]
 '''
+
+
+def test_protected_bare_return_materializes_the_literal_none():
+    from src.compiler.source_exception_ingestion import Context, FailureArms
+
+    lowering = FailureArms(set())
+    lowering.return_flag = '__returned'
+    lowering.return_value = '__return_value'
+    statements = lowering.statement(
+        ast.Return(value=None), Context('__error', protected=True),
+    )
+    assignment = statements[0]
+    assert isinstance(assignment, ast.Assign)
+    assert isinstance(assignment.value, ast.Constant)
+    assert assignment.value.value is None
 
 
 def run_source(tmp_path, source, n):
@@ -121,6 +137,54 @@ def test_nested_raise_rethrow_and_finally(tmp_path):
     return value
 '''
     run_source(tmp_path, source, 0)
+
+
+def test_raise_from_none_is_concorded_and_native(tmp_path):
+    source = '''def root(n: int) -> int:
+    try:
+        if n < 0:
+            raise TypeError("negative")
+    except TypeError:
+        raise KeyError("hidden context") from None
+    return n + 1
+'''
+    module = compile_source(source)
+    from src.compiler.concordance_declarations import SOURCE_EXCEPTION_OPERATION
+    book = module.metadata['identity_book']
+    facts = [book.page(SOURCE_EXCEPTION_OPERATION).latest(row)
+             for row in book.page(SOURCE_EXCEPTION_OPERATION).rows()]
+    key_error = [fact for fact in facts
+                 if fact[0] == 'exception_make' and fact[1] == 'builtins.KeyError']
+    assert len(key_error) == 1
+    assert key_error[0][4:7] == (None, None, True)
+    run_source(tmp_path, source, 1)
+
+
+def test_explicit_exception_cause_is_an_exact_graph_operand():
+    source = '''def root(n: int) -> int:
+    try:
+        raise ValueError("first")
+    except ValueError as error:
+        raise RuntimeError("second") from error
+'''
+    module = compile_source(source)
+    from src.compiler.concordance_declarations import SOURCE_EXCEPTION_OPERATION
+    from src.compiler.identity_concordance import Ref
+    book = module.metadata['identity_book']
+    facts = [(row, book.page(SOURCE_EXCEPTION_OPERATION).latest(row))
+             for row in book.page(SOURCE_EXCEPTION_OPERATION).rows()]
+    runtime_error = [(row, fact) for row, fact in facts
+                     if fact[0] == 'exception_make' and fact[1] == 'builtins.RuntimeError']
+    assert len(runtime_error) == 1
+    row, fact = runtime_error[0]
+    cause, cause_argument, suppress_context = fact[4:7]
+    assert isinstance(cause, Ref)
+    assert cause_argument == 0
+    assert suppress_context is True
+    assert cause in {source for source, _stage in book.edges_into(
+        book.latest_ref(SOURCE_EXCEPTION_OPERATION, row)
+    )}
+    assert '0 finding(s)' in concordance_report(module)
 
 
 @pytest.mark.parametrize('enabled', [True, False])

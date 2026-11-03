@@ -1572,12 +1572,20 @@ class CorrelationTable:
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
+        found.extend(self._source_closed_aggregate_length_findings(module))
+        found.extend(self._source_closed_class_alternative_findings(module))
+        found.extend(self._source_class_union_native_gap_findings(module))
+        found.extend(self._source_call_closed_class_alternatives_findings(module))
+        found.extend(self._source_formal_closed_class_alternatives_findings(module))
+        found.extend(self._loop_native_scalar_union_gap_findings(module))
+        found.extend(self._source_tuple_key_native_gap_findings(module))
         found.extend(self._mapping_child_contract_findings(module))
         found.extend(self._unborn_display_findings(module))
         found.extend(self._unreturned_output_findings(module))
         found.extend(self._live_structure_findings(module))
         found.extend(self._ssa_publication_findings(module))
         found.extend(self._value_type_abi_findings(module))
+        found.extend(self._ssa_abi_physical_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
         found.extend(self._frame_aliased_result_findings(module))
         found.extend(self._physical_call_input_conversion_findings(module))
@@ -1589,6 +1597,22 @@ class CorrelationTable:
         found.extend(self._planning_alias_transition_findings(module))
         found.extend(self._tensor_reduction_domain_findings(module))
         found.extend(self._callable_identity_findings(module))
+        found.extend(self._source_call_actual_formal_findings(module))
+        found.extend(self._source_call_object_alias_findings(module))
+        found.extend(self._source_call_field_effect_completion_findings(module))
+        found.extend(self._source_call_activity_corridor_findings(module))
+        found.extend(self._source_call_field_state_transfer_findings(module))
+        found.extend(self._source_mapping_get_read_findings(module))
+        found.extend(self._source_mapping_get_key_version_demand_findings(module))
+        found.extend(self._source_mapping_get_copy_state_demand_findings(module))
+        found.extend(self._source_guarded_mapping_payload_findings(module))
+        found.extend(self._source_evidence_flush_round_findings(module))
+        found.extend(self._source_guarded_callable_findings(module))
+        found.extend(self._source_parameter_memory_contract_findings(module))
+        found.extend(self._source_function_exit_field_state_findings(module))
+        found.extend(self._source_constructor_field_effect_demand_findings(module))
+        found.extend(self._source_call_tuple_member_projection_demand_findings(module))
+        found.extend(self._source_method_receiver_class_demand_findings(module))
         found.extend(self._post_ssa_numeric_identity_findings(module))
         found.extend(self._constant_materialization_findings(module))
         found.extend(self._table_member_findings(module))
@@ -1601,11 +1625,1472 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_parameter_memory_contract_findings(module: Any) -> list[Finding]:
+        """Check the one selected contract against authored and formal cells."""
+        from .concordance_declarations import (
+            CLASS_DECLARATION, NAME_BINDING, PARAMETER_ANNOTATION,
+            SOURCE_FORMAL_ORDER, SOURCE_PARAMETER_MEMORY_CONTRACT,
+        )
+        from ..transmogrifier.function_table import (
+            ParameterContract, ParameterStorage,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_PARAMETER_MEMORY_CONTRACT)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_PARAMETER_MEMORY_CONTRACT, row)
+            fact = page.cell(cell.row, cell.column)
+            contract = fact[0] if isinstance(fact, tuple) and len(fact) == 1 else None
+            sources = {source for source, _stage in book.edges_into(cell)}
+            order = book.latest_ref(SOURCE_FORMAL_ORDER, (row[0],))
+            bindings = tuple(source for source in sources
+                             if source.page == NAME_BINDING
+                             and source.row[1] == row[1])
+            prior = tuple(source for source in sources
+                          if source.page == SOURCE_PARAMETER_MEMORY_CONTRACT)
+            initial_sources = {
+                source for predecessor in prior
+                for source, _stage in book.edges_into(predecessor)
+            }
+            annotation = book.latest_ref(PARAMETER_ANNOTATION, (*row[0], row[1]))
+            class_sources = tuple(source for source in initial_sources
+                                  if source.page == CLASS_DECLARATION)
+            matching_entries = tuple(
+                entry for entry in (getattr(module, "function_table", ()) or ())
+                if getattr(getattr(entry, "graph", None), "G", None) is not None
+                and tuple(entry.graph.G.graph.get("authored_function_identity") or ()) == row[0]
+            )
+            installed = tuple(
+                installed_contract
+                for entry in matching_entries
+                for installed_contract in entry.parameter_contracts
+                if installed_contract.name == row[1]
+            )
+            used_inputs = tuple(
+                (entry, int(node_id))
+                for entry in matching_entries
+                for node_id, data in entry.graph.G.nodes(data=True)
+                if data.get("type") == "Input"
+                and (data.get("attributes") or {}).get("binding_name") == row[1]
+            )
+            annotation_text = (
+                book.page(PARAMETER_ANNOTATION).cell(
+                    annotation.row, annotation.column,
+                ) if annotation is not None else None
+            )
+            direct_annotation_causes = (
+                {source for source, _stage in book.edges_into(annotation)}
+                if annotation is not None else set()
+            )
+            exact_class_sources = tuple(
+                source for source in class_sources
+                if source.row == (row[0][0], annotation_text)
+                and source in direct_annotation_causes
+            )
+            binding_matches = (
+                len(bindings) == 1
+                and len(used_inputs) == 1
+                and bindings[0].row == (
+                    used_inputs[0][0].graph.G.graph.get("lexical_read_scope"),
+                    row[1], 0,
+                )
+                and book.page(NAME_BINDING).cell(
+                    bindings[0].row, bindings[0].column,
+                ).value_id == used_inputs[0][1]
+                or len(bindings) == 0 and not used_inputs
+            )
+            valid = (
+                isinstance(contract, ParameterContract)
+                and contract.name == row[1]
+                and order in sources
+                and row[1] in book.page(SOURCE_FORMAL_ORDER).cell(order.row, order.column)
+                if order is not None else False
+            )
+            valid = bool(
+                valid and binding_matches and prior
+                and contract.storage is ParameterStorage.RECORD
+                and annotation is not None and annotation in initial_sources
+                and len(exact_class_sources) == 1
+                and installed == (contract,)
+            )
+            if not valid:
+                found.append(Finding(
+                    "source-parameter-memory-contract", str(row[0]), None,
+                    f"parameter {row[1]!r} lost selected contract, annotation, class, order or formal binding",
+                ))
+        return found
+
+    @staticmethod
+    def _source_function_exit_field_state_findings(module: Any) -> list[Finding]:
+        """Check that a formal's exit state names its exact cursor and exit."""
+        from .concordance_declarations import (
+            CLASS_FIELD_DECLARATION, PROCESS_GRAPH_OPERANDS,
+            REDUCER_FIELD_STATE,
+            SOURCE_ACTIVITY_EDGE, SOURCE_ACTIVITY_NODE,
+            INGESTION_VALUE, SOURCE_FORMAL_ORDER,
+            SOURCE_FUNCTION_EXIT_FIELD_STATE, SOURCE_SPAN,
+            FieldState, FieldStateKind,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_FUNCTION_EXIT_FIELD_STATE)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_FUNCTION_EXIT_FIELD_STATE, row)
+            fact = page.cell(cell.row, cell.column)
+            if not (isinstance(fact, tuple) and len(fact) == 5):
+                found.append(Finding(
+                    "source-function-exit-field-state", str(row[0]), row[1],
+                    "exit receipt has no formal, state, exit, assignment and flow cells",
+                ))
+                continue
+            formal, state, exit_activity, assignment_source, flow_edge = fact
+            order = book.latest_ref(SOURCE_FORMAL_ORDER, (row[0],))
+            sources = {source for source, _stage in book.edges_into(cell)}
+            prior_receipts = tuple(source for source in sources
+                                   if source.page == SOURCE_FUNCTION_EXIT_FIELD_STATE)
+            order_proved = order in sources or any(
+                order in {source for source, _stage in book.edges_into(prior)}
+                for prior in prior_receipts
+            )
+            state_fact = (
+                book.page(REDUCER_FIELD_STATE).cell(state.row, state.column)
+                if isinstance(state, Ref) and state.page == REDUCER_FIELD_STATE
+                else None
+            )
+            exit_fact = (
+                book.page(SOURCE_ACTIVITY_NODE).cell(
+                    exit_activity.row, exit_activity.column,
+                )
+                if isinstance(exit_activity, Ref)
+                and exit_activity.page == SOURCE_ACTIVITY_NODE else None
+            )
+            assignment_exit = (
+                book.latest_ref(SOURCE_ACTIVITY_NODE, (
+                    row[0], assignment_source, "exit",
+                ))
+                if isinstance(assignment_source, Ref)
+                and assignment_source.page == SOURCE_SPAN else None
+            )
+            assignment_path = (
+                assignment_source.row[2]
+                if isinstance(assignment_source, Ref)
+                and assignment_source.page == SOURCE_SPAN else None
+            )
+            sequence_proved = assignment_path == (('body', 0),)
+            direct_write_proved = False
+            if (isinstance(state_fact, FieldState)
+                    and state_fact.kind is FieldStateKind.WRITTEN
+                    and assignment_path == (('body', 0),)):
+                proof_receipt = (
+                    prior_receipts[0] if len(prior_receipts) == 1 else cell
+                )
+                proof_fact = page.cell(proof_receipt.row, proof_receipt.column)
+                original_state = proof_fact[1]
+                original = book.page(REDUCER_FIELD_STATE).cell(
+                    original_state.row, original_state.column,
+                )
+                original_sources = {
+                    source for source, _stage in book.edges_into(original_state)
+                }
+                proof_sources = {
+                    source for source, _stage in book.edges_into(proof_receipt)
+                }
+                schemas = tuple(source for source in proof_sources
+                                if source.page == CLASS_FIELD_DECLARATION)
+                operands = tuple(source for source in proof_sources
+                                 if source.page == PROCESS_GRAPH_OPERANDS)
+                operand_fact = (
+                    book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operands[0].row, operands[0].column,
+                    ) if len(operands) == 1 else None
+                )
+                target = book.latest_ref(SOURCE_SPAN, (
+                    assignment_source.row[0], assignment_source.row[1],
+                    (('body', 0), ('targets', 0)),
+                ))
+                effect = original.effect if isinstance(original, FieldState) else None
+                effect_origins = (
+                    (effect,) if isinstance(effect, Ref)
+                    and effect.page == INGESTION_VALUE else tuple(
+                        source for source, _stage in book.edges_into(effect)
+                        if source.page == INGESTION_VALUE
+                    ) if isinstance(effect, Ref) else ()
+                )
+                body_spans = tuple(
+                    span_row for span_row in book.page(SOURCE_SPAN).rows()
+                    if span_row[:2] == assignment_source.row[:2]
+                    and len(span_row[2]) == 1
+                    and span_row[2][0][0] == 'body'
+                )
+                direct_write_proved = (
+                    len(body_spans) == 1
+                    and isinstance(original, FieldState)
+                    and original.kind is FieldStateKind.WRITTEN
+                    and original_state in proof_sources
+                    and len(schemas) == 1
+                    and schemas[0].row[-1] == row[2]
+                    and schemas[0] in original_sources
+                    and target is not None
+                    and book.page(SOURCE_SPAN).cell(
+                        target.row, target.column).kind == 'Attribute'
+                    and target in proof_sources
+                    and len(effect_origins) == 1
+                    and effect_origins[0] in proof_sources
+                    and target in {
+                        source for source, _stage in
+                        book.edges_into(effect_origins[0])
+                    }
+                    and isinstance(original.value, Ref)
+                    and original.value in proof_sources
+                    and isinstance(formal, Ref)
+                    and isinstance(state, Ref)
+                    and (proof_fact[0] == formal or proof_fact[0] in {
+                        source for source, _stage in book.edges_into(formal)
+                    })
+                    and (original_state == state or original_state in {
+                        source for source, _stage in book.edges_into(state)
+                    })
+                    and operand_fact == (
+                        (proof_fact[0], 'object'),
+                        (original.value, 'value'),
+                    )
+                    and operands[0].row[-1] == original.effect.row[-1]
+                )
+            if assignment_path == (('body', 1),):
+                proof_receipt = (
+                    prior_receipts[0] if len(prior_receipts) == 1 else cell
+                )
+                proof_fact = page.cell(proof_receipt.row, proof_receipt.column)
+                proof_state = proof_fact[1]
+                proof_sources = {
+                    source for source, _stage in book.edges_into(proof_receipt)
+                }
+                first_span = book.latest_ref(SOURCE_SPAN, (
+                    assignment_source.row[0], assignment_source.row[1],
+                    (('body', 0),),
+                ))
+                first_exit = (
+                    book.latest_ref(SOURCE_ACTIVITY_NODE, (
+                        row[0], first_span, 'exit',
+                    )) if first_span is not None else None
+                )
+                final_enter = book.latest_ref(SOURCE_ACTIVITY_NODE, (
+                    row[0], assignment_source, 'enter',
+                ))
+                bridge = (
+                    book.latest_ref(SOURCE_ACTIVITY_EDGE, (
+                        row[0], first_exit, final_enter, 'flow',
+                    )) if first_exit is not None and final_enter is not None
+                    else None
+                )
+                predecessors = tuple(
+                    source for source, _stage in book.edges_into(proof_state)
+                    if source.page == REDUCER_FIELD_STATE
+                    and source.row == proof_state.row
+                )
+                prior_state = predecessors[0] if len(predecessors) == 1 else None
+                first_state = (
+                    book.page(REDUCER_FIELD_STATE).cell(
+                        prior_state.row, prior_state.column,
+                    ) if prior_state is not None else None
+                )
+                last_state = book.page(REDUCER_FIELD_STATE).cell(
+                    proof_state.row, proof_state.column,
+                )
+                def exact_target(effect, position):
+                    if not isinstance(effect, Ref):
+                        return False
+                    ingestions = (
+                        (effect,) if effect.page == INGESTION_VALUE else
+                        tuple(source for source, _stage in book.edges_into(effect)
+                              if source.page == INGESTION_VALUE)
+                    )
+                    target = book.latest_ref(SOURCE_SPAN, (
+                        assignment_source.row[0], assignment_source.row[1],
+                        (('body', position), ('targets', 0)),
+                    ))
+                    return target is not None and any(
+                        target in {source for source, _stage in
+                                   book.edges_into(ingestion)}
+                        for ingestion in ingestions
+                    )
+                body_spans = tuple(
+                    span_row for span_row in book.page(SOURCE_SPAN).rows()
+                    if span_row[:2] == assignment_source.row[:2]
+                    and len(span_row[2]) == 1
+                    and span_row[2][0][0] == 'body'
+                )
+                sequence_proved = (
+                    len(body_spans) == 2
+                    and first_span is not None
+                    and book.page(SOURCE_SPAN).cell(
+                        first_span.row, first_span.column,
+                    ).kind == 'Assign'
+                    and first_exit is not None and final_enter is not None
+                    and bridge is not None
+                    and prior_state is not None
+                    and isinstance(first_state, FieldState)
+                    and first_state.kind is FieldStateKind.ELEMENT_WRITTEN
+                    and isinstance(last_state, FieldState)
+                    and last_state.kind is FieldStateKind.ELEMENT_WRITTEN
+                    and exact_target(first_state.effect, 0)
+                    and exact_target(last_state.effect, 1)
+                    and {first_span, first_exit, final_enter,
+                         bridge, prior_state} <= proof_sources
+                )
+            if (not isinstance(formal, Ref)
+                    or formal.row[-1] != row[1]
+                    or not isinstance(state, Ref) or state.row[1:] != row[1:]
+                    or not isinstance(state_fact, FieldState)
+                    or not (state_fact.kind is FieldStateKind.ELEMENT_WRITTEN
+                            or (state_fact.kind is FieldStateKind.WRITTEN
+                                and direct_write_proved))
+                    or exit_fact != ("FunctionDef", ())
+                    or exit_activity.row[0] != row[0]
+                    or exit_activity.row[-1] != "exit"
+                    or assignment_exit is None
+                    or book.page(SOURCE_SPAN).cell(
+                        assignment_source.row, assignment_source.column,
+                    ).kind != "Assign"
+                    or not isinstance(flow_edge, Ref)
+                    or flow_edge.page != SOURCE_ACTIVITY_EDGE
+                    or flow_edge.row != (
+                        row[0], assignment_exit, exit_activity, "flow",
+                    )
+                    or order is None or not order_proved
+                    or not sequence_proved
+                    or not {formal, state, exit_activity,
+                            assignment_source, flow_edge} <= sources):
+                found.append(Finding(
+                    "source-function-exit-field-state", str(row[0]), row[1],
+                    "exit receipt lost its formal, final write, formal order or exact assignment-to-exit flow",
+                ))
+        return found
+
+    @staticmethod
+    def _source_constructor_field_effect_demand_findings(module: Any) -> list[Finding]:
+        """Check a missing constructor receiver at its exact class Call."""
+        from .concordance_declarations import SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND
+        from .source_constructor_field_demand import candidate_constructor_field_demands
+
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        table = getattr(module, 'function_table', None)
+        if book is None or table is None:
+            return []
+        candidates = {
+            row: (fact, set(causes))
+            for row, fact, causes in candidate_constructor_field_demands(
+                table, book=book)
+        }
+        found = []
+        page = book.page(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND, row)
+            fact = page.cell(cell.row, cell.column)
+            causes = {source for source, _stage in book.edges_into(cell)}
+            expected = candidates.get(row)
+            if (expected is None or fact != expected[0]
+                    or not expected[1] <= causes):
+                found.append(Finding(
+                    'source-constructor-field-effect-demand', str(row[0]),
+                    row[1],
+                    'constructor demand lost exact Call, class, method, address, exit or activity cause',
+                ))
+        return found
+
+    @staticmethod
+    def _source_call_tuple_member_projection_demand_findings(module: Any) -> list[Finding]:
+        """Rejoin an unresolved callee member from exact call/layout cells."""
+        from .concordance_declarations import SOURCE_CALL_TUPLE_MEMBER_PROJECTION_DEMAND
+        from .source_tuple_member_demand import candidate_tuple_member_demands
+
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        table = getattr(module, 'function_table', None)
+        if book is None or table is None:
+            return []
+        expected = {
+            row: (fact, set(causes))
+            for row, fact, causes in candidate_tuple_member_demands(table, book=book)
+        }
+        found = []
+        page = book.page(SOURCE_CALL_TUPLE_MEMBER_PROJECTION_DEMAND)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_CALL_TUPLE_MEMBER_PROJECTION_DEMAND, row)
+            fact = page.cell(cell.row, cell.column)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            target = expected.get(row)
+            if target is None or fact != target[0] or not target[1] <= sources:
+                found.append(Finding(
+                    'source-call-tuple-member-projection-demand', str(row[2]),
+                    row[4],
+                    'tuple member demand lost call, formal, layout, index or control cause',
+                ))
+        return found
+
+    @staticmethod
+    def _source_method_receiver_class_demand_findings(module: Any) -> list[Finding]:
+        """Check a missing formal class against the exact method Call."""
+        from .concordance_declarations import SOURCE_METHOD_RECEIVER_CLASS_DEMAND
+        from .source_method_receiver_demand import candidate_method_receiver_demand
+
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        table = getattr(module, 'function_table', None)
+        if book is None or table is None:
+            return []
+        by_scope = {
+            tuple(entry.graph.G.graph.get('authored_function_identity') or ()): entry.graph
+            for entry in table if getattr(entry, 'graph', None) is not None
+        }
+        found = []
+        page = book.page(SOURCE_METHOD_RECEIVER_CLASS_DEMAND)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_METHOD_RECEIVER_CLASS_DEMAND, row)
+            fact = page.cell(cell.row, cell.column)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            graph = by_scope.get(row[0])
+            candidate = (None if graph is None else
+                         candidate_method_receiver_demand(
+                             graph, row[1], row[2], book=book))
+            if (candidate is None or candidate[0] != row
+                    or candidate[1] != fact
+                    or not set(candidate[2]) <= sources):
+                found.append(Finding(
+                    'source-method-receiver-class-demand', str(row[0]), row[1],
+                    'missing receiver class demand lost Call, Input, operand or control cause',
+                ))
+        return found
+
+    @staticmethod
+    def _source_evidence_flush_round_findings(module: Any) -> list[Finding]:
+        """Check every whole-source round against exact input/output cells."""
+        from .concordance_declarations import (
+            FIXED_POINT_ROUND, SOURCE_EVIDENCE_FLUSH_ROUND,
+        )
+        from .source_evidence_flush import (
+            _FAMILY, _apply_changes, _digest, _snapshot,
+        )
+        from .bounded_fixed_point import _digest as _guard_digest
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_EVIDENCE_FLUSH_ROUND)
+        family = set(_FAMILY)
+        family_names = {declaration.name for declaration in family}
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_EVIDENCE_FLUSH_ROUND, row)
+            receipt_stamp = page.stamps[(row, cell.column)]
+            later_family_write = any(
+                stamp > receipt_stamp
+                for declaration in family
+                for stamp in book.page(declaration).stamps.values()
+            ) or any(
+                stamp > receipt_stamp and edge_row[0][0] in family_names
+                for (edge_row, _column), stamp in book.page(EDGE_PAGE).stamps.items()
+            )
+            before, after, changes, guard, restarted = page.cell(
+                cell.row, cell.column)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            guard_fact = (book.page(FIXED_POINT_ROUND).cell(
+                guard.row, guard.column) if guard.page == FIXED_POINT_ROUND
+                else None)
+            entries = tuple(entry for pair in changes for entry in pair
+                            if entry is not None)
+            cells = tuple(item[0] for item in entries)
+            parents = tuple(source for _cell, edges in entries
+                            for source, _stage in edges)
+            previous = book.latest_ref(SOURCE_EVIDENCE_FLUSH_ROUND,
+                (row[0], row[1] - 1)) if row[1] > 1 else None
+            prior_after = (None if previous is None else
+                           book.page(SOURCE_EVIDENCE_FLUSH_ROUND).cell(
+                               previous.row, previous.column)[1])
+            if (guard.row != ('whole-source-evidence-flush', row[0], row[1])
+                    or guard_fact is None
+                    or guard_fact[0] != bool(changes)
+                    or guard_fact[1] != _guard_digest(after)
+                    or bool(changes) != (before != after)
+                    or _apply_changes(before, changes) != after
+                    or any(item.page not in family for item in cells)
+                    or tuple(sorted(changes, key=lambda pair: repr(
+                        (pair[1] or pair[0])[0]))) != changes
+                    or any(old == new for old, new in changes)
+                    or any(not set(edges) <= set(book.edges_into(item))
+                           for item, edges in entries)
+                    or not {*cells, *parents, guard} <= sources
+                    or (row[1] > 1 and not restarted and prior_after != before)
+                    or (restarted and row[1] <= 1)
+                    or (not later_family_write
+                        and not any(next_row[0] == row[0]
+                                and next_row[1] > row[1]
+                                for next_row in page.rows())
+                        and after != _digest(_snapshot(book)))):
+                found.append(Finding('source-evidence-flush-round',
+                                     str(row[0]), row[1],
+                                     'whole-source round lost exact input, result or bounded guard causes'))
+        return found
+
+    @staticmethod
+    def _source_guarded_mapping_payload_findings(module: Any) -> list[Finding]:
+        """Rejoin each present-arm payload from its exact source cells."""
+        from .concordance_declarations import (
+            INGESTION_VALUE, SOURCE_GUARDED_MAPPING_PAYLOAD,
+            SOURCE_MAPPING_GET_READ, SOURCE_OPERATOR_KIND, SOURCE_SPAN,
+        )
+        from .source_guarded_payload import candidate_facts
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        if book is None:
+            return []
+        found = []
+        for row in book.page(SOURCE_OPERATOR_KIND).rows():
+            cell = book.latest_ref(SOURCE_OPERATOR_KIND, row)
+            operator = book.page(SOURCE_OPERATOR_KIND).cell(cell.row, cell.column)
+            if not isinstance(operator, str) or not operator.startswith('compare:'):
+                continue
+            sources = {source for source, _stage in book.edges_into(cell)}
+            ingestion = row[0]
+            spans = tuple(source for source in sources if source.page == SOURCE_SPAN)
+            if (ingestion.page != INGESTION_VALUE or ingestion not in sources
+                    or len(spans) != 1
+                    or book.page(SOURCE_SPAN).cell(spans[0].row, spans[0].column).kind != 'Compare'):
+                found.append(Finding('source-compare-operator', str(row), None,
+                                     'typed Compare lost its ingested occurrence'))
+        for row in book.page(SOURCE_GUARDED_MAPPING_PAYLOAD).rows():
+            cell = book.latest_ref(SOURCE_GUARDED_MAPPING_PAYLOAD, row)
+            facts = book.page(SOURCE_GUARDED_MAPPING_PAYLOAD).cell(
+                cell.row, cell.column)
+            read = facts[0] if facts else None
+            candidates = (() if read is None else
+                          candidate_facts(book, row[0], int(row[1]), read))
+            direct = {source for source, _stage in book.edges_into(cell)}
+            if (read is None or read.page != SOURCE_MAPPING_GET_READ
+                    or read.row[0:2] != row[0:2]
+                    or book.latest_ref(SOURCE_MAPPING_GET_READ, read.row) != read
+                    or (row, facts) not in candidates
+                    or not set(facts) <= direct):
+                found.append(Finding('source-guarded-mapping-payload',
+                                     str(row[0]), row[2],
+                                     'present payload lost its assignment, Is None guard, terminal return or arm edges'))
+        return found
+
+    @staticmethod
+    def _source_guarded_callable_findings(module: Any) -> list[Finding]:
+        """Check the guarded call's exact method and address source bridge."""
+        import ast
+        from ..common.tensors.topological_reducer import node_identity_cell
+        from ..transmogrifier.function_table import function_address_identity
+        from .concordance_declarations import (
+            CALLABLE_IDENTITY, CANONICAL_VALUE, CLASS_DECLARATION,
+            CLASS_METHOD_DECLARATION,
+            FUNCTION_ADDRESS, PROCESS_GRAPH_OPERANDS,
+            SOURCE_GUARDED_MAPPING_PAYLOAD, SOURCE_MAPPING_GET_READ,
+            SOURCE_SPAN, SOURCE_VALUE_CLASS,
+        )
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        if book is None:
+            return []
+        found = []
+        for row in book.page(CALLABLE_IDENTITY).rows():
+            callable_cell = book.latest_ref(CALLABLE_IDENTITY, row)
+            direct = {source for source, _stage in book.edges_into(callable_cell)}
+            guards = tuple(source for source in direct
+                           if source.page == SOURCE_GUARDED_MAPPING_PAYLOAD)
+            if not guards:
+                continue
+            valid = False
+            if len(guards) == 1:
+                guard = guards[0]
+                guarded = book.page(SOURCE_GUARDED_MAPPING_PAYLOAD).cell(
+                    guard.row, guard.column)
+                read = guarded[0] if guarded else None
+                stored = guarded[1] if len(guarded) > 1 else None
+                operands = guarded[-1] if guarded else None
+                methods = tuple(source for source in direct
+                                if source.page == CLASS_METHOD_DECLARATION)
+                classes = tuple(source for source in direct
+                                if source.page == SOURCE_VALUE_CLASS)
+                addresses = tuple(source for source in direct
+                                  if source.page == FUNCTION_ADDRESS)
+                spans = tuple(source for source in direct
+                              if source.page == SOURCE_SPAN)
+                calls = tuple(source for source in direct
+                              if source.page == CANONICAL_VALUE
+                              and source.row[-1] == row[1])
+                if (guard.row[0] == row[0] and guard.row[2] == row[1]
+                        and read is not None and read.page == SOURCE_MAPPING_GET_READ
+                        and stored is not None and operands is not None
+                        and operands.page == PROCESS_GRAPH_OPERANDS
+                        and len(methods) == len(classes) == len(addresses)
+                        == len(spans) == len(calls) == 1):
+                    method, class_cell, address_cell, method_span = (
+                        methods[0], classes[0], addresses[0], spans[0])
+                    read_fact = book.page(SOURCE_MAPPING_GET_READ).cell(
+                        read.row, read.column)
+                    class_fact = book.page(SOURCE_VALUE_CLASS).cell(
+                        class_cell.row, class_cell.column)
+                    method_fact = book.page(CLASS_METHOD_DECLARATION).cell(
+                        method.row, method.column)
+                    entries = tuple(
+                        entry for entry in (getattr(module, 'function_table', ()) or ())
+                        if entry.qualified_name == method_fact.graph_identity
+                        and (entry.metadata or {}).get('method_owner') == class_fact[0]
+                    )
+                    wrappers = tuple(
+                        entry.graph for entry in (getattr(module, 'function_table', ()) or ())
+                        if getattr(entry, 'graph', None) is not None
+                        and tuple(entry.graph.G.graph.get('authored_function_identity')
+                                  or ()) == row[0]
+                    )
+                    exact_accessor = False
+                    if len(wrappers) == 1 and row[1] in wrappers[0].G:
+                        wrapper = wrappers[0]
+                        expression = wrapper.G.nodes[row[1]].get('expr_obj')
+                        if (isinstance(expression, ast.Call)
+                                and isinstance(expression.func, ast.Attribute)
+                                and expression.func.attr == method.row[2]
+                                and node_identity_cell(wrapper, row[1], book=book)
+                                == calls[0]):
+                            accessor_ids = tuple(
+                                int(node) for node, data in wrapper.G.nodes(data=True)
+                                if data.get('expr_obj') is expression.func)
+                            exact_accessor = (
+                                len(accessor_ids) == 1
+                                and node_identity_cell(wrapper, accessor_ids[0],
+                                                       book=book) in direct)
+                    declarations = tuple(source for source in direct
+                                         if source.page == CLASS_DECLARATION)
+                    method_sources = {source for source, _stage in
+                                      book.edges_into(method)}
+                    address_sources = {source for source, _stage in
+                                       book.edges_into(address_cell)}
+                    operand_fact = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operands.row, operands.column)
+                    valid = (
+                        exact_accessor
+                        and len(declarations) == 1
+                        and class_fact[1:] == (1, 'source class construction')
+                        and class_cell.row == (read_fact[1].row[0], stored.row[-1])
+                        and declarations[0].row == (read_fact[1].row[0][0],
+                                                     class_fact[0])
+                        and method.row[:2] == declarations[0].row
+                        and method_span.row[:2] == declarations[0].row
+                        and book.page(SOURCE_SPAN).cell(
+                            method_span.row, method_span.column).kind
+                        in ('FunctionDef', 'AsyncFunctionDef')
+                        and method_span in method_sources
+                        and method_span in address_sources
+                        and book.latest_ref(SOURCE_GUARDED_MAPPING_PAYLOAD,
+                                            guard.row) == guard
+                        and len(entries) == 1
+                        and address_cell.row == (
+                            function_address_identity(entries[0]),)
+                        and book.page(FUNCTION_ADDRESS).cell(
+                            address_cell.row, address_cell.column)
+                        == int(entries[0].reference.address)
+                        and book.page(FUNCTION_ADDRESS).cell(
+                            address_cell.row, address_cell.column)
+                        == book.page(CALLABLE_IDENTITY).cell(
+                            callable_cell.row, callable_cell.column)
+                        and guarded[-2] == calls[0]
+                        and (read_fact[7], 'operand') in operand_fact
+                        and all(source in direct for source in
+                                (read, stored, operands, declarations[0],
+                                 method, class_cell, address_cell, method_span))
+                    )
+            if not valid:
+                found.append(Finding(
+                    'source-guarded-callable', str(row[0]), row[1],
+                    'guarded callable lost its stored class, exact method span, or function address bridge',
+                ))
+        return found
+
+    @staticmethod
+    def _source_mapping_get_key_version_demand_findings(module: Any) -> list[Finding]:
+        """A later unproved key cannot be compared to the requested key."""
+        import ast
+        from ..common.tensors.topological_reducer import node_identity_cell
+        from .concordance_declarations import (
+            PROCESS_GRAPH_OPERANDS, REDUCER_FIELD_STATE,
+            SOURCE_AGGREGATE_LAYOUT, SOURCE_CALL_FIELD_STATE_TRANSFER,
+            SOURCE_LITERAL_VALUE, SOURCE_MAPPING_GET_KEY_VERSION_DEMAND,
+            SOURCE_SEQUENCE_MUTATION, FieldState, FieldStateKind,
+        )
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_MAPPING_GET_KEY_VERSION_DEMAND)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_MAPPING_GET_KEY_VERSION_DEMAND, row)
+            fact = page.cell(cell.row, cell.column)
+            if not isinstance(fact, tuple) or len(fact) != 13:
+                found.append(Finding('source-mapping-get-key-version-demand',
+                                     str(row[0]), row[1], 'incomplete key demand'))
+                continue
+            (reason, transfer, state, mutation, layout, later_key,
+             read_key, observed_cell, call, base, key, operands,
+             read_mutation) = fact
+            transferred = (book.page(SOURCE_CALL_FIELD_STATE_TRANSFER).cell(
+                transfer.row, transfer.column,
+            ) if transfer.page == SOURCE_CALL_FIELD_STATE_TRANSFER else None)
+            store = (book.page(SOURCE_SEQUENCE_MUTATION).cell(
+                mutation.row, mutation.column,
+            ) if mutation.page == SOURCE_SEQUENCE_MUTATION else None)
+            get = (book.page(SOURCE_SEQUENCE_MUTATION).cell(
+                read_mutation.row, read_mutation.column,
+            ) if read_mutation.page == SOURCE_SEQUENCE_MUTATION else None)
+            layout_fact = (book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+                layout.row, layout.column,
+            ) if layout.page == SOURCE_AGGREGATE_LAYOUT else None)
+            observed = (book.page(REDUCER_FIELD_STATE).cell(
+                observed_cell.row, observed_cell.column,
+            ) if observed_cell.page == REDUCER_FIELD_STATE else None)
+            operand_fact = (book.page(PROCESS_GRAPH_OPERANDS).cell(
+                operands.row, operands.column,
+            ) if operands.page == PROCESS_GRAPH_OPERANDS else None)
+            wrappers = tuple(
+                entry.graph for entry in (getattr(module, 'function_table', ()) or ())
+                if getattr(entry, 'graph', None) is not None
+                and tuple(entry.graph.G.graph.get('authored_function_identity') or ()) == row[0]
+            )
+            exact_call = False
+            if len(wrappers) == 1 and row[1] in wrappers[0].G:
+                expression = wrappers[0].G.nodes[row[1]].get('expr_obj')
+                exact_call = (
+                    isinstance(expression, ast.Call)
+                    and isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr == 'get'
+                    and len(expression.args) == 1 and not expression.keywords
+                    and node_identity_cell(wrappers[0], row[1], book=book) == call
+                )
+            direct = {source for source, _stage in book.edges_into(cell)}
+            if not (
+                reason == 'later_store_key_equality_unproved'
+                and transfer.row[3] == row[0]
+                and transfer.row[5] == row[2]
+                and transferred is not None
+                and transferred[6:9] == (state, mutation, observed_cell)
+                and store is not None and len(store) == 5
+                and store[1:3] == ('setitem', 'unique')
+                and store[4] == 'mapping' and len(store[3]) == 2
+                and layout_fact is not None
+                and layout_fact.aggregate_kind == 'dict'
+                and tuple(member.value_id for member in layout_fact.members)
+                == tuple(store[3])
+                and layout_fact.members[0].value_cell == later_key
+                and layout.row == (state.row[0], mutation.row[1])
+                and book.latest_ref(SOURCE_LITERAL_VALUE,
+                    (mutation.row[0], store[3][0])) is None
+                and read_key.page == SOURCE_LITERAL_VALUE
+                and isinstance(book.page(SOURCE_LITERAL_VALUE).cell(
+                    read_key.row, read_key.column,
+                ), (str, int, float, bool, bytes))
+                and isinstance(observed, FieldState)
+                and observed.kind is FieldStateKind.OBSERVED
+                and observed.value == base
+                and operand_fact is not None
+                and set(operand_fact) == {(base, 'operand'), (key, 'arg:0')}
+                and get == (base.row[-1], 'unclassified_call:get',
+                            'unique', (key.row[-1],), 'mapping')
+                and read_key.row == (row[0], key.row[-1])
+                and call.row[-1] == row[1]
+                and exact_call and set(fact[1:]) <= direct
+            ):
+                found.append(Finding('source-mapping-get-key-version-demand',
+                                     str(row[0]), row[1],
+                                     'later key demand lost its transfer, key, or exact read'))
+        return found
+
+    @staticmethod
+    def _source_mapping_get_copy_state_demand_findings(module: Any) -> list[Finding]:
+        """A copied mapping has an exact source, but no copy state contract."""
+        import ast
+        from ..common.tensors.topological_reducer import node_identity_cell
+        from .control_activity import binding
+        from .concordance_declarations import (
+            PROCESS_GRAPH_OPERANDS, REDUCER_FIELD_STATE,
+            SOURCE_CALL_FIELD_STATE_TRANSFER,
+            SOURCE_MAPPING_GET_COPY_STATE_DEMAND, SOURCE_SEQUENCE_MUTATION,
+            FieldState, FieldStateKind,
+        )
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_MAPPING_GET_COPY_STATE_DEMAND)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_MAPPING_GET_COPY_STATE_DEMAND, row)
+            fact = page.cell(cell.row, cell.column)
+            if not isinstance(fact, tuple) or len(fact) != 12:
+                found.append(Finding('source-mapping-get-copy-state-demand',
+                                     str(row[0]), row[1], 'incomplete copy demand'))
+                continue
+            (reason, transfer, observed_state, observed_value,
+             copy_mutation, copy_call, copy_operands, copy_binding,
+             get_call, get_operands, key, get_binding) = fact
+            transferred = (book.page(SOURCE_CALL_FIELD_STATE_TRANSFER).cell(
+                transfer.row, transfer.column,
+            ) if transfer.page == SOURCE_CALL_FIELD_STATE_TRANSFER else None)
+            observed = (book.page(REDUCER_FIELD_STATE).cell(
+                observed_state.row, observed_state.column,
+            ) if observed_state.page == REDUCER_FIELD_STATE else None)
+            mutation = (book.page(SOURCE_SEQUENCE_MUTATION).cell(
+                copy_mutation.row, copy_mutation.column,
+            ) if copy_mutation.page == SOURCE_SEQUENCE_MUTATION else None)
+            copy_inputs = (book.page(PROCESS_GRAPH_OPERANDS).cell(
+                copy_operands.row, copy_operands.column,
+            ) if copy_operands.page == PROCESS_GRAPH_OPERANDS else None)
+            get_inputs = (book.page(PROCESS_GRAPH_OPERANDS).cell(
+                get_operands.row, get_operands.column,
+            ) if get_operands.page == PROCESS_GRAPH_OPERANDS else None)
+            wrappers = tuple(
+                entry.graph for entry in (getattr(module, 'function_table', ()) or ())
+                if getattr(entry, 'graph', None) is not None
+                and tuple(entry.graph.G.graph.get('authored_function_identity') or ()) == row[0]
+            )
+            exact_occurrences = False
+            if len(wrappers) == 1:
+                wrapper = wrappers[0]
+                copy_id, get_id = copy_call.row[-1], get_call.row[-1]
+                if copy_id in wrapper.G and get_id in wrapper.G:
+                    copy_expr = wrapper.G.nodes[copy_id].get('expr_obj')
+                    get_expr = wrapper.G.nodes[get_id].get('expr_obj')
+                    exact_occurrences = (
+                        isinstance(copy_expr, ast.Call)
+                        and isinstance(copy_expr.func, ast.Attribute)
+                        and copy_expr.func.attr == 'copy'
+                        and not copy_expr.args and not copy_expr.keywords
+                        and isinstance(get_expr, ast.Call)
+                        and isinstance(get_expr.func, ast.Attribute)
+                        and get_expr.func.attr == 'get'
+                        and len(get_expr.args) == 1 and not get_expr.keywords
+                        and node_identity_cell(wrapper, copy_id, book=book) == copy_call
+                        and node_identity_cell(wrapper, get_id, book=book) == get_call
+                    )
+                    if exact_occurrences:
+                        try:
+                            exact_occurrences = (
+                                binding(wrapper, copy_id, book=book,
+                                        scope=row[0])[1] == copy_binding
+                                and binding(wrapper, get_id, book=book,
+                                            scope=row[0])[1] == get_binding
+                            )
+                        except (ValueError, KeyError):
+                            exact_occurrences = False
+            causes = {source for source, _stage in book.edges_into(cell)}
+            if not (
+                reason == 'mapping_copy_alias_or_state_contract'
+                and transfer.row[3] == row[0]
+                and transfer.row[5] == row[2]
+                and transferred is not None and transferred[8] == observed_state
+                and isinstance(observed, FieldState)
+                and observed.kind is FieldStateKind.OBSERVED
+                and observed.value == observed_value
+                and mutation == (observed_value.row[-1],
+                                 'unclassified_call:copy', 'unique', (), 'mapping')
+                and copy_inputs == ((observed_value, 'operand'),)
+                and set(get_inputs or ()) == {(copy_call, 'operand'),
+                                              (key, 'arg:0')}
+                and copy_mutation.row == (row[0], copy_call.row[-1])
+                and get_call.row[-1] == row[1]
+                and exact_occurrences
+                and set(fact[1:]) <= causes
+            ):
+                found.append(Finding('source-mapping-get-copy-state-demand',
+                                     str(row[0]), row[1],
+                                     'copy demand lost its exact transfer, operands, or source occurrences'))
+        return found
+
+    @staticmethod
+    def _source_mapping_get_read_findings(module: Any) -> list[Finding]:
+        """Check an exact present-key mapping read and its pure source prefix."""
+        import ast
+        from ..common.tensors.topological_reducer import node_identity_cell
+        from .concordance_declarations import (
+            PROCESS_GRAPH_OPERANDS, REDUCER_FIELD_STATE,
+            SOURCE_ACTIVITY_BINDING, SOURCE_ACTIVITY_CALL,
+            SOURCE_ACTIVITY_EDGE, SOURCE_AGGREGATE_LAYOUT,
+            SOURCE_CALL_FIELD_STATE_TRANSFER, SOURCE_LITERAL_VALUE,
+            SOURCE_MAPPING_GET_READ, SOURCE_SEQUENCE_MUTATION,
+            FieldState, FieldStateKind,
+        )
+        from .control_activity import normal_mapping_get_prefix
+        from .source_mapping_get import reaching_key_version
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_MAPPING_GET_READ)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_MAPPING_GET_READ, row)
+            fact = page.cell(cell.row, cell.column)
+            if not isinstance(fact, tuple) or len(fact) not in (19, 20):
+                found.append(Finding("source-mapping-get-read", str(row[0]), row[1],
+                                     "mapping read has no complete exact proof"))
+                continue
+            (transfer, store, layout, store_key, read_key, stored_value,
+             observed_cell, call, method, base, key, operands,
+             read_call, call_binding, activity_call, method_binding,
+             method_edge, nodes, edges) = fact[:19]
+            sources = {source for source, _stage in book.edges_into(cell)}
+            transferred = (book.page(SOURCE_CALL_FIELD_STATE_TRANSFER).cell(
+                transfer.row, transfer.column,
+            ) if transfer.page == SOURCE_CALL_FIELD_STATE_TRANSFER else None)
+            store_fact = (book.page(SOURCE_SEQUENCE_MUTATION).cell(
+                store.row, store.column,
+            ) if store.page == SOURCE_SEQUENCE_MUTATION else None)
+            read_fact = (book.page(SOURCE_SEQUENCE_MUTATION).cell(
+                read_call.row, read_call.column,
+            ) if read_call.page == SOURCE_SEQUENCE_MUTATION else None)
+            layout_fact = (book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+                layout.row, layout.column,
+            ) if layout.page == SOURCE_AGGREGATE_LAYOUT else None)
+            observed = (book.page(REDUCER_FIELD_STATE).cell(
+                observed_cell.row, observed_cell.column,
+            ) if observed_cell.page == REDUCER_FIELD_STATE else None)
+            operand_fact = (book.page(PROCESS_GRAPH_OPERANDS).cell(
+                operands.row, operands.column,
+            ) if operands.page == PROCESS_GRAPH_OPERANDS else None)
+            call_points = (book.page(SOURCE_ACTIVITY_BINDING).cell(
+                call_binding.row, call_binding.column,
+            ) if call_binding.page == SOURCE_ACTIVITY_BINDING else None)
+            method_points = (book.page(SOURCE_ACTIVITY_BINDING).cell(
+                method_binding.row, method_binding.column,
+            ) if method_binding.page == SOURCE_ACTIVITY_BINDING else None)
+            activity_fact = (book.page(SOURCE_ACTIVITY_CALL).cell(
+                activity_call.row, activity_call.column,
+            ) if activity_call.page == SOURCE_ACTIVITY_CALL else None)
+            literal_page = book.page(SOURCE_LITERAL_VALUE)
+            stored_literal = (literal_page.cell(store_key.row, store_key.column)
+                              if store_key.page == SOURCE_LITERAL_VALUE else None)
+            read_literal = (literal_page.cell(read_key.row, read_key.column)
+                            if read_key.page == SOURCE_LITERAL_VALUE else None)
+            version = (
+                reaching_key_version(book, transferred, read_literal)
+                if transferred is not None else None
+            )
+            version_cells = (() if version is None else tuple(dict.fromkeys((
+                *((version[0],) if version[5] else ()),
+                *(item for hop in version[5] for item in hop),
+            ))))
+            version_exact = (
+                version is not None
+                and version[1:5] == (store, layout, store_key, stored_value)
+                and (
+                    (len(fact) == 19 and not version[5])
+                    or (len(fact) == 20
+                        and fact[19] == (version[0], version[5])
+                        and bool(version[5]))
+                )
+            )
+            direct_method = (book.latest_ref(SOURCE_ACTIVITY_EDGE, (
+                row[0], call_points[0], method_points[0], 'flow',
+            )) if call_points is not None and method_points is not None else None)
+            def ancestry(value):
+                pending, seen = [value], set()
+                while pending:
+                    current = pending.pop()
+                    if current in seen:
+                        continue
+                    seen.add(current)
+                    pending.extend(source for source, _stage in
+                                   book.edges_into(current))
+                return seen
+            wrappers = tuple(
+                entry.graph for entry in (getattr(module, 'function_table', ()) or ())
+                if getattr(entry, 'graph', None) is not None
+                and tuple(entry.graph.G.graph.get('authored_function_identity') or ()) == row[0]
+            )
+            exact_method_occurrence = False
+            if len(wrappers) == 1 and row[1] in wrappers[0].G:
+                wrapper = wrappers[0]
+                expression = wrapper.G.nodes[row[1]].get('expr_obj')
+                if (isinstance(expression, ast.Call)
+                        and isinstance(expression.func, ast.Attribute)
+                        and expression.func.attr == 'get'
+                        and len(expression.args) == 1
+                        and not expression.keywords
+                        and node_identity_cell(wrapper, row[1], book=book) == call):
+                    method_ids = tuple(
+                        int(node_id) for node_id, data in wrapper.G.nodes(data=True)
+                        if data.get('expr_obj') is expression.func
+                    )
+                    exact_method_occurrence = (
+                        len(method_ids) == 1
+                        and node_identity_cell(
+                            wrapper, method_ids[0], book=book,
+                        ) == method
+                    )
+            valid = (
+                exact_method_occurrence
+                and
+                transfer.row[3] == row[0] and transfer.row[5] == row[2]
+                and transferred is not None and version_exact
+                and transferred[8] == observed_cell
+                and store_fact is not None and len(store_fact) == 5
+                and store_fact[1:3] == ('setitem', 'unique')
+                and store_fact[4] == 'mapping' and len(store_fact[3]) == 2
+                and layout_fact is not None and layout_fact.aggregate_kind == 'dict'
+                and len(layout_fact.members) == 2
+                and tuple(member.value_id for member in layout_fact.members)
+                == tuple(store_fact[3])
+                and layout_fact.members[1].value_cell == stored_value
+                and layout.row == (transferred[6].row[0], store.row[1])
+                and store_key.row == (store.row[0], store_fact[3][0])
+                and read_key.row == (row[0], key.row[-1])
+                and stored_literal == read_literal
+                and isinstance(stored_literal, (str, int, float, bool, bytes))
+                and isinstance(observed, FieldState)
+                and observed.kind is FieldStateKind.OBSERVED
+                and observed.value == base
+                and call.row[-1] == row[1]
+                and operand_fact is not None
+                and set(operand_fact) == {(base, 'operand'), (key, 'arg:0')}
+                and read_fact == (base.row[-1], 'unclassified_call:get',
+                                  'unique', (key.row[-1],), 'mapping')
+                and activity_fact == (1, ())
+                and call_points is not None and method_points is not None
+                and activity_call.row == (row[0], call_points[0].row[1])
+                and method_edge == direct_method
+                and call_binding.row[1] in ancestry(call)
+                and method_binding.row[1] in ancestry(method)
+                and normal_mapping_get_prefix(
+                    book, row[0], nodes[0], call_points[0],
+                ) == (nodes, edges)
+                and all(source in sources for source in (
+                    transfer, store, layout, store_key, read_key, stored_value,
+                    observed_cell, call, method, base, key, operands,
+                    read_call, call_binding, activity_call, method_binding,
+                    method_edge, *nodes, *edges,
+                    *version_cells,
+                ))
+            )
+            if not valid:
+                found.append(Finding(
+                    "source-mapping-get-read", str(row[0]), row[1],
+                    "mapping get lost its transferred store, key, call, or pure-prefix proof",
+                ))
+        return found
+
+    @staticmethod
+    def _source_call_field_state_transfer_findings(module: Any) -> list[Finding]:
+        """Check the source field cursor join without assigning payload class."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CLASS_FIELD_DECLARATION, REDUCER_FIELD_STATE,
+            SOURCE_CALL_ACTIVITY_CORRIDOR, SOURCE_CALL_FIELD_EFFECT_COMPLETION,
+            SOURCE_CALL_FIELD_STATE_TRANSFER, SOURCE_CALL_OBJECT_ALIAS,
+            SOURCE_FUNCTION_EXIT_FIELD_STATE, SOURCE_SEQUENCE_MUTATION,
+            FieldState, FieldStateKind,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_CALL_FIELD_STATE_TRANSFER)
+        def has_field_declaration_cause(state_cell: Ref, declaration: Ref) -> bool:
+            current, seen = state_cell, set()
+            while current not in seen and current.page == REDUCER_FIELD_STATE:
+                seen.add(current)
+                if current.row[-1] != declaration.row[-1]:
+                    return False
+                causes = {source for source, _stage in book.edges_into(current)}
+                predecessors = tuple(source for source in causes
+                                     if source.page == REDUCER_FIELD_STATE)
+                if not predecessors:
+                    return declaration in causes
+                if len(predecessors) != 1:
+                    return False
+                current = predecessors[0]
+            return False
+
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_CALL_FIELD_STATE_TRANSFER, row)
+            fact = page.cell(receipt.row, receipt.column)
+            if not isinstance(fact, tuple) or len(fact) != 9:
+                found.append(Finding(
+                    "source-call-field-state-transfer", str(row[0]), row[1],
+                    "field transfer has no complete source cell tuple",
+                ))
+                continue
+            (completion, corridor, publisher_alias, consumer_alias,
+             field_declaration, exit_receipt, written_state, mutation,
+             observed_state) = fact
+            completion_fact = book.page(SOURCE_CALL_FIELD_EFFECT_COMPLETION).cell(
+                completion.row, completion.column,
+            ) if completion.page == SOURCE_CALL_FIELD_EFFECT_COMPLETION else None
+            corridor_fact = book.page(SOURCE_CALL_ACTIVITY_CORRIDOR).cell(
+                corridor.row, corridor.column,
+            ) if corridor.page == SOURCE_CALL_ACTIVITY_CORRIDOR else None
+            publisher_fact = book.page(SOURCE_CALL_OBJECT_ALIAS).cell(
+                publisher_alias.row, publisher_alias.column,
+            ) if publisher_alias.page == SOURCE_CALL_OBJECT_ALIAS else None
+            consumer_fact = book.page(SOURCE_CALL_OBJECT_ALIAS).cell(
+                consumer_alias.row, consumer_alias.column,
+            ) if consumer_alias.page == SOURCE_CALL_OBJECT_ALIAS else None
+            exit_fact = book.page(SOURCE_FUNCTION_EXIT_FIELD_STATE).cell(
+                exit_receipt.row, exit_receipt.column,
+            ) if exit_receipt.page == SOURCE_FUNCTION_EXIT_FIELD_STATE else None
+            written = book.page(REDUCER_FIELD_STATE).cell(
+                written_state.row, written_state.column,
+            ) if written_state.page == REDUCER_FIELD_STATE else None
+            observed = book.page(REDUCER_FIELD_STATE).cell(
+                observed_state.row, observed_state.column,
+            ) if observed_state.page == REDUCER_FIELD_STATE else None
+            mutation_fact = book.page(SOURCE_SEQUENCE_MUTATION).cell(
+                mutation.row, mutation.column,
+            ) if mutation.page == SOURCE_SEQUENCE_MUTATION else None
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            valid = (
+                completion_fact is not None and corridor_fact is not None
+                and publisher_fact is not None and consumer_fact is not None
+                and isinstance(exit_fact, tuple) and len(exit_fact) == 5
+                and isinstance(written, FieldState)
+                and isinstance(observed, FieldState)
+                and completion.row[:2] == row[:2]
+                and completion.row[4] == row[5]
+                and corridor.row == (row[0], row[1], row[2],
+                                    publisher_fact[0], row[5])
+                and corridor_fact[0] == completion
+                and corridor_fact[1] == consumer_alias
+                and publisher_alias.row == completion.row[:4]
+                and consumer_alias.row == (row[0], row[2], row[3], row[4])
+                and completion_fact[0] == publisher_fact[0] == consumer_fact[0]
+                and completion_fact[2] == exit_receipt
+                and publisher_fact[4] == consumer_fact[4]
+                and field_declaration.page == CLASS_FIELD_DECLARATION
+                and field_declaration.row == (*publisher_fact[4].row, row[5])
+                and has_field_declaration_cause(written_state, field_declaration)
+                and has_field_declaration_cause(observed_state, field_declaration)
+                and exit_receipt.row == (completion.row[2], completion.row[3], row[5])
+                and exit_fact[0] == completion_fact[1]
+                and exit_fact[1] == written_state
+                and written.kind is FieldStateKind.ELEMENT_WRITTEN
+                and written.value == written.effect
+                and written.effect.page == CANONICAL_VALUE
+                and mutation.row == (completion.row[2], written.effect.row[-1])
+                and isinstance(mutation_fact, tuple) and len(mutation_fact) == 5
+                and mutation_fact[1] == "setitem"
+                and mutation_fact[4] == "mapping"
+                and observed_state.row == (consumer_fact[1].row[0], row[4], row[5])
+                and observed.kind is FieldStateKind.OBSERVED
+                and observed.value.page == CANONICAL_VALUE
+                and {completion, corridor, publisher_alias, consumer_alias,
+                     publisher_fact[4], field_declaration, exit_receipt,
+                     written_state, mutation, observed_state} <= sources
+            )
+            if not valid:
+                found.append(Finding(
+                    "source-call-field-state-transfer", str(row[0]), row[1],
+                    "field transfer lost the completed write, closed corridor, alias or observed formal field",
+                ))
+        return found
+
+    @staticmethod
+    def _source_call_activity_corridor_findings(module: Any) -> list[Finding]:
+        """Re-enumerate every outgoing source edge of a certified interval."""
+        from .concordance_declarations import (
+            SOURCE_ACTIVITY_BINDING, SOURCE_CALL_ACTIVITY_CORRIDOR,
+            SOURCE_CALL_FIELD_EFFECT_COMPLETION, SOURCE_CALL_OBJECT_ALIAS,
+        )
+        from .control_activity import normal_call_activity_corridor
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_CALL_ACTIVITY_CORRIDOR)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_CALL_ACTIVITY_CORRIDOR, row)
+            (finished, alias, publisher_binding, consumer_binding,
+             start, end, nodes, edges) = page.cell(cell.row, cell.column)
+            causes = {source for source, _stage in book.edges_into(cell)}
+            finished_fact = (book.page(SOURCE_CALL_FIELD_EFFECT_COMPLETION).cell(
+                finished.row, finished.column,
+            ) if finished.page == SOURCE_CALL_FIELD_EFFECT_COMPLETION else None)
+            alias_fact = (book.page(SOURCE_CALL_OBJECT_ALIAS).cell(
+                alias.row, alias.column,
+            ) if alias.page == SOURCE_CALL_OBJECT_ALIAS else None)
+            publisher_points = (book.page(SOURCE_ACTIVITY_BINDING).cell(
+                publisher_binding.row, publisher_binding.column,
+            ) if publisher_binding.page == SOURCE_ACTIVITY_BINDING else None)
+            consumer_points = (book.page(SOURCE_ACTIVITY_BINDING).cell(
+                consumer_binding.row, consumer_binding.column,
+            ) if consumer_binding.page == SOURCE_ACTIVITY_BINDING else None)
+            recomputed = normal_call_activity_corridor(book, row[0], start, end)
+            if (finished.row[0] != row[0] or finished.row[1] != row[1]
+                    or finished.row[4] != row[4]
+                    or alias.row[0] != row[0] or alias.row[1] != row[2]
+                    or finished_fact is None or alias_fact is None
+                    or finished_fact[0] != row[3] or alias_fact[0] != row[3]
+                    or finished_fact[4] != publisher_binding
+                    or publisher_points is None or publisher_points[1] != start
+                    or consumer_points is None or consumer_points[0] != end
+                    or recomputed != (nodes, edges)
+                    or any(source not in causes for source in (
+                        finished, alias, publisher_binding, consumer_binding,
+                        *nodes, *edges,
+                    ))):
+                found.append(Finding(
+                    "source-call-activity-corridor", str(row[0]), row[1],
+                    "normal caller interval lost its exact call, alias, or exhaustive flow proof",
+                ))
+        return found
+
+    @staticmethod
+    def _source_call_field_effect_completion_findings(module: Any) -> list[Finding]:
+        """Check a successful callee field exit against the reached Call exit."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE, SOURCE_ACTIVITY_BINDING,
+            SOURCE_ACTIVITY_EDGE, SOURCE_ACTIVITY_NODE,
+            SOURCE_CALL_FIELD_EFFECT_COMPLETION, SOURCE_CALL_OBJECT_ALIAS,
+            SOURCE_FUNCTION_EXIT_FIELD_STATE, SOURCE_FUNCTION_REACHABILITY,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_CALL_FIELD_EFFECT_COMPLETION)
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_CALL_FIELD_EFFECT_COMPLETION, row)
+            fact = page.cell(receipt.row, receipt.column)
+            if not isinstance(fact, tuple) or len(fact) != 6:
+                found.append(Finding(
+                    "source-call-field-effect-completion", str(row[0]), row[1],
+                    "completion receipt has no exact actual, formal and exit cells",
+                ))
+                continue
+            actual, formal, exit_receipt, callee_exit, call_binding, call_exit = fact
+            alias = book.latest_ref(SOURCE_CALL_OBJECT_ALIAS, row[:4])
+            reach = book.latest_ref(SOURCE_FUNCTION_REACHABILITY, row[:3])
+            alias_fact = (
+                book.page(SOURCE_CALL_OBJECT_ALIAS).cell(alias.row, alias.column)
+                if alias is not None else None
+            )
+            exit_fact = (
+                book.page(SOURCE_FUNCTION_EXIT_FIELD_STATE).cell(
+                    exit_receipt.row, exit_receipt.column,
+                ) if isinstance(exit_receipt, Ref)
+                and exit_receipt.page == SOURCE_FUNCTION_EXIT_FIELD_STATE else None
+            )
+            call_cell = (
+                book.latest_ref(CANONICAL_VALUE, (actual.row[0], row[1]))
+                if isinstance(actual, Ref) and actual.page == CANONICAL_VALUE
+                else None
+            )
+            call_sources = (
+                tuple(source for source, _stage in book.edges_into(call_cell)
+                      if source.page == INGESTION_VALUE)
+                if call_cell is not None else ()
+            )
+            binding_fact = (
+                book.page(SOURCE_ACTIVITY_BINDING).cell(
+                    call_binding.row, call_binding.column,
+                ) if isinstance(call_binding, Ref)
+                and call_binding.page == SOURCE_ACTIVITY_BINDING else None
+            )
+            callee_fact = (
+                book.page(SOURCE_ACTIVITY_NODE).cell(
+                    callee_exit.row, callee_exit.column,
+                ) if isinstance(callee_exit, Ref)
+                and callee_exit.page == SOURCE_ACTIVITY_NODE else None
+            )
+            call_exit_fact = (
+                book.page(SOURCE_ACTIVITY_NODE).cell(
+                    call_exit.row, call_exit.column,
+                ) if isinstance(call_exit, Ref)
+                and call_exit.page == SOURCE_ACTIVITY_NODE else None
+            )
+            incoming = tuple(
+                edge_row for edge_row in book.page(SOURCE_ACTIVITY_EDGE).rows()
+                if edge_row[0] == row[2] and edge_row[2] == callee_exit
+            )
+            sources = {source for source, _stage in book.edges_into(receipt)}
+            flow = exit_fact[4] if isinstance(exit_fact, tuple) and len(exit_fact) == 5 else None
+            valid = (
+                alias is not None and reach is not None
+                and isinstance(alias_fact, tuple) and len(alias_fact) == 5
+                and alias_fact[0] == actual
+                and isinstance(alias_fact[1], Ref)
+                and isinstance(formal, Ref) and formal.page == CANONICAL_VALUE
+                and formal.row[-1] == row[3]
+                and book.latest_ref(CANONICAL_VALUE, (
+                    alias_fact[1].row[0], row[3],
+                )) == formal
+                and isinstance(exit_fact, tuple) and len(exit_fact) == 5
+                and exit_receipt.row == (row[2], row[3], row[4])
+                and exit_fact[0] == formal and exit_fact[2] == callee_exit
+                and isinstance(flow, Ref) and flow.page == SOURCE_ACTIVITY_EDGE
+                and len(incoming) == 1 and incoming[0] == flow.row
+                and flow.row[3] == "flow"
+                and callee_fact is not None and callee_fact[0] == "FunctionDef"
+                and callee_exit.row[0] == row[2]
+                and callee_exit.row[-1] == "exit"
+                and len(call_sources) == 1
+                and isinstance(call_binding, Ref)
+                and call_binding.row == (row[0], call_sources[0])
+                and binding_fact is not None and binding_fact[1] == call_exit
+                and call_exit_fact is not None and call_exit_fact[0] == "Call"
+                and call_exit.row[0] == row[0]
+                and call_exit.row[-1] == "exit"
+                and {reach, alias, call_cell, actual, formal,
+                     exit_receipt, callee_exit, flow,
+                     call_binding, call_exit} <= sources
+            )
+            if not valid:
+                found.append(Finding(
+                    "source-call-field-effect-completion", str(row[0]), row[1],
+                    "completion lost its reached call, alias or successful function exit",
+                ))
+        return found
+
+    @staticmethod
+    def _source_call_object_alias_findings(module: Any) -> list[Finding]:
+        """Check a call's record alias against the exact formal and class cells."""
+        from .concordance_declarations import (
+            CLASS_DECLARATION, PARAMETER_ANNOTATION, SOURCE_CALL_ACTUAL_FORMAL,
+            SOURCE_CALL_OBJECT_ALIAS, SOURCE_PARAMETER_MEMORY_CONTRACT,
+            SOURCE_VALUE_CLASS,
+        )
+        from ..transmogrifier.function_table import (
+            ParameterAccess, ParameterContract, ParameterScope,
+            ParameterStorage, ParameterTransfer,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        alias_page = book.page(SOURCE_CALL_OBJECT_ALIAS)
+        for row in alias_page.rows():
+            alias = book.latest_ref(SOURCE_CALL_OBJECT_ALIAS, row)
+            actual, formal_binding, memory, actual_class, declaration = (
+                alias_page.cell(alias.row, alias.column)
+            )
+            sources = {source for source, _stage in book.edges_into(alias)}
+            binding = book.latest_ref(SOURCE_CALL_ACTUAL_FORMAL, row)
+            binding_fact = (None if binding is None else
+                            book.page(SOURCE_CALL_ACTUAL_FORMAL).cell(
+                                binding.row, binding.column,
+                            ))
+            memory_fact = (None if memory.page != SOURCE_PARAMETER_MEMORY_CONTRACT
+                           else book.page(SOURCE_PARAMETER_MEMORY_CONTRACT).cell(
+                               memory.row, memory.column,
+                           ))
+            contract = (memory_fact[0] if isinstance(memory_fact, tuple)
+                        and len(memory_fact) == 1 else None)
+            memory_sources = ({source for source, _stage in book.edges_into(memory)}
+                              if memory_fact is not None else set())
+            annotation = (book.latest_ref(
+                PARAMETER_ANNOTATION, (*row[2], binding_fact[2]),
+            ) if binding_fact is not None else None)
+            annotation_sources = ({source for source, _stage in
+                                   book.edges_into(annotation)}
+                                  if annotation is not None else set())
+            class_fact = (book.page(SOURCE_VALUE_CLASS).cell(
+                actual_class.row, actual_class.column,
+            ) if actual_class.page == SOURCE_VALUE_CLASS else None)
+            valid = (
+                binding in sources
+                and all(cell in sources for cell in (
+                    actual, formal_binding, memory, actual_class, declaration,
+                ))
+                and binding_fact is not None
+                and binding_fact[0] == actual
+                and binding_fact[4] == formal_binding
+                and memory.row == (row[2], binding_fact[2])
+                and annotation in memory_sources
+                and any(source.page == SOURCE_PARAMETER_MEMORY_CONTRACT
+                        for source in memory_sources)
+                and formal_binding in memory_sources
+                and declaration in memory_sources
+                and declaration in annotation_sources
+                and declaration.page == CLASS_DECLARATION
+                and declaration.row[0] == row[0][0]
+                and actual_class.row == (row[0], actual.row[-1])
+                and isinstance(class_fact, tuple) and len(class_fact) >= 2
+                and class_fact[0] == declaration.row[1]
+                and isinstance(contract, ParameterContract)
+                and contract.name == binding_fact[2]
+                and contract.transfer is ParameterTransfer.ALIAS
+                and contract.access is ParameterAccess.INOUT
+                and contract.storage is ParameterStorage.RECORD
+                and contract.scope is ParameterScope.CALLER
+            )
+            if not valid:
+                found.append(Finding(
+                    "source-call-object-alias", str(row[0]), row[1],
+                    "call alias lost its actual, formal contract, or class proof",
+                ))
+        return found
+
+    @staticmethod
+    def _source_call_actual_formal_findings(module: Any) -> list[Finding]:
+        """Check source call-frame bindings against their exact graph receipts."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, NAME_BINDING, PROCESS_GRAPH_OPERANDS,
+            SOURCE_ACTIVITY_SCOPE, SOURCE_CALL_ACTUAL_FORMAL, SOURCE_FORMAL_ORDER,
+            SOURCE_FUNCTION_REACHABILITY,
+        )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_CALL_ACTUAL_FORMAL)
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_CALL_ACTUAL_FORMAL, row)
+            actual, role, parameter, operand, formal_binding = page.cell(
+                cell.row, cell.column,
+            )
+            sources = {source for source, _stage in book.edges_into(cell)}
+            reach = book.latest_ref(SOURCE_FUNCTION_REACHABILITY, row[:3])
+            order = book.latest_ref(SOURCE_FORMAL_ORDER, (row[2],))
+            edges = (None if operand.page != PROCESS_GRAPH_OPERANDS else
+                     book.page(PROCESS_GRAPH_OPERANDS).cell(operand.row, operand.column))
+            formal_cells = tuple(
+                source for source in sources
+                if source.page == CANONICAL_VALUE
+                and source.row[-1] == row[3]
+                and (scope_cell := book.latest_ref(
+                    SOURCE_ACTIVITY_SCOPE, (source.row[0],),
+                )) in sources
+                and book.page(SOURCE_ACTIVITY_SCOPE).cell(
+                    scope_cell.row, scope_cell.column,
+                ) == row[2]
+            )
+            formal_fact = (
+                None if formal_binding.page != NAME_BINDING else
+                book.page(NAME_BINDING).cell(
+                    formal_binding.row, formal_binding.column,
+                )
+            )
+            if (reach is None or order is None or reach not in sources
+                    or order not in sources or actual not in sources
+                    or operand not in sources or edges is None
+                    or formal_binding not in sources
+                    or formal_binding.row[1] != parameter
+                    or formal_fact is None or not formal_fact.authored
+                    or int(formal_fact.value_id) != int(row[3])
+                    or not any(formal_binding.row[0] == formal.row[0]
+                               for formal in formal_cells)
+                    or (actual, role) not in edges
+                    or parameter not in book.page(SOURCE_FORMAL_ORDER).cell(
+                        order.row, order.column,
+                    ) or not formal_cells):
+                found.append(Finding(
+                    "source-call-actual-formal", str(row[0]), int(row[1]),
+                    "call-frame binding lost reachability, actual, formal, "
+                    "order or operand receipt",
+                ))
+        return found
+
+    @staticmethod
     def _control_activity_findings(module: Any) -> list[Finding]:
         from .concordance_declarations import (
             SOURCE_ACTIVITY_NODE, SOURCE_ACTIVITY_EDGE, SOURCE_ACTIVITY_BINDING, SOURCE_ACTIVITY_ARM_RELATION,
+            SOURCE_LAMBDA_NORMALIZATION, SOURCE_TERMINAL_RETURN,
             SOURCE_ACTIVITY_SCOPE, SOURCE_ACTIVITY_POLICY, SOURCE_ACTIVITY_SCHEDULE, SOURCE_SPAN,
-            SOURCE_RESOURCE_CONVERSION, SOURCE_RESOURCE_SCOPE, SOURCE_RESOURCE_CONTROL, SOURCE_PROCESS_OPERATION, SOURCE_LOOP_CONTROL_WORK,
+            SOURCE_RESOURCE_CONVERSION, SOURCE_RESOURCE_SCOPE, SOURCE_RESOURCE_ADMISSION_DEMAND, SOURCE_RESOURCE_CONTROL, SOURCE_PROCESS_OPERATION, SOURCE_LOOP_CONTROL_WORK,
             SOURCE_ACTIVITY_CHILD, SOURCE_ACTIVITY_CALL, SOURCE_ACTIVITY_CUT, SOURCE_CONTROL_OPERATOR,
             SOURCE_CONTROL_IR, CONTROL_PROGRAM, CONTROL_BLOCK, CONTROL_BLOCK_PLACEMENT,
             ControlBlockKind, Placement, SOURCE_LOOP_CONTROL_SITE, SOURCE_LOOP_SITE_EDGE, SOURCE_LOOP_SITE_VIEW, SOURCE_LOOP_EXIT_READ, PROCESS_GRAPH_OPERANDS, INGESTION_VALUE, SSA_CONTROL_EDGE, SSA_ARM_CONTINUATION, SSA_BLOCK,
@@ -1618,6 +3103,49 @@ class CorrelationTable:
         found, graphs = [], {}
         def value(cell):
             return book.page(cell.page).cell(cell.row, cell.column)
+        for row in book.page(SOURCE_LAMBDA_NORMALIZATION).rows():
+            cell = book.latest_ref(SOURCE_LAMBDA_NORMALIZATION, row)
+            generated_function, generated_return = value(cell)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            authored = row[0]
+            function_sources = {
+                source for source, _stage in book.edges_into(generated_function)
+            }
+            return_sources = {
+                source for source, _stage in book.edges_into(generated_return)
+            }
+            function_activity = tuple(
+                activity_row for activity_row in book.page(
+                    SOURCE_ACTIVITY_NODE).rows()
+                if activity_row[1] == generated_function
+                and activity_row[2] in {'enter', 'exit'}
+            )
+            return_activity = tuple(
+                activity_row for activity_row in book.page(
+                    SOURCE_ACTIVITY_NODE).rows()
+                if activity_row[1] == generated_return
+                and activity_row[2] in {'enter', 'exit'}
+            )
+            if (authored.page != SOURCE_SPAN
+                    or value(authored).kind != 'Lambda'
+                    or generated_function.page != SOURCE_SPAN
+                    or value(generated_function).kind != 'FunctionDef'
+                    or generated_return.page != SOURCE_SPAN
+                    or value(generated_return).kind != 'Return'
+                    or generated_function.row[:2] != generated_return.row[:2]
+                    or generated_function.row[2] != ()
+                    or generated_return.row[2] != (('body', 0),)
+                    or authored not in function_sources
+                    or authored not in return_sources
+                    or not {authored, generated_function,
+                            generated_return} <= sources
+                    or len(function_activity) != 2
+                    or len(return_activity) != 2):
+                found.append(Finding(
+                    'source-lambda-normalization', str(authored.row[:2]), None,
+                    'lambda wrapper lost its authored occurrence, generated '
+                    'control spans or activity identities',
+                ))
         for row in book.page(SOURCE_RESOURCE_CONVERSION).rows():
             cell = book.latest_ref(SOURCE_RESOURCE_CONVERSION, row)
             sources = {source for source, _stage in book.edges_into(cell)}
@@ -1633,6 +3161,19 @@ class CorrelationTable:
                     or not {row[0], conversion, entry, cleanup} <= sources):
                 found.append(Finding('resource-ingestion', '<source>', None,
                                      'resource scope lost its conversion and exact entry/cleanup occurrences'))
+        for row in book.page(SOURCE_RESOURCE_ADMISSION_DEMAND).rows():
+            cell = book.latest_ref(SOURCE_RESOURCE_ADMISSION_DEMAND, row)
+            source, activity, calls = value(cell)
+            sources = {item for item, _stage in book.edges_into(cell)}
+            required = {source, activity}
+            for call, receiver, inputs in calls:
+                required.update(item for item in (call, receiver) if item is not None)
+                required.update(item for _role, item in inputs if item is not None)
+            if (source.page != INGESTION_VALUE or value(source).type not in {'With', 'AsyncWith'}
+                    or source.row[1] != row[1] or activity.page != SOURCE_ACTIVITY_BINDING
+                    or not required <= sources):
+                found.append(Finding('resource-admission-demand', str(row[0]), int(row[1]),
+                                     'resource demand lost its exact With, activity, call or input identities'))
         for row in book.page(SOURCE_RESOURCE_CONTROL).rows():
             cell = book.latest_ref(SOURCE_RESOURCE_CONTROL, row)
             source, control, entry, cleanup, receiver = value(cell)
@@ -1655,6 +3196,33 @@ class CorrelationTable:
                     or not any(source.page == SOURCE_RESOURCE_CONVERSION for source in sources)):
                 found.append(Finding('resource-arm-relation', str(row[0]), None,
                                      'ordered cleanup arms lack their exact resource conversion'))
+        for row in book.page(SOURCE_TERMINAL_RETURN).rows():
+            cell = book.latest_ref(SOURCE_TERMINAL_RETURN, row)
+            enter, leave, owners = value(cell)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            occurrence = row[1]
+            protected = any(
+                value(owner).kind in {'Try', 'TryStar', 'With', 'AsyncWith'}
+                for owner, _arm in owners
+            )
+            outgoing = tuple(edge_row for edge_row in
+                             book.page(SOURCE_ACTIVITY_EDGE).scope_rows(row[0])
+                             if edge_row[1] == leave)
+            if (occurrence.page != SOURCE_SPAN
+                    or value(occurrence).kind != 'Return'
+                    or enter.page != SOURCE_ACTIVITY_NODE
+                    or leave.page != SOURCE_ACTIVITY_NODE
+                    or enter.row != (row[0], occurrence, 'enter')
+                    or leave.row != (row[0], occurrence, 'exit')
+                    or value(enter) != ('Return', owners)
+                    or value(leave) != ('Return', owners)
+                    or protected or outgoing
+                    or not {occurrence, enter, leave,
+                            *(owner for owner, _arm in owners)} <= sources):
+                found.append(Finding(
+                    'source-terminal-return', str(row[0]), None,
+                    'unprotected Return lost its exact terminal activity cut',
+                ))
         for row in book.page(SOURCE_LOOP_CONTROL_WORK).rows():
             cell = book.latest_ref(SOURCE_LOOP_CONTROL_WORK, row)
             sites, operations = value(cell)
@@ -1980,9 +3548,14 @@ class CorrelationTable:
                         data = fact(source)
                         if (source.page != SOURCE_EXCEPTION_OPERATION or not data
                                 or data[0] != attrs.get("dispatch_operation")
-                                or not isinstance(data[4], Ref)
-                                or data[4].page != SOURCE_PROCESS_OPERATION
-                                or data[4] not in {x for x, _stage in book.edges_into(source)}):
+                                or not isinstance(data[7], Ref)
+                                or data[7].page != SOURCE_PROCESS_OPERATION
+                                or data[7] not in {x for x, _stage in book.edges_into(source)}
+                                or (data[4] is None) != (data[5] is None)
+                                or (data[4] is not None and (
+                                    not isinstance(data[4], Ref)
+                                    or data[4] not in {x for x, _stage in book.edges_into(source)}
+                                    or not data[6]))):
                             found.append(Finding("ssa-exception-provenance", name, instruction.res.id,
                                                  "exception operation lost its process-graph origin"))
         for row in book.page(C_OPERATOR_SAFETY).rows():
@@ -2457,8 +4030,11 @@ class CorrelationTable:
         from function names or signature positions.
         """
         from .concordance_declarations import (
-            NAME_BINDING, SOURCE_CLOSURE_ENVIRONMENT, SOURCE_CLOSURE_CAPTURE,
+            FUNCTION_ADDRESS, NAME_BINDING, SOURCE_SPAN,
+            SOURCE_CLOSURE_FREE_NAMES,
+            SOURCE_CLOSURE_ENVIRONMENT, SOURCE_CLOSURE_CAPTURE,
             SOURCE_CLOSURE_CALLABLE, SOURCE_EXTRACTION_IDENTITY, INGESTION_VALUE,
+            SOURCE_VALUE_CLASS,
         )
         book = (getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None:
@@ -2481,21 +4057,125 @@ class CorrelationTable:
             if row[0].page != INGESTION_VALUE or not isinstance(identity, str) or not identity:
                 found.append(Finding('source-extraction-identity', str(row), None,
                                      'external callable identity is not an ingested classification'))
+        closure_inventories = {}
+        for row in book.page(SOURCE_CLOSURE_FREE_NAMES).rows():
+            cell = book.latest_ref(SOURCE_CLOSURE_FREE_NAMES, row)
+            fact = book.page(SOURCE_CLOSURE_FREE_NAMES).cell(
+                cell.row, cell.column,
+            )
+            if not (
+                isinstance(fact, tuple) and len(fact) == 4
+                and isinstance(fact[0], Ref) and fact[0].page == SOURCE_SPAN
+                and isinstance(fact[1], Ref) and fact[1].page == FUNCTION_ADDRESS
+                and isinstance(fact[2], tuple)
+                and isinstance(fact[3], tuple)
+                and len(set(fact[2])) == len(fact[2])
+                and set(fact[3]) <= set(fact[2])
+                and all(isinstance(name, str) and name for name in fact[2])
+            ):
+                found.append(Finding(
+                    "source-closure-free-names", str(row[0]), None,
+                    "closure free-name inventory is not an exact definition/address view",
+                ))
+                continue
+            check(
+                SOURCE_CLOSURE_FREE_NAMES, row, fact[:2],
+                "closure free-name inventory lacks its definition or function address",
+            )
+            closure_inventories[(int(row[1]),)] = (cell, fact)
+
+        closure_environments = {}
         for row in book.page(SOURCE_CLOSURE_ENVIRONMENT).rows():
             parent, definition, address = book.page(SOURCE_CLOSURE_ENVIRONMENT).latest(row)
+            inventory = closure_inventories.get((int(row[1]),))
             check(SOURCE_CLOSURE_ENVIRONMENT, row, (parent, definition, address),
                   "closure environment lacks its parent binding, definition or function address")
             if parent.page != NAME_BINDING or value(parent) is None:
                 found.append(Finding("source-closure-parent", str(row[0]), None,
                                      "closure environment has no exact parent binding"))
+            elif inventory is not None and (
+                definition != inventory[1][0]
+                or address != inventory[1][1]
+                or str(row[2]) not in inventory[1][3]
+            ):
+                found.append(Finding(
+                    "source-closure-environment-inventory", str(row[0]), None,
+                    "closure environment disagrees with its free-name inventory",
+                ))
+            elif inventory is not None:
+                environment_cell = book.latest_ref(
+                    SOURCE_CLOSURE_ENVIRONMENT, row,
+                )
+                sources = {
+                    source for source, _stage in book.edges_into(environment_cell)
+                }
+                inherited_inventory = any(
+                    source.page == SOURCE_CLOSURE_ENVIRONMENT
+                    and inventory[0] in {
+                        predecessor
+                        for predecessor, _stage in book.edges_into(source)
+                    }
+                    for source in sources
+                )
+                if inventory[0] not in sources and not inherited_inventory:
+                    found.append(Finding(
+                        "source-closure-environment-inventory",
+                        str(row[0]), None,
+                        "closure environment does not derive from its free-name inventory",
+                    ))
+            closure_environments.setdefault(
+                (int(row[1]), str(row[2])), set(),
+            ).add(book.latest_ref(SOURCE_CLOSURE_ENVIRONMENT, row))
+        captured_environments = set()
         for row in book.page(SOURCE_CLOSURE_CAPTURE).rows():
             environment, parent, input_binding = book.page(SOURCE_CLOSURE_CAPTURE).latest(row)
+            capture_cell = book.latest_ref(SOURCE_CLOSURE_CAPTURE, row)
+            captured_environments.add(environment)
             check(SOURCE_CLOSURE_CAPTURE, row, (environment, parent, input_binding),
                   "capture does not derive from both binding identities and their environment")
             if (value(environment)[0] != parent or input_binding.row != row
                     or input_binding.page != NAME_BINDING):
                 found.append(Finding("source-closure-binding", str(row[0]), None,
                                      "capture disagrees with its environment or input binding"))
+            environment_address = int(environment.row[1])
+            inventory = closure_inventories.get((environment_address,))
+            if inventory is not None:
+                parent_value = value(parent).value_id
+                parent_class = book.latest_ref(
+                    SOURCE_VALUE_CLASS,
+                    (inventory[0].row[0], int(parent_value)),
+                )
+                if parent_class is not None:
+                    input_value = value(input_binding).value_id
+                    transfers = tuple(
+                        cell
+                        for class_row in book.page(SOURCE_VALUE_CLASS).rows()
+                        if int(class_row[1]) == int(input_value)
+                        for cell in (
+                            book.latest_ref(SOURCE_VALUE_CLASS, class_row),
+                        )
+                        if {capture_cell, parent_class} <= {
+                            source for source, _stage in book.edges_into(cell)
+                        }
+                    )
+                    if not transfers:
+                        found.append(Finding(
+                            "source-closure-class-transport", str(row[0]), None,
+                            "captured input does not derive its known class from the exact parent binding",
+                        ))
+        for (address,), (_inventory_cell, fact) in closure_inventories.items():
+            for name in fact[3]:
+                environments = closure_environments.get((address, name), set())
+                if not environments:
+                    found.append(Finding(
+                        "source-closure-environment-missing", str(address), None,
+                        f"transported free name {name!r} has no environment row",
+                    ))
+                elif not environments & captured_environments:
+                    found.append(Finding(
+                        "source-closure-capture-missing", str(address), None,
+                        f"transported free name {name!r} has no input capture row",
+                    ))
         for row in book.page(SOURCE_CLOSURE_CALLABLE).rows():
             identity, environment, parent, receiver = book.page(SOURCE_CLOSURE_CALLABLE).latest(row)
             # Canonical rows additionally derive through their ingestion row.
@@ -3838,6 +5518,42 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _ssa_abi_physical_findings(module: Any) -> list[Finding]:
+        """Check a posted scalar physical field against its exact ABI cause."""
+        from .concordance_declarations import (
+            SSA_VALUE, SSAValueFact, VALUE_TYPE_ABI, ValueTypeABIFact,
+        )
+
+        book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
+        if book is None:
+            return []
+        found = []
+        for row in book.page(SSA_VALUE).rows():
+            cell = book.latest_ref(SSA_VALUE, row)
+            fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
+            if (not isinstance(fact, SSAValueFact)
+                    or fact.physical_dtype is None
+                    or fact.storage != 'scalar' or fact.rank != 0):
+                continue
+            abi_sources = tuple(source for source, _stage in book.edges_into(cell)
+                                if source.page == VALUE_TYPE_ABI)
+            for abi_cell in abi_sources:
+                abi = book.page(VALUE_TYPE_ABI).cell(
+                    abi_cell.row, abi_cell.column)
+                arms = (tuple(abi.physical_alternatives)
+                        if isinstance(abi, ValueTypeABIFact) else ())
+                views = {(arm.storage, arm.dtype, tuple(arm.shape), arm.rank)
+                         for arm in arms}
+                if (len(views) != 1 or next(iter(views)) !=
+                        (fact.storage, fact.physical_dtype,
+                         tuple(fact.shape), fact.rank)):
+                    found.append(Finding(
+                        'ssa-abi-physical-disagreement', str(row[0]), row[1],
+                        'posted physical SSA fields disagree with their exact type ABI arm',
+                    ))
+        return found
+
+    @staticmethod
     def _constant_materialization_findings(module: Any) -> list[Finding]:
         """Keep a materialized integer's exact native domain on its identity.
 
@@ -3897,6 +5613,30 @@ class CorrelationTable:
                 discrepancies.append(
                     f"ssa_value={value_fact!r}, materialization dtype={dtype!r}"
                 )
+            materialization_cell = book.latest_ref(
+                SSA_CONSTANT_MATERIALIZATION, row)
+            value_cell = book.latest_ref(SSA_VALUE, value_row)
+            value_sources = (
+                {source for source, _stage in book.edges_into(value_cell)}
+                if value_cell is not None else set()
+            )
+            # CONTROL_CONST physical publication is a revision caused by
+            # this exact literal receipt and its prior minted SSA identity.
+            if materialization_cell in value_sources:
+                materialization_sources = {
+                    source for source, _stage in
+                    book.edges_into(materialization_cell)
+                }
+                if (getattr(value_fact, "physical_dtype", None) != str(dtype)
+                        or getattr(value_fact, "storage", None) != "scalar"
+                        or getattr(value_fact, "rank", None) != 0
+                        or not any(source.page == SSA_VALUE
+                                   and source.row == value_row
+                                   for source in materialization_sources)):
+                    discrepancies.append(
+                        "physical scalar publication lost its exact literal "
+                        "materialization or prior SSA identity"
+                    )
             function = (getattr(module, "functions", {}) or {}).get(
                 str(function_name)
             )
@@ -5262,6 +7002,656 @@ class CorrelationTable:
                 found.append(Finding(
                     "source-aggregate-layout-disagreement", str(scope),
                     None if value_id is None else int(value_id), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _loop_native_scalar_union_gap_findings(module: Any) -> list[Finding]:
+        """Check exact loop binding, owner, and distinct scalar ABI arms."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, LOOP_CARRIED_BINDING,
+            LOOP_NATIVE_SCALAR_UNION_GAP, LOOP_UPDATE_MINIMUM_TRIPS,
+            VALUE_TYPE_ABI, LoopNativeScalarUnionGap, ValueTypeABIFact,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        for row in book.page(LOOP_NATIVE_SCALAR_UNION_GAP).rows():
+            cell = book.latest_ref(LOOP_NATIVE_SCALAR_UNION_GAP, row)
+            fact = book.page(LOOP_NATIVE_SCALAR_UNION_GAP).cell(
+                cell.row, cell.column)
+            expected = (
+                book.latest_ref(LOOP_CARRIED_BINDING, row),
+                book.latest_ref(CANONICAL_VALUE, (row[0], row[1])),
+                book.latest_ref(VALUE_TYPE_ABI, (row[0], row[3])),
+                book.latest_ref(VALUE_TYPE_ABI, (row[0], row[2])),
+            )
+            problem = None
+            if not isinstance(fact, LoopNativeScalarUnionGap):
+                problem = "invalid loop scalar union gap"
+            elif (
+                fact.operation != "header_exit_scalar_arm_projection"
+                or (fact.binding_cell, fact.loop_cell,
+                    fact.initial_abi_cell, fact.updated_abi_cell) != expected
+                or any(ref is None for ref in expected)
+                or not set(expected) <= {
+                    source for source, _stage in book.edges_into(cell)
+                }
+                or book.latest_ref(LOOP_UPDATE_MINIMUM_TRIPS,
+                                   (row[0], row[2])) is not None
+            ):
+                problem = "loop scalar union gap lacks exact binding/owner/arms"
+            else:
+                initial = book.page(VALUE_TYPE_ABI).cell(
+                    fact.initial_abi_cell.row, fact.initial_abi_cell.column)
+                updated = book.page(VALUE_TYPE_ABI).cell(
+                    fact.updated_abi_cell.row, fact.updated_abi_cell.column)
+                if not (
+                    isinstance(initial, ValueTypeABIFact)
+                    and isinstance(updated, ValueTypeABIFact)
+                    and len(initial.physical_alternatives) == 1
+                    and len(updated.physical_alternatives) == 1
+                    and initial.physical_alternatives[0].storage == "scalar"
+                    and updated.physical_alternatives[0].storage == "scalar"
+                    and initial.physical_alternatives[0].dtype
+                    != updated.physical_alternatives[0].dtype
+                    and initial.physical_alternatives[0].identity
+                    != updated.physical_alternatives[0].identity
+                ):
+                    problem = "loop scalar union gap changed physical arms"
+            if problem is not None:
+                found.append(Finding(
+                    "loop-native-scalar-union-gap-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_call_closed_class_alternatives_findings(module: Any) -> list[Finding]:
+        """Check the exact one-output, one-callee class-domain transport."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, SEMANTIC_OUTPUT,
+            SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES,
+            SOURCE_CLOSED_CLASS_ALTERNATIVES,
+            SOURCE_FORMAL_CLOSED_CLASS_ALTERNATIVES,
+            SOURCE_FUNCTION_REACHABILITY, SourceClosedClassAlternatives,
+        )
+        from .source_evidence_resolver import (
+            ClassAlternativesEvidence, require_class_alternatives,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        for row in book.page(SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES).rows():
+            cell = book.latest_ref(SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES, row)
+            fact = book.page(SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES).cell(
+                cell.row, cell.column)
+            problem = None
+            if not (isinstance(fact, tuple) and len(fact) == 5
+                    and all(isinstance(ref, Ref) for ref in fact)):
+                problem = "invalid call class-alternative transport"
+            else:
+                output, returned, closed, reached, call = fact
+                output_fact = (
+                    book.page(SEMANTIC_OUTPUT).cell(output.row, output.column)
+                    if output.page == SEMANTIC_OUTPUT
+                    and (output.row, output.column) in
+                    book.page(SEMANTIC_OUTPUT).cells else None
+                )
+                closed_fact = (
+                    book.page(SOURCE_CLOSED_CLASS_ALTERNATIVES).cell(
+                        closed.row, closed.column)
+                    if closed.page == SOURCE_CLOSED_CLASS_ALTERNATIVES
+                    and (closed.row, closed.column) in
+                    book.page(SOURCE_CLOSED_CLASS_ALTERNATIVES).cells else None
+                )
+                formal_domain = (
+                    require_class_alternatives(
+                        returned.row[0], int(returned.row[1]), book=book)
+                    if closed.page == SOURCE_FORMAL_CLOSED_CLASS_ALTERNATIVES
+                    and closed.row[:2] == returned.row
+                    and closed.row[2:] == row[:2]
+                    else None
+                )
+                reached_rows = tuple(
+                    candidate for candidate in
+                    book.page(SOURCE_FUNCTION_REACHABILITY).rows()
+                    if candidate[:2] == row[:2]
+                    and book.page(SOURCE_FUNCTION_REACHABILITY).latest(
+                        candidate) is True
+                )
+                if not (
+                    output.page == SEMANTIC_OUTPUT
+                    and output.row[1] == 0
+                    and isinstance(output_fact, tuple)
+                    and len(output_fact) == 2
+                    and int(output_fact[1]) == int(row[3])
+                    and returned.page == CANONICAL_VALUE
+                    and returned.row[1] == row[3]
+                    and returned in {source for source, _stage in
+                                     book.edges_into(output)}
+                    and (
+                        closed.page == SOURCE_CLOSED_CLASS_ALTERNATIVES
+                        and closed.row == returned.row
+                        and isinstance(closed_fact,
+                                       SourceClosedClassAlternatives)
+                        or isinstance(formal_domain,
+                                      ClassAlternativesEvidence)
+                        and formal_domain.subject_cell == closed
+                    )
+                    and reached.page == SOURCE_FUNCTION_REACHABILITY
+                    and reached.row == row[:3]
+                    and reached_rows == (row[:3],)
+                    and call.page == CANONICAL_VALUE
+                    and call.row[1] == row[1]
+                    and call in {source for source, _stage in
+                                 book.edges_into(reached)}
+                    and set(fact) <= {source for source, _stage in
+                                      book.edges_into(cell)}
+                ):
+                    problem = "call class domain lacks exact output/reachability"
+            if problem is not None:
+                found.append(Finding(
+                    "source-call-closed-class-alternatives-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_formal_closed_class_alternatives_findings(module: Any) -> list[Finding]:
+        """Check a formal class domain against its exact actual/call edges."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, NAME_BINDING, SEMANTIC_OUTPUT,
+            SOURCE_CALL_ACTUAL_FORMAL,
+            SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES,
+            SOURCE_CLOSED_CLASS_ALTERNATIVES,
+            SOURCE_FORMAL_CLOSED_CLASS_ALTERNATIVES,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        for row in book.page(SOURCE_FORMAL_CLOSED_CLASS_ALTERNATIVES).rows():
+            cell = book.latest_ref(SOURCE_FORMAL_CLOSED_CLASS_ALTERNATIVES,
+                                   row)
+            fact = book.page(SOURCE_FORMAL_CLOSED_CLASS_ALTERNATIVES).cell(
+                cell.row, cell.column)
+            problem = None
+            if not (isinstance(fact, tuple) and len(fact) == 5
+                    and all(isinstance(ref, Ref) for ref in fact)):
+                problem = "invalid formal class-alternative transport"
+            else:
+                binding, transport, closed, output, formal_binding = fact
+                binding_fact = (
+                    book.page(SOURCE_CALL_ACTUAL_FORMAL).cell(
+                        binding.row, binding.column)
+                    if binding.page == SOURCE_CALL_ACTUAL_FORMAL and
+                    (binding.row, binding.column) in
+                    book.page(SOURCE_CALL_ACTUAL_FORMAL).cells else None
+                )
+                transport_fact = (
+                    book.page(SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES).cell(
+                        transport.row, transport.column)
+                    if transport.page == SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES
+                    and (transport.row, transport.column) in
+                    book.page(SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES).cells
+                    else None
+                )
+                formal_value = book.latest_ref(
+                    CANONICAL_VALUE, (row[0], int(row[1])))
+                if not (
+                    isinstance(binding_fact, tuple)
+                    and len(binding_fact) == 5
+                    and isinstance(transport_fact, tuple)
+                    and len(transport_fact) == 5
+                    and binding.row[0] == row[2]
+                    and int(binding.row[1]) == int(row[3])
+                    and int(binding.row[3]) == int(row[1])
+                    and binding_fact[4] == formal_binding
+                    and formal_binding.page == NAME_BINDING
+                    and formal_binding.row[0] == row[0]
+                    and transport.row[0] == row[2]
+                    and int(transport.row[1]) == int(binding_fact[0].row[1])
+                    and transport_fact[0] == output
+                    and transport_fact[2] == closed
+                    and output.page == SEMANTIC_OUTPUT
+                    and closed.page == SOURCE_CLOSED_CLASS_ALTERNATIVES
+                    and formal_value is not None
+                    and {binding, transport, closed, output,
+                         formal_binding, formal_value,
+                         binding_fact[0]} <= {
+                        source for source, _stage in book.edges_into(cell)
+                    }
+                ):
+                    problem = "formal class domain lacks exact call binding"
+            if problem is not None:
+                found.append(Finding(
+                    "source-formal-closed-class-alternatives-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_class_union_native_gap_findings(module: Any) -> list[Finding]:
+        """Check an unlaid class merge against copied arm and source cells."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS,
+            SOURCE_CLASS_UNION_NATIVE_GAP, SOURCE_CLOSED_CLASS_ALTERNATIVES,
+            SOURCE_VALUE_CLASS, VALUE_TYPE_ABI, SourceClassUnionNativeGap,
+            SourceClosedClassAlternatives,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_CLASS_UNION_NATIVE_GAP)
+        found: list[Finding] = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_CLASS_UNION_NATIVE_GAP, row)
+            fact = page.cell(cell.row, cell.column)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            problem = None
+            if not isinstance(fact, SourceClassUnionNativeGap):
+                problem = "invalid native class union gap"
+            elif not (
+                len(fact.alternatives) == len(fact.arm_value_cells) == 2
+                and isinstance(fact.closed_cell, Ref)
+                and fact.closed_cell.page == SOURCE_CLOSED_CLASS_ALTERNATIVES
+                and fact.closed_cell.row == row
+                and isinstance(fact.operand_cell, Ref)
+                and fact.operand_cell.page == PROCESS_GRAPH_OPERANDS
+                and fact.operand_cell.row == row
+                and all(isinstance(arm, Ref)
+                        and arm.page == CANONICAL_VALUE
+                        and arm.row[0] == row[0]
+                        for arm in fact.arm_value_cells)
+                and len(set(fact.alternatives)) == 2
+                and {fact.closed_cell, fact.operand_cell,
+                     *fact.arm_value_cells} <= sources
+            ):
+                problem = "native class union gap lacks exact copy/arm proof"
+            else:
+                closed = book.page(SOURCE_CLOSED_CLASS_ALTERNATIVES).cell(
+                    fact.closed_cell.row, fact.closed_cell.column)
+                operands = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                    fact.operand_cell.row, fact.operand_cell.column)
+                if not isinstance(closed, SourceClosedClassAlternatives):
+                    problem = "native class union gap has no closed class source"
+                elif not any(
+                    source.page == SOURCE_CLOSED_CLASS_ALTERNATIVES
+                    and source.row[1] == row[1]
+                    for source, _stage in book.edges_into(fact.closed_cell)
+                ):
+                    problem = "native class union gap has no source-to-copy edge"
+                elif tuple((arm, role) for arm, role in operands
+                           if role in {"body", "orelse"}) != (
+                               (fact.arm_value_cells[0], "body"),
+                               (fact.arm_value_cells[1], "orelse")):
+                    problem = "native class union gap disagrees with copied operands"
+                elif fact.alternatives != tuple(identity for identity, _ in
+                                                closed.alternatives):
+                    problem = "native class union gap changed source classes"
+                else:
+                    for original, arm, class_cell in zip(
+                        closed.arm_value_cells, fact.arm_value_cells,
+                        closed.arm_class_cells, strict=True,
+                    ):
+                        arm_sources = {source for source, _stage in
+                                       book.edges_into(arm)}
+                        class_fact = book.page(SOURCE_VALUE_CLASS).cell(
+                            class_cell.row, class_cell.column)
+                        if (original not in arm_sources
+                                or class_fact[2] != "source class construction"
+                                or book.latest_ref(VALUE_TYPE_ABI,
+                                                   (row[0], arm.row[1]))
+                                is not None):
+                            problem = "native class union gap arm has another layout"
+                            break
+            if problem is not None:
+                found.append(Finding(
+                    "source-class-union-native-gap-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_closed_class_alternative_findings(module: Any) -> list[Finding]:
+        """Check each semantic class arm against exact control and operands."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS, SOURCE_CLOSED_CLASS_ALTERNATIVES,
+            SOURCE_SPAN, SOURCE_VALUE_CLASS, SourceClosedClassAlternatives,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_CLOSED_CLASS_ALTERNATIVES)
+        found: list[Finding] = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_CLOSED_CLASS_ALTERNATIVES, row)
+            fact = page.cell(cell.row, cell.column)
+            sources = {source for source, _stage in book.edges_into(cell)}
+            problem = None
+            if not isinstance(fact, SourceClosedClassAlternatives):
+                problem = "invalid closed class alternatives"
+            elif not (
+                len(fact.alternatives) == len(fact.arm_value_cells)
+                == len(fact.arm_class_cells) == 2
+                and all(isinstance(arm, Ref) and arm.page == CANONICAL_VALUE
+                        for arm in fact.arm_value_cells)
+                and all(isinstance(class_cell, Ref)
+                        and class_cell.page == SOURCE_VALUE_CLASS
+                        for class_cell in fact.arm_class_cells)
+                and isinstance(fact.control_cell, Ref)
+                and fact.control_cell.page == SOURCE_SPAN
+                and isinstance(fact.operand_cell, Ref)
+                and fact.operand_cell.page == PROCESS_GRAPH_OPERANDS
+                and fact.operand_cell.row == row
+                and len(set(fact.alternatives)) == 2
+            ):
+                problem = "closed class arm/control identities are incomplete"
+            elif not {
+                fact.control_cell, fact.operand_cell,
+                *fact.arm_value_cells, *fact.arm_class_cells,
+            } <= sources:
+                problem = "closed class proof edges are absent"
+            else:
+                operands = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                    fact.operand_cell.row, fact.operand_cell.column)
+                body = tuple(ref for ref, role in operands if role == "body")
+                orelse = tuple(ref for ref, role in operands if role == "orelse")
+                test = tuple(ref for ref, role in operands if role == "test")
+                if (body != (fact.arm_value_cells[0],)
+                        or orelse != (fact.arm_value_cells[1],)
+                        or len(test) != 1):
+                    problem = "closed class arms disagree with operand roles"
+                else:
+                    for alternative, arm, class_cell in zip(
+                        fact.alternatives, fact.arm_value_cells,
+                        fact.arm_class_cells, strict=True,
+                    ):
+                        class_fact = book.page(SOURCE_VALUE_CLASS).cell(
+                            class_cell.row, class_cell.column)
+                        if (class_cell.row[1] != arm.row[1]
+                                or not isinstance(class_fact, tuple)
+                                or len(class_fact) < 2
+                                or alternative != (class_fact[0], int(class_fact[1]))):
+                            problem = "closed class alternative disagrees with arm class"
+                            break
+                if (problem is None
+                        and book.latest_ref(SOURCE_VALUE_CLASS, row) is not None):
+                    problem = "closed class merge also claims one global class"
+            if problem is not None:
+                found.append(Finding(
+                    "source-closed-class-alternative-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_closed_aggregate_length_findings(module: Any) -> list[Finding]:
+        """Check a closed tuple length view against both immutable arm layouts."""
+
+        from .concordance_declarations import (
+            SOURCE_AGGREGATE_LAYOUT, SOURCE_CLOSED_AGGREGATE_LENGTHS,
+            SourceAggregateLayout, SourceAggregateMember,
+            SourceClosedAggregateLengths,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get(
+            "identity_book"
+        )
+        if book is None:
+            return []
+        page = book.page(SOURCE_CLOSED_AGGREGATE_LENGTHS)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_CLOSED_AGGREGATE_LENGTHS, row)
+            fact = page.cell(cell.row, cell.column)
+            history = tuple(entry for _column, entry in page.history(row))
+            sources = {source for source, _stage in book.edges_into(cell)}
+            problem = None
+            if len(set(map(repr, history))) != 1:
+                problem = "closed length domain changed after publication"
+            elif not isinstance(fact, SourceClosedAggregateLengths):
+                problem = f"invalid closed length fact {fact!r}"
+            elif not (
+                fact.aggregate_kind == "tuple"
+                and len(fact.lengths) == len(fact.arm_layout_cells) == 2
+                and all(isinstance(length, int) and length >= 0
+                        for length in fact.lengths)
+                and len(set(fact.lengths)) == 2
+                and isinstance(fact.conditional_cell, Ref)
+                and all(isinstance(arm, Ref)
+                        and arm.page == SOURCE_AGGREGATE_LAYOUT
+                        for arm in fact.arm_layout_cells)
+            ):
+                problem = "closed tuple arms/control are incomplete"
+            elif not {
+                fact.conditional_cell, *fact.arm_layout_cells,
+            } <= sources:
+                problem = "closed tuple arm/control proof edges are absent"
+            else:
+                for expected, arm_cell in zip(
+                    fact.lengths, fact.arm_layout_cells, strict=True,
+                ):
+                    arm = book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+                        arm_cell.row, arm_cell.column,
+                    )
+                    if not (
+                        isinstance(arm, SourceAggregateLayout)
+                        and arm.aggregate_kind == "tuple"
+                        and len(arm.members) == expected
+                        and all(
+                            isinstance(member, SourceAggregateMember)
+                            and isinstance(member.value_cell, Ref)
+                            and member.source_cells
+                            for member in arm.members
+                        )
+                    ):
+                        problem = "closed length disagrees with an arm's members"
+                        break
+            if problem is not None:
+                found.append(Finding(
+                    "source-closed-aggregate-length-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+        return found
+
+    @staticmethod
+    def _source_tuple_key_native_gap_findings(module: Any) -> list[Finding]:
+        """Check the return, call, formal and keyed-store refusal trail."""
+
+        from .concordance_declarations import (
+            SOURCE_CALL_ACTUAL_FORMAL, SOURCE_CALL_CLOSED_TUPLE_LENGTHS,
+            SOURCE_CALL_RESULT_IDENTITY, SOURCE_CLOSED_AGGREGATE_LENGTHS,
+            SOURCE_AGGREGATE_LAYOUT,
+            SOURCE_FUNCTION_REACHABILITY, SOURCE_TUPLE_KEY_NATIVE_GAP,
+            SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS,
+            PROCESS_GRAPH_OPERANDS, SEMANTIC_OUTPUT, CANONICAL_VALUE,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        def existing(cell: Any) -> bool:
+            return isinstance(cell, Ref) and (
+                (cell.row, cell.column) in book.page(cell.page).cells
+                or book.page(cell.page).is_virtual(cell.row, cell.column)
+            )
+
+        transport_page = book.page(SOURCE_CALL_CLOSED_TUPLE_LENGTHS)
+        for row in transport_page.rows():
+            cell = book.latest_ref(SOURCE_CALL_CLOSED_TUPLE_LENGTHS, row)
+            fact = transport_page.latest(row)
+            problem = None
+            if not (isinstance(row, tuple) and len(row) == 4
+                    and isinstance(fact, tuple) and len(fact) == 5):
+                problem = "invalid call tuple-domain row"
+            else:
+                output, returned, domain, reached, result = fact
+                output_fact = (
+                    None if not existing(output) or
+                    output.page != SEMANTIC_OUTPUT else
+                    book.page(SEMANTIC_OUTPUT).cell(
+                        output.row, output.column,
+                    )
+                )
+                if not (
+                    output_fact is not None
+                    and isinstance(output_fact, tuple)
+                    and len(output_fact) == 2
+                    and int(output_fact[1]) == int(row[3])
+                    and output.row[1] == 0
+                    and book.latest_ref(SEMANTIC_OUTPUT, output.row) == output
+                    and existing(returned) and returned.row[1] == row[3]
+                    and existing(domain)
+                    and domain.page == SOURCE_CLOSED_AGGREGATE_LENGTHS
+                    and domain.row[1] == row[3]
+                    and output.row[0] == domain.row[0]
+                    and returned in {
+                        source for source, _stage in book.edges_into(output)
+                    }
+                    and existing(reached)
+                    and reached.page == SOURCE_FUNCTION_REACHABILITY
+                    and reached.row == row[:3]
+                    and existing(result)
+                    and result.page == SOURCE_CALL_RESULT_IDENTITY
+                    and result.row == row[:2]
+                    and book.page(SOURCE_CALL_RESULT_IDENTITY).cell(
+                        result.row, result.column,
+                    )[1] == "builtins.tuple"
+                    and {output, returned, domain, reached, result} <= {
+                        source for source, _stage in book.edges_into(cell)
+                    }
+                ):
+                    problem = "call tuple domain lacks exact output/proof edge"
+            if problem:
+                found.append(Finding(
+                    "source-call-closed-tuple-length-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+
+        formal_page = book.page(SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS)
+        for row in formal_page.rows():
+            cell = book.latest_ref(SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS, row)
+            fact = formal_page.latest(row)
+            problem = None
+            if not (isinstance(row, tuple) and len(row) == 4
+                    and isinstance(fact, tuple) and len(fact) == 4):
+                problem = "invalid formal tuple-domain row"
+            else:
+                binding, transport, domain, output = fact
+                if not (
+                    existing(binding) and binding.page == SOURCE_CALL_ACTUAL_FORMAL
+                    and existing(transport)
+                    and transport.page == SOURCE_CALL_CLOSED_TUPLE_LENGTHS
+                    and existing(domain)
+                    and domain.page == SOURCE_CLOSED_AGGREGATE_LENGTHS
+                    and existing(output) and output.page == SEMANTIC_OUTPUT
+                ):
+                    problem = "formal tuple-domain proof cell is absent"
+                else:
+                    binding_fact = book.page(SOURCE_CALL_ACTUAL_FORMAL).cell(
+                        binding.row, binding.column,
+                    )
+                    transport_fact = book.page(
+                        SOURCE_CALL_CLOSED_TUPLE_LENGTHS
+                    ).cell(transport.row, transport.column)
+                    actual = binding_fact[0]
+                    formal_value = book.latest_ref(
+                        CANONICAL_VALUE, (row[0], int(row[1])),
+                    )
+                    if not (
+                        binding.row[0] == row[2]
+                        and int(binding.row[1]) == int(row[3])
+                        and int(binding.row[3]) == int(row[1])
+                        and binding_fact[4].row[0] == row[0]
+                        and transport.row[0] == row[2]
+                        and int(transport.row[1]) == int(actual.row[1])
+                        and transport_fact[0] == output
+                        and transport_fact[2] == domain
+                        and formal_value is not None
+                        and {binding, transport, domain, output,
+                             formal_value, actual} <= {
+                            source for source, _stage in book.edges_into(cell)
+                        }
+                    ):
+                        problem = "formal tuple domain lacks exact call edges"
+            if problem:
+                found.append(Finding(
+                    "source-formal-closed-tuple-length-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+
+        gap_page = book.page(SOURCE_TUPLE_KEY_NATIVE_GAP)
+        for row in gap_page.rows():
+            cell = book.latest_ref(SOURCE_TUPLE_KEY_NATIVE_GAP, row)
+            fact = gap_page.latest(row)
+            problem = None
+            if not (isinstance(row, tuple) and len(row) == 2
+                    and isinstance(fact, tuple) and len(fact) == 6):
+                problem = "invalid tuple-key refusal row"
+            else:
+                formal_id, lengths, formal, store, operands, operation = fact
+                if not (
+                    existing(formal)
+                    and formal.page == SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS
+                    and existing(store)
+                    and existing(operands)
+                    and operands.page == PROCESS_GRAPH_OPERANDS
+                ):
+                    problem = "tuple-key refusal proof cell is absent"
+                else:
+                    binding, transport, domain, output = book.page(
+                        SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS
+                    ).cell(formal.row, formal.column)
+                    lengths_fact = book.page(SOURCE_CLOSED_AGGREGATE_LENGTHS).cell(
+                        domain.row, domain.column,
+                    )
+                    graph_operands = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operands.row, operands.column,
+                    )
+                    if not (
+                        formal.row[1] == formal_id
+                        and binding.row[2] == row[0]
+                        and int(binding.row[3]) == int(formal_id)
+                        and store.row[1] == row[1]
+                        and operands.page == PROCESS_GRAPH_OPERANDS
+                        and operands.row[1] == row[1]
+                        and any(
+                            role == "index"
+                            and isinstance(source, Ref)
+                            and source.row[1] == formal_id
+                            for source, role in graph_operands
+                        )
+                        and tuple(lengths) == tuple(lengths_fact.lengths)
+                        and len(set(lengths)) > 1
+                        and operation == "runtime_tuple_to_key_columns"
+                        and book.latest_ref(
+                            SOURCE_AGGREGATE_LAYOUT,
+                            (formal.row[0], int(formal_id)),
+                        ) is None
+                        and {formal, store, operands} <= {
+                            source for source, _stage in book.edges_into(cell)
+                        }
+                    ):
+                        problem = "tuple-key refusal does not join exact calls and store"
+            if problem:
+                found.append(Finding(
+                    "source-tuple-key-native-gap-disagreement",
+                    str(row[0]), int(row[1]), problem,
                 ))
         return found
 
@@ -9725,6 +12115,40 @@ def concordant_shape_transformation_state(
     if not (isinstance(fact, tuple) and fact and fact[0] == "resolved"):
         return None
     return shape_transformation_state(fact[1])
+
+
+def concordant_shape_transformation_sources(
+    scope: Any, value_id: Any, *, operation: Any | None = None,
+    role: Any | None = None,
+) -> tuple[tuple[Any, ...], ...]:
+    """Return the exact live input edges recorded for one shape value.
+
+    Structural specialization may fold an input expression and retire its
+    mutable graph operand position.  The transformation edge remains the
+    authoritative correlation between the result and that input identity;
+    readers must consult it instead of reconstructing the input from a
+    surviving name, position, or source coordinate.
+    """
+
+    target_scope = _shape_key(scope)
+    operation_name = None if operation is None else str(operation).casefold()
+    role_name = None if role is None else str(role).casefold()
+    page = current_identity_book().page(SHAPE_EDGE_PAGE)
+    return tuple(
+        edge_row
+        for edge_row in page.scope_rows(target_scope)
+        if edge_row[1] == value_id
+        and (
+            operation_name is None
+            or str(edge_row[5]).casefold() == operation_name
+        )
+        and (
+            role_name is None
+            or str(edge_row[6]).casefold() == role_name
+        )
+        and isinstance(page.latest(edge_row), tuple)
+        and len(page.latest(edge_row)) == 2
+    )
 
 
 def invalidate_shape_transformation(

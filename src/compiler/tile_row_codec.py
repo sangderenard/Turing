@@ -35,13 +35,15 @@ from typing import Any, Callable, Mapping
 
 
 
-def compress_octets(data: bytes, codebook: Any = None) -> bytes:
+def compress_octets(
+    data: bytes, codebook: Any = None, *, level: int = 1,
+) -> bytes:
     """``octet_codec.compress_octets``; imported on use, since the tensor
     package imports the tile store that imports this module."""
 
     from ..common.tensors.compression.octet_codec import compress_octets
 
-    return compress_octets(data, codebook)
+    return compress_octets(data, codebook, level=level)
 
 
 def decompress_octets(packet: bytes, codebook: Any = None) -> bytes:
@@ -50,12 +52,12 @@ def decompress_octets(packet: bytes, codebook: Any = None) -> bytes:
     return decompress_octets(packet, codebook)
 
 
-def train_codebook(sample: bytes) -> Any:
+def train_codebook(sample: bytes, *, level: int = 1) -> Any:
     """``OctetCodebook.train``: the shared codebook of one table's tiles."""
 
     from ..common.tensors.compression.octet_codec import OctetCodebook
 
-    return OctetCodebook.train(sample)
+    return OctetCodebook.train(sample, level=level)
 
 _NONE, _FALSE, _TRUE, _INT, _FLOAT, _STR, _STR_REF, _BYTES = range(8)
 _TUPLE, _LIST, _DICT, _SET, _FROZENSET = range(8, 13)

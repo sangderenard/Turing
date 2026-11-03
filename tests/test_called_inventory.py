@@ -71,22 +71,35 @@ def test_distinct_signatures():
     assert sigs == [{"a": "int", "b": "int"}, {"a": "float", "b": "int"}]
 
 
-def test_internal_call_edges_feed_the_inventory_and_are_cited():
+def test_internal_call_edges_feed_the_inventory_and_are_cited(monkeypatch):
     """A callee reached by int and float actuals: its CALLED_INVENTORY cell
     cites both call-edge cells, each Derived from the caller's class cell."""
     from src.compiler.concordance_declarations import CALL_EDGE_ACTUAL
     from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
     from src.compiler.identity_concordance import current_identity_book
     import src.compiler.called_inventory as inv
+    from src.compiler import source_evidence_resolver
+    from src.compiler.source_evidence_resolver import ClassEvidence
 
     seen = {}
+    class_answers = []
     real = inv.post_call_edge_actual
+    real_class = source_evidence_resolver.require_class
 
     def spy(book, *args):
         real(book, *args)
         seen["book"] = book
 
+    def record_class(scope, value_id, *, book):
+        answer = real_class(scope, value_id, book=book)
+        if isinstance(answer, ClassEvidence):
+            class_answers.append(answer)
+        return answer
+
     inv.post_call_edge_actual = spy
+    monkeypatch.setattr(
+        source_evidence_resolver, "require_class", record_class,
+    )
     try:
         source = (
             "def f(x):\n    return x * 2\n\n"
@@ -106,6 +119,11 @@ def test_internal_call_edges_feed_the_inventory_and_are_cited():
     cited = [ref for ref, _stage in book.edges_into(cell)]
     assert len(cited) == 2
     assert {book.page(CALL_EDGE_ACTUAL).cell(r.row, r.column) for r in cited} == {"int", "float"}
+    assert {answer.class_identity for answer in class_answers} >= {
+        "builtins.int", "builtins.float",
+    }
+    assert all(answer.subject_cell and answer.proof_cells
+               for answer in class_answers)
 
 
 def test_revisited_call_edge_is_not_reposted():

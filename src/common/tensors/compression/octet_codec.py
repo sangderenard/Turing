@@ -43,7 +43,7 @@ class OctetCodebook:
     literal_lengths: tuple[int, ...]
 
     @classmethod
-    def train(cls, sample: bytes) -> "OctetCodebook":
+    def train(cls, sample: bytes, *, level: int = 1) -> "OctetCodebook":
         """A codebook for packets resembling ``sample``.
 
         The tail of ``sample`` is the dictionary; the tables are fitted to
@@ -54,7 +54,9 @@ class OctetCodebook:
         dictionary = sample[-DICTIONARY_LIMIT:]
         half = max(1, len(sample) // 2)
         _header_part, commands, literals = _split(
-            lz_encode(sample[half:], sample[:half][-DICTIONARY_LIMIT:])
+            lz_encode(
+                sample[half:], sample[:half][-DICTIONARY_LIMIT:], level=level,
+            )
         )
         return cls(
             dictionary,
@@ -63,9 +65,13 @@ class OctetCodebook:
         )
 
 
-def compress_octets(data: bytes, codebook: OctetCodebook | None = None) -> bytes:
+def compress_octets(
+    data: bytes, codebook: OctetCodebook | None = None, *, level: int = 1,
+) -> bytes:
     dictionary = b"" if codebook is None else codebook.dictionary
-    header, commands, literals = _split(lz_encode(data, dictionary))
+    header, commands, literals = _split(
+        lz_encode(data, dictionary, level=level)
+    )
     coded_commands = encode_octets(
         commands, None if codebook is None else codebook.command_lengths,
     )

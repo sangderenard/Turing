@@ -2608,6 +2608,96 @@ def test_joined_string_result_has_str_class_for_a_consuming_fstring():
     )
 
 
+def test_enumerate_induction_and_element_format_through_concorded_classes():
+    """Both members of enumerate's exact element contract format as ints."""
+
+    captured = {}
+
+    def capture(graph):
+        function = graph.function_table.entry("render").graph
+        joined = next(
+            data for _node_id, data in function.G.nodes(data=True)
+            if isinstance(data.get("expr_obj"), ast.JoinedStr)
+            and (data.get("attributes") or {}).get(
+                "source_glyph_sequence_row"
+            ) is not None
+        )
+        book = current_identity_book()
+        fact = book.page(SOURCE_GLYPH_SEQUENCE).latest(
+            joined["attributes"]["source_glyph_sequence_row"]
+        )
+        formatted = tuple(
+            component for component in fact.components
+            if component.kind == "formatted"
+        )
+        scope = tuple(function.G.graph["authored_function_identity"])
+        captured["formatted"] = formatted
+        captured["classes"] = tuple(
+            book.page(SOURCE_VALUE_CLASS).latest((
+                scope, int(component.operand_value_id),
+            ))
+            for component in formatted
+        )
+
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        lower_ast_source_to_ssa(
+            "def render(values: list[int]):\n"
+            "    for index, value in enumerate(values):\n"
+            "        return f'octet {index}: {value!r}'\n"
+            "    return ''\n",
+            "render",
+            name="enumerate_glyph_formatter_types",
+            extraction_contract=policy,
+            resolved_process_graph_sink=capture,
+            stop_after_compilation_unit_plan=True,
+            progress=lambda _message: None,
+        )
+    formatted = captured["formatted"]
+    assert len(formatted) == 2
+    assert all(
+        component.formatted_sequence_value_id is not None
+        for component in formatted
+    )
+    assert tuple(fact[:2] for fact in captured["classes"]) == (
+        ("builtins.int", 1), ("builtins.int", 1),
+    )
+
+
+def test_specialized_tensor_tolist_enumerate_formats_exact_element_class():
+    """A tensor call descriptor owns the formatted enumerate element type."""
+
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    )
+    source = (
+        "from src.common.tensors.abstract_tensor import AbstractTensor\n"
+        "def render(values: AbstractTensor):\n"
+        "    for index, value in enumerate(values[:].tolist()):\n"
+        "        raise ValueError(f'octet {index}: {value!r}')\n"
+        "    return 0\n"
+        "def root(values: AbstractTensor):\n"
+        "    return render(values.to_dtype('int64').reshape(-1))\n"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        module, outputs, exports = lower_ast_source_to_ssa(
+            source,
+            "root",
+            name="tensor_tolist_enumerate_glyph",
+            extraction_contract=policy,
+            stop_after_compilation_unit_plan=True,
+            progress=lambda _message: None,
+            progress_bars=False,
+        )
+    assert module is None
+    assert outputs == {}
+    assert exports == ()
+
+
 def test_type_name_attribute_has_str_class():
     formatted, classes = _reduced_joined_components(
         "def render(owner):\n"

@@ -763,7 +763,7 @@ def test_class_navigation_has_general_ssa_semantic_procedures():
         "class_navigation_lut"
     ]["classes"][0]["members"][0]["function_reference"] == 7
     assert [value.dtype for value in resolve.blocks["entry"].instrs[-1].args] == [
-        "i32", "i32", "bool",
+        "int32", "int32", "bool",
     ]
     emitted = emit_module(module, name="class_navigation_probe")
     assert emitted.api.metadata["class_table_schema"] == (
@@ -2086,7 +2086,7 @@ def test_mapping_setdefault_returns_initialized_child_table_handle():
         function_name="mapping_setdefault",
         first_value_id=1000,
         sequence_declarations=((20, "unique", 2, True),),
-        sequence_column_dtypes={20: ("int64", "int")},
+        sequence_column_dtypes={20: ("int64", "int64")},
         resolved_sequence_schemas={20: ResolvedSequenceSchema(
             column_count=2,
             policy="unique",

@@ -8,16 +8,43 @@ import sys
 
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import concordance_report
+from src.compiler import source_evidence_resolver
+from src.compiler.source_evidence_resolver import ClassEvidence
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_setdefault_append_uses_the_selected_child_row_storage():
+def test_setdefault_append_uses_the_selected_child_row_storage(monkeypatch):
+    class_queries = []
+    original_query = source_evidence_resolver.require_class
+
+    def record_class(scope, value_id, *, book):
+        answer = original_query(scope, value_id, book=book)
+        if isinstance(answer, ClassEvidence):
+            class_queries.append((answer, book))
+        return answer
+
+    monkeypatch.setattr(source_evidence_resolver, "require_class", record_class)
     source = (ROOT / "tests/record_view_corpus/c638_mapping_child_append.py").read_text()
     module, _, _ = lower_ast_source_to_ssa(
         source, "root", name="mapping_child_append",
         extraction_contract=ROOT / "extraction_contracts/program_extraction.yaml",
         progress=lambda _: None, progress_bars=False,
+    )
+    int_answers = tuple(
+        (answer, book) for answer, book in class_queries
+        if answer.class_identity == "builtins.int"
+    )
+    assert any(
+        len({answer.value_id for answer, _book in int_answers
+             if answer.scope == scope}) >= 2
+        for scope in {answer.scope for answer, _book in int_answers}
+    ), [(answer.scope, answer.value_id) for answer, _book in int_answers]
+    assert all(
+        answer.class_cell is not None and answer.proof_cells
+        and book.latest_ref(answer.class_cell.page,
+                            answer.class_cell.row) == answer.class_cell
+        for answer, book in int_answers
     )
     name = next(n for n in module.functions
                 if "__put__specialized" in n and "__ssa_sequence_" not in n)

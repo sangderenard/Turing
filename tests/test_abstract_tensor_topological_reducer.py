@@ -2730,6 +2730,15 @@ def kernel(values):
 
 
 def test_lambda_receives_an_anonymous_function_subgraph():
+    from src.compiler.concordance_declarations import (
+        REDUCTION, SOURCE_ACTIVITY_NODE, SOURCE_LAMBDA_NORMALIZATION,
+        SOURCE_SPAN,
+    )
+    from src.compiler.identity_concordance import (
+        CorrelationTable, Derived, Mode,
+    )
+    from types import SimpleNamespace
+
     graph = ProcessGraph(materialize_memory=False)
     module = ast.parse(
         """
@@ -2758,6 +2767,147 @@ def kernel(value):
         if isinstance(data.get("expr_obj"), ast.Call)
     )
     assert call["attributes"]["callee_ref"] == lambda_entry.reference.address
+
+    # The normalization wrapper and its Return are generated from this exact
+    # Lambda occurrence. Neither is an invented authored source root.
+    book = current_identity_book()
+    authored_lambda = next(node for node in ast.walk(module)
+                           if isinstance(node, ast.Lambda))
+    authored = book.latest_ref(
+        SOURCE_SPAN, authored_lambda._turing_source_span_row)
+    assert authored is not None
+    generated = {}
+    for row in book.page(SOURCE_SPAN).rows():
+        cell = book.latest_ref(SOURCE_SPAN, row)
+        if authored not in {parent for parent, _stage in book.edges_into(cell)}:
+            continue
+        generated[book.page(SOURCE_SPAN).cell(row, cell.column).kind] = cell
+    assert set(generated) == {"FunctionDef", "Return"}
+    assert generated["FunctionDef"].row[2] == ()
+    assert generated["Return"].row[2] == (("body", 0),)
+    receipt = book.latest_ref(SOURCE_LAMBDA_NORMALIZATION, (authored,))
+    assert receipt is not None
+    assert book.page(SOURCE_LAMBDA_NORMALIZATION).cell(
+        receipt.row, receipt.column,
+    ) == (generated["FunctionDef"], generated["Return"])
+    for occurrence in generated.values():
+        assert any(row[1] == occurrence and row[2] == "enter"
+                   for row in book.page(SOURCE_ACTIVITY_NODE).rows())
+    assert not CorrelationTable._control_activity_findings(
+        SimpleNamespace(metadata={"identity_book": book}),
+    )
+    book.post(
+        SOURCE_LAMBDA_NORMALIZATION, (authored,),
+        (generated["Return"], generated["FunctionDef"]),
+        stage=REDUCTION,
+        provenance=Derived((receipt, authored, *generated.values())),
+        mode=Mode.REVISE,
+    )
+    assert any(
+        finding.kind == "source-lambda-normalization"
+        for finding in CorrelationTable._control_activity_findings(
+            SimpleNamespace(metadata={"identity_book": book}),
+        )
+    )
+
+
+def test_lambda_capture_uses_the_generic_closure_concordance():
+    from types import SimpleNamespace
+
+    from src.compiler.concordance_declarations import (
+        REDUCTION, SOURCE_CLOSURE_CAPTURE, SOURCE_CLOSURE_ENVIRONMENT,
+        SOURCE_CLOSURE_FREE_NAMES, SOURCE_VALUE_CLASS,
+    )
+    from src.compiler.identity_concordance import (
+        CorrelationTable, Derived, Mode,
+    )
+
+    graph = ProcessGraph(materialize_memory=False)
+    module = ast.parse(
+        """
+def root(value: float, gain: float):
+    transform = lambda item: item + gain
+    return transform(value)
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+
+    lambda_entry = next(
+        entry for entry in graph.function_table
+        if entry.metadata.get("source_type") == "Lambda"
+    )
+    outer_graph = graph.function_table.entry("root").graph
+    call = next(
+        data for _node_id, data in outer_graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.Call)
+    )
+    assert any(role == "closure:gain" for _parent, role in call["parents"])
+    assert any(
+        data.get("type") == "Input"
+        and data.get("label") == "gain"
+        and (data.get("attributes") or {}).get("binding_kind") == "closure"
+        for _node_id, data in lambda_entry.graph.G.nodes(data=True)
+    )
+
+    book = current_identity_book()
+    inventory_row = next(
+        row for row in book.page(SOURCE_CLOSURE_FREE_NAMES).rows()
+        if int(row[1]) == int(lambda_entry.reference.address)
+    )
+    inventory_cell = book.latest_ref(
+        SOURCE_CLOSURE_FREE_NAMES, inventory_row,
+    )
+    definition, address, direct_names, transported_names = book.page(
+        SOURCE_CLOSURE_FREE_NAMES
+    ).cell(inventory_cell.row, inventory_cell.column)
+    assert direct_names == transported_names == ("gain",)
+    environments = tuple(
+        book.latest_ref(SOURCE_CLOSURE_ENVIRONMENT, row)
+        for row in book.page(SOURCE_CLOSURE_ENVIRONMENT).rows()
+        if int(row[1]) == int(lambda_entry.reference.address)
+        and row[2] == "gain"
+    )
+    assert environments
+    assert any(
+        book.page(SOURCE_CLOSURE_CAPTURE).latest(row)[0] in environments
+        for row in book.page(SOURCE_CLOSURE_CAPTURE).rows()
+    )
+    gain_id = next(
+        node_id for node_id, data in lambda_entry.graph.G.nodes(data=True)
+        if data.get("type") == "Input" and data.get("label") == "gain"
+    )
+    gain_class_cell = next(
+        book.latest_ref(SOURCE_VALUE_CLASS, row)
+        for row in book.page(SOURCE_VALUE_CLASS).rows()
+        if int(row[1]) == int(gain_id)
+        and book.page(SOURCE_VALUE_CLASS).latest(row)[:2]
+        == ("builtins.float", 1)
+        and any(
+            source.page == SOURCE_CLOSURE_CAPTURE
+            for source, _stage in book.edges_into(
+                book.latest_ref(SOURCE_VALUE_CLASS, row)
+            )
+        )
+    )
+    assert gain_class_cell is not None
+    audit_module = SimpleNamespace(metadata={"identity_book": book})
+    assert not CorrelationTable._source_closure_findings(audit_module)
+
+    # Completeness is concordance-audited: a declared transported name with
+    # no environment/capture path is visible, not silently treated external.
+    book.post(
+        SOURCE_CLOSURE_FREE_NAMES, inventory_row,
+        (definition, address, ("gain", "missing"), ("gain", "missing")),
+        stage=REDUCTION,
+        provenance=Derived((inventory_cell, definition, address)),
+        mode=Mode.REVISE,
+    )
+    assert any(
+        finding.kind == "source-closure-environment-missing"
+        for finding in CorrelationTable._source_closure_findings(audit_module)
+    )
 
 
 def test_augmented_assignment_lowers_to_value_operation():
@@ -2981,6 +3131,35 @@ def divide(x):
         if data.get("type") in {"Div", "FloorDiv"}
     ]
     assert operations == ["Div", "FloorDiv"]
+
+
+def test_tensor_shape_dimension_publishes_integer_value_class():
+    from src.common.tensors.topological_reducer import _source_numeric_scope
+    from src.compiler.concordance_declarations import SOURCE_VALUE_CLASS
+
+    graph = ProcessGraph(materialize_memory=False)
+    graph.python_bindings = {"AbstractTensor": AbstractTensor}
+    module = ast.parse(
+        """
+def dimension(values: AbstractTensor):
+    return values.shape[0]
+"""
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph.build_from_ast(module)
+    reduce_abstract_tensor_topology(graph)
+    function_graph = graph.function_table.entry("dimension").graph
+    indexed_id = next(
+        int(node_id)
+        for node_id, data in function_graph.G.nodes(data=True)
+        if data.get("type") == "Indexed"
+    )
+    fact = current_identity_book().page(SOURCE_VALUE_CLASS).latest((
+        _source_numeric_scope(function_graph.G), indexed_id,
+    ))
+    assert fact is not None
+    assert fact[:2] == ("builtins.int", 1)
+    assert fact[2] == "tensor shape dimension projection"
 
 
 def test_attribute_assignment_lowers_to_setattr_with_object_and_value():

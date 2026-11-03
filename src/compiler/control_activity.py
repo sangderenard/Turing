@@ -53,6 +53,162 @@ def binding(graph, node, *, book=None, scope=None):
     return next(iter(contracts)), cell
 
 
+def normal_call_activity_corridor(book, scope, start, end):
+    """Return a closed, unique normal source flow from Call exit to entry."""
+    node_page = book.page(SOURCE_ACTIVITY_NODE)
+    edge_page = book.page(SOURCE_ACTIVITY_EDGE)
+    if (start is None or end is None or start == end
+            or start.page != SOURCE_ACTIVITY_NODE
+            or end.page != SOURCE_ACTIVITY_NODE
+            or start.row[0] != scope or end.row[0] != scope):
+        return None
+    if (node_page.cell(start.row, start.column)[0], start.row[2]) != ('Call', 'exit'):
+        return None
+    if (node_page.cell(end.row, end.column)[0], end.row[2]) != ('Call', 'enter'):
+        return None
+    outgoing = {}
+    incoming = {}
+    for row in edge_page.scope_rows(scope):
+        before, after = row[1], row[2]
+        edge = book.latest_ref(SOURCE_ACTIVITY_EDGE, row)
+        outgoing.setdefault(before, []).append((after, row[3], edge))
+        incoming.setdefault(after, []).append(edge)
+    nodes, edges, seen = [start], [], {start}
+    current = start
+    while current != end:
+        options = outgoing.get(current, ())
+        if len(options) != 1:
+            return None
+        following, relation, edge = options[0]
+        if relation != 'flow' or following in seen:
+            return None
+        if following.page != SOURCE_ACTIVITY_NODE or following.row[0] != scope:
+            return None
+        if following != end:
+            kind, owners = node_page.cell(following.row, following.column)
+            if (kind, following.row[2]) not in {('Expr', 'exit'), ('Return', 'enter')} or owners:
+                return None
+            if len(incoming.get(following, ())) != 1:
+                return None
+        nodes.append(following)
+        edges.append(edge)
+        seen.add(following)
+        current = following
+    if len(incoming.get(end, ())) != 1:
+        return None
+    return tuple(nodes), tuple(edges)
+
+
+def normal_mapping_get_prefix(book, scope, start, end):
+    """Certify the narrow pure function-entry prefix before a mapping get."""
+    node_page = book.page(SOURCE_ACTIVITY_NODE)
+    edge_page = book.page(SOURCE_ACTIVITY_EDGE)
+    if (start is None or end is None or start == end
+            or start.page != SOURCE_ACTIVITY_NODE or end.page != SOURCE_ACTIVITY_NODE
+            or start.row[0] != scope or end.row[0] != scope
+            or (node_page.cell(start.row, start.column)[0], start.row[2])
+            != ('FunctionDef', 'enter')
+            or (node_page.cell(end.row, end.column)[0], end.row[2])
+            != ('Call', 'enter')):
+        return None
+    outgoing, incoming = {}, {}
+    for row in edge_page.scope_rows(scope):
+        edge = book.latest_ref(SOURCE_ACTIVITY_EDGE, row)
+        outgoing.setdefault(row[1], []).append((row[2], row[3], edge))
+        incoming.setdefault(row[2], []).append(edge)
+    allowed = {
+        ('arg', 'enter'), ('arg', 'exit'),
+        ('Name', 'enter'), ('Name', 'exit'),
+        ('Assign', 'enter'),
+    }
+    nodes, edges, seen, current = [start], [], {start}, start
+    while current != end:
+        options = outgoing.get(current, ())
+        if len(options) != 1:
+            return None
+        following, relation, edge = options[0]
+        if (relation != 'flow' or following in seen
+                or following.page != SOURCE_ACTIVITY_NODE
+                or following.row[0] != scope):
+            return None
+        if following != end:
+            kind, owners = node_page.cell(following.row, following.column)
+            if (kind, following.row[2]) not in allowed or owners:
+                return None
+            if len(incoming.get(following, ())) != 1:
+                return None
+        nodes.append(following)
+        edges.append(edge)
+        seen.add(following)
+        current = following
+    if len(incoming.get(end, ())) != 1:
+        return None
+    return tuple(nodes), tuple(edges)
+
+
+def post_call_activity_corridors(function_table, *, book=None):
+    """Concord normal caller intervals between completed effects and aliases."""
+    from .concordance_declarations import (
+        REDUCTION, SOURCE_CALL_ACTIVITY_CORRIDOR,
+        SOURCE_CALL_FIELD_EFFECT_COMPLETION, SOURCE_CALL_OBJECT_ALIAS,
+    )
+    book = current_identity_book() if book is None else book
+    completions = book.page(SOURCE_CALL_FIELD_EFFECT_COMPLETION)
+    aliases = book.page(SOURCE_CALL_OBJECT_ALIAS)
+    for entry in function_table:
+        wrapper = getattr(entry, 'graph', None)
+        if wrapper is None:
+            continue
+        scope = wrapper.G.graph.get('authored_function_identity')
+        if scope is None:
+            continue
+        for finished_row in completions.scope_rows(scope):
+            finished = book.latest_ref(SOURCE_CALL_FIELD_EFFECT_COMPLETION, finished_row)
+            actual, _formal, _exit, _callee_activity, publisher_binding, publisher_exit = (
+                completions.cell(finished.row, finished.column)
+            )
+            try:
+                publisher_points, exact_publisher_binding = binding(
+                    wrapper, int(finished_row[1]), book=book, scope=scope,
+                )
+            except (ValueError, KeyError):
+                continue
+            if (publisher_points is None or exact_publisher_binding != publisher_binding
+                    or publisher_points[1] != publisher_exit):
+                continue
+            for consumer_row in aliases.scope_rows(scope):
+                if consumer_row[1] == finished_row[1]:
+                    continue
+                consumer_alias = book.latest_ref(SOURCE_CALL_OBJECT_ALIAS, consumer_row)
+                if aliases.cell(consumer_alias.row, consumer_alias.column)[0] != actual:
+                    continue
+                try:
+                    consumer_points, consumer_binding = binding(
+                        wrapper, int(consumer_row[1]), book=book, scope=scope,
+                    )
+                except (ValueError, KeyError):
+                    continue
+                if consumer_points is None:
+                    continue
+                corridor = normal_call_activity_corridor(
+                    book, scope, publisher_exit, consumer_points[0],
+                )
+                if corridor is None:
+                    continue
+                nodes, edges = corridor
+                book.post(
+                    SOURCE_CALL_ACTIVITY_CORRIDOR,
+                    (scope, int(finished_row[1]), int(consumer_row[1]),
+                     actual, str(finished_row[4])),
+                    (finished, consumer_alias, publisher_binding, consumer_binding,
+                     publisher_exit, consumer_points[0], nodes, edges),
+                    stage=REDUCTION,
+                    provenance=Derived((finished, consumer_alias, publisher_binding,
+                                        consumer_binding, *nodes, *edges)),
+                    mode=Mode.CONCORD,
+                )
+
+
 def memberships(graph, *, book=None):
     """Project exact owner/arm edges onto this graph's resident identities."""
     book = current_identity_book() if book is None else book

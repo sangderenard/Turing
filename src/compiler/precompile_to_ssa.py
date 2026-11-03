@@ -1735,7 +1735,16 @@ def _contract_physical(
             return None
         if arm.storage == "scalar" and tuple(value.shape or ()):
             return None
-        return {"storage": str(arm.storage), "rank": int(arm.rank)}, contract
+        # Program: duplicate-activation offsets=[False, True] in
+        # test_source_call_input_conversion_frames. Its early sequence ABI
+        # arm is `unknown` although storage/rank are exact. Posting that
+        # unresolved spelling as a physical dtype made C/LLVM ask
+        # dtype_layout for `unknown`; the later bool semantic settlement
+        # cannot make the physical claim retroactively valid.
+        physical = {"storage": str(arm.storage), "rank": int(arm.rank)}
+        if str(arm.dtype) not in {"", "None", "unknown"}:
+            physical["physical_dtype"] = str(arm.dtype)
+        return physical, contract
     return None
 
 
@@ -6464,8 +6473,20 @@ class _ControlSSABuilder(TiledObject):
         and the LLVM lane refused every resident ``sum``/``any``/``count``
         loop on it (lane E)."""
 
+        # The region-call result index in ``root(x: int): return x + 1`` is
+        # a minted Const(0). Its old SSA_VALUE had semantic ``int`` and no
+        # physical width, although the exact literal has an int64 layout.
+        # Record that literal before revising the physical SSA fact below.
+        exact_integer = (type(literal) is int and dtype == "int"
+                         and getattr(self, "_captured_instruction_sink", None) is None)
+        if exact_integer:
+            from ..transmogrifier.dtype_layout import python_int_literal_dtype
+
+            selected_dtype = python_int_literal_dtype(literal)
+        else:
+            selected_dtype = dtype
         value = self.fresh_value(
-            dtype=dtype, transform=CONTROL_CONST, operands=operands,
+            dtype=selected_dtype, transform=CONTROL_CONST, operands=operands,
         )
         self.emit(
             Handler.Const,
@@ -6473,6 +6494,28 @@ class _ControlSSABuilder(TiledObject):
             value,
             attributes={"value": int(literal)},
         )
+        if exact_integer:
+            book = self._book()
+            row = (self._scope(), int(value.id))
+            prior = book.latest_ref(SSA_VALUE, row)
+            literal_cell = book.post(
+                SSA_CONSTANT_MATERIALIZATION,
+                (self._scope(), str(self.function_name),
+                 str(self.current.name), int(value.id)),
+                ("Const", selected_dtype, repr(literal)),
+                stage=self._stage(), provenance=Derived((prior,)),
+                mode=Mode.CONCORD,
+            )
+            prior_fact = book.page(SSA_VALUE).cell(prior.row, prior.column)
+            book.post(
+                SSA_VALUE, row,
+                rebuilt_ssa_value_fact(
+                    prior_fact, selected_dtype, (), prior_fact.origin,
+                    physical={"physical_dtype": selected_dtype,
+                              "storage": "scalar", "rank": 0}),
+                stage=self._stage(),
+                provenance=Derived((prior, literal_cell)), mode=Mode.REVISE,
+            )
         return value
 
     def indexed_load(

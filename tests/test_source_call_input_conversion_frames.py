@@ -7,6 +7,8 @@ import pytest
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import CorrelationTable, Derived, Mode
 from src.compiler.concordance_declarations import CALL_RECORD, CALL_INPUT_CONVERSION, PHYSICAL_CALL_INPUT_ADAPTATION
+from src.compiler.concordance_declarations import SSA_VALUE
+from src.compiler.ssa_record_return_state import function_scope_of
 
 
 SOURCE = '''def consume(begin:int,end:int)->int:
@@ -33,6 +35,19 @@ def _calls(module, entry):
     return [(label, ins) for label, block in function.blocks.items() for ins in block.instrs
             if ins.op == 'Call' and ins.attributes.get('plan_callsite_id') is not None
             and ins.attributes.get('callee') in module.functions]
+
+
+def test_unresolved_sequence_abi_does_not_post_unknown_physical_dtype():
+    module, _outputs, exports = _lower()
+    root = module.functions[exports[0]]
+    book = module.metadata['identity_book']
+    cell = book.latest_ref(SSA_VALUE, (function_scope_of(root), 4))
+    assert cell is not None
+    fact = book.page(SSA_VALUE).cell(cell.row, cell.column)
+    assert (fact.dtype, fact.storage, fact.rank, fact.physical_dtype) == (
+        'bool', 'sequence', 1, None,
+    )
+    assert not CorrelationTable.build(module).findings(module)
 
 
 @pytest.mark.parametrize('backend', ['c', 'llvm', 'fortran'])

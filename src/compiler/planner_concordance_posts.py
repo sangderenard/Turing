@@ -480,7 +480,9 @@ def _fold_literal_source_cells(graph: Any, node_id: int) -> tuple:
     ``planner_specialization`` cell of an operand Input the planner fed."""
 
     from ..common.tensors.topological_reducer import node_identity_cell
-    from .concordance_declarations import PLANNER_SPECIALIZATION_PAGE
+    from .concordance_declarations import (
+        PLANNER_SPECIALIZATION_PAGE, PROVEN_LITERAL,
+    )
     from .identity_concordance import current_identity_book
 
     if node_id not in graph.G:
@@ -507,8 +509,24 @@ def _fold_literal_source_cells(graph: Any, node_id: int) -> tuple:
         for parent, _role in graph.G.nodes[node_id].get("parents") or ():
             if int(parent) not in graph.G:
                 continue
+            parent_data = graph.G.nodes[int(parent)]
             cells.append(node_identity_cell(graph, int(parent)))
-            specialization = specialization_cell(graph.G.nodes[int(parent)])
+            # A normalized compiler operation can consume a literal which an
+            # earlier fold just established (optional-presence ``logical_not``
+            # is the repository case).  The parent's canonical value names
+            # the identity but not the decision that made it literal.  Carry
+            # that exact row into this fold so the derived truth changes only
+            # with its concordant cause.
+            parent_literal = book.latest_ref(
+                PROVEN_LITERAL,
+                (
+                    str(graph.G.graph.get("function_name")),
+                    int(parent_data.get("value_id", parent)),
+                ),
+            )
+            if parent_literal is not None:
+                cells.append(parent_literal)
+            specialization = specialization_cell(parent_data)
             if specialization is not None:
                 cells.append(specialization)
     except ValueError:
@@ -737,9 +755,32 @@ def _callsite_descriptor_receipt(descriptor: Any) -> Any:
     """Stable concordance spelling for one structured return descriptor."""
 
     if isinstance(descriptor, Mapping):
+        shape = tuple(descriptor.get("shape") or ())
+        # Repository compressor lowering reached ``_require_tensor`` with
+        # two exact descriptors that shared shape/dtype but differed in the
+        # rank/metadata contract.  Recording only (shape, dtype) made the
+        # second graph write look identical to the first receipt while its
+        # node metadata really changed, so the concordance correctly refused
+        # a REVISE with no changed recorded source.  The receipt is the whole
+        # descriptor state consumed by planning, including dynamic rank and
+        # declared boundary identity; no type fact may change off-book.
         return (
-            tuple(descriptor.get("shape") or ()),
+            shape,
             str(descriptor.get("dtype") or "unknown"),
+            int(descriptor.get("rank", len(shape)) or 0),
+            (
+                str(descriptor["metadata_state"])
+                if descriptor.get("metadata_state") is not None else None
+            ),
+            (
+                tuple(descriptor["sequence_row_shape"])
+                if descriptor.get("sequence_row_shape") is not None else None
+            ),
+            descriptor.get("device"),
+            (
+                str(descriptor["python_type"])
+                if descriptor.get("python_type") else None
+            ),
         )
     if isinstance(descriptor, tuple):
         return tuple(_callsite_descriptor_receipt(item) for item in descriptor)

@@ -6707,10 +6707,94 @@ def _merge_conditional_value_type_abi_arm(
 
     incumbent_physical = physical(incumbent)
     incoming_physical = physical(incoming)
+    # repository compress_octets, octet_huffman.encode_octets value 37:
+    # `_code_lengths(octets)` and `_octets(bytes(lengths))` are the two
+    # control-owned definitions of one AbstractTensor span.  The former's
+    # nested return settlement had established the carrier and rank but not
+    # yet its dtype; the latter established int64.  `unknown` is an absent
+    # claim, not a second physical ABI.  Join that partial evidence here,
+    # where the two exact arm cells meet, and retain both cells as the proof.
+    same_non_dtype_physical = (
+        incumbent.identity == incoming.identity
+        and incumbent.storage == incoming.storage
+        and incumbent.shape == incoming.shape
+        and incumbent.rank == incoming.rank
+        and incumbent.storage_identity == incoming.storage_identity
+        and incumbent.metadata_state == incoming.metadata_state
+        and incumbent.row_shape == incoming.row_shape
+    )
+    incumbent_dtype = str(incumbent.dtype or "")
+    incoming_dtype = str(incoming.dtype or "")
+    if (
+        incumbent_physical != incoming_physical
+        and same_non_dtype_physical
+        and {incumbent_dtype, incoming_dtype}.intersection({"", "unknown"})
+        and len({
+            dtype for dtype in (incumbent_dtype, incoming_dtype)
+            if dtype not in {"", "unknown"}
+        }) <= 1
+    ):
+        settled_dtype = next((
+            dtype for dtype in (incumbent_dtype, incoming_dtype)
+            if dtype not in {"", "unknown"}
+        ), "unknown")
+        incumbent_physical = (
+            incumbent.identity,
+            incumbent.storage,
+            settled_dtype,
+            incumbent.shape,
+            incumbent.rank,
+            incumbent.storage_identity,
+            incumbent.metadata_state,
+            incumbent.row_shape,
+        )
+        incoming_physical = incumbent_physical
+    # Two span arms use the same pointer/length carrier even when one arm's
+    # extent is statically known and the other is runtime-sized.  Repository
+    # ``encode_octets`` value 37 joins `_code_lengths(octets)` (256 int64
+    # rows) with `_octets(bytes(lengths))` (runtime-sized int64 rows).  The
+    # union cannot retain the stronger fixed extent because the runtime arm
+    # does not prove it; its exact common contract is the dynamic span.  This
+    # is a union join over both arm cells, not a tolerance for different
+    # carriers: dtype, rank, storage identity and row layout must all agree.
+    same_span_carrier = (
+        incumbent.identity == incoming.identity
+        and incumbent.storage == incoming.storage == "span"
+        and incumbent.dtype == incoming.dtype
+        and incumbent.rank == incoming.rank
+        and incumbent.rank > 0
+        and incumbent.storage_identity == incoming.storage_identity
+        and incumbent.row_shape == incoming.row_shape
+    )
+    static_dynamic_span_pair = (
+        incumbent.metadata_state == "dynamic"
+        and incumbent.shape == ()
+        and incoming.metadata_state == "static"
+        and len(incoming.shape) == incoming.rank
+    ) or (
+        incoming.metadata_state == "dynamic"
+        and incoming.shape == ()
+        and incumbent.metadata_state == "static"
+        and len(incumbent.shape) == incumbent.rank
+    )
+    if (
+        incumbent_physical != incoming_physical
+        and same_span_carrier and static_dynamic_span_pair
+    ):
+        incumbent_physical = (
+            incumbent.identity, incumbent.storage, incumbent.dtype,
+            (), incumbent.rank, incumbent.storage_identity,
+            "dynamic", incumbent.row_shape,
+        )
+        incoming_physical = incumbent_physical
     if incumbent_physical != incoming_physical:
         raise ValueError(
             "conditional union arm changes its physical ABI: "
-            f"value={int(value_id)}, arm={incoming.identity!r}"
+            f"value={int(value_id)}, arm={incoming.identity!r}, "
+            f"incumbent={incumbent_physical!r}, "
+            f"incoming={incoming_physical!r}, "
+            f"incumbent_sources={incumbent.source_cells!r}, "
+            f"incoming_sources={incoming.source_cells!r}"
         )
     return ValueTypeABIAlternative(
         *incoming_physical[:6],
@@ -12584,6 +12668,90 @@ def _field_slot_ops(
     declared_ids = {
         int(sequence_id) for sequence_id, *_rest in sequence_declarations
     }
+    # root(flag) -> use((1, 2), key_of(flag)) passes a tuple of closed
+    # lengths (2, 3) to the second keyed store. Its parameter is one graph
+    # id after the call frame, while the native table would compare that id
+    # as one int64 key. Refuse from the already-published formal length view
+    # before that scalar native contract is posted.
+    if authored_function_identity:
+        from .identity_concordance import (
+            current_identity_book, Derived as _TupleKeyDerived,
+        )
+        from .concordance_declarations import (
+            SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS,
+            SOURCE_CLOSED_AGGREGATE_LENGTHS,
+            SOURCE_AGGREGATE_LAYOUT,
+            SOURCE_TUPLE_KEY_NATIVE_GAP,
+            PROCESS_GRAPH_OPERANDS,
+        )
+        gap_book = current_identity_book()
+        formal_page = gap_book.page(SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS)
+        for effect_id, key_id, _value_id, _sequence_id in table_stores:
+            if not isinstance(key_id, int):
+                continue
+            formal_cell = _frame_graph_cell(graph_obj, int(key_id))
+            if formal_cell is None:
+                continue
+            for formal_row in formal_page.scope_rows(formal_cell.row[0]):
+                if int(formal_row[1]) != int(key_id):
+                    continue
+                formal_ref = gap_book.latest_ref(
+                    SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS, formal_row,
+                )
+                formal_fact = formal_page.latest(formal_row)
+                if formal_ref is None or formal_fact is None:
+                    continue
+                lengths_cell = formal_fact[2]
+                if lengths_cell is not None:
+                    lengths = gap_book.page(
+                        SOURCE_CLOSED_AGGREGATE_LENGTHS
+                    ).cell(lengths_cell.row, lengths_cell.column).lengths
+                    if len(set(lengths)) < 2:
+                        continue
+                    store_cell = _frame_graph_cell(graph_obj, int(effect_id))
+                    operand_scope = (
+                        graph_obj.graph.get("operand_position_scope")
+                        or graph_obj.graph.get("lexical_read_scope")
+                    )
+                    operand_ref = gap_book.latest_ref(
+                        PROCESS_GRAPH_OPERANDS,
+                        (operand_scope, int(effect_id)),
+                    )
+                    if (store_cell is None or formal_cell is None
+                            or operand_ref is None or (
+                                formal_cell, "index"
+                            ) not in gap_book.page(
+                                PROCESS_GRAPH_OPERANDS
+                            ).cell(operand_ref.row, operand_ref.column)):
+                        continue
+                    # The exact formal has a closed (2, 3) length domain but
+                    # no member layout. Native table helpers accept a fixed
+                    # tuple of scalar key columns, so the first missing
+                    # operation is projecting this runtime tuple into those
+                    # columns, including its length discriminator.
+                    if gap_book.latest_ref(
+                        SOURCE_AGGREGATE_LAYOUT,
+                        (formal_cell.row[0], int(key_id)),
+                    ) is not None:
+                        continue
+                    gap_book.post(
+                        SOURCE_TUPLE_KEY_NATIVE_GAP,
+                        (authored_function_identity, int(effect_id)),
+                        (int(key_id), tuple(lengths), formal_ref,
+                         store_cell, operand_ref,
+                         "runtime_tuple_to_key_columns"),
+                        stage=SHELL_HANDOFF,
+                        provenance=_TupleKeyDerived((
+                            formal_ref, store_cell, operand_ref,
+                        )),
+                        mode=Mode.CONCORD,
+                    )
+                    raise ValueError(
+                        "native_tuple_key_arm_projection_missing: "
+                        f"store={int(effect_id)}, formal={int(key_id)}, "
+                        f"closed_lengths={tuple(lengths)!r}, "
+                        "operation=runtime_tuple_to_key_columns"
+                    )
     # A contract-declared keyed field is writable exactly when the contract
     # says so (``mutable: true``): its store helper is refused as a read-only
     # destination otherwise.
@@ -24174,13 +24342,16 @@ def _class_surface_ssa_program(
     from .extraction_contract import binding_names_function
 
     planned_graphs_by_shell: dict[int, Any] = {}
+    planned_process_graphs_by_graph: dict[int, Any] = {}
     for planned_shell in planned_shells:
-        planned_graph = getattr(
-            getattr(planned_shell, "process_graph", None), "G", None
-        )
+        planned_process_graph = getattr(planned_shell, "process_graph", None)
+        planned_graph = getattr(planned_process_graph, "G", None)
         if planned_graph is None:
             continue
         planned_graphs_by_shell[id(planned_shell)] = planned_graph
+        planned_process_graphs_by_graph[id(planned_graph)] = (
+            planned_process_graph
+        )
         function_name = planned_graph.graph.get("function_name")
         if function_name is None:
             continue
@@ -25098,11 +25269,6 @@ def _class_surface_ssa_program(
         SourcePageFactClass as _ABISourcePageFactClass,
     )
     def current_source_class_cell(owner, value_id, attributes):
-        current = shape_identity_book.latest_ref(
-            _ABI_VALUE_CLASS, (_source_numeric_scope(owner), int(value_id)),
-        )
-        if current is not None:
-            return current
         receipt = attributes.get("callsite_iterable_element_class_cell")
         if receipt is None:
             return None
@@ -25124,6 +25290,12 @@ def _class_surface_ssa_program(
             if cell.page.name in {"source_value_class_concordance", "cell_set"}:
                 pending.extend(parent for parent, _ in shape_identity_book.edges_into(cell))
         raise ValueError("callsite class receipt belongs to a different canonical subject")
+
+    from .source_evidence_resolver import (
+        ClassEvidence as _SourceClassEvidence,
+        UnresolvedSourceDemand as _UnresolvedSourceDemand,
+        require_class as _require_source_class,
+    )
 
     deferred_type_expectations = []
     for planned_graph in planned_graphs_by_shell.values():
@@ -25221,18 +25393,42 @@ def _class_surface_ssa_program(
             # Their complete numeric domains already project those receipts
             # to distinct current class rows. The current projection owns
             # this copy; its earlier receipt is a cause, not a competing view.
-            class_cell = current_source_class_cell(planned_graph, value_id, attributes)
-            class_fact = None if class_cell is None else _cell_fact(class_cell)
-            if not (
-                isinstance(class_fact, tuple)
-                and class_fact
-                and str(class_fact[0])
+            class_answer = _require_source_class(
+                numeric_scope, value_id, book=shape_identity_book,
+            )
+            if isinstance(class_answer, _SourceClassEvidence):
+                # The ProgramABI semantic class uses the exact source value
+                # and its published class proof. A class carried on a graph
+                # attribute cannot replace that value's concordance row.
+                class_cell = class_answer.class_cell
+                identity = class_answer.class_identity
+            elif (
+                isinstance(class_answer, _UnresolvedSourceDemand)
+                and class_answer.missing == "missing_source_value_class"
             ):
-                continue
-            identity = str(class_fact[0])
+                # An iterable callsite can carry an earlier exact class
+                # receipt for this same canonical subject. Preserve that
+                # narrow existing transport until it has a published value
+                # class row of its own.
+                class_cell = current_source_class_cell(
+                    planned_graph, value_id, attributes,
+                )
+                class_fact = None if class_cell is None else _cell_fact(class_cell)
+                if not (
+                    isinstance(class_fact, tuple)
+                    and class_fact and str(class_fact[0])
+                ):
+                    continue
+                identity = str(class_fact[0])
+            else:
+                raise ValueError(
+                    "source class settlement has unresolved published proof: "
+                    f"scope={numeric_scope!r}, value={value_id}, "
+                    f"demand={class_answer!r}"
+                )
             if class_cell is None:
                 raise ValueError(
-                    "source value class fact has no exact concordance cell: "
+                    "source class settlement has no exact class cell: "
                     f"scope={numeric_scope!r}, value={value_id}"
                 )
             # ONE identity per authored class.  The reducer concords a
@@ -25963,12 +26159,29 @@ def _class_surface_ssa_program(
         )))
         if not identities:
             return ()
+        process_owner = planned_process_graphs_by_graph.get(id(owner))
+        exact_descriptor = (
+            _tensor_descriptor(process_owner, int(value_id))
+            if process_owner is not None and int(value_id) in owner
+            else None
+        )
+        descriptor_state_cell = None
+        if exact_descriptor is not None and process_owner is not None:
+            from .identity_concordance import (
+                SHAPE_STATE_PAGE, shape_scope_of,
+            )
+
+            descriptor_state_cell = shape_identity_book.latest_ref(
+                SHAPE_STATE_PAGE,
+                (shape_scope_of(process_owner), int(value_id)),
+            )
         source_class_cell = current_source_class_cell(
             owner, int(value_id), {}
         )
         source_cells = tuple(dict.fromkeys((
             _identity_cell(owner, int(value_id)),
             *((source_class_cell,) if source_class_cell is not None else ()),
+            *((descriptor_state_cell,) if descriptor_state_cell is not None else ()),
             *linked_value_type_source_cells_by_graph.get(id(owner), {}).get(
                 int(value_id), (),
             ),
@@ -26037,6 +26250,31 @@ def _class_surface_ssa_program(
                 ))
                 continue
             storage = str(contract.get("storage") or "")
+            exact_rank = int(
+                (exact_descriptor or {}).get("rank", 0) or 0
+            )
+            exact_dtype = str(
+                (exact_descriptor or {}).get("dtype") or ""
+            )
+            exact_shape = tuple(map(
+                int, (exact_descriptor or {}).get("shape") or (),
+            ))
+            exact_dynamic = bool(
+                exact_descriptor is not None
+                and not exact_shape
+                and exact_rank > 0
+                and str(exact_descriptor.get("metadata_state") or "")
+                == "dynamic"
+            )
+            if (
+                not storage
+                and identity in {
+                    "AbstractTensor",
+                    "src.common.tensors.abstraction.AbstractTensor",
+                }
+                and exact_descriptor is not None
+            ):
+                storage = "span" if exact_rank > 0 else "scalar"
             declared_record = None
             if not storage:
                 # A value whose semantic class identity IS a ProgramABI record
@@ -26112,6 +26350,17 @@ def _class_surface_ssa_program(
                 or (primitive_receipt or {}).get("dtype")
                 or ""
             )
+            if dtype in {"", "unknown"} and exact_dtype not in {
+                "", "unknown",
+            }:
+                # repository compress_octets: the `_tensor` call's source
+                # class establishes AbstractTensor storage, while its exact
+                # call-result shape state establishes dynamic rank 1/int64.
+                # Publishing the class's generic `unknown` dtype discarded
+                # the latter before the specialized lz_encode shell was
+                # copied.  This reads the descriptor from that same value's
+                # concordance state and cites its cell above.
+                dtype = exact_dtype
             # Program: ``def table(n: int): return {1: n, 2: 5}`` (corpus
             # c217).  Wrong record: the formal's contract still spelled the
             # provisional class ``'int'`` while the literal's arm said
@@ -26125,11 +26374,16 @@ def _class_surface_ssa_program(
             ):
                 dtype = str(primitive_receipt["dtype"])
             shape = tuple(map(int, contract.get("shape") or ()))
+            if contract.get("shape") is None and exact_descriptor is not None:
+                shape = exact_shape
             rank = int(contract.get(
                 "rank",
                 node_abi.get(
                     "program_abi_rank",
-                    (primitive_receipt or {}).get("rank", len(shape)),
+                    (primitive_receipt or {}).get(
+                        "rank", exact_rank if exact_descriptor is not None
+                        else len(shape),
+                    ),
                 ),
             ))
             if primitive_receipt is not None and rank and not shape:
@@ -26198,7 +26452,19 @@ def _class_surface_ssa_program(
             arms.append(_ValueTypeABIAlternative(
                 identity, storage, dtype, shape, rank,
                 storage_identity, source_cells,
-                str(contract.get("metadata_state") or "static"),
+                str(
+                    contract.get("metadata_state")
+                    or (
+                        "dynamic"
+                        if exact_dynamic
+                        # An extentless positive-rank span necessarily carries
+                        # its extent at runtime.  Calling it static produced an
+                        # impossible ABI receipt for `_code_lengths` even
+                        # though its exact carrier was already concorded.
+                        or (storage == "span" and rank > 0 and not shape)
+                        else "static"
+                    )
+                ),
                 (
                     None
                     if contract.get("sequence_row_shape") is None
@@ -26256,6 +26522,86 @@ def _class_surface_ssa_program(
     # VALUE_TYPE_ABI publication.  Per-arm physical receipts are retained
     # independently, so ``None | dict`` is represented by a payload-free arm
     # and a descriptor-handle arm rather than by coercing both to one dtype.
+    def refuse_unlaid_class_constructor_merge(
+        planned_graph: Any, node_id: int,
+        arm_contracts: tuple[tuple[int, Any], ...],
+    ) -> None:
+        """Refuse only a copied, exactly proved two-constructor class merge."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS,
+            SOURCE_CLASS_UNION_NATIVE_GAP, SOURCE_CLOSED_CLASS_ALTERNATIVES,
+            SOURCE_VALUE_CLASS, SourceClassUnionNativeGap,
+            SourceClosedClassAlternatives,
+        )
+
+        if len(arm_contracts) != 2:
+            return
+        scope = planned_graph.graph.get("lexical_read_scope")
+        if scope is None:
+            return
+        value_id = int(planned_graph.nodes[node_id].get("value_id", node_id))
+        row = (scope, value_id)
+        closed = shape_identity_book.latest_ref(
+            SOURCE_CLOSED_CLASS_ALTERNATIVES, row)
+        operands = shape_identity_book.latest_ref(PROCESS_GRAPH_OPERANDS, row)
+        if closed is None or operands is None:
+            return
+        fact = shape_identity_book.page(SOURCE_CLOSED_CLASS_ALTERNATIVES).cell(
+            closed.row, closed.column)
+        operand_fact = shape_identity_book.page(PROCESS_GRAPH_OPERANDS).cell(
+            operands.row, operands.column)
+        if not isinstance(fact, SourceClosedClassAlternatives):
+            return
+        if not any(
+            source.page == SOURCE_CLOSED_CLASS_ALTERNATIVES
+            and source.row[1] == value_id
+            for source, _stage in shape_identity_book.edges_into(closed)
+        ):
+            return
+        arms = tuple(shape_identity_book.latest_ref(
+            CANONICAL_VALUE, (scope, int(arm_id)))
+            for arm_id, _contract in arm_contracts)
+        if any(arm is None for arm in arms):
+            return
+        if (tuple((arm, role) for arm, role in operand_fact
+                   if role in {"body", "orelse"})
+                != ((arms[0], "body"), (arms[1], "orelse"))
+                or any(original not in {
+                    source for source, _stage in shape_identity_book.edges_into(copy)
+                } for original, copy in zip(fact.arm_value_cells, arms, strict=True))
+                or closed.row != row):
+            return
+        identities = tuple(str(contract.get("python_type") or "")
+                           for _arm_id, contract in arm_contracts)
+        if identities != tuple(identity for identity, _limbs in fact.alternatives):
+            return
+        if any(
+            shape_identity_book.page(SOURCE_VALUE_CLASS).cell(
+                class_cell.row, class_cell.column)[2]
+            != "source class construction"
+            for class_cell in fact.arm_class_cells
+        ):
+            return
+        if any(_physical_type_arms(planned_graph, arm_id, contract)
+               for arm_id, contract in arm_contracts):
+            return
+        # Program: choose(flag) returns A() if flag else B(). Both source
+        # classes are exact, but neither constructor has a physical arm. The
+        # IfExp Phi would read undefined SSA values 3 and 4. Record the exact
+        # copy/operand/arm trail and refuse before that unsound Phi is emitted.
+        gap = shape_identity_book.post(
+            SOURCE_CLASS_UNION_NATIVE_GAP, row,
+            SourceClassUnionNativeGap(identities, closed, operands, arms),
+            stage=_LINKED_VALUE_ABI_SETTLEMENT,
+            provenance=_ShapeDerived((closed, operands, *arms)),
+            mode=_ShapeMode.CONCORD,
+        )
+        raise ConcordanceRefusal(
+            "native_class_union_arm_layout_missing: "
+            f"merge={value_id}, arms={tuple(int(arm_id) for arm_id, _ in arm_contracts)}, "
+            f"classes={identities}, gap={gap!r}")
+
     def settle_conditional_unions() -> bool:
         """Join every conditional's arm contracts; True if any changed."""
 
@@ -26417,6 +26763,8 @@ def _class_surface_ssa_program(
                             planned_graph, int(arm_id), arm_contract,
                         )
                         if tuple(arm.identity for arm in arm_abis) != arm_identities:
+                            refuse_unlaid_class_constructor_merge(
+                                planned_graph, int(node_id), arm_contracts)
                             established.clear()
                             break
                         identities.update(arm_identities)
@@ -27566,6 +27914,70 @@ def _class_surface_ssa_program(
                 int(value_id): dict(contract)
                 for value_id, contract in contracts.items()
             }
+    # Program: `total = 0; for token in xs: total += token` with a possibly
+    # empty float list. The exact loop binding has int64 seed and float64
+    # update ABI rows. A single int64 header/exit Phi cannot transport both
+    # physical arms. The tag/payload union machinery requires a control-owned
+    # arm projection that this loop has not published. Refuse at ABI
+    # settlement, where both source arm receipts are still available.
+    from .concordance_declarations import (
+        CANONICAL_VALUE as _LOOP_CANONICAL_VALUE,
+        LOOP_CARRIED_BINDING as _LOOP_CARRIED_BINDING,
+        LOOP_NATIVE_SCALAR_UNION_GAP as _LOOP_NATIVE_SCALAR_UNION_GAP,
+        LOOP_UPDATE_MINIMUM_TRIPS as _LOOP_UPDATE_MINIMUM_TRIPS,
+        VALUE_TYPE_ABI as _LOOP_VALUE_TYPE_ABI,
+        LoopNativeScalarUnionGap as _LoopNativeScalarUnionGap,
+    )
+    for _loop_row in shape_identity_book.page(_LOOP_CARRIED_BINDING).rows():
+        _loop_scope, _loop_id, _updated_id, _initial_id = _loop_row
+        if shape_identity_book.latest_ref(
+            _LOOP_UPDATE_MINIMUM_TRIPS, (_loop_scope, _updated_id),
+        ) is not None:
+            continue
+        _loop_binding = shape_identity_book.latest_ref(
+            _LOOP_CARRIED_BINDING, _loop_row,
+        )
+        _loop_owner = shape_identity_book.latest_ref(
+            _LOOP_CANONICAL_VALUE, (_loop_scope, _loop_id),
+        )
+        _loop_initial = shape_identity_book.latest_ref(
+            _LOOP_VALUE_TYPE_ABI, (_loop_scope, _initial_id),
+        )
+        _loop_updated = shape_identity_book.latest_ref(
+            _LOOP_VALUE_TYPE_ABI, (_loop_scope, _updated_id),
+        )
+        if any(ref is None for ref in (
+            _loop_binding, _loop_owner, _loop_initial, _loop_updated,
+        )):
+            continue
+        _initial_fact = _cell_fact(_loop_initial)
+        _updated_fact = _cell_fact(_loop_updated)
+        _initial_arms = tuple(_initial_fact.physical_alternatives)
+        _updated_arms = tuple(_updated_fact.physical_alternatives)
+        if not (
+            len(_initial_arms) == len(_updated_arms) == 1
+            and _initial_arms[0].storage == _updated_arms[0].storage == "scalar"
+            and _initial_arms[0].dtype != _updated_arms[0].dtype
+            and _initial_arms[0].identity != _updated_arms[0].identity
+        ):
+            continue
+        _loop_gap = shape_identity_book.post(
+            _LOOP_NATIVE_SCALAR_UNION_GAP, _loop_row,
+            _LoopNativeScalarUnionGap(
+                "header_exit_scalar_arm_projection",
+                _loop_binding, _loop_owner, _loop_initial, _loop_updated,
+            ),
+            stage=_LINKED_VALUE_ABI_SETTLEMENT,
+            provenance=_ShapeDerived((
+                _loop_binding, _loop_owner, _loop_initial, _loop_updated,
+            )),
+            mode=_ShapeMode.CONCORD,
+        )
+        raise ConcordanceRefusal(
+            "native_loop_scalar_union_projection_missing: "
+            f"loop={_loop_id}, initial={_initial_id}, "
+            f"updated={_updated_id}, gap={_loop_gap!r}"
+        )
     # Hierarchy plans freeze each numerical region's value shapes.  The
     # exact call-edge ABI contracts above are deliberately settled before
     # region partitioning, so plans made earlier during graph preparation
@@ -64250,9 +64662,9 @@ def _lower_ast_source_to_ssa_impl(
     chained_comparison_receipts.extend(_normalize_builtin_divmod(tree))
     chained_comparison_receipts.extend(_normalize_mapping_get(tree))
     chained_comparison_receipts.extend(_normalize_set_constructor(tree))
-    from .source_exception_ingestion import ingest_exception_syntax
     # Exception conversion runs after source pursuit has resolved native call
     # identities, before ProcessGraph ingestion; see source_control_normalizers.
+    from .source_exception_ingestion import ingest_exception_syntax
     short_circuit_receipts = list(_normalize_binary_short_circuit(tree))
     loop_else_receipts = list(_normalize_loop_else(tree))
     if chained_comparison_receipts:
@@ -64864,6 +65276,24 @@ def _lower_ast_source_to_ssa_impl(
         ),
         progress=report,
     )
+    # Program: the pursued repository compressor's ``lz_encode`` destructures
+    # ``length, distance = _longest_matches(...)``.  Dependency normalization
+    # retains the exact generated ``length = __turing_assignment_value_N[0]``
+    # statement in its receipt, but Assign itself is not always a ProcessGraph
+    # value and therefore did not necessarily cause its stamped SOURCE_SPAN to
+    # be posted.  Publish those retained statement identities at the end of
+    # source ingestion.  The later projection row can then derive from the
+    # exact statement it already records instead of posting an empty Derived.
+    from ..transmogrifier.graph.graph_express2 import post_source_span
+
+    for receipt in assignment_receipts:
+        for projection_statement in getattr(
+            receipt, "projection_statements", (),
+        ):
+            if post_source_span(None, projection_statement) is None:
+                raise ValueError(
+                    "assignment projection statement has no source identity"
+                )
     if numeric_specialization_receipts:
         graph.G.graph["numeric_source_specializations"] = tuple(
             dict(receipt) for receipt in numeric_specialization_receipts

@@ -12,6 +12,10 @@ sources. New Turing worktrees must come from Turing's own integrated history.
 
 (Everything below is mandatory. Any omission, digital shortcut, or silent deviation is "total failure." Agent = the person or program that will edit the existing repo.)
 
+Read [`AGENT_OBSTINANCE.md`](AGENT_OBSTINANCE.md) before changing this
+repository.  When an agent disregards a narrow instruction, record the
+departure and its concrete cost there using that document's entry format.
+
 ---
 
 ## Table of contents

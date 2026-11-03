@@ -46,6 +46,19 @@ def test_repeated_text_compresses_and_noise_does_not_grow_much():
     assert len(compress_octets(noise)) < len(noise) + 200
 
 
+def test_higher_levels_trade_search_latency_for_stronger_matching():
+    data = b"".join(
+        f"node {index} stage ingestion value ".encode() + b"x" * (index % 97)
+        for index in range(500)
+    )
+    fast = compress_octets(data, level=1)
+    strong = compress_octets(data, level=9)
+    assert len(strong) < len(fast)
+    assert decompress_octets(strong) == data
+    with pytest.raises(ValueError, match="level"):
+        compress_octets(data, level=10)
+
+
 def test_a_damaged_packet_refuses():
     packet = bytearray(compress_octets(b"stable repeated text " * 50))
     packet[-3] ^= 0xFF

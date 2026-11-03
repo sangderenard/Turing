@@ -71,8 +71,8 @@ TURING_VALIDATION_EXPORT uint32_t turing_validation_error_take(void) {
     return turing_validation_error_take_packet(&packet) ? packet.code : 0;
 }
 
-TURING_VALIDATION_EXPORT void turing_error_packet_init(turing_error_packet *packet, uint32_t code, const char *type, const char *message) {
-    *packet = (turing_error_packet){code ? code : UINT32_MAX, current_worker, current_worker_function, type, message};
+TURING_VALIDATION_EXPORT void turing_error_packet_init(turing_error_packet *packet, uint32_t code, const char *type, const char *message, uint8_t suppress_context) {
+    *packet = (turing_error_packet){code ? code : UINT32_MAX, current_worker, current_worker_function, type, message, suppress_context};
 }
 
 TURING_VALIDATION_EXPORT int turing_validation_error_take_active(turing_error_packet *packet) {

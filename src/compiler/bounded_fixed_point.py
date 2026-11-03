@@ -78,6 +78,7 @@ class BoundedFixedPoint:
         self, name: str, bound: int, *, scope: Any = (),
         progress: Callable[[str], None] | None = None, state: Any = None,
         recurrence: str = "refuse", book: Any = None,
+        start_index: int = 0, previous_ref: Any = None,
     ) -> None:
         if recurrence not in ("refuse", "record"):
             raise ConcordanceRefusal(
@@ -90,15 +91,15 @@ class BoundedFixedPoint:
         self.recurrence = recurrence
         self._report = progress or (lambda _message: None)
         self._book = book
-        self.rounds = 0
-        self._previous_ref = None
+        self.rounds = int(start_index)
+        self._previous_ref = previous_ref
         # Round 0 is the state the loop started from (the reference loop,
         # ssa_call_input_adapters, seeds ``seen_states`` the same way), so
         # a first round that restores it has period 1.
         self._seen: dict[str, int] = {}
         digest = _digest(state)
         if digest:
-            self._seen[digest] = 0
+            self._seen[digest] = self.rounds
 
     def round(
         self, changed: Any, *, changed_ids: Iterable[Any] = (),

@@ -978,6 +978,93 @@ def _source_loop_control_work(graph: Any, loop: LoopDescriptor):
         mode=Mode.CONCORD if previous is None else Mode.REVISE)
 
 
+def exact_zip_projected_iterable_bindings(
+    graph: Any,
+    loop_node_id: int,
+    iterable_node_id: int,
+    target_bindings: Iterable[tuple[str, int]],
+    induction: str,
+) -> tuple[tuple[int, int, str, int | None], ...]:
+    """Correlate a nested ``zip`` target with its exact source columns.
+
+    This is the one structural writer used both by eager descriptor
+    publication and retained-loop composition.  The outer target position
+    selects the exact zip argument; destructuring inside that target selects
+    a column of that argument's row.  Flattened target order is never used as
+    a proxy for either relation.
+    """
+
+    G = getattr(graph, "G", graph)
+    loop_expression = G.nodes.get(int(loop_node_id), {}).get("expr_obj")
+    iterable_data = G.nodes.get(int(iterable_node_id), {})
+    identity = str(
+        (iterable_data.get("attributes") or {}).get("extraction_identity")
+        or (iterable_data.get("attributes") or {}).get(
+            "static_python_reference"
+        )
+        or ""
+    )
+    if identity not in {"zip", "builtins.zip"} or not isinstance(
+        loop_expression, ast.For,
+    ) or not isinstance(loop_expression.target, (ast.Tuple, ast.List)):
+        return ()
+    numbered_sources: dict[int, int] = {}
+    for parent, role in iterable_data.get("parents", ()):
+        match = re.fullmatch(r"arg(?::)?(\d+)", str(role))
+        if match is None:
+            continue
+        position = int(match.group(1))
+        if position in numbered_sources:
+            return ()
+        numbered_sources[position] = int(parent)
+    if not numbered_sources or set(numbered_sources) != set(
+        range(len(numbered_sources))
+    ):
+        return ()
+    sources = tuple(
+        numbered_sources[position] for position in range(len(numbered_sources))
+    )
+    if len(loop_expression.target.elts) != len(sources):
+        return ()
+    target_bindings = tuple(target_bindings)
+    target_ids = dict(target_bindings)
+
+    def project(
+        target: ast.AST, source: int,
+    ) -> tuple[tuple[int, int, str, int | None], ...]:
+        if isinstance(target, ast.Name):
+            target_id = target_ids.get(target.id)
+            return () if target_id is None else ((
+                int(source), int(target_id), str(induction), None,
+            ),)
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return ()
+        projected = []
+        for column, member in enumerate(target.elts):
+            if not isinstance(member, ast.Name):
+                return ()
+            target_id = target_ids.get(member.id)
+            if target_id is None:
+                return ()
+            projected.append((
+                int(source), int(target_id), str(induction), int(column),
+            ))
+        return tuple(projected)
+
+    bindings = tuple(
+        binding
+        for source, target in zip(
+            sources, loop_expression.target.elts, strict=True,
+        )
+        for binding in project(target, source)
+    )
+    return bindings if {
+        int(binding[1]) for binding in bindings
+    } == {
+        int(target_id) for _name, target_id in target_bindings
+    } else ()
+
+
 def loop_requires_iterative_control(graph: Any, plan: LoopPlan) -> bool:
     """The evaporator's existing terminal/conditional control boundary.
 
@@ -1064,7 +1151,42 @@ def evaporate_unrolled_loops(
         # The clone's ``canonical_value`` row is NOVEL from the cell of the
         # body node it copies, so its operand edges (below) find a sourced
         # row instead of an Unsourced one synthesized by the reducer.
-        _post_planner_node_row(graph, clone_id, "loop_body_clone", int(source_id))
+        clone_cell = _post_planner_node_row(
+            graph, clone_id, "loop_body_clone", int(source_id),
+        )
+        if clone_cell is not None:
+            # Program: the repository compressor unrolls the fixed 4-gram
+            # loop in ``lz_encode``.  Its cloned Add is eligible deployment
+            # work, but a Novel canonical row does not give the activity
+            # reader an edge back to the authored body operation.  Publish
+            # the clone's control owner from the authored node's exact
+            # activity binding at the transformation that creates it.
+            from .concordance_declarations import (
+                LOOP_COMPOSER, SOURCE_ACTIVITY_BINDING,
+            )
+            from .control_activity import activity_scope, binding
+            from .identity_concordance import (
+                Derived, Mode, current_identity_book,
+            )
+            from ..common.tensors.topological_reducer import node_identity_cell
+
+            activity_book = current_identity_book()
+            points, activity_cell = binding(
+                graph, int(source_id), book=activity_book,
+            )
+            if points is not None:
+                scope = activity_scope(graph, book=activity_book)
+                source_cell = node_identity_cell(
+                    graph, int(source_id), book=activity_book,
+                )
+                activity_book.post(
+                    SOURCE_ACTIVITY_BINDING, (scope, clone_cell), points,
+                    stage=LOOP_COMPOSER,
+                    provenance=Derived((
+                        source_cell, clone_cell, activity_cell, *points,
+                    )),
+                    mode=Mode.CONCORD,
+                )
         from ..common.tensors.topological_reducer import _set_operands
 
         _set_operands(graph, clone_id, list(parents), cause=_LOOP_BODY_CLONE)
@@ -5514,21 +5636,24 @@ def analyze_shader_loop_reductions(
                         numbered_sources[position] = int(parent)
                     if numbered_sources and set(numbered_sources) == set(
                         range(len(numbered_sources))
-                    ) and len(numbered_sources) == len(loop.target_bindings):
+                    ):
                         zip_sources = tuple(
                             numbered_sources[position]
                             for position in range(len(numbered_sources))
                         )
-                        projected_iterable_bindings = tuple(
-                            (
-                                int(projected_source), int(target_id),
-                                induction_name, None,
-                            )
-                            for projected_source, (_name, target_id) in zip(
-                                zip_sources, loop.target_bindings, strict=True,
+                        # Program: ``for (hashes, powers), modulus in
+                        # zip(tables, _MODULI)`` in the repository octet
+                        # compressor.  The eager type publisher and retained
+                        # loop consume this one exact structural writer.
+                        exact_zip_bindings = (
+                            exact_zip_projected_iterable_bindings(
+                                graph, int(loop.node_id), int(iterable_id),
+                                loop.target_bindings, induction_name,
                             )
                         )
-                        iterable_extent_ids = tuple(map(int, zip_sources))
+                        if exact_zip_bindings:
+                            projected_iterable_bindings = exact_zip_bindings
+                            iterable_extent_ids = tuple(map(int, zip_sources))
         iterable_extent_id = (
             int(enumerated_source_id)
             if enumerated_source_id is not None

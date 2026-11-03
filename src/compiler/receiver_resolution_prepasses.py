@@ -510,6 +510,12 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         )
 
     def receiver_class(value_id: int) -> str | None:
+        from .source_evidence_resolver import (
+            ClassEvidence, UnresolvedSourceDemand, require_class,
+        )
+        from ..common.tensors.topological_reducer import _source_numeric_scope
+        from .identity_concordance import current_identity_book
+
         pending = [int(value_id)]
         visited = set()
         candidates = set()
@@ -520,6 +526,49 @@ def _resolve_grounded_method_references(graph: Any) -> None:
             visited.add(current)
             node = graph.G.nodes[current]
             attributes = node.get("attributes") or {}
+            if str(node.get("type")) in {"Input", "input"}:
+                # Program: `run(body: CodeBuilder): body.to_body()`.
+                # The formal's SOURCE_VALUE_CLASS is already published by
+                # reduction. Read that exact class before the older ABI or
+                # host-specialization paths can choose a same-named method.
+                evidence = require_class(
+                    _source_numeric_scope(graph), current,
+                    book=current_identity_book(),
+                )
+                if isinstance(evidence, ClassEvidence):
+                    if evidence.class_identity in class_table:
+                        candidates.add(evidence.class_identity)
+                    continue
+                if attributes.get("binding_kind") == "parameter":
+                    # Program: an untyped `body.to_body()` with a ProgramABI
+                    # hint for CodeBuilder. No SOURCE_VALUE_CLASS names the
+                    # formal, so no authored method may be selected from
+                    # the ABI or a host specialization's class spelling.
+                    continue
+            else:
+                # Program: root() calls Builder().to_body(). The constructor
+                # Call already has SOURCE_VALUE_CLASS Builder, while its
+                # graph class_ref is only a view. Read the exact class before
+                # routing the method from that receiver.
+                evidence = require_class(
+                    _source_numeric_scope(graph), current,
+                    book=current_identity_book(),
+                )
+                if isinstance(evidence, ClassEvidence):
+                    if evidence.class_identity in class_table:
+                        candidates.add(evidence.class_identity)
+                    continue
+                if (isinstance(evidence, UnresolvedSourceDemand)
+                        and evidence.missing != "missing_source_value_class"):
+                    raise ValueError(
+                        "method receiver has unresolved published class proof: "
+                        f"{evidence!r}"
+                    )
+                if attributes.get("class_ref") is not None:
+                    # A constructor receiver's graph class_ref is only the
+                    # read view. Without its SOURCE_VALUE_CLASS cell there
+                    # is no class proof for authored method selection.
+                    continue
             record_identity = attributes.get(
                 "program_abi_record_identity"
             )
@@ -599,6 +648,11 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         if receiver_id is None or method_name is None:
             continue
         class_identity = receiver_class(receiver_id)
+        if (class_identity is None
+                and graph.G.nodes[receiver_id].get('type') in {'Input', 'input'}
+                and (graph.G.nodes[receiver_id].get('attributes') or {}).get(
+                    'binding_kind') == 'parameter'):
+            continue
         reference = (class_table.get(class_identity, {}).get("methods", {}).get(method_name)
                      if class_identity is not None else None)
         binding_name = (graph.G.nodes[receiver_id].get("attributes") or {}).get("binding_name")
@@ -670,6 +724,13 @@ def _resolve_grounded_method_references(graph: Any) -> None:
         if receiver_id is None:
             continue
         class_identity = receiver_class(receiver_id)
+        if (class_identity is None
+                and graph.G.nodes[receiver_id].get('type') in {'Input', 'input'}
+                and (graph.G.nodes[receiver_id].get('attributes') or {}).get(
+                    'binding_kind') == 'parameter'):
+            from .source_method_receiver_demand import post_method_receiver_demand
+            post_method_receiver_demand(graph, int(_node_id), receiver_id)
+            continue
         reference = None
         if class_identity is not None:
             reference = (
@@ -748,6 +809,37 @@ def _resolve_grounded_method_references(graph: Any) -> None:
             )
         if reference is None:
             continue
+        # A used authored formal has an exact source class and declaration.
+        # Post this grounded decision through the incumbent CALL_BINDING with
+        # both declaration edges; do not select it from a host type or a
+        # similarly spelled class-table key.
+        from .source_evidence_resolver import ClassEvidence, require_class
+        from ..common.tensors.topological_reducer import _source_numeric_scope
+        from .concordance_declarations import CLASS_DECLARATION, CLASS_METHOD_DECLARATION
+        from .identity_concordance import current_identity_book
+        from .planner_concordance_posts import _post_call_binding
+        source_scope = _source_numeric_scope(graph)
+        evidence = require_class(source_scope, int(receiver_id),
+                                 book=current_identity_book())
+        if not isinstance(evidence, ClassEvidence):
+            continue
+        else:
+            if evidence.class_identity != class_identity:
+                continue
+            book = current_identity_book()
+            declaration = book.latest_ref(CLASS_DECLARATION,
+                (source_scope[0], class_identity))
+            method = book.latest_ref(CLASS_METHOD_DECLARATION,
+                (source_scope[0], class_identity, str(expression.func.attr)))
+            if declaration is None or method is None:
+                continue
+            binding = _post_call_binding(
+                graph, int(_node_id), int(reference), "callsite_shell",
+                source_cells=(evidence.subject_cell, *evidence.proof_cells,
+                              declaration, method),
+            )
+            if binding is None:
+                continue
         attributes = dict(attributes)
         attributes["method_ref"] = int(reference)
         attributes["method_resolution"] = "receiver-class-ref"

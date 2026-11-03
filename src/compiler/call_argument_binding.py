@@ -59,6 +59,25 @@ def _method_parameter_layout(graph: Any) -> tuple[
     return receiver, call_positional, all_parameters
 
 
+def _variadic_parameter_layout(graph: Any) -> tuple[str | None, str | None]:
+    """Return the authored ``*args`` and ``**kwargs`` parameter identities.
+
+    These identities are not positional parameters.  Reconstructing either
+    one from the tail of ``function_parameters`` confuses ``*args`` with
+    ``**kwargs`` and loses the source ABI distinction.  The extractor writes
+    both fields directly from the function definition; call binding only
+    reads that receipt.
+    """
+
+    metadata = graph.graph
+    positional = metadata.get("variadic_positional_parameter")
+    keyword = metadata.get("variadic_keyword_parameter")
+    return (
+        str(positional) if positional is not None else None,
+        str(keyword) if keyword is not None else None,
+    )
+
+
 def _callsite_parameter_name(
     role: str,
     receiver: str | None,

@@ -1334,6 +1334,10 @@ def _adapt_physical_call_inputs_round(
     represent logical Boolean values in double buffers. Convert at these value
     boundaries rather than changing the shared caller storage representation.
     """
+    from .source_evidence_resolver import (
+        PhysicalLayoutEvidence, require_physical_layout,
+    )
+    from .ssa_record_return_state import function_scope_of
     report = progress or (lambda _message: None)
     started = time.monotonic()
     report(
@@ -1519,8 +1523,54 @@ def _adapt_physical_call_inputs_round(
                         accounting = {**dict(actual.accounting or {}),
                             **dict((caller_formals.get(int(actual.id), actual).accounting or {}))}
                         scalar_region = scalar_region_formal(callee, formal)
-                        source_dtype = accounting.get('physical_dtype') or actual.dtype
-                        target_dtype = formal.dtype if scalar_region else (formal.accounting or {}).get('physical_dtype')
+                        if (accounting.get('program_abi_parameter')
+                                and accounting.get('physical_dtype')
+                                and accounting.get('program_abi_storage') in {
+                                    'scalar', 'span',
+                                }):
+                            # Program: root(xs: list[float]) calling helper(xs)
+                            # in test_physical_call_input_evidence. The old
+                            # call-width choice trusted resident accounting;
+                            # the same formal and generated descriptor feed
+                            # have exact SSA physical rows. Read those rows
+                            # before choosing any numeric call conversion.
+                            physical = require_physical_layout(
+                                function_scope_of(caller), int(actual.id),
+                            )
+                            if not isinstance(physical, PhysicalLayoutEvidence):
+                                from .identity_concordance import ConcordanceRefusal
+                                raise ConcordanceRefusal(
+                                    'physical-call-input-unproven: '
+                                    f'{caller.name} value {int(actual.id)}: '
+                                    f'{physical.missing}'
+                                )
+                            source_dtype = physical.physical_dtype
+                        else:
+                            source_dtype = accounting.get('physical_dtype') or actual.dtype
+                        if scalar_region:
+                            target_dtype = formal.dtype
+                        elif ((formal.accounting or {}).get('program_abi_parameter')
+                              and (formal.accounting or {}).get('physical_dtype')
+                              and (formal.accounting or {}).get('program_abi_storage')
+                              in {'scalar', 'span'}):
+                            # Program: root(xs: list[float]) calls helper(xs)
+                            # in test_physical_call_input_evidence. The helper
+                            # formal's target width is posted on its own SSA
+                            # row from VALUE_TYPE_ABI; resident accounting is
+                            # only a view of that physical contract.
+                            formal_physical = require_physical_layout(
+                                function_scope_of(callee), int(formal.id),
+                            )
+                            if not isinstance(formal_physical, PhysicalLayoutEvidence):
+                                from .identity_concordance import ConcordanceRefusal
+                                raise ConcordanceRefusal(
+                                    'physical-call-formal-unproven: '
+                                    f'{callee.name} value {int(formal.id)}: '
+                                    f'{formal_physical.missing}'
+                                )
+                            target_dtype = formal_physical.physical_dtype
+                        else:
+                            target_dtype = (formal.accounting or {}).get('physical_dtype')
                         numeric = {'bool', 'int32', 'int64', 'float32', 'float64'}
                         # A generated scalar (most importantly a loop-carried
                         # induction value) may feed an authored tensor helper

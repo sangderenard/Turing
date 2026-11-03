@@ -232,3 +232,156 @@ def save(path, payload):
     lower_python_shell_file_contexts(tree)
 
     assert any(isinstance(node, ast.With) for node in ast.walk(tree))
+
+
+def test_unresolved_context_is_a_total_compilation_failure():
+    from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+    from src.compiler.exception_graph import MissingResourceControlTopology
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        graph.build_from_ast(ast.parse(
+            "def root(manager):\n"
+            "    with manager() as value:\n"
+            "        return value\n"
+        ))
+        with pytest.raises(
+            MissingResourceControlTopology,
+            match="native resource scope requires concorded entry, exit and cleanup edges",
+        ):
+            reduce_abstract_tensor_topology(graph)
+    finally:
+        end_identity_book(token)
+
+
+def test_context_call_identity_follows_concorded_factory_result_and_dynamic_argument():
+    from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
+    from src.compiler.concordance_declarations import NATIVE_EXCEPTION_CONTROL_GAP, SOURCE_PYTHON_IDENTITY
+    from src.compiler.exception_graph import MissingResourceControlTopology
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        graph.build_from_ast(ast.parse(
+            "class IdentityBook:\n"
+            "    def borrowed(self, name):\n"
+            "        return name\n"
+            "def identity_book(module) -> IdentityBook:\n"
+            "    return IdentityBook()\n"
+            "def root(module, names):\n"
+            "    book = identity_book(module)\n"
+            "    for name in names:\n"
+            "        with book.borrowed(name) as page:\n"
+            "            return page\n"
+        ))
+        with pytest.raises(MissingResourceControlTopology):
+            reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("root").graph
+        context = next(
+            node for node in ast.walk(function.G.graph["function_body"][1])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "borrowed"
+        )
+        fact = book.page(SOURCE_PYTHON_IDENTITY).latest((
+            function.G.graph["authored_function_identity"], id(context),
+        ))
+        assert fact[0] == "concorded_context_call"
+        source = next(row[0] for row in book.page(NATIVE_EXCEPTION_CONTROL_GAP).rows()
+                      if book.page(NATIVE_EXCEPTION_CONTROL_GAP).latest(row)[0] == "With")
+        assert book.page(NATIVE_EXCEPTION_CONTROL_GAP).latest((source,))[1] == (
+            "resource_enter", "resource_exit", "cleanup",
+        )
+    finally:
+        end_identity_book(token)
+
+
+def test_mapping_get_uses_declared_value_class_after_presence_guard():
+    from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
+    from src.compiler.concordance_declarations import SOURCE_PYTHON_IDENTITY
+    from src.compiler.exception_graph import MissingResourceControlTopology
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        graph.build_from_ast(ast.parse(
+            "class IdentityBook:\n"
+            "    def borrowed(self, name):\n"
+            "        return name\n"
+            "def root(books: dict[str, IdentityBook], name: str):\n"
+            "    book = books.get(name)\n"
+            "    if book is None:\n"
+            "        return 0\n"
+            "    with book.borrowed(name) as page:\n"
+            "        return 1\n"
+        ))
+        with pytest.raises(MissingResourceControlTopology):
+            reduce_abstract_tensor_topology(graph)
+        function = graph.function_table.entry("root").graph
+        context = next(
+            node
+            for statement in function.G.graph["function_body"]
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "borrowed"
+        )
+        fact = book.page(SOURCE_PYTHON_IDENTITY).latest((
+            function.G.graph["authored_function_identity"], id(context),
+        ))
+        assert fact[0] == "concorded_context_call"
+    finally:
+        end_identity_book(token)
+
+
+def test_resource_demand_finalization_records_all_refusals_and_is_order_independent():
+    from types import SimpleNamespace
+    from src.common.tensors.topological_reducer import reduce_abstract_tensor_topology
+    from src.compiler.concordance_declarations import (
+        NATIVE_EXCEPTION_CONTROL_GAP, SOURCE_RESOURCE_ADMISSION_DEMAND,
+    )
+    from src.compiler.exception_graph import (
+        MissingResourceControlTopology, finalize_resource_admission_demands,
+    )
+    from src.compiler.identity_concordance import (
+        CorrelationTable, begin_identity_book, end_identity_book,
+    )
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        graph.build_from_ast(ast.parse(
+            "def first(manager):\n"
+            "    with manager() as value:\n"
+            "        return value\n"
+            "def second(manager):\n"
+            "    with manager() as value:\n"
+            "        return value\n"
+        ))
+        with pytest.raises(MissingResourceControlTopology):
+            reduce_abstract_tensor_topology(graph)
+        demand_rows = tuple(book.page(SOURCE_RESOURCE_ADMISSION_DEMAND).rows())
+        gap_rows = tuple(book.page(NATIVE_EXCEPTION_CONTROL_GAP).rows())
+        assert len(demand_rows) == len(gap_rows) == 2
+        assert all(book.page(NATIVE_EXCEPTION_CONTROL_GAP).latest(row)[1] == (
+            "missing_callable_identity", "resource_enter", "resource_exit", "cleanup",
+        ) for row in gap_rows)
+        findings = CorrelationTable._control_activity_findings(
+            SimpleNamespace(metadata={"identity_book": book}),
+        )
+        assert not [finding for finding in findings
+                    if finding.kind == "resource-admission-demand"]
+        original = tuple(book.latest_ref(NATIVE_EXCEPTION_CONTROL_GAP, row)
+                         for row in gap_rows)
+        table = graph.function_table
+        table._entries = dict(reversed(tuple(table._entries.items())))
+        with pytest.raises(MissingResourceControlTopology):
+            finalize_resource_admission_demands(graph)
+        assert original == tuple(book.latest_ref(NATIVE_EXCEPTION_CONTROL_GAP, row)
+                                 for row in gap_rows)
+    finally:
+        end_identity_book(token)

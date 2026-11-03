@@ -14,6 +14,7 @@ from src.compiler.concordance_declarations import (
     SOURCE_VALUE_CLASS,
 )
 from src.compiler.identity_concordance import (
+    Derived,
     Mode,
     Novel,
     Unresolved,
@@ -157,7 +158,11 @@ def test_terminal_freeze_settles_owed_host_scalar_from_class_or_planned_dtype():
         current_identity_book().post(
             SOURCE_VALUE_CLASS, (("module", "reader"), 5),
             ("builtins.float", 1, "test producer"),
-            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            stage=INGESTION, provenance=Derived((
+                current_identity_book().latest_ref(
+                    CANONICAL_VALUE, (("callers", 0), 5),
+                ),
+            )),
             mode=Mode.CONCORD,
         )
         strategy._refuse_unsettled_host_scalars(by_class, {})
@@ -171,6 +176,119 @@ def test_terminal_freeze_settles_owed_host_scalar_from_class_or_planned_dtype():
         row = strategy._region_value_dtype_row(by_plan, 6, mint=False)
         assert current_identity_book().page(
             PLAN_REGION_VALUE_DTYPE).latest(row) == "int64"
+    finally:
+        end_identity_book(token)
+
+
+def test_terminal_freeze_does_not_bypass_invalid_class_with_planned_dtype(
+    monkeypatch,
+):
+    from src.compiler import source_evidence_resolver
+
+    seen = []
+    original = source_evidence_resolver.require_class
+
+    def recording_query(scope, value_id, *, book):
+        answer = original(scope, value_id, book=book)
+        seen.append(answer)
+        return answer
+
+    monkeypatch.setattr(
+        source_evidence_resolver, "require_class", recording_query,
+    )
+    _book, token = begin_identity_book()
+    try:
+        graph = _owed_host_scalar_graph(8)
+        current_identity_book().post(
+            SOURCE_VALUE_CLASS, (("module", "reader"), 8),
+            ("builtins.float", 1, "unproved test producer"),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        with pytest.raises(ValueError, match="missing_class_provenance"):
+            strategy._refuse_unsettled_host_scalars(
+                graph, {8: "float64"},
+            )
+        assert seen and seen[-1].subject_cell is not None
+        assert strategy.outstanding_region_value_obligations(graph) == (8,)
+    finally:
+        end_identity_book(token)
+
+
+def test_terminal_freeze_does_not_collapse_closed_class_arms_to_planned_scalar(
+    monkeypatch,
+):
+    from src.compiler import source_evidence_resolver
+    from src.compiler.source_evidence_resolver import (
+        ClassAlternativesEvidence, UnresolvedSourceDemand,
+    )
+
+    _book, token = begin_identity_book()
+    try:
+        graph = _owed_host_scalar_graph(9)
+        subject = current_identity_book().latest_ref(
+            CANONICAL_VALUE, (("callers", 0), 9),
+        )
+        monkeypatch.setattr(
+            source_evidence_resolver,
+            "require_class",
+            lambda scope, value_id, *, book: UnresolvedSourceDemand(
+                scope, value_id, "class", "missing_source_value_class",
+            ),
+        )
+        monkeypatch.setattr(
+            source_evidence_resolver,
+            "require_class_alternatives",
+            lambda scope, value_id, *, book: ClassAlternativesEvidence(
+                scope, value_id,
+                (("A", 1), ("B", 1)),
+                subject, (subject,), subject,
+            ),
+        )
+        with pytest.raises(ValueError, match="closed_class_alternatives"):
+            strategy._refuse_unsettled_host_scalars(
+                graph, {9: "float64"},
+            )
+        assert strategy.outstanding_region_value_obligations(graph) == (9,)
+    finally:
+        end_identity_book(token)
+
+
+def test_open_any_needs_independent_physical_evidence():
+    _book, token = begin_identity_book()
+    try:
+        graph = _owed_host_scalar_graph(10)
+        class_cell = current_identity_book().post(
+            SOURCE_VALUE_CLASS, (("module", "reader"), 10),
+            ("builtins.object", 1, "open authored class"),
+            stage=INGESTION, provenance=Derived((
+                current_identity_book().latest_ref(
+                    CANONICAL_VALUE, (("callers", 0), 10),
+                ),
+            )),
+            mode=Mode.CONCORD,
+        )
+        with pytest.raises(
+            ValueError, match="open_class_requires_physical_layout",
+        ):
+            strategy._refuse_unsettled_host_scalars(graph, {})
+        assert strategy.outstanding_region_value_obligations(graph) == (10,)
+
+        strategy._refuse_unsettled_host_scalars(
+            graph, {10: "opaque_ref"},
+        )
+        row = strategy._region_value_dtype_row(graph, 10, mint=False)
+        assert current_identity_book().page(
+            PLAN_REGION_VALUE_DTYPE
+        ).latest(row) == "opaque_ref"
+        settled = current_identity_book().latest_ref(
+            PLAN_REGION_VALUE_DTYPE, row,
+        )
+        assert class_cell in {
+            source for source, _stage in current_identity_book().edges_into(
+                settled,
+            )
+        }
     finally:
         end_identity_book(token)
 

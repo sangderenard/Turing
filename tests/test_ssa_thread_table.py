@@ -176,3 +176,33 @@ def root():
                and f.metadata.get("source_function_reference") == table.bodies[body][0]
                for f in module.functions.values())
     assert "0 finding(s)" in concordance_report(module)
+
+
+def test_lambda_thread_target_uses_the_generic_closure_capture():
+    from src.compiler.concordance_declarations import (
+        SOURCE_THREAD_ACTIVATION, SOURCE_THREAD_BODY,
+    )
+
+    module = compile_source('''\
+import threading
+def root():
+    value = 9
+    thread = threading.Thread(target=lambda: value + 1)
+    thread.start()
+    thread.join()
+    return 1
+''')
+    book = module.metadata["identity_book"]
+    captures = tuple(
+        book.latest_ref(SOURCE_CLOSURE_CAPTURE, row)
+        for row in book.page(SOURCE_CLOSURE_CAPTURE).rows()
+    )
+    assert len(captures) == 1
+    bodies = tuple(
+        book.page(SOURCE_THREAD_BODY).latest(row)
+        for row in book.page(SOURCE_THREAD_BODY).rows()
+    )
+    assert len(bodies) == 1
+    assert bodies[0][2] == captures
+    assert len(tuple(book.page(SOURCE_THREAD_ACTIVATION).rows())) == 1
+    assert "0 finding(s)" in concordance_report(module)

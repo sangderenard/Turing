@@ -69,7 +69,9 @@ class DiskTileStore:
         return os.path.join(self.path, f"{offset:016x}.tile")
 
     def write(self, data, rows, *, heavy=True, compress=True):
-        # ``heavy`` asked for the stronger disk codec; there is one codec now.
+        # ``heavy`` is retained for the disk-tier call contract.  Compression
+        # effort is selected while the resident tile is made; offload must not
+        # silently add a long level-9 encode to a memory-pressure operation.
         # ``compress=False`` stores raw: a chunk of hashes does not shrink.
         if not compress:
             return self._append(data, len(data), rows, "raw", _checksum(data))
@@ -358,8 +360,9 @@ class CompressedTile:
     def encode(
         cls, data: bytes, rows: int, level: int, codebook: Any = None,
     ) -> CompressedTile:
-        # Level 0 stores raw; every other level is the one octet codec.
-        compressed = compress_octets(data, codebook) if level else data
+        compressed = (
+            compress_octets(data, codebook, level=level) if level else data
+        )
         if len(compressed) < len(data):
             return cls(compressed, len(data), rows, True, codebook)
         return cls(data, len(data), rows, False)
@@ -477,9 +480,13 @@ class CompressedTable(Mapping):
             # A shared codebook costs its dictionary once; it pays only on
             # a table of several tiles, so the first ones are coded alone
             # and train it.
-            self._codebook = train_codebook(b"".join(
-                tile.decode() for tile in self._tiles[:CODEBOOK_AFTER_TILES]
-            ))
+            self._codebook = train_codebook(
+                b"".join(
+                    tile.decode()
+                    for tile in self._tiles[:CODEBOOK_AFTER_TILES]
+                ),
+                level=level,
+            )
         restored = self._loader(data)
         for (original, _), (key, _) in zip(chunk, restored):
             if hash(original) != hash(key) or original != key:
@@ -674,9 +681,7 @@ class CompressedTable(Mapping):
                 continue
             with self._lock:
                 for index, tile in enumerate(self._tiles):
-                    # Every nonzero level is the same codec: only a tile
-                    # stored raw can shrink.
-                    if isinstance(tile, DiskTile) or tile.compressed:
+                    if isinstance(tile, DiskTile):
                         continue
                     candidate = CompressedTile.encode(
                         tile.decode(), tile.rows, level, self._codebook,

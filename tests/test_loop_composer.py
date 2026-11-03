@@ -44,6 +44,8 @@ from src.compiler.loop_composer import (
 )
 from src.compiler.glsl_deployment_strategy import (
     _fold_callsite_structural_values,
+    _publish_exact_zip_loop_target_descriptors,
+    _tensor_descriptor,
     _branch_compartments,
     _ordinary_conditional_control_programs,
     _resolve_grounded_method_references,
@@ -56,7 +58,10 @@ from src.compiler.resident_sequence_materialization import (
     _promote_conditional_sequence_aliases,
     _sequence_append_call_mutations,
 )
-from src.compiler.concordance_declarations import CONTROL_PROGRAM_BUILD
+from src.compiler.concordance_declarations import (
+    CONTROL_PROGRAM_BUILD,
+    PLANNER_TENSOR_SPECIALIZATION,
+)
 from src.compiler.loop_ir import (
     IterableAccess,
     IterableDomain,
@@ -76,6 +81,7 @@ from src.compiler.control_source import (
     StreamPublishBlock,
     ValidationBlock,
     WhileBlock,
+    concordant_projected_iterable_binding,
     post_control_program,
     render_control_program,
 )
@@ -182,6 +188,32 @@ def test_static_unroll_clones_authored_calls_with_exact_argument_edges():
         if role == "arg:1"
     )
     assert graph.G.nodes[index_id]["constant"] == 1
+
+
+def test_structural_fold_keeps_runtime_rank_when_broadcasting_a_scalar():
+    graph = _function_graph(
+        "def kernel(values):\n    return values * 4\n",
+        "kernel",
+    )
+    span = {
+        "shape": (), "dtype": "int64", "rank": 1,
+        "metadata_state": "dynamic",
+    }
+    formal_id = next(
+        node_id for node_id, data in graph.G.nodes(data=True)
+        if data.get("type") == "Input"
+        and (data.get("attributes") or {}).get("binding_name") == "values"
+    )
+    graph.G.nodes[formal_id]["tensor"] = dict(span)
+    graph.G.graph["planner_tensor_descriptors"] = {"values": dict(span)}
+    product_id = next(
+        node_id for node_id, data in graph.G.nodes(data=True)
+        if str(data.get("op") or "").casefold() in {"mul", "mult"}
+    )
+
+    _fold_callsite_structural_values(graph)
+
+    assert graph.G.nodes[product_id]["tensor"] == span
 
 
 def test_static_unroll_retains_value_dead_linked_call_occurrences():
@@ -1513,6 +1545,149 @@ def test_enumerate_zip_nested_target_preserves_each_source_column():
         f"min(__iterable_extent_{zip_sources[0]}__, "
         f"__iterable_extent_{zip_sources[1]}__)"
     )
+    post_control_program(
+        graph, reduction.control_program, stage=CONTROL_PROGRAM_BUILD,
+        label=("loop_control", int(plan.loop.node_id)),
+    )
+    assert concordant_projected_iterable_binding(
+        graph, int(plan.loop.target_bindings[0][1]),
+    )[:2] == (zip_sources[0], 0)
+    assert concordant_projected_iterable_binding(
+        graph, int(plan.loop.target_bindings[1][1]),
+    )[:2] == (zip_sources[0], 1)
+    assert concordant_projected_iterable_binding(
+        graph, int(plan.loop.target_bindings[2][1]),
+    )[:2] == (zip_sources[1], None)
+
+
+def test_zip_nested_target_projects_columns_from_each_exact_source():
+    graph = _function_graph(
+        "def kernel(rows, tags):\n"
+        "    total = 0\n"
+        "    for (left, right), tag in zip(rows, tags):\n"
+        "        total = total + left + right + tag\n"
+        "    return total\n",
+        "kernel",
+    )
+    plan, = _glsl_composer().compose(graph)
+    reduction, = analyze_shader_loop_reductions(
+        graph, (plan,), (plan.loop.body_nodes,)
+    )
+    zip_node = graph.G.nodes[int(plan.loop.iterable_node)]
+    zip_sources = tuple(
+        int(parent)
+        for parent, role in zip_node["parents"]
+        if str(role).startswith("arg:")
+    )
+
+    assert len(plan.loop.target_bindings) == 3
+    assert reduction.control_program is not None
+    assert tuple(
+        (int(iterable_id), int(target_id), projection)
+        for iterable_id, target_id, _induction, projection
+        in reduction.control_program.projected_iterable_bindings
+    ) == (
+        (zip_sources[0], int(plan.loop.target_bindings[0][1]), 0),
+        (zip_sources[0], int(plan.loop.target_bindings[1][1]), 1),
+        (zip_sources[1], int(plan.loop.target_bindings[2][1]), None),
+    )
+    assert reduction.control_program.root.stop == (
+        f"min(__iterable_extent_{zip_sources[0]}__, "
+        f"__iterable_extent_{zip_sources[1]}__)"
+    )
+
+
+def test_nested_zip_target_type_derives_from_exact_call_member_cell():
+    from src.common.tensors.topological_reducer import (
+        node_identity_cell, post_derived_node_identity,
+    )
+    from src.compiler.identity_concordance import (
+        concordant_shape_transformation_state,
+        descriptor_from_shape_transformation_state,
+        shape_scope_of,
+    )
+    from src.compiler.planner_concordance_posts import (
+        _post_callsite_return_member,
+    )
+
+    graph = _function_graph(
+        "def pair(x):\n"
+        "    return x, x\n"
+        "def kernel(rows, tags):\n"
+        "    tables = [pair(x) for x in rows]\n"
+        "    total = 0\n"
+        "    for (left, right), tag in zip(tables, tags):\n"
+        "        total = total + left + right + tag\n"
+        "    return total\n",
+        "kernel",
+    )
+    list_display = next(
+        int(node_id) for node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.ListComp)
+    )
+    call_id, = tuple(
+        int(parent)
+        for parent, role in graph.G.nodes[list_display]["parents"]
+        if str(role) == "elt"
+    )
+    source_cell = node_identity_cell(graph, call_id)
+    first_leaf = max(map(int, graph.G.nodes)) + 1
+    leaves = (first_leaf, first_leaf + 1)
+    for leaf_id in leaves:
+        graph.G.add_node(
+            leaf_id, type="Indexed", op="Indexed", value_id=leaf_id,
+            attributes={"authored_call_result_projection": True},
+            parents=[], children=[],
+        )
+        post_derived_node_identity(
+            graph, leaf_id, (source_cell,),
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+        )
+    graph.G.nodes[call_id].setdefault("attributes", {})[
+        "aggregate_leaf_value_ids"
+    ] = leaves
+    for index, leaf_id in enumerate(leaves):
+        _post_callsite_return_member(
+            graph, call_id, index, leaf_id,
+            {
+                "shape": (), "dtype": "int64", "rank": 1,
+                "metadata_state": "dynamic",
+            },
+            (source_cell,), stage=PLANNER_TENSOR_SPECIALIZATION,
+        )
+
+    loop = next(
+        data for _node_id, data in graph.G.nodes(data=True)
+        if isinstance(data.get("expr_obj"), ast.For)
+    )
+    zip_id, = tuple(
+        int(parent) for parent, role in loop["parents"]
+        if str(role) == "iterable"
+    )
+    tag_source, = tuple(
+        int(parent) for parent, role in graph.G.nodes[zip_id]["parents"]
+        if str(role) == "arg:1"
+    )
+    graph.G.nodes[tag_source]["tensor"] = {
+        "shape": (), "dtype": "int64", "rank": 1,
+        "metadata_state": "dynamic",
+    }
+
+    assert _publish_exact_zip_loop_target_descriptors(graph) == 3
+    left_id = int(loop["attributes"]["loop_target_bindings"]["left"])
+    state = concordant_shape_transformation_state(
+        shape_scope_of(graph), left_id,
+    )
+    expected = {
+        "shape": (), "dtype": "int64", "rank": 1,
+        "metadata_state": "dynamic",
+    }
+    assert descriptor_from_shape_transformation_state(state) == expected
+    assert _tensor_descriptor(graph, left_id) == expected
+    tag_id = int(loop["attributes"]["loop_target_bindings"]["tag"])
+    assert _tensor_descriptor(graph, tag_id) == {
+        "shape": (), "dtype": "int64", "rank": 0,
+    }
 
 
 def test_structural_fold_refreshes_retained_loop_order_after_removing_constants():

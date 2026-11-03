@@ -164,7 +164,25 @@ def _prefix_hashes(octets: AbstractTensor, modulus: int):
     return (sums * shift) % modulus, powers
 
 
-def _longest_matches(octets, order, sorted_gram, positions, total):
+def _compression_effort(level: int) -> tuple[int, int]:
+    """Translate the public 1..9 level into bounded LZ search effort.
+
+    Level 1 retains the codec's original search.  Higher levels only inspect
+    more exact prior 4-gram occurrences and permit longer matches; they do not
+    change the packet format or the decoder.
+    """
+
+    if type(level) is not int or not 1 <= level <= 9:
+        raise ValueError("octet compression level must be an integer in [1, 9]")
+    # Every increment performs strictly more candidate comparisons.  Match
+    # reach doubles at levels 4 and 7, where the additional pointer-doubling
+    # round becomes useful rather than being cosmetic work at every step.
+    return 2 * level, MAX_MATCH << ((level - 1) // 3)
+
+
+def _longest_matches(
+    octets, order, sorted_gram, positions, total, *, candidates, max_match,
+):
     """Each position's longest match among its ``CANDIDATES`` most recent
     earlier occurrences of its 4-gram: ``(length, distance)``, 0 for none.
 
@@ -177,14 +195,14 @@ def _longest_matches(octets, order, sorted_gram, positions, total):
     tables = [_prefix_hashes(octets, modulus) for modulus in _MODULI]
     best_length = positions * 0
     best_distance = positions * 0
-    for back in range(1, min(CANDIDATES, grams - 1) + 1):
+    for back in range(1, min(candidates, grams - 1) + 1):
         same = ((sorted_gram[back:] - sorted_gram[:-back]) == 0).to_dtype("int64")
         candidate = _place(grams, order[back:], (order[:-back] + 1) * same) - 1
         has = (candidate >= 0).to_dtype("int64")
         source = candidate * has
-        limit = (total - positions).minimum(MAX_MATCH) * has
+        limit = (total - positions).minimum(max_match) * has
         length = positions * 0
-        step = MAX_MATCH
+        step = max_match
         while step:
             trial = length + step
             fits = (trial <= limit).to_dtype("int64")
@@ -246,7 +264,9 @@ def _read_header(packet: bytes, count: int) -> tuple[list[int], int]:
     return values, at
 
 
-def lz_encode(data: bytes, dictionary: bytes = b"") -> bytes:
+def lz_encode(
+    data: bytes, dictionary: bytes = b"", *, level: int = 1,
+) -> bytes:
     """The match-coded packet of ``data``.
 
     ``dictionary`` is text both sides already hold: matches may copy from
@@ -254,6 +274,7 @@ def lz_encode(data: bytes, dictionary: bytes = b"") -> bytes:
     """
 
     data, dictionary = bytes(data), bytes(dictionary)
+    candidates, max_match = _compression_effort(level)
     n, known = len(data), len(dictionary)
     if n == 0:
         return _header(0, 0, 0)
@@ -274,6 +295,7 @@ def lz_encode(data: bytes, dictionary: bytes = b"") -> bytes:
         sorted_gram = gram[order]
         length, distance = _longest_matches(
             octets, order, sorted_gram, positions, total,
+            candidates=candidates, max_match=max_match,
         )
         has = (length > 0).to_dtype("int64")
         pad = _zeros(total - grams, octets)

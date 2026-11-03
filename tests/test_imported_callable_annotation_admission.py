@@ -7,7 +7,8 @@ import pytest
 from src.compiler.identity_concordance import begin_identity_book, end_identity_book, CorrelationTable, Derived, Mode
 from src.compiler.concordance_declarations import (
     CLASS_DECLARATION, CLASS_FIELD_DECLARATION, PARAMETER_ANNOTATION,
-    FUNCTION_RETURN_ANNOTATION, STATIC_SYMBOL_DEFINITION, INGESTION,
+    FUNCTION_RETURN_ANNOTATION, SOURCE_RECORD_VIEW_SCHEMA,
+    STATIC_SYMBOL_DEFINITION, INGESTION,
 )
 from src.transmogrifier.graph.graph_express2 import (
     _source_ast_definition, _annotate_visual_source_owners,
@@ -22,6 +23,10 @@ class Record:
     optional_value: int | None = None
     def unused(self):
         raise RuntimeError('not executable source')
+class Factory:
+    @classmethod
+    def result(cls) -> "Record":
+        return Record()
 def read(record: "Record"):
     return record.optional_value
 def result() -> "Record":
@@ -52,8 +57,14 @@ def test_quoted_parameter_and_return_keep_exact_callable_class_field_causes(tmp_
     try:
         identity = module.Record.__module__ + "." + module.Record.__qualname__
         shells = _admit(module, "read", (identity,))
-        assert shells == ()  # declaration facts are admitted; no second graph class identity
-        _admit(module, "result", (identity,))
+        assert len(shells) == 1
+        assert shells[0].name == "Record"
+        assert shells[0]._turing_declaration_fragment is True
+        assert shells[0]._python_source_identity == (
+            module.__name__, module.Record.__qualname__,
+        )
+        return_shells = _admit(module, "result", (identity,))
+        assert len(return_shells) == 1
         for authority, row in ((PARAMETER_ANNOTATION, (module.__name__, "read", "record")),
                                (FUNCTION_RETURN_ANNOTATION, (module.__name__, "result"))):
             ref = book.latest_ref(authority, row)
@@ -69,6 +80,39 @@ def test_quoted_parameter_and_return_keep_exact_callable_class_field_causes(tmp_
         end_identity_book(token)
 
 
+def test_annotated_return_shell_enters_existing_record_schema_publisher(
+    tmp_path, monkeypatch,
+):
+    from src.compiler.fortran_c_shell import _authored_dataclass_record_views
+
+    module = _module(tmp_path, monkeypatch, "annotation_return_record_schema")
+    book, token = begin_identity_book()
+    try:
+        identity = module.Record.__module__ + "." + module.Record.__qualname__
+        shells = _admit(module, "result", (identity,))
+        projection_schemas = {}
+        _authored_dataclass_record_views(
+            ast.Module(body=list(shells), type_ignores=[]),
+            projection_schemas=projection_schemas,
+            carried_declarations=True,
+        )
+
+        schema = projection_schemas["Record"]
+        assert schema["source_record_view_schema"] == (
+            module.__name__, identity,
+        )
+        assert schema["fields"]["optional_value"] == {
+            "storage": "scalar", "dtype": "int64", "rank": 0,
+            "mutable": False, "optional": True,
+        }
+        assert book.latest_ref(
+            SOURCE_RECORD_VIEW_SCHEMA,
+            (module.__name__, identity),
+        ) is not None
+    finally:
+        end_identity_book(token)
+
+
 def test_same_named_imported_class_cannot_satisfy_another_modules_contract(tmp_path, monkeypatch):
     left = _module(tmp_path, monkeypatch, "annotation_import_left")
     right = _module(tmp_path, monkeypatch, "annotation_import_right")
@@ -80,6 +124,39 @@ def test_same_named_imported_class_cannot_satisfy_another_modules_contract(tmp_p
         assert page is None or not tuple(page.rows())
     finally:
         end_identity_book(token)
+
+
+def test_source_local_return_record_needs_no_external_boundary_record(
+    tmp_path, monkeypatch,
+):
+    module = _module(tmp_path, monkeypatch, "annotation_local_return")
+    book, token = begin_identity_book()
+    try:
+        assert _admit(module, "read", ()) == ()
+        shells = _admit(module, "result", ())
+        assert len(shells) == 1
+        assert shells[0]._python_source_identity == (
+            module.__name__, module.Record.__qualname__,
+        )
+        assert book.latest_ref(
+            FUNCTION_RETURN_ANNOTATION, (module.__name__, "result"),
+        ) is not None
+    finally:
+        end_identity_book(token)
+
+
+def test_admitted_class_carries_its_method_return_record_declaration(
+    tmp_path, monkeypatch,
+):
+    module = _module(tmp_path, monkeypatch, "annotation_class_return")
+    definition = _source_ast_definition(module.Factory)
+    shells = _source_owner_annotation_declaration_shells(
+        module.Factory, source_definition=definition, record_identities=(),
+    )
+    assert len(shells) == 1
+    assert shells[0]._python_source_identity == (
+        module.__name__, module.Record.__qualname__,
+    )
 
 
 def test_audit_refuses_foreign_class_added_to_an_annotation(tmp_path, monkeypatch):

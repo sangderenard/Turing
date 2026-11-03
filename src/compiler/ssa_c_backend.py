@@ -2339,6 +2339,12 @@ def emit_ssa_module_to_c(
         if left_root != right_root:
             physical_parent[right_root] = left_root
 
+    from .source_evidence_resolver import (
+        PhysicalLayoutEvidence, require_physical_layout,
+    )
+    from .ssa_record_return_state import function_scope_of
+    physical_book = (module.metadata or {}).get("identity_book")
+
     def authored_array_contract(value, owner: str) -> bool:
         """Whether a call operand is physically an array, not just indexed.
 
@@ -2350,6 +2356,16 @@ def emit_ssa_module_to_c(
         for legacy rankless repository buffers.
         """
 
+        if physical_book is not None:
+            layout = require_physical_layout(
+                function_scope_of(module.functions[owner]), int(value.id),
+                book=physical_book,
+            )
+            if isinstance(layout, PhysicalLayoutEvidence):
+                # An exact SSA physical scalar is not an array call edge;
+                # an ABI-backed span is. Resident shape/accounting cannot
+                # override either represented layout.
+                return layout.storage == "span"
         accounting = dict(value.accounting or {})
         return bool(
             tuple(value.shape or ())
@@ -2384,8 +2400,11 @@ def emit_ssa_module_to_c(
                         )
 
     explicit_physical: dict[tuple[str, int], set[str]] = {}
+    scalar_physical_shortfalls: list[CEmissionShortfall] = []
+    from .concordance_declarations import SSA_VALUE, SSAValueFact
     for owner in reachable:
         function = module.functions[owner]
+        owner_scope = function_scope_of(function)
         values = [*function.args]
         values.extend(
             instruction.res
@@ -2394,7 +2413,29 @@ def emit_ssa_module_to_c(
             if instruction.res is not None
         )
         for value in values:
-            physical_dtype = dict(value.accounting or {}).get("physical_dtype")
+            physical_row = (owner_scope, int(value.id))
+            layout = (require_physical_layout(
+                owner_scope, int(value.id), book=physical_book,
+            ) if physical_book is not None else None)
+            if isinstance(layout, PhysicalLayoutEvidence):
+                # The rank-zero scalar's posted row owns its C width. The
+                # resident accounting view cannot override this decision.
+                physical_dtype = layout.physical_dtype
+            else:
+                recorded = (physical_book.page(SSA_VALUE).latest(physical_row)
+                            if physical_book is not None else None)
+                if (isinstance(recorded, SSAValueFact)
+                        and recorded.storage == "scalar"
+                        and recorded.rank == 0):
+                    scalar_physical_shortfalls.append(CEmissionShortfall(
+                        "physical_layout",
+                        f"scalar-physical-layout-unproven: {owner} value "
+                        f"{int(value.id)}: {getattr(layout, 'missing', 'missing_identity_book')}",
+                    ))
+                    continue
+                # Other physical kinds retain their incumbent C contract;
+                # this scalar query does not describe their layouts.
+                physical_dtype = dict(value.accounting or {}).get("physical_dtype")
             if physical_dtype is None:
                 continue
             explicit_physical.setdefault(
@@ -2733,6 +2774,7 @@ def emit_ssa_module_to_c(
             extent_order.append(key)
         return extent_slots[key]
     shortfalls: list[CEmissionShortfall] = []
+    shortfalls.extend(scalar_physical_shortfalls)
     for conflict in (getattr(module, "metadata", {}) or {}).get("call_result_type_conflicts", ()):
         if str(conflict["caller"]) in reachable:
             shortfalls.append(CEmissionShortfall(
@@ -4572,19 +4614,30 @@ def emit_ssa_module_to_c(
                     if source_cell is None:
                         shortfalls.append(CEmissionShortfall(op, "exception operation has no source contract"))
                         continue
-                    operation, exception_type, message, error_code, _normalization = emission.page(SOURCE_EXCEPTION_OPERATION).cell(source_cell.row, source_cell.column)
+                    (operation, exception_type, message, error_code, cause,
+                     cause_argument, suppress_context, _normalization) = emission.page(
+                         SOURCE_EXCEPTION_OPERATION
+                     ).cell(source_cell.row, source_cell.column)
                     result_id = int(instruction.res.id)
                     policy = "native_record_and_control_edges"
                     try:
                         if op == "ExceptionNone":
                             expressions[result_id] = "INT64_C(0)"
                         elif op in {"ExceptionMake", "ExceptionTake"}:
-                            if op == "ExceptionMake" and instruction.args:
+                            if (op == "ExceptionMake" and cause_argument is not None
+                                    and (cause_argument >= len(instruction.args)
+                                         or cause is None)):
+                                raise ValueError("explicit exception cause lost its exact graph operand")
+                            message_arguments = len(instruction.args) - (1 if cause_argument is not None else 0)
+                            if op == "ExceptionMake" and message_arguments:
                                 raise ValueError("dynamic raised message requires an owned native message ABI")
+                            if op == "ExceptionMake" and cause_argument is not None:
+                                raise ValueError("explicit exception cause requires an owned native cause-chain ABI")
                             body.append(f"        turing_error_packet exception_{result_id} = {{0}};")
                             if op == "ExceptionMake":
                                 body.append(f"        turing_error_packet_init(&exception_{result_id}, {int(error_code)}u, "
-                                            f"{_trace_text(exception_type) if exception_type else 'NULL'}, {_trace_text(message) if message is not None else 'NULL'});")
+                                            f"{_trace_text(exception_type) if exception_type else 'NULL'}, {_trace_text(message) if message is not None else 'NULL'}, "
+                                            f"{1 if suppress_context else 0});")
                             else:
                                 body.append(f"        (void)turing_validation_error_take_active(&exception_{result_id});")
                             body.append(f"        int64_t t{result_id} = (int64_t)(uintptr_t)&exception_{result_id};")

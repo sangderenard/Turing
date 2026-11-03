@@ -1099,6 +1099,90 @@ def _source_owner_declaration_shell(value):
 def _source_owner_annotation_declaration_shells(value, *, source_definition=None, record_identities=()):
     """Declaration-only source classes named by an admitted callable API."""
 
+    def declaration_shell(referenced, definition):
+        declarations = [
+            copy.deepcopy(member)
+            for member in definition.body
+            if isinstance(member, (ast.Assign, ast.AnnAssign))
+        ]
+        if not declarations:
+            return None
+        shell = ast.ClassDef(
+            name=definition.name,
+            bases=copy.deepcopy(definition.bases),
+            keywords=copy.deepcopy(definition.keywords),
+            body=declarations,
+            decorator_list=[],
+            type_params=list(getattr(definition, "type_params", ())),
+        )
+        shell = ast.copy_location(shell, definition)
+        _carry_declared_decorators(shell, definition)
+        shell._turing_declaration_fragment = True
+        shell._python_source_identity = (
+            str(getattr(referenced, "__module__", "")),
+            str(getattr(
+                referenced, "__qualname__", referenced.__name__,
+            )),
+        )
+        return shell
+
+    if inspect.isclass(value):
+        # Source pursuit may admit a whole class at once.  In that case this
+        # hook is not revisited for each method, but method return records are
+        # still part of the admitted class API.  Retain only source-local
+        # return declarations; parameters and imported classes keep the
+        # ordinary ProgramABI gate used by the callable path below.
+        definition = (
+            source_definition
+            if isinstance(source_definition, ast.ClassDef)
+            else _source_ast_definition(value)
+        )
+        module = inspect.getmodule(value)
+        if not isinstance(definition, ast.ClassDef) or module is None:
+            return ()
+        bindings = _ast_definition_bindings(value, definition)
+        shells = []
+        seen = set()
+        for method in definition.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            annotation = method.returns
+            if isinstance(annotation, ast.Constant) and isinstance(
+                annotation.value, str
+            ):
+                try:
+                    annotation = ast.parse(annotation.value, mode="eval").body
+                except SyntaxError:
+                    continue
+            if annotation is None:
+                continue
+            for expression in ast.walk(annotation):
+                if not isinstance(expression, (ast.Name, ast.Attribute)):
+                    continue
+                referenced = _resolve_ast_parent_reference(expression, bindings)
+                identity = (
+                    None if not inspect.isclass(referenced) else
+                    f"{referenced.__module__}.{referenced.__qualname__}"
+                )
+                if (
+                    identity is None
+                    or referenced is value
+                    or str(getattr(referenced, "__module__", ""))
+                    != str(getattr(value, "__module__", ""))
+                    or identity in seen
+                ):
+                    continue
+                referenced_definition = _source_ast_definition(referenced)
+                if not isinstance(referenced_definition, ast.ClassDef):
+                    continue
+                _stamp_reference_class_identity(referenced, referenced_definition)
+                ingest_class_declaration_by_reference(referenced)
+                shell = declaration_shell(referenced, referenced_definition)
+                if shell is not None:
+                    shells.append(shell)
+                    seen.add(identity)
+        return tuple(shells)
+
     if inspect.ismethod(value):
         value = value.__func__
     if not inspect.isfunction(value):
@@ -1124,7 +1208,7 @@ def _source_owner_annotation_declaration_shells(value, *, source_definition=None
     # quoted-annotation/reference resolution, without adding executable methods.
     allowed_records = frozenset(map(str, record_identities))
     callable_definition = source_definition
-    if allowed_records and isinstance(callable_definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if isinstance(callable_definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
         parameters = (
             *callable_definition.args.posonlyargs, *callable_definition.args.args,
             *callable_definition.args.kwonlyargs,
@@ -1155,7 +1239,24 @@ def _source_owner_annotation_declaration_shells(value, *, source_definition=None
             if not inspect.isclass(referenced) or referenced is owner:
                 continue
             identity = f"{referenced.__module__}.{referenced.__qualname__}"
-            if occurrence is not None and identity not in allowed_records:
+            # A retained callable's source-local return class is itself part
+            # of that callable's output ABI.  ``encode_codewords`` constructs
+            # and returns ``HuffmanCodewords`` without an extraction-contract
+            # boundary record; refusing the exact return annotation here left
+            # its class fields semantically known but absent from the source
+            # record-schema concordance.  Imported parameter classes still
+            # require the explicit ProgramABI identity below: this exception
+            # is only the callable's own module and its authored return slot.
+            source_local_return = (
+                parameter == "return"
+                and str(getattr(referenced, "__module__", ""))
+                == str(getattr(value, "__module__", ""))
+            )
+            if (
+                occurrence is not None
+                and identity not in allowed_records
+                and not source_local_return
+            ):
                 continue
             evidence = references.setdefault(referenced, [])
             if occurrence is not None:
@@ -1258,38 +1359,23 @@ def _source_owner_annotation_declaration_shells(value, *, source_definition=None
                 )),
                 mode=Mode.CONCORD,
             )
-        # Callable-only annotation admission is already complete on the
-        # book. Appending another graph class shell would re-key that same
-        # class through _python_source_identity and duplicate its fields.
-        # Preserve the incumbent owner-field executable-navigation surface.
-        if referenced not in field_api_references:
+        # Program: ``CanonicalHuffmanTable.encode_codewords`` returns the
+        # annotated ``HuffmanCodewords`` dataclass, then ``compact_codewords``
+        # reads its tensor fields.  Wrong record: callable-only annotation
+        # admission posted the semantic return annotation and field reference
+        # classes but suppressed the declaration shell.  The existing source
+        # record-schema publisher consequently had no exact ClassDef from
+        # which to publish ``source_record_view_schema``; the constructor,
+        # returned value and downstream formal could not share one record.
+        # Rule: an exact admitted callable annotation carries the same
+        # declaration-only shell as a field-API reference.  The fragment's
+        # ``_python_source_identity`` joins the incumbent class declaration;
+        # it admits no method body and creates no second record mechanism.
+        if referenced not in field_api_references and not annotation_evidence:
             continue
-        declarations = [
-            copy.deepcopy(member)
-            for member in definition.body
-            if isinstance(member, (ast.Assign, ast.AnnAssign))
-        ]
-        if not declarations:
+        shell = declaration_shell(referenced, definition)
+        if shell is None:
             continue
-        shell = ast.ClassDef(
-            name=definition.name,
-            # Bases are declaration data for Enum classes: they distinguish
-            # an authored finite scalar domain from an ordinary record.
-            bases=copy.deepcopy(definition.bases),
-            keywords=copy.deepcopy(definition.keywords),
-            body=declarations,
-            decorator_list=[],
-            type_params=list(getattr(definition, "type_params", ())),
-        )
-        shell = ast.copy_location(shell, definition)
-        _carry_declared_decorators(shell, definition)
-        shell._turing_declaration_fragment = True
-        shell._python_source_identity = (
-            str(getattr(referenced, "__module__", "")),
-            str(getattr(
-                referenced, "__qualname__", referenced.__name__,
-            )),
-        )
         shells.append(shell)
     return tuple(shells)
 
@@ -2249,6 +2335,38 @@ def _ast_definition_bindings(value, definition=None):
         bindings.update(closure.builtins)
         bindings.update(closure.globals)
         bindings.update(closure.nonlocals)
+        # ``inspect.getclosurevars`` reads the outer code object's names.  A
+        # comprehension, generator expression, or lambda has its own nested
+        # code object, so a global used only there is absent.  Repository
+        # ``_longest_matches`` exposed this with
+        # ``[_prefix_hashes(octets, modulus) for modulus in _MODULI]``:
+        # ``_MODULI`` reached the outer binding map, while the helper call did
+        # not, and source pursuit left an admitted repository function as an
+        # external Input.  Nested code constants are the exact lexical
+        # evidence for those names.  Select only names present in the
+        # function's globals or builtins, preserving the same narrow boundary
+        # as getclosurevars rather than copying the module namespace.
+        nested_names = set()
+
+        def collect_nested_names(code):
+            for constant in code.co_consts:
+                if not isinstance(constant, types.CodeType):
+                    continue
+                nested_names.update(map(str, constant.co_names))
+                collect_nested_names(constant)
+
+        collect_nested_names(value.__code__)
+        function_globals = getattr(value, "__globals__", {})
+        bindings.update({
+            name: function_globals[name]
+            for name in nested_names
+            if name in function_globals
+        })
+        bindings.update({
+            name: vars(builtins)[name]
+            for name in nested_names
+            if name not in bindings and name in vars(builtins)
+        })
         # Signature defaults are evaluated outside the function code object,
         # so a global used only by ``parameter=NAME`` is intentionally absent
         # from getclosurevars().  The pursued definition still contains that
@@ -2274,7 +2392,6 @@ def _ast_definition_bindings(value, definition=None):
                 if isinstance(member, ast.Name)
                 and isinstance(member.ctx, ast.Load)
             }
-            function_globals = getattr(value, "__globals__", {})
             bindings.update({
                 name: function_globals[name]
                 for name in default_names
@@ -5604,6 +5721,15 @@ class ProcessGraph(TiledObject):
                 node_cell = book.latest_ref(INGESTION_VALUE, (scope, int(nid)))
                 book.post(SOURCE_OPERATOR_KIND, (node_cell,), handler.value,
                           stage=INGESTION, provenance=Derived((node_cell,)), mode=Mode.CONCORD)
+        elif isinstance(node, ast.Compare) and len(node.ops) == 1:
+            # Program: `book is None` guards the later `book.borrowed` call.
+            # The generic graph `equal` operator loses Python's `is` versus
+            # `==` distinction. Record that distinction at source ingestion.
+            from ...compiler.concordance_declarations import SOURCE_OPERATOR_KIND
+            book.post(SOURCE_OPERATOR_KIND, (identity,),
+                      f"compare:{type(node.ops[0]).__name__}",
+                      stage=INGESTION, provenance=Derived((identity, span)),
+                      mode=Mode.CONCORD)
         if span is None:
             return
         module_name, qualname, path = span.row

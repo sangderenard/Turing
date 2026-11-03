@@ -8,8 +8,20 @@ import ast
 from .concordance_declarations import (
     SOURCE_ACTIVITY_NODE, SOURCE_ACTIVITY_EDGE, SOURCE_ACTIVITY_BINDING,
     SOURCE_ACTIVITY_CALL, SOURCE_ACTIVITY_CHILD, REDUCTION, SOURCE_ACTIVITY_ARM_RELATION,
+    NATIVE_EXCEPTION_CONTROL_GAP, SOURCE_SPAN, SOURCE_TERMINAL_RETURN,
 )
 from .identity_concordance import Derived, Mode, current_identity_book
+
+
+class UnadmittedSourceControlTopology(ValueError):
+    """Source control reached reduction without an admitted graph contract."""
+
+    def __init__(self, kind, gap):
+        self.kind = str(kind)
+        self.gap = gap
+        super().__init__(
+            f"source {self.kind} reached reduction without admitted control topology: {gap}"
+        )
 
 
 def ingest_control_activity(graph, definition, scope):
@@ -34,12 +46,37 @@ def ingest_control_activity(graph, definition, scope):
 
     def sequence(nodes, before, after, owners, relation='flow'):
         tail = before
+        reaches_successor = True
         for node in nodes:
             first, last = visit(node, owners)
+            if not reaches_successor:
+                continue
             edge(tail, first, relation)
             relation = 'flow'
-            tail = last
-        edge(tail, after, relation)
+            # Program: `if book is None: return 0; with book.borrowed(...)`.
+            # The Return value reaches Return.exit, but that exit cannot flow
+            # through If.exit into the following With. Converted resource
+            # Try/With scopes keep their existing cleanup route; their owner
+            # cells identify them exactly, so this narrow rule leaves them.
+            protected = any(
+                book.page(SOURCE_SPAN).cell(owner.row, owner.column).kind
+                in {'Try', 'TryStar', 'With', 'AsyncWith'}
+                for owner, _arm in owners
+            )
+            if isinstance(node, ast.Return) and not protected:
+                occurrence = source(node)
+                book.post(
+                    SOURCE_TERMINAL_RETURN, (scope, occurrence),
+                    (first, last, tuple(owners)), stage=REDUCTION,
+                    provenance=Derived((occurrence, first, last,
+                                        *(owner for owner, _arm in owners))),
+                    mode=Mode.CONCORD,
+                )
+                reaches_successor = False
+            else:
+                tail = last
+        if reaches_successor:
+            edge(tail, after, relation)
 
     def visit(node, owners=(), root=False):
         enter, leave = point(node, 'enter', owners), point(node, 'exit', owners)
@@ -118,10 +155,29 @@ def ingest_control_activity(graph, definition, scope):
                 provenance=Derived((node._turing_resource_contract, body_exit, cleanup_enter)), mode=Mode.CONCORD)
             edge(body_exit, cleanup_enter, 'resource_cleanup', (arm_relation,))
             sequence(node.finalbody, cleanup_enter, leave, (*owners, (occurrence, 'finalbody')))
-        elif isinstance(node, (ast.Try, ast.TryStar, ast.With, ast.AsyncWith, ast.Raise)):
-            # No exceptional/resource topology is invented here. The native
-            # admission gate continues to refuse these missing contracts.
-            edge(enter, leave, 'unadmitted')
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            # This pass records source activity only.  Resource admission is
+            # decided after expression reduction has written each context
+            # call's exact callable and input identities to the concordance.
+            contexts = tuple(
+                child
+                for item in node.items
+                for child in (
+                    item.context_expr,
+                    *((item.optional_vars,) if item.optional_vars is not None else ()),
+                )
+            )
+            body_enter = point(node, 'body_enter', (*owners, (occurrence, 'body')))
+            sequence(contexts, enter, body_enter, owners)
+            sequence(node.body, body_enter, leave, (*owners, (occurrence, 'body')))
+        elif isinstance(node, (ast.Try, ast.TryStar, ast.Raise)):
+            requirements = ('exceptional_successor', 'handler', 'cleanup')
+            gap = book.post(
+                NATIVE_EXCEPTION_CONTROL_GAP, (source(node),),
+                (type(node).__name__, requirements), stage=REDUCTION,
+                provenance=Derived((enter, leave)), mode=Mode.CONCORD,
+            )
+            raise UnadmittedSourceControlTopology(type(node).__name__, gap)
         else:
             if isinstance(node, ast.Call):
                 children = (node.func, *node.args, *(keyword.value for keyword in node.keywords))
@@ -142,7 +198,7 @@ def ingest_control_activity(graph, definition, scope):
     # Join existing node registrations through their exact source-span
     # provenance. Some registered operators already carry lowered payloads,
     # so expr_obj is not an authoritative ingestion reader even here.
-    from .concordance_declarations import INGESTION_VALUE, SOURCE_SPAN
+    from .concordance_declarations import INGESTION_VALUE
     for row in tuple(book.page(INGESTION_VALUE).rows()):
         identity = book.latest_ref(INGESTION_VALUE, row)
         occurrences = tuple(cell for cell, _stage in book.edges_into(identity)

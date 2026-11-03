@@ -360,6 +360,36 @@ def test_conditional_none_arm_merges_distinct_exact_source_proofs():
         ) == (
             "builtins.NoneType", "none", "", (), 0, (),
         )
+        partial_tensor = ValueTypeABIAlternative(
+            "AbstractTensor", "span", "unknown", (), 1, (),
+            (call_cell,), "dynamic", None,
+        )
+        settled_tensor = ValueTypeABIAlternative(
+            "AbstractTensor", "span", "int64", (), 1, (),
+            (literal_cell,), "dynamic", None,
+        )
+        tensor_merged = _merge_conditional_value_type_abi_arm(
+            partial_tensor, settled_tensor, value_id=37,
+        )
+        assert tensor_merged.dtype == "int64"
+        assert tensor_merged.metadata_state == "dynamic"
+        assert tensor_merged.source_cells == (call_cell, literal_cell)
+        static_tensor = ValueTypeABIAlternative(
+            "AbstractTensor", "span", "int64", (256,), 1, (),
+            (call_cell,), "static", None,
+        )
+        dynamic_tensor = ValueTypeABIAlternative(
+            "AbstractTensor", "span", "int64", (), 1, (),
+            (literal_cell,), "dynamic", None,
+        )
+        extent_merged = _merge_conditional_value_type_abi_arm(
+            static_tensor, dynamic_tensor, value_id=37,
+        )
+        assert (
+            extent_merged.shape, extent_merged.rank,
+            extent_merged.metadata_state, extent_merged.dtype,
+            extent_merged.source_cells,
+        ) == ((), 1, "dynamic", "int64", (call_cell, literal_cell))
         with pytest.raises(
             ValueError, match="conditional union arm changes its physical ABI"
         ):

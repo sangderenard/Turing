@@ -1745,6 +1745,21 @@ def post_control_program(
             for node_id in program.specialized_conditional_node_ids
         ),
         root_blocks=root_cells,
+        # Program: ``for (hashes, powers), modulus in zip(tables, MODULI)``
+        # in the repository octet compressor.  Wrong record: ControlProgram
+        # retained the exact ``tables -> hashes, column 0`` projection, but
+        # ControlProgramFact dropped it, leaving descriptor settlement to
+        # flatten three targets against a two-source zip.  Rule: the control
+        # concordance carries the exact source and target identity cells and
+        # the projection selected by the loop composer.
+        projected_iterable_bindings=tuple(
+            (
+                cell_or_id(source), cell_or_id(target),
+                str(induction), projection,
+            )
+            for source, target, induction, projection
+            in program.projected_iterable_bindings
+        ),
     )
     incumbent_program = latest_fact(CONTROL_PROGRAM, program_row)
     if incumbent_program != program_fact:
@@ -1764,6 +1779,12 @@ def post_control_program(
             (
                 *root_cells, *cause,
                 *(item for item in program_fact.regions if isinstance(item, Ref)),
+                *(
+                    item
+                    for binding in program_fact.projected_iterable_bindings
+                    for item in binding[:2]
+                    if isinstance(item, Ref)
+                ),
                 book.latest_ref(CONTROL_PROGRAM, program_row),
                 *incumbent_cells,
             ),
@@ -1773,6 +1794,75 @@ def post_control_program(
             int(metadata.get("control_program_unrouted") or 0) + unrouted
         )
     return program_cell
+
+
+def concordant_projected_iterable_binding(
+    graph: Any, target_value_id: int,
+) -> tuple[int, object, Any] | None:
+    """Read one loop target's exact resident projection from control cells.
+
+    The loop composer is the sole writer of this relation.  This reader does
+    not infer a projection from target order: it matches the target's value
+    identity cell in the posted ``ControlProgramFact`` and resolves the
+    source through the same graph's value identity cells.  The returned cell
+    is the program fact that proves the relation.
+    """
+
+    from .concordance_declarations import CONTROL_PROGRAM, ControlProgramFact
+    from .identity_concordance import Ref, current_identity_book
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    G = getattr(graph, "G", graph)
+    metadata = getattr(G, "graph", None) or {}
+    scope = (
+        metadata.get("lexical_read_scope")
+        or metadata.get("ingestion_value_scope")
+    )
+    if scope is None:
+        return None
+    scope = tuple(scope)
+    value_cells: dict[Any, int] = {}
+    target_cell = None
+    for node_id, data in G.nodes(data=True):
+        value_id = data.get("value_id", node_id)
+        if not isinstance(value_id, int) or isinstance(value_id, bool):
+            continue
+        identity = node_identity_cell(graph, node_id)
+        if identity is None:
+            continue
+        value_cells[identity.key] = int(value_id)
+        if int(value_id) == int(target_value_id):
+            target_cell = identity
+    if target_cell is None:
+        return None
+
+    book = current_identity_book()
+    page = book.page(CONTROL_PROGRAM)
+    matches = []
+    for row in page.rows():
+        if not isinstance(row, tuple) or len(row) != 2 or row[0] != scope:
+            continue
+        program_cell = book.latest_ref(CONTROL_PROGRAM, row)
+        fact = page.latest(row)
+        if not isinstance(fact, ControlProgramFact):
+            continue
+        for source, target, _induction, projection in (
+            fact.projected_iterable_bindings
+        ):
+            if not (
+                isinstance(source, Ref) and isinstance(target, Ref)
+                and target.key == target_cell.key
+                and source.key in value_cells
+            ):
+                continue
+            matches.append((value_cells[source.key], projection, program_cell))
+    unique = {
+        (source, projection, cell.key if isinstance(cell, Ref) else None)
+        for source, projection, cell in matches
+    }
+    if len(unique) != 1:
+        return None
+    return matches[0]
 
 
 def post_control_rewrite(

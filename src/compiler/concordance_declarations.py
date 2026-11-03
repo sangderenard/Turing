@@ -190,6 +190,48 @@ class SourceAggregateLayout:
 
 
 @dataclass(frozen=True)
+class SourceClosedAggregateLengths:
+    """Closed tuple-arm lengths derived from two exact layouts and control."""
+
+    aggregate_kind: str
+    lengths: tuple[int, int]
+    conditional_cell: Ref
+    arm_layout_cells: tuple[Ref, Ref]
+
+
+@dataclass(frozen=True)
+class SourceClosedClassAlternatives:
+    """Two exactly reached semantic classes; no native tagged ABI claim."""
+
+    alternatives: tuple[tuple[str, int], tuple[str, int]]
+    arm_value_cells: tuple[Ref, Ref]
+    arm_class_cells: tuple[Ref, Ref]
+    control_cell: Ref
+    operand_cell: Ref
+
+
+@dataclass(frozen=True)
+class SourceClassUnionNativeGap:
+    """An exact authored two-class merge with no physical constructor arms."""
+
+    alternatives: tuple[str, str]
+    closed_cell: Ref
+    operand_cell: Ref
+    arm_value_cells: tuple[Ref, Ref]
+
+
+@dataclass(frozen=True)
+class LoopNativeScalarUnionGap:
+    """Exact loop-carried scalar arms awaiting a native header/exit projection."""
+
+    operation: str
+    binding_cell: Ref
+    loop_cell: Ref
+    initial_abi_cell: Ref
+    updated_abi_cell: Ref
+
+
+@dataclass(frozen=True)
 class StructuralValue:
     """A recursive view of an existing value/descriptor, never a new identity.
 
@@ -423,6 +465,9 @@ NAME_BINDING_CAPTURE = declare_page("name_binding_capture", (
     RowField("read_scope", K.SCOPE), RowField("name", K.NAME),
     RowField("version", K.INDEX),
 ), tuple)  # (source binding, source version, owning loop or None); CONCORD
+SOURCE_CLOSURE_FREE_NAMES = declare_page("source_closure_free_names", (
+    RowField("owner_scope", K.SCOPE), RowField("function_ref", K.INDEX),
+), tuple)  # (definition span, function address, direct names, transported names)
 SOURCE_CLOSURE_ENVIRONMENT = declare_page("source_closure_environment", (
     RowField("read_scope", K.SCOPE), RowField("function_ref", K.INDEX),
     RowField("name", K.NAME),
@@ -485,6 +530,9 @@ SOURCE_ACTIVITY_EDGE = declare_page("source_activity_edge", (
     RowField("source_scope", K.SCOPE), RowField("before", K.PAGE_REF),
     RowField("after", K.PAGE_REF), RowField("relation", K.LABEL),
 ), bool)  # source evaluation/control edges; repeat edges are region backedges
+SOURCE_TERMINAL_RETURN = declare_page("source_terminal_return", (
+    RowField("source_scope", K.SCOPE), RowField("return_occurrence", K.PAGE_REF),
+), tuple)  # (Return enter, Return exit, exact owners); no normal successor
 SOURCE_ACTIVITY_CHILD = declare_page("source_activity_child", (
     RowField("source_scope", K.SCOPE), RowField("owner", K.PAGE_REF), RowField("ordinal", K.INDEX),
 ), tuple)  # exact evaluation entry/completion of an authored display member
@@ -541,6 +589,9 @@ SSA_PROCESS_CALL = declare_page("ssa_process_call", (
 SOURCE_FORMAL_ORDER = declare_page("source_formal_order", (
     RowField("source_scope", K.SCOPE),
 ), tuple)  # ordered authored parameter names; grammar captured at ingestion
+SOURCE_PARAMETER_MEMORY_CONTRACT = declare_page("source_parameter_memory_contract", (
+    RowField("source_scope", K.SCOPE), RowField("parameter", K.NAME),
+), tuple)  # (selected ParameterContract,); proof edges add formal order/binding
 SOURCE_THREAD_ARGUMENT_PACK = declare_page("source_thread_argument_pack", (
     RowField("activation", K.PAGE_REF),
 ), tuple)  # exact ordered SOURCE_THREAD_ARGUMENT binding cells (including empty pack)
@@ -588,12 +639,18 @@ SOURCE_ACTIVITY_ARM_RELATION = declare_page("source_activity_arm_relation", (
     RowField("scope", K.SCOPE), RowField("owner", K.PAGE_REF),
     RowField("before", K.LABEL), RowField("after", K.LABEL),
 ), str)  # declared ordered relationship between non-exclusive control arms
+SOURCE_LAMBDA_NORMALIZATION = declare_page("source_lambda_normalization", (
+    RowField("authored_lambda", K.PAGE_REF),
+), tuple)  # generated FunctionDef and Return source spans from one authored Lambda
 SOURCE_RESOURCE_CONVERSION = declare_page("source_resource_conversion", (
     RowField("source", K.PAGE_REF), RowField("item", K.INDEX),
 ), tuple)  # admitted context kind, acquire operation, cleanup operation
 SOURCE_RESOURCE_SCOPE = declare_page("source_resource_scope", (
     RowField("source", K.PAGE_REF),
 ), tuple)  # conversion, exact entry-call occurrence, exact cleanup-call occurrence
+SOURCE_RESOURCE_ADMISSION_DEMAND = declare_page("source_resource_admission_demand", (
+    RowField("scope", K.SCOPE), RowField("source_node", K.VALUE_ID),
+), tuple)  # With identity, activity owner, ordered (call, receiver, input) identities
 SOURCE_RESOURCE_CONTROL = declare_page("source_resource_control", (
     RowField("scope", K.SCOPE), RowField("node", K.VALUE_ID),
 ), tuple)  # source scope, placed resource block, entry/cleanup source operations, receiver cell
@@ -605,7 +662,9 @@ SOURCE_EXCEPTION_NODE = declare_page("source_exception_node", (
 ), object)  # exact generated ingestion node -> exception conversion
 SOURCE_EXCEPTION_OPERATION = declare_page("source_exception_operation", (
     RowField("source", K.PAGE_REF),
-), tuple)  # (operation, exception type, message, code, process-operation origin cell)
+), tuple)  # (operation, exception type, message, code, explicit cause identity,
+            #  cause argument position, suppress implicit context,
+            #  process-operation origin cell)
 C_EXCEPTION_OPERATION = declare_page("c_exception_operation", (
     RowField("source", K.PAGE_REF), RowField("function", K.NAME), RowField("result", K.VALUE_ID),
 ), tuple)  # (semantic operator, input ids, materialization policy)
@@ -682,6 +741,18 @@ CLASS_FIELD_DECLARATION = declare_page("class_field_declaration", (
 SOURCE_RECORD_VIEW_SCHEMA = declare_page("source_record_view_schema", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
 ), tuple)
+#: One source value's exact record view after constructor arguments or a
+#: returned-record call have specialized the class declaration.  The class
+#: schema remains the declaration; this row is the correlational identity of
+#: the particular value.  ``(shape scope, value id)`` -> ProgramABI record
+#: receipt, REVISE, DERIVED from the value/call edge, the declared field rows,
+#: and the exact field-value shape/literal rows.  An optional field may carry
+#: ``present: bool`` only when its constructor actual is an exact literal; the
+#: payload declaration remains intact because an absent ABI slot still has a
+#: typed filler.
+SOURCE_VALUE_RECORD_VIEW = declare_page("source_value_record_view", (
+    RowField("shape_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), object)
 CLASS_METHOD_DECLARATION = declare_page("class_method_declaration", (
     RowField("module", K.SCOPE), RowField("class_identity", K.NAME),
     RowField("method", K.NAME),
@@ -866,6 +937,29 @@ REDUCER_FIELD_STATE = declare_page("reducer_field_state", (
     RowField("reduction_scope", K.SCOPE), RowField("receiver", K.VALUE_ID),
     RowField("field", K.NAME),
 ), FieldState)                         # mode REVISE: each write is a version
+#: One straight-line function's final mutation of a formal-owned field on
+#: successful implicit exit. One or two keyed writes may contribute; two
+#: writes additionally cite the earlier field-state revision and exact
+#: assignment-to-assignment activity flow. This is distinct from
+#: RETURN_SITE_FIELD_STATE,
+#: which records a field only when its receiver is an explicit returned slot.
+#: Fact: (formal identity, final field-state cell, function exit activity cell,
+#: authored sole assignment source, direct assignment-exit -> function-exit
+#: flow edge). CONCORD, DERIVED from those cells and SOURCE_FORMAL_ORDER.
+SOURCE_FUNCTION_EXIT_FIELD_STATE = declare_page("source_function_exit_field_state", (
+    RowField("function_scope", K.SCOPE), RowField("formal", K.VALUE_ID),
+    RowField("field", K.NAME),
+), tuple)
+#: A class Call has an exact class, declared __init__ method/address and
+#: field-exit state, but no receiver actual/formal alias for the newly
+#: constructed object. This names that missing constructor effect bridge at
+#: the exact caller Call; it does not transfer a field value or class.
+SOURCE_CONSTRUCTOR_FIELD_EFFECT_DEMAND = declare_page(
+    "source_constructor_field_effect_demand", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("initializer_scope", K.SCOPE), RowField("field", K.NAME),
+    ), tuple,
+)
 STATIC_ATTRIBUTE_STATE = declare_page("static_attribute_state", (
     RowField("reduction_scope", K.SCOPE), RowField("receiver_path", K.LABEL),
     RowField("field", K.NAME),
@@ -1334,6 +1428,19 @@ SOURCE_GLYPH_SEQUENCE = declare_page("source_glyph_sequence", (
 SOURCE_AGGREGATE_LAYOUT = declare_page("source_aggregate_layout", (
     RowField("source_scope", K.SCOPE), RowField("value", K.VALUE_ID),
 ), SourceAggregateLayout)
+SOURCE_CLOSED_AGGREGATE_LENGTHS = declare_page("source_closed_aggregate_lengths", (
+    RowField("source_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), SourceClosedAggregateLengths)  # derived arm-length domain; no runtime layout claim
+SOURCE_CLOSED_CLASS_ALTERNATIVES = declare_page("source_closed_class_alternatives", (
+    RowField("source_scope", K.SCOPE), RowField("value", K.VALUE_ID),
+), SourceClosedClassAlternatives)  # closed semantic arm classes, no native ABI
+SOURCE_CLASS_UNION_NATIVE_GAP = declare_page("source_class_union_native_gap", (
+    RowField("copy_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
+), SourceClassUnionNativeGap)  # exact constructor arms lack native layout
+LOOP_NATIVE_SCALAR_UNION_GAP = declare_page("loop_native_scalar_union_gap", (
+    RowField("copy_scope", K.SCOPE), RowField("loop", K.VALUE_ID),
+    RowField("updated", K.VALUE_ID), RowField("initial", K.VALUE_ID),
+), LoopNativeScalarUnionGap)  # exact scalar arms lack header/exit projection
 SOURCE_PAGE_FACT_CLASS = declare_page("source_page_fact_class", (
     RowField("module", K.SCOPE), RowField("page_name", K.NAME),
 ), SourcePageFactClass)
@@ -2949,6 +3056,11 @@ class ControlProgramFact:
     anchor_region: Any
     specialized_conditionals: tuple
     root_blocks: tuple
+    # Exact resident iterable -> lexical target projections.  The source and
+    # target entries are value identity cells, never reconstructed ordinals.
+    # Kept last so older serialized facts and positional seed construction
+    # retain their field order.
+    projected_iterable_bindings: tuple = ()
 
 
 #: ``CONTROL_PROGRAM.program`` for the shell's one program.
@@ -4362,6 +4474,115 @@ SOURCE_FUNCTION_REACHABILITY = declare_page(
         RowField("callee_scope", K.SCOPE),
     ), bool,
 )
+#: A source call's exact actual-to-formal relationship, before type transfer.
+#: ``(caller scope, call, callee scope, formal)`` -> (actual cell, role,
+#: formal-name, operand receipt, formal NAME_BINDING). CONCORD, DERIVED(reachability, call,
+#: actual, formal, SOURCE_ACTIVITY_SCOPE, SOURCE_FORMAL_ORDER,
+#: PROCESS_GRAPH_OPERANDS, NAME_BINDING). This says
+#: only which value crosses the call frame; object alias and mutable mapping
+#: state require separate proofs.
+SOURCE_CALL_ACTUAL_FORMAL = declare_page(
+    "source_call_actual_formal", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("callee_scope", K.SCOPE), RowField("formal", K.VALUE_ID),
+    ), tuple,
+)
+#: A reached source call presents one exact record actual to a formal whose
+#: installed ParameterContract says ALIAS/INOUT/RECORD/CALLER.  Fact:
+#: (actual identity, authored formal NAME_BINDING, memory-contract receipt,
+#:  actual class receipt, authored class declaration).  This is call storage
+#: aliasing only; mutable field effects require their own control proof.
+SOURCE_CALL_OBJECT_ALIAS = declare_page(
+    "source_call_object_alias", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("callee_scope", K.SCOPE), RowField("formal", K.VALUE_ID),
+    ), tuple,
+)
+#: One reached call's successful completion of a straight-line field effect.
+#: The callee's exact FunctionDef exit state is joined to the caller's Call
+#: exit through reachability and the same actual/formal object-alias receipt.
+#: This records completion only; no consumer field-state version is changed.
+SOURCE_CALL_FIELD_EFFECT_COMPLETION = declare_page(
+    "source_call_field_effect_completion", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("callee_scope", K.SCOPE), RowField("formal", K.VALUE_ID),
+        RowField("field", K.NAME),
+    ), tuple,
+)
+#: The complete authored caller activity inventory certifies one normal
+#: flow corridor from a successful field-effect Call exit to a later Call
+#: entry on the same exact object actual. No field-state transfer is implied.
+SOURCE_CALL_ACTIVITY_CORRIDOR = declare_page(
+    "source_call_activity_corridor", (
+        RowField("caller_scope", K.SCOPE),
+        RowField("publisher_call", K.VALUE_ID),
+        RowField("consumer_call", K.VALUE_ID),
+        RowField("actual", K.PAGE_REF), RowField("field", K.NAME),
+    ), tuple,
+)
+#: The publisher's completed field cursor is available at a later call's
+#: observed formal field through two exact aliases and a closed normal
+#: corridor. The consumer endpoint is its OBSERVED formal field cursor; this
+#: receipt does not link that cursor to a mapping get or select payload class.
+SOURCE_CALL_FIELD_STATE_TRANSFER = declare_page(
+    "source_call_field_state_transfer", (
+        RowField("caller_scope", K.SCOPE),
+        RowField("publisher_call", K.VALUE_ID),
+        RowField("consumer_call", K.VALUE_ID),
+        RowField("consumer_scope", K.SCOPE),
+        RowField("consumer_formal", K.VALUE_ID),
+        RowField("field", K.NAME),
+    ), tuple,
+)
+#: One exact dict.get read of the field version transferred from a completed
+#: keyed store. A selected earlier store additionally cites each later
+#: unequal-key field revision; a later unknown key leaves a named demand.
+#: The result keeps optional lookup semantics. This receipt identifies only
+#: the present-key value and the pure prefix before the read.
+SOURCE_MAPPING_GET_READ = declare_page(
+    "source_mapping_get_read", (
+        RowField("consumer_scope", K.SCOPE),
+        RowField("get_call", K.VALUE_ID),
+        RowField("field", K.NAME),
+    ), tuple,
+)
+#: A get of the result of mapping.copy has exact dataflow from the observed
+#: transferred field, but no published copy alias/state contract. This is a
+#: demand on that missing contract, not a present-key read or payload fact.
+SOURCE_MAPPING_GET_COPY_STATE_DEMAND = declare_page(
+    "source_mapping_get_copy_state_demand", (
+        RowField("consumer_scope", K.SCOPE),
+        RowField("get_call", K.VALUE_ID),
+        RowField("field", K.NAME),
+    ), tuple,
+)
+#: A later keyed write has no literal key proof, so a transferred field
+#: version cannot certify whether it overwrote an earlier get key.
+SOURCE_MAPPING_GET_KEY_VERSION_DEMAND = declare_page(
+    "source_mapping_get_key_version_demand", (
+        RowField("consumer_scope", K.SCOPE),
+        RowField("get_call", K.VALUE_ID),
+        RowField("field", K.NAME),
+    ), tuple,
+)
+#: A get result's stored value is present only on one exact source arm.
+#: This is a guarded payload view, not a global class for optional get.
+SOURCE_GUARDED_MAPPING_PAYLOAD = declare_page(
+    "source_guarded_mapping_payload", (
+        RowField("consumer_scope", K.SCOPE),
+        RowField("get_call", K.VALUE_ID),
+        RowField("borrowed_call", K.VALUE_ID),
+    ), tuple,
+)
+#: Each bounded whole-source evidence round cites only its changed cells and
+#: direct edges. Its before/after fingerprints replay through that delta and
+#: its incumbent FIXED_POINT_ROUND receipt; the settled fingerprint is audited
+#: against the current source pages.
+SOURCE_EVIDENCE_FLUSH_ROUND = declare_page(
+    "source_evidence_flush_round", (
+        RowField("source_scope", K.SCOPE), RowField("round", K.INDEX),
+    ), tuple,
+)
 #: The one source-level result identity a reached call owns.  Duplicate table
 #: entries for the same authored definition use their canonical address, so a
 #: call vertex cannot acquire two identities merely because pursuit reached
@@ -4370,6 +4591,79 @@ SOURCE_FUNCTION_REACHABILITY = declare_page(
 SOURCE_CALL_RESULT_IDENTITY = declare_page(
     "source_call_result_identity_concordance", (
         RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    ), tuple,
+)
+#: A reached call's exact one-value output has a closed tuple-arm length
+#: domain. Fact: (SEMANTIC_OUTPUT cell, returned value cell,
+#: closed-domain cell, reachability cell, call-result identity cell). The
+#: output cell is the authoritative source output-to-value edge, and the
+#: caller call owns its transport. This is source evidence, not a native ABI.
+SOURCE_CALL_CLOSED_TUPLE_LENGTHS = declare_page(
+    "source_call_closed_tuple_lengths", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("callee_scope", K.SCOPE), RowField("returned", K.VALUE_ID),
+    ), tuple,
+)
+#: A one-output reached call carries the callee's closed semantic class arms.
+#: Fact: (SEMANTIC_OUTPUT, returned CANONICAL_VALUE, closed arms or a
+#: complete formal closed-domain view, reachability, caller CANONICAL_VALUE).
+#: No native ABI or one-class result.
+SOURCE_CALL_CLOSED_CLASS_ALTERNATIVES = declare_page(
+    "source_call_closed_class_alternatives", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("callee_scope", K.SCOPE), RowField("returned", K.VALUE_ID),
+    ), tuple,
+)
+#: An exact reached call presents a closed tuple-arm domain to one formal.
+#: Row: (formal read scope, formal, caller scope, call). Fact:
+#: (actual/formal cell, call-domain cell, arm-domain cell, output binding cell).
+#: A formal with several reached calls must retain every binding; this page
+#: does not claim a global runtime union representation.
+SOURCE_FORMAL_CLOSED_TUPLE_LENGTHS = declare_page(
+    "source_formal_closed_tuple_lengths", (
+        RowField("formal_scope", K.SCOPE), RowField("formal", K.VALUE_ID),
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    ), tuple,
+)
+#: A reached call binds a tuple actual with an exact member to a formal that
+#: an Indexed consumer reads. No callee-local member identity has been
+#: published, so the caller member cannot be used as a callee value.
+SOURCE_CALL_TUPLE_MEMBER_PROJECTION_DEMAND = declare_page(
+    "source_call_tuple_member_projection_demand", (
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("callee_scope", K.SCOPE), RowField("formal", K.VALUE_ID),
+        RowField("indexed", K.VALUE_ID), RowField("index", K.INDEX),
+    ), tuple,
+)
+#: A grounded authored method Call has an exact Input receiver and operand,
+#: but no SOURCE_VALUE_CLASS for that receiver. A ProgramABI or specialized
+#: graph hint cannot select its class. The row names the missing source proof
+#: without binding the method or manufacturing a class fact.
+SOURCE_METHOD_RECEIVER_CLASS_DEMAND = declare_page(
+    "source_method_receiver_class_demand", (
+        RowField("function_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+        RowField("receiver", K.VALUE_ID),
+    ), tuple,
+)
+#: One exact actual/formal binding carries a reached call's closed class
+#: alternatives. Fact: (actual/formal, call domain, callee closed arms,
+#: semantic output, formal binding). Several callers retain separate rows.
+SOURCE_FORMAL_CLOSED_CLASS_ALTERNATIVES = declare_page(
+    "source_formal_closed_class_alternatives", (
+        RowField("formal_scope", K.SCOPE), RowField("formal", K.VALUE_ID),
+        RowField("caller_scope", K.SCOPE), RowField("call", K.VALUE_ID),
+    ), tuple,
+)
+#: One authored keyed store whose variable tuple key crosses an exact call
+#: result and actual/formal binding without a runtime tuple-to-key-column
+#: projection. Equality and hashing are downstream of that missing operation.
+#: Fact: (formal id, lengths, formal-domain cell, store cell,
+#: PROCESS_GRAPH_OPERANDS cell proving the index edge, missing operation).
+#: A compiler refusal
+#: consumes this receipt.
+SOURCE_TUPLE_KEY_NATIVE_GAP = declare_page(
+    "source_tuple_key_native_gap", (
+        RowField("callee_scope", K.SCOPE), RowField("store", K.VALUE_ID),
     ), tuple,
 )
 #: ``specialize_python_precision_widths``: the numeric scope a callsite
