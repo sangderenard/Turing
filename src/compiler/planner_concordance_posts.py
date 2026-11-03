@@ -6,6 +6,170 @@ import ast
 from typing import Any, Iterable, Mapping
 
 
+def _class_proves_value(book: Any, class_cell: Any, value_cell: Any) -> bool:
+    """Follow only class revisions to an exact source value identity cause."""
+
+    from .concorded_literals import origin_cell
+    from .concordance_declarations import (
+        CANONICAL_VALUE, INGESTION_VALUE, SOURCE_VALUE_CLASS,
+    )
+
+    try:
+        wanted = origin_cell(book, value_cell)
+    except ValueError:
+        return False
+    pending, seen = [class_cell], set()
+    while pending:
+        current = pending.pop()
+        if current in seen or current.page != SOURCE_VALUE_CLASS:
+            continue
+        seen.add(current)
+        for source, _stage in book.edges_into(current):
+            if source.page == SOURCE_VALUE_CLASS:
+                pending.append(source)
+            elif source.page in {CANONICAL_VALUE, INGESTION_VALUE}:
+                try:
+                    if origin_cell(book, source) == wanted:
+                        return True
+                except ValueError:
+                    pass
+    return False
+
+
+def materialized_sequence_row_dtype(
+    graph: Any, node_id: int,
+) -> tuple[str | None, tuple[Any, ...]]:
+    """Prove the one native row of ``list(bytes)``/``tuple(bytes)``.
+
+    Program: ``_octets(data: bytes)`` constructs ``tensor(list(data))``.
+    The list's class says nothing about its elements; its exact materializer
+    input and the declared bytes iterator contract do. No payload is read.
+    """
+
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope, node_identity_cell,
+    )
+    from ..transmogrifier.graph.python_identity_programs import (
+        BUILTIN_ITERABLE_ELEMENTS, resolve_python_identity,
+    )
+    from .concorded_literals import origin_cell
+    from .concordance_declarations import (
+        BUILTIN_ITERABLE_ELEMENT, INGESTION, INGEST_SOURCE,
+        PLANNER_HIERARCHY, PROCESS_GRAPH_OPERANDS,
+        SEQUENCE_ROW_DTYPE, SOURCE_PYTHON_IDENTITY,
+    )
+    from .identity_concordance import (
+        Novel, Mode, Ref, concord_sequence_row_dtypes,
+        current_identity_book,
+    )
+    from .process_graph_facts import operands
+    from .source_evidence_resolver import ClassEvidence, require_class
+
+    node_id = int(node_id)
+    if node_id not in graph.G:
+        return None, ()
+    book = current_identity_book()
+    numeric_scope = _source_numeric_scope(graph.G)
+    lexical_scope = graph.G.graph.get("lexical_read_scope")
+    if lexical_scope is None:
+        return None, ()
+    materializer = node_identity_cell(graph, node_id, book=book)
+    identity = book.latest_ref(SOURCE_PYTHON_IDENTITY, (numeric_scope, node_id))
+    if identity is None:
+        # A specialized graph keeps the exact row selected by canonical
+        # relabel; its numeric scope is the authored source scope, while the
+        # current graph has a new specialization scope. Verify its identity
+        # cause below rather than rebuilding that row from a function name.
+        source_row = (graph.G.nodes[node_id].get("attributes") or {}).get(
+            "source_python_identity_row"
+        )
+        if (isinstance(source_row, tuple) and len(source_row) == 2
+                and int(source_row[1]) == node_id):
+            identity = book.latest_ref(SOURCE_PYTHON_IDENTITY, source_row)
+    if identity is None:
+        return None, ()
+    identity_fact = book.page(SOURCE_PYTHON_IDENTITY).cell(
+        identity.row, identity.column,
+    )
+    if not (isinstance(identity_fact, tuple) and len(identity_fact) == 4
+            and identity_fact[0] in {"builtins.list", "builtins.tuple"}):
+        return None, ()
+    program = resolve_python_identity(identity_fact[0])
+    if (program is None or program.kind != "object"
+            or program.object_type not in {"resident_sequence", "resident_tuple"}
+            or identity_fact[1] != program.kind):
+        return None, ()
+    try:
+        same_call = any(
+            origin_cell(book, source) == origin_cell(book, materializer)
+            for source, _stage in book.edges_into(identity)
+            if source.page == materializer.page
+        )
+    except ValueError:
+        same_call = False
+    if not same_call:
+        return None, ()
+    edges, operand = operands(graph, node_id)
+    arguments = tuple(source for source, role in edges if role == "arg:0")
+    if (operand.page != PROCESS_GRAPH_OPERANDS
+            or len(arguments) != 1
+            or any(role.startswith("arg:") and role != "arg:0"
+                   for _source, role in edges)
+            or materializer not in {
+                source for source, _stage in book.edges_into(operand)
+            }):
+        return None, ()
+    source_nodes = tuple(
+        int(candidate) for candidate in graph.G
+        if node_identity_cell(graph, int(candidate), book=book) == arguments[0]
+    )
+    if len(source_nodes) != 1:
+        return None, ()
+    source_id = source_nodes[0]
+    classes = require_class(numeric_scope, source_id, book=book)
+    if (not isinstance(classes, ClassEvidence)
+            or not _class_proves_value(book, classes.subject_cell,
+                                       arguments[0])):
+        return None, ()
+    declaration_fact = BUILTIN_ITERABLE_ELEMENTS.get(classes.class_identity)
+    if declaration_fact is None or tuple(declaration_fact) != (
+            "builtins.int", "int64"):
+        return None, ()
+    attrs = graph.G.nodes[node_id].get("attributes") or {}
+    if (attrs.get("producer_kind") != "aggregate_materialization"
+            or attrs.get("sequence_column_count") != 1
+            or tuple(attrs.get("sequence_key_columns") or ())
+            or tuple(attrs.get("materialized_source_value_ids") or ())
+                != (source_id,)):
+        return None, ()
+    declaration = book.latest_ref(
+        BUILTIN_ITERABLE_ELEMENT, (classes.class_identity,),
+    )
+    if declaration is None:
+        declaration = book.post(
+            BUILTIN_ITERABLE_ELEMENT, (classes.class_identity,),
+            tuple(declaration_fact), stage=INGESTION,
+            provenance=Novel(INGEST_SOURCE, ()), mode=Mode.CONCORD,
+        )
+    elif book.page(BUILTIN_ITERABLE_ELEMENT).cell(
+            declaration.row, declaration.column) != tuple(declaration_fact):
+        return None, ()
+    causes = tuple(dict.fromkeys((
+        materializer, arguments[0], identity, operand,
+        classes.subject_cell, *classes.proof_cells, declaration,
+    )))
+    scope = tuple(lexical_scope)
+    resolved = concord_sequence_row_dtypes(
+        scope, {node_id: (declaration_fact[1],)},
+        source="builtin iterable materialization", sources=causes,
+        stage=PLANNER_HIERARCHY,
+    )
+    receipt = book.latest_ref(SEQUENCE_ROW_DTYPE, (scope, node_id))
+    if resolved != (declaration_fact[1],) or not isinstance(receipt, Ref):
+        return None, ()
+    return resolved[0], (receipt, *causes)
+
+
 def _callsite_activation_owner(graph: Any) -> str:
     """Exact authored function identity used by callsite activation rows."""
 

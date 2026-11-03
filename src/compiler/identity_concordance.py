@@ -1569,6 +1569,7 @@ class CorrelationTable:
         found.extend(self._source_intrinsic_admission_findings(module))
         found.extend(self._source_call_parameter_default_findings(module))
         found.extend(self._numerical_constructor_default_findings(module))
+        found.extend(self._materialized_byte_row_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._numerical_schema_operand_findings(module))
         found.extend(self._numerical_dtype_operand_findings(module))
@@ -7028,6 +7029,115 @@ class CorrelationTable:
                     "numerical-constructor-default", str(row), None,
                     "physical dtype lacks exact omitted source default or native output store",
                 ))
+        return found
+
+    @staticmethod
+    def _materialized_byte_row_findings(module: Any) -> list[Finding]:
+        """Audit only byte-iterable claims in the incumbent row dtype page."""
+
+        from .concordance_declarations import (
+            BUILTIN_ITERABLE_ELEMENT, CANONICAL_VALUE,
+            PROCESS_GRAPH_OPERANDS, SEQUENCE_ROW_DTYPE,
+            SOURCE_PYTHON_IDENTITY, SOURCE_VALUE_CLASS,
+        )
+        from ..transmogrifier.graph.python_identity_programs import (
+            BUILTIN_ITERABLE_ELEMENTS,
+        )
+        from .concorded_literals import origin_cell
+        from .planner_concordance_posts import _class_proves_value
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        protocol_page = book.page(BUILTIN_ITERABLE_ELEMENT)
+        for row in protocol_page.rows():
+            fact = protocol_page.latest(row)
+            if (not isinstance(row, tuple) or len(row) != 1
+                    or fact != BUILTIN_ITERABLE_ELEMENTS.get(row[0])):
+                found.append(Finding(
+                    "builtin-iterable-element", str(row), None,
+                    "builtin iterable row contract differs from ingested declaration",
+                ))
+        page = book.page(SEQUENCE_ROW_DTYPE)
+        for row in page.rows():
+            for column, fact in page.history(row):
+                if not (isinstance(fact, tuple) and len(fact) == 2
+                        and fact[1] == "builtin iterable materialization"):
+                    continue
+                receipt = Ref(SEQUENCE_ROW_DTYPE, row, column)
+                causes = {source for source, _stage in book.edges_into(receipt)}
+                protocols = tuple(source for source in causes
+                                  if source.page == BUILTIN_ITERABLE_ELEMENT)
+                identities = tuple(source for source in causes
+                                   if source.page == SOURCE_PYTHON_IDENTITY)
+                operands = tuple(source for source in causes
+                                 if source.page == PROCESS_GRAPH_OPERANDS)
+                classes = tuple(source for source in causes
+                                if source.page == SOURCE_VALUE_CLASS)
+                valid = (
+                    len(protocols) == len(identities) == len(operands) == 1
+                    and bool(classes)
+                    and isinstance(row, tuple) and len(row) == 2
+                    and fact[0] == ("int64",)
+                    and protocol_page.cell(protocols[0].row,
+                                           protocols[0].column)
+                        == BUILTIN_ITERABLE_ELEMENTS.get(protocols[0].row[0])
+                    and len(tuple(book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operands[0].row, operands[0].column,
+                    ))) >= 1
+                )
+                if valid:
+                    identity_fact = book.page(SOURCE_PYTHON_IDENTITY).cell(
+                        identities[0].row, identities[0].column,
+                    )
+                    edges = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operands[0].row, operands[0].column,
+                    )
+                    args = tuple(source for source, role in edges
+                                 if role == "arg:0")
+                    consumers = tuple(source for source in causes
+                                      if source.page == CANONICAL_VALUE
+                                      and source.row[0] == row[0]
+                                      and source.row[1] == row[1])
+                    valid = (
+                        isinstance(identity_fact, tuple)
+                        and identity_fact[0] in {"builtins.list", "builtins.tuple"}
+                        and args and len(args) == 1
+                        and args[0] in causes
+                        and any(
+                            _class_proves_value(book, class_cell, args[0])
+                            and book.page(SOURCE_VALUE_CLASS).cell(
+                                class_cell.row, class_cell.column,
+                            )[0] == protocols[0].row[0]
+                            for class_cell in classes
+                        )
+                        and len(consumers) == 1
+                        and consumers[0] in {
+                            source for source, _stage in book.edges_into(
+                                operands[0],
+                            )
+                        }
+                        and not any(role.startswith("arg:") and role != "arg:0"
+                                    for _source, role in edges)
+                    )
+                    if valid:
+                        try:
+                            valid = any(
+                                origin_cell(book, source)
+                                == origin_cell(book, consumers[0])
+                                for source, _stage in book.edges_into(
+                                    identities[0],
+                                ) if source.page == CANONICAL_VALUE
+                            )
+                        except ValueError:
+                            valid = False
+                if not valid:
+                    found.append(Finding(
+                        "materialized-byte-row", str(row), None,
+                        "byte materialization row lacks exact protocol, class, "
+                        "identity or operand proof",
+                    ))
         return found
 
     @staticmethod
