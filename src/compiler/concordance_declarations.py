@@ -4684,6 +4684,15 @@ SOURCE_NUMERIC_SPECIALIZATION = declare_transform(
 SOURCE_PYTHON_IDENTITY = declare_page("source_python_identity_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("node", K.VALUE_ID),
 ), tuple)
+#: Numerical region extraction: an exact consumer/operand edge whose source
+#: Python identity program produces a compile-time schema identity.  The
+#: operand remains source semantic evidence but is absent from the numerical
+#: value ABI.  The fact is its SOURCE_PYTHON_IDENTITY cell; the operand
+#: snapshot and both value identities are direct causes at PLANNER_HIERARCHY.
+NUMERICAL_SCHEMA_OPERAND = declare_page("numerical_schema_operand", (
+    RowField("consumer", K.PAGE_REF), RowField("role", K.LABEL),
+    RowField("parent", K.PAGE_REF),
+), tuple)
 
 # -- the reducer's numeric source facts, one row per (numeric scope, node) ---
 #: ``_concord_source_precision_boundary``: an authored Precision boundary,

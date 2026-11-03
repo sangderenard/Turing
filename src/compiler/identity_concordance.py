@@ -1565,6 +1565,7 @@ class CorrelationTable:
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
+        found.extend(self._numerical_schema_operand_findings(module))
         found.extend(self._source_numeric_component_findings(module))
         found.extend(self._source_numeric_specialization_findings(module))
         found.extend(self._source_numeric_intrinsic_findings(module))
@@ -6393,6 +6394,84 @@ class CorrelationTable:
                 f"parameter {parameter!r} changed identity across source "
                 f"stages: {distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _numerical_schema_operand_findings(module: Any) -> list[Finding]:
+        """Check that a numerical ABI exclusion has an exact schema cause."""
+
+        from .concordance_declarations import (
+            PROCESS_GRAPH_OPERANDS, SOURCE_PYTHON_IDENTITY,
+            NUMERICAL_SCHEMA_OPERAND,
+        )
+        from ..transmogrifier.graph.python_identity_programs import (
+            resolve_python_identity,
+        )
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(NUMERICAL_SCHEMA_OPERAND)
+        for row in page.rows():
+            receipt = book.latest_ref(NUMERICAL_SCHEMA_OPERAND, row)
+            fact = page.latest(row)
+            valid = isinstance(row, tuple) and len(row) == 3
+            if valid:
+                consumer, role, parent = row
+                valid = (
+                    isinstance(consumer, Ref) and isinstance(parent, Ref)
+                    and isinstance(role, str) and isinstance(fact, tuple)
+                    and len(fact) == 1 and isinstance(fact[0], Ref)
+                    and fact[0].page == SOURCE_PYTHON_IDENTITY
+                )
+            if valid:
+                identity = fact[0]
+                identity_fact = book.page(SOURCE_PYTHON_IDENTITY).cell(
+                    identity.row, identity.column,
+                )
+                valid = (
+                    isinstance(identity_fact, tuple)
+                    and len(identity_fact) == 4
+                    and isinstance(identity_fact[0], str)
+                    and isinstance(identity_fact[1], str)
+                )
+            if valid:
+                program = resolve_python_identity(identity_fact[0])
+                valid = (
+                    program is not None
+                    and program.object_type == "schema_type_identity"
+                    and identity_fact[1] == program.kind
+                    and _canonical_identity_base(book, parent) in {
+                        _canonical_identity_base(book, source)
+                        for source, _stage in book.edges_into(identity)
+                        if source.page == parent.page
+                    }
+                )
+            if valid:
+                operand_cells = tuple(
+                    source for source, _stage in book.edges_into(receipt)
+                    if source.page == PROCESS_GRAPH_OPERANDS
+                )
+                valid = len(operand_cells) == 1 and (
+                    (parent, role) in book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operand_cells[0].row, operand_cells[0].column,
+                    )
+                    and consumer in {
+                        source for source, _stage in book.edges_into(
+                            operand_cells[0],
+                        )
+                    }
+                    and {consumer, parent, identity, operand_cells[0]} <= {
+                        source for source, _stage in book.edges_into(receipt)
+                    }
+                )
+            if not valid:
+                found.append(Finding(
+                    "numerical-schema-operand", str(row), None,
+                    "numerical ABI exclusion lacks its exact source schema "
+                    "identity and operand edge",
+                ))
         return found
 
     @staticmethod

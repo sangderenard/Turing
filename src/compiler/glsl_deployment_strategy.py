@@ -6383,6 +6383,69 @@ def _build_shell_hierarchy_plan(
                     continue
                 parent_data = graph.G.nodes.get(parent, {})
                 attributes = parent_data.get("attributes") or {}
+                identity_row = attributes.get("source_python_identity_row")
+                if identity_row is not None:
+                    from .concordance_declarations import (
+                        NUMERICAL_SCHEMA_OPERAND, SOURCE_PYTHON_IDENTITY,
+                        PLANNER_HIERARCHY,
+                    )
+                    from .identity_concordance import (
+                        Derived, Mode, current_identity_book,
+                    )
+                    from ..common.tensors.topological_reducer import (
+                        node_identity_cell,
+                    )
+                    from ..transmogrifier.graph.python_identity_programs import (
+                        resolve_python_identity,
+                    )
+                    from .process_graph_facts import operands
+
+                    schema_book = current_identity_book()
+                    identity_cell = schema_book.latest_ref(
+                        SOURCE_PYTHON_IDENTITY, tuple(identity_row),
+                    )
+                    identity_fact = (
+                        schema_book.page(SOURCE_PYTHON_IDENTITY).cell(
+                            identity_cell.row, identity_cell.column,
+                        ) if identity_cell is not None else None
+                    )
+                    program = (
+                        resolve_python_identity(identity_fact[0])
+                        if isinstance(identity_fact, tuple)
+                        and len(identity_fact) == 4 else None
+                    )
+                    if (
+                        program is not None
+                        and program.object_type == "schema_type_identity"
+                        and identity_fact[1] == program.kind
+                    ):
+                        # compact_codewords' arange(n, cls=type(lengths))
+                        # promoted the class query to runtime value 74, then
+                        # demanded a numerical dtype for it. The registry's
+                        # exact schema identity is compiler metadata. Keep
+                        # the source edge and publish why the numerical ABI
+                        # omits it; no host class or numerical type is guessed.
+                        consumer_cell = node_identity_cell(graph, int(node_id))
+                        parent_cell = node_identity_cell(graph, parent)
+                        edge_facts, edge_cell = operands(graph, int(node_id))
+                        if (parent_cell, str(role)) not in edge_facts:
+                            raise ValueError(
+                                "schema operand has no exact source edge"
+                            )
+                        receipt_row = (consumer_cell, str(role), parent_cell)
+                        receipt = (identity_cell,)
+                        if schema_book.page(NUMERICAL_SCHEMA_OPERAND).latest(
+                            receipt_row
+                        ) != receipt:
+                            schema_book.post(
+                                NUMERICAL_SCHEMA_OPERAND, receipt_row, receipt,
+                                stage=PLANNER_HIERARCHY,
+                                provenance=Derived((
+                                    consumer_cell, parent_cell,
+                                    identity_cell, edge_cell,
+                                )), mode=Mode.CONCORD,
+                            )
+                        continue
                 leaves = tuple(map(
                     int,
                     attributes.get("aggregate_leaf_value_ids", ()),
