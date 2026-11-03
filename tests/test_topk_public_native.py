@@ -78,3 +78,84 @@ def test_public_topk_named_leaf_has_one_native_aggregate_call(
         input_id: np.array([2**53, 2**53 + 1, 2**53 + 2], dtype=np.int64),
     }).run()
     assert execution.buffers[output_id].tolist() == expected
+
+
+@pytest.mark.parametrize("k,dim,expected_shape,expected", (
+    (4, 0, [3], [2, 1, 0]),
+    (4, -1, [3], [2, 1, 0]),
+    (0, 0, [0], []),
+))
+def test_public_topk_static_selected_count_bounds_native_k(
+    tmp_path, k, dim, expected_shape, expected,
+):
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {}, "bindings": [],
+        "values": [{
+            "function": "root", "parameter": "values", "storage": "span",
+            "dtype": "int64", "rank": 1, "shape": [3],
+            "python_type": "src.common.tensors.abstraction.AbstractTensor",
+        }],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(values):\n"
+        f"    return AbstractTensor.topk(values,k={k},dim={dim}).indices\n",
+        "root", python_bindings={"AbstractTensor": AbstractTensor},
+        name="topk_bounded", extraction_contract=policy,
+        tensor_ssa_reference=c_backend_repository_ssa_reference(),
+        progress=lambda _: None, progress_bars=False,
+    )
+    region = module.functions["topk_bounded__root__planned_region_0"]
+    instructions = tuple(i for block in region.blocks.values()
+                         for i in block.instrs)
+    call = next(i for i in instructions
+                if i.op == "Call"
+                and i.attributes.get("callee") == "topk_int64_dim")
+    bounded_ids = {i.res.id for i in instructions if i.op == "Min"}
+    assert len(bounded_ids) == 1
+    assert (call.args[4].id in bounded_ids or any(
+        i.op == "Cast" and i.res.id == call.args[4].id
+        and i.args[0].id in bounded_ids for i in instructions
+    ))
+    assert CorrelationTable.build(module).findings(module) == []
+    artifact = emit_ssa_module_to_c(module, "topk_bounded__root")
+    assert artifact.complete, artifact.shortfalls
+    artifact.compile(tmp_path / f"topk_{k}_{dim}")
+    abi = artifact.runtime_abi()
+    assert tuple(item["shape"] for item in abi["buffers"]) == (
+        [3], expected_shape,
+    )
+    input_id, output_id = (item["value_id"] for item in abi["buffers"])
+    execution = artifact.prepare_execution({
+        input_id: np.array([2**53, 2**53 + 1, 2**53 + 2], dtype=np.int64),
+    }).run()
+    assert execution.buffers[output_id].tolist() == expected
+
+
+@pytest.mark.parametrize("k,dim,reason", (
+    (-1, 0, "negative k"),
+    (2, -2, "out-of-range axis"),
+))
+def test_public_topk_invalid_static_selection_refuses(k, dim, reason):
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {}, "bindings": [],
+        "values": [{
+            "function": "root", "parameter": "values", "storage": "span",
+            "dtype": "int64", "rank": 1, "shape": [3],
+            "python_type": "src.common.tensors.abstraction.AbstractTensor",
+        }],
+    })
+    with pytest.raises(ValueError, match=reason):
+        lower_ast_source_to_ssa(
+            "def root(values):\n"
+            f"    return AbstractTensor.topk(values,k={k},dim={dim}).indices\n",
+            "root", python_bindings={"AbstractTensor": AbstractTensor},
+            name="topk_invalid", extraction_contract=policy,
+            tensor_ssa_reference=c_backend_repository_ssa_reference(),
+            progress=lambda _: None, progress_bars=False,
+        )

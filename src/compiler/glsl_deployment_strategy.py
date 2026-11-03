@@ -26964,6 +26964,8 @@ def _dtype_argument_name(
 def _topk_named_member_descriptor(graph, receiver, field_name, seen=None):
     """The incumbent top-k named-member shape rule, shared by its producer."""
 
+    from .concorded_literals import MISSING as MISSING_LITERAL, literal
+
     if receiver is None or int(receiver) not in graph.G or field_name not in {
         "values", "indices",
     }:
@@ -26999,19 +27001,31 @@ def _topk_named_member_descriptor(graph, receiver, field_name, seen=None):
         if str(role) in {"kw:k", "k"} and int(parent) in graph.G
     ), None)
     try:
-        k_literal = (
-            None if k_value is None else _constant_value(
-                graph.G.nodes[k_value]
-            )
-        )
+        k_literal = None if k_value is None else literal(graph, k_value)[0]
     except (KeyError, TypeError, ValueError):
         k_literal = None
-    axis = int(receiver_attributes.get("dim", -1))
-    if source_shape and isinstance(k_literal, int) and not isinstance(
+    dim_value = next((
+        int(parent) for parent, role in receiver_data.get("parents") or ()
+        if str(role) in {"kw:dim", "dim"} and int(parent) in graph.G
+    ), None)
+    try:
+        axis = None if dim_value is None else literal(graph, dim_value)[0]
+    except (KeyError, TypeError, ValueError):
+        axis = None
+    if source_shape and k_literal is not MISSING_LITERAL and isinstance(k_literal, int) and not isinstance(
         k_literal, bool,
-    ):
+    ) and axis is not MISSING_LITERAL and isinstance(axis, int) and not isinstance(axis, bool):
+        if k_literal < 0:
+            raise ValueError("topk has no admitted negative k extent")
+        if not -len(source_shape) <= axis < len(source_shape):
+            raise ValueError("topk has no admitted out-of-range axis")
         axis %= len(source_shape)
-        source_shape[axis] = int(k_literal)
+        # Program: root(values[3]) calls topk(k=4). Wrong record: both
+        # named leaves were stamped (4,) although the authored backend
+        # clamps selection to the axis extent before allocating. The source
+        # operand and input descriptor are exact; this selected extent is
+        # carried into CALLSITE_RETURN_MEMBER and SOURCE_AGGREGATE_LAYOUT.
+        source_shape[axis] = min(int(k_literal), source_shape[axis])
         result["shape"] = tuple(source_shape)
         result["rank"] = len(source_shape)
         result.pop("metadata_state", None)

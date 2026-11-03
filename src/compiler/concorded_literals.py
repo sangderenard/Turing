@@ -28,6 +28,80 @@ def origin_cell(book, cell):
     return cell
 
 
+def literal_from_identity(book, identity, _seen=()):
+    """Read one exact literal of a canonical value and its read-scope forks.
+
+    A canonical relabel may post SOURCE_LITERAL_VALUE in the authored numeric
+    scope instead of the lexical scope. Its direct provenance edge from this
+    canonical identity is the bridge; a coincident numeric value ID is not.
+    """
+    if identity in _seen:
+        return MISSING, ()
+    pending, visited, matches = [identity], set(), set()
+    while pending:
+        current = pending.pop()
+        if current in visited or current.page != CANONICAL_VALUE:
+            continue
+        visited.add(current)
+        direct = book.latest_ref(SOURCE_LITERAL_VALUE, current.row)
+        if direct is not None:
+            matches.add(direct)
+        matches.update(target for target, _stage in book.edges_out_of(current)
+                       if target.page == SOURCE_LITERAL_VALUE)
+        pending.extend(source for source, stage in book.edges_into(current)
+                       if source.page == CANONICAL_VALUE
+                       and stage.name == 'read_scope_fork')
+    for current in visited:
+        sync = book.latest_ref(SYNCHRONIZATION_LITERAL, (current,))
+        if sync is not None:
+            matches.add(sync)
+    if not matches:
+        # Some source Neg nodes are forked before their source descriptor is
+        # read. Apply the same admitted unary operator and mutable-binding
+        # guard used by literal(graph), using only the exact operand receipt.
+        from .concordance_declarations import LEXICAL_READ_BINDING, PROCESS_GRAPH_OPERANDS
+        derived = []
+        for current in visited:
+            try:
+                origin = origin_cell(book, current)
+            except ValueError:
+                continue
+            if origin.page != INGESTION_VALUE:
+                continue
+            kind = book.latest_ref(SOURCE_OPERATOR_KIND, (origin,))
+            edges = book.latest_ref(PROCESS_GRAPH_OPERANDS, current.row)
+            if kind is None or edges is None:
+                continue
+            if Handler(book.page(SOURCE_OPERATOR_KIND).cell(kind.row, kind.column)) != Handler.Neg:
+                continue
+            operands = tuple(parent for parent, role in
+                             book.page(PROCESS_GRAPH_OPERANDS).cell(edges.row, edges.column)
+                             if role == 'operand' and parent.page == CANONICAL_VALUE)
+            if len(operands) != 1 or book.latest_ref(LEXICAL_READ_BINDING, (
+                    edges.row[0], edges.row[-1], 'operand', 0)) is not None:
+                continue
+            value, causes = literal_from_identity(book, operands[0], (*_seen, identity))
+            if type(value) is int:
+                derived.append((-value, (current, origin, kind, edges, *causes)))
+        if not derived or any(value != derived[0][0] for value, _ in derived[1:]):
+            return MISSING, ()
+        return derived[0][0], tuple(dict.fromkeys(
+            cause for _value, causes in derived for cause in causes
+        ))
+    cells = tuple(sorted(matches, key=lambda cell: (repr(cell.row), cell.column)))
+    values = tuple(
+        book.page(cell.page).cell(cell.row, cell.column)
+        if cell.page == SOURCE_LITERAL_VALUE else
+        book.page(cell.page).cell(cell.row, cell.column)[2]
+        for cell in cells
+    )
+    first = values[0]
+    if any(type(value) is not type(first) or value != first
+           for value in values[1:]):
+        return MISSING, cells
+    return first, cells
+
+
 def literal(graph, node, seen=()):
     from ..common.tensors.topological_reducer import node_identity_cell, _source_numeric_scope
     if node in seen:
@@ -53,20 +127,9 @@ def literal(graph, node, seen=()):
     # scope. Follow only that exact copy relation to the literal's own row;
     # walking arbitrary computation causes would mistake an operand's
     # literal for its consumer's result.
-    pending, visited = [node_cell], set()
-    while pending:
-        identity = pending.pop()
-        if identity in visited:
-            continue
-        visited.add(identity)
-        if identity.page != CANONICAL_VALUE:
-            continue
-        cell = book.latest_ref(SOURCE_LITERAL_VALUE, identity.row)
-        if cell is not None:
-            return book.page(cell.page).cell(cell.row, cell.column), (cell,)
-        pending.extend(source for source, stage in book.edges_into(identity)
-                       if source.page == CANONICAL_VALUE
-                       and stage.name == 'read_scope_fork')
+    value, cells = literal_from_identity(book, node_cell)
+    if value is not MISSING:
+        return value, cells
     cell = book.latest_ref(PROVEN_LITERAL, (str(graph.G.graph.get('function_name')), int(node)))
     if cell is not None:
         return book.page(cell.page).cell(cell.row, cell.column), (cell,)
