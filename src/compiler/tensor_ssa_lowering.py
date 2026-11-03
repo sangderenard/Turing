@@ -1475,6 +1475,25 @@ def propagate_repository_ssa_call_metadata(
     no extents.
     """
 
+    # A composed module may be inspected after the planning context ended.
+    # Its attached book still owns local rows, and accepted components retain
+    # separate owner books.  Resume the module transaction before any shape
+    # post or imported accepted-cell receipt; otherwise those writes land in
+    # an unrelated ambient book and source cells appear absent.
+    from .identity_concordance import (
+        begin_identity_book, current_identity_book, end_identity_book,
+    )
+
+    module_book = identity_book(module)
+    if current_identity_book() is not module_book:
+        _book, token = begin_identity_book(module_book)
+        try:
+            return propagate_repository_ssa_call_metadata(
+                module, authoritative_returns=authoritative_returns,
+            )
+        finally:
+            end_identity_book(token)
+
     changed_any = False
 
     # The SSA instruction topology is immutable throughout this metadata
@@ -1524,7 +1543,7 @@ def propagate_repository_ssa_call_metadata(
     def _log_enrichment(
         function: Any, function_name: Any, value_id: int, field: str,
         old: Any, new: Any, authoritative: bool, source_id: int,
-        fixed_point_round: int,
+        fixed_point_round: int, source_owner: Any = None,
     ) -> Any:
         """One enrichment write, posted DERIVED from the value's and the
         source value's ``ssa_value`` cells in ``function``'s scope."""
@@ -1534,6 +1553,7 @@ def propagate_repository_ssa_call_metadata(
         )
         from .identity_concordance import Derived, Mode
         from .ssa_record_return_state import ssa_value_identity_cell
+        from .frame_identity_book import _frame_value_cell
 
         row = (str(function_name), int(value_id), str(field))
         incumbent_cell = enrichment_book.latest_ref(
@@ -1559,8 +1579,9 @@ def propagate_repository_ssa_call_metadata(
                 ssa_value_identity_cell(
                     function, int(value_id), book=enrichment_book,
                 ),
-                ssa_value_identity_cell(
-                    function, int(source_id), book=enrichment_book,
+                _frame_value_cell(
+                    function if source_owner is None else source_owner,
+                    int(source_id),
                 ),
                 incumbent_cell,
             )
@@ -1630,6 +1651,12 @@ def propagate_repository_ssa_call_metadata(
         source_owner: Any = None,
         stage: str = "repository_ssa_enrichment",
     ) -> bool:
+        # An accepted SSA component is an immutable transaction.  Its caller
+        # may read its exact rows through the retained owner book, but cannot
+        # revise its values or descriptors in the ambient compilation book.
+        from .ssa_record_return_state import accepted_ssa_component
+        if accepted_ssa_component(function):
+            return False
         changed = False
         source_accounting = dict(source.accounting or {})
         source_shape = tuple(source.shape or ())
@@ -1729,7 +1756,7 @@ def propagate_repository_ssa_call_metadata(
                 cell = _log_enrichment(
                     function, function_names_by_id.get(id(function), "?"),
                     int(value.id), field, old, new, authoritative,
-                    int(source.id), fixed_point_round,
+                    int(source.id), fixed_point_round, source_owner,
                 )
                 if cell is not None:
                     enrichment_cells.append(cell)
@@ -1780,17 +1807,16 @@ def propagate_repository_ssa_call_metadata(
                 # value's cell (the edge's own source cell) and the target's
                 # previous cell; the accounting is then set FROM that fact.
                 from .ssa_record_return_state import (
-                    posted_ssa_value_fact as _posted_physical_fact,
                     revise_ssa_value as _revise_physical,
-                    ssa_value_identity_cell as _physical_identity_cell,
                 )
+                from .frame_identity_book import _frame_value_cell
                 _physical_book = identity_book(module)
                 _revise_physical(
                     function, int(value.id), dtype=value.dtype,
                     shape=tuple(value.shape or ()), stage=stage,
-                    sources=(_physical_identity_cell(
+                    sources=(_frame_value_cell(
                         function if source_owner is None else source_owner,
-                        int(source.id), book=_physical_book,
+                        int(source.id),
                     ),),
                     book=_physical_book,
                     physical={"physical_dtype": str(source_physical_dtype)},
@@ -1840,12 +1866,20 @@ def propagate_repository_ssa_call_metadata(
             from .ssa_record_return_state import (
                 posted_ssa_value_fact as _posted_edge_fact,
                 revise_ssa_value as _revise_edge_physical,
-                ssa_value_identity_cell as _edge_identity_cell,
+            )
+            from .frame_identity_book import (
+                _frame_owner_book, _frame_value_cell, _frame_cite,
             )
             _edge_book = identity_book(module)
+            _edge_source_owner = (
+                function if source_owner is None else source_owner
+            )
+            _edge_source_book, _edge_source_digest = _frame_owner_book(
+                _edge_source_owner
+            )
             _edge_source_fact = _posted_edge_fact(
-                function if source_owner is None else source_owner,
-                int(source.id), book=_edge_book,
+                _edge_source_owner, int(source.id),
+                book=_edge_source_book,
             )
             _edge_physical: dict[str, Any] = {}
             if _edge_source_fact is not None:
@@ -1900,9 +1934,8 @@ def propagate_repository_ssa_call_metadata(
                 _revise_edge_physical(
                     function, int(value.id), dtype=value.dtype,
                     shape=tuple(value.shape or ()), stage=stage,
-                    sources=(_edge_identity_cell(
-                        function if source_owner is None else source_owner,
-                        int(source.id), book=_edge_book,
+                    sources=(_frame_value_cell(
+                        _edge_source_owner, int(source.id),
                     ),),
                     book=_edge_book, physical=_edge_physical,
                 )
@@ -1913,16 +1946,15 @@ def propagate_repository_ssa_call_metadata(
                 shape_scope_of,
             )
             from .ssa_record_return_state import (
-                revise_ssa_value, ssa_value_identity_cell,
+                revise_ssa_value,
             )
 
             book = identity_book(module)
-            source_value_cell = ssa_value_identity_cell(
-                function if source_owner is None else source_owner,
-                int(source.id), book=book,
+            source_value_cell = _frame_value_cell(
+                _edge_source_owner, int(source.id),
             )
-            target_value_cell = ssa_value_identity_cell(
-                function, int(value.id), book=book,
+            target_value_cell = _frame_value_cell(
+                function, int(value.id),
             )
             if before != (tuple(value.shape or ()), value.dtype):
                 # The transport changed this value's dtype or shape: that
@@ -1970,11 +2002,13 @@ def propagate_repository_ssa_call_metadata(
                 int(value.id),
             ):
                 continue
+            _shape_source_owner = (
+                source_function or source_owner or function
+            )
             if (
                 int(source.id) == int(value.id)
-                and shape_scope_of(
-                    function if source_function is None else source_function
-                ) == shape_scope_of(function)
+                and shape_scope_of(_shape_source_owner)
+                == shape_scope_of(function)
             ):
                 # expand_to's planned region and enclosing function both
                 # name value 2 in one shape scope.  Transporting its updated
@@ -1984,9 +2018,7 @@ def propagate_repository_ssa_call_metadata(
                 continue
             shape_transformation_records.append((
                 (
-                    shape_scope_of(
-                        function if source_function is None else source_function
-                    ),
+                    shape_scope_of(_shape_source_owner),
                     int(source.id),
                     shape_scope_of(function),
                     int(value.id),
@@ -2038,14 +2070,15 @@ def propagate_repository_ssa_call_metadata(
                         target_value_cell,
                         # The state the source was last resolved to: when
                         # that changed, this edge's revision has its cause.
-                        identity_book(module).latest_ref(
-                            SHAPE_STATE_PAGE, (
-                                shape_scope_of(
-                                    function if source_owner is None
-                                    else source_owner
+                        _frame_cite(
+                            _edge_source_book,
+                            _edge_source_book.latest_ref(
+                                SHAPE_STATE_PAGE, (
+                                    shape_scope_of(_shape_source_owner),
+                                    int(source.id),
                                 ),
-                                int(source.id),
                             ),
+                            _edge_source_digest,
                         ),
                         # A later shape proof can refine an occurrence whose
                         # ``ssa_value`` identity has not itself been revised
@@ -2078,8 +2111,14 @@ def propagate_repository_ssa_call_metadata(
 
     def settle_specialized_formal_descriptor(
         callee_name: str, formal: SSAValue, source: SSAValue,
+        *, source_owner: Any = None,
     ) -> bool:
         """Keep a region input descriptor aligned with its exact call ABI."""
+
+        from .ssa_record_return_state import accepted_ssa_component
+        callee = module.functions.get(callee_name)
+        if callee is not None and accepted_ssa_component(callee):
+            return False
 
         shape = tuple(map(int, source.shape or ()))
         if not shape:
@@ -2103,7 +2142,7 @@ def propagate_repository_ssa_call_metadata(
         _log_enrichment(
             module.functions.get(callee_name), callee_name, int(formal.id),
             "descriptor.shape", tuple(descriptor.shape), shape, True,
-            int(source.id), fixed_point_round,
+            int(source.id), fixed_point_round, source_owner,
         )
         table.tensors[int(formal.id)] = dataclasses.replace(
             descriptor,
@@ -2477,6 +2516,7 @@ def propagate_repository_ssa_call_metadata(
                         if specialized_call:
                             changed |= settle_specialized_formal_descriptor(
                                 callee_name, formal, semantic_actual,
+                                source_owner=function,
                             )
                         # A shared in-place kernel (it declares an output
                         # argument; the call carries none) owns only that
