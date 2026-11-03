@@ -6815,12 +6815,35 @@ def _build_shell_hierarchy_plan(
             if value_id not in capture_constants
         )
         compute_lines = []
+        named_region_results = {}
         for value in region_nodes:
             node_data = graph.G.nodes[value]
             expression = node_data.get("expr_obj")
             parents = numerical_region_parents(value)
             opcode = str(node_data.get("op") or node_data.get("type"))
             line_attributes = dict(node_data.get("attributes") or {})
+            layout_row = line_attributes.get("source_aggregate_layout_row")
+            if layout_row is not None:
+                from .concordance_declarations import SOURCE_AGGREGATE_LAYOUT
+                from .identity_concordance import current_identity_book
+
+                layout_cell = current_identity_book().latest_ref(
+                    SOURCE_AGGREGATE_LAYOUT, tuple(layout_row),
+                )
+                layout = current_identity_book().page(
+                    SOURCE_AGGREGATE_LAYOUT
+                ).latest(tuple(layout_row))
+                descriptors = tuple(line_attributes.get(
+                    "tensor_output_descriptors", (),
+                ))
+                if (layout_cell is not None and layout is not None
+                        and len(layout.members) == len(descriptors)):
+                    leaves = tuple(int(member.value_id) for member in layout.members)
+                    named_region_results[int(value)] = (
+                        leaves, descriptors, (layout_cell,),
+                    )
+                    line_attributes["intrinsic_named_result_proof"] = (layout_cell,)
+                    line_attributes["intrinsic_named_call_id"] = int(value)
             if int(value) in numerical_dtype_metadata:
                 line_attributes["dtype"] = numerical_dtype_metadata[int(value)]
             if (
@@ -6854,7 +6877,11 @@ def _build_shell_hierarchy_plan(
             compute_lines.append(PlanLine.create(
                 opcode,
                 inputs=tuple(parent for parent, _role in parents),
-                outputs=(int(value),),
+                outputs=(
+                    tuple(named_region_results[int(value)][0])
+                    if int(value) in named_region_results
+                    else (int(value),)
+                ),
                 attributes={
                     **line_attributes,
                     "region": region_index,
@@ -6869,7 +6896,11 @@ def _build_shell_hierarchy_plan(
         # defining line it is a dangling SSA value the backend emits as an
         # undeclared variable. Materialise each such constant as its own ``const``
         # line, ahead of the consumers, so the region is self-contained.
-        produced = set(region_nodes)
+        produced = set(region_nodes) | {
+            int(leaf)
+            for leaves, _descriptors, _proof in named_region_results.values()
+            for leaf in leaves
+        }
         captured = set(region_captures)
         const_lines = []
         materialised: set[int] = set()
@@ -8079,7 +8110,12 @@ def _build_shell_hierarchy_plan(
             record
             for record in (
                 _typed_value_shape(value_id)
-                for value_id in (*region_nodes, *region_captures)
+                for value_id in (
+                    *region_nodes, *region_captures,
+                    *(leaf for leaves, _descriptors, _proof
+                      in named_region_results.values() for leaf in leaves),
+                )
+                if int(value_id) not in named_region_results
             )
             if record is not None
         )
@@ -8151,7 +8187,11 @@ def _build_shell_hierarchy_plan(
                     "rank", len(tuple((descriptor or {}).get("shape") or ()))
                 )),
             )
-            for value_id in (*region_nodes, *region_captures, *sorted(materialised))
+            for value_id in (
+                *region_nodes, *region_captures, *sorted(materialised),
+                *(leaf for leaves, _descriptors, _proof
+                  in named_region_results.values() for leaf in leaves),
+            )
             for descriptor in (planned_descriptor(int(value_id)),)
             if descriptor is not None
         )
@@ -41281,6 +41321,16 @@ def strategize_shell_deployment(
     selection_phase(
         "stamp-max-semantics",
         lambda: _stamp_max_semantics(graph),
+    )
+    # Admit named result leaves before dispatch classification. Their exact
+    # source layout owns the pair's tensor members; the pair is structural.
+    selection_phase(
+        "publish-intrinsic-named-results",
+        lambda: tuple(
+            publish_intrinsic_named_result_leaves(graph, int(node_id))
+            for node_id in tuple(graph.G.nodes)
+            if node_id in graph.G
+        ),
     )
     reference_tables = selection_phase(
         "build-shell-reference-tables",
