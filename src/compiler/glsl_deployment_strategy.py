@@ -23148,9 +23148,10 @@ def _publish_callsite_return_members(
     stale_leaves = tuple(
         leaf_id for leaf_id in incumbent_leaves if leaf_id not in caller.G
     )
+    resident_paths = _post_call_result_projections(caller, node_id)
 
     def resident_direct_projection(index: int) -> int | None:
-        """Return the one authored ``call[index]`` value, when exact.
+        """Return the one authored positional or named slot, when exact.
 
         Lexical tuple unpacking creates these projections before callsite
         return descriptors settle.  Reusing that identity is essential:
@@ -23158,6 +23159,9 @@ def _publish_callsite_return_members(
         makes the call publish one value while the effect consumes another.
         """
 
+        concorded = resident_paths.get((int(index),))
+        if concorded is not None and int(concorded) in caller.G:
+            return int(concorded)
         candidates = []
         for successor in caller.G.successors(node_id):
             projection = caller.G.nodes[int(successor)]
@@ -23330,6 +23334,109 @@ def _publish_callsite_return_members(
     data["attributes"] = attributes
     data.pop("tensor", None)
     return True
+
+
+def publish_intrinsic_named_result_leaves(graph: Any, node_id: int):
+    """Publish one admitted named result as existing ordered call leaves.
+
+    The source pair remains an aggregate. Its authored GetAttr is reused as
+    one leaf; an unaccessed slot uses the incumbent generated projection.
+    This publisher reports only the member descriptors proved by the current
+    named-member tensor rule.
+    """
+
+    from .concordance_declarations import (
+        CALL_RESULT_PROJECTION, CALLSITE_RETURN_MEMBER,
+        PLANNER_TENSOR_SPECIALIZATION,
+        SOURCE_AGGREGATE_LAYOUT, SourceAggregateLayout,
+        SourceAggregateMember,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .intrinsic_result_layouts import intrinsic_result_fields
+    from .process_graph_facts import operands as process_operands
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    node_id = int(node_id)
+    if node_id not in graph.G:
+        return None
+    fields, proof = intrinsic_result_fields(graph, node_id)
+    scope = graph.G.graph.get("source_aggregate_layout_scope")
+    if not fields or scope is None:
+        return None
+    descriptors = tuple(
+        _topk_named_member_descriptor(graph, node_id, str(name))
+        for name, _ in fields
+    )
+    if any(descriptor is None for descriptor in descriptors):
+        return None
+    book = current_identity_book()
+    _edges, operand_cell = process_operands(graph, node_id)
+    if operand_cell is None:
+        return None
+    return_cells = tuple(
+        tuple(dict.fromkeys((*proof, field, operand_cell)))
+        for _name, field in fields
+    )
+    _publish_callsite_return_members(
+        graph, node_id, descriptors, "tuple", return_cells,
+    )
+    leaves = tuple(map(int, (
+        graph.G.nodes[node_id].get("attributes") or {}
+    ).get("aggregate_leaf_value_ids") or ()))
+    if len(leaves) != len(fields):
+        return None
+    paths = _post_call_result_projections(graph, node_id)
+    projection_scope = _call_projection_scope(graph)
+    member_scope = tuple(graph.G.graph.get("lexical_read_scope") or (
+        "function", str(graph.G.graph.get("function_name") or ""),
+    ))
+    members = []
+    for index, ((name, field), leaf) in enumerate(zip(fields, leaves)):
+        if paths.get((index,)) != leaf:
+            return None
+        projection = book.latest_ref(
+            CALL_RESULT_PROJECTION,
+            (projection_scope, node_id, leaf),
+        )
+        typed_member = book.latest_ref(
+            CALLSITE_RETURN_MEMBER,
+            (member_scope, node_id, index, leaf),
+        )
+        value = node_identity_cell(graph, leaf)
+        if projection is None or typed_member is None or value is None:
+            return None
+        members.append(SourceAggregateMember(
+            leaf, value,
+            tuple(dict.fromkeys((
+                *proof, field, projection, typed_member, operand_cell,
+            ))),
+        ))
+    layout = SourceAggregateLayout("tuple", tuple(members))
+    layout_row = (scope, node_id)
+    incumbent = book.page(SOURCE_AGGREGATE_LAYOUT).latest(layout_row)
+    if incumbent is not None and incumbent != layout:
+        raise ValueError(
+            "intrinsic named result disagrees with source aggregate layout: "
+            f"{layout_row!r}"
+        )
+    layout_cell = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, layout_row)
+    if layout_cell is None:
+        sources = tuple(dict.fromkeys((
+            node_identity_cell(graph, node_id), operand_cell, *proof,
+            *(member.value_cell for member in members),
+            *(source for member in members for source in member.source_cells),
+        )))
+        layout_cell = book.post(
+            SOURCE_AGGREGATE_LAYOUT, layout_row, layout,
+            stage=PLANNER_TENSOR_SPECIALIZATION,
+            provenance=Derived(tuple(source for source in sources
+                                     if source is not None)),
+            mode=Mode.CONCORD,
+        )
+    graph.G.nodes[node_id].setdefault("attributes", {})[
+        "source_aggregate_layout_row"
+    ] = layout_row
+    return leaves, descriptors, (*proof, layout_cell)
 
 
 def _callee_optional_aggregate_members(callee: Any) -> tuple | None:
@@ -26814,6 +26921,68 @@ def _dtype_argument_name(
     return str(literal) if isinstance(literal, str) else None
 
 
+def _topk_named_member_descriptor(graph, receiver, field_name, seen=None):
+    """The incumbent top-k named-member shape rule, shared by its producer."""
+
+    if receiver is None or int(receiver) not in graph.G or field_name not in {
+        "values", "indices",
+    }:
+        return None
+    receiver_data = graph.G.nodes[int(receiver)]
+    receiver_attributes = receiver_data.get("attributes") or {}
+    operation = str(
+        receiver_attributes.get("tensor_operation")
+        or receiver_attributes.get("tensor")
+        or receiver_attributes.get("tensor_candidate")
+        or receiver_data.get("op") or receiver_data.get("type") or ""
+    ).casefold()
+    if operation != "topk":
+        return None
+    topk_value = next((
+        int(parent) for parent, role in receiver_data.get("parents") or ()
+        if str(role).casefold() in {
+            "arg:0", "operand", "value", "base", "input",
+        } and int(parent) in graph.G
+    ), None)
+    source = (
+        _tensor_descriptor(graph, topk_value, seen)
+        if topk_value is not None else None
+    )
+    if source is None or int(source.get("rank", 0) or 0) <= 0:
+        return None
+    result = dict(source)
+    if field_name == "indices":
+        result["dtype"] = "int64"
+    source_shape = list(map(int, source.get("shape") or ()))
+    k_value = next((
+        int(parent) for parent, role in receiver_data.get("parents") or ()
+        if str(role) in {"kw:k", "k"} and int(parent) in graph.G
+    ), None)
+    try:
+        k_literal = (
+            None if k_value is None else _constant_value(
+                graph.G.nodes[k_value]
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        k_literal = None
+    axis = int(receiver_attributes.get("dim", -1))
+    if source_shape and isinstance(k_literal, int) and not isinstance(
+        k_literal, bool,
+    ):
+        axis %= len(source_shape)
+        source_shape[axis] = int(k_literal)
+        result["shape"] = tuple(source_shape)
+        result["rank"] = len(source_shape)
+        result.pop("metadata_state", None)
+    else:
+        result.update({
+            "shape": (), "rank": int(source["rank"]),
+            "metadata_state": "dynamic",
+        })
+    return result
+
+
 def _tensor_descriptor_rule(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -27254,80 +27423,13 @@ def _tensor_descriptor_rule(
             {} if receiver is None else
             graph.G.nodes[receiver].get("attributes") or {}
         )
-        # Repository compressor: ``AbstractTensor.topk(...).indices`` is a
-        # named projection, not an opaque record field.  Top-k preserves the
-        # operand rank and replaces only the selected axis extent with k;
-        # the indices projection is int64 while values keeps the operand
-        # dtype.  The exact GetAttr edge selects the named result, so no tuple
-        # position or backend convention is reconstructed here.
-        receiver_operation = (
-            "" if receiver is None else str(
-                receiver_attributes.get("tensor_operation")
-                or receiver_attributes.get("tensor")
-                or receiver_attributes.get("tensor_candidate")
-                or graph.G.nodes[receiver].get("op")
-                or graph.G.nodes[receiver].get("type")
-                or ""
-            ).casefold()
+        # The named projection's existing tensor rule also serves the
+        # aggregate-result producer, so both paths type the same member.
+        named_result = _topk_named_member_descriptor(
+            graph, receiver, field_name, seen,
         )
-        if receiver_operation == "topk" and field_name in {
-            "values", "indices",
-        }:
-            topk_value = next((
-                int(parent)
-                for parent, role in (
-                    graph.G.nodes[receiver].get("parents") or ()
-                )
-                if str(role).casefold() in {
-                    "arg:0", "operand", "value", "base", "input",
-                }
-                and int(parent) in graph.G
-            ), None)
-            source = (
-                _tensor_descriptor(graph, topk_value, seen)
-                if topk_value is not None else None
-            )
-            if source is not None and int(source.get("rank", 0) or 0) > 0:
-                result = dict(source)
-                if field_name == "indices":
-                    result["dtype"] = "int64"
-                source_shape = list(map(int, source.get("shape") or ()))
-                k_value = next((
-                    int(parent)
-                    for parent, role in (
-                        graph.G.nodes[receiver].get("parents") or ()
-                    )
-                    if str(role) in {"kw:k", "k"}
-                    and int(parent) in graph.G
-                ), None)
-                try:
-                    k_literal = (
-                        None if k_value is None else _constant_value(
-                            graph.G.nodes[k_value]
-                        )
-                    )
-                except (KeyError, TypeError, ValueError):
-                    # A structurally cloned/folded `k` may retain its exact
-                    # value identity while no longer carrying a literal
-                    # payload.  That proves a runtime extent, not an error and
-                    # not a guessed constant; the dynamic-rank arm below is
-                    # the top-k contract for precisely that evidence state.
-                    k_literal = None
-                axis = int(receiver_attributes.get("dim", -1))
-                if source_shape and isinstance(k_literal, int) and not isinstance(
-                    k_literal, bool
-                ):
-                    axis %= len(source_shape)
-                    source_shape[axis] = int(k_literal)
-                    result["shape"] = tuple(source_shape)
-                    result["rank"] = len(source_shape)
-                    result.pop("metadata_state", None)
-                else:
-                    result.update({
-                        "shape": (), "rank": int(source["rank"]),
-                        "metadata_state": "dynamic",
-                    })
-                return result
+        if named_result is not None:
+            return named_result
         receiver_identity = receiver_attributes.get(
             "program_abi_record_identity"
         )

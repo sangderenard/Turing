@@ -7993,7 +7993,9 @@ class CorrelationTable:
         """Validate immutable reducer-owned aggregate layout facts."""
 
         from .concordance_declarations import (
-            SOURCE_AGGREGATE_LAYOUT,
+            CALL_RESULT_PROJECTION, CALLSITE_RETURN_MEMBER,
+            PROCESS_GRAPH_OPERANDS, SOURCE_AGGREGATE_LAYOUT,
+            SOURCE_NAMED_TUPLE_LAYOUT,
             SourceAggregateLayout,
             SourceAggregateMember,
         )
@@ -8038,6 +8040,71 @@ class CorrelationTable:
                 or any(not isinstance(cell, Ref) for cell in fact.arm_layout_cells)
             ):
                 problem = "conditional aggregate does not name two arm layouts"
+            if problem is None:
+                named = tuple(dict.fromkeys(
+                    source for member in fact.members
+                    for source in member.source_cells
+                    if source.page == SOURCE_NAMED_TUPLE_LAYOUT
+                ))
+                if named:
+                    layout_cell = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, row)
+                    direct = {source for source, _ in book.edges_into(layout_cell)}
+                    named_fact = book.page(SOURCE_NAMED_TUPLE_LAYOUT).cell(
+                        named[0].row, named[0].column,
+                    ) if len(named) == 1 else None
+                    declared = (
+                        named_fact[1]
+                        if isinstance(named_fact, tuple)
+                        and len(named_fact) == 2 else ()
+                    )
+                    if (
+                        fact.aggregate_kind != "tuple"
+                        or len(named) != 1 or named[0] not in direct
+                        or len(declared) != len(fact.members)
+                    ):
+                        problem = "named aggregate lacks its one ordered class layout"
+                    else:
+                        for index, member in enumerate(fact.members):
+                            sources = set(member.source_cells)
+                            projections = tuple(source for source in sources
+                                                if source.page == CALL_RESULT_PROJECTION)
+                            typed = tuple(source for source in sources
+                                          if source.page == CALLSITE_RETURN_MEMBER)
+                            operands = tuple(source for source in sources
+                                             if source.page == PROCESS_GRAPH_OPERANDS)
+                            valid = (
+                                declared[index][1] in sources
+                                and member.value_cell in direct
+                                and sources <= direct
+                                and len(projections) == 1
+                                and len(typed) == 1
+                                and len(operands) == 1
+                            )
+                            if valid:
+                                valid = (
+                                    book.page(CALL_RESULT_PROJECTION).cell(
+                                        projections[0].row,
+                                        projections[0].column,
+                                    ) == (index,)
+                                    and projections[0].row[1:] == (
+                                        row[1], member.value_id,
+                                    )
+                                    and typed[0].row[1:] == (
+                                        row[1], index, member.value_id,
+                                    )
+                                    and operands[0].row[-1] == row[1]
+                                    and member.value_cell in {
+                                        source for source, _ in book.edges_into(
+                                            projections[0],
+                                        )
+                                    }
+                                )
+                            if not valid:
+                                problem = (
+                                    "named aggregate member lacks exact field, "
+                                    "projection, typed member or operand causes"
+                                )
+                                break
             if problem is not None:
                 scope, value_id = (
                     row if isinstance(row, tuple) and len(row) == 2

@@ -3438,6 +3438,15 @@ def emit_ssa_module_to_c(
                 )
                 if not projections:
                     continue
+                sparse_output_formal = (
+                    int(output.id) in {
+                        int(formal.id)
+                        for formal in module.functions[record.callee].args
+                    }
+                    and int(output.id) not in tuple(map(
+                        int, record.call.attributes.get("callee_input_ids", ()),
+                    ))
+                ) if record.call.attributes.get("callee_input_ids") is not None else False
                 inout_source = next((
                     int(projection.value.id)
                     for projection in projections
@@ -3490,13 +3499,47 @@ def emit_ssa_module_to_c(
                     # value with the same number (a bool region output
                     # typed a double callee result as one byte).
                     element_type = solved_buffer_type(record.callee, output)
-                    shape = tuple(output.shape or ())
+                    # An omitted output formal is a physical destination,
+                    # while the caller's exact projection declares its extent.
+                    # The imported top-k formals are shape-generic; allocating
+                    # from that empty formal shape would make a two-element
+                    # caller projection a one-element buffer.
+                    projection_shapes = {
+                        tuple(projection.value.shape or ())
+                        for projection in projections
+                    }
+                    if sparse_output_formal and len(projection_shapes) != 1:
+                        shortfalls.append(CEmissionShortfall(
+                            "Call", f"aggregate output {output.id} in {fn} "
+                            "has conflicting caller projection extents",
+                        ))
+                        continue
+                    shape = (
+                        next(iter(projection_shapes))
+                        if sparse_output_formal else tuple(output.shape or ())
+                    )
                     runtime_slot = (
                         extent_slot(
-                            record.callee, int(output.id), "element_count", None,
+                            fn if sparse_output_formal else record.callee,
+                            int(projections[0].value.id) if sparse_output_formal
+                            else int(output.id),
+                            "element_count", None,
                         )
-                        if not shape and _runtime_sized_span(output) else None
+                        if not shape and _runtime_sized_span(
+                            projections[0].value if sparse_output_formal
+                            else output
+                        ) else None
                     )
+                    if (
+                        sparse_output_formal and not shape
+                        and _runtime_sized_span(projections[0].value)
+                        and runtime_slot is None
+                    ):
+                        shortfalls.append(CEmissionShortfall(
+                            "Call", f"aggregate output {output.id} in {fn} "
+                            "has no exact caller element-count storage origin",
+                        ))
+                        continue
                     if runtime_slot is not None:
                         # A runtime-sized span result is owned storage of
                         # its element count, never one scalar slot.
@@ -6061,7 +6104,47 @@ def emit_ssa_module_to_c(
                             f"attributes={dict(instruction.attributes or {})!r}",
                         ))
                         continue
-                    if len(instruction.args) != len(target.args):
+                    aggregate_record = aggregate_calls.get(id(instruction))
+                    declared_input_ids = instruction.attributes.get(
+                        "callee_input_ids"
+                    ) if aggregate_record is not None else None
+                    formal_positions = {
+                        int(formal.id): position
+                        for position, formal in enumerate(target.args)
+                    }
+                    if declared_input_ids is not None:
+                        input_ids = tuple(map(int, declared_input_ids))
+                        output_formal_ids = {
+                            int(output.id) for output in native_outputs[callee]
+                        }
+                        missing_ids = (
+                            set(formal_positions) - set(input_ids)
+                        )
+                        if (
+                            len(input_ids) != len(instruction.args)
+                            or len(set(input_ids)) != len(input_ids)
+                            or not set(input_ids) <= set(formal_positions)
+                            or not missing_ids <= output_formal_ids
+                            or any(
+                                not aggregate_record.projection_for_output(
+                                    output_id
+                                )
+                                for output_id in missing_ids
+                            )
+                        ):
+                            shortfalls.append(CEmissionShortfall(
+                                op,
+                                f"call to {callee!r} has an incomplete exact "
+                                "callee_input_ids/output projection binding",
+                            ))
+                            continue
+                        input_formals = tuple(
+                            target.args[formal_positions[value_id]]
+                            for value_id in input_ids
+                        )
+                    elif len(instruction.args) == len(target.args):
+                        input_formals = tuple(target.args)
+                    else:
                         shortfalls.append(CEmissionShortfall(
                             op,
                             f"call to {callee!r} has {len(instruction.args)} "
@@ -6069,15 +6152,20 @@ def emit_ssa_module_to_c(
                             f"{len(target.args)} in {fn}",
                         ))
                         continue
-                    rendered_args = []
+                    formal_actual_positions = {
+                        formal_positions[int(formal.id)]: actual_position
+                        for actual_position, formal in enumerate(input_formals)
+                    }
+                    rendered_args = [None] * len(target.args)
                     call_token = instruction.attributes.get(
                         "callsite_id",
                         instruction.res.id
                         if instruction.res is not None else id(instruction),
                     )
                     for argument_index, (actual, formal) in enumerate(zip(
-                        instruction.args, target.args
+                        instruction.args, input_formals
                     )):
+                        formal_slot = formal_positions[int(formal.id)]
                         actual_has_array_contract = bool(
                             tuple(actual.shape or ())
                             or int((actual.accounting or {}).get(
@@ -6171,7 +6259,7 @@ def emit_ssa_module_to_c(
                                     f"        {formal_type} {local_name} = "
                                     f"{converted};"
                                 )
-                                rendered_args.append(f"&{local_name}")
+                                rendered_args[formal_slot] = f"&{local_name}"
                                 continue
                         value = addresses.get(int(actual.id))
                         if value is None:
@@ -6188,10 +6276,9 @@ def emit_ssa_module_to_c(
                         if value is None:
                             rendered_args = None
                             break
-                        rendered_args.append(value)
+                        rendered_args[formal_slot] = value
                     if rendered_args is None:
                         continue
-                    aggregate_record = aggregate_calls.get(id(instruction))
                     if aggregate_record is not None:
                         projected_addresses: dict[int, str] = {}
                         callee_formal_positions = {
@@ -6211,8 +6298,14 @@ def emit_ssa_module_to_c(
                             prebound_storage = aggregate_projection_storage.get(
                                 (id(instruction), output_id)
                             )
-                            if formal_position is not None:
-                                actual = instruction.args[formal_position]
+                            bound_formal_position = (
+                                formal_position is not None
+                                and formal_position in formal_actual_positions
+                            )
+                            if bound_formal_position:
+                                actual = instruction.args[
+                                    formal_actual_positions[formal_position]
+                                ]
                                 projected_address = address_operand(actual)
                                 if projected_address is None:
                                     rendered_args = None
@@ -6247,7 +6340,7 @@ def emit_ssa_module_to_c(
                                     if len(caller_destinations) == 1
                                     else None
                                 )
-                            if formal_position is None and destination is not None:
+                            if not bound_formal_position and destination is not None:
                                 output_argument = destination
                                 projected_expression = (
                                     destination
@@ -6255,12 +6348,12 @@ def emit_ssa_module_to_c(
                                     else storage_expression(output, destination)
                                 )
                                 projected_address = destination
-                            elif formal_position is None and prebound_storage is not None:
+                            elif not bound_formal_position and prebound_storage is not None:
                                 projected_expression, projected_address = (
                                     prebound_storage
                                 )
                                 output_argument = projected_address
-                            elif formal_position is None and projections and all(
+                            elif not bound_formal_position and projections and all(
                                 int(projection.value.id) in addresses
                                 for projection in projections
                             ):
@@ -6268,7 +6361,7 @@ def emit_ssa_module_to_c(
                                 output_argument = addresses[first_result_id]
                                 projected_expression = expressions[first_result_id]
                                 projected_address = addresses[first_result_id]
-                            elif formal_position is None:
+                            elif not bound_formal_position:
                                 first_result_id = (
                                     int(projections[0].value.id)
                                     if projections else int(instruction.res.id)
@@ -6311,7 +6404,10 @@ def emit_ssa_module_to_c(
                                         projected_expression = local_name
                                         projected_address = f"&{local_name}"
                             if output_argument is not None:
-                                rendered_args.append(output_argument)
+                                if formal_position is None:
+                                    rendered_args.append(output_argument)
+                                else:
+                                    rendered_args[formal_position] = output_argument
                             for projection in projections:
                                 expressions[int(projection.value.id)] = (
                                     projected_expression
@@ -6499,6 +6595,12 @@ def emit_ssa_module_to_c(
                             addresses[result_id] = result_address
                         if rendered_args is None:
                             continue
+                    if any(argument is None for argument in rendered_args):
+                        shortfalls.append(CEmissionShortfall(
+                            op,
+                            f"call to {callee!r} has an unbound native formal",
+                        ))
+                        continue
                     if callee in extent_users:
                         rendered_args.append("extents")
                     invocation = (
