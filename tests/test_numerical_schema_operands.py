@@ -264,3 +264,64 @@ def test_dynamic_constructor_region_reads_its_settled_explicit_dtype(monkeypatch
             name="explicit_constructor_type_record", extraction_contract=policy,
             progress=lambda _: None, progress_bars=False,
         )
+
+
+@pytest.mark.parametrize("dtype", [None, "float32"])
+def test_tensor_byte_materialization_keeps_rows_and_explicit_target(monkeypatch, dtype):
+    from src.compiler import hierarchical_plan
+    from src.compiler.concordance_declarations import CANONICAL_VALUE, SEQUENCE_ROW_DTYPE
+    from src.compiler.concorded_literals import origin_cell
+    from src.compiler.identity_concordance import current_identity_book
+
+    class ObservedTensorRegion(Exception):
+        pass
+
+    original = hierarchical_plan.plan_region_to_ssa_instrs
+
+    def inspect_region(region, **kwargs):
+        tensors = [item for item in region.items
+                   if getattr(item, "opcode", None) == "tensor"]
+        if tensors:
+            item = tensors[0]
+            wanted = dtype or "int64"
+            assert (item.outputs[0], (), wanted) in region.value_shapes
+            if dtype is not None:
+                assert dict(item.attributes)["dtype"] == dtype
+            book = current_identity_book()
+            source = item.inputs[0]
+            current = book.latest_ref(
+                CANONICAL_VALUE, (tuple(kwargs["lexical_read_scope"]), int(source)),
+            )
+            page = book.page(SEQUENCE_ROW_DTYPE)
+            claims = tuple(
+                book.latest_ref(SEQUENCE_ROW_DTYPE, row)
+                for row in page.rows() if page.latest(row)[0] == ("int64",)
+            )
+            assert any(
+                cause.page == CANONICAL_VALUE
+                and cause.row == claim.row
+                and origin_cell(book, cause) == origin_cell(book, current)
+                for claim in claims
+                for cause, _stage in book.edges_into(claim)
+            )
+            raise ObservedTensorRegion
+        return original(region, **kwargs)
+
+    monkeypatch.setattr(hierarchical_plan, "plan_region_to_ssa_instrs", inspect_region)
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {}, "bindings": [],
+        "values": [{"function": "root", "parameter": "data",
+                    "storage": "span", "dtype": "int64", "rank": 1,
+                    "python_type": "builtins.bytes"}],
+    })
+    target = "" if dtype is None else f", dtype={dtype!r}"
+    with pytest.raises(ObservedTensorRegion):
+        lower_ast_source_to_ssa(
+            f"def root(data: bytes):\n    return AbstractTensor.tensor(list(data){target})\n",
+            "root", python_bindings={"AbstractTensor": AbstractTensor},
+            name="tensor_byte_rows", extraction_contract=policy,
+            progress=lambda _: None, progress_bars=False,
+        )

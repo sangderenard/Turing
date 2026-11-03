@@ -26,6 +26,14 @@ _PROCESS_GRAPH_OPERATORS = frozenset({
 })
 _KNOWN_OPERATORS = CANONICAL_ABSTRACT_TENSOR_OPERATORS | _PROCESS_GRAPH_OPERATORS
 
+# Inert builtin iterable contracts used by source materialization.  These
+# state the class of a row yielded by the Python iterable, not the dtype of
+# the container's physical storage or any sampled payload.
+BUILTIN_ITERABLE_ELEMENTS = MappingProxyType({
+    "builtins.bytes": ("builtins.int", "int64"),
+    "builtins.bytearray": ("builtins.int", "int64"),
+})
+
 
 @dataclass(frozen=True, slots=True)
 class PythonProgramStep:
@@ -367,6 +375,7 @@ def resolve_python_identity(identity: str | None) -> PythonIdentityProgram | Non
 
 
 __all__ = [
+    "BUILTIN_ITERABLE_ELEMENTS",
     "PYTHON_IDENTITY_PROGRAMS",
     "PythonIdentityProgram",
     "PythonProgramStep",

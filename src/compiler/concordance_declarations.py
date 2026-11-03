@@ -4726,6 +4726,12 @@ SOURCE_NUMERIC_SPECIALIZATION = declare_transform(
 SOURCE_PYTHON_IDENTITY = declare_page("source_python_identity_concordance", (
     RowField("numeric_scope", K.SCOPE), RowField("node", K.VALUE_ID),
 ), tuple)
+#: The inert builtin iterable row contract ingested from
+#: ``python_identity_programs.BUILTIN_ITERABLE_ELEMENTS``. Row is the exact
+#: builtin class identity, fact is (element class, native scalar dtype).
+BUILTIN_ITERABLE_ELEMENT = declare_page("builtin_iterable_element", (
+    RowField("iterable_class", K.NAME),
+), tuple)
 #: Numerical region extraction: an exact consumer/operand edge whose source
 #: Python identity program produces a compile-time schema identity.  The
 #: operand remains source semantic evidence but is absent from the numerical

@@ -26547,6 +26547,15 @@ def _tensor_descriptor(
                     from .numerical_constructor_defaults import constructor_default_dtype
 
                     _default_dtype, source_cells = constructor_default_dtype(graph, int(node_id))
+                elif operation.casefold() == "tensor":
+                    from .planner_concordance_posts import materialized_sequence_row_dtype
+
+                    payloads = tuple(dict.fromkeys(
+                        int(parent) for parent, role in data.get("parents") or ()
+                        if str(role) in {"arg:0", "arg0"} and int(parent) in graph.G
+                    ))
+                    if len(payloads) == 1:
+                        _row_dtype, source_cells = materialized_sequence_row_dtype(graph, payloads[0])
                 loop_owner = _arithmetic_loop_target_owner(graph, int(node_id))
                 if not semantic_sources and loop_owner is not None:
                     # A ``range`` target is the loop's own product: the edge
@@ -29227,6 +29236,24 @@ def _tensor_descriptor_rule(
                 inherited = _tensor_descriptor(graph, sources[0], seen)
                 if inherited is not None:
                     return inherited
+                from .planner_concordance_posts import materialized_sequence_row_dtype
+
+                row_dtype, _row_type_cells = materialized_sequence_row_dtype(graph, sources[0])
+                explicit_dtype = any(
+                    str(role) in {"kw:dtype", "dtype"}
+                    for _parent, role in data.get("parents") or ()
+                ) or "kw:dtype" in (
+                    (data.get("attributes") or {}).get("static_call_arguments") or {}
+                )
+                if row_dtype is not None and not explicit_dtype:
+                    # _octets' tensor(list(data)) precedes its explicit cast.
+                    # The bytes iterator's declared integer rows survive the
+                    # exact list materializer edge; its row ledger supplies
+                    # dtype without sampling bytes or typing a tag column.
+                    return {
+                        "shape": (), "dtype": row_dtype, "rank": 1,
+                        "metadata_state": "dynamic",
+                    }
                 # Repository compressor: ``AbstractTensor.tensor(list(values))``
                 # reaches callsite specialization before native VALUE_TYPE_ABI
                 # publication.  The source resolver has already settled the
