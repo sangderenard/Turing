@@ -1693,6 +1693,7 @@ READ_SCOPE_NODE_KEYED_PAGES = (
     "loop_continuation_rewire_concordance",
     "canonical_value",
     "ingestion_value",
+    "source_aggregate_layout",
 )
 
 # -- reasons -----------------------------------------------------------------

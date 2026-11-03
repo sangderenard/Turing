@@ -4066,6 +4066,25 @@ def fork_read_scope(
     graph_data["lexical_read_scope"] = forked
     if tuple(graph_data.get("operand_position_scope") or ()) == source:
         graph_data["operand_position_scope"] = forked
+    # A specialized copy's aggregate layout names this copy's canonical
+    # member cells. Sharing the authored scope made the second topk call in
+    # root(select(a, 1), select(b, 2)) collide with the first copy's layout.
+    if tuple(graph_data.get("source_aggregate_layout_scope") or ()) == source:
+        graph_data["source_aggregate_layout_scope"] = forked
+        from ...compiler.concordance_declarations import SOURCE_AGGREGATE_LAYOUT
+        for value_id, data in graph.G.nodes(data=True):
+            attributes = data.get("attributes") or {}
+            row = attributes.get("source_aggregate_layout_row")
+            if (
+                isinstance(row, (tuple, list)) and len(row) == 2
+                and tuple(row[0]) == source and int(row[1]) == int(value_id)
+                and book.latest_ref(
+                    SOURCE_AGGREGATE_LAYOUT, (source, int(value_id)),
+                ) is not None
+            ):
+                attributes["source_aggregate_layout_row"] = (
+                    forked, int(value_id),
+                )
 
 
 def fork_operand_position_scope(

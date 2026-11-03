@@ -23387,7 +23387,7 @@ def publish_intrinsic_named_result_leaves(graph: Any, node_id: int):
 
     from .concordance_declarations import (
         CALL_RESULT_PROJECTION, CALLSITE_RETURN_MEMBER,
-        PLANNER_TENSOR_SPECIALIZATION,
+        PLANNER_TENSOR_SPECIALIZATION, READ_SCOPE_FORK,
         SOURCE_AGGREGATE_LAYOUT, SourceAggregateLayout,
         SourceAggregateMember,
     )
@@ -23454,15 +23454,43 @@ def publish_intrinsic_named_result_leaves(graph: Any, node_id: int):
     layout = SourceAggregateLayout("tuple", tuple(members))
     layout_row = (scope, node_id)
     incumbent = book.page(SOURCE_AGGREGATE_LAYOUT).latest(layout_row)
-    if incumbent is not None and incumbent != layout:
-        raise ValueError(
-            "intrinsic named result disagrees with source aggregate layout: "
-            f"{layout_row!r}"
-        )
     layout_cell = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, layout_row)
-    if layout_cell is None:
+    inherited = None
+    if incumbent is not None and incumbent != layout and layout_cell is not None:
+        # A second-level select/topk copy inherits its parent's layout at
+        # column 0, whose members still cite parent canonical cells. Project
+        # only that exact fork to this child's cells; a different layout
+        # remains a disagreement, and both facts stay in the row history.
+        history = book.page(SOURCE_AGGREGATE_LAYOUT).history(layout_row)
+        origins = tuple(
+            source for source, stage in book.edges_into(layout_cell)
+            if source.page == SOURCE_AGGREGATE_LAYOUT
+            and stage == READ_SCOPE_FORK
+        )
+        if (
+            len(history) == 1 and layout_cell.column == 0
+            and len(origins) == 1
+            and book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+                origins[0].row, origins[0].column,
+            ) == incumbent
+            and incumbent.aggregate_kind == layout.aggregate_kind
+            and tuple(member.value_id for member in incumbent.members)
+            == tuple(member.value_id for member in layout.members)
+            and all(
+                (old.value_cell, READ_SCOPE_FORK)
+                in book.edges_into(new.value_cell)
+                for old, new in zip(incumbent.members, layout.members)
+            )
+        ):
+            inherited = layout_cell
+        else:
+            raise ValueError(
+                "intrinsic named result disagrees with source aggregate layout: "
+                f"{layout_row!r}"
+            )
+    if layout_cell is None or inherited is not None:
         sources = tuple(dict.fromkeys((
-            node_identity_cell(graph, node_id), operand_cell, *proof,
+            inherited, node_identity_cell(graph, node_id), operand_cell, *proof,
             *(member.value_cell for member in members),
             *(source for member in members for source in member.source_cells),
         )))
@@ -23471,7 +23499,7 @@ def publish_intrinsic_named_result_leaves(graph: Any, node_id: int):
             stage=PLANNER_TENSOR_SPECIALIZATION,
             provenance=Derived(tuple(source for source in sources
                                      if source is not None)),
-            mode=Mode.CONCORD,
+            mode=Mode.REVISE if inherited is not None else Mode.CONCORD,
         )
     graph.G.nodes[node_id].setdefault("attributes", {})[
         "source_aggregate_layout_row"

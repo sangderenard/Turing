@@ -7994,7 +7994,8 @@ class CorrelationTable:
 
         from .concordance_declarations import (
             CALL_RESULT_PROJECTION, CALLSITE_RETURN_MEMBER,
-            PROCESS_GRAPH_OPERANDS, SOURCE_AGGREGATE_LAYOUT,
+            PROCESS_GRAPH_OPERANDS, READ_SCOPE_FORK,
+            SOURCE_AGGREGATE_LAYOUT,
             SOURCE_NAMED_TUPLE_LAYOUT,
             SourceAggregateLayout,
             SourceAggregateMember,
@@ -8018,7 +8019,39 @@ class CorrelationTable:
             distinct = tuple(dict.fromkeys(map(repr, facts)))
             fact = facts[-1]
             problem = None
-            if len(distinct) != 1:
+            fork_projection = False
+            if len(distinct) != 1 and len(history) == 2 and all(
+                isinstance(item, SourceAggregateLayout) for item in facts
+            ):
+                inherited, projected = facts
+                first = Ref(SOURCE_AGGREGATE_LAYOUT, row, history[0][0])
+                last = Ref(SOURCE_AGGREGATE_LAYOUT, row, history[1][0])
+                origins = tuple(
+                    source for source, stage in book.edges_into(first)
+                    if source.page == SOURCE_AGGREGATE_LAYOUT
+                    and stage == READ_SCOPE_FORK
+                )
+                fork_projection = (
+                    len(origins) == 1
+                    and book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+                        origins[0].row, origins[0].column,
+                    ) == inherited
+                    and first in {
+                        source for source, _stage in book.edges_into(last)
+                    }
+                    and inherited.aggregate_kind == projected.aggregate_kind
+                    and tuple(member.value_id for member in inherited.members)
+                    == tuple(member.value_id for member in projected.members)
+                    and all(
+                        new.value_cell.row == (row[0], new.value_id)
+                        and (old.value_cell, READ_SCOPE_FORK)
+                        in book.edges_into(new.value_cell)
+                        for old, new in zip(
+                            inherited.members, projected.members,
+                        )
+                    )
+                )
+            if len(distinct) != 1 and not fork_projection:
                 problem = f"immutable layout changed: {distinct!r}"
             elif not isinstance(fact, SourceAggregateLayout):
                 problem = f"invalid aggregate layout fact {fact!r}"
