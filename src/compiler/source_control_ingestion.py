@@ -78,6 +78,45 @@ def ingest_control_activity(graph, definition, scope):
         if reaches_successor:
             edge(tail, after, relation)
 
+    def comprehension_clause(clause, owners, continuation):
+        """Evaluate one eager display clause before its nested body work.
+
+        In `canonical_codes_from_lengths`, the ListComp's `width in
+        range(...)` clause is a process loop.  Its source activity previously
+        had only generic enter/exit points, so the loop planner could not
+        place the clause at `select`.  The iterator is evaluated before that
+        point; target, filters and the nested clause or element are body-owned.
+        """
+
+        enter, leave = point(clause, 'enter', owners), point(clause, 'exit', owners)
+        occurrence = source(clause)
+        first, last = visit(clause.iter, (*owners, (occurrence, 'iter')))
+        select = point(clause, 'select', owners)
+        edge(enter, first); edge(last, select)
+        body_owners = (*owners, (occurrence, 'body'))
+        body_enter = point(clause, 'body_enter', body_owners)
+        body_exit = point(clause, 'body_exit', body_owners)
+        edge(select, body_enter, 'body')
+        target_first, target_last = visit(clause.target, body_owners)
+        edge(body_enter, target_first)
+        tail = target_last
+        for index, condition in enumerate(clause.ifs):
+            test_first, test_last = visit(condition, body_owners)
+            guard = point(clause, f'filter_{index}_select', body_owners)
+            edge(tail, test_first)
+            edge(test_last, guard)
+            # A false filter skips this item and asks this exact clause for
+            # its next item. It never enters the nested clause or element.
+            edge(guard, select, 'repeat')
+            tail = guard
+        nested_first, nested_last = continuation(body_owners)
+        edge(tail, nested_first, 'body' if clause.ifs else 'flow')
+        edge(nested_last, body_exit)
+        edge(body_exit, select, 'repeat')
+        edge(select, leave, 'exhausted')
+        edge(body_exit, leave, 'iteration_extent')
+        return enter, leave
+
     def visit(node, owners=(), root=False):
         enter, leave = point(node, 'enter', owners), point(node, 'exit', owners)
         occurrence = source(node)
@@ -85,7 +124,32 @@ def ingest_control_activity(graph, definition, scope):
             book.post(SOURCE_ACTIVITY_CALL, (scope, occurrence),
                       (len(node.args), tuple(keyword.arg for keyword in node.keywords)), stage=REDUCTION,
                       provenance=Derived((enter, leave)), mode=Mode.CONCORD)
-        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
+            if any(clause.is_async for clause in node.generators):
+                raise UnadmittedSourceControlTopology(
+                    type(node).__name__, 'async_comprehension_activity',
+                )
+
+            def nested(index, nested_owners):
+                if index < len(node.generators):
+                    return comprehension_clause(
+                        node.generators[index], nested_owners,
+                        lambda body_owners: nested(index + 1, body_owners),
+                    )
+                if isinstance(node, ast.DictComp):
+                    key_first, key_last = visit(node.key, nested_owners)
+                    value_first, value_last = visit(node.value, nested_owners)
+                    edge(key_last, value_first)
+                    return key_first, value_last
+                return visit(node.elt, nested_owners)
+
+            if not node.generators:
+                raise UnadmittedSourceControlTopology(
+                    type(node).__name__, 'missing_comprehension_clause',
+                )
+            first, last = nested(0, owners)
+            edge(enter, first); edge(last, leave)
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
             tail = enter
             for index, member in enumerate(node.elts):
                 first, last = visit(member, owners)
