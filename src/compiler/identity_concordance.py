@@ -3513,6 +3513,8 @@ class CorrelationTable:
         from ..transmogrifier.operator_safety import OPERATOR_FAILURE_ARMS
         from .thread_operations import PROCESS_OPERATORS
         from .emission_concordance import value_cell
+        from .ssa_record_return_state import accepted_ssa_component
+        from .frame_identity_book import _frame_owner_book
         book = (getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None:
             return []
@@ -3537,6 +3539,11 @@ class CorrelationTable:
                 found.append(Finding("exception-ingestion-node", "<source>", None,
                                      "generated exception node lacks its ingestion conversion"))
         for name, fn in module.functions.items():
+            # A linked _read_header's ExceptionNone/Make/Raise instructions
+            # retain SOURCE_EXCEPTION_OPERATION in its accepted owner book.
+            # The composed caller book owns new edges, not that body's origin.
+            accepted = accepted_ssa_component(fn)
+            instruction_book = _frame_owner_book(fn)[0] if accepted else book
             for block in fn.blocks.values():
                 for instruction in block.instrs:
                     attrs = instruction.attributes or {}
@@ -3555,16 +3562,18 @@ class CorrelationTable:
                         if cell is not None: instructions[(cell, name)] = instruction
                     source = attrs.get("exception_operation_cell")
                     if source is not None:
-                        data = fact(source)
+                        data = instruction_book.page(source.page).cell(
+                            source.row, source.column,
+                        )
                         if (source.page != SOURCE_EXCEPTION_OPERATION or not data
                                 or data[0] != attrs.get("dispatch_operation")
                                 or not isinstance(data[7], Ref)
                                 or data[7].page != SOURCE_PROCESS_OPERATION
-                                or data[7] not in {x for x, _stage in book.edges_into(source)}
+                                or data[7] not in {x for x, _stage in instruction_book.edges_into(source)}
                                 or (data[4] is None) != (data[5] is None)
                                 or (data[4] is not None and (
                                     not isinstance(data[4], Ref)
-                                    or data[4] not in {x for x, _stage in book.edges_into(source)}
+                                    or data[4] not in {x for x, _stage in instruction_book.edges_into(source)}
                                     or not data[6]))):
                             found.append(Finding("ssa-exception-provenance", name, instruction.res.id,
                                                  "exception operation lost its process-graph origin"))
@@ -3694,9 +3703,13 @@ class CorrelationTable:
     def _thread_operation_findings(module: Any) -> list[Finding]:
         from .thread_operations import PROCESS_OPERATORS, PROCESS_RESULT_DTYPES
         from .concordance_declarations import SOURCE_PROCESS_OPERATION
+        from .ssa_record_return_state import accepted_ssa_component
+        from .frame_identity_book import _frame_owner_book
         book = (getattr(module, "metadata", {}) or {}).get("identity_book")
         found = []
         for name, function in module.functions.items():
+            accepted = accepted_ssa_component(function)
+            instruction_book = _frame_owner_book(function)[0] if accepted else book
             for block in function.blocks.values():
                 for instruction in block.instrs:
                     attributes = instruction.attributes or {}
@@ -3724,7 +3737,7 @@ class CorrelationTable:
                     if book is not None:
                         cell = attributes.get("source_process_cell")
                         fact = (None if cell is None or cell.page != SOURCE_PROCESS_OPERATION else
-                                book.page(SOURCE_PROCESS_OPERATION).cell(cell.row, cell.column))
+                                instruction_book.page(SOURCE_PROCESS_OPERATION).cell(cell.row, cell.column))
                         if fact is None or fact[:3] != (operation, semantic, PROCESS_RESULT_DTYPES.get(semantic)):
                             found.append(Finding("ssa-process-provenance", name, None,
                                                  "process operation lost its exact ingestion contract"))
@@ -8084,7 +8097,37 @@ class CorrelationTable:
                 ))
                 if named:
                     layout_cell = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, row)
-                    direct = {source for source, _ in book.edges_into(layout_cell)}
+                    # A later source read-scope fork can inherit this exact
+                    # immutable layout without publishing a local revision.
+                    # In root(values, k).topk(...).indices, the final audit
+                    # saw only the child layout's direct copy edge and lost
+                    # the parent cell's named class/projection causes. Follow
+                    # that one declared copy chain, requiring the fact to
+                    # remain identical at every hop; a changed fact must have
+                    # its own audited projection revision above.
+                    cause_cell = layout_cell
+                    copy_seen = set()
+                    copy_valid = True
+                    while cause_cell not in copy_seen:
+                        copy_seen.add(cause_cell)
+                        causes = tuple(book.edges_into(cause_cell))
+                        if len(causes) != 1 or not (
+                            causes[0][0].page == SOURCE_AGGREGATE_LAYOUT
+                            and causes[0][1] == READ_SCOPE_FORK
+                        ):
+                            break
+                        parent = causes[0][0]
+                        if book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+                            parent.row, parent.column,
+                        ) != fact:
+                            copy_valid = False
+                            break
+                        cause_cell = parent
+                    else:
+                        copy_valid = False
+                    direct = {
+                        source for source, _ in book.edges_into(cause_cell)
+                    } if copy_valid else set()
                     named_fact = book.page(SOURCE_NAMED_TUPLE_LAYOUT).cell(
                         named[0].row, named[0].column,
                     ) if len(named) == 1 else None
