@@ -734,9 +734,26 @@ def plan_region_to_ssa_instrs(
         if existing is not None:
             return existing
         if value_id not in dtype_of:
+            occurrences = tuple(
+                (
+                    str(item.opcode),
+                    tuple(map(int, item.outputs)),
+                    semantic_input_ids(item),
+                )
+                for item in region.items
+                if isinstance(item, PlanLine)
+                and value_id in {
+                    *map(int, item.outputs),
+                    *semantic_input_ids(item),
+                }
+            )
             raise ValueError(
                 f"region value {value_id} has no settled dtype in the "
-                "region's value records"
+                "region's value records: "
+                f"function={function_scope!r} scope={lexical_read_scope!r} "
+                f"region={region.name!r} captures={region.captures!r} "
+                f"occurrences={occurrences!r} "
+                f"recorded={tuple(sorted(dtype_of))!r}"
             )
         made = SSAValue(
             value_id,
