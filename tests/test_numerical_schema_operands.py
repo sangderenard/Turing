@@ -136,3 +136,39 @@ def test_cast_dtype_literal_is_projected_into_operation_metadata(target):
         provenance=Derived((*sources, receipt)), mode=Mode.REVISE,
     )
     assert len(CorrelationTable._numerical_dtype_operand_findings(module)) == 1
+
+
+def test_unrolled_cast_uses_the_cloned_literal_cell():
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {}, "bindings": [],
+        "values": [{"function": "root", "parameter": "values",
+                    "storage": "span", "dtype": "int64", "rank": 1,
+                    "python_type": "src.common.tensors.abstraction.AbstractTensor"}],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "def root(values):\n"
+        "    out = values * 0\n"
+        "    for index in range(2):\n"
+        "        out = out + (values >= index).to_dtype('int64')\n"
+        "    return out\n",
+        "root", name="unrolled_cast_literal", extraction_contract=policy,
+        progress=lambda _: None, progress_bars=False,
+    )
+    from src.compiler.concordance_declarations import (
+        NUMERICAL_DTYPE_OPERAND, SOURCE_LITERAL_VALUE,
+    )
+    from src.compiler.identity_concordance import CorrelationTable
+
+    book = module.metadata["identity_book"]
+    assert CorrelationTable._numerical_dtype_operand_findings(module) == []
+    rows = tuple(book.page(NUMERICAL_DTYPE_OPERAND).rows())
+    assert rows
+    assert any(
+        any(source.page == SOURCE_LITERAL_VALUE
+            for literal_cell in book.page(NUMERICAL_DTYPE_OPERAND).latest(row)[0]
+            for source, _stage in book.edges_into(literal_cell))
+        for row in rows
+    ), "the cast must consume a copied literal fact, not only authored literals"

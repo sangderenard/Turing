@@ -190,6 +190,43 @@ def test_static_unroll_clones_authored_calls_with_exact_argument_edges():
     assert graph.G.nodes[index_id]["constant"] == 1
 
 
+def test_unrolled_literal_keeps_its_exact_copy_local_concordance_fact():
+    from src.compiler.concordance_declarations import SOURCE_LITERAL_VALUE
+    from src.compiler.concorded_literals import literal
+    from src.common.tensors.topological_reducer import node_identity_cell
+    from src.compiler.identity_concordance import current_identity_book
+
+    graph = _function_graph(
+        "def selected(parts, index, dtype):\n"
+        "    return parts[index]\n"
+        "def kernel(left, right):\n"
+        "    parts = (left, right)\n"
+        "    result = left\n"
+        "    for index in range(2):\n"
+        "        result = result + selected(parts, index, 'int64')\n"
+        "    return result\n",
+        "kernel",
+    )
+    plans = _glsl_composer().discover(graph)
+    assert evaporate_unrolled_loops(graph, plans) == plans
+    clones = [
+        node_id for node_id, data in graph.G.nodes(data=True)
+        if (data.get("attributes") or {}).get("unrolled_from") is not None
+        and (data.get("attributes") or {}).get("value") == "int64"
+    ]
+    assert len(clones) == 2
+    book = current_identity_book()
+    scope = graph.G.graph["lexical_read_scope"]
+    for node_id in clones:
+        value, cells = literal(graph, node_id)
+        assert value == "int64"
+        clone_cell = book.latest_ref(SOURCE_LITERAL_VALUE, (scope, node_id))
+        assert cells == (clone_cell,)
+        sources = {cell for cell, _stage in book.edges_into(clone_cell)}
+        assert node_identity_cell(graph, node_id) in sources
+        assert any(cell.page == SOURCE_LITERAL_VALUE for cell in sources)
+
+
 def test_structural_fold_keeps_runtime_rank_when_broadcasting_a_scalar():
     graph = _function_graph(
         "def kernel(values):\n    return values * 4\n",

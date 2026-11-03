@@ -1171,6 +1171,25 @@ def evaporate_unrolled_loops(
             from ..common.tensors.topological_reducer import node_identity_cell
 
             activity_book = current_identity_book()
+            # _varints' unrolled to_dtype("int64") cloned the Constant as
+            # value 75 without its literal cell. The metadata reader then
+            # had only graph attributes and an opaque Novel clone identity.
+            # A clone keeps its exact authored literal fact in its own scope,
+            # derived from that fact and both identities at this writer.
+            from .concordance_declarations import SOURCE_LITERAL_VALUE
+            from .concorded_literals import literal, MISSING as LITERAL_MISSING
+
+            literal_scope = tuple(graph.G.graph["lexical_read_scope"])
+            if str(cloned.get("type") or "").casefold() in {"constant", "const"}:
+                literal_value, literal_cells = literal(graph, int(source_id))
+                if literal_value is not LITERAL_MISSING:
+                    activity_book.post(
+                        SOURCE_LITERAL_VALUE, (literal_scope, int(clone_id)),
+                        literal_value, stage=LOOP_COMPOSER,
+                        provenance=Derived((*literal_cells, clone_cell,
+                            node_identity_cell(graph, int(source_id)))),
+                        mode=Mode.CONCORD,
+                    )
             points, activity_cell = binding(
                 graph, int(source_id), book=activity_book,
             )
@@ -1214,9 +1233,21 @@ def evaporate_unrolled_loops(
         # is NOVEL from the loop construct it unrolls (plan 80, A2.6), so
         # ``node_identity_cell`` finds a sourced row instead of minting an
         # Unsourced one.
-        _post_planner_node_row(
+        constant_cell = _post_planner_node_row(
             graph, constant_id, "loop_composer_constant", int(loop_id),
         )
+        if constant_cell is not None:
+            from .concordance_declarations import SOURCE_LITERAL_VALUE, LOOP_COMPOSER
+            from .identity_concordance import Derived, Mode, current_identity_book
+            from ..common.tensors.topological_reducer import node_identity_cell
+
+            current_identity_book().post(
+                SOURCE_LITERAL_VALUE,
+                (tuple(graph.G.graph["lexical_read_scope"]), constant_id),
+                value, stage=LOOP_COMPOSER,
+                provenance=Derived((constant_cell, node_identity_cell(graph, loop_id))),
+                mode=Mode.CONCORD,
+            )
         return constant_id
 
     def post_cloned_layout(source_id: int, mapping: dict[int, int]) -> None:

@@ -35,7 +35,11 @@ def literal(graph, node, seen=()):
     book = current_identity_book()
     node_cell = node_identity_cell(graph, int(node))
     scope = _source_numeric_scope(graph)
-    scopes = [scope]
+    local_scope = graph.G.graph.get('lexical_read_scope')
+    scopes = list(dict.fromkeys(
+        candidate for candidate in (local_scope, scope)
+        if candidate is not None
+    ))
     if isinstance(scope, tuple) and len(scope) == 3:
         specialization = book.latest_ref(SOURCE_NUMERIC_SPECIALIZATION_PAGE, (scope[0], scope[2]))
         if specialization is not None and book.page(specialization.page).cell(specialization.row, specialization.column)[0] == scope:
@@ -44,6 +48,25 @@ def literal(graph, node, seen=()):
         cell = book.latest_ref(SOURCE_LITERAL_VALUE, (candidate, int(node)))
         if cell is not None:
             return book.page(cell.page).cell(cell.row, cell.column), (cell,)
+    # An unrolled literal is born in the clone's lexical scope. A later
+    # callsite fork copies its canonical identity, not its authored numeric
+    # scope. Follow only that exact copy relation to the literal's own row;
+    # walking arbitrary computation causes would mistake an operand's
+    # literal for its consumer's result.
+    pending, visited = [node_cell], set()
+    while pending:
+        identity = pending.pop()
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if identity.page != CANONICAL_VALUE:
+            continue
+        cell = book.latest_ref(SOURCE_LITERAL_VALUE, identity.row)
+        if cell is not None:
+            return book.page(cell.page).cell(cell.row, cell.column), (cell,)
+        pending.extend(source for source, stage in book.edges_into(identity)
+                       if source.page == CANONICAL_VALUE
+                       and stage.name == 'read_scope_fork')
     cell = book.latest_ref(PROVEN_LITERAL, (str(graph.G.graph.get('function_name')), int(node)))
     if cell is not None:
         return book.page(cell.page).cell(cell.row, cell.column), (cell,)
