@@ -780,7 +780,7 @@ def test_optional_record_payload_storage_does_not_select_present_arm():
 
 def test_synthesized_optional_presence_derives_from_field_and_receiver():
     from src.compiler.concordance_declarations import (
-        CLASS_FIELD_DECLARATION, INGESTION_VALUE,
+        CLASS_FIELD_DECLARATION,
     )
     from src.compiler.fortran_c_shell import (
         _lower_optional_record_presence_graph,
@@ -823,10 +823,8 @@ def test_synthesized_optional_presence_derives_from_field_and_receiver():
     presence_id = graph.G.graph[
         "optional_record_presence_receipts"
     ][0]["presence_value_id"]
-    presence_cell = book.latest_ref(
-        INGESTION_VALUE,
-        (graph.G.graph["operand_position_scope"], presence_id),
-    )
+    from src.common.tensors.topological_reducer import node_identity_cell
+    presence_cell = node_identity_cell(graph, presence_id)
     assert presence_cell is not None
     incoming = {
         source for source, _stage in book.edges_into(presence_cell)
@@ -838,8 +836,73 @@ def test_synthesized_optional_presence_derives_from_field_and_receiver():
         node_id for node_id, data in graph.G.nodes(data=True)
         if (data.get("attributes") or {}).get("binding_name") == "page"
     )
-    from src.common.tensors.topological_reducer import node_identity_cell
     assert node_identity_cell(graph, page_input) in incoming
+
+
+def test_optional_presence_uses_formal_input_not_later_same_name_value():
+    """A parameter record is owned by its exact formal Input identity."""
+
+    from src.compiler.concordance_declarations import CLASS_FIELD_DECLARATION
+    from src.compiler.fortran_c_shell import (
+        _lower_optional_record_presence_graph,
+    )
+    from src.compiler.identity_concordance import current_identity_book
+    from src.common.tensors.topological_reducer import node_identity_cell
+
+    graph = _function_graph(
+        "class Page:\n"
+        "    book: int\n"
+        "def thaw(page: Page):\n"
+        "    page = page.__dict__\n"
+        "    return page\n",
+        "thaw",
+    )
+    graph.G.graph["parameter_record_abi"] = {
+        "page": {
+            "identity": "Page",
+            "fields": {
+                "book": {
+                    "storage": "scalar", "dtype": "int64", "rank": 0,
+                    "mutable": False, "optional": True,
+                },
+            },
+            "source_record_view_schema": ("<string>", "Page"),
+        },
+    }
+    book = current_identity_book()
+    field_row = next(
+        row for row in book.page(CLASS_FIELD_DECLARATION).rows()
+        if row[1:] == ("Page", "book")
+    )
+    graph.G.graph["parameter_record_abi"]["page"][
+        "source_record_view_schema"
+    ] = field_row[:2]
+
+    assert len(graph.G.graph["identity_table"]["page"]) > 1
+    assert _lower_optional_record_presence_graph(graph.G) == 1
+
+    presence_id = graph.G.graph[
+        "optional_record_presence_receipts"
+    ][0]["presence_value_id"]
+    incoming = {
+        source for source, _stage in book.edges_into(
+            node_identity_cell(graph, presence_id)
+        )
+    }
+    formal_id = next(
+        node_id for node_id in graph.G.graph["identity_table"]["page"]
+        if str(graph.G.nodes[node_id].get("type") or "").casefold()
+        == "input"
+        and (graph.G.nodes[node_id].get("attributes") or {}).get(
+            "binding_name"
+        ) == "page"
+    )
+    later_ids = set(graph.G.graph["identity_table"]["page"]) - {formal_id}
+    assert node_identity_cell(graph, formal_id) in incoming
+    assert not any(
+        node_identity_cell(graph, node_id) in incoming
+        for node_id in later_ids
+    )
 
 
 def test_synthesized_optional_presence_refuses_a_field_with_no_declaration():

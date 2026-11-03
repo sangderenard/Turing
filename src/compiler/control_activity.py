@@ -48,7 +48,11 @@ def binding(graph, node, *, book=None, scope=None):
         return None, None
     contracts = {book.page(SOURCE_ACTIVITY_BINDING).cell(cell.row, cell.column) for cell in found}
     if len(contracts) != 1:
-        raise ValueError('process node has ambiguous control-activity ownership')
+        raise ValueError(
+            "process node has ambiguous control-activity ownership: "
+            f"node={int(node)} scope={scope!r} bindings="
+            f"{tuple(sorted(map(repr, found)))!r}"
+        )
     cell = next(iter(found))
     return next(iter(contracts)), cell
 

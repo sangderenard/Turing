@@ -94,6 +94,12 @@ def _source_glyph_cell(book, canonical_cell):
     )
 
 
+def _pursued_integer_glyph(value: int) -> str:
+    """A dependency whose glyph syntax is absent from its caller's AST."""
+
+    return f"value={value!r}"
+
+
 @pytest.mark.parametrize(
     ("value", "spelling"),
     (
@@ -173,6 +179,56 @@ def test_value_union_glyph_recipe_retains_exact_per_arm_sequences():
         assert dispatch.sequence_value_id == 30
         assert dispatch.argument_value_ids == (10, 20, 21)
         assert dispatch.argument_kind == "value_union_glyph_projection"
+    finally:
+        end_identity_book(token)
+
+
+def test_resident_materialization_prefers_copy_local_glyph_recipe():
+    """One graph value has one authoritative recipe in its local scope."""
+
+    book, token = begin_identity_book()
+    try:
+        graph = ProcessGraph(materialize_memory=False)
+        authored_scope = book.mint_scope("authored-glyph")
+        local_scope = book.mint_scope("copy-glyph")
+        graph.G.graph.update({
+            "source_glyph_sequence_scope": authored_scope,
+            "source_numeric_scope": local_scope,
+            "authored_function_identity": authored_scope,
+        })
+        graph.G.add_node(40, value_id=40, attributes={
+            "source_glyph_sequence_row": (local_scope, 40),
+        })
+        source = book.post(
+            SOURCE_VALUE_CLASS, (authored_scope, 10),
+            ("builtins.int", 1, "annotation"),
+            stage=INGESTION, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        )
+        unresolved = SourceGlyphSequence((SourceGlyphComponent(
+            kind="formatted", component_value_id=11,
+            operand_value_id=10, glyph_tokens=(), conversion=ord("r"),
+            format_spec_value_id=None, projection_kind="scalar",
+            record_identity=None,
+        ),))
+        resolved = SourceGlyphSequence((replace(
+            unresolved.components[0], formatted_sequence_value_id=20,
+        ),))
+        authored_cell = book.post(
+            SOURCE_GLYPH_SEQUENCE, (authored_scope, 40), unresolved,
+            stage=INGESTION, provenance=Derived((source,)),
+            mode=Mode.CONCORD,
+        )
+        book.post(
+            SOURCE_GLYPH_SEQUENCE, (local_scope, 40), resolved,
+            stage=INGESTION, provenance=Derived((authored_cell,)),
+            mode=Mode.CONCORD,
+        )
+
+        declarations, _initializations, _mutations = (
+            _source_glyph_sequence_materializations(graph.G)
+        )
+        assert (20, "duplicates", 1, True) in declarations
     finally:
         end_identity_book(token)
 
@@ -548,6 +604,82 @@ def test_integer_formatted_value_has_authored_call_and_unit_dependency():
     assert reference_to_unit[formatter.reference.address] in plan["units"][
         reference_to_unit[root_ref]
     ]["dependency_units"]
+
+
+def test_pursued_dependency_installs_authored_integer_glyph_runtime():
+    """Glyph runtime support belongs to the pursued program, not its root AST."""
+
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {},
+        "bindings": [],
+        "values": [{
+            "function": "render",
+            "parameter": "value",
+            "storage": "scalar",
+            "dtype": "int64",
+            "rank": 0,
+            "python_type": "builtins.int",
+        }],
+    })
+    captured = {}
+
+    def capture(process):
+        dependency = next(
+            entry.graph for entry in process.function_table
+            if entry.name == "_pursued_integer_glyph"
+        )
+        formatter = next(
+            entry for entry in process.function_table
+            if entry.qualified_name == (
+                "src.compiler.glyph_sequence_format."
+                "decimal_integer_glyph_tokens"
+            )
+        )
+        book = current_identity_book()
+        row = next(
+            (data.get("attributes") or {})["source_glyph_sequence_row"]
+            for _node_id, data in dependency.G.nodes(data=True)
+            if (data.get("attributes") or {}).get(
+                "source_glyph_sequence_row"
+            ) is not None
+        )
+        fact = book.page(SOURCE_GLYPH_SEQUENCE).latest(row)
+        component = next(
+            item for item in fact.components if item.kind == "formatted"
+        )
+        captured.update({
+            "dependency": dependency,
+            "formatter": formatter,
+            "component": component,
+        })
+
+    source = (
+        "def render(value: int):\n"
+        "    return _pursued_integer_glyph(value)\n"
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        lower_ast_source_to_ssa(
+            source,
+            "render",
+            name="pursued_integer_glyph_runtime",
+            python_bindings={
+                "_pursued_integer_glyph": _pursued_integer_glyph,
+            },
+            extraction_contract=policy,
+            resolved_process_graph_sink=capture,
+            stop_after_compilation_unit_plan=True,
+            progress=lambda _message: None,
+        )
+
+    call_id = captured["component"].formatted_sequence_value_id
+    assert call_id is not None
+    call = captured["dependency"].G.nodes[int(call_id)]
+    assert call["attributes"]["callee_ref"] == (
+        captured["formatter"].reference.address
+    )
 
 
 def test_unannotated_formal_links_the_integer_formatter_once_its_callsite_class_settles():

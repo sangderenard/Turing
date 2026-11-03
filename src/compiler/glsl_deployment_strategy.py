@@ -35241,6 +35241,66 @@ def _post_callsite_loop_element_classes(
             if enumerate_iterators:
                 if len(enumerate_iterators) != 1 or len(target_ids) != 2:
                     continue
+                # ``enumerate`` owns two distinct element projections.  The
+                # tensor descriptor proves only the second one; the builtin
+                # iterator itself proves that the first is an integer.  A
+                # callsite fork previously copied the whole glyph recipe but
+                # posted only the second target's local class row.  The
+                # formatter for ``index`` then consulted the fork scope and
+                # had no resident producer even though the authored scope
+                # knew the class.  Publish the induction target in the same
+                # fork from the exact enumerate and target identities before
+                # relinking either formatted component.
+                induction_id = int(target_ids[0])
+                induction_data = specialized.G.nodes.get(induction_id, {})
+                induction_attributes = induction_data.get("attributes") or {}
+                if induction_attributes.get("binding_kind") != "loop":
+                    continue
+                if callee_scope is None:
+                    raise ValueError(
+                        "callsite enumerate induction class requires the "
+                        "existing forked lexical read scope"
+                    )
+                induction_value_id = int(
+                    induction_data.get("value_id", induction_id)
+                )
+                induction_row = (callee_scope, induction_value_id)
+                induction_previous = book.latest_ref(
+                    SOURCE_VALUE_CLASS, induction_row,
+                )
+                induction_cells = tuple(dict.fromkeys(filter(None, (
+                    induction_previous,
+                    node_identity_cell(
+                        specialized, int(enumerate_iterators[0]),
+                    ),
+                    node_identity_cell(specialized, induction_id),
+                ))))
+                induction_fact = (
+                    "builtins.int", 1,
+                    "builtins.enumerate induction class",
+                )
+                if class_page.latest(induction_row) != induction_fact:
+                    book.post(
+                        SOURCE_VALUE_CLASS, induction_row, induction_fact,
+                        stage=PLANNER_TENSOR_SPECIALIZATION,
+                        provenance=Derived(induction_cells),
+                        mode=(
+                            Mode.CONCORD if induction_previous is None
+                            else Mode.REVISE
+                        ),
+                    )
+                induction_attributes[
+                    "callsite_iterable_element_class_fact"
+                ] = induction_fact
+                induction_attributes[
+                    "callsite_iterable_element_class_cell"
+                ] = book.latest_ref(SOURCE_VALUE_CLASS, induction_row)
+                induction_attributes[
+                    "callsite_iterable_element_class_cells"
+                ] = induction_cells
+                induction_attributes["result_class_ref"] = "builtins.int"
+                induction_data["attributes"] = induction_attributes
+                relinked_loop_targets.add(induction_value_id)
                 # enumerate's first target is its own integer induction
                 # value.  Only the second target projects the actual tensor
                 # element descriptor through the exact arg:0 edge.

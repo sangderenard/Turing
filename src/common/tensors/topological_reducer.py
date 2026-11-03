@@ -678,6 +678,88 @@ def _drop_spelled_tensor_operation(attributes: dict, expression: Any) -> None:
     attributes.pop("tensor_candidate", None)
 
 
+def _canonical_node_identity_base_tokens(
+    graph: Any, node_id: int, *,
+    parents: tuple[tuple[int, str], ...] | None = None,
+) -> tuple[str, ...]:
+    """The stable structural token prefix used by every canonical node."""
+
+    def stable_token_atom(value: Any) -> str:
+        if isinstance(value, str):
+            address_repr = re.fullmatch(
+                r"<([A-Za-z_][A-Za-z_0-9.]*) object at 0x[0-9A-Fa-f]+>",
+                value,
+            )
+            return address_repr.group(1) if address_repr is not None else value
+        if value is None or isinstance(value, (bool, float, int)):
+            return str(value)
+        enum_value = getattr(value, "value", None)
+        if isinstance(enum_value, (bool, float, int, str)):
+            return str(enum_value)
+        value_type = type(value)
+        return f"{value_type.__module__}.{value_type.__qualname__}"
+
+    target = getattr(graph, "G", graph)
+
+    def node_description(current: int) -> dict[str, Any]:
+        data = target.nodes[current]
+        expression = data.get("expr_obj")
+        occurrence = (data.get("attributes") or {}).get(
+            "source_glyph_occurrence"
+        )
+        return {
+            "source_span": {
+                "line": getattr(expression, "lineno", -1),
+                "column": getattr(expression, "col_offset", -1),
+                "end_line": getattr(expression, "end_lineno", -1),
+                "end_column": getattr(expression, "end_col_offset", -1),
+            },
+            "ast": (
+                ast.dump(expression, include_attributes=False)
+                if isinstance(expression, ast.AST)
+                else type(expression).__name__
+            ),
+            "type": stable_token_atom(data.get("type", "")),
+            "op": stable_token_atom(data.get("op", "")),
+            "label": stable_token_atom(data.get("label", "")),
+            "source_glyph_occurrence": (
+                tuple(stable_token_atom(part) for part in occurrence)
+                if occurrence is not None else ()
+            ),
+        }
+
+    data = target.nodes[int(node_id)]
+    expression = data.get("expr_obj")
+    missing_position = 10**12
+    positions = tuple(
+        value if value >= 0 else missing_position
+        for value in (
+            getattr(expression, "lineno", -1),
+            getattr(expression, "col_offset", -1),
+            getattr(expression, "end_lineno", -1),
+            getattr(expression, "end_col_offset", -1),
+        )
+    )
+    parent_context = tuple(
+        {"role": str(role), "node": node_description(int(parent_id))}
+        for parent_id, role in (
+            data.get("parents", ()) if parents is None else parents
+        )
+        if int(parent_id) in target
+    )
+    return (
+        "priority:0" if str(data.get("type", "")) == "Input" else "priority:1",
+        f"line:{positions[0]:012d}",
+        f"column:{positions[1]:012d}",
+        f"end_line:{positions[2]:012d}",
+        f"end_column:{positions[3]:012d}",
+        *structural_context_tokens({
+            "node": node_description(int(node_id)),
+            "parents": parent_context,
+        }),
+    )
+
+
 def node_identity_cell(graph: Any, node_id: int, *, book: Any = None) -> Any:
     """The cell that identifies graph node ``node_id`` (plan 60, seam 1).
 
@@ -724,6 +806,7 @@ def node_identity_cell(graph: Any, node_id: int, *, book: Any = None) -> Any:
 
 def post_derived_node_identity(
     graph: Any, node_id: int, cells: Iterable[Any], *, stage: Any,
+    canonical_parents: tuple[tuple[int, str], ...] | None = None,
 ) -> Any:
     """Post a synthesized node's ``ingestion_value`` row DERIVED from
     ``cells`` (what the node stands for) in the scope ``node_identity_cell``
@@ -736,22 +819,62 @@ def post_derived_node_identity(
     ingestion scope, or no cell: nothing is posted (``None`` / the
     existing cell)."""
 
+    from ...compiler.concordance_declarations import CANONICAL_VALUE
     from ...compiler.identity_concordance import Mode
 
     existing = _posted_node_identity_cell(graph, int(node_id))
     if existing is not None:
         return existing
-    scopes = node_ingestion_scopes(graph)
     cells = tuple(dict.fromkeys(cell for cell in cells if cell is not None))
-    if not scopes or not cells:
+    if not cells:
         return None
     data = getattr(graph, "G", graph).nodes.get(node_id) or {}
+    fact = _NodeFact(
+        str(data.get("type") or ""), str(data.get("op") or ""),
+        str(data.get("label") or ""),
+    )
+    metadata = getattr(getattr(graph, "G", graph), "graph", {}) or {}
+    if metadata.get("canonical_value_ids"):
+        lexical_scope = metadata.get("lexical_read_scope")
+        if lexical_scope is None:
+            raise ValueError(
+                f"canonical graph node {int(node_id)} has no lexical read "
+                "scope for its identity row"
+            )
+        # Program: a settled glyph formatter Call was created independently
+        # in seven tensor-call forks.  Its recipe named value 147, but the
+        # writer posted only an INGESTION_VALUE row; none of the seven forks
+        # had a CANONICAL_VALUE 147, while a peer fork's unrelated LoopResult
+        # did.  Rule: after canonical relabeling, a synthesized node is born
+        # in the graph's own lexical scope.  Posting to the earlier ingestion
+        # namespace loses the copy identity and permits numeric-id collisions
+        # across peer forks.
+        book = current_identity_book()
+        base_tokens = _canonical_node_identity_base_tokens(
+            graph, int(node_id), parents=canonical_parents,
+        )
+        canonical_page = book.page(CANONICAL_VALUE)
+        version = sum(
+            1
+            for row in canonical_page.scope_rows(tuple(lexical_scope))
+            if tuple(canonical_page.latest(row) or ())[:-1] == base_tokens
+        )
+        identity_tokens = (*base_tokens, f"version:{version}")
+        cell = book.post(
+            CANONICAL_VALUE, (tuple(lexical_scope), int(node_id)),
+            identity_tokens,
+            stage=stage, provenance=_Derived(cells), mode=Mode.CONCORD,
+        )
+        metadata.setdefault("ssa_identity_tokens", {})[int(node_id)] = (
+            identity_tokens
+        )
+        return cell
+    scopes = node_ingestion_scopes(graph)
+    if not scopes:
+        return None
     return current_identity_book().post(
         _INGESTION_VALUE, (scopes[0], int(node_id)),
-        _NodeFact(
-            str(data.get("type") or ""), str(data.get("op") or ""),
-            str(data.get("label") or ""),
-        ),
+        fact,
         stage=stage, provenance=_Derived(cells), mode=Mode.CONCORD,
     )
 
@@ -4763,9 +4886,10 @@ def _mint_settled_node(
     )
     cell = post_derived_node_identity(
         graph, int(node_id), cells, stage=_REDUCTION,
+        canonical_parents=parents,
     )
     if cell is None:
-        graph.G.remove_node(node_id)
+        _remove_node(graph, node_id)
         raise ValueError(
             f"_mint_settled_node({node_type!r}, {label!r}): the graph has "
             "no identity scope to register the node in"
@@ -4954,11 +5078,31 @@ def _link_integer_glyph_formatter_calls(
         # at creation; placement readers must not guess from its operands.
         from ...compiler.control_activity import binding
         from ...compiler.concordance_declarations import SOURCE_ACTIVITY_BINDING
-        points, activity_cell = binding(graph, int(row[1]), book=book, scope=value_class_scope)
+        # A specialization forks value-class and glyph rows, not the authored
+        # control graph.  Program: the forked ``tensor_octets_to_bytes`` glyph
+        # resolved both enumerate operands as int, then tried to find owner 50
+        # under the forked class scope and reported no activity owner.  The
+        # JoinedStr's canonical identity already traces to its ingestion
+        # identity and exact authored activity binding.  Read that binding
+        # through the control graph's declared scope, then bind the expansion
+        # in that same scope; a numeric/glyph scope is never a control key.
+        activity_scope_override = (
+            value_class_scope
+            if graph.G.graph.get("lexical_read_scope") is None
+            else None
+        )
+        points, activity_cell = binding(
+            graph, int(row[1]), book=book,
+            **(
+                {"scope": activity_scope_override}
+                if activity_scope_override is not None else {}
+            ),
+        )
         if points is None:
             raise ValueError('glyph formatter expansion has no source activity owner')
         formatter_cell = node_identity_cell(graph, int(call_id))
-        book.post(SOURCE_ACTIVITY_BINDING, (value_class_scope, formatter_cell),
+        activity_binding_scope = activity_cell.row[0]
+        book.post(SOURCE_ACTIVITY_BINDING, (activity_binding_scope, formatter_cell),
                   points, stage=_REDUCTION,
                   provenance=_Derived((glyph_cell, activity_cell, formatter_cell, *points)), mode=_Mode.CONCORD)
         rewritten_components[ordinal] = _dataclass_replace(
@@ -6614,7 +6758,19 @@ def _relink_settled_glyph_formatters(
     )
     if glyph_scope is None:
         return
-    value_class_scope = _source_numeric_scope(graph)
+    # A callsite specialization forks both the glyph recipe and the loop
+    # target class rows into one lexical scope.  The first implementation of
+    # ``glyph_scope_override`` selected only the forked recipe while still
+    # reading classes from the graph's generic numeric scope.  Consequently
+    # ``enumerate(octets.tolist())`` had exact local int rows for ``index``
+    # and ``value``, yet neither formatter could see them.  The override is
+    # the correlational scope for the whole relink operation, not merely the
+    # recipe key.
+    value_class_scope = (
+        tuple(glyph_scope_override)
+        if glyph_scope_override is not None
+        else _source_numeric_scope(graph)
+    )
     for node_id, data in tuple(graph.G.nodes(data=True)):
         attributes = data.get("attributes") or {}
         row = attributes.get("source_glyph_sequence_row")
@@ -19838,80 +19994,10 @@ def _normalize_lexical_values(
         "compile-time references must not appear as runtime parent IDs: "
         f"{invalid_parent_ids!r}"
     )
-    def stable_token_atom(value: Any) -> str:
-        if isinstance(value, str):
-            address_repr = re.fullmatch(
-                r"<([A-Za-z_][A-Za-z_0-9.]*) object at 0x[0-9A-Fa-f]+>",
-                value,
-            )
-            return (
-                address_repr.group(1)
-                if address_repr is not None else value
-            )
-        if value is None or isinstance(value, (bool, float, int)):
-            return str(value)
-        enum_value = getattr(value, "value", None)
-        if isinstance(enum_value, (bool, float, int, str)):
-            return str(enum_value)
-        value_type = type(value)
-        return f"{value_type.__module__}.{value_type.__qualname__}"
-
-    def node_description(node_id: int) -> dict[str, Any]:
-        data = graph.G.nodes[node_id]
-        expression = data.get("expr_obj")
-        source_glyph_occurrence = (
-            data.get("attributes") or {}
-        ).get("source_glyph_occurrence")
-        return {
-            "source_span": {
-                "line": getattr(expression, "lineno", -1),
-                "column": getattr(expression, "col_offset", -1),
-                "end_line": getattr(expression, "end_lineno", -1),
-                "end_column": getattr(expression, "end_col_offset", -1),
-            },
-            "ast": (
-                ast.dump(expression, include_attributes=False)
-                if isinstance(expression, ast.AST) else type(expression).__name__
-            ),
-            "type": stable_token_atom(data.get("type", "")),
-            "op": stable_token_atom(data.get("op", "")),
-            "label": stable_token_atom(data.get("label", "")),
-            "source_glyph_occurrence": (
-                tuple(stable_token_atom(part) for part in source_glyph_occurrence)
-                if source_glyph_occurrence is not None else ()
-            ),
-        }
-
-    base_token_chains: dict[int, tuple[str, ...]] = {}
-    for node_id, data in graph.G.nodes(data=True):
-        expression = data.get("expr_obj")
-        line = getattr(expression, "lineno", -1)
-        column = getattr(expression, "col_offset", -1)
-        end_line = getattr(expression, "end_lineno", -1)
-        end_column = getattr(expression, "end_col_offset", -1)
-        missing_position = 10**12
-        ordering_prefix = (
-            "priority:0" if str(data.get("type", "")) == "Input" else "priority:1",
-            f"line:{line if line >= 0 else missing_position:012d}",
-            f"column:{column if column >= 0 else missing_position:012d}",
-            f"end_line:{end_line if end_line >= 0 else missing_position:012d}",
-            f"end_column:{end_column if end_column >= 0 else missing_position:012d}",
-        )
-        parent_context = tuple(
-            {
-                "role": str(role),
-                "node": node_description(parent_id),
-            }
-            for parent_id, role in data.get("parents", ())
-            if parent_id in graph.G
-        )
-        base_token_chains[node_id] = (
-            *ordering_prefix,
-            *structural_context_tokens({
-                "node": node_description(node_id),
-                "parents": parent_context,
-            }),
-        )
+    base_token_chains: dict[int, tuple[str, ...]] = {
+        int(node_id): _canonical_node_identity_base_tokens(graph, int(node_id))
+        for node_id in graph.G.nodes
+    }
     chain_versions: dict[tuple[str, ...], int] = {}
     node_token_chains: dict[int, tuple[str, ...]] = {}
     for node_id in graph.G.nodes:

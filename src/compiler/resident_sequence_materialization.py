@@ -123,7 +123,30 @@ def _source_glyph_sequence_materializations(
         for node_id, data in graph_obj.nodes(data=True)
     }
     page = book.page(SOURCE_GLYPH_SEQUENCE)
-    for row in _source_contract_rows(graph_obj, page):
+    # A specialized graph retains authored/base scopes as historical
+    # read-through while its JoinedStr node names the exact copy-local row.
+    # Program: ``tensor_octets_to_bytes`` revised value 50 in seven callsite
+    # scopes with formatter 147, but broad scope enumeration also consumed
+    # the unresolved authored value-50 row and rejected component 49.  The
+    # node's ``source_glyph_sequence_row`` is the writer-maintained
+    # concordance handle.  Use it for that value; scope enumeration is only
+    # the fallback for older literal records without a handle.
+    candidate_rows = _source_contract_rows(graph_obj, page)
+    rows_by_value = {
+        int(value_id): tuple(exact_row)
+        for value_id, (_node_id, data) in nodes_by_value.items()
+        for exact_row in ((data.get("attributes") or {}).get(
+            "source_glyph_sequence_row"
+        ),)
+        if exact_row is not None
+        and len(exact_row) == 2
+        and int(exact_row[1]) == int(value_id)
+        and book.latest_ref(SOURCE_GLYPH_SEQUENCE, tuple(exact_row)) is not None
+    }
+    for source_row in candidate_rows:
+        if len(source_row) == 2:
+            rows_by_value.setdefault(int(source_row[1]), source_row)
+    for row in rows_by_value.values():
         if len(row) != 2 or int(row[1]) not in nodes_by_value:
             continue
         node_id, data = nodes_by_value[int(row[1])]

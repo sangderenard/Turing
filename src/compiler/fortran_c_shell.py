@@ -5862,7 +5862,6 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
     # can still acquire and lower its optional fields later.
     if not graph.graph.get("parameter_record_abi"):
         return 0
-    identities = graph.graph.get("identity_table") or {}
     receipts: list[dict[str, Any]] = list(
         graph.graph.get("optional_record_presence_receipts", ())
     )
@@ -5892,6 +5891,7 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
     from .concordance_declarations import PLANNER_STRUCTURAL_FOLD
     from .frame_identity_book import _record_field_declaration_cell
     from .identity_concordance import ConcordanceRefusal
+    from .planner_concordance_posts import _formal_identity_cells
 
     view = SimpleNamespace(G=graph)
 
@@ -5927,7 +5927,19 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
     for parameter, record in dict(
         graph.graph.get("parameter_record_abi") or {}
     ).items():
-        owner_ids = set(map(int, identities.get(str(parameter), ())))
+        # Program: ``_hops_to_end(jump, ...)`` later assigns
+        # ``jump = jump[jump]``.  Wrong record: optional Program-ABI presence
+        # for ``jump._identity_token`` derived from every version in the name
+        # history, so its canonical Input had both the formal's activity and
+        # the loop update's activity.  Rule: this storage field belongs to the
+        # parameter record.  Its owner is the exact parameter Input identity,
+        # not subsequent values that reuse the authored name.
+        formal_cells = _formal_identity_cells(view, str(parameter))
+        owner_cells = tuple(
+            cell for cell in formal_cells
+            if cell.page.name in {"ingestion_value", "canonical_value"}
+        )
+        owner_ids = {int(cell.row[1]) for cell in owner_cells}
         if not owner_ids:
             continue
         for field_name, field in dict(record.get("fields") or {}).items():
@@ -6009,11 +6021,6 @@ def _lower_optional_record_presence_graph(graph_obj: Any) -> int:
             else:
                 detach_inputs(positive)
             positive_data = graph.nodes[positive]
-            owner_cells = tuple(
-                node_identity_cell(view, owner_id)
-                for owner_id in sorted(owner_ids)
-                if owner_id in graph
-            )
             post_derived_node_identity(
                 view, positive,
                 (*owner_cells, field_cell),
@@ -63633,52 +63640,61 @@ def _lower_ast_source_to_ssa_impl(
     # is created later by the reducer, when SOURCE_GLYPH_SEQUENCE owns the
     # exact operand/conversion recipe; no callee address is invented here.
     glyph_formatter_pursuit_roots: tuple[str, ...] = ()
-    if any(isinstance(node, ast.JoinedStr) for node in ast.walk(tree)):
-        from . import glyph_sequence_format as glyph_format_module
+    # Program: ``compress_octets`` is submitted from ``octet_codec.py``,
+    # which has no JoinedStr, but source pursuit reaches ``bitstream.py`` and
+    # its ``f"octet {index}: {value!r}"`` diagnostics.  Wrong record: glyph
+    # runtime support was selected by scanning only the submitted AST, so the
+    # pursued JoinedStr recipes and their exact integer class cells existed
+    # while the authored formatter had no FunctionTable entry to link.
+    # Rule: glyph formatting is compiler language support for the complete
+    # pursued program.  Install its authored sources before pursuit just as
+    # the other runtime roots are installed; whether a recipe calls them is
+    # still decided later from SOURCE_GLYPH_SEQUENCE and SOURCE_VALUE_CLASS.
+    from . import glyph_sequence_format as glyph_format_module
 
-        glyph_formatters = (
-            glyph_format_module.decimal_digit_glyph_token,
-            glyph_format_module.append_decimal_integer_glyphs,
-            glyph_format_module.decimal_integer_glyph_tokens,
-            glyph_format_module.lower_hex_digit_glyph_token,
-            glyph_format_module.prefixed_lower_hex_integer_glyph_tokens,
+    glyph_formatters = (
+        glyph_format_module.decimal_digit_glyph_token,
+        glyph_format_module.append_decimal_integer_glyphs,
+        glyph_format_module.decimal_integer_glyph_tokens,
+        glyph_format_module.lower_hex_digit_glyph_token,
+        glyph_format_module.prefixed_lower_hex_integer_glyph_tokens,
+    )
+    existing_top_level_names = {
+        statement.name
+        for statement in tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    collisions = tuple(
+        helper.__name__ for helper in glyph_formatters
+        if helper.__name__ in existing_top_level_names
+    )
+    if collisions:
+        raise ValueError(
+            "dynamic glyph formatter names collide with authored "
+            f"top-level definitions: {collisions!r}"
         )
-        existing_top_level_names = {
-            statement.name
-            for statement in tree.body
-            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        collisions = tuple(
-            helper.__name__ for helper in glyph_formatters
-            if helper.__name__ in existing_top_level_names
-        )
-        if collisions:
-            raise ValueError(
-                "dynamic glyph formatter names collide with authored "
-                f"top-level definitions: {collisions!r}"
+    formatter_bindings = dict(vars(glyph_format_module))
+    formatter_definitions = []
+    for helper in glyph_formatters:
+        definition = ast.parse(
+            textwrap.dedent(inspect.getsource(helper)),
+            filename=str(inspect.getsourcefile(helper) or source_module or "<glyph-format>"),
+        ).body[0]
+        if not isinstance(definition, ast.FunctionDef):
+            raise TypeError(
+                f"glyph formatter {helper.__qualname__!r} is not an authored function"
             )
-        formatter_bindings = dict(vars(glyph_format_module))
-        formatter_definitions = []
-        for helper in glyph_formatters:
-            definition = ast.parse(
-                textwrap.dedent(inspect.getsource(helper)),
-                filename=str(inspect.getsourcefile(helper) or source_module or "<glyph-format>"),
-            ).body[0]
-            if not isinstance(definition, ast.FunctionDef):
-                raise TypeError(
-                    f"glyph formatter {helper.__qualname__!r} is not an authored function"
-                )
-            definition._python_source_identity = (
-                str(helper.__module__), str(helper.__qualname__),
-            )
-            definition._python_bindings = formatter_bindings
-            definition._turing_private_export = True
-            formatter_definitions.append(definition)
-        tree.body.extend(formatter_definitions)
-        ast.fix_missing_locations(tree)
-        glyph_formatter_pursuit_roots = tuple(
-            definition.name for definition in formatter_definitions
+        definition._python_source_identity = (
+            str(helper.__module__), str(helper.__qualname__),
         )
+        definition._python_bindings = formatter_bindings
+        definition._turing_private_export = True
+        formatter_definitions.append(definition)
+    tree.body.extend(formatter_definitions)
+    ast.fix_missing_locations(tree)
+    glyph_formatter_pursuit_roots = tuple(
+        definition.name for definition in formatter_definitions
+    )
     # The called inventory types the entry's unannotated formals: the class
     # the callers pass (compiler/called_inventory.py) is read from the book's
     # CALLED_INVENTORY record and stands where the authored annotation would.
