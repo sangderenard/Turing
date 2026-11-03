@@ -1,4 +1,3 @@
-2026-11-03 TITLE (MEASURED, where): 
 2026-11-03 `_header` borrowed iterable native row width (MEASURED)
 
 Checkout: `C:/Users/alber/.codex/worktrees/compressor-results/turing`. Bounded sanctioned source: `inspect.getsource(octet_lz._header) + "\ndef root(x: int) -> bytes:\n    return _header(x)\n"`, lowered with `lower_ast_source_to_ssa(source, "root", name="authored_header_element", extraction_contract=Path.cwd()/"extraction_contracts/program_extraction.yaml")`. Scratch command from the checkout: `$env:PYTHONPATH=(Get-Location).Path; python -u (Join-Path $env:TEMP 'probe_header_writer.py')`. It ran in about 10 seconds; no full compressor lowering was run.
