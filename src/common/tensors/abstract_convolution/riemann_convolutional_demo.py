@@ -56,6 +56,9 @@ def normalize_for_visualization(arr):
 
     arr = _to_numpy(arr)
 
+    if arr.size == 0:
+        raise ValueError("normalize_for_visualization() received an empty array")
+
     # Collapse leading batch/channel dimensions for 4D/5D (or higher) inputs
     if arr.ndim in (4, 5):
         arr = arr.mean(axis=(0, 1))
