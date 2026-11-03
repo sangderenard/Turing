@@ -1644,7 +1644,7 @@ def _source_sequence_slices(graph_obj: Any):
         # defined after the loop reading it.  Rule: ``a[i:j]`` of an array
         # is a new array of the same typecode, filled exactly as a list
         # slice is.
-        if (attrs.get("aggregate_kind") not in {"list", "array"}
+        if (attrs.get("aggregate_kind") not in {"list", "array", "bytes"}
                 or attrs.get("producer_kind") != "sequence_slice"):
             continue
         roles = {str(role): int(parent) for parent, role in data.get("parents") or ()}

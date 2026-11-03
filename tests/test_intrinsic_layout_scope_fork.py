@@ -86,6 +86,9 @@ def test_two_specialized_topk_calls_publish_distinct_layout_rows(monkeypatch):
             assert book.page(SOURCE_AGGREGATE_LAYOUT).cell(
                 inherited.row, inherited.column,
             ) == layout
+            assert CorrelationTable._source_aggregate_layout_findings(
+                SimpleNamespace(metadata={"identity_book": book})
+            ) == []
             projected = original(child, node_id)
             assert projected is not None
             assert len(book.page(SOURCE_AGGREGATE_LAYOUT).history(

@@ -13898,7 +13898,7 @@ def _normalize_lexical_values(
             if (
                 isinstance(expression.slice, ast.Slice)
                 and base_attributes.get("aggregate_kind") in {
-                    "list", "set", "frozenset", "tuple", "array",
+                    "list", "set", "frozenset", "tuple", "array", "bytes",
                 }
             ):
                 # A sequence slice preserves the declared row contract.  In
@@ -13923,9 +13923,16 @@ def _normalize_lexical_values(
                     "sequence_column_count": int(base_attributes.get(
                         "sequence_column_count", 1
                     )),
-                    "sequence_writable": bool(base_attributes.get(
-                        "sequence_writable", True
-                    )),
+                    # A bytes slice is a fresh destination filled by the
+                    # incumbent clipped-append helper. The authored packet
+                    # remains read-only; its new result needs writable
+                    # construction storage, as the existing str slice does.
+                    "sequence_writable": (
+                        True if base_attributes["aggregate_kind"] == "bytes"
+                        else bool(base_attributes.get(
+                            "sequence_writable", True
+                        ))
+                    ),
                 })
                 for field in (
                     "sequence_element_dtypes",
@@ -13937,6 +13944,28 @@ def _normalize_lexical_values(
                 ):
                     if field in base_attributes:
                         projected[field] = base_attributes[field]
+                if (
+                    base_attributes["aggregate_kind"] == "bytes"
+                    and isinstance(base_class_fact, tuple)
+                    and base_class_fact
+                    and _canonical_source_class_identity(
+                        base_class_fact[0]
+                    ) == "builtins.bytes"
+                    and base_class_cell is not None
+                ):
+                    # _split's packet[:at] is a fresh byte sequence. Its
+                    # class follows the exact packet class and this indexed
+                    # source identity; no host payload or slice-ID spelling
+                    # supplies the result type.
+                    projected["result_class_ref"] = "bytes"
+                    _concord_source_value_class(
+                        value_class_scope, int(node_id), "builtins.bytes",
+                        source="authored bytes slice",
+                        provenance=_Derived((
+                            base_class_cell,
+                            node_identity_cell(graph, int(node_id)),
+                        )),
+                    )
             if (
                 isinstance(expression.slice, ast.Slice)
                 and isinstance(base_class_fact, tuple)
