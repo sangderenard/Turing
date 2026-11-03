@@ -47882,7 +47882,26 @@ def _class_surface_ssa_program(
                 caller_sequence = caller_result_sequences.by_id(
                     int(caller_result_id)
                 )
-                if callee_sequence is None and callee_result_sequences is not None:
+                # Unit 3 append_decimal_integer_glyphs calls the linked
+                # decimal_digit_glyph_token at source value 114. Its result
+                # is scalar and the callee's empty SSASequenceTable is not
+                # a storage candidate. Only a caller result with a resident
+                # sequence descriptor demands this correlation. A linked
+                # sequence whose returned alias still needs a source-body
+                # chase must refuse below instead of treating a cut body as
+                # an identity or silently dropping its storage binding.
+                if caller_sequence is None or callee_result_sequences is None:
+                    continue
+                if callee_sequence is None and not callee_result_sequences.sequences:
+                    continue
+                if callee_sequence is None:
+                    if child_graph is None:
+                        raise ValueError(
+                            "linked_sequence_return_storage_unproven: "
+                            f"callee={callee_symbol!r} result={int(callee_result_id)} "
+                            "has no direct sequence descriptor and its "
+                            "retained source storage edge is absent"
+                        )
                     # ``out = [0] * count; while ...: out[i] = ...; return
                     # count, out`` returns the loop's version of ``out``: the
                     # same storage as its birth (loop result -> store ->

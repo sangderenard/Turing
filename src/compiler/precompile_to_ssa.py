@@ -19574,10 +19574,40 @@ class _ControlSSABuilder(TiledObject):
                     conditional.predicate_expression
                 )
                 if conditional.predicate_expression is not None
-                else self.external_value(
-                    conditional.predicate_value_id, dtype="bool"
-                )
+                else self.external_value(conditional.predicate_value_id)
             )
+            if (
+                conditional.predicate_expression is None
+                and str(predicate.dtype) in self._NUMERIC_CLASS
+                and str(predicate.dtype) != "bool"
+                and not tuple(predicate.shape or ())
+            ):
+                # Program: octet_lz._header, ``low, value = ...; if not
+                # value: break``. The old bool dtype demand cloned graph
+                # value 6 and rebound it away from the emitted int64 Load;
+                # the break edge then read a non-dominating clone. A scalar
+                # truth test is a separate result and keeps the source value's
+                # exact binding for the loop exit.
+                resident = predicate
+                zero = self.constant_value(
+                    0, resident, dtype=str(resident.dtype),
+                )
+                predicate = self.fresh_value(
+                    dtype="bool", transform=CONTROL_PREDICATE,
+                    operands=(
+                        resident, zero,
+                        self._construct_cell(conditional.source_node_id),
+                    ),
+                )
+                self.emit(
+                    Handler.Ne, [resident, zero], predicate,
+                    attributes={
+                        "binding": "scalar_truthiness",
+                        "source_value_id": int(
+                            conditional.predicate_value_id
+                        ),
+                    },
+                )
         true_block = self.new_block("if_true")
         false_block = self.new_block("if_false")
         merge_block = self.new_block("if_merge")

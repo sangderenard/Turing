@@ -7218,9 +7218,28 @@ def _accepted_physical_output_paths(
 
     from .structural_concordance import aggregate_return_layouts, optional_return_members
     from .ssa_record_return_state import record_return_layouts
+    from .fortran_c_shell import _concordant_function_aliases
+    from .identity_concordance import begin_identity_book, end_identity_book
 
     recorded_aggregates = aggregate_return_layouts(function, book=book)
-    resolved = dict(paths)
+    # _read_header's authored return uses counter13, while its accepted
+    # control output is Phi43. OUTPUT_IDENTITY already records 13 -> 43;
+    # value_aliases alone is a storage-stage view and omitted that return
+    # history, so unit0 incorrectly reported a native result-layout mismatch.
+    # Read the existing checked planning/output ledger from this module's
+    # owned book before publishing the native paths.
+    token = None
+    if book is not None:
+        _owner, token = begin_identity_book(book)
+    try:
+        aliases = _concordant_function_aliases(
+            function, include_output_identities=True,
+        )
+    finally:
+        if token is not None:
+            end_identity_book(token)
+    resolved = {path: aliases.get(int(value), int(value))
+                for path, value in paths.items()}
     if len(resolved) == 1:
         _path, authored_id = next(iter(resolved.items()))
         record_layout = record_return_layouts(function, book=book).get(int(authored_id))
@@ -7812,14 +7831,6 @@ def _compile_resolved_process_graph_unit_impl(
                 # owns their physical values. Reject an unproved identity seam.
                 slots = sites[0] if sites and all(site == sites[0] for site in sites) else source_ids
                 paths = _authored_output_paths(source, slots)
-                aliases = dict(function.metadata.get("value_aliases", {}))
-                def accepted_id(value_id):
-                    visited = set()
-                    while value_id in aliases and value_id not in visited:
-                        visited.add(value_id)
-                        value_id = int(aliases[value_id])
-                    return value_id
-                paths = {path: accepted_id(value_id) for path, value_id in paths.items()}
                 kinds = set((source.G.graph.get("return_container_kinds") or {}).values())
                 kind = next(iter(kinds)) if len(kinds) == 1 else None
                 paths, kind = _accepted_physical_output_paths(
