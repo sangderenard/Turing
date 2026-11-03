@@ -184,7 +184,7 @@ class _FunctionImporter:
         arguments = []
         for argument in self.llvm_function.arguments:
             value = self.fresh(
-                _layout_dtype(argument.type), "argument", str(argument.name),
+                _layout_dtype(argument.type), "argument", str(argument),
             )
             self.values[self._value_key(argument)] = value
             arguments.append(value)
@@ -545,7 +545,7 @@ def import_llvm_to_repository_ssa(
                 origins: dict[int, tuple[int, str, str]] = {}
                 for argument in llvm_function.arguments:
                     origins[next_value_id] = (
-                        len(origins), "argument", str(argument.name),
+                        len(origins), "argument", str(argument),
                     )
                     arguments.append(
                         SSAValue(next_value_id, dtype=_layout_dtype(argument.type))
@@ -660,11 +660,23 @@ def post_repository_kernel_identity(function: Any, book: Any = None) -> bool:
             # shell later delivers (4 type-disagreements per probe), so the
             # pointer's row stays unposted until the edge posts it.
             physical: dict[str, Any] = {}
-            if (
-                int(value_id) in formal_ids
-                and value.dtype not in (None, "", "unknown", "ptr")
-            ):
-                physical = {"storage": "scalar", "rank": 0}
+            if int(value_id) in formal_ids:
+                # Program: C topk_int64_dim. Wrong record: its pointer
+                # formals have pointee SSAValue.dtype int64/int32 after C
+                # registry import, so that resident dtype made them scalar
+                # rank-0. The exact LLVM argument declaration is the
+                # repository_kernel_value cell; only a declared non-pointer
+                # scalar supplies physical dtype, storage and rank here.
+                declaration = book.page(REPOSITORY_KERNEL_VALUE).cell(
+                    cell.row, cell.column,
+                )
+                llvm_type = declaration.text.partition(" ")[0]
+                layout = by_llvm_type(llvm_type)
+                if llvm_type != "ptr" and layout is not None:
+                    physical = {
+                        "physical_dtype": layout.name,
+                        "storage": "scalar", "rank": 0,
+                    }
             book.post(
                 SSA_VALUE, (scope, int(value_id)),
                 SSAValueFact(

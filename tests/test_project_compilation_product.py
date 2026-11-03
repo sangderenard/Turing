@@ -157,6 +157,33 @@ def test_record_return_layout_does_not_mask_a_published_disagreement():
 
 
 @pytest.mark.usefixtures("_fresh_compile_book")
+def test_native_output_path_reads_the_concorded_return_identity():
+    from src.compiler.fortran_c_shell import _publish_concorded_output_identities
+
+    function, book = _returning_function("read_header_return", 4, 13, 43)
+    _publish_concorded_output_identities(function, {13: 43})
+    assert function.metadata.get("value_aliases", {}) == {}
+    paths, kind = _accepted_physical_output_paths(
+        {(0,): 4, (1,): 13}, {4, 43}, function, "tuple", book=book,
+    )
+    assert paths == {(0,): 4, (1,): 43}
+    assert kind == "tuple"
+
+
+@pytest.mark.usefixtures("_fresh_compile_book")
+def test_native_output_path_rejects_a_forged_return_identity_snapshot():
+    from src.compiler.fortran_c_shell import _publish_concorded_output_identities
+
+    function, book = _returning_function("read_header_return", 4, 13, 43)
+    _publish_concorded_output_identities(function, {13: 43})
+    function.metadata["output_identity_aliases"] = ((13, 4),)
+    with pytest.raises(ValueError, match="output identity concordance disagreement"):
+        _accepted_physical_output_paths(
+            {(0,): 4, (1,): 13}, {4, 43}, function, "tuple", book=book,
+        )
+
+
+@pytest.mark.usefixtures("_fresh_compile_book")
 def test_optional_tuple_return_layout_expands_all_physical_leaf_receipts():
     from src.compiler.concordance_declarations import (
         OPTIONAL_VALUE_STRUCTURE, STRUCTURAL_CONCORDANCE,

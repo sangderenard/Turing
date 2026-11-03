@@ -21,6 +21,33 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-03 — broad scheduler in a focused linked-unit regression
+
+The agent was told to test the exact linked caller and callee units with a
+bounded fresh plan. Its first regression used a 32-node cap and asserted the
+entire seven-unit scheduler was clean, including injected formatter units
+outside the assigned reader. The agent chose that form for a compact fixture
+instead of selecting the two authored unit indices. It wasted one 38-second
+run on tile-cap failures and one 58-second run on unrelated formatter failures;
+neither result tested the reader. The fixture was rewritten to use a measured
+512-node bound and compile only the exact leaf and caller via
+`compile_resolved_process_graph_unit`; both focused cases then passed. The
+preventing constraint is to inspect the plan's authored unit indices and
+compile only the dependency edge under test.
+
+## 2026-11-03 — nested compiler instructions read after the predicate edit
+
+The agent was assigned the isolated `_header` break-edge repair and was required
+to read applicable `AGENTS.md` instructions before changing compiler files. It
+read the repository root instructions and `AGENT_OBSTINANCE.md`, but discovered
+and read `src/compiler/AGENTS.md` only after editing `precompile_to_ssa.py` and
+running focused tests. The omission came from checking only the root instruction
+path at the start. The nested file repeats the root's system-preservation and
+public-entry rules, so the edit needed no removal; the agent spent an extra
+read and compliance check after the edit and delayed its final report. Checking
+for nested `AGENTS.md` under the target directory before the first edit would
+have prevented the departure.
+
 ## 2026-11-03 — full concordance audit outside the signature slice
 
 The agent was assigned a bounded intrinsic-signature declaration bridge and
