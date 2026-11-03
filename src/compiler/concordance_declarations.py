@@ -4695,9 +4695,10 @@ NUMERICAL_SCHEMA_OPERAND = declare_page("numerical_schema_operand", (
 ), tuple)
 
 #: Numerical region extraction: an exact dtype keyword operand whose source
-#: literal proof resolves to the dtype of the consumer's posted shape state.
-#: The operand snapshot, literal proofs, shape state, and both identities are
-#: direct causes.  The fact is ``(literal proof refs, normalized dtype)``.
+#: literal proof resolves to the consumer's settled PLAN_REGION_VALUE_DTYPE.
+#: The operand snapshot, literal proofs, settled dtype cell, and both value
+#: identities are direct causes. Geometry need not be settled for this fact.
+#: The fact is ``(literal proof refs, normalized dtype)``.
 NUMERICAL_DTYPE_OPERAND = declare_page("numerical_dtype_operand", (
     RowField("consumer", K.PAGE_REF), RowField("role", K.LABEL),
     RowField("parent", K.PAGE_REF),

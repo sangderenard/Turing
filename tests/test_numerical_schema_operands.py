@@ -172,3 +172,46 @@ def test_unrolled_cast_uses_the_cloned_literal_cell():
             for source, _stage in book.edges_into(literal_cell))
         for row in rows
     ), "the cast must consume a copied literal fact, not only authored literals"
+
+
+def test_record_cast_target_type_does_not_require_settled_reshape_geometry():
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {"Pack": {"identity": "Pack", "fields": {
+            "valid": {"storage": "span", "dtype": "bool", "rank": 2},
+            "max_bits": {"storage": "scalar", "dtype": "int64", "rank": 0},
+        }}},
+        "bindings": [{"function": "root", "parameter": "pack", "record": "Pack"}],
+        "values": [],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        "class Pack:\n"
+        "    valid: AbstractTensor\n"
+        "    max_bits: int\n"
+        "def root(pack: Pack):\n"
+        "    valid = pack.valid.reshape(-1, pack.max_bits)\n"
+        "    return valid.to_dtype('int64')\n",
+        "root", python_bindings={"AbstractTensor": AbstractTensor},
+        name="record_cast_target_type", extraction_contract=policy,
+        progress=lambda _: None, progress_bars=False,
+    )
+    from src.compiler.concordance_declarations import (
+        NUMERICAL_DTYPE_OPERAND, PLAN_REGION_VALUE_DTYPE,
+    )
+    from src.compiler.identity_concordance import CorrelationTable
+
+    book = module.metadata["identity_book"]
+    assert CorrelationTable._numerical_dtype_operand_findings(module) == []
+    rows = tuple(book.page(NUMERICAL_DTYPE_OPERAND).rows())
+    assert rows
+    for row in rows:
+        receipt = book.latest_ref(NUMERICAL_DTYPE_OPERAND, row)
+        type_cells = [cell for cell, _stage in book.edges_into(receipt)
+                      if cell.page == PLAN_REGION_VALUE_DTYPE]
+        assert len(type_cells) == 1
+        assert type_cells[0].row == row[0].row
+        assert book.page(PLAN_REGION_VALUE_DTYPE).cell(
+            type_cells[0].row, type_cells[0].column
+        ) == "int64"

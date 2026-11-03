@@ -6394,10 +6394,10 @@ def _build_shell_hierarchy_plan(
                     from ..transmogrifier.dtype_layout import resolve
                     from .concordance_declarations import (
                         NUMERICAL_DTYPE_OPERAND, PLANNER_HIERARCHY,
+                        PLAN_REGION_VALUE_DTYPE,
                     )
                     from .identity_concordance import (
-                        Derived, Mode, SHAPE_STATE_PAGE,
-                        current_identity_book, shape_scope_of,
+                        Derived, Mode, current_identity_book,
                     )
                     from ..common.tensors.topological_reducer import node_identity_cell
                     from .process_graph_facts import operands
@@ -6407,12 +6407,8 @@ def _build_shell_hierarchy_plan(
                         resolve(dtype_literal)
                         if isinstance(dtype_literal, str) else None
                     )
-                    descriptor = planned_descriptor(int(node_id))
-                    result_layout = resolve((descriptor or {}).get("dtype"))
                     if (
                         target_layout is not None and literal_cells
-                        and result_layout is not None
-                        and target_layout.name == result_layout.name
                     ):
                         # compact_codewords' to_dtype("int64") was classified
                         # numerical, yet its metadata spelling became Const25
@@ -6420,28 +6416,38 @@ def _build_shell_hierarchy_plan(
                         # exact literal into the incumbent dtype attribute;
                         # retain the authored source edge and its proof.
                         dtype_book = current_identity_book()
-                        shape_cell = dtype_book.latest_ref(
-                            SHAPE_STATE_PAGE,
-                            (shape_scope_of(graph), int(node_id)),
+                        consumer_cell = node_identity_cell(graph, int(node_id))
+                        parent_cell = node_identity_cell(graph, parent)
+                        edge_facts, edge_cell = operands(graph, int(node_id))
+                        if (parent_cell, str(role)) not in edge_facts:
+                            raise ValueError("dtype metadata has no exact source edge")
+                        # A cast's explicit target type is independent of its
+                        # geometry. compact_codewords' dynamic record reshape
+                        # invalidated shape26, which wrongly kept this literal
+                        # in the runtime ABI despite its known int64 target.
+                        type_causes = (consumer_cell, parent_cell, edge_cell,
+                                       *literal_cells)
+                        _post_region_value_obligation(graph, int(node_id))
+                        _settle_region_value_obligation(
+                            graph, int(node_id), target_layout.name, type_causes,
                         )
-                        if shape_cell is not None:
-                            consumer_cell = node_identity_cell(graph, int(node_id))
-                            parent_cell = node_identity_cell(graph, parent)
-                            edge_facts, edge_cell = operands(graph, int(node_id))
-                            if (parent_cell, str(role)) not in edge_facts:
-                                raise ValueError("dtype metadata has no exact source edge")
-                            receipt_row = (consumer_cell, str(role), parent_cell)
-                            receipt = (tuple(literal_cells), target_layout.name)
-                            if dtype_book.page(NUMERICAL_DTYPE_OPERAND).latest(receipt_row) != receipt:
-                                dtype_book.post(
-                                    NUMERICAL_DTYPE_OPERAND, receipt_row, receipt,
-                                    stage=PLANNER_HIERARCHY,
-                                    provenance=Derived((consumer_cell, parent_cell,
-                                        edge_cell, *literal_cells, shape_cell)),
-                                    mode=Mode.CONCORD,
-                                )
-                            numerical_dtype_metadata[int(node_id)] = target_layout.name
-                            continue
+                        type_row = _region_value_dtype_row(
+                            graph, int(node_id), mint=False,
+                        )
+                        if dtype_book.page(PLAN_REGION_VALUE_DTYPE).latest(type_row) != target_layout.name:
+                            raise ValueError("dtype metadata disagrees with settled output type")
+                        type_cell = dtype_book.latest_ref(PLAN_REGION_VALUE_DTYPE, type_row)
+                        receipt_row = (consumer_cell, str(role), parent_cell)
+                        receipt = (tuple(literal_cells), target_layout.name)
+                        if dtype_book.page(NUMERICAL_DTYPE_OPERAND).latest(receipt_row) != receipt:
+                            dtype_book.post(
+                                NUMERICAL_DTYPE_OPERAND, receipt_row, receipt,
+                                stage=PLANNER_HIERARCHY,
+                                provenance=Derived((*type_causes, type_cell)),
+                                mode=Mode.CONCORD,
+                            )
+                        numerical_dtype_metadata[int(node_id)] = target_layout.name
+                        continue
                 identity_row = attributes.get("source_python_identity_row")
                 if identity_row is not None:
                     from .concordance_declarations import (

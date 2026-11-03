@@ -6480,7 +6480,8 @@ class CorrelationTable:
         """Check an omitted dtype operand against its exact literal and output."""
 
         from .concordance_declarations import (
-            NUMERICAL_DTYPE_OPERAND, PROCESS_GRAPH_OPERANDS,
+            NUMERICAL_DTYPE_OPERAND, PLAN_REGION_VALUE_DTYPE,
+            PROCESS_GRAPH_OPERANDS,
             PROVEN_LITERAL, SOURCE_LITERAL_VALUE, SYNCHRONIZATION_LITERAL,
         )
         from ..transmogrifier.dtype_layout import resolve as resolve_dtype
@@ -6512,10 +6513,10 @@ class CorrelationTable:
                 causes = {source for source, _stage in book.edges_into(receipt)}
                 operands = tuple(source for source in causes
                                  if source.page == PROCESS_GRAPH_OPERANDS)
-                states = tuple(source for source in causes
-                               if source.page == SHAPE_STATE_PAGE)
+                dtype_cells = tuple(source for source in causes
+                                    if source.page == PLAN_REGION_VALUE_DTYPE)
                 valid = (
-                    len(operands) == 1 and len(states) == 1
+                    len(operands) == 1 and len(dtype_cells) == 1
                     and {consumer, parent, *literal_cells} <= causes
                     and (parent, role) in book.page(PROCESS_GRAPH_OPERANDS).cell(
                         operands[0].row, operands[0].column,
@@ -6525,25 +6526,14 @@ class CorrelationTable:
                     }
                 )
             if valid:
-                state = book.page(SHAPE_STATE_PAGE).cell(
-                    states[0].row, states[0].column,
-                )
-                state_edges = tuple(
-                    source for source, _stage in book.edges_into(states[0])
-                    if source.page == SHAPE_EDGE_PAGE
+                settled_dtype = book.page(PLAN_REGION_VALUE_DTYPE).cell(
+                    dtype_cells[0].row, dtype_cells[0].column,
                 )
                 valid = (
-                    isinstance(state, tuple) and len(state) == 3
-                    and state[0] == "resolved"
-                    and isinstance(state[1], tuple) and len(state[1]) == 5
-                    and state[1][1] == dtype
-                    and len(state_edges) == 1
-                    and state_edges[0].row == state[2]
-                    and tuple(state_edges[0].row[:2]) == states[0].row
-                    and _canonical_identity_base(book, consumer) in {
-                        _canonical_identity_base(book, source)
-                        for source, _stage in book.edges_into(state_edges[0])
-                        if source.page == consumer.page
+                    dtype_cells[0].row == consumer.row
+                    and settled_dtype == dtype
+                    and consumer in {
+                        source for source, _stage in book.edges_into(dtype_cells[0])
                     }
                 )
             if valid:
@@ -6573,7 +6563,7 @@ class CorrelationTable:
                 found.append(Finding(
                     "numerical-dtype-operand", str(row), None,
                     "numerical dtype operand lacks exact source literal, "
-                    "operand edge, or matching output shape state",
+                    "operand edge, or matching settled output dtype",
                 ))
         return found
 
