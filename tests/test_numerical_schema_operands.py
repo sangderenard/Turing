@@ -1,6 +1,7 @@
 """Schema identities remain source evidence outside numerical region ABIs."""
 
 from pathlib import Path
+import pytest
 
 from src.common.tensors.abstraction import AbstractTensor
 from src.compiler.extraction_contract import ExtractionContract
@@ -80,3 +81,58 @@ def test_arange_schema_class_operand_has_no_runtime_dtype_requirement():
         assert findings[0].kind == "numerical-schema-operand"
     finally:
         end_identity_book(token)
+
+
+@pytest.mark.parametrize("target", ["int64", "float64", "bool"])
+def test_cast_dtype_literal_is_projected_into_operation_metadata(target):
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {}, "bindings": [],
+        "values": [{"function": "root", "parameter": "values",
+                    "storage": "span", "dtype": "bool", "rank": 1,
+                    "python_type": "src.common.tensors.abstraction.AbstractTensor"}],
+    })
+    module, _outputs, _exports = lower_ast_source_to_ssa(
+        f"def root(values):\n    return values.to_dtype({target!r})\n",
+        "root", name=f"cast_metadata_{target}", extraction_contract=policy,
+        progress=lambda _: None, progress_bars=False,
+    )
+    from src.compiler.concordance_declarations import NUMERICAL_DTYPE_OPERAND
+    from src.compiler.identity_concordance import CorrelationTable
+
+    book = module.metadata["identity_book"]
+    rows = tuple(book.page(NUMERICAL_DTYPE_OPERAND).rows())
+    assert rows
+    assert all(book.page(NUMERICAL_DTYPE_OPERAND).latest(row)[1] == target
+               for row in rows)
+    assert CorrelationTable._numerical_dtype_operand_findings(module) == []
+    instructions = [
+        instruction for function in module.functions.values()
+        for block in function.blocks.values() for instruction in block.instrs
+    ]
+    assert not any(
+        str(instruction.op).casefold() == "const"
+        and instruction.attributes.get("value") == target
+        for instruction in instructions
+    )
+    casts = [instruction for instruction in instructions
+             if str(instruction.op).casefold() == "to_dtype"]
+    assert casts
+    assert all(len(instruction.args) == 1
+               and instruction.attributes["dtype"] == target
+               for instruction in casts)
+    from src.compiler.identity_concordance import Derived, Mode
+    from src.compiler.concordance_declarations import PLANNER_HIERARCHY
+
+    row = rows[0]
+    receipt = book.latest_ref(NUMERICAL_DTYPE_OPERAND, row)
+    literal_cells, _dtype = book.page(NUMERICAL_DTYPE_OPERAND).latest(row)
+    sources = tuple(source for source, _stage in book.edges_into(receipt))
+    book.post(
+        NUMERICAL_DTYPE_OPERAND, row,
+        (literal_cells, "float32"), stage=PLANNER_HIERARCHY,
+        provenance=Derived((*sources, receipt)), mode=Mode.REVISE,
+    )
+    assert len(CorrelationTable._numerical_dtype_operand_findings(module)) == 1

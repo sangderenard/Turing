@@ -1566,6 +1566,7 @@ class CorrelationTable:
         found.extend(self._source_parameter_identity_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._numerical_schema_operand_findings(module))
+        found.extend(self._numerical_dtype_operand_findings(module))
         found.extend(self._source_numeric_component_findings(module))
         found.extend(self._source_numeric_specialization_findings(module))
         found.extend(self._source_numeric_intrinsic_findings(module))
@@ -6471,6 +6472,108 @@ class CorrelationTable:
                     "numerical-schema-operand", str(row), None,
                     "numerical ABI exclusion lacks its exact source schema "
                     "identity and operand edge",
+                ))
+        return found
+
+    @staticmethod
+    def _numerical_dtype_operand_findings(module: Any) -> list[Finding]:
+        """Check an omitted dtype operand against its exact literal and output."""
+
+        from .concordance_declarations import (
+            NUMERICAL_DTYPE_OPERAND, PROCESS_GRAPH_OPERANDS,
+            PROVEN_LITERAL, SOURCE_LITERAL_VALUE, SYNCHRONIZATION_LITERAL,
+        )
+        from ..transmogrifier.dtype_layout import resolve as resolve_dtype
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(NUMERICAL_DTYPE_OPERAND)
+        for row in page.rows():
+            receipt = book.latest_ref(NUMERICAL_DTYPE_OPERAND, row)
+            fact = page.latest(row)
+            valid = (
+                isinstance(row, tuple) and len(row) == 3
+                and isinstance(fact, tuple) and len(fact) == 2
+            )
+            if valid:
+                consumer, role, parent = row
+                literal_cells, dtype = fact
+                valid = (
+                    isinstance(consumer, Ref) and isinstance(parent, Ref)
+                    and isinstance(role, str) and isinstance(dtype, str)
+                    and isinstance(literal_cells, tuple) and bool(literal_cells)
+                    and all(isinstance(cell, Ref) for cell in literal_cells)
+                    and resolve_dtype(dtype) is not None
+                    and resolve_dtype(dtype).name == dtype
+                )
+            if valid:
+                causes = {source for source, _stage in book.edges_into(receipt)}
+                operands = tuple(source for source in causes
+                                 if source.page == PROCESS_GRAPH_OPERANDS)
+                states = tuple(source for source in causes
+                               if source.page == SHAPE_STATE_PAGE)
+                valid = (
+                    len(operands) == 1 and len(states) == 1
+                    and {consumer, parent, *literal_cells} <= causes
+                    and (parent, role) in book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operands[0].row, operands[0].column,
+                    )
+                    and consumer in {
+                        source for source, _stage in book.edges_into(operands[0])
+                    }
+                )
+            if valid:
+                state = book.page(SHAPE_STATE_PAGE).cell(
+                    states[0].row, states[0].column,
+                )
+                state_edges = tuple(
+                    source for source, _stage in book.edges_into(states[0])
+                    if source.page == SHAPE_EDGE_PAGE
+                )
+                valid = (
+                    isinstance(state, tuple) and len(state) == 3
+                    and state[0] == "resolved"
+                    and isinstance(state[1], tuple) and len(state[1]) == 5
+                    and state[1][1] == dtype
+                    and len(state_edges) == 1
+                    and state_edges[0].row == state[2]
+                    and tuple(state_edges[0].row[:2]) == states[0].row
+                    and _canonical_identity_base(book, consumer) in {
+                        _canonical_identity_base(book, source)
+                        for source, _stage in book.edges_into(state_edges[0])
+                        if source.page == consumer.page
+                    }
+                )
+            if valid:
+                admitted = {SOURCE_LITERAL_VALUE, PROVEN_LITERAL,
+                            SYNCHRONIZATION_LITERAL}
+                for literal_cell in literal_cells:
+                    if literal_cell.page not in admitted:
+                        valid = False
+                        break
+                    literal = book.page(literal_cell.page).cell(
+                        literal_cell.row, literal_cell.column,
+                    )
+                    if literal_cell.page == SYNCHRONIZATION_LITERAL:
+                        literal = literal[2] if isinstance(literal, tuple) and len(literal) == 3 else None
+                    layout = resolve_dtype(literal) if isinstance(literal, str) else None
+                    if layout is None or layout.name != dtype:
+                        valid = False
+                        break
+                    if _canonical_identity_base(book, parent) not in {
+                        _canonical_identity_base(book, source)
+                        for source, _stage in book.edges_into(literal_cell)
+                        if source.page == parent.page
+                    }:
+                        valid = False
+                        break
+            if not valid:
+                found.append(Finding(
+                    "numerical-dtype-operand", str(row), None,
+                    "numerical dtype operand lacks exact source literal, "
+                    "operand edge, or matching output shape state",
                 ))
         return found
 

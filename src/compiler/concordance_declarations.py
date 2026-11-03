@@ -4694,6 +4694,15 @@ NUMERICAL_SCHEMA_OPERAND = declare_page("numerical_schema_operand", (
     RowField("parent", K.PAGE_REF),
 ), tuple)
 
+#: Numerical region extraction: an exact dtype keyword operand whose source
+#: literal proof resolves to the dtype of the consumer's posted shape state.
+#: The operand snapshot, literal proofs, shape state, and both identities are
+#: direct causes.  The fact is ``(literal proof refs, normalized dtype)``.
+NUMERICAL_DTYPE_OPERAND = declare_page("numerical_dtype_operand", (
+    RowField("consumer", K.PAGE_REF), RowField("role", K.LABEL),
+    RowField("parent", K.PAGE_REF),
+), tuple)
+
 # -- the reducer's numeric source facts, one row per (numeric scope, node) ---
 #: ``_concord_source_precision_boundary``: an authored Precision boundary,
 #: ``(numeric scope, value)`` -> ``(boundary kind, operand, limbs)``, CONCORD,

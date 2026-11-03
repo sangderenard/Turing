@@ -6345,6 +6345,7 @@ def _build_shell_hierarchy_plan(
             if value_id not in carried_initial_boundaries
         )
         region_node_set = set(region_nodes)
+        numerical_dtype_metadata = {}
 
         def numerical_region_parents(
             node_id: int,
@@ -6383,6 +6384,64 @@ def _build_shell_hierarchy_plan(
                     continue
                 parent_data = graph.G.nodes.get(parent, {})
                 attributes = parent_data.get("attributes") or {}
+                if (
+                    (operation.casefold() in _DTYPE_CAST_OPERATIONS
+                     and str(role) in {"arg:0", "kw:dtype", "dtype"})
+                    or (operation in abstract_tensor_funcs
+                        and str(role) == "kw:dtype")
+                ):
+                    from .concorded_literals import literal
+                    from ..transmogrifier.dtype_layout import resolve
+                    from .concordance_declarations import (
+                        NUMERICAL_DTYPE_OPERAND, PLANNER_HIERARCHY,
+                    )
+                    from .identity_concordance import (
+                        Derived, Mode, SHAPE_STATE_PAGE,
+                        current_identity_book, shape_scope_of,
+                    )
+                    from ..common.tensors.topological_reducer import node_identity_cell
+                    from .process_graph_facts import operands
+
+                    dtype_literal, literal_cells = literal(graph, parent)
+                    target_layout = (
+                        resolve(dtype_literal)
+                        if isinstance(dtype_literal, str) else None
+                    )
+                    descriptor = planned_descriptor(int(node_id))
+                    result_layout = resolve((descriptor or {}).get("dtype"))
+                    if (
+                        target_layout is not None and literal_cells
+                        and result_layout is not None
+                        and target_layout.name == result_layout.name
+                    ):
+                        # compact_codewords' to_dtype("int64") was classified
+                        # numerical, yet its metadata spelling became Const25
+                        # and then an untyped runtime operand. Project the
+                        # exact literal into the incumbent dtype attribute;
+                        # retain the authored source edge and its proof.
+                        dtype_book = current_identity_book()
+                        shape_cell = dtype_book.latest_ref(
+                            SHAPE_STATE_PAGE,
+                            (shape_scope_of(graph), int(node_id)),
+                        )
+                        if shape_cell is not None:
+                            consumer_cell = node_identity_cell(graph, int(node_id))
+                            parent_cell = node_identity_cell(graph, parent)
+                            edge_facts, edge_cell = operands(graph, int(node_id))
+                            if (parent_cell, str(role)) not in edge_facts:
+                                raise ValueError("dtype metadata has no exact source edge")
+                            receipt_row = (consumer_cell, str(role), parent_cell)
+                            receipt = (tuple(literal_cells), target_layout.name)
+                            if dtype_book.page(NUMERICAL_DTYPE_OPERAND).latest(receipt_row) != receipt:
+                                dtype_book.post(
+                                    NUMERICAL_DTYPE_OPERAND, receipt_row, receipt,
+                                    stage=PLANNER_HIERARCHY,
+                                    provenance=Derived((consumer_cell, parent_cell,
+                                        edge_cell, *literal_cells, shape_cell)),
+                                    mode=Mode.CONCORD,
+                                )
+                            numerical_dtype_metadata[int(node_id)] = target_layout.name
+                            continue
                 identity_row = attributes.get("source_python_identity_row")
                 if identity_row is not None:
                     from .concordance_declarations import (
@@ -6703,6 +6762,8 @@ def _build_shell_hierarchy_plan(
             parents = numerical_region_parents(value)
             opcode = str(node_data.get("op") or node_data.get("type"))
             line_attributes = dict(node_data.get("attributes") or {})
+            if int(value) in numerical_dtype_metadata:
+                line_attributes["dtype"] = numerical_dtype_metadata[int(value)]
             if (
                 isinstance(expression, ast.Attribute)
                 or (
@@ -6798,7 +6859,7 @@ def _build_shell_hierarchy_plan(
                 attributes={"value": value, "region": region_index},
             ))
         for value in region_nodes:
-            for parent, _role in (graph.G.nodes[value].get("parents") or ()):
+            for parent, _role in numerical_region_parents(value):
                 parent = int(parent)
                 if (
                     parent in produced
@@ -26484,7 +26545,15 @@ def _tensor_descriptor(
                     if operand_cell is not None and operand_cell not in operand_cells:
                         operand_cells.append(operand_cell)
                 for _source_node, source_value, source_role in semantic_sources:
-                    edge_source_cells = source_cells or tuple(operand_cells)
+                    # compact_codewords' to_dtype result had an int64 shape
+                    # state whose causes named only its operands. The region
+                    # metadata audit could not prove that state belonged to
+                    # this result across lexical forks. A transformation owns
+                    # its exact output identity as well as its input causes.
+                    edge_source_cells = tuple(dict.fromkeys((
+                        *(source_cells or tuple(operand_cells)),
+                        _descriptor_source_cell(graph, int(node_id)),
+                    )))
                     record_shape_transformation(
                         row[0], source_value, row[0], row[1],
                         stage="graph_tensor_descriptor",
