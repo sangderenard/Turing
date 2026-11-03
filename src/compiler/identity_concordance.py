@@ -6865,6 +6865,15 @@ class CorrelationTable:
             SOURCE_PARAMETER_DEFAULT, PROCESS_GRAPH_OPERANDS,
             SSA_VALUE, SpecializationFact, SpecializationSource,
         )
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        declarations = book.page(NUMERICAL_CONSTRUCTOR_CODE_REFERENCE)
+        page = book.page(NUMERICAL_CONSTRUCTOR_DEFAULT)
+        if not tuple(declarations.rows()) and not tuple(page.rows()):
+            return found
+
         from .numerical_constructor_defaults import _stored_output_values
         from .concorded_literals import origin_cell
         from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import (
@@ -6872,12 +6881,7 @@ class CorrelationTable:
         )
         from .ssa_record_return_state import function_scope_of
 
-        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
-        if book is None:
-            return []
-        found: list[Finding] = []
         code_reference = c_backend_repository_ssa_reference()
-        declarations = book.page(NUMERICAL_CONSTRUCTOR_CODE_REFERENCE)
         for row in declarations.rows():
             cell = book.latest_ref(NUMERICAL_CONSTRUCTOR_CODE_REFERENCE, row)
             fact = declarations.latest(row)
@@ -6896,7 +6900,6 @@ class CorrelationTable:
                     "numerical-constructor-code-reference", str(row), None,
                     "constructor operation lacks its exact repository SSA entrypoint",
                 ))
-        page = book.page(NUMERICAL_CONSTRUCTOR_DEFAULT)
         for row in page.rows():
             receipt = book.latest_ref(NUMERICAL_CONSTRUCTOR_DEFAULT, row)
             fact = page.latest(row)

@@ -14,7 +14,27 @@ from src.compiler.concordance_declarations import (
 )
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
-from src.compiler.identity_concordance import CorrelationTable, current_identity_book
+from src.compiler.identity_concordance import (
+    CorrelationTable,
+    IdentityBook,
+    current_identity_book,
+)
+
+
+def test_empty_constructor_pages_do_not_load_native_ssa(monkeypatch):
+    from src.common.tensors.accelerator_backends import c_backend_llvm_ssa
+
+    def unexpected_reference():
+        raise AssertionError("empty constructor pages do not require native SSA")
+
+    monkeypatch.setattr(
+        c_backend_llvm_ssa,
+        "c_backend_repository_ssa_reference",
+        unexpected_reference,
+    )
+    module = SimpleNamespace(metadata={"identity_book": IdentityBook()})
+
+    assert CorrelationTable._numerical_constructor_default_findings(module) == []
 
 
 @pytest.mark.parametrize(("call", "expected"), [
@@ -22,11 +42,25 @@ from src.compiler.identity_concordance import CorrelationTable, current_identity
     ("AbstractTensor.zeros((count,), dtype='float64', cls=type(like))", None),
 ])
 def test_native_constructor_default_at_real_source_region(monkeypatch, call, expected):
+    from src.common.tensors.accelerator_backends import c_backend_llvm_ssa
+
     class ReachedZerosRegion(Exception):
         pass
 
     observed = []
+    reference_loads = []
+    original_reference = c_backend_llvm_ssa.c_backend_repository_ssa_reference
     original = hierarchical_plan.plan_region_to_ssa_instrs
+
+    def observe_reference():
+        reference_loads.append(True)
+        return original_reference()
+
+    monkeypatch.setattr(
+        c_backend_llvm_ssa,
+        "c_backend_repository_ssa_reference",
+        observe_reference,
+    )
 
     def inspect_region(region, **kwargs):
         if any(getattr(item, "opcode", None) == "zeros"
@@ -106,3 +140,4 @@ def test_native_constructor_default_at_real_source_region(monkeypatch, call, exp
         )
     assert len(observed) == 1
     assert bool(observed[0]) is bool(expected)
+    assert bool(reference_loads) is bool(expected)
