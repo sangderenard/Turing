@@ -215,3 +215,41 @@ def test_record_cast_target_type_does_not_require_settled_reshape_geometry():
         assert book.page(PLAN_REGION_VALUE_DTYPE).cell(
             type_cells[0].row, type_cells[0].column
         ) == "int64"
+
+
+def test_dynamic_constructor_region_reads_its_settled_explicit_dtype(monkeypatch):
+    from src.compiler import hierarchical_plan
+
+    class ObservedConstructorRegion(Exception):
+        pass
+
+    original = hierarchical_plan.plan_region_to_ssa_instrs
+
+    def inspect_region(region, **kwargs):
+        constructors = [item for item in region.items
+                        if getattr(item, "opcode", None) == "zeros"]
+        if constructors:
+            result_id = constructors[0].outputs[0]
+            assert (result_id, (), "float64") in region.value_shapes
+            assert dict(constructors[0].attributes)["dtype"] == "float64"
+            raise ObservedConstructorRegion
+        return original(region, **kwargs)
+
+    monkeypatch.setattr(hierarchical_plan, "plan_region_to_ssa_instrs", inspect_region)
+    policy = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "records": {}, "bindings": [],
+        "values": [{"function": "root", "parameter": "like",
+                    "storage": "span", "dtype": "int64", "rank": 1,
+                    "python_type": "src.common.tensors.abstraction.AbstractTensor"}],
+    })
+    with pytest.raises(ObservedConstructorRegion):
+        lower_ast_source_to_ssa(
+            "def root(like, count: int):\n"
+            "    return AbstractTensor.zeros((count + 1,), cls=type(like), dtype='float64')\n",
+            "root", python_bindings={"AbstractTensor": AbstractTensor},
+            name="explicit_constructor_type_record", extraction_contract=policy,
+            progress=lambda _: None, progress_bars=False,
+        )

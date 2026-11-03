@@ -7694,6 +7694,26 @@ def _build_shell_hierarchy_plan(
             record = _value_shape_dtype(value_id)
             if record[2] is not None:
                 return record, _dtype_producer_cells(graph, int(value_id))
+            # zeros((runtime_count,), dtype="float64") already has its
+            # explicit target type on the book, even while its geometry is
+            # incomplete. Omitting that settled fact here left the constructor
+            # output absent from value_shapes and repeated the dtype refusal.
+            from .concordance_declarations import PLAN_REGION_VALUE_DTYPE
+            from .identity_concordance import current_identity_book
+
+            type_book = current_identity_book()
+            type_row = _region_value_dtype_row(graph, int(value_id), mint=False)
+            type_cell = (
+                type_book.latest_ref(PLAN_REGION_VALUE_DTYPE, type_row)
+                if type_row is not None else None
+            )
+            settled_dtype = (
+                type_book.page(PLAN_REGION_VALUE_DTYPE).cell(
+                    type_cell.row, type_cell.column,
+                ) if type_cell is not None else None
+            )
+            if isinstance(settled_dtype, str):
+                return (record[0], record[1], settled_dtype), (type_cell,)
             # Repository ``encode_octets`` value 65 is ``bytes(header)``.
             # Its graph node is a non-tensor Call, so ``declared`` above has
             # no local tensor/domain dtype; linked ABI settlement nevertheless
