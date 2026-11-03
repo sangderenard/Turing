@@ -1289,8 +1289,10 @@ class CModuleExecution:
     buffers: dict[int, Any]
     _pointers: Any = field(default=None, repr=False)
     _extents: Any = field(default=None, repr=False)
+    _capacity_buffers: dict[int, Any] = field(default_factory=dict, repr=False)
 
     def run(self) -> "CModuleExecution":
+        self.buffers.update(self._capacity_buffers)
         self.artifact.reset_validation_error()
         self.artifact.entry()(self._pointers, self._extents)
         validation_error = self.artifact.take_validation_error()
@@ -1305,6 +1307,15 @@ class CModuleExecution:
             from .external_functions import check_external_faults
 
             check_external_faults(self.artifact)
+        if self.artifact.output_length_sources or self.artifact.output_shape_sources:
+            from .runtime_abi import apply_native_result_extents
+
+            self.artifact.runtime_abi()
+            apply_native_result_extents(
+                self.buffers, self._capacity_buffers,
+                length_sources=self.artifact.output_length_sources,
+                shape_sources=self.artifact.output_shape_sources,
+            )
         return self
 
 
@@ -1350,6 +1361,12 @@ class CModuleArtifact:
     #: ``(output id, input id)``: a runtime-sized result whose extents are
     #: that public input's, axis for axis.  The caller allocates it so.
     output_extent_sources: tuple[tuple[int, int], ...] = ()
+    #: Physical output capacities and native-written logical extents are
+    #: separate identities: a byte slice reserves at most its input buffer,
+    #: while its returned length is written by the compiled slice helper.
+    output_capacity_sources: tuple[tuple[int, int], ...] = ()
+    output_length_sources: tuple[tuple[int, int], ...] = ()
+    output_shape_sources: tuple[tuple[int, int], ...] = ()
     #: Per public buffer: its rank (independent of any static shape) and its
     #: role (input / output / inout / other).  Read by ``runtime_abi``.
     buffer_ranks: tuple[int, ...] = ()
@@ -1401,7 +1418,7 @@ class CModuleArtifact:
 
         from .runtime_abi import runtime_abi_description
 
-        return runtime_abi_description(
+        description = runtime_abi_description(
             entry=self.name, backend="c", extent_type="int64_t",
             buffer_order=self.buffer_order, buffer_dtypes=self.buffer_dtypes,
             buffer_shapes=self.buffer_shapes or tuple(
@@ -1415,7 +1432,27 @@ class CModuleArtifact:
             ),
             extent_order=self.extent_order,
             output_extent_sources=self.output_extent_sources,
+            output_capacity_sources=self.output_capacity_sources,
+            output_length_sources=self.output_length_sources,
+            output_shape_sources=self.output_shape_sources,
         )
+        if (self.output_capacity_sources or self.output_length_sources
+                or self.output_shape_sources):
+            from .concordance_declarations import EMISSION_ARTIFACT, ArtifactPart, Backend
+            from .identity_concordance import ConcordanceRefusal
+
+            recorded = (None if self.emission is None else
+                        self.emission.book.page(EMISSION_ARTIFACT).latest(
+                            (self.name, Backend.C_MODULE, ArtifactPart.RUNTIME_ABI)))
+            import hashlib
+            payload = repr(description).encode("utf-8")
+            if (recorded is None or recorded.location != (description,)
+                    or recorded.sha256 != hashlib.sha256(payload).hexdigest()
+                    or recorded.byte_length != len(payload)):
+                raise ConcordanceRefusal(
+                    "computed output ABI disagrees with its emission concordance"
+                )
+        return description
 
     def write_layout_header(
         self, directory: str | Path,
@@ -1534,8 +1571,20 @@ class CModuleArtifact:
                 raise ValueError(f"native tile object digest changed: {path}")
             pool_sources.append(str(path))
         if self.needs_validation_runtime:
-            pool_sources.append(str(Path(__file__).resolve().parents[1] /
-                "common/tensors/accelerator_backends/c_backend/turing_validation_runtime.c"))
+            # The accepted _read_header -> _split module includes this
+            # runtime header. Linking the runtime .c alone did not make the
+            # declaration visible beside the generated source, so its DLL
+            # build failed before any native packet could be verified.
+            validation_home = Path(__file__).resolve().parents[1] / "common/tensors/accelerator_backends/c_backend"
+            validation_header_path = destination / "turing_validation_runtime.h"
+            validation_header = (validation_home / validation_header_path.name).read_text(encoding="utf-8")
+            validation_header_path.write_text(validation_header, encoding="utf-8")
+            if self.emission is not None:
+                layout_sources = (*layout_sources, (
+                    "validation_runtime_header", validation_header,
+                    validation_header_path, (self.emission.module_text,),
+                ))
+            pool_sources.append(str(validation_home / "turing_validation_runtime.c"))
         if link == "dynamic":
             # link against the pieces' own DLLs; their IR is not recompiled
             link_inputs, piece_dlls = self._dynamic_link_inputs()
@@ -1645,6 +1694,21 @@ class CModuleArtifact:
         }
         buffers: dict[int, Any] = {}
         shapes = self.buffer_shapes or tuple(() for _ in self.buffer_order)
+        ranks = self.buffer_ranks or tuple(len(shape) for shape in shapes)
+        if (self.output_capacity_sources or self.output_length_sources
+                or self.output_shape_sources):
+            self.runtime_abi()
+        for output_id, source_id in self.output_capacity_sources:
+            source = feed_values.get(int(source_id))
+            if source is None:
+                raise ValueError(
+                    f"output capacity {output_id} requires public input {source_id}"
+                )
+            capacity = tuple(np.atleast_1d(np.asarray(source)).shape)
+            declared = shape_overrides.get(int(output_id))
+            if declared is not None and declared != capacity:
+                raise ValueError("output capacity override disagrees with its proven input")
+            shape_overrides[int(output_id)] = capacity
         for output_id, source_id in self.output_extent_sources:
             if int(output_id) in shape_overrides:
                 continue
@@ -1655,13 +1719,17 @@ class CModuleArtifact:
                     f"from input {source_id}, which was not fed"
                 )
             shape_overrides[int(output_id)] = tuple(np.shape(source))
-        for value_id, dtype, shape in zip(
-            self.buffer_order, self.buffer_dtypes, shapes
+        for value_id, dtype, shape, rank in zip(
+            self.buffer_order, self.buffer_dtypes, shapes, ranks
         ):
             value_id = int(value_id)
             fed = feed_values.get(value_id)
             wanted = _numpy_dtype(dtype)
             if fed is None:
+                if rank > len(shape) and value_id not in shape_overrides:
+                    raise ValueError(
+                        f"runtime-sized buffer {value_id} requires a feed or proven allocation origin"
+                    )
                 runtime_shape = shape_overrides.get(value_id, tuple(shape or ()))
                 if not runtime_shape and not shape:
                     runtime_shape = (1,)
@@ -1701,6 +1769,12 @@ class CModuleArtifact:
             buffers=buffers,
             _pointers=pointers,
             _extents=extents,
+            _capacity_buffers={
+                int(value_id): buffers[int(value_id)]
+                for value_id, _source in (
+                    *self.output_length_sources, *self.output_shape_sources,
+                )
+            },
         )
 
     def compile_standalone(
@@ -1753,13 +1827,24 @@ class CModuleArtifact:
         counts: list[int] = []
         item_sizes: list[int] = []
         runtime_shapes: dict[int, tuple[int, ...]] = {}
+        # The executable host owns the same buffers as the DLL caller. In
+        # particular a returned slice reserves its proven input capacity,
+        # never the old rankless one-cell default.
+        computed_buffers = (
+            self.prepare_execution(feeds).buffers
+            if self.output_capacity_sources else None
+        )
         with initial_state_path.open("wb") as stream:
             for value_id, dtype, shape in zip(
                 self.buffer_order, self.buffer_dtypes, shapes
             ):
                 wanted = np.dtype(_numpy_dtype(dtype))
                 fed = feeds.get(int(value_id))
-                if fed is None:
+                if computed_buffers is not None:
+                    held = computed_buffers[int(value_id)]
+                    count = int(held.size)
+                    runtime_shapes[int(value_id)] = tuple(held.shape)
+                elif fed is None:
                     count = (
                         math.prod(tuple(map(int, shape))) if shape else 1
                     )
@@ -4653,12 +4738,28 @@ def emit_ssa_module_to_c(
                 if op.startswith("Exception"):
                     from .concordance_declarations import SOURCE_EXCEPTION_OPERATION, C_EXCEPTION_OPERATION
                     from .identity_concordance import Derived, Mode
+                    from .ssa_record_return_state import accepted_ssa_component
+                    from .frame_identity_book import _frame_owner_book
                     source_cell = instruction.attributes.get("exception_operation_cell")
                     if source_cell is None:
                         shortfalls.append(CEmissionShortfall(op, "exception operation has no source contract"))
                         continue
+                    # An accepted _read_header exception carries a source Ref
+                    # owned by its retained leaf book. Import that exact
+                    # contract into this module's emission transaction before
+                    # deriving the C policy; keep the original Ref as the
+                    # semantic C_EXCEPTION_OPERATION row identity.
+                    accepted = accepted_ssa_component(function)
+                    source_book, source_digest = (
+                        _frame_owner_book(function) if accepted
+                        else (emission, None)
+                    )
+                    source_receipt = (
+                        emission.import_cell(source_book, source_cell, source_digest)
+                        if source_book is not emission else source_cell
+                    )
                     (operation, exception_type, message, error_code, cause,
-                     cause_argument, suppress_context, _normalization) = emission.page(
+                     cause_argument, suppress_context, _normalization) = source_book.page(
                          SOURCE_EXCEPTION_OPERATION
                      ).cell(source_cell.row, source_cell.column)
                     result_id = int(instruction.res.id)
@@ -4715,14 +4816,14 @@ def emit_ssa_module_to_c(
                             raise ValueError("exception operation has no C materialization")
                         policy_cell = emission.post(C_EXCEPTION_OPERATION, (source_cell, fn, result_id),
                             (op, tuple(v.id for v in instruction.args), policy), stage=EMISSION_C,
-                            provenance=Derived((source_cell,)), mode=Mode.CONCORD)
+                            provenance=Derived((source_receipt,)), mode=Mode.CONCORD)
                         span.take(UnitKind.STATEMENT, result=instruction.res, args=instruction.args,
                                   instruction=instruction, extra_cells=(policy_cell,))
                         span.pending = None
                     except ValueError as error:
                         emission.post(C_EXCEPTION_OPERATION, (source_cell, fn, result_id),
                             (op, tuple(v.id for v in instruction.args), 'refused: ' + str(error)),
-                            stage=EMISSION_C, provenance=Derived((source_cell,)), mode=Mode.CONCORD)
+                            stage=EMISSION_C, provenance=Derived((source_receipt,)), mode=Mode.CONCORD)
                         shortfalls.append(CEmissionShortfall(op, str(error)))
                     continue
                 if op == "ThreadCreate":
@@ -7850,12 +7951,22 @@ def emit_ssa_module_to_c(
         function_storage_requirements,
         is_compiler_owned_storage,
         is_structural_abi_value as _is_structural_abi_value,
+        public_sequence_capacity_sources,
     )
 
     storage_requirements = function_storage_requirements(module, function_name)
     buffer_order: list[int] = []
     buffer_shapes: list[tuple[int, ...]] = []
     output_extent_sources: list[tuple[int, int]] = []
+    sequence_capacity_relations = public_sequence_capacity_sources(module, function_name)
+    output_capacity_sources = tuple(
+        (item.output_data_id, item.input_data_id)
+        for item in sequence_capacity_relations
+    )
+    output_length_sources = tuple(
+        (item.output_data_id, item.output_length_id)
+        for item in sequence_capacity_relations
+    )
     buffer_dtypes: list[str] = []
     entry_lines: list[str] = []
     root_allocations: list[tuple[str, str, int]] = []
@@ -8207,6 +8318,42 @@ def emit_ssa_module_to_c(
                 entry_span.take(
                     UnitKind.STATEMENT, args=(int(member_id),), spelling=cell,
                 )
+    # Program: return packet[:at], packet[at:at+n], packet[at+n:]. Each
+    # returned arena reserves at most packet's rows, while the clipped-copy
+    # helper writes its actual length. Initialize the caller-owned capacity
+    # from that exact public input, as proved by SOURCE_SEQUENCE_CAPACITY_BOUND;
+    # neither the host nor this wrapper evaluates the source slice again.
+    initialized_input_members = set()
+    for relation in sequence_capacity_relations:
+        capacity = rendered_root_value(relation.output_capacity_id)
+        source_extent = extent_slot(function_name, relation.input_data_id, "dim", 0)
+        if capacity is None or source_extent is None:
+            raise ValueError("proved public sequence capacity has no native ABI port")
+        entry_lines.append(
+            f"    ((int64_t *){capacity})[0] = extents[{source_extent}];"
+        )
+        entry_span.take(
+            UnitKind.STATEMENT,
+            args=(relation.output_capacity_id, relation.input_data_id),
+            spelling=capacity,
+        )
+        # The public bytes span contains exactly its runtime rows. Its
+        # descriptor's input length/capacity ports describe that same buffer;
+        # leaving either calloc-zeroed made every source slice appear empty.
+        for member_id in (relation.input_length_id, relation.input_capacity_id):
+            if member_id in initialized_input_members:
+                continue
+            member = rendered_root_value(member_id)
+            if member is None:
+                raise ValueError("public bytes descriptor has no native extent port")
+            entry_lines.append(
+                f"    ((int64_t *){member})[0] = extents[{source_extent}];"
+            )
+            entry_span.take(
+                UnitKind.STATEMENT, args=(member_id, relation.input_data_id),
+                spelling=member,
+            )
+            initialized_input_members.add(member_id)
     # -- record-parameter relocation prologue -------------------------------
     # Record parameters are runtime cell arenas (the program mutates scalar
     # cells in place), but their private storage starts calloc-zeroed, so
@@ -8398,12 +8545,40 @@ def emit_ssa_module_to_c(
         buffer_shapes=buffer_shapes, buffer_order_cell=buffer_order_cell,
         unit_cells=(wrapper_header_unit, *formal_units), stage=EMISSION_C,
     )
-    from .runtime_abi import public_buffer_contract
+    from .runtime_abi import public_buffer_contract, runtime_abi_description
 
     public_ranks, public_roles = public_buffer_contract(
         buffer_order, root.args, native_outputs[function_name],
         _declared_span_rank,
     )
+    native_written_members = {
+        value_id for item in sequence_capacity_relations
+        for value_id in (item.output_length_id, item.output_capacity_id,
+                         item.input_length_id, item.input_capacity_id)
+    }
+    public_roles = tuple(
+        "inout" if value_id in native_written_members else role
+        for value_id, role in zip(buffer_order, public_roles, strict=True)
+    )
+    if sequence_capacity_relations:
+        description = runtime_abi_description(
+            entry=name, backend="c", extent_type="int64_t",
+            buffer_order=buffer_order, buffer_dtypes=buffer_dtypes,
+            buffer_shapes=buffer_shapes, buffer_ranks=public_ranks,
+            buffer_roles=public_roles, extent_order=extent_order,
+            output_extent_sources=output_extent_sources,
+            output_capacity_sources=output_capacity_sources,
+            output_length_sources=output_length_sources,
+        )
+        post_artifact_part(
+            emission, name, Backend.C_MODULE, ArtifactPart.RUNTIME_ABI,
+            data=repr(description), location=(description,),
+            sources=(buffer_order_cell, api_contract_cell, *(
+                cell for item in sequence_capacity_relations
+                for cell in (item.bound_cell, item.output_descriptor_cell,
+                             item.input_descriptor_cell)
+            )), stage=EMISSION_C,
+        )
     return CModuleArtifact(
         external_slots=external_slot_rows(module, slot_functions),
         linked_llvm=tuple(linked_llvm),
@@ -8418,6 +8593,8 @@ def emit_ssa_module_to_c(
         buffer_shapes=tuple(buffer_shapes),
         extent_order=tuple(extent_order),
         output_extent_sources=tuple(output_extent_sources),
+        output_capacity_sources=output_capacity_sources,
+        output_length_sources=output_length_sources,
         buffer_ranks=public_ranks,
         buffer_roles=public_roles,
         precision_sections=precision_present,

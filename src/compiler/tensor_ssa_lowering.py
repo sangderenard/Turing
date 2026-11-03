@@ -2105,7 +2105,50 @@ def propagate_repository_ssa_call_metadata(
         # all of them before publishing their common shape edge: otherwise
         # an already-settled occurrence can revise the row before the later
         # occurrence that actually changes has produced the causal receipt.
+        from .identity_concordance import (
+            SHAPE_EDGE_PAGE, shape_transformation_state,
+        )
         for arguments, keywords in shape_transformation_records:
+            source_scope, source_id, target_scope, target_id = arguments
+            if (
+                source_scope != target_scope
+                and keywords["operation"] == "ssa_metadata_transport"
+            ):
+                # compress_octets' sequence-31 append_slice helper forwards
+                # one canonical storage id in both directions.  The forward
+                # edge may have just revised ptr to int64 from an exact
+                # metadata receipt, while the reverse edge's SSA and source
+                # shape cells still predate its prior column.  Cite that
+                # *new* matching forward edge as the reverse write's cause.
+                stage_name = str(keywords["stage"])
+                role_name = str(keywords["role"])
+                reverse_row = (
+                    target_scope, target_id, source_scope, source_id,
+                    stage_name, "ssa_metadata_transport", role_name,
+                )
+                forward_row = (
+                    source_scope, source_id, target_scope, target_id,
+                    stage_name, "ssa_metadata_transport", role_name,
+                )
+                incumbent = book.latest_ref(SHAPE_EDGE_PAGE, reverse_row)
+                forward = book.latest_ref(SHAPE_EDGE_PAGE, forward_row)
+                if (
+                    incumbent is not None
+                    and forward is not None
+                    and book.stamp_of(forward) > book.stamp_of(incumbent)
+                    and book.page(SHAPE_EDGE_PAGE).cell(
+                        forward.row, forward.column,
+                    ) == (
+                        shape_transformation_state(keywords["target_state"]),
+                        shape_transformation_state(keywords["source_state"]),
+                    )
+                ):
+                    keywords = {
+                        **keywords,
+                        "source_cells": tuple(dict.fromkeys((
+                            *keywords["source_cells"], forward,
+                        ))),
+                    }
             record_shape_transformation(*arguments, **keywords)
         return changed
 

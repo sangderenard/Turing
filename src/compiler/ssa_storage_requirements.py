@@ -29,6 +29,145 @@ class SSAStorageRequirement:
     dynamic: bool
 
 
+@dataclass(frozen=True, slots=True)
+class PublicSequenceCapacitySource:
+    """Caller-owned output capacity bounded by an exact input sequence."""
+
+    output_sequence_id: int
+    input_sequence_id: int
+    output_data_id: int
+    output_length_id: int
+    output_capacity_id: int
+    input_data_id: int
+    input_length_id: int
+    input_capacity_id: int
+    bound_cell: Any
+    output_descriptor_cell: Any
+    input_descriptor_cell: Any
+
+
+def public_sequence_capacity_sources(
+    module: Any, function_name: str,
+) -> tuple[PublicSequenceCapacitySource, ...]:
+    """Read bytes-slice capacity from the source bound and both SSA views.
+
+    `sequence_capacity_sources` is only a forwarding index. The authority is
+    the source bound joined by unique canonical origins to the two sequence
+    contracts, and the actual Ret/output and public Input SSA roles.
+    """
+
+    from .concordance_declarations import (
+        CANONICAL_VALUE, SEQUENCE_CONTRACT_CONCORDANCE,
+        SEQUENCE_DESCRIPTOR, SOURCE_SEQUENCE_CAPACITY_BOUND,
+        SourceSequenceCapacityBound,
+    )
+    from .concorded_literals import origin_cell
+    from .identity_concordance import CorrelationTable
+
+    function = module.functions.get(str(function_name))
+    table = (getattr(module, "sequence_tables", {}) or {}).get(str(function_name))
+    book = None if table is None else table.book
+    if function is None or table is None or book is None:
+        return ()
+    if CorrelationTable._source_sequence_capacity_bound_findings(module):
+        return ()
+    returned = {
+        int(value.id)
+        for block in function.blocks.values()
+        for instruction in block.instrs
+        if instruction.op == "Ret"
+        and not instruction.attributes.get("fault_exit")
+        for value in instruction.args
+    }
+    public_inputs = {
+        int(value.id)
+        for value in function.args
+        if (value.accounting or {}).get("program_abi_parameter")
+    }
+
+    def descriptor_identity(sequence_id: int):
+        descriptor = table.sequences.get(int(sequence_id))
+        cell = book.latest_ref(
+            SEQUENCE_DESCRIPTOR, (table.owner, int(sequence_id)),
+        )
+        if descriptor is None or cell is None:
+            return None
+        contracts = tuple(
+            parent for parent, _stage in book.edges_into(cell)
+            if parent.page == SEQUENCE_CONTRACT_CONCORDANCE
+        )
+        if len(contracts) != 1:
+            return None
+        visited = set()
+        pending = [contracts[0]]
+        identities = set()
+        while pending:
+            contract = pending.pop()
+            if contract in visited:
+                continue
+            visited.add(contract)
+            for parent, _stage in book.edges_into(contract):
+                if parent.page == CANONICAL_VALUE:
+                    try:
+                        identities.add(origin_cell(book, parent))
+                    except ValueError:
+                        return None
+                elif parent.page == SEQUENCE_CONTRACT_CONCORDANCE:
+                    pending.append(parent)
+        if len(identities) != 1:
+            return None
+        return descriptor, cell, next(iter(identities))
+
+    bound_page = book.page(SOURCE_SEQUENCE_CAPACITY_BOUND)
+    relations = []
+    for output_id, input_id in function.metadata.get(
+        "sequence_capacity_sources", ()
+    ):
+        output_id, input_id = int(output_id), int(input_id)
+        if output_id not in returned or input_id not in public_inputs:
+            continue
+        output = descriptor_identity(output_id)
+        source = descriptor_identity(input_id)
+        if output is None or source is None:
+            continue
+        output_descriptor, output_cell, output_origin = output
+        source_descriptor, source_cell, source_origin = source
+        candidates = []
+        for row in bound_page.rows():
+            bound_cell = book.latest_ref(SOURCE_SEQUENCE_CAPACITY_BOUND, row)
+            fact = (
+                None if bound_cell is None else
+                bound_page.cell(bound_cell.row, bound_cell.column)
+            )
+            if not isinstance(fact, SourceSequenceCapacityBound):
+                continue
+            try:
+                matches = (
+                    origin_cell(book, fact.destination_cell) == output_origin
+                    and origin_cell(book, fact.source_cell) == source_origin
+                )
+            except ValueError:
+                continue
+            if matches:
+                candidates.append(bound_cell)
+        if len(candidates) != 1:
+            continue
+        if (len(output_descriptor.column_value_ids) != 1
+                or len(source_descriptor.column_value_ids) != 1
+                or int(output_descriptor.column_value_ids[0]) != output_id
+                or int(source_descriptor.column_value_ids[0]) != input_id):
+            continue
+        relations.append(PublicSequenceCapacitySource(
+            output_id, input_id,
+            output_id, int(output_descriptor.length_address_id),
+            int(output_descriptor.capacity_value_id),
+            input_id, int(source_descriptor.length_address_id),
+            int(source_descriptor.capacity_value_id),
+            candidates[0], output_cell, source_cell,
+        ))
+    return tuple(relations)
+
+
 def is_compiler_owned_storage(value: Any) -> bool:
     """Whether a root-frame value is workspace rather than authored ABI."""
 
@@ -464,6 +603,7 @@ def function_storage_requirements(
 
 
 __all__ = [
-    "SSAStorageRequirement", "function_storage_requirements",
+    "PublicSequenceCapacitySource", "SSAStorageRequirement",
+    "function_storage_requirements", "public_sequence_capacity_sources",
     "is_compiler_owned_storage", "module_storage_requirements",
 ]

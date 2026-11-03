@@ -16768,6 +16768,28 @@ def _normalize_lexical_values(
             aggregate_kind = str(
                 base_attributes.get("aggregate_kind") or ""
             ).casefold()
+            base_class_cell = current_identity_book().latest_ref(
+                _SOURCE_VALUE_CLASS, (value_class_scope, int(base)),
+            )
+            base_class_fact = (
+                None if base_class_cell is None else
+                current_identity_book().page(_SOURCE_VALUE_CLASS).cell(
+                    base_class_cell.row, base_class_cell.column,
+                )
+            )
+            if (
+                isinstance(base_class_fact, tuple)
+                and base_class_fact
+                and _canonical_source_class_identity(base_class_fact[0])
+                in {"builtins.bytes", "builtins.str"}
+            ):
+                # The fresh bytes/string slice is writable only while the
+                # incumbent copy helper fills its private arena. An authored
+                # IndexedStore still targets an immutable source value.
+                raise TypeError(
+                    "indexed assignment to immutable source value: "
+                    f"class={base_class_fact[0]!r}; source={base_class_cell!r}"
+                )
             sequence_policy = (
                 "unique" if aggregate_kind in {"set", "dict"}
                 else "duplicates" if aggregate_kind in {

@@ -5,6 +5,8 @@ import inspect
 import json
 from pathlib import Path
 
+import pytest
+
 from src.common.tensors.compression import octet_codec, octet_lz
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
@@ -17,6 +19,31 @@ from src.compiler.project_compilation_product import (
     compile_resolved_process_graph_unit,
 )
 from src.common.tensors.topological_reducer import node_identity_cell
+
+
+def test_authored_write_to_fresh_bytes_slice_is_refused():
+    from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
+
+    source = """def root(packet: bytes) -> int:
+    fresh = packet[:]
+    fresh[0] = 99
+    return fresh[0]
+"""
+    contract = ExtractionContract(
+        Path(__file__).resolve().parents[1]
+        / "extraction_contracts/program_extraction.yaml"
+    ).with_program_abi({
+        "values": [{"function": "root", "parameter": "packet",
+                    "storage": "span", "dtype": "int64", "rank": 1,
+                    "python_type": "builtins.bytes"}],
+        "records": {}, "bindings": [],
+    })
+    with pytest.raises(TypeError, match="indexed assignment to immutable source value"):
+        lower_ast_source_to_ssa(
+            source, "root", extraction_contract=contract,
+            tensor_ssa_reference=c_backend_repository_ssa_reference(),
+            progress=lambda _: None, progress_bars=False,
+        )
 
 
 def test_linked_split_has_three_typed_fresh_byte_slices(tmp_path):
