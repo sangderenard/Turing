@@ -1,4 +1,3 @@
-2026-11-03 TITLE (MEASURED, where): 
 2026-11-03 Empty constructor-default audit on mobile dependencies (MEASURED):
 
 The iOS mobile workflow installs requirements.txt, ziglang and pytest, but not
