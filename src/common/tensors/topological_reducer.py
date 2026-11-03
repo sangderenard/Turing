@@ -27584,6 +27584,12 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             statement,
             (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda),
         ):
+            from ...compiler.concordance_declarations import SOURCE_PARAMETER_DEFAULT
+            from ...transmogrifier.graph.graph_express2 import (
+                post_source_parameter_defaults,
+            )
+
+            post_source_parameter_defaults(statement)
             for argument in (
                 *statement.args.posonlyargs,
                 *statement.args.args,
@@ -27611,9 +27617,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             ):
                 if default_expression is None:
                     continue
+                authored_literal_default = True
                 try:
                     value = ast.literal_eval(default_expression)
                 except (ValueError, TypeError):
+                    authored_literal_default = False
                     if (
                         not isinstance(default_expression, ast.Name)
                         or default_expression.id
@@ -27629,6 +27637,18 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 # or embedded in a worker checkpoint.
                 if not is_python_static_literal(value):
                     continue
+                if authored_literal_default:
+                    # The AST declaration owns this value; the graph defaults
+                    # dictionary is its read view, including non-scalar None.
+                    definition_row = statement._turing_source_span_row
+                    default_scope = tuple(
+                        definition_row if isinstance(statement, ast.Lambda)
+                        else definition_row[:2]
+                    )
+                    default_row = (default_scope, str(name))
+                    value = current_identity_book().page(SOURCE_PARAMETER_DEFAULT).latest(
+                        default_row
+                    ).value
                 parameter_defaults[name] = value
                 if isinstance(
                     value,

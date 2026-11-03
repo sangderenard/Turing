@@ -4803,6 +4803,15 @@ SOURCE_PARAMETER_IDENTITY = declare_page(
         RowField("function_scope", K.SCOPE), RowField("parameter", K.NAME),
     ), tuple,
 )
+#: An authored function parameter's evaluated literal default.  The writer
+#: derives this row from the exact function, ast.arg and default-expression
+#: SOURCE_SPAN cells at INGESTION. A missing row means no proved literal
+#: default; literal entries in graph parameter_defaults are its read view.
+SOURCE_PARAMETER_DEFAULT = declare_page(
+    "source_parameter_default", (
+        RowField("function_scope", K.SCOPE), RowField("parameter", K.NAME),
+    ), SpecializationFact,
+)
 #: ``_lower_ast_source_to_ssa_impl``: the coefficient closure of a numeric
 #: type an authored parameter annotation names, ``(type name, limbs)`` ->
 #: the closure's descriptor receipts, CONCORD, DERIVED(the

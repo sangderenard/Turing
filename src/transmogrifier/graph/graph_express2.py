@@ -1593,6 +1593,55 @@ def post_source_span(owner_definition, node, *, stage=None, source_cells=None):
     )
 
 
+def post_source_parameter_defaults(function):
+    """Publish literal defaults from the exact authored signature, not its body."""
+
+    if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return
+    from ...compiler.concordance_declarations import (
+        INGESTION, SOURCE_PARAMETER_DEFAULT, SpecializationFact,
+        SpecializationSource,
+    )
+    from ...compiler.identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+    from .python_special_cases import is_python_static_literal
+
+    arguments = function.args
+    positional = (*arguments.posonlyargs, *arguments.args)
+    for parameter, expression in (
+        *zip(positional[len(positional) - len(arguments.defaults):], arguments.defaults),
+        *zip(arguments.kwonlyargs, arguments.kw_defaults),
+    ):
+        # kw_defaults uses Python None for a required parameter; an authored
+        # default None is ast.Constant(None) and is retained below.
+        if expression is None:
+            continue
+        try:
+            value = ast.literal_eval(expression)
+        except (ValueError, TypeError):
+            continue
+        if not is_python_static_literal(value):
+            continue
+        definition_cell = post_source_span(function, function)
+        parameter_cell = post_source_span(function, parameter)
+        default_cell = post_source_span(function, expression)
+        if any(cell is None for cell in (definition_cell, parameter_cell, default_cell)):
+            raise ValueError("authored parameter default has no exact source occurrence")
+        scope = tuple(definition_cell.row if isinstance(function, ast.Lambda)
+                      else definition_cell.row[:2])
+        # creation.zeros declares dtype=None even if its Try body cannot yet
+        # be lowered. Defaults belong to source declaration ingestion, so
+        # consumers can prove omission without compiling that function body.
+        current_identity_book().post(
+            SOURCE_PARAMETER_DEFAULT, (scope, str(parameter.arg)),
+            SpecializationFact(value, SpecializationSource.DEFAULT),
+            stage=INGESTION,
+            provenance=Derived((definition_cell, parameter_cell, default_cell)),
+            mode=Mode.CONCORD,
+        )
+
+
 def _source_enum_declaration(definition):
     """Return the authored Enum base and literal members, if complete.
 
@@ -6755,6 +6804,8 @@ class ProcessGraph(TiledObject):
         # the map IR and the parameter annotations describe it.  The index is
         # an in-process lookup for ``ensure_node``, never a fact.
         self._source_owner_index = _annotate_visual_source_owners(tree)
+        for definition in ast.walk(tree):
+            post_source_parameter_defaults(definition)
         # The scope every ``ingestion_value`` row this build posts lives in
         # (``ensure_node``); ingestion ids are unique across one build.
         self.G.graph["ingestion_value_scope"] = book.mint_scope(

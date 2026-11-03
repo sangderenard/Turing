@@ -199,17 +199,21 @@ def _argument_identity_cells(graph: Any, node_id: int) -> tuple:
 
 
 def _formal_identity_cells(callee: Any, parameter: str) -> tuple:
-    """The cells that identify a callee formal bound to its signature
-    default: the Input node's identity cell and its ``scalar_parameter``
-    row when the reducer posted one (that row derives from the default's
-    span; the def statement itself is not kept on the graph)."""
+    """The formal's identity, authored default and scalar evidence cells."""
 
     from ..common.tensors.topological_reducer import node_identity_cell
-    from .concordance_declarations import SCALAR_PARAMETER
+    from .concordance_declarations import SCALAR_PARAMETER, SOURCE_PARAMETER_DEFAULT
     from .identity_concordance import current_identity_book
 
     cells: list = []
     book = current_identity_book()
+    function_scope = callee.G.graph.get("authored_function_identity")
+    if function_scope is not None:
+        default = book.latest_ref(
+            SOURCE_PARAMETER_DEFAULT, (tuple(function_scope), str(parameter)),
+        )
+        if default is not None:
+            cells.append(default)
     for node_id, data in callee.G.nodes(data=True):
         if data.get("type") != "Input" or str(
             (data.get("attributes") or {}).get("binding_name") or ""
@@ -710,8 +714,9 @@ def _post_copy_planner_specializations(
     page's read view."""
 
     from .concordance_declarations import (
-        SpecializationFact, SpecializationSource,
+        SOURCE_PARAMETER_DEFAULT, SpecializationFact, SpecializationSource,
     )
+    from .identity_concordance import current_identity_book
 
     for parameter, value in specializations.items():
         cells = tuple(specialization_cells.get(str(parameter)) or ())
@@ -719,6 +724,15 @@ def _post_copy_planner_specializations(
         if not cells:
             cells = _formal_identity_cells(specialized, str(parameter))
             source = SpecializationSource.DEFAULT
+            # An omitted dtype=None used to be copied from a graph dictionary
+            # with only the formal identity as its cause. Read the authored
+            # default itself; parameter_defaults is its cached view.
+            for cell in cells:
+                if cell.page == SOURCE_PARAMETER_DEFAULT:
+                    value = current_identity_book().page(cell.page).cell(
+                        cell.row, cell.column,
+                    ).value
+                    break
         _post_planner_specialization(
             specialized, str(parameter), SpecializationFact(value, source),
             cells,

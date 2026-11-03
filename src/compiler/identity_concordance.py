@@ -1564,6 +1564,7 @@ class CorrelationTable:
         found.extend(self._tile_storage_findings(module))
         found.extend(self._source_field_identity_findings(module))
         found.extend(self._source_parameter_identity_findings(module))
+        found.extend(self._source_parameter_default_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._numerical_schema_operand_findings(module))
         found.extend(self._numerical_dtype_operand_findings(module))
@@ -6395,6 +6396,79 @@ class CorrelationTable:
                 f"parameter {parameter!r} changed identity across source "
                 f"stages: {distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _source_parameter_default_findings(module: Any) -> list[Finding]:
+        """Check each default against its three authored source constructs."""
+
+        from .concordance_declarations import (
+            SOURCE_PARAMETER_DEFAULT, SOURCE_SPAN, SpecializationFact,
+            SpecializationSource,
+        )
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found: list[Finding] = []
+        page = book.page(SOURCE_PARAMETER_DEFAULT)
+        spans = book.page(SOURCE_SPAN)
+        for row in page.rows():
+            receipt = book.latest_ref(SOURCE_PARAMETER_DEFAULT, row)
+            fact = page.latest(row)
+            causes = tuple(source for source, _stage in book.edges_into(receipt))
+            source_spans = tuple(source for source in causes
+                                 if source.page == SOURCE_SPAN)
+            valid = (
+                isinstance(row, tuple) and len(row) == 2
+                and isinstance(row[1], str)
+                and isinstance(fact, SpecializationFact)
+                and fact.source is SpecializationSource.DEFAULT
+                and len(source_spans) == 3
+                and len(set(source_spans)) == 3
+            )
+            if valid:
+                by_kind = tuple(
+                    (source, spans.cell(source.row, source.column).kind)
+                    for source in source_spans
+                )
+                definitions = tuple(source for source, kind in by_kind
+                                    if kind in {"FunctionDef", "AsyncFunctionDef", "Lambda"})
+                arguments = tuple(source for source, kind in by_kind
+                                  if kind == "arg")
+                defaults = tuple(source for source in source_spans
+                                 if source not in definitions and source not in arguments)
+                valid = (len(definitions) == len(arguments) == len(defaults) == 1)
+            if valid:
+                definition, argument, default = (
+                    definitions[0], arguments[0], defaults[0]
+                )
+                definition_kind = spans.cell(
+                    definition.row, definition.column,
+                ).kind
+                expected_scope = (
+                    definition.row if definition_kind == "Lambda"
+                    else definition.row[:2]
+                )
+                definition_path = tuple(definition.row[2])
+                valid = (
+                    row[0] == expected_scope
+                    and argument.row[:2] == definition.row[:2]
+                    and default.row[:2] == definition.row[:2]
+                    and tuple(argument.row[2])[:len(definition_path)]
+                        == definition_path
+                    and tuple(default.row[2])[:len(definition_path)]
+                        == definition_path
+                    and argument.row[2] != default.row[2]
+                    and spans.cell(default.row, default.column).kind
+                        not in {"arg", "FunctionDef", "AsyncFunctionDef", "Lambda"}
+                )
+            if not valid:
+                found.append(Finding(
+                    "source-parameter-default", str(row[0]), None,
+                    f"parameter {row[1]!r} lacks exact function, argument, "
+                    "and default-expression source causes",
+                ))
         return found
 
     @staticmethod
