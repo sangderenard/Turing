@@ -201,3 +201,16 @@ block from its function-root cell, attached an owned book, and reran emission,
 native compilation, and the audit. The preventing constraint is to establish
 the owned book and mint every SSA value and block origin before using an
 emitter result as evidence.
+
+## 2026-11-03 — broad identity audit outside the selected top-k gate
+
+The agent was told to use the bounded top-k public slice and the selected
+mapping audit while integrating the named native result. It ran the full
+`tools/audit_identity_concordance.py` instead. The broad run spent about 60
+seconds on view, toplevel, energy, controller, mapping, and oscillator cases;
+most ended in unrelated refusals that were not baseline compared. It added
+no evidence for the top-k parity claim and delayed the frozen patch report.
+The selected public top-k module audit and five focused tests were already
+green; the broad result was recorded without attribution. The preventing
+constraint is to run only the specified short audit gate for a narrow slice
+and widen it only for a concrete unresolved risk.
