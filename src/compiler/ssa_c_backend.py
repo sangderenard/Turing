@@ -7952,6 +7952,7 @@ def emit_ssa_module_to_c(
         is_compiler_owned_storage,
         is_structural_abi_value as _is_structural_abi_value,
         public_sequence_capacity_sources,
+        public_sequence_input_ports,
     )
 
     storage_requirements = function_storage_requirements(module, function_name)
@@ -7959,6 +7960,7 @@ def emit_ssa_module_to_c(
     buffer_shapes: list[tuple[int, ...]] = []
     output_extent_sources: list[tuple[int, int]] = []
     sequence_capacity_relations = public_sequence_capacity_sources(module, function_name)
+    sequence_input_ports = public_sequence_input_ports(module, function_name)
     output_capacity_sources = tuple(
         (item.output_data_id, item.input_data_id)
         for item in sequence_capacity_relations
@@ -8323,7 +8325,27 @@ def emit_ssa_module_to_c(
     # helper writes its actual length. Initialize the caller-owned capacity
     # from that exact public input, as proved by SOURCE_SEQUENCE_CAPACITY_BOUND;
     # neither the host nor this wrapper evaluates the source slice again.
-    initialized_input_members = set()
+    # Every public bytes input describes its full runtime span, independently
+    # of whether the function returns a slice. _read_header(packet,count)
+    # previously saw zero length when no returned-slice bound initialized its
+    # descriptor. Read the exact descriptor/class chain, never a parameter name.
+    for ports in sequence_input_ports:
+        source_extent = extent_slot(function_name, ports.data_id, "dim", 0)
+        if source_extent is None:
+            raise ValueError("public bytes descriptor has no native extent source")
+        for member_id in (ports.length_id, ports.capacity_id):
+            member = rendered_root_value(member_id)
+            if member is None:
+                raise ValueError("public bytes descriptor has no native extent port")
+            entry_lines.append(
+                f"    ((int64_t *){member})[0] = extents[{source_extent}];"
+            )
+            entry_span.take(
+                UnitKind.STATEMENT, args=(member_id, ports.data_id),
+                spelling=member,
+                extra_cells=(ports.descriptor_cell, ports.contract_cell,
+                             ports.source_identity_cell, ports.source_class_cell),
+            )
     for relation in sequence_capacity_relations:
         capacity = rendered_root_value(relation.output_capacity_id)
         source_extent = extent_slot(function_name, relation.input_data_id, "dim", 0)
@@ -8336,24 +8358,9 @@ def emit_ssa_module_to_c(
             UnitKind.STATEMENT,
             args=(relation.output_capacity_id, relation.input_data_id),
             spelling=capacity,
+            extra_cells=(relation.bound_cell, relation.output_descriptor_cell,
+                         relation.input_descriptor_cell),
         )
-        # The public bytes span contains exactly its runtime rows. Its
-        # descriptor's input length/capacity ports describe that same buffer;
-        # leaving either calloc-zeroed made every source slice appear empty.
-        for member_id in (relation.input_length_id, relation.input_capacity_id):
-            if member_id in initialized_input_members:
-                continue
-            member = rendered_root_value(member_id)
-            if member is None:
-                raise ValueError("public bytes descriptor has no native extent port")
-            entry_lines.append(
-                f"    ((int64_t *){member})[0] = extents[{source_extent}];"
-            )
-            entry_span.take(
-                UnitKind.STATEMENT, args=(member_id, relation.input_data_id),
-                spelling=member,
-            )
-            initialized_input_members.add(member_id)
     # -- record-parameter relocation prologue -------------------------------
     # Record parameters are runtime cell arenas (the program mutates scalar
     # cells in place), but their private storage starts calloc-zeroed, so
@@ -8553,8 +8560,10 @@ def emit_ssa_module_to_c(
     )
     native_written_members = {
         value_id for item in sequence_capacity_relations
-        for value_id in (item.output_length_id, item.output_capacity_id,
-                         item.input_length_id, item.input_capacity_id)
+        for value_id in (item.output_length_id, item.output_capacity_id)
+    } | {
+        value_id for ports in sequence_input_ports
+        for value_id in (ports.length_id, ports.capacity_id)
     }
     public_roles = tuple(
         "inout" if value_id in native_written_members else role

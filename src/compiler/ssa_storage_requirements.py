@@ -46,6 +46,131 @@ class PublicSequenceCapacitySource:
     input_descriptor_cell: Any
 
 
+@dataclass(frozen=True, slots=True)
+class PublicSequenceInputPorts:
+    """Exact native ports of one caller supplied bytes sequence."""
+
+    data_id: int
+    length_id: int
+    capacity_id: int
+    descriptor_cell: Any
+    contract_cell: Any
+    source_identity_cell: Any
+    source_class_cell: Any
+
+
+def _sequence_descriptor_identity(table: Any, sequence_id: int):
+    """Follow one descriptor through its contract to one ingestion origin."""
+
+    from .concordance_declarations import (
+        CANONICAL_VALUE, SEQUENCE_CONTRACT_CONCORDANCE,
+        SEQUENCE_DESCRIPTOR,
+    )
+    from .concorded_literals import origin_cell
+
+    book = table.book
+    descriptor = table.sequences.get(int(sequence_id))
+    cell = book.latest_ref(
+        SEQUENCE_DESCRIPTOR, (table.owner, int(sequence_id)),
+    )
+    if descriptor is None or cell is None:
+        return None
+    contracts = tuple(
+        parent for parent, _stage in book.edges_into(cell)
+        if parent.page == SEQUENCE_CONTRACT_CONCORDANCE
+    )
+    if len(contracts) != 1:
+        return None
+    visited = set()
+    pending = [contracts[0]]
+    identities = set()
+    while pending:
+        contract = pending.pop()
+        if contract in visited:
+            continue
+        visited.add(contract)
+        for parent, _stage in book.edges_into(contract):
+            if parent.page == CANONICAL_VALUE:
+                try:
+                    identities.add(origin_cell(book, parent))
+                except ValueError:
+                    return None
+            elif parent.page == SEQUENCE_CONTRACT_CONCORDANCE:
+                pending.append(parent)
+    if len(identities) != 1:
+        return None
+    return descriptor, cell, contracts[0], next(iter(identities))
+
+
+def public_sequence_input_ports(
+    module: Any, function_name: str,
+) -> tuple[PublicSequenceInputPorts, ...]:
+    """Read bytes input ports from one descriptor and its authored class.
+
+    The public formal IDs select the resident descriptor. Its canonical
+    contract and the authored class must reach the same ingestion value.
+    Returned slices and their capacity forwarding are irrelevant here.
+    """
+
+    from .concordance_declarations import SOURCE_VALUE_CLASS
+
+    function = module.functions.get(str(function_name))
+    table = (getattr(module, "sequence_tables", {}) or {}).get(str(function_name))
+    book = None if table is None else table.book
+    if function is None or book is None:
+        return ()
+    arguments = {int(value.id): value for value in function.args}
+    result = []
+    for sequence_id in table.sequences:
+        identity = _sequence_descriptor_identity(table, int(sequence_id))
+        if identity is None:
+            continue
+        descriptor, descriptor_cell, contract_cell, source_cell = identity
+        columns = tuple(int(value) for value in descriptor.column_value_ids)
+        if len(columns) != 1 or columns[0] != int(sequence_id):
+            continue
+        data_id = columns[0]
+        length_id = int(descriptor.length_address_id)
+        capacity_id = int(descriptor.capacity_value_id)
+        if any(value_id not in arguments for value_id in (
+            data_id, length_id, capacity_id,
+        )):
+            continue
+        data = arguments[data_id]
+        accounting = dict(data.accounting or {})
+        if (
+            not accounting.get("program_abi_parameter")
+            or accounting.get("program_abi_storage") != "span"
+            or accounting.get("program_abi_rank") != 1
+        ):
+            continue
+        # Only the authored class birth is a source-class authority. A
+        # specialized peer with the same numeric ID cannot identify this
+        # formal unless its exact ingestion cause is the descriptor origin.
+        classes = []
+        for row in book.page(SOURCE_VALUE_CLASS).rows():
+            class_cell = book.latest_ref(SOURCE_VALUE_CLASS, row)
+            if class_cell is None:
+                continue
+            class_fact = book.page(SOURCE_VALUE_CLASS).cell(
+                class_cell.row, class_cell.column,
+            )
+            if not isinstance(class_fact, tuple) or class_fact[:1] != (
+                "builtins.bytes",
+            ):
+                continue
+            causes = {parent for parent, _stage in book.edges_into(class_cell)}
+            if source_cell in causes:
+                classes.append(class_cell)
+        if len(classes) != 1:
+            continue
+        result.append(PublicSequenceInputPorts(
+            data_id, length_id, capacity_id, descriptor_cell,
+            contract_cell, source_cell, classes[0],
+        ))
+    return tuple(result)
+
+
 def public_sequence_capacity_sources(
     module: Any, function_name: str,
 ) -> tuple[PublicSequenceCapacitySource, ...]:
@@ -57,9 +182,7 @@ def public_sequence_capacity_sources(
     """
 
     from .concordance_declarations import (
-        CANONICAL_VALUE, SEQUENCE_CONTRACT_CONCORDANCE,
-        SEQUENCE_DESCRIPTOR, SOURCE_SEQUENCE_CAPACITY_BOUND,
-        SourceSequenceCapacityBound,
+        SOURCE_SEQUENCE_CAPACITY_BOUND, SourceSequenceCapacityBound,
     )
     from .concorded_literals import origin_cell
     from .identity_concordance import CorrelationTable
@@ -85,39 +208,6 @@ def public_sequence_capacity_sources(
         if (value.accounting or {}).get("program_abi_parameter")
     }
 
-    def descriptor_identity(sequence_id: int):
-        descriptor = table.sequences.get(int(sequence_id))
-        cell = book.latest_ref(
-            SEQUENCE_DESCRIPTOR, (table.owner, int(sequence_id)),
-        )
-        if descriptor is None or cell is None:
-            return None
-        contracts = tuple(
-            parent for parent, _stage in book.edges_into(cell)
-            if parent.page == SEQUENCE_CONTRACT_CONCORDANCE
-        )
-        if len(contracts) != 1:
-            return None
-        visited = set()
-        pending = [contracts[0]]
-        identities = set()
-        while pending:
-            contract = pending.pop()
-            if contract in visited:
-                continue
-            visited.add(contract)
-            for parent, _stage in book.edges_into(contract):
-                if parent.page == CANONICAL_VALUE:
-                    try:
-                        identities.add(origin_cell(book, parent))
-                    except ValueError:
-                        return None
-                elif parent.page == SEQUENCE_CONTRACT_CONCORDANCE:
-                    pending.append(parent)
-        if len(identities) != 1:
-            return None
-        return descriptor, cell, next(iter(identities))
-
     bound_page = book.page(SOURCE_SEQUENCE_CAPACITY_BOUND)
     relations = []
     for output_id, input_id in function.metadata.get(
@@ -126,12 +216,12 @@ def public_sequence_capacity_sources(
         output_id, input_id = int(output_id), int(input_id)
         if output_id not in returned or input_id not in public_inputs:
             continue
-        output = descriptor_identity(output_id)
-        source = descriptor_identity(input_id)
+        output = _sequence_descriptor_identity(table, output_id)
+        source = _sequence_descriptor_identity(table, input_id)
         if output is None or source is None:
             continue
-        output_descriptor, output_cell, output_origin = output
-        source_descriptor, source_cell, source_origin = source
+        output_descriptor, output_cell, _output_contract, output_origin = output
+        source_descriptor, source_cell, _source_contract, source_origin = source
         candidates = []
         for row in bound_page.rows():
             bound_cell = book.latest_ref(SOURCE_SEQUENCE_CAPACITY_BOUND, row)
@@ -603,7 +693,8 @@ def function_storage_requirements(
 
 
 __all__ = [
-    "PublicSequenceCapacitySource", "SSAStorageRequirement",
+    "PublicSequenceCapacitySource", "PublicSequenceInputPorts", "SSAStorageRequirement",
     "function_storage_requirements", "public_sequence_capacity_sources",
+    "public_sequence_input_ports",
     "is_compiler_owned_storage", "module_storage_requirements",
 ]

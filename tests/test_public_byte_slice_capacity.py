@@ -95,6 +95,32 @@ def test_public_bytes_slice_capacity_tracks_exact_packet_and_outputs(tmp_path):
             execution.run()
             assert tuple(bytes(execution.buffers[item.output_data_id].tolist())
                          for item in relations) == expected
+    # The Python-free pointer-table host reserves exactly the same capacities.
+    # Decode its written native length cells instead of a second slice model.
+    feeds = {parameters["packet"]: np.arange(17, dtype=np.int64),
+             parameters["at"]: 3, parameters["command_bytes"]: 5}
+    allocated = artifact.prepare_execution(feeds).buffers
+    standalone = artifact.compile_standalone(tmp_path / "standalone_slices", feeds)
+    result = standalone.run(frames=2, warmup=1)
+    assert "frames=2" in result.stdout
+    written = standalone.final_outputs_path.read_bytes()
+    decoded = {}
+    offset = 0
+    for value_id in artifact.buffer_order:
+        capacity = allocated[value_id]
+        decoded[value_id] = np.frombuffer(
+            written, dtype=capacity.dtype, count=capacity.size, offset=offset,
+        ).reshape(capacity.shape)
+        offset += capacity.nbytes
+    assert offset == len(written)
+    from src.compiler.runtime_abi import apply_native_result_extents
+    apply_native_result_extents(
+        decoded, {item.output_data_id: decoded[item.output_data_id]
+                  for item in relations},
+        length_sources=artifact.output_length_sources,
+    )
+    assert tuple(bytes(decoded[item.output_data_id].tolist())
+                 for item in relations) == namespace["root"](bytes(range(17)), 3, 5)
     original_lengths = artifact.output_length_sources
     artifact.output_length_sources = (
         (original_lengths[0][0], original_lengths[1][1]),
