@@ -228,3 +228,15 @@ exact comparison, delaying validation and the freeze release. The earlier
 uint8 result remains labelled as a different-contract observation in its
 hazard receipt. The preventing constraint is to copy the measured ProgramABI
 from the original product before launching a fresh comparison fixture.
+
+## 2026-11-03 — broad C exception file after the focused emission proof
+
+The agent was instructed to keep the accepted leaf C emission repair on a
+focused linked source test and avoid broad tests. After the focused real
+source test passed, it launched the entire `test_source_c_exceptions.py` file.
+That run spent about 60 seconds, printed `....FFF.`, and was interrupted
+before terminal diagnostics. It supplied no usable attribution for the
+accepted owner repair and delayed reporting the measured three private
+sequence capacity shortfalls. The preventing constraint is to stop testing
+once the focused proof and concordance audit answer the assigned boundary;
+an adjacent file is not a narrow test selection.

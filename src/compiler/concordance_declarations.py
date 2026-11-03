@@ -1502,6 +1502,22 @@ SOURCE_SEQUENCE_MUTATION = declare_page(
         RowField("call_value_id", K.VALUE_ID),
     ), tuple,
 )
+@dataclass(frozen=True)
+class SourceSequenceCapacityBound:
+    """A fresh bytes slice needs no more rows than its exact source."""
+
+    destination_cell: Ref
+    source_cell: Ref
+    operand_cell: Ref
+    source_class_cell: Ref
+
+
+SOURCE_SEQUENCE_CAPACITY_BOUND = declare_page(
+    "source_sequence_capacity_bound", (
+        RowField("source_scope", K.SCOPE),
+        RowField("destination_value_id", K.VALUE_ID),
+    ), SourceSequenceCapacityBound,
+)
 SOURCE_CONTROL_SPECIALIZATION = declare_page(
     "source_control_specialization_concordance", (
         RowField("function", K.NAME), RowField("control", K.VALUE_ID),
@@ -3181,6 +3197,7 @@ class ArtifactPart(Enum):
     BINARY = "binary"
     API_CONTRACT = "api_contract"
     BUFFER_ORDER = "buffer_order"
+    RUNTIME_ABI = "runtime_abi"
     #: ``(symbol, LLVM_MODULE, KERNEL_SOURCE)``: the authored text of a
     #: kernel pulled in by symbol, NOVEL(AUTHORED_KERNEL_TEXT).
     KERNEL_SOURCE = "kernel_source"

@@ -166,17 +166,27 @@ def value_cell(book: Any, function: Any, value: Any) -> Ref | None:
     minted values and adopted graph ids); then, for a graph id the builder
     bound without adopting, its ``control_value_binding`` cell."""
 
-    from .ssa_record_return_state import function_scope_of, ssa_value_identity_cell
+    from .ssa_record_return_state import (
+        accepted_ssa_component, function_scope_of, ssa_value_identity_cell,
+    )
+    from .frame_identity_book import _frame_owner_book
 
     value_id = getattr(value, "id", value)
     if value_id is None or isinstance(value_id, bool) or not isinstance(value_id, int):
         return None
-    cell = ssa_value_identity_cell(function, value_id, book=book)
+    # Linked _read_header's formal 2 and its companion storage values were
+    # posted in the accepted leaf's retained book. The caller's emitter must
+    # cite those rows by verified import into its attached emission book.
+    accepted = accepted_ssa_component(function)
+    owner, digest = _frame_owner_book(function) if accepted else (book, None)
+    cell = ssa_value_identity_cell(function, value_id, book=owner)
     if cell is not None:
-        return cell
-    return book.latest_ref(
+        return book.import_cell(owner, cell, digest) if owner is not book else cell
+    cell = owner.latest_ref(
         CONTROL_VALUE_BINDING, (function_scope_of(function), int(value_id)),
     )
+    return (book.import_cell(owner, cell, digest)
+            if cell is not None and owner is not book else cell)
 
 
 def ssa_block_cell(book: Any, function: Any, label: Any) -> Ref | None:
@@ -184,11 +194,18 @@ def ssa_block_cell(book: Any, function: Any, label: Any) -> Ref | None:
     2.6), or None.  Always with the attached ``book``: without it the
     reader would fall back to the ambient one, which emission never reads."""
 
-    from .ssa_record_return_state import ssa_block_identity_cell
+    from .ssa_record_return_state import (
+        accepted_ssa_component, ssa_block_identity_cell,
+    )
+    from .frame_identity_book import _frame_owner_book
 
     if book is None or label is None or function is None:
         return None
-    return ssa_block_identity_cell(function, str(label), book=book)
+    accepted = accepted_ssa_component(function)
+    owner, digest = _frame_owner_book(function) if accepted else (book, None)
+    cell = ssa_block_identity_cell(function, str(label), book=owner)
+    return (book.import_cell(owner, cell, digest)
+            if cell is not None and owner is not book else cell)
 
 
 def kernel_source_cell(
@@ -438,11 +455,50 @@ class EmissionRecorder:
             # helper module-level minters share (a straight-line lowering
             # that never named it has none yet).
             from .precompile_to_ssa import _function_root_cell
-            from .ssa_record_return_state import function_scope_of
+            from .ssa_record_return_state import (
+                accepted_ssa_component, function_scope_of,
+                ssa_block_identity_cell,
+            )
+            from .frame_identity_book import _frame_owner_book
+            from .concordance_declarations import CELL_SET, SSABlockKind
 
-            sources = _distinct((
-                _function_root_cell(book, function_scope_of(self.function)),
-            ))
+            if accepted_ssa_component(self.function):
+                owner, digest = _frame_owner_book(self.function)
+                root = owner.latest_ref(
+                    CELL_SET, (function_scope_of(self.function), 0),
+                )
+                if (
+                    root is None
+                    and (self.function.metadata or {}).get(
+                        "ssa_sequence_operation"
+                    ) is not None
+                ):
+                    # A registered sequence helper has no function-root
+                    # CELL_SET. Its entry SSA_BLOCK is DERIVED from the exact
+                    # source control operation that registered the helper.
+                    entry = ssa_block_identity_cell(
+                        self.function, "entry", book=owner,
+                    )
+                    if (
+                        entry is not None
+                        and owner.page(entry.page).cell(entry.row, entry.column)
+                        is SSABlockKind.SEQUENCE_HELPER
+                        and owner.edges_into(entry)
+                    ):
+                        root = entry
+                if root is None:
+                    raise ValueError(
+                        f"accepted emission function {self.function.name} "
+                        "lacks its retained function-root cell"
+                    )
+                sources = _distinct((
+                    book.import_cell(owner, root, digest)
+                    if owner is not book else root,
+                ))
+            else:
+                sources = _distinct((
+                    _function_root_cell(book, function_scope_of(self.function)),
+                ))
         self.function_cell = book.post(
             EMISSION_FUNCTION, row, pending, stage=self.stage,
             provenance=Derived(sources), mode=Mode.REVISE,

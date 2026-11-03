@@ -31643,8 +31643,94 @@ def _class_surface_ssa_program(
                         "metadata_state": "dynamic",
                     },
                 )
+        # A bytes slice has one exact source operand and is filled by the
+        # incumbent clipped-copy mutation. Its caller-owned result arena
+        # needs at most the source's runtime rows, even when the public
+        # packet's shape is dynamic. Publish that bound before the SSA
+        # capacity view is forwarded; neither a numeric ID nor the result's
+        # logical length is itself an allocation bound.
+        from .concordance_declarations import (
+            CANONICAL_VALUE as _CAP_CANONICAL_VALUE,
+            PROCESS_GRAPH_OPERANDS as _CAP_PROCESS_GRAPH_OPERANDS,
+            SOURCE_SEQUENCE_CAPACITY_BOUND as _CAP_SOURCE_SEQUENCE_CAPACITY_BOUND,
+            SourceSequenceCapacityBound as _SourceSequenceCapacityBound,
+        )
+        byte_slice_capacity_sources = []
+        if late_type_scope is not None:
+            for mutation in control_mutations:
+                if (str(mutation.operator) != "slice"
+                        or len(mutation.argument_value_ids) < 1):
+                    continue
+                destination_id = int(mutation.sequence_value_id)
+                source_id = int(mutation.argument_value_ids[0])
+                destination_data = graph_obj.nodes.get(destination_id, {})
+                source_data = graph_obj.nodes.get(source_id, {})
+                if (
+                    (destination_data.get("attributes") or {}).get(
+                        "aggregate_kind") != "bytes"
+                    or (source_data.get("attributes") or {}).get(
+                        "aggregate_kind") != "bytes"
+                ):
+                    continue
+                destination_cell = _identity_cell(graph_obj, destination_id)
+                source_cell = _identity_cell(graph_obj, source_id)
+                operand_cell = late_book.latest_ref(
+                    _CAP_PROCESS_GRAPH_OPERANDS,
+                    (late_type_scope, destination_id),
+                )
+                source_class_cell = late_book.latest_ref(
+                    _LATE_SOURCE_VALUE_CLASS,
+                    (late_numeric_scope, source_id),
+                )
+                if (destination_cell is None or source_cell is None
+                        or operand_cell is None or source_class_cell is None
+                        or destination_cell.page != _CAP_CANONICAL_VALUE
+                        or source_cell.page != _CAP_CANONICAL_VALUE):
+                    continue
+                operands = late_book.page(
+                    _CAP_PROCESS_GRAPH_OPERANDS
+                ).cell(operand_cell.row, operand_cell.column)
+                source_class = late_book.page(
+                    _LATE_SOURCE_VALUE_CLASS
+                ).cell(source_class_cell.row, source_class_cell.column)
+                if (
+                    not isinstance(operands, tuple)
+                    or (source_cell, "base") not in operands
+                    or not isinstance(source_class, tuple)
+                    or not source_class
+                    or str(source_class[0]) != "builtins.bytes"
+                    or source_cell not in {
+                        parent for parent, _stage in late_book.edges_into(
+                            source_class_cell
+                        )
+                    }
+                    or destination_cell not in {
+                        parent for parent, _stage in late_book.edges_into(
+                            operand_cell
+                        )
+                    }
+                ):
+                    continue
+                bound = _SourceSequenceCapacityBound(
+                    destination_cell, source_cell, operand_cell,
+                    source_class_cell,
+                )
+                late_book.post(
+                    _CAP_SOURCE_SEQUENCE_CAPACITY_BOUND,
+                    (late_type_scope, destination_id), bound,
+                    stage=SHELL_HANDOFF,
+                    provenance=_LateDerived((
+                        destination_cell, source_cell, operand_cell,
+                        source_class_cell,
+                    )),
+                    mode=Mode.CONCORD,
+                )
+                byte_slice_capacity_sources.append(
+                    (destination_id, source_id)
+                )
         sequence_capacity_sources = tuple(
             dict.fromkeys((
+                *byte_slice_capacity_sources,
                 *(
                     (
                         int(data.get("value_id", node_id)),
@@ -32947,6 +33033,31 @@ def _class_surface_ssa_program(
                 ),
                 *sequence_capacity_sources,
             )))
+            # The bytes slice's authored return is caller-owned fixed
+            # workspace. Its capacity follows the exact input sequence
+            # bound, while its logical length remains the helper's written
+            # length cell. Mark only the returned descriptor members whose
+            # SOURCE_SEQUENCE_CAPACITY_BOUND and SSA descriptor origins the
+            # incumbent storage reader joined; leave other frame residents
+            # and the slice's private status cell alone.
+            from .ssa_storage_requirements import (
+                public_sequence_capacity_sources as _public_slice_capacity,
+            )
+            for relation in _public_slice_capacity(module_ir, symbol):
+                public_members = {
+                    relation.output_data_id,
+                    relation.output_length_id,
+                    relation.output_capacity_id,
+                }
+                for argument in module_ir.functions[symbol].args:
+                    if int(argument.id) not in public_members:
+                        continue
+                    argument.accounting = {
+                        **dict(argument.accounting or {}),
+                        "caller_provided_workspace": True,
+                        "workspace_operation": "source_bytes_slice_result",
+                        "source_sequence_capacity_bound": relation.bound_cell,
+                    }
             source_output_value_ids = tuple(
                 int(history[-1])
                 for name in tuple(

@@ -1581,6 +1581,8 @@ class CorrelationTable:
         found.extend(self._source_numeric_type_dependency_findings(module))
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
+        found.extend(self._source_sequence_capacity_bound_findings(module))
+        found.extend(self._runtime_result_abi_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
         found.extend(self._source_closed_aggregate_length_findings(module))
         found.extend(self._source_closed_class_alternative_findings(module))
@@ -3587,8 +3589,41 @@ class CorrelationTable:
         for row in book.page(C_EXCEPTION_OPERATION).rows():
             source, name, _result = row
             data = book.page(C_EXCEPTION_OPERATION).latest(row)
-            if (source.page != SOURCE_EXCEPTION_OPERATION
-                    or PROCESS_OPERATORS.get(fact(source)[0]) != data[0]):
+            function = module.functions.get(name)
+            accepted = (
+                function is not None and accepted_ssa_component(function)
+            )
+            source_book, digest = (
+                _frame_owner_book(function) if accepted else (book, None)
+            )
+            source_fact = (
+                None if source.page != SOURCE_EXCEPTION_OPERATION else
+                source_book.page(SOURCE_EXCEPTION_OPERATION).cell(
+                    source.row, source.column,
+                )
+            )
+            import_ref = (
+                book.latest_ref(IMPORTED_CELL, (digest, source.key))
+                if source_book is not book and source_fact is not None else None
+            )
+            imported = (
+                None if import_ref is None else
+                book.page(IMPORTED_CELL).cell(import_ref.row, import_ref.column)
+            )
+            expected_cause = source if source_book is book else import_ref
+            policy_ref = book.latest_ref(C_EXCEPTION_OPERATION, row)
+            causes = (
+                set() if policy_ref is None else
+                {cell for cell, _stage in book.edges_into(policy_ref)}
+            )
+            if (source_fact is None
+                    or PROCESS_OPERATORS.get(source_fact[0]) != data[0]
+                    or expected_cause is None or expected_cause not in causes
+                    or (source_book is not book and (
+                        not isinstance(imported, ImportedCell)
+                        or imported.source != source
+                        or imported.fact != source_fact
+                        or imported.owner is not source_book))):
                 found.append(Finding("c-exception-provenance", str(name), None,
                                      "C exception operation disagrees with its source identity"))
         return found
@@ -9067,6 +9102,227 @@ class CorrelationTable:
                 "source mutation changed resident sequence, operator, "
                 f"arguments, policy, or mutation kind: {distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _source_sequence_capacity_bound_findings(module: Any) -> list[Finding]:
+        """Validate the exact bytes base, slice selector and bound causes."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS,
+            SOURCE_SEQUENCE_CAPACITY_BOUND, SOURCE_VALUE_CLASS,
+            SourceSequenceCapacityBound,
+        )
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_SEQUENCE_CAPACITY_BOUND)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_SEQUENCE_CAPACITY_BOUND, row)
+            fact = None if cell is None else page.cell(cell.row, cell.column)
+            valid = isinstance(fact, SourceSequenceCapacityBound)
+            if valid:
+                destination = fact.destination_cell
+                source = fact.source_cell
+                operands = fact.operand_cell
+                source_class = fact.source_class_cell
+                causes = {parent for parent, _stage in book.edges_into(cell)}
+                valid = (
+                    destination.page == CANONICAL_VALUE
+                    and destination.row == row
+                    and source.page == CANONICAL_VALUE
+                    and operands.page == PROCESS_GRAPH_OPERANDS
+                    and operands.row == row
+                    and source_class.page == SOURCE_VALUE_CLASS
+                    and {destination, source, operands, source_class} <= causes
+                    and source in {
+                        parent for parent, _stage in book.edges_into(source_class)
+                    }
+                    and destination in {
+                        parent for parent, _stage in book.edges_into(operands)
+                    }
+                )
+            if valid:
+                operand_fact = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                    operands.row, operands.column,
+                )
+                selector = tuple(
+                    parent for parent, role in operand_fact
+                    if role == "index" and parent.page == CANONICAL_VALUE
+                )
+                source_fact = book.page(SOURCE_VALUE_CLASS).cell(
+                    source_class.row, source_class.column,
+                )
+                destination_fact = book.page(CANONICAL_VALUE).cell(
+                    destination.row, destination.column,
+                )
+                selector_fact = (
+                    book.page(CANONICAL_VALUE).cell(
+                        selector[0].row, selector[0].column,
+                    ) if len(selector) == 1 else ()
+                )
+                valid = (
+                    (source, "base") in operand_fact
+                    and len(selector) == 1
+                    and isinstance(source_fact, tuple)
+                    and source_fact[0] == "builtins.bytes"
+                    and isinstance(destination_fact, tuple)
+                    and isinstance(selector_fact, tuple)
+                    and any(
+                        destination_fact[index:index + 2]
+                        == ("field:node.ast", "value:Subscript")
+                        for index in range(len(destination_fact) - 1)
+                    )
+                    and any(
+                        selector_fact[index:index + 2]
+                        == ("field:node.ast", "value:Slice")
+                        for index in range(len(selector_fact) - 1)
+                    )
+                )
+            if not valid:
+                found.append(Finding(
+                    "source-sequence-capacity-bound",
+                    str(row[0]), int(row[1]),
+                    "bytes slice capacity lacks exact source, selector, "
+                    "operand or class provenance",
+                ))
+        return found
+
+    @staticmethod
+    def _runtime_result_abi_findings(module: Any) -> list[Finding]:
+        """Check a native result ABI against the exact source/SSA bound."""
+
+        import hashlib
+
+        from .concordance_declarations import (
+            ArtifactFact, ArtifactPart, Backend, EMISSION_ARTIFACT,
+        )
+        from .ssa_storage_requirements import public_sequence_capacity_sources
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(EMISSION_ARTIFACT)
+        found = []
+        for row in page.rows():
+            if (
+                not isinstance(row, tuple) or len(row) != 3
+                or row[2] is not ArtifactPart.RUNTIME_ABI
+            ):
+                continue
+            cell = book.latest_ref(EMISSION_ARTIFACT, row)
+            fact = None if cell is None else page.cell(cell.row, cell.column)
+            entry, backend, _part = row
+            issue = lambda detail: found.append(Finding(
+                "runtime-result-abi", str(entry), None, detail,
+            ))
+            if (
+                backend is not Backend.C_MODULE
+                or not isinstance(fact, ArtifactFact)
+                or len(fact.location) != 1
+                or not isinstance(fact.location[0], dict)
+            ):
+                issue("runtime ABI lacks an exact C entry and description")
+                continue
+            description = fact.location[0]
+            payload = repr(description).encode("utf-8")
+            if (
+                fact.sha256 != hashlib.sha256(payload).hexdigest()
+                or fact.byte_length != len(payload)
+                or description.get("entry") != str(entry)
+                or description.get("backend") != "c"
+                or description.get("schema") != "turing-runtime-abi-v2"
+            ):
+                issue("runtime ABI description hash, entry or schema disagrees")
+                continue
+            order = tuple(
+                int(buffer["value_id"])
+                for buffer in description.get("buffers", ())
+            )
+            if len(order) != len(set(order)):
+                issue("runtime ABI repeats one public buffer identity")
+                continue
+            buffer_index = {value_id: index for index, value_id in enumerate(order)}
+            causes = {parent for parent, _stage in book.edges_into(cell)}
+            order_cell = book.latest_ref(EMISSION_ARTIFACT, (
+                str(entry), backend, ArtifactPart.BUFFER_ORDER,
+            ))
+            api_cell = book.latest_ref(EMISSION_ARTIFACT, (
+                str(entry), backend, ArtifactPart.API_CONTRACT,
+            ))
+            # `entry_name` is an exported symbol and may differ from the
+            # source function key. The exact descriptor cells cited by the
+            # artifact select one owning root; a name coincidence does not.
+            owners = []
+            for function_name in module.functions:
+                candidates = public_sequence_capacity_sources(
+                    module, str(function_name),
+                )
+                if candidates and all(
+                    proof in causes
+                    for relation in candidates
+                    for proof in (
+                        relation.bound_cell,
+                        relation.output_descriptor_cell,
+                        relation.input_descriptor_cell,
+                    )
+                ):
+                    owners.append((function_name, candidates))
+            if len(owners) != 1:
+                issue("runtime ABI has no unique descriptor-owned source root")
+                continue
+            _owner, relations = owners[0]
+            expected_capacities = {}
+            expected_lengths = {}
+            for relation in relations:
+                output = relation.output_data_id
+                if output not in buffer_index or relation.input_data_id not in buffer_index:
+                    continue
+                if relation.output_length_id not in buffer_index:
+                    continue
+                expected_capacities[output] = buffer_index[relation.input_data_id]
+                expected_lengths[output] = buffer_index[relation.output_length_id]
+            actual_capacities = {
+                int(buffer["value_id"]): buffer["capacity_from"]
+                for buffer in description["buffers"]
+                if "capacity_from" in buffer
+            }
+            actual_lengths = {
+                int(buffer["value_id"]): buffer["logical_length_from"]
+                for buffer in description["buffers"]
+                if "logical_length_from" in buffer
+            }
+            actual_shapes = {
+                int(buffer["value_id"]): buffer["logical_shape_from"]
+                for buffer in description["buffers"]
+                if "logical_shape_from" in buffer
+            }
+            required = {
+                order_cell, api_cell,
+                *(
+                    proof
+                    for relation in relations
+                    for proof in (
+                        relation.bound_cell,
+                        relation.output_descriptor_cell,
+                        relation.input_descriptor_cell,
+                    )
+                ),
+            }
+            if (
+                None in required or not required <= causes
+                or actual_capacities != expected_capacities
+                or actual_lengths != expected_lengths
+                or actual_shapes
+                or not relations
+                or page.cell(order_cell.row, order_cell.column).location != order
+                or order_cell not in {
+                    parent for parent, _stage in book.edges_into(api_cell)
+                }
+            ):
+                issue("runtime ABI capacity, logical length or proof cells disagree")
         return found
 
     @staticmethod

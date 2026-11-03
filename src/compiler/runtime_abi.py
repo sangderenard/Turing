@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 
 SCHEMA = "turing-runtime-abi-v1"
+COMPUTED_OUTPUT_SCHEMA = "turing-runtime-abi-v2"
 
 #: A stored callable field crosses the native boundary as two method inputs,
 #: a C function pointer and an opaque context handle, which the host supplies
@@ -68,6 +69,9 @@ def runtime_abi_description(
     buffer_roles: Iterable[str],
     extent_order: Iterable[tuple[int, str, int | None]],
     output_extent_sources: Iterable[tuple[int, int]] = (),
+    output_capacity_sources: Iterable[tuple[int, int]] = (),
+    output_length_sources: Iterable[tuple[int, int]] = (),
+    output_shape_sources: Iterable[tuple[int, int]] = (),
 ) -> dict[str, Any]:
     """Describe the buffer and extent vectors of one compiled entry.
 
@@ -90,6 +94,38 @@ def runtime_abi_description(
     sources: Mapping[int, int] = {
         int(output): int(source) for output, source in output_extent_sources
     }
+    def relations(pairs):
+        result = {}
+        for output, source in pairs:
+            output, source = int(output), int(source)
+            if output in result and result[output] != source:
+                raise ValueError("runtime output identity has conflicting sources")
+            result[output] = source
+        return result
+    capacities = relations(output_capacity_sources)
+    lengths = relations(output_length_sources)
+    result_shapes = relations(output_shape_sources)
+    if set(lengths) & set(result_shapes):
+        raise ValueError("a result cannot take both a logical length and a shape vector")
+    from ..transmogrifier.dtype_layout import layout_for
+    for output, source in (*capacities.items(), *lengths.items(), *result_shapes.items()):
+        if output not in index_of or source not in index_of or output == source:
+            raise ValueError("runtime output relation requires distinct public buffer identities")
+        if ranks[index_of[output]] <= 0:
+            raise ValueError("runtime output relation requires a ranked data buffer")
+    for output, source in capacities.items():
+        if (ranks[index_of[output]] != ranks[index_of[source]]
+                or roles[index_of[source]] not in {"input", "inout"}):
+            raise ValueError("runtime output capacity requires a same-rank public input")
+    for output, source in (*lengths.items(), *result_shapes.items()):
+        source_index = index_of[source]
+        if layout_for(dtypes[source_index]).kind not in {"int", "uint"}:
+            raise ValueError("native output extents require an integer buffer")
+        expected_count = 1 if output in lengths else ranks[index_of[output]]
+        shape = shapes[source_index]
+        if not ((ranks[source_index] == 0 and shape == () and expected_count == 1)
+                or (ranks[source_index] == 1 and shape == (expected_count,))):
+            raise ValueError("native output extent port has the wrong fixed size")
     buffers = []
     for index, value_id in enumerate(order):
         static = shapes[index]
@@ -102,9 +138,15 @@ def runtime_abi_description(
             "rank": ranks[index],
             "shape": None if runtime_sized else [int(item) for item in static],
         }
+        if value_id in capacities:
+            record["capacity_from"] = index_of[capacities[value_id]]
+        if value_id in lengths:
+            record["logical_length_from"] = index_of[lengths[value_id]]
+        if value_id in result_shapes:
+            record["logical_shape_from"] = index_of[result_shapes[value_id]]
         if runtime_sized and value_id in sources:
             record["extents_from"] = index_of[sources[value_id]]
-        elif runtime_sized:
+        elif runtime_sized and value_id not in capacities:
             record["extents_from"] = "fed"
         buffers.append(record)
     extents = []
@@ -121,13 +163,56 @@ def runtime_abi_description(
             "axis": None if axis is None else int(axis),
         })
     return {
-        "schema": SCHEMA,
+        "schema": (COMPUTED_OUTPUT_SCHEMA
+                   if capacities or lengths or result_shapes else SCHEMA),
         "entry": str(entry),
         "backend": str(backend),
         "signature": f"void {entry}(void **buffers, {extent_type} *extents)",
         "buffers": buffers,
         "extents": {"type": str(extent_type), "order": extents},
     }
+
+
+def apply_native_result_extents(
+    buffers: dict[int, Any], capacities: Mapping[int, Any], *,
+    length_sources: Iterable[tuple[int, int]] = (),
+    shape_sources: Iterable[tuple[int, int]] = (),
+) -> None:
+    """Present native-written logical extents over caller-owned capacities.
+
+    A byte slice may reserve its source's capacity while returning fewer rows.
+    Reading its native length cell preserves that distinction; evaluating the
+    source slice again on the host would create a second implementation.
+    """
+    import numpy as np
+
+    views = {}
+    for output, source in length_sources:
+        output, source = int(output), int(source)
+        allocated = capacities[output]
+        native = np.asarray(buffers[source])
+        if native.dtype.kind not in {"i", "u"} or native.size != 1:
+            raise ValueError("native result length is not one integer")
+        count = int(native.reshape(-1)[0])
+        if allocated.ndim < 1 or not 0 <= count <= allocated.shape[0]:
+            raise ValueError("native result length exceeds its proven capacity")
+        views[output] = allocated[:count]
+    for output, source in shape_sources:
+        output, source = int(output), int(source)
+        allocated = capacities[output]
+        native = np.asarray(buffers[source])
+        if native.dtype.kind not in {"i", "u"} or native.size != allocated.ndim:
+            raise ValueError("native result shape has the wrong rank or element type")
+        shape = tuple(int(value) for value in native.reshape(-1))
+        if any(extent < 0 for extent in shape):
+            raise ValueError("native result shape has a negative extent")
+        count = 1
+        for extent in shape:
+            count *= extent
+        if count > allocated.size:
+            raise ValueError("native result shape exceeds its proven capacity")
+        views[output] = allocated.reshape(-1)[:count].reshape(shape)
+    buffers.update(views)
 
 
 def public_buffer_contract(
