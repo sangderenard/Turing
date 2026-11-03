@@ -4131,6 +4131,142 @@ def lower_tensor_calls_to_repository_ssa(
                 operation = str(operation_value)
                 result = instruction.res
                 args = list(instruction.args)
+                if result.dtype == "ssa.aggregate":
+                    # The source layout has already selected these ordered
+                    # result leaves. Use the passed repository reference's
+                    # canonical operation entrypoint and named output formals;
+                    # the pair has no element dtype of its own.
+                    from .concordance_declarations import SOURCE_AGGREGATE_LAYOUT
+
+                    layout_proof = tuple(
+                        cell for cell in instruction.attributes.get(
+                            "intrinsic_named_result_proof", (),
+                        ) if cell.page == SOURCE_AGGREGATE_LAYOUT
+                    )
+                    operation_reference = reference.operation(operation)
+                    entrypoints = (
+                        () if operation_reference is None
+                        else tuple(operation_reference.entrypoints)
+                    )
+                    roles = tuple(map(str, instruction.arg_roles))
+                    outputs = tuple(map(int, instruction.attributes.get(
+                        "output_ids", (),
+                    )))
+                    if (len(layout_proof) != 1 or len(entrypoints) != 1
+                            or len(args) != len(roles)
+                            or set(roles) != {"arg:0", "kw:k", "kw:dim"}
+                            or len(outputs) != 2):
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "named aggregate call lacks exact layout, input roles or repository entrypoint",
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    layout = book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+                        layout_proof[0].row, layout_proof[0].column,
+                    )
+                    if tuple(int(member.value_id) for member in layout.members) != outputs:
+                        raise ValueError("named aggregate call output identities disagree with source layout")
+                    kernel_name = str(entrypoints[0])
+                    kernel = reference.module.functions[kernel_name]
+                    from ..common.tensors.accelerator_backends.llvm_repository_ssa import (
+                        post_repository_kernel_identity,
+                    )
+                    from .concordance_declarations import SSA_VALUE, TENSOR_SSA_LOWERING
+                    from .ssa_record_return_state import (
+                        function_scope_of, revise_ssa_value,
+                    )
+
+                    post_repository_kernel_identity(kernel, book)
+                    named_outputs = dict(kernel.metadata.get("named_outputs") or ())
+                    if (tuple(named_outputs) != ("values", "indices")
+                            or len(kernel.args) != 7):
+                        raise ValueError("named aggregate repository output contract is incomplete")
+                    by_role = dict(zip(roles, args, strict=True))
+                    source = by_role["arg:0"]
+                    if str(source.dtype) != "int64":
+                        shortfalls.append(TensorSSALoweringShortfall(
+                            function_name, block_name, operation,
+                            "repository named aggregate entrypoint has no matching input dtype",
+                        ))
+                        rewritten.append(instruction)
+                        continue
+                    prefix = []
+                    dynamic = ensure_dynamic(prefix, source)
+                    def prove_native_actual(actual, formal, *, storage, rank):
+                        formal_cell = book.latest_ref(
+                            SSA_VALUE, (function_scope_of(kernel), int(formal.id)),
+                        )
+                        if formal_cell is None:
+                            raise ValueError("repository formal lacks its ingested identity")
+                        formal_fact = book.page(SSA_VALUE).cell(
+                            formal_cell.row, formal_cell.column,
+                        )
+                        if not getattr(formal_fact, "dtype", None):
+                            raise ValueError("repository formal has no declared element dtype")
+                        proof_sources = (layout_proof[0], formal_cell)
+                        native_dtype = str(formal_fact.dtype)
+                        revised = revise_ssa_value(
+                            function, int(actual.id), dtype=native_dtype,
+                            shape=tuple(actual.shape or ()),
+                            stage=TENSOR_SSA_LOWERING,
+                            sources=proof_sources, book=book,
+                            physical={
+                                "physical_dtype": native_dtype,
+                                "storage": storage, "rank": rank,
+                            },
+                        )
+                        if revised is None:
+                            raise ValueError("native actual lacks its SSA identity")
+                        actual.dtype = native_dtype
+                        actual.accounting = {
+                            **dict(actual.accounting or {}),
+                            "physical_dtype": native_dtype,
+                            "program_abi_storage": storage,
+                            "program_abi_rank": rank,
+                        }
+                    def i32_actual(operand):
+                        if str(operand.dtype) == "int32":
+                            return operand
+                        converted = fresh(dtype="int32")
+                        prefix.append(Instr(
+                            "Cast", [operand], converted,
+                            attributes={"target_dtype": "int32"},
+                        ))
+                        return converted
+                    actuals = [
+                        source, dynamic["shape"], dynamic["rank"],
+                        i32_actual(by_role["kw:dim"]),
+                        i32_actual(by_role["kw:k"]),
+                    ]
+                    for position, actual in enumerate(actuals[1:], 1):
+                        prove_native_actual(
+                            actual, kernel.args[position],
+                            storage="span" if position == 1 else "scalar",
+                            rank=1 if position == 1 else 0,
+                        )
+                    attributes = {
+                        key: value for key, value in instruction.attributes.items()
+                        if key not in {"tensor_candidate", "tensor_operation", "tensor"}
+                    }
+                    attributes.update({
+                        "callee": kernel_name,
+                        "result_convention": "ssa.aggregate",
+                        "output_ids": outputs,
+                        "output_positions": (0, 1),
+                        "callee_input_ids": tuple(int(arg.id) for arg in kernel.args[:5]),
+                        "callee_output_ids": (
+                            int(named_outputs["values"]),
+                            int(named_outputs["indices"]),
+                        ),
+                    })
+                    linked_roots.add(kernel_name)
+                    rewritten.extend(prefix)
+                    rewritten.append(Instr(
+                        "Call", actuals, result, attributes=attributes,
+                        source_span=instruction.source_span,
+                    ))
+                    continue
                 raw_basic_axes = instruction.attributes.get(
                     "basic_index_axes"
                 )

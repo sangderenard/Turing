@@ -935,12 +935,9 @@ def plan_region_to_ssa_instrs(
             raise ValueError(
                 f"{region.name!r} is not a flat operator region"
             )
-        if len(item.outputs) > 1:
-            raise ValueError(
-                f"{item.opcode!r} may publish at most one SSA result"
-            )
         result = (
-            value(int(item.outputs[0])) if item.outputs else None
+            value(int(item.outputs[0]))
+            if len(item.outputs) == 1 else None
         )
         # A Python identity replacement is already the call's graph-native
         # meaning.  Its callable/definition input is provenance, not runtime
@@ -961,6 +958,72 @@ def plan_region_to_ssa_instrs(
         else:
             semantic_inputs = tuple(int(value_id) for value_id in item.inputs)
             semantic_roles = tuple(str(role) for role in item.input_roles)
+
+        # A named intrinsic's source pair is structural. Its exact aggregate
+        # layout is the cause of the two numerical results in this region.
+        # Preserve the pair as one SSA aggregate Call and materialize the
+        # source-owned projections through ordinary GEP/Load instructions.
+        if len(item.outputs) > 1:
+            from .concordance_declarations import (
+                ADDRESS, CONTROL_CONST, PLANNER_HIERARCHY,
+                REGION_CALL_RESULT, SOURCE_AGGREGATE_LAYOUT,
+            )
+            from .precompile_to_ssa import _mint_ssa_id
+
+            proof = tuple(dict(item.attributes).get(
+                "intrinsic_named_result_proof", (),
+            ))
+            layout_cells = tuple(
+                cell for cell in proof
+                if cell.page == SOURCE_AGGREGATE_LAYOUT
+            )
+            if len(layout_cells) != 1:
+                raise ValueError(
+                    f"{item.opcode!r} has no exact named aggregate layout"
+                )
+            layout = current_identity_book().page(
+                SOURCE_AGGREGATE_LAYOUT
+            ).cell(layout_cells[0].row, layout_cells[0].column)
+            if tuple(int(member.value_id) for member in layout.members) != tuple(
+                map(int, item.outputs)
+            ):
+                raise ValueError(
+                    f"{item.opcode!r} named aggregate outputs disagree with layout"
+                )
+            aggregate_id = _mint_ssa_id(
+                current_identity_book(), function_scope,
+                REGION_CALL_RESULT, (layout_cells[0],),
+                dtype="ssa.aggregate", shape=(), stage=PLANNER_HIERARCHY,
+            )
+            aggregate = SSAValue(aggregate_id, "ssa.aggregate", ())
+            operands = [value(value_id) for value_id in semantic_inputs]
+            attributes = dict(item.attributes)
+            attributes["output_ids"] = tuple(map(int, item.outputs))
+            attributes["result_convention"] = "ssa.aggregate"
+            instructions.append(Instr(
+                str(item.opcode), operands, aggregate,
+                arg_roles=list(semantic_roles), attributes=attributes,
+            ))
+            for position, output_id in enumerate(item.outputs):
+                index_id = _mint_ssa_id(
+                    current_identity_book(), function_scope,
+                    CONTROL_CONST, (layout_cells[0],),
+                    dtype="int32", shape=(), stage=PLANNER_HIERARCHY,
+                )
+                index = SSAValue(index_id, "int32", ())
+                address_id = _mint_ssa_id(
+                    current_identity_book(), function_scope,
+                    ADDRESS, (layout_cells[0],),
+                    dtype="ptr", shape=(), stage=PLANNER_HIERARCHY,
+                )
+                address = SSAValue(address_id, "ptr", ())
+                instructions.extend((
+                    Instr("Const", [], index, attributes={"value": position}),
+                    Instr("GetElementPtr", [aggregate, index], address,
+                          attributes={"aggregate_index": position}),
+                    Instr("Load", [address], value(int(output_id))),
+                ))
+            continue
 
         opcode = str(item.opcode)
         attributes = dict(item.attributes)
