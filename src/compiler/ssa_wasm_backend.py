@@ -558,6 +558,7 @@ _OP_I64_STORE = 0x37
 _I64_DTYPES = frozenset({"int", "int64", "i64", "long"})
 _I32_DTYPES = frozenset({"int32", "i32", "bool", "i1"})
 _F64_DTYPES = frozenset({"float", "float64", "f64", "double"})
+_F32_DTYPES = frozenset({"float32", "f32", "single"})
 # The C lane's implicit conversions: (double) of an integer and bool widened
 # unsigned.  Narrowings are never implicit: a Cast truncates a double the
 # way C does (i64.trunc_f64_s traps where C's is undefined), and only an
@@ -566,19 +567,25 @@ _CONVERSIONS = {
     ("i64", "f64"): (0xB9,),  # f64.convert_i64_s
     ("i32", "f64"): (0xB7,),  # f64.convert_i32_s
     ("i32", "i64"): (0xAD,),  # i64.extend_i32_u
+    ("f32", "f64"): (0xBB,),  # f64.promote_f32 (fpext)
 }
-_CAST_CONVERSIONS = {**_CONVERSIONS, ("f64", "i64"): (0xB0,)}
+_CAST_CONVERSIONS = {
+    **_CONVERSIONS, ("f64", "i64"): (0xB0,),
+    ("f64", "f32"): (0xB6,),  # f32.demote_f64 (fptrunc)
+}
 _INDEX_CONVERSIONS = {**_CONVERSIONS, ("i64", "i32"): (0xA7,)}
 
 
 @dataclass(frozen=True, slots=True)
 class WasmCoreArtifact:
-    """A whole repository-call module as one exported wasm function.
+    """A whole repository-call module as one wasm module.
 
-    ``parameters`` is the call ABI in formal order: ``("buffer", id)`` for an
-    i32 byte-offset parameter, ``("i32", id)`` / ``("f64", id)`` for scalars
-    passed by value. ``buffer_order`` lists the buffer-parameter value ids,
-    which is what a feed dictionary keys.
+    ``parameters`` is the exported entry's call ABI in formal order:
+    ``("buffer", id)`` for an i32 byte-offset parameter, ``("i32", id)`` /
+    ``("i64", id)`` / ``("f64", id)`` for scalars passed by value.
+    ``buffer_order`` lists the buffer-parameter value ids, which is what a
+    feed dictionary keys.  Every other reachable SSA function is its own
+    wasm function inside the module (see ``emit_ssa_module_to_wasm_core``).
     """
 
     name: str
@@ -594,6 +601,14 @@ class WasmCoreArtifact:
     # Static aggregate cells emitted by the direct core occupy this prefix.
     # The existing host buffer layout starts after it.
     reserved_bytes: int = 8
+    #: Host functions the module imports: ``(module, field, arity)``, all
+    #: ``f64 -> f64`` by arity.  The same libm names the LLVM and C lanes
+    #: declare (``pow``, ``exp``, ``tanh`` ...); a host binds them from
+    #: ``Math``.  Empty when the program reaches none.
+    imports: tuple[tuple[str, str, int], ...] = ()
+    #: ``(name, parameter kinds, result kinds)`` of every further function,
+    #: in function-index order after the entry.  Diagnostics and shells.
+    functions: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -607,10 +622,55 @@ class WasmCoreArtifact:
         )
 
 
+#: Scalar externs the repository's imported LLVM kernels call, and the one
+#: Wasm instruction that spells each exactly.
+_WASM_UNARY_INTRINSICS = {
+    "llvm.fabs.f64": 0x99, "llvm.ceil.f64": 0x9B, "llvm.floor.f64": 0x9C,
+    "llvm.trunc.f64": 0x9D, "llvm.sqrt.f64": 0x9F,
+}
+#: libm functions WebAssembly has no instruction for.  They are imported
+#: from the host under module ``math`` with this arity, the same way the
+#: LLVM lane declares them and links libm: the host supplies ``Math.pow``
+#: and friends.  Parity note for acceptance: a host's ``Math.exp`` is not
+#: bit-identical to MSVC's libm in the last ulp; the Meowdoku law reaches
+#: none of these at run time (they sit in dead opcode arms of
+#: ``unary_double`` / ``binary_value``), so its parity stays exact.
+_MATH_IMPORTS = {
+    "pow": 2, "exp": 1, "log": 1, "sin": 1, "cos": 1, "tan": 1,
+    "asin": 1, "acos": 1, "atan": 1, "sinh": 1, "cosh": 1, "tanh": 1,
+    "asinh": 1, "acosh": 1, "atanh": 1,
+}
+_PTR_DTYPES = frozenset({"ptr", "pointer"})
+_OP_DROP = 0x1A
+_OP_LOCAL_TEE = 0x22
+_OP_F64_ABS = 0x99
+_OP_F64_TRUNC = 0x9D
+_OP_F64_ADD = 0xA0
+_OP_F64_SUB = 0xA1
+_OP_F64_GE = 0x66
+_OP_F64_EQ = 0x61
+_OP_F64_COPYSIGN = 0xA6
+_OP_I32_OR = 0x72
+_OP_I32_AND_ = 0x71
+
+
 def emit_ssa_module_to_wasm_core(
     module: IRModule, function_name: str, *, entry_name: str | None = None,
 ) -> WasmCoreArtifact:
-    """Emit ``function_name`` plus its inlined callees as one wasm function."""
+    """Emit ``function_name`` and its call closure as one wasm module.
+
+    Modelled on the LLVM lane's ``_emit_repository_call_module`` and the C
+    module lane: EVERY reachable SSA function becomes its own wasm function,
+    a ``Call`` is a ``call``, and a callee with several ``Ret`` blocks
+    returns from each (``binary_value`` is a 23-arm opcode switch).  The
+    internal convention is LLVM's: a formal something addresses through is
+    an i32 byte offset into linear memory, a scalar travels by value, and a
+    function's ``Ret`` values are its wasm results (a span result is its
+    pointer).  Only the exported entry keeps the host ABI the shells speak:
+    buffers and scalars in, one output buffer per returned value, no wasm
+    results.  Scalar externs are exact Wasm instructions where one exists
+    (``llvm.fabs.f64`` ...) and ``math`` imports otherwise.
+    """
 
     from .ir_identities import precision_backend_shortfalls
     from .ssa_llvm_backend import (
@@ -622,6 +682,7 @@ def emit_ssa_module_to_wasm_core(
     from .ssa_storage_requirements import (
         is_compiler_owned_storage, module_storage_requirements,
     )
+    from .wasm_binary import WasmFunction, WasmImport, uleb
 
     name = str(entry_name or function_name)
     root: Function = module.functions[function_name]
@@ -636,6 +697,7 @@ def emit_ssa_module_to_wasm_core(
     returned_values = root_returns[-1] if root_returns else ()
     shortfalls: list[WasmEmissionShortfall] = []
     reachable = [function_name]
+    externs: set[str] = set()
     for owner_name in reachable:
         owner = module.functions.get(owner_name)
         if owner is None:
@@ -644,8 +706,11 @@ def emit_ssa_module_to_wasm_core(
             for instruction in block.instrs:
                 if instruction.op in ("Call", "call"):
                     callee_name = str(instruction.attributes.get("callee") or "")
-                    if callee_name in module.functions and callee_name not in reachable:
-                        reachable.append(callee_name)
+                    if callee_name in module.functions:
+                        if callee_name not in reachable:
+                            reachable.append(callee_name)
+                    else:
+                        externs.add(callee_name)
     shortfalls.extend(
         WasmEmissionShortfall(
             "precision_section",
@@ -655,10 +720,11 @@ def emit_ssa_module_to_wasm_core(
         for item in precision_backend_shortfalls(module, "wasm", reachable)
     )
 
-    # A root formal's posted physical span is already a buffer contract,
-    # even if a deeper selected kernel is the first instruction to read it.
-    # Keep identities scoped while closing pointer uses through live Call
-    # actual/formal edges; several functions reuse small numeric SSA IDs.
+    # Which values are addresses.  A root formal's posted physical span is a
+    # buffer contract; a ``ptr`` formal or a non-scalar formal of any
+    # function is one too; GetElementPtr/Store bases are; and pointer-ness
+    # closes through Call actual/formal edges in both directions.  Identities
+    # are scoped by function because several functions reuse small ids.
     pointer_ids: set[tuple[str, int]] = set()
     for formal in root.args:
         fact = posted_ssa_value_fact(root, int(formal.id), book=book)
@@ -668,6 +734,10 @@ def emit_ssa_module_to_wasm_core(
         function = module.functions.get(callee_name)
         if function is None:
             continue
+        for formal in function.args:
+            if (str(formal.dtype or "").casefold() in _PTR_DTYPES
+                    or tuple(getattr(formal, "shape", ()) or ())):
+                pointer_ids.add((function.name, int(formal.id)))
         for block in function.blocks.values():
             for instruction in block.instrs:
                 if str(instruction.op) == "GetElementPtr" and instruction.args:
@@ -692,9 +762,12 @@ def emit_ssa_module_to_wasm_core(
                         continue
                     for actual, formal in zip(instruction.args, callee.args):
                         identity = (owner.name, int(actual.id))
-                        if ((callee.name, int(formal.id)) in pointer_ids
-                                and identity not in pointer_ids):
+                        formal_identity = (callee.name, int(formal.id))
+                        if formal_identity in pointer_ids and identity not in pointer_ids:
                             pointer_ids.add(identity)
+                            changed = True
+                        elif identity in pointer_ids and formal_identity not in pointer_ids:
+                            pointer_ids.add(formal_identity)
                             changed = True
 
     # Receipt (2026-10-24, extra frontends/backends lane, Lane X2): every
@@ -709,12 +782,22 @@ def emit_ssa_module_to_wasm_core(
         dtype = str(value.dtype or "").casefold()
         if dtype in _I64_DTYPES:
             return "i64"
-        if dtype in _I32_DTYPES:
+        if dtype in _I32_DTYPES or dtype in _PTR_DTYPES:
             return "i32"
         if dtype in _F64_DTYPES:
             return "f64"
+        if dtype in _F32_DTYPES:
+            return "f32"
         return None
 
+    def is_pointer(function, value) -> bool:
+        return (
+            (function.name, int(value.id)) in pointer_ids
+            or str(value.dtype or "").casefold() in _PTR_DTYPES
+            or bool(tuple(getattr(value, "shape", ()) or ()))
+        )
+
+    # -- the exported entry's host ABI ---------------------------------------
     parameters: list[tuple[str, int]] = []
     parameter_types: list[str] = []
     compiler_frame_formals = []
@@ -760,61 +843,86 @@ def emit_ssa_module_to_wasm_core(
         parameters.append(("buffer", value_id))
         parameter_types.append("i32")
 
+    # -- internal signatures and the function index space --------------------
+    # Imports first, then the entry, then every other reachable function in
+    # closure order (``WasmFunction`` documents the rule).
+    import_names = sorted(symbol for symbol in externs if symbol in _MATH_IMPORTS)
+    import_index = {symbol: index for index, symbol in enumerate(import_names)}
+    others = [fname for fname in reachable if fname != function_name]
+    function_index = {function_name: len(import_names)}
+    for position, fname in enumerate(others):
+        function_index[fname] = len(import_names) + 1 + position
+
+    def ret_kinds(function, values) -> tuple[str, ...]:
+        kinds = []
+        for value in values:
+            if is_pointer(function, value):
+                kinds.append("i32")
+                continue
+            kind = value_kind(value)
+            if kind is None:
+                shortfalls.append(WasmEmissionShortfall(
+                    "Ret", f"{function.name}: %t{value.id} dtype "
+                    f"{value.dtype!r} has no Wasm result kind",
+                ))
+                kind = "f64"
+            kinds.append(kind)
+        return tuple(kinds)
+
+    signatures: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    for fname in others:
+        function = module.functions[fname]
+        param_kinds = []
+        for formal in function.args:
+            if is_pointer(function, formal):
+                param_kinds.append("i32")
+                continue
+            kind = value_kind(formal)
+            if kind is None:
+                shortfalls.append(WasmEmissionShortfall(
+                    "formal", f"{fname}: %t{formal.id} dtype "
+                    f"{formal.dtype!r} has no Wasm value kind",
+                ))
+                kind = "f64"
+            param_kinds.append(kind)
+        rets = [
+            instruction.args
+            for block in function.blocks.values()
+            for instruction in block.instrs
+            if str(instruction.op) in {"Ret", "ret", "Return", "return"}
+        ]
+        result_kinds = ret_kinds(function, rets[0]) if rets else ()
+        for later in rets[1:]:
+            if ret_kinds(function, later) != result_kinds:
+                shortfalls.append(WasmEmissionShortfall(
+                    "Ret", f"{fname}: Ret blocks disagree on result kinds",
+                ))
+                break
+        signatures[fname] = (tuple(param_kinds), result_kinds)
+
+    # -- shared emission state -----------------------------------------------
     builder = CodeBuilder("f64", parameter_count=len(parameters))
     precision_present = False
     aggregate_slots: dict[tuple[str, int], tuple[int, str, int]] = {}
     aggregate_end = 8
 
     class _Env:
-        """Value id -> local index, with parameters pre-bound."""
+        """Value id -> local index for ONE function body."""
 
         def __init__(self, bindings, function):
             self.slots = dict(bindings)
             self.function = function
             self.kinds = {}
-            # A repository Call may return ``ssa.aggregate``.  The wrapper's
-            # GetElementPtr carries the exact ``source_output_id`` for each
-            # member, so retain that identity rather than reconstructing it
-            # from aggregate position after the callee is inlined.
+            # A repository Call may return ``ssa.aggregate``.  The caller's
+            # GetElementPtr carries the exact ``source_output_id`` (or the
+            # ``aggregate_index`` position) for each member, so retain the
+            # declared identities rather than reconstructing them.
             self.aggregate_members = {}
+            self.aggregate_order = {}
             self.direct_pointer_values = {}
             self.aggregate_element_kind = {}
             self.pointer_element_kind = {}
             self.sequence_storage_address = {}
-
-    root_env = _Env({
-        value_id: index for index, (_, value_id) in enumerate(parameters)
-        if value_id in argument_ids
-    }, root)
-    for kind, value_id in parameters:
-        if value_id not in argument_ids:
-            continue
-        root_env.kinds[value_id] = "i32" if kind == "buffer" else kind
-
-    for formal in compiler_frame_formals:
-        value_id = int(formal.id)
-        requirement = storage_requirements.get(root.name, {}).get(value_id)
-        count = (
-            None if requirement is None or requirement.dynamic else
-            requirement.element_count if requirement.element_count is not None
-            else 1 if not requirement.shape else None
-        )
-        dtype = "" if requirement is None else str(requirement.dtype).casefold()
-        width = 4 if dtype in _I32_DTYPES else 8 if dtype in (_I64_DTYPES | _F64_DTYPES) else None
-        if count is None or width is None:
-            shortfalls.append(WasmEmissionShortfall(
-                "formal", f"compiler frame %t{value_id} has no static storage obligation",
-            ))
-            continue
-        start = (aggregate_end + width - 1) // width * width
-        aggregate_end = start + max(1, count) * width
-        held = builder.declare_local("i32")
-        builder.i32_const(start).local_set(held)
-        root_env.slots[value_id] = held
-        root_env.kinds[value_id] = "i32"
-        root_env.pointer_element_kind[value_id] = (
-            "i32" if width == 4 else "f64" if dtype in _F64_DTYPES else "i64"
-        )
 
     def slot_for(env, value, kind: str):
         value_id = int(value.id)
@@ -837,7 +945,7 @@ def emit_ssa_module_to_wasm_core(
         held = env.slots.get(int(value.id))
         if held is None:
             shortfalls.append(WasmEmissionShortfall(
-                "operand", f"%t{value.id} is unavailable"
+                "operand", f"{env.function.name}: %t{value.id} is unavailable"
             ))
             return None
         builder.local_get(held)
@@ -891,26 +999,37 @@ def emit_ssa_module_to_wasm_core(
         )
         descriptor = None if descriptor is None else descriptor.tensors.get(value_id)
         requirement = storage_requirements.get(env.function.name, {}).get(value_id)
-        if (descriptor is None or requirement is None
-                or descriptor.storage != "temporary"
-                or descriptor.metadata_state != "static"
-                or int(descriptor.data_value_id) != value_id
-                or requirement.dynamic or requirement.element_count is None
-                or tuple(descriptor.shape) != tuple(requirement.shape)
-                or str(descriptor.dtype).casefold() != str(requirement.dtype).casefold()
-                or tuple(output.shape or ()) != tuple(requirement.shape)):
+        # The booked storage must be static and exact.  A ``temporary`` is
+        # the function's own scratch; an ``output`` is the function's own
+        # result span, which the LLVM lane receives as a result pointer and
+        # this lane allocates in the function's static frame and returns.
+        if (requirement is None or requirement.dynamic
+                or requirement.element_count is None
+                or tuple(output.shape or ()) != tuple(requirement.shape)
+                or (descriptor is not None and (
+                    descriptor.storage not in {"temporary", "output"}
+                    or descriptor.metadata_state != "static"
+                    or int(descriptor.data_value_id) != value_id
+                    or tuple(descriptor.shape) != tuple(requirement.shape)
+                    or str(descriptor.dtype).casefold()
+                        != str(requirement.dtype).casefold()))):
             shortfalls.append(WasmEmissionShortfall(
-                "Call", f"output %t{value_id} lacks a booked static temporary arena",
+                "Call", f"{env.function.name}: output %t{value_id} shaped "
+                f"{tuple(output.shape or ())} lacks a booked static arena "
+                f"(requirement {None if requirement is None else (requirement.element_count, tuple(requirement.shape))}, "
+                f"descriptor {None if descriptor is None else descriptor.storage!r})",
             ))
             return
-        spelling = str(descriptor.dtype).casefold()
+        spelling = str(requirement.dtype).casefold()
         element_kind = (
             "f64" if spelling in _F64_DTYPES
             else "i64" if spelling in _I64_DTYPES
             else "i32" if spelling in _I32_DTYPES else None
         )
         width = {"i32": 4, "i64": 8, "f64": 8}.get(element_kind)
-        if width is None or int(descriptor.byte_size or -1) != requirement.element_count * width:
+        if width is None or (
+                descriptor is not None
+                and int(descriptor.byte_size or -1) != requirement.element_count * width):
             shortfalls.append(WasmEmissionShortfall(
                 "Call", f"output %t{value_id} lacks exact element storage width",
             ))
@@ -921,23 +1040,84 @@ def emit_ssa_module_to_wasm_core(
         builder.local_set(slot_for(env, output, "i32"))
         env.pointer_element_kind[value_id] = element_kind
 
-    def emit_known_intrinsic_call(env, instruction) -> bool:
-        """Emit an imported LLVM scalar intrinsic with an exact Wasm opcode."""
+    def emit_extern_call(env, instruction) -> bool:
+        """A call to a function outside the module: an exact Wasm spelling
+        of an LLVM scalar intrinsic, or a ``math`` import.  False when the
+        callee is a module function."""
 
-        intrinsic = instruction.attributes.get("callee")
-        opcode = {"llvm.fabs.f64": 0x99, "llvm.floor.f64": 0x9C}.get(intrinsic)
-        if opcode is None:
+        symbol = str(instruction.attributes.get("callee") or "")
+        if symbol in module.functions:
             return False
-        if (instruction.attributes.get("llvm_opcode") != "call"
-                or len(instruction.args) != 1 or instruction.res is None
-                or value_kind(instruction.res) != "f64"):
-            shortfalls.append(WasmEmissionShortfall(
-                "Call", f"{intrinsic} lacks its imported scalar signature",
-            ))
+        args = instruction.args
+        result = instruction.res
+        opcode = _WASM_UNARY_INTRINSICS.get(symbol)
+        if opcode is not None:
+            if len(args) != 1 or result is None or value_kind(result) != "f64":
+                shortfalls.append(WasmEmissionShortfall(
+                    "Call", f"{symbol} lacks its scalar f64 signature",
+                ))
+                return True
+            if push_as(env, args[0], "f64", "Call"):
+                builder.raw(opcode)
+                builder.local_set(slot_for(env, result, "f64"))
             return True
-        if push_as(env, instruction.args[0], "f64", "Call"):
-            builder.raw(opcode)
-            builder.local_set(slot_for(env, instruction.res, "f64"))
+        if symbol == "llvm.round.f64":
+            # Round half away from zero, which f64.nearest (half to even)
+            # is not: r = trunc(x); |x - r| >= 0.5 ? r + copysign(1, x) : r.
+            if len(args) != 1 or result is None or value_kind(result) != "f64":
+                shortfalls.append(WasmEmissionShortfall(
+                    "Call", f"{symbol} lacks its scalar f64 signature",
+                ))
+                return True
+            if not push_as(env, args[0], "f64", "Call"):
+                return True
+            x = builder.declare_local("f64")
+            r = builder.declare_local("f64")
+            builder.raw(_OP_LOCAL_TEE, *uleb(x)).raw(_OP_F64_TRUNC).local_set(r)
+            builder.local_get(r).value_const(1.0).local_get(x)
+            builder.raw(_OP_F64_COPYSIGN).raw(_OP_F64_ADD)       # val1
+            builder.local_get(r)                                  # val2
+            builder.local_get(x).local_get(r).raw(_OP_F64_SUB)
+            builder.raw(_OP_F64_ABS).value_const(0.5).raw(_OP_F64_GE)
+            builder.select()
+            builder.local_set(slot_for(env, result, "f64"))
+            return True
+        if symbol in {"llvm.fcmp.ord", "llvm.fcmp.uno"}:
+            # ord: neither is NaN; uno: either is.  x == x is false for NaN.
+            if len(args) != 2 or result is None:
+                shortfalls.append(WasmEmissionShortfall(
+                    "Call", f"{symbol} lacks its two f64 operands",
+                ))
+                return True
+            # push a; push a; eq; push b; push b; eq; and  (xor 1 for uno).
+            if not (push_as(env, args[0], "f64", "Call")
+                    and push_as(env, args[0], "f64", "Call")):
+                return True
+            builder.raw(_OP_F64_EQ)
+            if not (push_as(env, args[1], "f64", "Call")
+                    and push_as(env, args[1], "f64", "Call")):
+                return True
+            builder.raw(_OP_F64_EQ).raw(_OP_I32_AND_)
+            if symbol == "llvm.fcmp.uno":
+                builder.i32_const(1).raw(0x73)  # xor 1
+            builder.local_set(slot_for(env, result, "i32"))
+            return True
+        arity = _MATH_IMPORTS.get(symbol)
+        if arity is not None:
+            if len(args) != arity or result is None or value_kind(result) != "f64":
+                shortfalls.append(WasmEmissionShortfall(
+                    "Call", f"{symbol} lacks its f64 x{arity} -> f64 signature",
+                ))
+                return True
+            for argument in args:
+                if not push_as(env, argument, "f64", "Call"):
+                    return True
+            builder.call(import_index[symbol])
+            builder.local_set(slot_for(env, result, "f64"))
+            return True
+        shortfalls.append(WasmEmissionShortfall(
+            "Call", f"callee {symbol!r} is absent",
+        ))
         return True
 
     def emit_straight_instruction(env, instruction) -> None:
@@ -1097,9 +1277,14 @@ def emit_ssa_module_to_wasm_core(
             return
         if operation == "GetElementPtr" and len(instruction.args) >= 2:
             aggregate = env.aggregate_members.get(int(instruction.args[0].id))
-            source_output_id = instruction.attributes.get("source_output_id")
-            if aggregate is not None and source_output_id is not None:
-                held = aggregate.get(int(source_output_id))
+            if aggregate is not None:
+                source_output_id = instruction.attributes.get("source_output_id")
+                if source_output_id is None:
+                    position = instruction.attributes.get("aggregate_index")
+                    order = env.aggregate_order.get(int(instruction.args[0].id), ())
+                    if type(position) is int and 0 <= position < len(order):
+                        source_output_id = order[position]
+                held = None if source_output_id is None else aggregate.get(int(source_output_id))
                 if held is None:
                     shortfalls.append(WasmEmissionShortfall(
                         operation,
@@ -1137,7 +1322,7 @@ def emit_ssa_module_to_wasm_core(
             )
             if element_kind not in {"i32", "i64", "f64"}:
                 shortfalls.append(WasmEmissionShortfall(
-                    operation, f"%t{base_id} has no proved element layout",
+                    operation, f"{env.function.name}: %t{base_id} has no proved element layout",
                 ))
                 return
             # Address scale follows the source buffer's booked physical
@@ -1154,9 +1339,11 @@ def emit_ssa_module_to_wasm_core(
         if operation == "Load" and instruction.args:
             direct = env.direct_pointer_values.get(int(instruction.args[0].id))
             if direct is not None:
-                value_id, held_kind = direct
+                value_id, held_kind, element_kind = direct
                 env.slots[int(instruction.res.id)] = value_id
                 env.kinds[int(instruction.res.id)] = held_kind
+                if held_kind == "i32" and element_kind is not None:
+                    env.pointer_element_kind[int(instruction.res.id)] = element_kind
                 return
             address_id = int(instruction.args[0].id)
             element_kind = env.pointer_element_kind.get(address_id)
@@ -1177,8 +1364,8 @@ def emit_ssa_module_to_wasm_core(
                     or result_fact is None or result_fact.storage == "span"):
                 shortfalls.append(WasmEmissionShortfall(
                     operation,
-                    f"%t{instruction.res.id} lacks a scalar load matching "
-                    "its proved pointer element",
+                    f"{env.function.name}: %t{instruction.res.id} lacks a "
+                    "scalar load matching its proved pointer element",
                 ))
                 return
             if not push_as(env, instruction.args[0], "i32", operation):
@@ -1226,6 +1413,88 @@ def emit_ssa_module_to_wasm_core(
             builder.local_set(slot_for(env, instruction.res, kind or "f64"))
             return
         if operation in {"Cast", "CastLike"} and instruction.args:
+            result_shape = tuple(getattr(instruction.res, "shape", ()) or ())
+            if result_shape:
+                # A SHAPED cast is the elementwise cast of a span into a
+                # fresh array of the result's physical element type -- the
+                # loop the C module lane and the LLVM lane both emit.  The
+                # region-boundary conversions the compiler inserts
+                # (``physical_region_input_conversion``) are this shape.
+                source = instruction.args[0]
+                source_shape = tuple(getattr(source, "shape", ()) or ())
+                if (source_shape != result_shape or any(
+                        type(extent) is not int or extent < 0
+                        for extent in result_shape)):
+                    shortfalls.append(WasmEmissionShortfall(
+                        operation, f"{env.function.name}: array cast requires "
+                        f"a matching static shape ({source_shape} -> {result_shape})",
+                    ))
+                    return
+                source_kind = (
+                    env.pointer_element_kind.get(int(source.id))
+                    or physical_kind(env, source)
+                )
+                target_kind = physical_kind(env, instruction.res) or value_kind(instruction.res)
+                if (source_kind not in {"i32", "i64", "f64"}
+                        or target_kind not in {"i32", "i64", "f64"}
+                        or env.kinds.get(int(source.id)) != "i32"):
+                    shortfalls.append(WasmEmissionShortfall(
+                        operation, f"{env.function.name}: array cast of "
+                        f"%t{source.id} lacks proved span element kinds "
+                        f"({source_kind} -> {target_kind})",
+                    ))
+                    return
+                from math import prod
+                count = prod(result_shape)
+                width = 4 if target_kind == "i32" else 8
+                start = (aggregate_end + width - 1) // width * width
+                aggregate_end = start + max(1, count) * width
+                destination = slot_for(env, instruction.res, "i32")
+                builder.i32_const(start).local_set(destination)
+                env.pointer_element_kind[int(instruction.res.id)] = target_kind
+                target_is_bool = str(instruction.res.dtype).casefold() in {"bool", "i1"}
+                source_is_bool = str(source.dtype).casefold() in {"bool", "i1"}
+                counter = builder.declare_local("i32")
+                builder.i32_const(0).local_set(counter)
+                builder.block().loop()
+                builder.local_get(counter).i32_const(count)
+                builder.raw(OP_I32_GE_S).br_if(1)
+                builder.local_get(destination)
+                builder.local_get(counter).i32_const(2 if width == 4 else 3)
+                builder.raw(_OP_I32_SHL).raw(OP_I32_ADD)
+                builder.local_get(env.slots[int(source.id)])
+                builder.local_get(counter).i32_const(2 if source_kind == "i32" else 3)
+                builder.raw(_OP_I32_SHL).raw(OP_I32_ADD)
+                if source_kind == "i32":
+                    builder.i32_load()
+                elif source_kind == "i64":
+                    builder.i64_load()
+                else:
+                    builder.load()
+                if target_is_bool:
+                    if source_kind == "i64":
+                        builder.i64_const(0).raw(_OP_I64_NE)
+                    elif source_kind == "f64":
+                        builder.value_const(0.0).raw(_OP_F64_NE)
+                    else:
+                        builder.i32_const(0).raw(_OP_I32_NE)
+                elif source_kind != target_kind:
+                    builder.raw(*{
+                        ("i64", "f64"): (0xB9,), ("i32", "f64"): (0xB7,),
+                        ("f64", "i64"): (0xB0,), ("f64", "i32"): (0xAA,),
+                        ("i32", "i64"): (0xAD,) if source_is_bool else (0xAC,),
+                        ("i64", "i32"): (0xA7,),
+                    }[(source_kind, target_kind)])
+                if target_kind == "i32":
+                    builder.i32_store_width(32)
+                elif target_kind == "i64":
+                    builder.i64_store()
+                else:
+                    builder.store()
+                builder.local_get(counter).i32_const(1)
+                builder.raw(OP_I32_ADD).local_set(counter)
+                builder.br(0).end().end()
+                return
             kind = value_kind(instruction.res)
             if kind is None:
                 shortfalls.append(WasmEmissionShortfall(
@@ -1270,7 +1539,9 @@ def emit_ssa_module_to_wasm_core(
             casts = {
                 ("UiToFp", "i32", "f64", "uitofp"): 0xB8,
                 ("SiToFp", "i64", "f64", "sitofp"): 0xB9,
+                ("SiToFp", "i32", "f64", "sitofp"): 0xB7,
                 ("FpToSi", "f64", "i64", "fptosi"): 0xB0,
+                ("FpToSi", "f64", "i32", "fptosi"): 0xAA,
             }
             if len(instruction.args) != 1 or instruction.res is None:
                 shortfalls.append(WasmEmissionShortfall(
@@ -1379,174 +1650,132 @@ def emit_ssa_module_to_wasm_core(
             }[kind][operation])
             builder.local_set(slot_for(env, instruction.res, "i32"))
             return
-        shortfalls.append(WasmEmissionShortfall(
-            operation, "no module-lane WASM spelling"
-        ))
-
-    def inline_call(env, instruction) -> None:
-        if emit_known_intrinsic_call(env, instruction):
-            return
-        callee_name = str(instruction.attributes.get("callee") or "")
-        callee = module.functions.get(callee_name)
-        if callee is None:
+        if operation in TENSOR_OPERATION_SCALAR_SPELLING or operation == "equal":
+            shapes = tuple(
+                tuple(getattr(argument, "shape", ()) or ())
+                for argument in instruction.args
+            )
             shortfalls.append(WasmEmissionShortfall(
-                "Call",
-                f"callee {callee_name!r} is absent",
+                operation,
+                f"{env.function.name}: bare tensor {operation} over {shapes} "
+                "is not a linked kernel; the core spells only repository "
+                "kernels and scalars (the C module lane refuses this "
+                "instruction by name too)",
             ))
             return
+        shortfalls.append(WasmEmissionShortfall(
+            operation, f"{env.function.name}: no module-lane WASM spelling"
+        ))
+
+    def emit_call(env, instruction) -> None:
+        """``call`` a module function with the LLVM-style internal ABI."""
+
+        if emit_extern_call(env, instruction):
+            return
+        callee_name = str(instruction.attributes.get("callee") or "")
+        callee = module.functions[callee_name]
         if len(instruction.args) != len(callee.args):
             shortfalls.append(WasmEmissionShortfall(
                 "Call", f"callee {callee_name!r} actual/formal arity disagrees",
             ))
             return
         ensure_call_output_arena(env, instruction)
-        # The callee's formals alias the caller's actual slots; everything
-        # else the callee computes gets fresh locals in its own namespace.
-        callee_env = _Env({}, callee)
-        for actual, formal in zip(instruction.args, callee.args):
-            held = env.slots.get(int(actual.id))
-            if held is None:
-                shortfalls.append(WasmEmissionShortfall(
-                    "Call", f"actual %t{actual.id} is unavailable",
-                ))
+        param_kinds, result_kinds = signatures[callee_name]
+        for actual, kind in zip(instruction.args, param_kinds):
+            if not push_as(env, actual, kind, "Call", _INDEX_CONVERSIONS):
                 return
-            callee_env.slots[int(formal.id)] = held
-            callee_env.kinds[int(formal.id)] = env.kinds.get(int(actual.id))
-        if set(callee.blocks) == {"entry"}:
-            for callee_instruction in callee.blocks["entry"].instrs:
-                operation = str(callee_instruction.op)
-                if operation in ("Ret", "Return"):
-                    continue
-                if operation in ("Call", "call"):
-                    inline_call(callee_env, callee_instruction)
-                    continue
-                emit_straight_instruction(callee_env, callee_instruction)
-        else:
-            # The selected broadcast/binary kernels contain real loops and
-            # Phi edges. Inline their existing SSA blocks with the same label
-            # dispatcher used for the root, within a block that returns to
-            # this exact caller instruction when the callee reaches Ret.
-            callee_order = list(callee.blocks)
-            if not callee_order or callee_order[0] != "entry":
-                shortfalls.append(WasmEmissionShortfall(
-                    "Call", f"callee {callee_name!r} lacks entry block",
-                ))
-                return
-            callee_label = builder.declare_local("i32")
-            for callee_block in callee.blocks.values():
-                for callee_instruction in callee_block.instrs:
-                    if str(callee_instruction.op) == "Phi" and callee_instruction.res is not None:
-                        slot_for(callee_env, callee_instruction.res, phi_kind(callee_instruction))
-            builder.block()  # return from the inlined callee
-            builder.loop()
-            for _ in callee_order:
-                builder.block()
-            for index in range(len(callee_order)):
-                builder.local_get(callee_label).i32_const(index)
-                builder.raw(_OP_I32_EQ).br_if(index)
-            builder.raw(_OP_UNREACHABLE)
-            for index, block_name in enumerate(callee_order):
-                builder.end()
-                depth_to_loop = len(callee_order) - 1 - index
-                for callee_instruction in callee.blocks[block_name].instrs:
-                    operation = str(callee_instruction.op)
-                    if operation == "Phi":
-                        continue
-                    if operation in ("Call", "call"):
-                        inline_call(callee_env, callee_instruction)
-                    elif operation == "Br":
-                        target = str(callee_instruction.attributes.get("target"))
-                        if target not in callee.blocks:
-                            shortfalls.append(WasmEmissionShortfall(
-                                "Br", f"callee {callee_name!r} has unknown target {target!r}",
-                            ))
-                            continue
-                        edge_assignments(callee_env, callee, block_name, target)
-                        builder.i32_const(callee_order.index(target))
-                        builder.local_set(callee_label)
-                        builder.br(depth_to_loop)
-                    elif operation == "CondBr":
-                        on_true = str(callee_instruction.attributes.get("true_target"))
-                        on_false = str(callee_instruction.attributes.get("false_target"))
-                        if on_true not in callee.blocks or on_false not in callee.blocks:
-                            shortfalls.append(WasmEmissionShortfall(
-                                "CondBr", f"callee {callee_name!r} has unknown target",
-                            ))
-                            continue
-                        condition = push(callee_env, callee_instruction.args[0])
-                        if condition == "i64":
-                            builder.i64_const(0).raw(_OP_I64_NE)
-                        elif condition != "i32":
-                            if condition is not None:
-                                shortfalls.append(WasmEmissionShortfall(
-                                    "CondBr", f"condition %t{callee_instruction.args[0].id} is {condition}",
-                                ))
-                            continue
-                        builder.if_()
-                        edge_assignments(callee_env, callee, block_name, on_true)
-                        builder.i32_const(callee_order.index(on_true))
-                        builder.local_set(callee_label)
-                        builder.br(depth_to_loop + 1)
-                        builder.else_()
-                        edge_assignments(callee_env, callee, block_name, on_false)
-                        builder.i32_const(callee_order.index(on_false))
-                        builder.local_set(callee_label)
-                        builder.br(depth_to_loop + 1)
-                        builder.end()
-                    elif operation in ("Ret", "Return"):
-                        builder.br(depth_to_loop + 1)
-                    else:
-                        emit_straight_instruction(callee_env, callee_instruction)
-            builder.end()  # callee dispatcher loop
-            builder.end()  # caller continuation
-        if instruction.res is None:
+        builder.call(function_index[callee_name])
+        result = instruction.res
+        if result is None:
+            for _ in result_kinds:
+                builder.raw(_OP_DROP)
             return
-        returned = tuple(
+        returned = next((
             item.args
             for block in callee.blocks.values()
             for item in block.instrs
             if str(item.op) in {"Ret", "Return"}
-        )
+        ), ())
         declared = tuple(
             int(value_id)
             for value_id in instruction.attributes.get("output_ids", ())
         )
-        if (not returned or len(declared) != len(returned[-1])
-                or any(tuple(int(value.id) for value in values)
-                       != tuple(int(value.id) for value in returned[-1])
-                       for values in returned[:-1])):
-            shortfalls.append(WasmEmissionShortfall(
-                "Call",
-                f"callee {callee_name!r} aggregate result disagrees with "
-                "its declared output_ids",
-            ))
-            return
-        returned_by_id = {
-            int(value.id): (
-                None if callee_env.slots.get(int(value.id)) is None
-                else (
-                    callee_env.slots[int(value.id)],
-                    callee_env.kinds.get(int(value.id)),
-                )
+        aggregate = (
+            instruction.attributes.get("result_convention") == "ssa.aggregate"
+            or str(result.dtype or "").casefold() == "ssa.aggregate"
+            or bool(declared)
+        )
+        if aggregate:
+            callee_ids = tuple(
+                int(value_id) for value_id in
+                instruction.attributes.get("callee_output_ids", declared)
             )
-            for value in returned[-1]
-        }
-        if set(returned_by_id) != set(declared) or any(
-            held is None for held in returned_by_id.values()
-        ):
+            every_return = [
+                tuple(int(value.id) for value in item.args)
+                for block in callee.blocks.values()
+                for item in block.instrs
+                if str(item.op) in {"Ret", "Return"}
+            ]
+            if (len(declared) != len(result_kinds) or not every_return
+                    or any(ids != callee_ids for ids in every_return)):
+                shortfalls.append(WasmEmissionShortfall(
+                    "Call",
+                    f"callee {callee_name!r} aggregate result disagrees with "
+                    "its declared output_ids",
+                ))
+                return
+            members = {}
+            # Results come back top of stack last: bind them in reverse.
+            for position in reversed(range(len(declared))):
+                kind = result_kinds[position]
+                held = builder.declare_local(kind)
+                builder.local_set(held)
+                element = None
+                if kind == "i32" and position < len(returned):
+                    element = _callee_element_kind(callee, returned[position])
+                members[declared[position]] = (held, kind, element)
+            env.aggregate_members[int(result.id)] = members
+            env.aggregate_order[int(result.id)] = declared
+            return
+        output_position = instruction.attributes.get("ssa_output_argument")
+        if (type(output_position) is int
+                and 0 <= output_position < len(instruction.args)
+                and int(instruction.args[output_position].id) == int(result.id)):
+            # The result IS the output argument the caller already owns.
+            for _ in result_kinds:
+                builder.raw(_OP_DROP)
+            return
+        if len(result_kinds) != 1:
             shortfalls.append(WasmEmissionShortfall(
-                "Call",
-                f"callee {callee_name!r} did not materialize its exact "
-                "declared output identities",
+                "Call", f"callee {callee_name!r} returns {len(result_kinds)} "
+                "values into one result",
             ))
             return
-        env.aggregate_members[int(instruction.res.id)] = {
-            value_id: returned_by_id[value_id] for value_id in declared
-        }
+        kind = result_kinds[0]
+        builder.local_set(slot_for(env, result, kind))
+        if kind == "i32" and returned:
+            element = _callee_element_kind(callee, returned[0])
+            if element is not None:
+                env.pointer_element_kind[int(result.id)] = element
 
-    # -- the wrapper CFG through the label dispatcher -----------------------
-    order = list(root.blocks)
-    label_local = builder.declare_local("i32")  # zero-initialised: entry
+    def _callee_element_kind(callee, value):
+        fact = posted_ssa_value_fact(callee, int(value.id), book=book)
+        if fact is None:
+            return None
+        spelling = str(fact.physical_dtype or "").casefold()
+        if spelling in _F64_DTYPES:
+            return "f64"
+        if spelling in _I64_DTYPES:
+            return "i64"
+        if spelling in _I32_DTYPES:
+            return "i32"
+        return None
+
+    def phi_kind(instruction) -> str:
+        return value_kind(instruction.res) or next((
+            value_kind(argument) for argument in instruction.args
+            if argument is not None and value_kind(argument) is not None
+        ), "f64")
 
     def edge_assignments(env, function, source_block: str, target_block: str) -> None:
         # Every Phi on an edge reads its incoming value before any Phi on
@@ -1578,135 +1807,237 @@ def emit_ssa_module_to_wasm_core(
         for destination in reversed(destinations):
             builder.local_set(destination)
 
-    def phi_kind(instruction) -> str:
-        return value_kind(instruction.res) or next((
-            value_kind(argument) for argument in instruction.args
-            if argument is not None and value_kind(argument) is not None
-        ), "f64")
+    def emit_cfg(function, env, on_return) -> None:
+        """The function's CFG through the classic label dispatcher: a loop
+        over nested blocks selected by a label local, WebAssembly's
+        structured spelling of an arbitrary branch.  ``on_return`` emits a
+        ``Ret``'s values in the function's own convention."""
 
-    # Phi results need their locals to exist before any predecessor writes
-    # them, so walk them first.
-    for block_name in order:
-        for instruction in root.blocks[block_name].instrs:
-            if str(instruction.op) == "Phi" and instruction.res is not None:
-                slot_for(root_env, instruction.res, phi_kind(instruction))
-
-    count = len(order)
-    builder.loop()
-    for _ in range(count):
-        builder.block()
-    for index in range(count):
-        builder.local_get(label_local).i32_const(index)
-        builder.raw(_OP_I32_EQ).br_if(index)
-    builder.raw(_OP_UNREACHABLE)
-    for index, block_name in enumerate(order):
-        builder.end()  # opens block ``index``'s straight-line code region
-        depth_to_loop = count - 1 - index
-        for instruction in root.blocks[block_name].instrs:
-            operation = str(instruction.op)
-            if operation == "Phi":
-                continue  # defined by edge assignments
-            if operation in ("Call", "call"):
-                inline_call(root_env, instruction)
-                continue
-            if operation == "Br":
-                target = str(instruction.attributes.get("target"))
-                edge_assignments(root_env, root, block_name, target)
-                builder.i32_const(order.index(target))
-                builder.local_set(label_local)
-                builder.br(depth_to_loop)
-                continue
-            if operation == "CondBr":
-                on_true = str(instruction.attributes.get("true_target"))
-                on_false = str(instruction.attributes.get("false_target"))
-                condition = push(root_env, instruction.args[0])
-                if condition == "i64":
-                    builder.i64_const(0).raw(_OP_I64_NE)
-                elif condition != "i32":
-                    if condition is not None:
-                        shortfalls.append(WasmEmissionShortfall(
-                            operation,
-                            f"condition %t{instruction.args[0].id} is "
-                            f"{condition}",
-                        ))
+        order = list(function.blocks)
+        label_local = builder.declare_local("i32")  # zero-initialised: entry
+        # Phi results need their locals to exist before any predecessor
+        # writes them, so walk them first.
+        for block_name in order:
+            for instruction in function.blocks[block_name].instrs:
+                if str(instruction.op) == "Phi" and instruction.res is not None:
+                    slot_for(env, instruction.res, phi_kind(instruction))
+        count = len(order)
+        builder.loop()
+        for _ in range(count):
+            builder.block()
+        for index in range(count):
+            builder.local_get(label_local).i32_const(index)
+            builder.raw(_OP_I32_EQ).br_if(index)
+        builder.raw(_OP_UNREACHABLE)
+        for index, block_name in enumerate(order):
+            builder.end()  # opens block ``index``'s straight-line code region
+            depth_to_loop = count - 1 - index
+            for instruction in function.blocks[block_name].instrs:
+                operation = str(instruction.op)
+                if operation == "Phi":
+                    continue  # defined by edge assignments
+                if operation in ("Call", "call"):
+                    emit_call(env, instruction)
                     continue
-                builder.if_()
-                edge_assignments(root_env, root, block_name, on_true)
-                builder.i32_const(order.index(on_true))
-                builder.local_set(label_local)
-                builder.br(depth_to_loop + 1)
-                builder.else_()
-                edge_assignments(root_env, root, block_name, on_false)
-                builder.i32_const(order.index(on_false))
-                builder.local_set(label_local)
-                builder.br(depth_to_loop + 1)
-                builder.end()
-                continue
-            if operation in ("Ret", "Return"):
-                for returned in instruction.args:
-                    output_parameter = output_parameter_indices.get(
-                        int(returned.id)
-                    )
-                    if output_parameter is None:
+                if operation == "Br":
+                    target = str(instruction.attributes.get("target"))
+                    if target not in function.blocks:
+                        shortfalls.append(WasmEmissionShortfall(
+                            "Br", f"{function.name} has unknown target {target!r}",
+                        ))
                         continue
-                    if (root.name, int(returned.id)) in pointer_ids or returned.shape:
-                        result_fact = posted_ssa_value_fact(
-                            root, int(returned.id), book=book,
-                        )
-                        count = output_elements.get(int(returned.id))
-                        source_slot = root_env.slots.get(int(returned.id))
-                        source_kind = root_env.kinds.get(int(returned.id))
-                        element_kind = (
-                            None if result_fact is None else physical_kind(root_env, returned)
-                        )
-                        if (count is None or source_slot is None
-                                or source_kind != "i32"
-                                or result_fact is None
-                                or result_fact.storage != "span"
-                                or result_fact.rank != len(tuple(returned.shape or ()))
-                                or element_kind not in {"f64", "i64"}):
+                    edge_assignments(env, function, block_name, target)
+                    builder.i32_const(order.index(target))
+                    builder.local_set(label_local)
+                    builder.br(depth_to_loop)
+                    continue
+                if operation == "CondBr":
+                    on_true = str(instruction.attributes.get("true_target"))
+                    on_false = str(instruction.attributes.get("false_target"))
+                    if on_true not in function.blocks or on_false not in function.blocks:
+                        shortfalls.append(WasmEmissionShortfall(
+                            "CondBr", f"{function.name} has unknown target",
+                        ))
+                        continue
+                    condition = push(env, instruction.args[0])
+                    if condition == "i64":
+                        builder.i64_const(0).raw(_OP_I64_NE)
+                    elif condition != "i32":
+                        if condition is not None:
                             shortfalls.append(WasmEmissionShortfall(
-                                "Ret", "aggregate return has no exact span "
-                                f"storage and static output count: %t{returned.id}",
+                                operation,
+                                f"condition %t{instruction.args[0].id} is "
+                                f"{condition}",
                             ))
-                            continue
-                        counter = builder.declare_local("i32")
-                        builder.i32_const(0).local_set(counter)
-                        builder.block().loop()
-                        builder.local_get(counter).i32_const(count)
-                        builder.raw(OP_I32_GE_S).br_if(1)
-                        builder.local_get(output_parameter)
-                        builder.local_get(counter).i32_const(3)
-                        builder.raw(_OP_I32_SHL).raw(OP_I32_ADD)
-                        builder.local_get(source_slot)
-                        builder.local_get(counter).i32_const(3)
-                        builder.raw(_OP_I32_SHL).raw(OP_I32_ADD)
-                        if element_kind == "i64":
-                            builder.i64_load().i64_store()
-                        else:
-                            builder.load().store()
-                        builder.local_get(counter).i32_const(1)
-                        builder.raw(OP_I32_ADD).local_set(counter)
-                        builder.br(0).end().end()
                         continue
-                    builder.local_get(output_parameter)
-                    if output_dtypes[int(returned.id)] == "int64":
-                        if push_as(root_env, returned, "i64", operation):
-                            builder.raw(_OP_I64_STORE, 3, 0)
-                    elif push_as(root_env, returned, "f64", operation):
-                        builder.store()
-                builder.raw(_OP_RETURN)
+                    builder.if_()
+                    edge_assignments(env, function, block_name, on_true)
+                    builder.i32_const(order.index(on_true))
+                    builder.local_set(label_local)
+                    builder.br(depth_to_loop + 1)
+                    builder.else_()
+                    edge_assignments(env, function, block_name, on_false)
+                    builder.i32_const(order.index(on_false))
+                    builder.local_set(label_local)
+                    builder.br(depth_to_loop + 1)
+                    builder.end()
+                    continue
+                if operation in ("Ret", "Return"):
+                    on_return(instruction)
+                    builder.raw(_OP_RETURN)
+                    continue
+                emit_straight_instruction(env, instruction)
+        builder.end()  # the dispatcher loop
+        # Every block branches or returns, so this point is never reached;
+        # ``unreachable`` is stack-polymorphic, which lets a function with
+        # results validate here.
+        builder.raw(_OP_UNREACHABLE)
+
+    # -- the exported entry --------------------------------------------------
+    root_env = _Env({
+        value_id: index for index, (_, value_id) in enumerate(parameters)
+        if value_id in argument_ids
+    }, root)
+    for kind, value_id in parameters:
+        if value_id not in argument_ids:
+            continue
+        root_env.kinds[value_id] = "i32" if kind == "buffer" else kind
+    for kind, value_id in parameters:
+        if value_id in argument_ids and kind == "buffer":
+            element = physical_kind(root_env, next(
+                formal for formal in root.args if int(formal.id) == value_id
+            ))
+            if element is not None:
+                root_env.pointer_element_kind[value_id] = element
+
+    for formal in compiler_frame_formals:
+        value_id = int(formal.id)
+        requirement = storage_requirements.get(root.name, {}).get(value_id)
+        count = (
+            None if requirement is None or requirement.dynamic else
+            requirement.element_count if requirement.element_count is not None
+            else 1 if not requirement.shape else None
+        )
+        dtype = "" if requirement is None else str(requirement.dtype).casefold()
+        width = 4 if dtype in _I32_DTYPES else 8 if dtype in (_I64_DTYPES | _F64_DTYPES) else None
+        if count is None or width is None:
+            shortfalls.append(WasmEmissionShortfall(
+                "formal", f"compiler frame %t{value_id} has no static storage obligation",
+            ))
+            continue
+        start = (aggregate_end + width - 1) // width * width
+        aggregate_end = start + max(1, count) * width
+        held = builder.declare_local("i32")
+        builder.i32_const(start).local_set(held)
+        root_env.slots[value_id] = held
+        root_env.kinds[value_id] = "i32"
+        root_env.pointer_element_kind[value_id] = (
+            "i32" if width == 4 else "f64" if dtype in _F64_DTYPES else "i64"
+        )
+
+    def root_return(instruction) -> None:
+        for returned in instruction.args:
+            output_parameter = output_parameter_indices.get(int(returned.id))
+            if output_parameter is None:
                 continue
-            emit_straight_instruction(root_env, instruction)
-    builder.end()  # the dispatcher loop
+            if (root.name, int(returned.id)) in pointer_ids or returned.shape:
+                result_fact = posted_ssa_value_fact(
+                    root, int(returned.id), book=book,
+                )
+                count = output_elements.get(int(returned.id))
+                source_slot = root_env.slots.get(int(returned.id))
+                source_kind = root_env.kinds.get(int(returned.id))
+                element_kind = (
+                    None if result_fact is None else physical_kind(root_env, returned)
+                )
+                if (count is None or source_slot is None
+                        or source_kind != "i32"
+                        or result_fact is None
+                        or result_fact.storage != "span"
+                        or result_fact.rank != len(tuple(returned.shape or ()))
+                        or element_kind not in {"f64", "i64"}):
+                    shortfalls.append(WasmEmissionShortfall(
+                        "Ret", "aggregate return has no exact span "
+                        f"storage and static output count: %t{returned.id}",
+                    ))
+                    continue
+                counter = builder.declare_local("i32")
+                builder.i32_const(0).local_set(counter)
+                builder.block().loop()
+                builder.local_get(counter).i32_const(count)
+                builder.raw(OP_I32_GE_S).br_if(1)
+                builder.local_get(output_parameter)
+                builder.local_get(counter).i32_const(3)
+                builder.raw(_OP_I32_SHL).raw(OP_I32_ADD)
+                builder.local_get(source_slot)
+                builder.local_get(counter).i32_const(3)
+                builder.raw(_OP_I32_SHL).raw(OP_I32_ADD)
+                if element_kind == "i64":
+                    builder.i64_load().i64_store()
+                else:
+                    builder.load().store()
+                builder.local_get(counter).i32_const(1)
+                builder.raw(OP_I32_ADD).local_set(counter)
+                builder.br(0).end().end()
+                continue
+            builder.local_get(output_parameter)
+            if output_dtypes[int(returned.id)] == "int64":
+                if push_as(root_env, returned, "i64", "Ret"):
+                    builder.raw(_OP_I64_STORE, 3, 0)
+            elif push_as(root_env, returned, "f64", "Ret"):
+                builder.store()
+
+    emit_cfg(root, root_env, root_return)
+    root_builder = builder
+
+    # -- every other reachable function --------------------------------------
+    further: list = []
+    for fname in others:
+        function = module.functions[fname]
+        param_kinds, result_kinds = signatures[fname]
+        builder = CodeBuilder("f64", parameter_count=len(param_kinds))
+        env = _Env({int(formal.id): index for index, formal in enumerate(function.args)}, function)
+        for formal, kind in zip(function.args, param_kinds):
+            env.kinds[int(formal.id)] = kind
+            if kind == "i32":
+                element = physical_kind(env, formal)
+                if element is not None:
+                    env.pointer_element_kind[int(formal.id)] = element
+
+        def callee_return(instruction, env=env, result_kinds=result_kinds) -> None:
+            if len(instruction.args) != len(result_kinds):
+                shortfalls.append(WasmEmissionShortfall(
+                    "Ret", f"{env.function.name}: Ret arity disagrees with its signature",
+                ))
+                return
+            for value, kind in zip(instruction.args, result_kinds):
+                if not push_as(env, value, kind, "Ret", _INDEX_CONVERSIONS):
+                    return
+
+        emit_cfg(function, env, callee_return)
+        further.append(WasmFunction(
+            name=fname, parameter_types=tuple(param_kinds), body=builder,
+            result_types=tuple(result_kinds),
+        ))
+    builder = root_builder
 
     binary = b""
+    imports = [
+        WasmImport(
+            module="math", field=symbol, kind="func",
+            parameter_types=("f64",) * _MATH_IMPORTS[symbol],
+            result_types=("f64",),
+        )
+        for symbol in import_names
+    ]
     if not shortfalls:
         binary = build_module(
             function_name=name,
             parameter_types=parameter_types,
-            body=builder,
+            body=root_builder,
             memory_pages=max(1, (aggregate_end + 65535) // 65536),
+            imports=imports,
+            functions=further,
         )
     return WasmCoreArtifact(
         name=name,
@@ -1718,6 +2049,11 @@ def emit_ssa_module_to_wasm_core(
         output_dtypes=tuple(sorted(output_dtypes.items())),
         output_elements=tuple(sorted(output_elements.items())),
         reserved_bytes=aggregate_end,
+        imports=tuple(("math", symbol, _MATH_IMPORTS[symbol]) for symbol in import_names),
+        functions=tuple(
+            (item.name, tuple(item.parameter_types), tuple(item.result_types))
+            for item in further
+        ),
     )
 
 
@@ -1734,7 +2070,10 @@ rl.on('line', async (line) => {
   try {
     if (msg.cmd === 'init') {
       const bytes = Buffer.from(msg.module, 'base64');
-      const { instance } = await WebAssembly.instantiate(bytes, {});
+      const math = {};
+      for (const name of ['pow','exp','log','sin','cos','tan','asin','acos','atan',
+                          'sinh','cosh','tanh','asinh','acosh','atanh']) math[name] = Math[name];
+      const { instance } = await WebAssembly.instantiate(bytes, {math});
       exports = instance.exports;
       entry = msg.entry;
       const need = Math.ceil(msg.bytes / 65536);

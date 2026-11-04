@@ -55,6 +55,11 @@ except Exception:
     sys.exit(1)
 print(f"[probe] lowered in {time.perf_counter() - started:.1f}s", flush=True)
 module = lowered[0] if isinstance(lowered, tuple) else lowered.module
+import os, pickle
+_pkl = Path(os.environ["TEMP"]) / f"meowdoku_canonical_{BATCH}_module.pkl"
+with _pkl.open("wb") as _h:
+    pickle.dump(module, _h)
+print(f"[probe] saved module to {_pkl}", flush=True)
 print("[probe] functions:", list(module.functions)[:40], flush=True)
 entry = next((n for n in module.functions if n.endswith(f"__{ENTRY}")), None) or ENTRY
 function = module.functions[entry]

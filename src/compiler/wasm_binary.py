@@ -243,10 +243,35 @@ class WasmImport:
     kind: Literal["func", "memory"]
     parameter_types: tuple[str, ...] = ()
     memory_pages: int | None = None
+    #: Value results of a function import.  Empty keeps the historical
+    #: memory-only convention; a host math function (``Math.pow``) returns
+    #: its value, which is ``("f64",)``.
+    result_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.kind == "memory" and self.memory_pages is None:
             raise ValueError("a memory import needs memory_pages")
+
+
+@dataclass(frozen=True)
+class WasmFunction:
+    """One further function of a module, beside the primary exported one.
+
+    The repository-SSA core emits every reachable SSA function as its own
+    Wasm function, the way the LLVM and C module lanes emit one native
+    function each, so a Call is a ``call`` and a callee with several ``Ret``
+    blocks returns from each.  ``result_types`` are returned by value
+    (several at once is the multi-value proposal, which every engine the
+    shells target ships); an exported one is reachable from the host by
+    ``name``.  Function index space: ``"func"`` imports first, then the
+    primary function, then these in order.
+    """
+
+    name: str
+    parameter_types: tuple[str, ...]
+    body: "CodeBuilder"
+    result_types: tuple[str, ...] = ()
+    export: bool = False
 
 
 @dataclass
@@ -468,8 +493,14 @@ def build_module(
     data: bytes = b"",
     data_offset: int = 0,
     imports: Sequence[WasmImport] = (),
+    functions: Sequence[WasmFunction] = (),
+    result_types: Sequence[str] = (),
 ) -> bytes:
     """Assemble one exported function plus one exported memory.
+
+    ``functions`` adds further functions after the primary one (see
+    ``WasmFunction``); ``result_types`` are the primary function's own value
+    results, empty by default.
 
     ``data`` is placed at ``data_offset`` as an active data segment, which is
     how a baked table -- a lookup table for a function WebAssembly has no
@@ -495,18 +526,23 @@ def build_module(
 
     # Type section: the imported functions' signatures come first, so their
     # type indices are known and stable, then this module's own function.
+    def function_type(parameters, results) -> bytes:
+        return (
+            bytes([0x60])
+            + _vector([bytes([_VALUE_TYPE[t]]) for t in parameters])
+            + _vector([bytes([_VALUE_TYPE[t]]) for t in results])
+        )
+
     types = [
-        bytes([0x60])
-        + _vector([bytes([_VALUE_TYPE[t]]) for t in entry.parameter_types])
-        + _vector([])  # no results; outputs are written through memory
+        function_type(entry.parameter_types, entry.result_types)
         for entry in func_imports
     ]
     own_type_index = len(types)
-    types.append(
-        bytes([0x60])
-        + _vector([bytes([_VALUE_TYPE[t]]) for t in parameter_types])
-        + _vector([])
-    )
+    types.append(function_type(parameter_types, result_types))
+    further_type_indices = []
+    for extra in functions:
+        further_type_indices.append(len(types))
+        types.append(function_type(extra.parameter_types, extra.result_types))
     type_section = _section(1, _vector(types))
 
     import_section = b""
@@ -527,20 +563,28 @@ def build_module(
     # Function index space: imports of kind "func" first (already accounted
     # for above), then this module's own function.
     own_function_index = len(func_imports)
-    function_section = _section(3, _vector([uleb(own_type_index)]))
+    function_section = _section(3, _vector(
+        [uleb(own_type_index)] + [uleb(index) for index in further_type_indices]
+    ))
 
     memory_section = b""
     if memory_import is None:
         memory_section = _section(5, _vector([bytes([0x00]) + uleb(memory_pages)]))
 
-    export_section = _section(
-        7,
-        _vector([
-            _name(memory_name) + bytes([0x02]) + uleb(0),
-            _name(function_name) + bytes([0x00]) + uleb(own_function_index),
-        ]),
-    )
-    code_section = _section(10, _vector([body.to_body()]))
+    exports = [
+        _name(memory_name) + bytes([0x02]) + uleb(0),
+        _name(function_name) + bytes([0x00]) + uleb(own_function_index),
+    ]
+    for position, extra in enumerate(functions):
+        if extra.export:
+            exports.append(
+                _name(extra.name) + bytes([0x00])
+                + uleb(own_function_index + 1 + position)
+            )
+    export_section = _section(7, _vector(exports))
+    code_section = _section(10, _vector(
+        [body.to_body()] + [extra.body.to_body() for extra in functions]
+    ))
     # An active data segment: memory index 0, a constant offset expression,
     # then the bytes. Emitted after the code section, as the format requires.
     data_section = b""
@@ -599,6 +643,7 @@ __all__ = [
     "OP_I64_SUB",
     "OP_I64_XOR",
     "OP_SELECT",
+    "WasmFunction",
     "WasmImport",
     "build_module",
     "sleb",

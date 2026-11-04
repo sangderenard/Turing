@@ -33,7 +33,9 @@ if backend_path is not None:
 else:
     import src.compiler.ssa_wasm_backend as backend  # noqa: E402
 
-PKL = Path(os.environ["TEMP"]) / f"meowdoku_validation_{BATCH}_module.pkl"
+PKL = Path(os.environ["TEMP"]) / (
+    f"meowdoku_canonical_{BATCH}_module.pkl" if "--canonical" in sys.argv
+    else f"meowdoku_validation_{BATCH}_module.pkl")
 with PKL.open("rb") as handle:
     loaded = pickle.load(handle)
 module = loaded[0] if isinstance(loaded, tuple) else loaded

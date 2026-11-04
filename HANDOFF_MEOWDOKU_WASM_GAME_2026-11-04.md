@@ -212,3 +212,78 @@ does (`probe_meowdoku_c_module.py 25`, one shortfall). It must not emit as an
 elementwise loop over aliased, undersized operands. This is the kind of
 silent wrong answer the acceptance contract's parity check exists to catch,
 so parity against the Python piece stays part of acceptance for every lane.
+
+## Finding 3: the direct Wasm core modelled on the LLVM and C module lanes (2026-11-04, evening)
+
+The wasm lane resumed on the user's instruction after the compiler checkpoint
+merge (`cd7cf06d`). Canonical now lowers the law itself: batch 25 and 64 each
+in ~10 s to 35 complete functions (`tools/probe_meowdoku_ssa.py [batch]`
+saves `%TEMP%\meowdoku_canonical_{batch}_module.pkl`). The validation
+checkout is no longer needed for this lane.
+
+**What changed (wasm lane files only).**
+
+- `src/compiler/wasm_binary.py`: `build_module` assembles further functions
+  (`WasmFunction`, with value results and optional export) and value-returning
+  imports (`WasmImport.result_types`). Backward compatible; every existing
+  caller is unchanged. `tests/test_wasm_binary_functions.py` runs both in node.
+- `src/compiler/ssa_wasm_backend.py`, `emit_ssa_module_to_wasm_core`: every
+  reachable SSA function is now its own wasm function with the LLVM
+  repository-module convention (pointer formals as i32 offsets, scalars by
+  value, `Ret` values as wasm results, multi-value where a function returns
+  several). A `Call` is a `call`; a callee with several `Ret` blocks
+  (`binary_value`, 23 arms) returns from each. The exported entry keeps the
+  host ABI the shells speak. Scalar externs: exact Wasm opcodes for
+  `llvm.fabs/ceil/floor/trunc/sqrt.f64`, an exact spelling of
+  `llvm.round.f64` (half away from zero; `f64.nearest` is half to even),
+  `llvm.fcmp.ord/uno` by self-equality, and `math` imports for `pow`, `exp`,
+  `log` and the trig family, which the node worker binds from `Math`.
+  Shaped `Cast` (the compiler's `physical_region_input_conversion`) is the
+  element loop into a fresh static arena, as the C module lane and the LLVM
+  lane emit it. A function's own `output` span is allocated in its static
+  frame and returned by pointer (LLVM receives it as a result pointer).
+  `float32` is a value kind (`cast_double_to_float_values` narrows through it).
+- Gate: `test_wasm_core_int64`, `test_mobile_reference_app`,
+  `test_wasm_multiblock_callee`, `test_wasm_binary_functions`: 14 passed.
+  The lane's other test files: 230 passed; the 2 failures and 3 errors
+  (`test_wasm_class_modules` x2, `test_read_head_wasm_state_machine` x3) are
+  compiler-stage refusals (`_decide_value_shape` dtype settlement,
+  `source_call_actual_formal` concordance disagreement, fused-program dtype
+  record) reached before any wasm emission; none touches the changed files.
+
+**Proof on repository kernels.** The Codex lane's pairwise slice module
+(`build/meowdoku_pairwise25_ssa.pkl` in the validation checkout: 10 functions,
+`broadcast_double`, `binary_double`, `binary_value`, `unary_double`,
+`sum_double` ...) emits complete through the new core (9 further functions,
+5.8 kB), runs in node and returns exactly 1000.0, the Python value.
+
+**Meowdoku through the core: 124 shortfalls -> 9**, identical at batch 25
+and 64 (`PYTHONPATH=. python tools/probe_meowdoku_wasm_core.py 25 --canonical`).
+All nine are two compiler-side items and their cascades:
+
+1. `planned_region_8`: the bare `equal` over `(25, 1)` and `(1, 25)` (Finding 2).
+   The core refuses it by name, as the C module lane does; its result `%t88`
+   and the region's output cascade.
+2. `planned_region_18`: the storage requirements for the two
+   `cast_double_to_float_values` values `%t2305843010213694258/259` are
+   `(625, (25, 25))` while the values, the region formal `%t105` and its
+   output `%t110` are all `(25,)`. The core refuses the output arena because
+   the booked obligation disagrees with the value's declared shape
+   (`output ... shaped (25,) lacks a booked static arena (requirement (625,
+   (25, 25)) ...)`), and `planned_region_19` cascades. `planned_region_9` has
+   the same kernel at `(25, 25)` and books `(625, (25, 25))` correctly, so this
+   looks like the kernel's obligation being shared across its call sites
+   rather than per value.
+
+**Asks for the compiler lane (both exact, both seconds-long to reproduce):**
+link or refuse the bare `equal` (Finding 2), and post per-value storage
+requirements for the region-18 cast temporaries. With those two, the core
+has no remaining refusal on this program.
+
+**Not claimed.** No Meowdoku wasm parity yet (the module does not emit while
+the two items stand). `lowered_system(backend="wasm")` and the one-file page
+through `wasm_html_shell` are the game lane's next steps once the module
+emits; the shell's loader will need the same `math` import object the node
+worker supplies. Host `Math.*` is not bit-identical to libm in the last ulp;
+the Meowdoku law never reaches those imports at run time (dead opcode arms),
+so its parity target stays exact.
