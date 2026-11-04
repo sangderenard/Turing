@@ -33608,6 +33608,47 @@ def lower_control_sections_to_ssa(
                 stage=CONTROL_SSA_FINISH,
             )
             record_tables[control_function.name] = table
+            # Table.size's receiver1 is first demanded by a shape read,
+            # before record inputs exist. The record handoff now declares
+            # that span as incoming storage; keeping its old NO_PRODUCER
+            # binding contradicted the finished frame and its live extent.
+            # Resolve only these exact declared field-input identities here,
+            # at the writer that makes them resident, with the record and
+            # authored field declaration as causes.
+            from .concordance_declarations import RECORD_DESCRIPTOR
+            record_cell = book.latest_ref(
+                RECORD_DESCRIPTOR, (table.owner, record_id),
+            )
+            input_ids = {int(value.id) for value in control_function.args}
+            for kind, value_id, slot in field_ops:
+                if (kind != "read" or int(slot) not in span_slots
+                        or int(value_id) not in input_ids):
+                    continue
+                row = (str(value_scope), int(value_id))
+                prior = book.latest_ref(CONTROL_VALUE_BINDING, row)
+                pending = (None if prior is None else book.page(
+                    CONTROL_VALUE_BINDING).cell(prior.row, prior.column))
+                if not isinstance(pending, Unresolved) or pending.reason != NO_PRODUCER_AT_USE:
+                    continue
+                value_cell = member_cell(int(value_id))
+                declaration = _record_field_declaration_cell(
+                    declared_record, str(field_names[int(slot)]), identity=record_identity,
+                )
+                graph_cell = _graph_cell(int(value_id))
+                contract_cell = (None if graph_cell is None else book.latest_ref(
+                    VALUE_TYPE_ABI, graph_cell.row,
+                ))
+                causes = tuple(cell for cell in (
+                    prior, value_cell, record_cell, declaration, contract_cell,
+                    graph_cell,
+                ) if cell is not None)
+                if value_cell is None or record_cell is None or contract_cell is None:
+                    raise ConcordanceRefusal("record field input lacks exact binding causes")
+                book.post(
+                    CONTROL_VALUE_BINDING, row,
+                    ControlBinding(value_cell, BindingKind.FIELD_INCUMBENT),
+                    stage=CONTROL_SSA_FINISH, provenance=Derived(causes), mode=Mode.REVISE,
+                )
     from ..transmogrifier.ssa import (
         SSAReferenceDescriptor,
         SSAReferenceKind,

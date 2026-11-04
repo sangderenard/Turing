@@ -30410,9 +30410,33 @@ def _remove_dead_metadata_nodes(
             graph.G.graph.get("source_sequence_mutation_records") or {}
         )
     }
+    from .concordance_declarations import SOURCE_TENSOR_SHAPE_DIMENSION
+    from .identity_concordance import Ref, current_identity_book
+
+    book = current_identity_book()
+    read_scope = graph.G.graph.get("lexical_read_scope")
+    shape_dependencies = set()
+    if read_scope is not None:
+        dimension_page = book.page(SOURCE_TENSOR_SHAPE_DIMENSION)
+        for row in dimension_page.scope_rows(read_scope):
+            projection = int(row[1])
+            if (projection not in graph.G or str(graph.G.nodes[projection].get("type"))
+                    in {"Constant", "Const", "const"}):
+                continue
+            fact = dimension_page.latest(row)
+            if isinstance(fact, tuple) and len(fact) == 4:
+                # Table.size: self.lengths.shape[0] + self.lengths.sum().item().
+                # Folding extracted the shape read into control metadata, then
+                # this pruner deleted its receiver1 as graph-unconsumed. The
+                # field handoff kept only the later read5, and control received
+                # an untyped phantom receiver. The exact source-dimension
+                # record still consumes these identities; they remain live
+                # until that projection itself becomes a literal or retires.
+                shape_dependencies.update(int(cell.row[1]) for cell in fact[:3]
+                                          if isinstance(cell, Ref))
 
     def is_candidate(node_id: int, data: Mapping[str, Any]) -> bool:
-        if int(node_id) in effect_ids:
+        if int(node_id) in effect_ids or int(node_id) in shape_dependencies:
             return False
         # Program: ``self.trace(i)`` with ``trace`` a stored callable field
         # (SSAReferenceEvaluator._execute).  Wrong record: the spelling reads

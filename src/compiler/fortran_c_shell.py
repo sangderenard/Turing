@@ -25215,6 +25215,20 @@ def _class_surface_ssa_program(
                         contract[
                             "program_abi_field_declaration_cell"
                         ] = field_cell
+                read_declaration = (data.get("attributes") or {}).get(
+                    "field_declaration_cell"
+                )
+                if read_declaration is not None:
+                    # Table.size reads a declared tensor field solely for
+                    # its shape. An explicit ProgramABI record need not have
+                    # a source_record_view_schema key; the exact GetAttr
+                    # already carries its authored field declaration. Dropping
+                    # that cell left a complete int64/span/rank1 contract
+                    # without its class, so VALUE_TYPE_ABI was never posted.
+                    declared = contract.get("program_abi_field_declaration_cell")
+                    if declared is not None and declared != read_declaration:
+                        raise ValueError("record field read has conflicting declaration identities")
+                    contract["program_abi_field_declaration_cell"] = read_declaration
                 # Program: ``keep`` / ``fresh`` / ``coerce`` (``class Metrics``
                 # with ``max_vel: float``, read as ``metrics.max_vel``).
                 # Wrong record: a ProgramABI record with no
@@ -25285,6 +25299,19 @@ def _class_surface_ssa_program(
                             _declared_annotation,
                         ))))
                     )
+                    _declared_field_layout = (
+                        None if _declared_annotation is None else
+                        _authored_annotation_field_receipt(_declared_annotation)
+                    )
+                    if (not _declared_field_types and _declared_field_layout is not None
+                            and _declared_field_layout.get("python_type")):
+                        # The primitive-only class reader intentionally has
+                        # no authored Tensor class. The incumbent annotation
+                        # ABI reader already resolves that exact substrate;
+                        # retain its class instead of dropping its span ABI.
+                        _declared_field_types = (
+                            str(_declared_field_layout["python_type"]),
+                        )
                     if _declared_field_types:
                         contract[
                             "program_abi_field_declaration_cell"
