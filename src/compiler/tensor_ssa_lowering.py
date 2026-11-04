@@ -6818,13 +6818,27 @@ def lower_tensor_calls_to_repository_ssa(
                         )
                         if native_output_fact.physical_dtype is None:
                             raise ValueError("native named output lacks typed storage proof")
+                        from .frame_identity_book import _frame_physical_fields
+                        member_physical = _frame_physical_fields(
+                            function, outputs[slot], book=book,
+                        )
+                        if (not isinstance(member_physical, dict)
+                                or member_physical.get("storage") != "span"
+                                or not isinstance(member_physical.get("rank"), int)):
+                            raise ValueError("native named output lacks its authored member geometry")
+                        # _ascending_order's raw indices19 already have rank1
+                        # in their member record while their extent is runtime.
+                        # The kernel formal supplies the element dtype, not a
+                        # logical rank. Replacing that rank with len(()) made
+                        # indices19 and ensure_tensor20 rank0, contradicting
+                        # their exact source ABI. Retain the member geometry.
                         revise_ssa_value(
                             function, outputs[slot], dtype=native_output_fact.dtype,
                             shape=member_shapes[slot], stage=TENSOR_SSA_LOWERING,
                             sources=(native_output, member, layout_proof[0]), book=book,
                             physical={
+                                **member_physical,
                                 "physical_dtype": native_output_fact.physical_dtype,
-                                "storage": "span", "rank": len(static_shape),
                             },
                         )
                         post_result_family(

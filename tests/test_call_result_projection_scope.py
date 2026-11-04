@@ -74,13 +74,33 @@ def test_two_functions_with_equal_node_ids_keep_their_own_paths():
         assert _post_call_result_projections(root, 5) == {(0,): 6, (1,): 7}
         assert _post_call_result_projections(one, 5) == {(1,): 6, (0,): 7}
         page = book.pages[CALL_RESULT_PROJECTION.name]
-        assert page.latest(("root", 5, 6)) == (0,)
-        assert page.latest(("one", 5, 6)) == (1,)
+        assert page.latest((root.G.graph["lexical_read_scope"], 5, 6)) == (0,)
+        assert page.latest((one.G.graph["lexical_read_scope"], 5, 6)) == (1,)
         assert _projection_result_bindings(root, 5, (40, 41)) == (
             (40, 6), (41, 7),
         )
         assert _projection_result_bindings(one, 5, (40, 41)) == (
             (40, 7), (41, 6),
         )
+    finally:
+        end_identity_book(token)
+
+
+def test_two_copies_of_one_function_do_not_merge_projection_operands():
+    from src.compiler.concordance_declarations import CALL_RESULT_PROJECTION
+    from src.compiler.glsl_deployment_strategy import _post_call_result_projections
+    from src.compiler.identity_concordance import begin_identity_book, end_identity_book
+
+    first = _Graph("same_authored_function", {6: 0})
+    second = _Graph("same_authored_function", {6: 1})
+    book, token = begin_identity_book()
+    try:
+        _ingest(first, book)
+        _ingest(second, book)
+        assert _post_call_result_projections(first, 5) == {(0,): 6}
+        assert _post_call_result_projections(second, 5) == {(1,): 6}
+        page = book.page(CALL_RESULT_PROJECTION)
+        assert page.latest((first.G.graph["lexical_read_scope"], 5, 6)) == (0,)
+        assert page.latest((second.G.graph["lexical_read_scope"], 5, 6)) == (1,)
     finally:
         end_identity_book(token)
