@@ -1361,7 +1361,7 @@ def _post_derived_or_raw(
 
 def _post_region_signature(
     book: Any, scope: Any, lexical_read_scope: Any, region_index: int,
-    signature: tuple,
+    signature: tuple, *, source_cells: tuple[Ref, ...] = (),
 ) -> Any:
     """``region_signature`` row ``(function scope, region)``: CONCORD
     DERIVED(the ``deployment_region`` cell when the planner posted one, else
@@ -1375,7 +1375,9 @@ def _post_region_signature(
     if existing is not None and (
         book.pages[REGION_SIGNATURE.name].cells.get((row, existing.column))
         == fact
-    ):
+    ) and set(source_cells) <= {
+        source for source, _stage in book.edges_into(existing)
+    }:
         return existing
     sources: list = []
     if lexical_read_scope is not None:
@@ -1385,6 +1387,7 @@ def _post_region_signature(
             )
             if cell is not None and cell not in sources:
                 sources.append(cell)
+    sources.extend(cell for cell in source_cells if cell not in sources)
     if not sources:
         # A region of a lowering with no lexical read scope (a fused or
         # planned region) or whose values have no canonical cell stands on
@@ -32061,6 +32064,16 @@ def lower_control_sections_to_ssa(
             signature_cell = _post_region_signature(
                 _book(), str(tensor_shape_concordance_scope), lexical_read_scope,
                 region_index, region_signatures[region_index],
+                source_cells=tuple(dict.fromkeys(
+                    cell
+                    for instruction in instructions
+                    for cell in (
+                        (instruction.attributes or {}).get(
+                            "numerical_constructor_dimension_cell"
+                        ),
+                    )
+                    if isinstance(cell, Ref)
+                )),
             )
             _post_planned_region_identities(
                 _book(), str(tensor_shape_concordance_scope), region_function,

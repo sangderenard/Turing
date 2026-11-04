@@ -6385,6 +6385,7 @@ def _build_shell_hierarchy_plan(
         )
         region_node_set = set(region_nodes)
         numerical_dtype_metadata = {}
+        numerical_constructor_dimension_cells = {}
 
         def numerical_region_parents(
             node_id: int,
@@ -6437,6 +6438,98 @@ def _build_shell_hierarchy_plan(
                     continue
                 parent_data = graph.G.nodes.get(parent, {})
                 attributes = parent_data.get("attributes") or {}
+                if (
+                    operation.casefold() in {"zeros", "ones", "empty", "full"}
+                    and str(role).casefold() in {"arg:0", "arg0"}
+                    and (
+                        descriptor := planned_descriptor(int(node_id))
+                    ) is not None
+                    and descriptor.get("metadata_state") == "dynamic"
+                    and int(descriptor.get("rank") or 0) == 1
+                ):
+                    from .concordance_declarations import (
+                        NUMERICAL_CONSTRUCTOR_DIMENSION,
+                        PLANNER_HIERARCHY,
+                    )
+                    from .identity_concordance import (
+                        Derived, Mode, current_identity_book,
+                    )
+                    from .process_graph_facts import operands
+                    from .concorded_literals import origin_cell
+                    from .source_evidence_resolver import (
+                        LengthEvidence, MemberEvidence,
+                        require_length, require_member,
+                    )
+                    from ..common.tensors.topological_reducer import (
+                        node_identity_cell,
+                    )
+
+                    scope = graph.G.graph.get("lexical_read_scope")
+                    book = current_identity_book()
+                    length = (
+                        require_length(tuple(scope), parent, book=book)
+                        if scope is not None else None
+                    )
+                    member = (
+                        require_member(tuple(scope), parent, 0, book=book)
+                        if isinstance(length, LengthEvidence)
+                        and length.length == 1 else None
+                    )
+                    if (
+                        isinstance(member, MemberEvidence)
+                        and member.member_value_id in graph.G
+                    ):
+                        consumer_cell = node_identity_cell(graph, int(node_id))
+                        parent_cell = node_identity_cell(graph, parent)
+                        member_cell = node_identity_cell(
+                            graph, member.member_value_id,
+                        )
+                        operand_facts, operand_cell = operands(
+                            graph, int(node_id),
+                        )
+                        try:
+                            same_member = (
+                                origin_cell(book, member.member_cell)
+                                == origin_cell(book, member_cell)
+                            )
+                        except ValueError:
+                            same_member = False
+                        if (
+                            not same_member
+                            or (parent_cell, str(role)) not in operand_facts
+                        ):
+                            raise ValueError(
+                                "constructor dimension lacks exact member "
+                                "or operand identity"
+                            )
+                        row = (consumer_cell, str(role), parent_cell)
+                        fact = (
+                            member_cell, member.layout_cell, operand_cell,
+                        )
+                        receipt = book.latest_ref(
+                            NUMERICAL_CONSTRUCTOR_DIMENSION, row,
+                        )
+                        if receipt is None or book.page(
+                            NUMERICAL_CONSTRUCTOR_DIMENSION
+                        ).cell(receipt.row, receipt.column) != fact:
+                            receipt = book.post(
+                                NUMERICAL_CONSTRUCTOR_DIMENSION, row, fact,
+                                stage=PLANNER_HIERARCHY,
+                                provenance=Derived(tuple(dict.fromkeys((
+                                    consumer_cell, parent_cell, member_cell,
+                                    member.member_cell, member.layout_cell,
+                                    operand_cell,
+                                    *member.proof_cells,
+                                )))), mode=Mode.CONCORD,
+                            )
+                        numerical_constructor_dimension_cells[
+                            int(node_id)
+                        ] = receipt
+                        expanded.append((
+                            member.member_value_id,
+                            f"{role}:dimension:0",
+                        ))
+                        continue
                 if (
                     (operation.casefold() in _DTYPE_CAST_OPERATIONS
                      and str(role) in {"arg:0", "kw:dtype", "dtype"})
@@ -6846,6 +6939,10 @@ def _build_shell_hierarchy_plan(
                     line_attributes["intrinsic_named_call_id"] = int(value)
             if int(value) in numerical_dtype_metadata:
                 line_attributes["dtype"] = numerical_dtype_metadata[int(value)]
+            if int(value) in numerical_constructor_dimension_cells:
+                line_attributes["numerical_constructor_dimension_cell"] = (
+                    numerical_constructor_dimension_cells[int(value)]
+                )
             if (
                 isinstance(expression, ast.Attribute)
                 or (
