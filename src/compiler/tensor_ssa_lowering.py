@@ -3080,6 +3080,14 @@ def propagate_repository_ssa_call_metadata(
             )
             _edge_physical: dict[str, Any] = {}
             if _edge_source_fact is not None:
+                # Weighted float multiplication: binary_double Loads188/189
+                # have no accounting cache, but binary_value's exact scalar
+                # edge proves float64. Copy that source cell's physical
+                # dtype with its storage/rank; the cache is only a view.
+                if _edge_source_fact.physical_dtype is not None:
+                    _edge_physical["physical_dtype"] = (
+                        _edge_source_fact.physical_dtype
+                    )
                 if _edge_source_fact.storage is not None:
                     _edge_physical["storage"] = _edge_source_fact.storage
                 if _edge_source_fact.rank is not None:
@@ -3134,10 +3142,17 @@ def propagate_repository_ssa_call_metadata(
                             else not _edge_target_fact.arena
                         )
                     }
-            if _edge_physical:
+            _edge_layout_target = _posted_edge_fact(
+                function, int(value.id), book=_edge_book,
+            ) if _edge_physical else None
+            if _edge_physical and _edge_layout_target is not None:
+                # A physical transport may target an occurrence of storage0
+                # viewed as flatten(2,3)->(6,). Its physical fields belong to
+                # storage0; its displayed axes do not revise storage0's
+                # semantic shape. Retain that row while filling layout.
                 _revise_edge_physical(
-                    function, int(value.id), dtype=value.dtype,
-                    shape=tuple(value.shape or ()), stage=stage,
+                    function, int(value.id), dtype=_edge_layout_target.dtype,
+                    shape=_edge_layout_target.shape, stage=stage,
                     sources=(_frame_value_cell(
                         _edge_source_owner, int(source.id),
                     ),),
