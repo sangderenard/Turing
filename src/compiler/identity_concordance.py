@@ -1589,6 +1589,7 @@ class CorrelationTable:
         found.extend(self._source_numeric_type_dependency_findings(module))
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
+        found.extend(self._source_sequence_constructor_snapshot_findings(module))
         found.extend(self._source_sequence_capacity_bound_findings(module))
         found.extend(self._source_bytes_concat_class_findings(module))
         found.extend(self._source_eager_bytes_return_findings(module))
@@ -10120,6 +10121,206 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _source_sequence_constructor_snapshot_findings(module: Any) -> list[Finding]:
+        """A mutable constructor copy must cite its exact authored argument."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CELL_SET, PROCESS_GRAPH_OPERANDS, SSA_VALUE,
+            SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT, SOURCE_VALUE_CLASS,
+            SourceSequenceConstructorSnapshot,
+        )
+        from .source_bytes_concat_class import _class_matches_operand
+        from .concorded_literals import origin_cell
+        from .source_evidence_resolver import ClassEvidence, require_class
+        from .ssa_record_return_state import function_scope_of
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT)
+        live_class_scopes = {
+            function.metadata.get("source_numeric_scope")
+            for function in module.functions.values()
+            if function.metadata.get("source_numeric_scope") is not None
+        }
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT, row)
+            fact = page.cell(cell.row, cell.column)
+            valid = isinstance(fact, SourceSequenceConstructorSnapshot)
+            if valid:
+                destination, source, operands = (
+                    fact.destination_cell, fact.source_cell, fact.operand_cell,
+                )
+                destination_class, source_class = (
+                    fact.destination_class_cell, fact.source_class_cell,
+                )
+                causes = {parent for parent, _stage in book.edges_into(cell)}
+                valid = (
+                    {destination, source, operands, destination_class,
+                     source_class} <= causes
+                    and destination.page == source.page == CANONICAL_VALUE
+                    and destination.row == row
+                    and source.row[0] == row[0]
+                    and operands.page == PROCESS_GRAPH_OPERANDS
+                    and operands.row == row
+                    and destination_class.page == source_class.page
+                    == SOURCE_VALUE_CLASS
+                )
+            if valid:
+                operand_fact = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                    operands.row, operands.column,
+                )
+                dest_answer = require_class(
+                    destination_class.row[0], int(row[1]), book=book,
+                )
+                source_answer = require_class(
+                    source_class.row[0], int(source.row[1]), book=book,
+                )
+                valid = (
+                    tuple(parent for parent, role in operand_fact
+                          if role == "arg:0") == (source,)
+                    and isinstance(dest_answer, ClassEvidence)
+                    and dest_answer.class_cell == destination_class
+                    and dest_answer.class_identity == "builtins.bytearray"
+                    and isinstance(source_answer, ClassEvidence)
+                    and source_answer.class_cell == source_class
+                    and source_answer.class_identity in {
+                        "builtins.list", "builtins.tuple", "builtins.bytes",
+                        "builtins.bytearray",
+                    }
+                    and _class_matches_operand(
+                        book, destination_class, destination,
+                    )
+                    and _class_matches_operand(book, source_class, source)
+                )
+            if valid:
+                calls = [
+                    (function, instruction)
+                    for function in module.functions.values()
+                    for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.attributes.get(
+                        "source_sequence_snapshot_cell"
+                    ) == cell
+                ]
+                inherited = False
+                if not calls and destination_class.row[0] not in live_class_scopes:
+                    # A base source graph and its compiled specialization
+                    # both publish this authored constructor. Only the
+                    # specialization has a live SSA Call. Its exact
+                    # ingestion origins, both class facts, and newer source
+                    # receipt must match before it can discharge the base
+                    # row's execution obligation.
+                    try:
+                        origins = (
+                            origin_cell(book, destination),
+                            origin_cell(book, source),
+                        )
+                    except ValueError:
+                        origins = None
+                    for later_row in page.rows():
+                        if later_row == row or origins is None:
+                            continue
+                        later_cell = book.latest_ref(
+                            SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT, later_row,
+                        )
+                        later = page.cell(
+                            later_cell.row, later_cell.column,
+                        )
+                        if not isinstance(later, SourceSequenceConstructorSnapshot):
+                            continue
+                        try:
+                            later_origins = (
+                                origin_cell(book, later.destination_cell),
+                                origin_cell(book, later.source_cell),
+                            )
+                        except ValueError:
+                            continue
+                        if (
+                            later_origins != origins
+                            or book.stamp_of(later_cell) <= book.stamp_of(cell)
+                            or book.page(SOURCE_VALUE_CLASS).cell(
+                                later.destination_class_cell.row,
+                                later.destination_class_cell.column,
+                            ) != book.page(SOURCE_VALUE_CLASS).cell(
+                                destination_class.row,
+                                destination_class.column,
+                            )
+                            or book.page(SOURCE_VALUE_CLASS).cell(
+                                later.source_class_cell.row,
+                                later.source_class_cell.column,
+                            ) != book.page(SOURCE_VALUE_CLASS).cell(
+                                source_class.row,
+                                source_class.column,
+                            )
+                        ):
+                            continue
+                        inherited = any(
+                            instruction.attributes.get(
+                                "source_sequence_snapshot_cell"
+                            ) == later_cell
+                            for function in module.functions.values()
+                            for block in function.blocks.values()
+                            for instruction in block.instrs
+                        )
+                        if inherited:
+                            break
+                valid = len(calls) == 1 or inherited
+            if valid and not inherited:
+                function, instruction = calls[0]
+                result = getattr(instruction, "res", None)
+                result_cell = (
+                    None if result is None else book.latest_ref(
+                        SSA_VALUE,
+                        (function_scope_of(function), int(result.id)),
+                    )
+                )
+                mint = None if result_cell is None else book.mint_of(result_cell)
+                pending = [] if mint is None else list(mint[1])
+                seen = set()
+                closed = True
+                while pending:
+                    source_ref = pending.pop()
+                    if source_ref in seen:
+                        continue
+                    seen.add(source_ref)
+                    if source_ref.page == CELL_SET:
+                        members = tuple(
+                            parent for parent, _stage in book.edges_into(
+                                source_ref,
+                            )
+                        )
+                        recorded = book.page(CELL_SET).cell(
+                            source_ref.row, source_ref.column,
+                        )
+                        if set(recorded) != {member.key for member in members}:
+                            closed = False
+                            break
+                        pending.extend(members)
+                valid = (
+                    instruction.op == "Call"
+                    and instruction.attributes.get(
+                        "ssa_sequence_operation"
+                    ) == "replace"
+                    and int(instruction.attributes.get("sequence_id", -1))
+                    == int(row[1])
+                    and int(instruction.attributes.get(
+                        "source_effect_node_id", -1,
+                    )) == int(row[1])
+                    and closed
+                    and cell in seen
+                )
+            if not valid:
+                found.append(Finding(
+                    "source-sequence-constructor-snapshot",
+                    str(row[0]), int(row[1]),
+                    "mutable constructor copy lacks its exact source operand "
+                    "or class lineage",
+                ))
+        return found
+
+    @staticmethod
     def _source_sequence_capacity_bound_findings(module: Any) -> list[Finding]:
         """Validate the exact bytes base, slice selector and bound causes."""
 
@@ -15114,8 +15315,13 @@ def withdraw_superseded_shape_derivations(
                 # resolved: nothing derived from it remains to supersede.
                 continue
             if isinstance(target_id, int) and not isinstance(target_id, bool):
+                # The byte-loop append helper's value 4063 derives root
+                # value 3 through a reverse metadata edge. When 4063 gains
+                # its rank-one shape, withdrawing root 3 must cite 4063 in
+                # the helper scope, not search for id 4063 in root's scope.
                 invalidate_proven_shape(
                     target_scope, target_id, source_id, reason,
+                    source_scope=source_scope,
                 )
                 invalidate_sequence_row_layout(
                     target_scope, target_id, source_id, reason,
@@ -17103,7 +17309,7 @@ def record_proven_shape(
 
 def invalidate_proven_shape(
     function: Any, value_id: int, source_id: int, reason: Any,
-    *, source_cells: tuple[Ref, ...] = (),
+    *, source_scope: Any = None, source_cells: tuple[Ref, ...] = (),
 ) -> None:
     """Withdraw a derived shape after one of its exact dependencies changes."""
 
@@ -17117,6 +17323,7 @@ def invalidate_proven_shape(
         source_id = int(source_id)
     state_ref = invalidate_shape_transformation(
         function, int(value_id), source_id, reason,
+        source_scope=source_scope,
         source_cells=source_cells,
     )
     # Scalar identities have no ``proven_shape`` row: this page stores only

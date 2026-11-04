@@ -18860,6 +18860,7 @@ class _ControlSSABuilder(TiledObject):
             if source is None:
                 return
             _dtype_cells = self._cells(
+                mutation.snapshot_cell,
                 self._sequence_contract_cell(
                     int(destination.sequence_id)
                 ),
@@ -19178,7 +19179,9 @@ class _ControlSSABuilder(TiledObject):
         # cell the descriptor names, never a positional stand-in.
         status = self.fresh_value(
             dtype="int", transform=REGION_CALL_RESULT,
-            operands=tuple(call_arguments),
+            operands=(*call_arguments, *((mutation.snapshot_cell,)
+                                         if mutation.snapshot_cell is not None
+                                         else ())),
         )
         self.emit(
             Handler.Call,
@@ -19190,6 +19193,8 @@ class _ControlSSABuilder(TiledObject):
                 "ssa_sequence_operation": operation,
                 "sequence_id": int(destination.sequence_id),
                 "source_effect_node_id": int(mutation.effect_node_id),
+                **({"source_sequence_snapshot_cell": mutation.snapshot_cell}
+                   if mutation.snapshot_cell is not None else {}),
                 "native_type_tag_sequence": native_type_tag_sequence_receipt,
                 **({
                     "ssa_deferred_record_row": deferred_record_row,

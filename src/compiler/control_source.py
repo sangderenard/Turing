@@ -205,6 +205,8 @@ class ControlSequenceMutation(TiledObject):
     # so a ``clear`` and its ``extend`` steps (one effect node) are rows of
     # their own rather than revisions of one.
     step_cell: Any = None
+    # Exact authored constructor/argument proof for an owned sequence copy.
+    snapshot_cell: Any = None
     # Native ``list.sort`` options retained from the authored call.  Mapping
     # ``__getitem__`` keys use ``argument_value_ids`` plus
     # ``argument_kind == "sort_key_mapping_getitem"``; a direct row

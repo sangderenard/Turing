@@ -1578,10 +1578,25 @@ def _constant_byte_literal_materializations(graph_obj: Any):
 def _source_sequence_snapshots(graph_obj: Any):
     """Sequence conversion captures contents and length in separate storage."""
     from .control_source import ControlSequenceMutation
+    from .concordance_declarations import (
+        CANONICAL_VALUE, CONTROL_PROGRAM_BUILD, PROCESS_GRAPH_OPERANDS,
+        SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT,
+        SourceSequenceConstructorSnapshot,
+    )
+    from .identity_concordance import Derived, Mode, current_identity_book
+    from .source_bytes_concat_class import _class_matches_operand
+    from .source_evidence_resolver import ClassEvidence, require_class
+
+    book = current_identity_book()
+    source_scope = graph_obj.graph.get("lexical_read_scope")
+    class_scope = (
+        graph_obj.graph.get("source_numeric_scope")
+        or graph_obj.graph.get("authored_function_identity")
+    )
     mutations = []
     for node_id, data in graph_obj.nodes(data=True):
         attrs = data.get("attributes") or {}
-        if (attrs.get("aggregate_kind") not in {"tuple", "list"}
+        if (attrs.get("aggregate_kind") not in {"tuple", "list", "bytearray"}
                 or attrs.get("producer_kind") != "aggregate_materialization"):
             continue
         sources = [int(parent) for parent, role in data.get("parents") or ()
@@ -1592,12 +1607,85 @@ def _source_sequence_snapshots(graph_obj: Any):
         # ``list(a)`` of an ``array`` copies its rows exactly as ``list(xs)``
         # does (Token Orchard ``list(self.exact_atoms[b : b + n])``); without
         # the copy the result read its argument as a one-member display.
-        if (graph_obj.nodes.get(source, {}).get("attributes") or {}).get(
+        source_kind = (graph_obj.nodes.get(source, {}).get("attributes") or {}).get(
             "aggregate_kind"
-        ) not in {"list", "tuple", "array"}:
+        )
+        destination_kind = attrs.get("aggregate_kind")
+        # encode_octets' bytearray((VERSION,)) is fresh mutable storage.
+        # Its early bytes(header) view must therefore find the new mutable
+        # arena rather than the constructor's one-element tuple literal.
+        if destination_kind == "bytearray":
+            accepted = source_kind in {"list", "tuple", "array", "bytes", "bytearray"}
+        else:
+            accepted = source_kind in {"list", "tuple", "array"}
+        if not accepted:
             continue
+        snapshot_cell = None
+        if destination_kind == "bytearray":
+            destination_id = int(data.get("value_id", node_id))
+            source_id = int(graph_obj.nodes[source].get("value_id", source))
+            if source_scope is None or class_scope is None:
+                continue
+            destination_cell = book.latest_ref(
+                CANONICAL_VALUE, (source_scope, destination_id),
+            )
+            source_cell = book.latest_ref(
+                CANONICAL_VALUE, (source_scope, source_id),
+            )
+            operand_cell = book.latest_ref(
+                PROCESS_GRAPH_OPERANDS, (source_scope, destination_id),
+            )
+            destination_class = require_class(
+                class_scope, destination_id, book=book,
+            )
+            source_class = require_class(
+                class_scope, source_id, book=book,
+            )
+            if (
+                destination_cell is None or source_cell is None
+                or operand_cell is None
+                or not isinstance(destination_class, ClassEvidence)
+                or destination_class.class_identity != "builtins.bytearray"
+                or destination_class.class_cell is None
+                or not isinstance(source_class, ClassEvidence)
+                or source_class.class_identity not in {
+                    "builtins.list", "builtins.tuple", "builtins.bytes",
+                    "builtins.bytearray",
+                }
+                or source_class.class_cell is None
+            ):
+                continue
+            operands = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                operand_cell.row, operand_cell.column,
+            )
+            if (
+                tuple(parent for parent, role in operands if role == "arg:0")
+                != (source_cell,)
+                or not _class_matches_operand(
+                    book, destination_class.class_cell, destination_cell,
+                )
+                or not _class_matches_operand(
+                    book, source_class.class_cell, source_cell,
+                )
+            ):
+                continue
+            snapshot_cell = book.post(
+                SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT,
+                (source_scope, destination_id),
+                SourceSequenceConstructorSnapshot(
+                    destination_cell, source_cell, operand_cell,
+                    destination_class.class_cell, source_class.class_cell,
+                ),
+                stage=CONTROL_PROGRAM_BUILD,
+                provenance=Derived((
+                    destination_cell, source_cell, operand_cell,
+                    destination_class.class_cell, source_class.class_cell,
+                )),
+                mode=Mode.CONCORD,
+            )
         mutations.append(ControlSequenceMutation(
-            int(node_id), "replace", (source,), int(node_id), policy="duplicates",
+            int(node_id), "replace", (source,), int(node_id),
+            policy="duplicates", snapshot_cell=snapshot_cell,
         ))
     return tuple(mutations)
 

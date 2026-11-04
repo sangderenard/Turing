@@ -1503,6 +1503,23 @@ SOURCE_SEQUENCE_MUTATION = declare_page(
     ), tuple,
 )
 @dataclass(frozen=True)
+class SourceSequenceConstructorSnapshot:
+    """A mutable constructor owns a copy of its exact sequence argument."""
+
+    destination_cell: Ref
+    source_cell: Ref
+    operand_cell: Ref
+    destination_class_cell: Ref
+    source_class_cell: Ref
+
+
+SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT = declare_page(
+    "source_sequence_constructor_snapshot", (
+        RowField("source_scope", K.SCOPE),
+        RowField("destination_value_id", K.VALUE_ID),
+    ), SourceSequenceConstructorSnapshot,
+)
+@dataclass(frozen=True)
 class SourceSequenceCapacityBound:
     """A fresh bytes slice needs no more rows than its exact source."""
 
