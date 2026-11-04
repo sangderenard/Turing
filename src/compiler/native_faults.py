@@ -67,6 +67,11 @@ FLOAT_MATH_RANGE = 96
 #: divisible by width: the authored tensor operation raises ``ValueError``.
 RESHAPE_INVALID_SHAPE = 98
 
+#: Two tensor dimensions disagree and neither is one. The authored
+#: broadcast_shape_extents law reports incompatibility before elementwise
+#: storage may be read or written.
+BROADCAST_INCOMPATIBLE_SHAPE = 100
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -158,4 +163,6 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
         return NativeFloatOverflow(f"math range error ({runtime_message})")
     if int(code) == RESHAPE_INVALID_SHAPE:
         return NativeValueError(f"invalid reshape shape ({runtime_message})")
+    if int(code) == BROADCAST_INCOMPATIBLE_SHAPE:
+        return NativeValueError(f"incompatible broadcast shapes ({runtime_message})")
     return RuntimeError(runtime_message)
