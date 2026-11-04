@@ -31995,18 +31995,30 @@ def _class_surface_ssa_program(
                     return None
                 return (), (evidence.class_cell,)
             result_cell = _identity_cell(graph_obj, int(value_id))
-            lhs_cell = _identity_cell(graph_obj, operands[0])
-            rhs_cell = _identity_cell(graph_obj, operands[1])
             operand_cell = late_book.latest_ref(
                 _OWN_OPERANDS, (late_type_scope, int(value_id)),
             )
-            if None in (result_cell, lhs_cell, rhs_cell, operand_cell):
+            if None in (result_cell, operand_cell):
                 return None
             operand_fact = late_book.page(_OWN_OPERANDS).cell(
                 operand_cell.row, operand_cell.column,
             )
+            # bytes(header) + bytes(data) has authored operands 13/14,
+            # while sequence lowering uses their resident arenas 8/1.
+            # Comparing the source operand row to those arena identities
+            # discarded both exact bytes classes and left the returned
+            # concat without an owner. Source semantics come from the
+            # authoritative operand row; storage aliases stay on their
+            # existing planning/descriptor records.
             if (
-                tuple(operand_fact) != ((lhs_cell, "lhs"), (rhs_cell, "rhs"))
+                not isinstance(operand_fact, tuple)
+                or len(operand_fact) != 2
+                or tuple(role for _cell, role in operand_fact) != ("lhs", "rhs")
+                or any(
+                    cell.page != result_cell.page
+                    or cell.row[0] != result_cell.row[0]
+                    for cell, _role in operand_fact
+                )
                 or result_cell not in {
                     parent for parent, _stage in late_book.edges_into(
                         operand_cell
@@ -32014,8 +32026,9 @@ def _class_surface_ssa_program(
                 }
             ):
                 return None
-            lhs_proof = _owned_concat_proof(operands[0], active | {value_id})
-            rhs_proof = _owned_concat_proof(operands[1], active | {value_id})
+            lhs_cell, rhs_cell = (cell for cell, _role in operand_fact)
+            lhs_proof = _owned_concat_proof(int(lhs_cell.row[1]), active | {value_id})
+            rhs_proof = _owned_concat_proof(int(rhs_cell.row[1]), active | {value_id})
             if lhs_proof is None or rhs_proof is None:
                 return None
             return (
