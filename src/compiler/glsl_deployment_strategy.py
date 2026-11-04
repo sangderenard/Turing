@@ -26636,6 +26636,44 @@ def _sequence_append_descriptor_sources(
     )
 
 
+def _source_primitive_scalar_descriptor(graph: Any, node_id: int):
+    """Read the same primitive class ABI for formals and computed scalars."""
+    from ..common.tensors.topological_reducer import (
+        _source_numeric_scope, node_identity_cell,
+    )
+    from .fortran_c_shell import _authored_annotation_field_receipt
+    from .identity_concordance import current_identity_book
+    from .planner_concordance_posts import _class_proves_value
+    from .source_evidence_resolver import ClassEvidence, require_class
+
+    book = current_identity_book()
+    value_id = int(graph.G.nodes[int(node_id)].get("value_id", node_id))
+    evidence = require_class(_source_numeric_scope(graph.G), value_id, book=book)
+    if not isinstance(evidence, ClassEvidence) or evidence.precision_limbs != 1:
+        return None, ()
+    if not evidence.class_identity.startswith("builtins."):
+        return None, ()
+    identity = node_identity_cell(graph, int(node_id))
+    if not _class_proves_value(book, evidence.class_cell, identity):
+        return None, ()
+    receipt = _authored_annotation_field_receipt(ast.Name(
+        id=evidence.class_identity.removeprefix("builtins."), ctx=ast.Load(),
+    ))
+    if receipt is None or receipt["storage"] != "scalar" or receipt["rank"] != 0:
+        return None, ()
+    # _ascending_order's weights.shape[0] already had builtins.int while
+    # descriptor planning read it as tensor indexing. Only Inputs consulted
+    # that class; waiting for the later VALUE_TYPE_ABI publication was too
+    # late for arange's region. Read the incumbent primitive ABI receipt for
+    # every exact source scalar, with the class/identity causes on the shape
+    # transformation. Explicit physical boundary contracts still take
+    # precedence in the rule below. Any, unions and tensor classes supply
+    # no primitive scalar receipt.
+    return {"shape": (), "dtype": receipt["dtype"], "rank": 0}, tuple(dict.fromkeys((
+        evidence.class_cell, identity, *evidence.proof_cells,
+    )))
+
+
 def _tensor_descriptor(
     graph: Any, node_id: int, _seen: set[int] | None = None,
 ) -> dict[str, Any] | None:
@@ -26672,6 +26710,9 @@ def _tensor_descriptor(
         )
 
         data = graph.G.nodes[int(node_id)] if int(node_id) in graph.G else {}
+        primitive_scalar_descriptor, _scalar_cells = _source_primitive_scalar_descriptor(
+            graph, int(node_id),
+        )
         collection_result = bool(
             str(data.get("type") or data.get("op") or "").casefold()
             == "loopresult"
@@ -26696,7 +26737,7 @@ def _tensor_descriptor(
             or data.get("op") or data.get("type") or ""
         ).casefold()
         specialized_operator = bool(
-            descriptor_operation in {
+            primitive_scalar_descriptor is not None or descriptor_operation in {
                 "flatten", "reshape", "view", "unsqueeze", "squeeze",
                 "expand", "broadcast_to",
             }
@@ -26893,7 +26934,10 @@ def _tensor_descriptor(
                     )))
             if answer is not None:
                 source_cells: tuple = ()
-                if operation.casefold() in {"zeros", "ones", "empty", "full"}:
+                scalar_answer, scalar_cells = _source_primitive_scalar_descriptor(graph, int(node_id))
+                if scalar_answer is not None:
+                    source_cells = scalar_cells
+                elif operation.casefold() in {"zeros", "ones", "empty", "full"}:
                     from .numerical_constructor_defaults import constructor_default_dtype
 
                     _default_dtype, source_cells = constructor_default_dtype(graph, int(node_id))
@@ -28071,46 +28115,10 @@ def _tensor_descriptor_rule(
                 tensor["rank"] = int(boundary["rank"])
             if boundary.get("metadata_state") is not None:
                 tensor["metadata_state"] = str(boundary["metadata_state"])
-        if "shape" not in tensor:
-            # Program: ``sum(i * k for i in range(6))`` with ``k: int``.
-            # Wrong record: an Input with no planner/ProgramABI boundary had
-            # no descriptor, so binary operators described it as the host
-            # scalar default float64 and ``i * k`` became a float row.
-            # Rule: an Input whose ``source_value_class`` row (posted from
-            # its annotation, default or call edge) is a builtin scalar class
-            # is a rank-0 value of that class's dtype.
-            from ..common.tensors.topological_reducer import (
-                _source_numeric_scope as _input_class_scope,
-            )
-            from .concordance_declarations import (
-                SOURCE_VALUE_CLASS as _INPUT_VALUE_CLASS,
-            )
-            from .identity_concordance import (
-                current_identity_book as _input_class_book,
-            )
-
-            input_class = _input_class_book().page(
-                _INPUT_VALUE_CLASS
-            ).latest((
-                _input_class_scope(graph.G),
-                int(data.get("value_id", node_id)),
-            ))
-            # An authored ``int`` value is the repository's int64 (the
-            # root formal's own SSA dtype).  The loop target's ``int`` is
-            # the composer's carried index, not this value: ``[n, 0]``
-            # handed to ``use(rec)`` described ``rec[0]`` as ``int``
-            # while the caller's ``n`` was int64 -- "incompatible physical
-            # call inputs" (corpus c465).
-            scalar_dtype = {
-                "builtins.int": "int64",
-                "builtins.bool": "bool",
-                "builtins.float": "float64",
-            }.get(
-                str(input_class[0])
-                if isinstance(input_class, tuple) and input_class else ""
-            )
-            if scalar_dtype is not None:
-                return {"shape": (), "dtype": scalar_dtype, "rank": 0}
+    if "shape" not in tensor:
+        scalar_descriptor, _scalar_cells = _source_primitive_scalar_descriptor(graph, int(node_id))
+        if scalar_descriptor is not None:
+            return scalar_descriptor
     if "shape" not in tensor:
         operation = descriptor_operation
         collection_expression = data.get("expr_obj")

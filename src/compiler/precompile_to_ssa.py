@@ -6095,6 +6095,13 @@ class _ControlSSABuilder(TiledObject):
         follow_aliases: bool = True,
     ) -> SSAValue:
         value_id = int(value_id)
+        incumbent_dimension = self.external_values.get(value_id)
+        if incumbent_dimension is None or not self._defines(incumbent_dimension):
+            # _ascending_order's count = weights.shape[0] is an ordinary
+            # assignment, not an If arm. Its source dimension must be
+            # computed at this first demand as well; recovering it as an
+            # extra root formal loses the authored receiver relationship.
+            self._materialize_source_tensor_shape_dimension(value_id)
         if value_id in self.native_value_type_tests and (
             value_id not in self.external_values or self._is_stand_in(value_id)
         ):
@@ -19633,7 +19640,11 @@ class _ControlSSABuilder(TiledObject):
                 f"source tensor shape dimension {row!r} has no exact current-arm identity"
             )
         receiver_id = int(receiver_cell.row[1])
-        receiver = self.external_value(receiver_id)
+        receiver = self._read(
+            receiver_id,
+            self._operand_bindings(((int(shape_cell.row[1]), "value", 0),)),
+            f"shape dimension {value_id} receiver",
+        ) if self.enclosing_loop_states else self.external_value(receiver_id)
         receiver_ssa_cell = self._value_cell(receiver)
         receiver_fact = book.page(SSA_VALUE).cell(
             receiver_ssa_cell.row, receiver_ssa_cell.column
@@ -20933,7 +20944,23 @@ class _ControlSSABuilder(TiledObject):
                 )
             port.shape = tuple(normal_value.shape)
             port.device = normal_value.device
-            self._revise_value(port, normal_value)
+            # The small package-merge slice exits with tensor port16. Its
+            # incoming header Phi has int64/span/rank1, but the old writer
+            # copied shape alone and left this exact port unphysical. Use
+            # the same posted carried contract that owns header Phi types.
+            _port_dtype, port_physical = self._posted_carried_type(
+                normal_value, *incoming_values,
+            )
+            port_cell = self._revise_value(
+                port, *incoming_values, stage=CONTROL_SSA_LOOP,
+                physical=port_physical if port_physical else KEEP_PHYSICAL,
+            )
+            port_fact = book.page(SSA_VALUE).cell(port_cell.row, port_cell.column)
+            port.accounting.update({key: value for key, value in (
+                ("physical_dtype", port_fact.physical_dtype),
+                ("program_abi_storage", port_fact.storage),
+                ("program_abi_rank", port_fact.rank),
+            ) if value is not None})
             self.emit(
                 Handler.Phi,
                 incoming_values,
