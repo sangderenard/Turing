@@ -287,3 +287,42 @@ emits; the shell's loader will need the same `math` import object the node
 worker supplies. Host `Math.*` is not bit-identical to libm in the last ulp;
 the Meowdoku law never reaches those imports at run time (dead opcode arms),
 so its parity target stays exact.
+
+## Finding 4: the wasm lane's host plumbing, built ahead of the compiler fixes (2026-11-04, night)
+
+- `lowered_system(backend="wasm")` exists in `examples/llvm_dt_system.py`.
+  It requires `piece_mode="inline"` (the core has no linker for LLVM pieces)
+  and returns a `NativeSystem` whose artifact is the `WasmCoreArtifact`
+  itself; the core now posts the same book rows the C lane posts
+  (MODULE_TEXT, BUFFER_ORDER, `program_abi_field_slot` under
+  `Backend.WASM_BINARY`), carries `buffer_dtypes`/`buffer_shapes` and a
+  `prepare_execution`, so `NativeSystem.prepare/state_field_ids/layout`
+  drive it unchanged.
+- `src/compiler/wasm_core_product.py`: `core_contract` (the
+  `turing.wasm-core-abi.v1` contract with per-buffer dtype, count and the
+  exact offsets the node harness uses), `write_core_web_product` and
+  `emit_core_single_file_page` (one html: base64 module, contract, shell
+  binding). `examples/mobile_reference_app/web/turing-wasm-shell.js` binds
+  the `math` imports from `Math`, grows memory to the contract, reads and
+  writes span buffers by dtype, and gained `fromBytes`.
+- Tests: `tests/test_wasm_core_product.py` (3: offsets equal the node
+  harness layout; the binding runs the drift law from bytes in node and
+  matches Python; the page carries module, contract and binding) and
+  `tests/dt_system/test_wasm_dt_system.py` (the wasm backend refuses linked
+  pieces; the round comparison against the Python lane).
+- **Blocked, compiler lane:** the round comparison cannot run because
+  `lower_ast_source_to_ssa(dt_system_over)` refuses with
+  `MissingResourceControlTopology` ("native resource scope requires
+  concorded entry, exit and cleanup edges") before any backend is reached;
+  `backend="c"` refuses identically on the same piece. Recorded hazard
+  class (`docs/hazards/20261102T145430Z_main.md`). The test xfails on that
+  exact message and runs for real once the lowering admits the program.
+  `compile_sympy_equations` also refuses on current main
+  (`topological_reducer`: "has no lexical read scope for its identity
+  row"), so the dt-system tests here build their piece from an authored
+  AbstractTensor law, the route `examples/meowdoku` takes.
+- Open items for the game, all compiler-side: the bare `equal` and the
+  region-18 storage obligation (Finding 3), and the `dt_system_over`
+  resource topology above. The game page (`examples/meowdoku` board on top
+  of `emit_core_single_file_page`) is the remaining game-lane step once the
+  Meowdoku module emits.

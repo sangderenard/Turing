@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -609,10 +609,27 @@ class WasmCoreArtifact:
     #: ``(name, parameter kinds, result kinds)`` of every further function,
     #: in function-index order after the entry.  Diagnostics and shells.
     functions: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = ()
+    #: Per buffer parameter (``buffer_order`` order): the host dtype and the
+    #: declared shape, the same two tables the C and LLVM artifacts carry so
+    #: ``NativeSystem.layout`` reads any lane alike.
+    buffer_dtypes: tuple[str, ...] = ()
+    buffer_shapes: tuple[tuple[int, ...], ...] = ()
+    #: ``emission_concordance.ArtifactEmission``: the book and the
+    #: MODULE_TEXT / BUFFER_ORDER cells this emission posted (None without an
+    #: attached book).  ``NativeSystem.slots`` reads the ProgramABI slot rows
+    #: posted beside them under ``emission.backend``.
+    emission: Any = field(default=None, repr=False, compare=False)
 
     @property
     def complete(self) -> bool:
         return not self.shortfalls
+
+    def prepare_execution(self, feeds: Mapping[int, Any], *, shapes=None):
+        """Allocate the public buffers from real feed values, ready to run:
+        the same name and contract as ``CModuleArtifact.prepare_execution``,
+        so a host (``NativeSystem.prepare``) drives this lane unchanged."""
+
+        return prepare_wasm_core_execution(self, feeds)
 
     @property
     def buffer_order(self) -> tuple[int, ...]:
@@ -2039,6 +2056,57 @@ def emit_ssa_module_to_wasm_core(
             imports=imports,
             functions=further,
         )
+    # The host-facing tables and the book rows, as the C module lane posts
+    # them: MODULE_TEXT and BUFFER_ORDER derive from the slot values' cells,
+    # and the ProgramABI slot rows (which formal is which state field) are
+    # posted once here and read by ``NativeSystem.slots``.
+    buffer_order = tuple(value_id for kind, value_id in parameters if kind == "buffer")
+    values_by_id = {int(formal.id): formal for formal in root.args}
+    for value in returned_values:
+        values_by_id.setdefault(int(value.id), value)
+    buffer_dtypes = []
+    buffer_shapes = []
+    for value_id in buffer_order:
+        value = values_by_id.get(value_id)
+        dtype = output_dtypes.get(value_id)
+        if dtype is None:
+            physical = None if value is None else physical_kind(root_env, value)
+            dtype = {"i64": "int64", "i32": "int32", "f64": "float64"}.get(physical, "float64")
+        buffer_dtypes.append(dtype)
+        buffer_shapes.append(tuple(getattr(value, "shape", ()) or ()))
+    emission_record = None
+    if not shortfalls:
+        from .concordance_declarations import (
+            ArtifactPart, Backend, EMISSION_WASM, VALUE_WITHOUT_IDENTITY_CELL,
+        )
+        from .emission_concordance import (
+            ArtifactEmission, emission_book, post_artifact_part,
+            post_program_abi_field_slots, value_cell,
+        )
+
+        emission = emission_book(module, "emit_ssa_module_to_wasm_core")
+        slot_cells = tuple(value_cell(emission, root, value_id) for value_id in buffer_order)
+        module_text = post_artifact_part(
+            emission, name, Backend.WASM_BINARY, ArtifactPart.MODULE_TEXT,
+            data=binary, sources=slot_cells, reason=VALUE_WITHOUT_IDENTITY_CELL,
+            stage=EMISSION_WASM, module=module, what="emit_ssa_module_to_wasm_core",
+        )
+        buffer_order_cell = None if emission is None else post_artifact_part(
+            emission, name, Backend.WASM_BINARY, ArtifactPart.BUFFER_ORDER,
+            data=repr((buffer_order, tuple(buffer_dtypes), tuple(buffer_shapes))),
+            location=buffer_order, sources=slot_cells,
+            reason=VALUE_WITHOUT_IDENTITY_CELL, stage=EMISSION_WASM,
+        )
+        post_program_abi_field_slots(
+            emission, root, name, Backend.WASM_BINARY, buffer_order=buffer_order,
+            buffer_dtypes=buffer_dtypes, buffer_shapes=buffer_shapes,
+            buffer_order_cell=buffer_order_cell, stage=EMISSION_WASM,
+        )
+        if emission is not None:
+            emission_record = ArtifactEmission(
+                emission, Backend.WASM_BINARY, module_text, buffer_order_cell,
+                root=root,
+            )
     return WasmCoreArtifact(
         name=name,
         binary=binary,
@@ -2054,6 +2122,9 @@ def emit_ssa_module_to_wasm_core(
             (item.name, tuple(item.parameter_types), tuple(item.result_types))
             for item in further
         ),
+        buffer_dtypes=tuple(buffer_dtypes),
+        buffer_shapes=tuple(buffer_shapes),
+        emission=emission_record,
     )
 
 

@@ -76,6 +76,7 @@ from src.compiler.native_law_kernels import LLVMPiece
 C_BACKEND = "c"
 LLVM_BACKEND = "llvm"
 FORTRAN_BACKEND = "fortran"
+WASM_BACKEND = "wasm"
 
 #: ``residual`` is a law's convergence measure (a fixed-point cycle's iterate
 #: change, a constraint solve's violation), reduced by max like the error
@@ -1502,6 +1503,10 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
 
     if piece_mode not in {"link", "inline"}:
         raise ValueError(f"piece_mode={piece_mode!r}: 'link' or 'inline'")
+    if backend == WASM_BACKEND and piece_mode != "inline":
+        raise ValueError(
+            "backend='wasm' has no linker for LLVM pieces: the laws must be "
+            "part of the program; pass piece_mode='inline'")
     source_compilation = "parallel" if source_compilation == "units" else source_compilation
     if source_compilation not in {"auto", "serial", "parallel"}:
         raise ValueError(f"source_compilation={source_compilation!r}: 'auto', 'serial' or 'parallel'")
@@ -1571,6 +1576,22 @@ def lowered_system(piece_files, *, backend=C_BACKEND, directory=None, optimizati
                                     directory=build, optimization=optimization)
     elif backend == FORTRAN_BACKEND:
         raise NotImplementedError("the Fortran deployment route is not built for this program yet")
+    elif backend == WASM_BACKEND:
+        # The direct Wasm core (``ssa_wasm_backend``): one wasm function per
+        # reachable SSA function, no linker.  The laws must therefore be
+        # part of this program (``piece_mode="inline"``): a linked LLVM
+        # piece is machine code the core cannot call.  The artifact is its
+        # own executable -- there is no compile step -- and
+        # ``prepare_execution`` runs it in node (or a page's engine).
+        from src.compiler.ssa_wasm_backend import emit_ssa_module_to_wasm_core
+
+        progress("emitting linked repository SSA to the direct Wasm core")
+        compiled = emit_ssa_module_to_wasm_core(module, exports[0], entry_name=exports[0])
+        if not compiled.complete:
+            raise RuntimeError("Wasm emission shortfalls: " + "; ".join(
+                f"{s.operation}: {s.reason}" for s in compiled.shortfalls[:6]))
+        progress(f"wasm core emitted: {len(compiled.binary)} bytes, "
+                 f"{len(compiled.functions)} further functions")
     else:
         raise ValueError(f"unknown backend {backend!r}")
     return NativeSystem(compiled, module, exports[0], pieces,
