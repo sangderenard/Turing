@@ -118,6 +118,7 @@ def with_authored_broadcast_extents(
         },
         f"{reference.source_identity}+sha256:{digest}",
         reference.external_primitives,
+        reference.compile_time_constructors,
     )
     if module is not None:
         module.metadata["tensor_ssa_reference"] = augmented

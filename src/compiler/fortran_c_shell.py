@@ -63699,6 +63699,23 @@ def _lower_resolved_process_graph_deployment(
         }
         graph.G.graph["map_ir"] = map_ir
 
+    # A selected literal tensor constructor is a source type decision before
+    # region folding. Carry only its concorded declaration cells into each
+    # authored graph; the repository kernel module itself is not graph state.
+    from .numerical_constructor_defaults import selected_literal_constructor_source
+
+    selected_literal = selected_literal_constructor_source(tensor_ssa_reference)
+    if selected_literal is not None:
+        for candidate in (
+            deployment_graph,
+            *(getattr(entry, "graph", None)
+              for entry in deployment_graph.function_table),
+        ):
+            if getattr(candidate, "G", None) is not None:
+                candidate.G.graph["selected_literal_constructor_source"] = (
+                    selected_literal
+                )
+
     compile_stage("deployment-select")
     report("ssa-source: selecting complete control/operator deployment")
     deployment_type = strategize_shell_deployment(

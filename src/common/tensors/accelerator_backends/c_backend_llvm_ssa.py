@@ -4337,8 +4337,9 @@ def c_backend_repository_ssa_reference():
     """Return the C computational core as one repository-SSA code reference.
 
     The C functions and handwritten LLVM are provenance.  The returned object
-    contains only Turing repository SSA and canonical operation→entrypoint
-    references; it cannot execute or dispatch tensor operations.
+    contains Turing repository SSA, canonical operation→entrypoint references,
+    and source declarations for compile-time constructor defaults. Consumers
+    ingest those declarations; this reference does not execute tensor operations.
     """
 
     from ....transmogrifier.tensor_ssa_reference import (
@@ -4346,6 +4347,7 @@ def c_backend_repository_ssa_reference():
         SSATensorOperationReference,
     )
     from .llvm_repository_ssa import import_llvm_to_repository_ssa
+    from .ssa_backend import SSATensorProgram
 
     imported = import_llvm_to_repository_ssa(
         LLVM_SSA_MODULE,
@@ -4397,6 +4399,7 @@ def c_backend_repository_ssa_reference():
         operations,
         "c_backend_llvm_ssa.LLVM_SSA_MODULE",
         C_SSA_EXTERNAL_PRIMITIVES,
+        {"ensure_tensor": SSATensorProgram.constant},
     )
 
 
