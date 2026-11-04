@@ -572,16 +572,18 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
     # owners are caller frame cells, and neither tensor escapes. Their
     # allocation outlives every region consumer and is released by the
     # existing heap instruction immediately before this root's Ret. The
-    # single-block order is checked here and rechecked by the audit; other
-    # control topologies remain a named refusal until their lifetime is
-    # proved from control edges.
+    # A later sole Ret is also safe when the producer block dominates it and
+    # every use stays in the producer block. The control proof comes from the
+    # exact booked SSA edges; an unbooked successor remains a refusal.
     from .concordance_declarations import (
+        SSA_CONTROL_EDGE,
         TENSOR_HEAP_OWNER_CALL_BINDING,
         TENSOR_HEAP_RELEASE_BINDING,
         TENSOR_HEAP_CONSUMER_NONESCAPE,
     )
     from .ssa_heap_allocation import heap_release
     from .ssa_record_return_state import ssa_block_identity_cell
+    from .identity_concordance import CorrelationTable
     for owner_row in tuple(book.page(TENSOR_HEAP_OWNER_CALL_BINDING).rows()):
         caller = module.functions.get(str(owner_row[1]))
         if caller is None:
@@ -617,7 +619,6 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
             len(owner_actuals) != 1
             or len(returns) != 1
             or len(producer) != 1
-            or returns[0][0] is not producer[0][0]
             or any(int(value.id) in {tensor_id, owner_actual_id}
                    for value in returns[0][1].args)
         ):
@@ -625,7 +626,8 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
                 "private owned tensor has no single-block nonescaping lifetime"
             )
         block = returns[0][0]
-        producer_position = block.instrs.index(producer[0][1])
+        producer_block = producer[0][0]
+        producer_position = producer_block.instrs.index(producer[0][1])
         return_position = block.instrs.index(returns[0][1])
         uses = tuple(
             (other_block, other_block.instrs.index(instruction))
@@ -635,10 +637,55 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
             and any(int(value.id) == tensor_id
                     for value in instruction.args)
         )
+        control_cells = ()
+        if producer_block is not block:
+            dominators = CorrelationTable._dominators(caller)
+            if producer_block.name not in dominators.get(block.name, ()):
+                raise ValueError(
+                    "private owned tensor producer does not dominate its return"
+                )
+            scope = function_scope_of(caller)
+            reachable = set(dominators)
+            live_edges = {
+                (name, successor)
+                for name in reachable
+                for successor in caller.blocks[name].successors
+                if successor in reachable
+            }
+            booked_edges = {}
+            for edge_row in book.page(SSA_CONTROL_EDGE).rows():
+                if edge_row[:2] != (scope, caller.name):
+                    continue
+                before, after = edge_row[2:4]
+                edge = (str(before.row[2]), str(after.row[2]))
+                if edge not in live_edges:
+                    continue
+                if (
+                    before != ssa_block_identity_cell(
+                        caller, edge[0], book=book,
+                    )
+                    or after != ssa_block_identity_cell(
+                        caller, edge[1], book=book,
+                    )
+                ):
+                    continue
+                edge_cell = book.latest_ref(SSA_CONTROL_EDGE, edge_row)
+                if edge_cell is not None and book.page(SSA_CONTROL_EDGE).cell(
+                    edge_cell.row, edge_cell.column,
+                ) is True:
+                    booked_edges.setdefault(edge, set()).add(edge_cell)
+            if any(len(booked_edges.get(edge, ())) != 1
+                   for edge in live_edges):
+                raise ValueError(
+                    "private owned tensor return has unbooked SSA control"
+                )
+            control_cells = tuple(
+                next(iter(booked_edges[edge])) for edge in sorted(live_edges)
+            )
         if (
-            producer_position >= return_position
-            or any(other_block is not block
-                   or not producer_position < position < return_position
+            (producer_block is block and producer_position >= return_position)
+            or any(other_block is not producer_block
+                   or position <= producer_position
                    for other_block, position in uses)
         ):
             raise ValueError(
@@ -776,6 +823,9 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
             ssa_value_identity_cell(caller, tensor_id, book=book),
             ssa_value_identity_cell(caller, owner_actual_id, book=book),
             ssa_block_identity_cell(caller, block.name, book=book),
+            *((ssa_block_identity_cell(caller, producer_block.name, book=book),)
+              if producer_block is not block else ()),
+            *control_cells,
             *nonescape_cells,
         )
         if any(cell is None for cell in release_sources):
