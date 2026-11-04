@@ -885,6 +885,7 @@ def _refresh_source_return_passthrough_metadata(module: IRModule, book) -> bool:
     from .concordance_declarations import (
         AGGREGATE_PASSTHROUGH_REBINDING, CALL_RECORD, SSA_VALUE,
         TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+        TENSOR_RUNTIME_BROADCAST_VALIDITY,
         TENSOR_SOURCE_OWNED_RETURN,
         TENSOR_SSA_LOWERING,
     )
@@ -1039,6 +1040,85 @@ def _refresh_source_return_passthrough_metadata(module: IRModule, book) -> bool:
                             provenance=Derived((binding_ref, latest_result)),
                             mode=Mode.CONCORD,
                         )
+                        # _ascending_order's root broadcast lives in a
+                        # planned consumer, not in the source Call's own
+                        # function. The existing metadata Call receipt and
+                        # live actual/formal pairs identify that consumer's
+                        # exact tensor input and three geometry formals.
+                        # Its older broadcast receipt cited the source
+                        # result before this aggregate fold. Re-cite the
+                        # changed source result, current Call record and
+                        # three rebindings without changing the law/fact.
+                        target = module.functions.get(str(binding_row[4]))
+                        source_block = caller.blocks.get(str(binding_row[2]))
+                        linked = () if source_block is None else tuple(
+                            instruction for instruction in source_block.instrs
+                            if instruction.op == "Call"
+                            and instruction.res is not None
+                            and int(instruction.res.id) == int(binding_row[3])
+                            and instruction.attributes.get("callee") == binding_row[4]
+                        )
+                        if (target is None or len(linked) != 1
+                                or len(linked[0].args) != len(target.args)):
+                            continue
+                        if (tuple(map(int, linked[0].attributes.get(
+                                "callee_input_ids", ()))) != tuple(
+                                int(formal.id) for formal in target.args)
+                                or tuple(map(int, linked[0].attributes.get(
+                                    "feed_ids", ()))) != tuple(
+                                    int(actual.id) for actual in linked[0].args)):
+                            continue
+                        pairs = tuple((int(actual.id), int(formal.id))
+                                      for actual, formal in zip(
+                                          linked[0].args, target.args, strict=True,
+                                      ))
+                        data_formals = tuple(formal_id for actual_id, formal_id
+                                             in pairs if actual_id == caller_id)
+                        metadata_pairs = tuple(zip(
+                            *binding_fact, strict=True,
+                        ))
+                        if (len(data_formals) != 1
+                                or any(pair not in pairs
+                                       for pair in metadata_pairs)
+                                or tuple(binding_fact[0]) != caller_ids):
+                            continue
+                        tensor_formal = data_formals[0]
+                        formal_ids = tuple(binding_fact[1])
+                        validity_page = book.page(TENSOR_RUNTIME_BROADCAST_VALIDITY)
+                        for validity_row in tuple(validity_page.rows()):
+                            if validity_row[:2] != (
+                                function_scope_of(target), target.name,
+                            ):
+                                continue
+                            validity_ref = book.latest_ref(
+                                TENSOR_RUNTIME_BROADCAST_VALIDITY, validity_row,
+                            )
+                            validity_fact = validity_page.cell(
+                                validity_ref.row, validity_ref.column,
+                            )
+                            if (not isinstance(validity_fact, tuple)
+                                    or len(validity_fact) != 19
+                                    or tuple(validity_fact[1:3]).count(
+                                        tensor_formal) != 1):
+                                continue
+                            geometry = (tuple(validity_fact[5:8])
+                                        if int(validity_fact[3]) == tensor_formal
+                                        else tuple(validity_fact[8:11])
+                                        if int(validity_fact[4]) == tensor_formal
+                                        else None)
+                            if geometry != formal_ids or prior not in {
+                                parent for parent, _stage in book.edges_into(
+                                    validity_ref)
+                            }:
+                                continue
+                            book.post(
+                                TENSOR_RUNTIME_BROADCAST_VALIDITY, validity_row,
+                                validity_fact, stage=TENSOR_SSA_LOWERING,
+                                provenance=Derived((latest_result, record_ref,
+                                                    *rebinding_refs,
+                                                    binding_ref)),
+                                mode=Mode.CONCORD,
+                            )
                     return_row = (function_scope_of(caller), caller.name,
                                   int(call.res.id), source.name, source_id)
                     return_ref = book.latest_ref(TENSOR_SOURCE_OWNED_RETURN,

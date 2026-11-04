@@ -622,6 +622,25 @@ the source audit was corrected to compare carriers with that measured origin.
 Reading the exact origin cell before naming its physical layout would have
 prevented the mistaken instruction.
 
+## 2026-11-04 — assumed the source caller was the broadcast function
+
+The first mixed-broadcast receipt refresh matched the outer source Call's
+caller name against the function that held the broadcast. The actual
+`_ascending_order` source Call is in `root`, while the guarded broadcast is
+in `root__planned_region_0`; the existing TENSOR_METADATA_CALL_BINDING and
+live Call actual/formal pairs connect them. Two bounded ASC runs still
+reported the same audit finding before the writer was moved to that exact
+Call edge. The draft also included the existing CONCORD target as its own
+cause, which would have created a self-edge; root's review caught it before
+the final run. The finished writer cites only the current result, Call
+record, and three aggregate rebinding causes on the existing receipt.
+The first permanent negative also asked the broadcast audit to reject a
+forged *callee* metadata triple even though that audit consumes the unchanged
+*caller* triple. Native parity passed, but that assertion failed after a
+33.19-second test run. The negative now assigns the forged callee triple to
+the metadata-result audit and the forged caller triple to the broadcast
+audit, preserving each reader's exact contract.
+
 ## 2026-11-04 — refreshed a historical Call cause while adding physical proof
 
 The agent was asked to carry the newly posted float64 SSA physical cell into

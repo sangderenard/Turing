@@ -11,7 +11,11 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
 )
 from src.common.tensors.compression import huffman
-from src.compiler.concordance_declarations import TENSOR_RUNTIME_TOPK_SELECTION
+from src.compiler.concordance_declarations import (
+    AGGREGATE_PASSTHROUGH_REBINDING, CALL_RECORD,
+    TENSOR_METADATA_RESULT_BINDING, TENSOR_RUNTIME_BROADCAST_VALIDITY,
+    TENSOR_RUNTIME_TOPK_SELECTION,
+)
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.precompile_to_ssa import SSALoweringIncompleteError
@@ -116,6 +120,25 @@ def test_authored_ascending_order_runtime_topk_native(tmp_path):
     module, root, artifact = _lower(
         source, "topk_runtime_ascending", _contract("weights"),
     )
+    book = module.metadata["identity_book"]
+    validity_page = book.page(TENSOR_RUNTIME_BROADCAST_VALIDITY)
+    mixed_rows = tuple(row for row in validity_page.rows()
+                       if validity_page.latest(row)[0] == "mul")
+    assert len(mixed_rows) == 1
+    mixed_ref = book.latest_ref(TENSOR_RUNTIME_BROADCAST_VALIDITY,
+                                mixed_rows[0])
+    causes = {cause for cause, _stage in book.edges_into(mixed_ref)}
+    assert mixed_ref not in causes
+    result_causes = tuple(cause for cause in causes
+                          if cause.page == TENSOR_METADATA_RESULT_BINDING
+                          and book.latest_ref(cause.page, cause.row) == cause)
+    record_causes = tuple(cause for cause in causes
+                          if cause.page == CALL_RECORD
+                          and book.latest_ref(cause.page, cause.row) == cause)
+    rebinding_causes = tuple(cause for cause in causes
+                             if cause.page == AGGREGATE_PASSTHROUGH_REBINDING)
+    assert len(result_causes) == len(record_causes) == 1
+    assert len(rebinding_causes) == 3
     artifact.compile(tmp_path / "topk_runtime_ascending")
     for items in ((), (5,), (5, 3, 3, 1), (9, 2, 8, 2, 1, 1)):
         values = np.asarray(items, dtype=np.int64)
@@ -127,6 +150,26 @@ def test_authored_ascending_order_runtime_topk_native(tmp_path):
             _port(module, root, "weights"): values,
         }).run().buffers[_result(module, root)]
         assert int(np.asarray(result).item()) == expected
+    result_ref = result_causes[0]
+    result_page = book.page(TENSOR_METADATA_RESULT_BINDING)
+    original = result_page.cell(result_ref.row, result_ref.column)
+    result_page.cells[(result_ref.row, result_ref.column)] = (
+        original[0], (original[1][0] + 1, *original[1][1:]), original[2],
+    )
+    try:
+        assert CorrelationTable._tensor_metadata_result_binding_findings(
+            module)
+    finally:
+        result_page.cells[(result_ref.row, result_ref.column)] = original
+    result_page.cells[(result_ref.row, result_ref.column)] = (
+        original[0], original[1],
+        (original[2][0] + 1, *original[2][1:]),
+    )
+    try:
+        assert CorrelationTable._tensor_runtime_broadcast_validity_findings(
+            module)
+    finally:
+        result_page.cells[(result_ref.row, result_ref.column)] = original
 
 
 def test_runtime_topk_selection_rejects_changed_min_or_count():
