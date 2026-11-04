@@ -755,7 +755,16 @@ def _infer_pointer_storage(functions, native_storage=None):
         instructions = [instruction for block in function.blocks.values() for instruction in block.instrs]
         for formal in function.args:
             posted_formal = posted_ssa_value_fact(function, formal.id)
-            if formal.dtype != 'ptr' or (
+            repository_origin = (
+                (function.metadata.get('llvm_repository_kernel') or (None, {}))[1]
+                .get(int(formal.id))
+            )
+            imported_pointer = (
+                repository_origin is not None
+                and repository_origin[1] == 'argument'
+                and str(repository_origin[2]).startswith('ptr ')
+            )
+            if (formal.dtype != 'ptr' and not imported_pointer) or (
                 posted_formal is not None
                 and posted_formal.physical_dtype is not None
             ):
@@ -785,6 +794,28 @@ def _infer_pointer_storage(functions, native_storage=None):
                     witnesses.append(instruction.args[0])
                 if dtype is not None:
                     types.add(dtype)
+            # The int64-selector gather copies full rows with llvm.memcpy.
+            # Its output has no Store witness.  An exact imported typed GEP
+            # feeding that memcpy gives the physical element stride, while
+            # the imported formal origin proves this is a pointer despite a
+            # signature-specific resident dtype annotation.
+            for instruction in instructions:
+                if (instruction.op not in {'GEP', 'GetElementPtr', 'getelementptr'}
+                        or instruction.res is None
+                        or int(instruction.res.id) not in aliases):
+                    continue
+                element = instruction.attributes.get('llvm_gep_element_type')
+                if element is None:
+                    continue
+                if any(
+                    use.op == 'Call'
+                    and str(use.attributes.get('callee', '')).startswith('llvm.memcpy.')
+                    and any(int(arg.id) == int(instruction.res.id)
+                            for arg in use.args[:2])
+                    for use in instructions
+                ):
+                    types.add(str(element))
+                    witnesses.append(instruction.res)
             native = (
                 None if native_storage is None
                 else native_storage.get((function.name, int(formal.id)))

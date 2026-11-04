@@ -327,6 +327,20 @@ class _FunctionImporter:
             attributes["callee"] = str(callee.name)
         else:
             handler = _DIRECT_HANDLERS.get(opcode)
+        if opcode == "getelementptr":
+            # LLVM opaque pointers erase the pointee from ValueRef.type.
+            # Retain the authored element type on the exact GEP operation;
+            # the repository's typed-storage reader may then cite its result
+            # when a memcpy consumes that address.
+            element = re.search(
+                r"\bgetelementptr(?:\s+inbounds)?\s+"
+                r"(?P<type>i32|i64|double),\s+ptr\b",
+                str(instruction),
+            )
+            if element is not None:
+                attributes["llvm_gep_element_type"] = {
+                    "i32": "int32", "i64": "int64", "double": "float64",
+                }[element.group("type")]
         if handler is None:
             self.shortfalls.append(
                 LLVMRepositorySSAShortfall(
@@ -343,6 +357,22 @@ class _FunctionImporter:
             if str(instruction.type) == "void"
             else self.values[self._value_key(instruction)]
         )
+        if opcode == "call" and attributes.get("callee") == "turing_validation_error":
+            # The repository validation Call carries its literal code as an
+            # attribute.  Only an authored LLVM i32 literal can take that
+            # form; a dynamic code remains an ordinary Call and is refused
+            # by the emitter.  The imported Const and kernel source origin
+            # stay in the component's value history.
+            literal = (
+                str(operands[0]).strip()
+                if len(operands) == 1
+                and operands[0].value_kind.name.startswith("constant")
+                else ""
+            )
+            match = re.fullmatch(r"i32 ([0-9]+)", literal)
+            if match is not None and 0 < int(match.group(1)) <= 0xFFFFFFFF:
+                attributes["error_code"] = int(match.group(1))
+                operands = []
         if opcode == "phi":
             try:
                 attributes["incoming_blocks"] = tuple(

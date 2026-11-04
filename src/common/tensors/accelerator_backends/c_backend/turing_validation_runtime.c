@@ -1,16 +1,16 @@
 #include "turing_validation_runtime.h"
 #include <stddef.h>
 
-#if defined(_WIN32)
-#define TURING_VALIDATION_EXPORT __declspec(dllexport)
+#if defined(_MSC_VER)
+#define TURING_THREAD_LOCAL __declspec(thread)
 #else
-#define TURING_VALIDATION_EXPORT __attribute__((visibility("default")))
+#define TURING_THREAD_LOCAL _Thread_local
 #endif
 
-static _Thread_local turing_error_packet active_error = {0};
-static _Thread_local turing_error_packet reported_error = {0};
-static _Thread_local uint64_t current_worker = 0;
-static _Thread_local const char *current_worker_function = NULL;
+static TURING_THREAD_LOCAL turing_error_packet active_error = {0};
+static TURING_THREAD_LOCAL turing_error_packet reported_error = {0};
+static TURING_THREAD_LOCAL uint64_t current_worker = 0;
+static TURING_THREAD_LOCAL const char *current_worker_function = NULL;
 
 TURING_VALIDATION_EXPORT void turing_validation_error_set_worker(uint64_t token, const char *function) {
     current_worker = token;
@@ -31,7 +31,7 @@ TURING_VALIDATION_EXPORT void turing_validation_error(uint32_t code) {
     const char *type = NULL;
     /* These are the existing native_faults.py ABI codes. */
     switch (code) {
-        case 71: type = "builtins.IndexError"; break;
+        case 71: case 101: type = "builtins.IndexError"; break;
         case 84: type = "builtins.KeyError"; break;
         case 86: case 95: case 96: type = "builtins.OverflowError"; break;
         case 87: case 90: case 94: type = "builtins.ValueError"; break;

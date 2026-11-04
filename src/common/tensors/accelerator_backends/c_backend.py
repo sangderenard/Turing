@@ -141,6 +141,12 @@ ffi.cdef("""
     void index_select_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, const int* indices, int index_count);
+    void index_select_int64_indices_int64(
+        const long long* input, long long* output, const int* shape,
+        int ndim, int dim, const long long* indices, int index_count);
+    void index_select_double_indices_int64(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const long long* indices, int index_count);
     void scatter_sum_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, const long long* indices, int index_count,
@@ -182,6 +188,7 @@ ffi.cdef("""
     void gather_pairs_2d(const double* a, const int* rows, const int* cols,
                          double* out, int n_pairs, int stride);
     double sum_double(const double* a, int n);
+    long long sum_int64(const long long* a, int n);
     void create_arange(double start, double step, int n, double* out);
     void create_arange_int64(
         long long start, long long step, int n, long long* out);
@@ -220,16 +227,17 @@ from pathlib import Path
 # backend will raise an error. This approach encourages explicit dependency
 # management and avoids silent mismatches between versions.
 SOURCE_PATH = Path(__file__).with_name("c_backend") / "ctensor_ops.c"
+VALIDATION_SOURCE_PATH = SOURCE_PATH.with_name("turing_validation_runtime.c")
 if not SOURCE_PATH.exists():
     raise FileNotFoundError(f"Missing C source: {SOURCE_PATH}")
-C_SOURCE = SOURCE_PATH.read_text()
+C_SOURCE = SOURCE_PATH.read_text() + '\n' + VALIDATION_SOURCE_PATH.read_text()
 
 _prebuilt = os.environ.get("TENSOR_CTENSOR_LIB")
 if _prebuilt and os.path.exists(_prebuilt):
     C = ffi.dlopen(_prebuilt)
 else:
     C = ffi.verify(
-        C_SOURCE, include_dirs=[str(SOURCE_PATH.parent)]
+        C_SOURCE, include_dirs=[str(SOURCE_PATH.parent)],
     )
 
 # ########## STUB: build_ctensor_with_zig ##########
@@ -279,6 +287,7 @@ def build_ctensor_with_zig(source_path: str, out_dir: str) -> str:
             "-shared",
             "-O3",
             source_path,
+            str(Path(source_path).with_name("turing_validation_runtime.c")),
             "-o",
             str(out_path),
         ]

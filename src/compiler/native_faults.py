@@ -72,6 +72,9 @@ RESHAPE_INVALID_SHAPE = 98
 #: storage may be read or written.
 BROADCAST_INCOMPATIBLE_SHAPE = 100
 
+#: A tensor integer selector lies outside -axis_extent <= index < axis_extent.
+TENSOR_INDEX_OUT_OF_RANGE = 101
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -117,6 +120,8 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
 
     if int(code) == LIST_INDEX_OUT_OF_RANGE:
         return NativeIndexError(f"list index out of range ({runtime_message})")
+    if int(code) == TENSOR_INDEX_OUT_OF_RANGE:
+        return NativeIndexError(f"tensor index out of range ({runtime_message})")
     if int(code) == MAPPING_KEY_ABSENT:
         return NativeKeyError(f"key not in mapping ({runtime_message})")
     if int(code) == INT_OVERFLOW:

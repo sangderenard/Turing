@@ -1605,6 +1605,8 @@ class CorrelationTable:
         found.extend(self._runtime_result_abi_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
         found.extend(self._source_tensor_shape_dimension_findings(module))
+        from .native_tensor_family import family_findings
+        found.extend(family_findings(module))
         found.extend(self._source_closed_aggregate_length_findings(module))
         found.extend(self._source_closed_class_alternative_findings(module))
         found.extend(self._source_class_union_native_gap_findings(module))
@@ -5106,7 +5108,7 @@ class CorrelationTable:
         """An input binding names one live Call by its SSA result identity."""
 
         from .concordance_declarations import (
-            AGGREGATE_PASSTHROUGH_REBINDING, SSA_VALUE,
+            AGGREGATE_PASSTHROUGH_REBINDING, DEAD_STRUCTURAL_RETIREMENT, SSA_VALUE,
             TENSOR_METADATA_CALL_BINDING,
             TENSOR_METADATA_RESULT_BINDING, TENSOR_SHAPE_CONCORDANCE,
         )
@@ -5124,8 +5126,16 @@ class CorrelationTable:
             matching = () if block is None else tuple(
                 instruction for instruction in block.instrs
                 if instruction.op in {"Call", "call"}
-                and instruction.res is not None
-                and int(instruction.res.id) == row[3]
+                and (
+                    instruction.res is not None and int(instruction.res.id) == row[3]
+                    or instruction.res is None and isinstance(
+                        retired := instruction.attributes.get("aggregate_retired_result"), Ref)
+                    and retired.page == DEAD_STRUCTURAL_RETIREMENT
+                    and retired.row == (row[0], row[3])
+                    and book.latest_ref(DEAD_STRUCTURAL_RETIREMENT, retired.row) == retired
+                    and book.page(retired.page).cell(retired.row, retired.column)[0] == "Call"
+                    and instruction.attributes.get("aggregate_output_passthrough_bindings")
+                )
             )
             valid = (
                 len(row) == 5 and caller is not None and callee is not None
@@ -5215,10 +5225,12 @@ class CorrelationTable:
                             previous_fact[0], fact[0], strict=True,
                         ):
                             item = mapping.get(int(old_id))
-                            if (item is None or item[1] != (
-                                    int(new_id), result_refs[0].row[2],
-                                    int(old_id),
-                                )):
+                            if (item is None or len(item[1]) != 3
+                                    or item[1][0] != int(new_id)
+                                    or item[1][2] != int(old_id)
+                                    or item[0] not in {
+                                        source for source, _stage in book.edges_into(result_refs[0])
+                                    }):
                                 valid = False
                                 break
                             cited_rows.update(
@@ -5230,6 +5242,23 @@ class CorrelationTable:
                             parent.row for parent in previous_causes
                             if parent.page == SSA_VALUE
                         )
+                        # A second upstream fold changes only actuals again;
+                        # the original Call/formal identities remain on the
+                        # initial binding. Follow this exact row's recorded
+                        # predecessor chain, rather than requiring each view
+                        # revision to duplicate those original SSA causes.
+                        pending_bindings, seen_bindings = [previous], set()
+                        while pending_bindings:
+                            ancestor = pending_bindings.pop()
+                            if ancestor in seen_bindings:
+                                continue
+                            seen_bindings.add(ancestor)
+                            for source, _stage in book.edges_into(ancestor):
+                                if source.page == SSA_VALUE:
+                                    cited_rows.add(source.row)
+                                elif (source.page == TENSOR_METADATA_CALL_BINDING
+                                      and source.row == row):
+                                    pending_bindings.append(source)
                 valid = (
                     valid and required_rows <= cited_rows
                     and any(parent.page in {
@@ -5687,19 +5716,22 @@ class CorrelationTable:
                     and len(instruction.args) == 1
                     and int(instruction.args[0].id) == int(row[2])
                 )
-                returns = tuple(
+                terminals = tuple(
                     (index, instruction)
                     for index, instruction in enumerate(instructions)
-                    if instruction.op == "Ret"
+                    if instruction.op in {"Ret", "Br", "CondBr"}
                 )
-                valid = (len(producers) == len(releases) == len(returns) == 1
+                valid = (len(producers) == len(releases) == len(terminals) == 1
+                         and terminals[0][0] == len(instructions) - 1
                          and sum(instruction.op == "Ret"
                                  for other in function.blocks.values()
                                  for instruction in other.instrs) == 1)
             if valid:
                 producer_block, producer_index, producer = producers[0]
                 release_index, release = releases[0]
-                return_index, terminal = returns[0]
+                return_index, terminal = terminals[0]
+                if terminal.op != "Ret":
+                    valid = producer_block is block
                 control_refs = ()
                 if producer_block is not block:
                     dominators = CorrelationTable._dominators(function)
@@ -7078,6 +7110,7 @@ class CorrelationTable:
         from .concordance_declarations import (
             AGGREGATE_PASSTHROUGH_REBINDING, SSA_VALUE,
             TENSOR_METADATA_RESULT_BINDING,
+            TENSOR_METADATA_CALL_BINDING,
             TENSOR_OWNED_HEAP_BINDING,
         )
         from .ssa_record_return_state import function_scope_of
@@ -7121,6 +7154,43 @@ class CorrelationTable:
                                ref.column - 1)
                 previous_fact = page.cell(previous.row, previous.column)
                 causes = {source for source, _ in book.edges_into(ref)}
+                incoming = tuple(source for source in causes
+                                 if source.page == TENSOR_METADATA_CALL_BINDING)
+                if incoming:
+                    # Chained equal-geometry returns share the upstream
+                    # triple. Its fold revises this result through the exact
+                    # incoming Call, preserving this result's formal IDs.
+                    rebindings = tuple(source for source in causes
+                                       if source.page == AGGREGATE_PASSTHROUGH_REBINDING)
+                    mapping = {source.row[1]: book.page(source.page).cell(
+                        source.row, source.column) for source in rebindings}
+                    call = next(instruction for block in caller.blocks.values()
+                                for instruction in block.instrs
+                                if instruction.op == "Call" and instruction.res is not None
+                                and int(instruction.res.id) == row[1]
+                                and instruction.attributes.get("callee") == row[2])
+                    pairs = tuple(zip(call.args, callee.args, strict=True))
+                    incoming_fact = book.page(incoming[0].page).cell(
+                        incoming[0].row, incoming[0].column)
+                    valid = (
+                        len(incoming) == 1 and previous in causes
+                        and previous_fact[:2] == fact[:2]
+                        and len(rebindings) == 3
+                        and incoming[0].row[0] == row[0]
+                        and incoming[0].row[3:] == (row[1], row[2])
+                        and all(mapping.get(old, (None,))[0] == new
+                                for old, new in zip(previous_fact[2], fact[2], strict=True))
+                        and all((actual_id, formal_id) in tuple(zip(*incoming_fact, strict=True))
+                                and sum(int(actual.id) == actual_id and int(formal.id) == formal_id
+                                        for actual, formal in pairs) == 1
+                                for actual_id, formal_id in zip(fact[2], fact[1], strict=True))
+                    )
+                    if not valid:
+                        found.append(Finding(
+                            "tensor-metadata-result-binding-disagreement", str(row[2]), int(row[3]),
+                            "transitive computed metadata fold lacks its exact incoming Call or rebinding",
+                        ))
+                    continue
                 rebinding_cells = tuple(
                     source for source in causes
                     if source.page == AGGREGATE_PASSTHROUGH_REBINDING

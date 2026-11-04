@@ -4,6 +4,7 @@
     #include <stddef.h>
     #include <string.h>
     #include "ctensor_ops.h"
+    #include "turing_validation_runtime.h"
 
     // Forward declarations for later functions so that Zig's C compiler
     // does not fail due to implicit declarations.
@@ -659,6 +660,54 @@
                     after * sizeof(double));
     }
 
+    void index_select_int64_indices_int64(
+        const int64_t* input, int64_t* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count) {
+        int before = 1;
+        int after = 1;
+        for (int i = 0; i < dim; ++i) before *= shape[i];
+        for (int i = dim + 1; i < ndim; ++i) after *= shape[i];
+        const int source_count = shape[dim];
+        for (int b = 0; b < before; ++b) {
+            for (int j = 0; j < index_count; ++j) {
+                int64_t source_item = indices[j];
+                if (source_item < 0) source_item += source_count;
+                if (source_item < 0 || source_item >= source_count) {
+                    turing_validation_error(101);
+                    return;
+                }
+                memcpy(
+                    output + (b * index_count + j) * after,
+                    input + ((int64_t)b * source_count + source_item) * after,
+                    (size_t)after * sizeof(int64_t));
+            }
+        }
+    }
+
+    void index_select_double_indices_int64(
+        const double* input, double* output, const int* shape,
+        int ndim, int dim, const int64_t* indices, int index_count) {
+        int before = 1;
+        int after = 1;
+        for (int i = 0; i < dim; ++i) before *= shape[i];
+        for (int i = dim + 1; i < ndim; ++i) after *= shape[i];
+        const int source_count = shape[dim];
+        for (int b = 0; b < before; ++b) {
+            for (int j = 0; j < index_count; ++j) {
+                int64_t source_item = indices[j];
+                if (source_item < 0) source_item += source_count;
+                if (source_item < 0 || source_item >= source_count) {
+                    turing_validation_error(101);
+                    return;
+                }
+                memcpy(
+                    output + (b * index_count + j) * after,
+                    input + ((int64_t)b * source_count + source_item) * after,
+                    (size_t)after * sizeof(double));
+            }
+        }
+    }
+
     void slice_copy_double(
         const double* input, double* output, const int* shape,
         int ndim, int dim, int start, int step, int count) {
@@ -1043,6 +1092,16 @@
             s += a[i];
         }
         return s;
+    }
+
+    int64_t sum_int64(const int64_t* a, int n) {
+        /* NumPy's int64 sum wraps at fixed width. Accumulate unsigned to
+         * avoid signed-overflow UB, then preserve the resulting bit pattern. */
+        uint64_t bits = 0;
+        int64_t result;
+        for (int i = 0; i < n; ++i) bits += (uint64_t)a[i];
+        memcpy(&result, &bits, sizeof(result));
+        return result;
     }
 
     void create_arange(double start, double step, int n, double* out) {

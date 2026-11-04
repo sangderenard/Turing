@@ -381,3 +381,69 @@ module before printing 382 tokens of exact records. The preventing constraint
 is to suppress routine
 progress, retain the rejected module through the existing artifact writer,
 and print only bounded row facts, causes and failed predicates.
+
+## 2026-11-04 — oversized Indexed probe output required a second capture
+
+The agent was assigned a compact native Indexed witness. Its first scratch
+probe printed every matching SSA operation and generated C index line, and the
+tool output was truncated before the result could be read. The cost was one
+unusable bounded run of about 8 seconds and a second compact run of about 8
+seconds. The compact run printed the planned region's GEP/Load/Ret, the one
+generated C index expression, and the native result. The preventing constraint
+is to cap selected SSA/C lines and finding text before sending tool output.
+
+## 2026-11-04 — gather pytest rerun before runtime linkage settled
+
+The agent was asked for compact focused native gather output and to wait for
+the index runtime registration to stabilize. It ran the focused file after
+the typed kernel importer was reported import-stable, while CFFI runtime
+header and definition edits were still underway. Six tests failed before
+lowering at MSVC C2375 linkage errors. The run cost 44.91 seconds and produced
+an oversized compiler traceback, so it could not measure index parity. The
+preventing constraint is to confirm the CFFI import, LLVM typed reference,
+and MSVC runtime are stable together before the next native test run.
+
+## 2026-11-04 — nested backend instructions read after typed kernel edits
+
+The agent was assigned typed native gather kernels and was required to read
+applicable repository instructions before changing the backend. It edited the
+C and LLVM backend files before reading `src/common/tensors/AGENTS.md` and
+`src/common/tensors/accelerator_backends/c_backend/AGENTS.md`. The implementation
+followed their C-kernel and arbitrary-rank requirements, but the required
+ordering was lost and a separate review of both files and the kernel diff was
+needed. Reading nested instructions before the first edit would have prevented
+that review cost.
+
+## 2026-11-04 — full concordance audit launched instead of mapping view
+
+The agent was required to use the bounded mapping audit while checking typed
+gather. It invoked `python -u tools/audit_identity_concordance.py` without the
+`mapping` argument. The command began several full example lowerings, showed
+two known incomplete views, and consumed about a minute before the parent
+caught the wrong invocation. The agent stopped PID 71412; no terminal audit
+result was obtained. The preventing constraint is to use the exact bounded
+`python -u tools/audit_identity_concordance.py mapping` command and inspect
+its arguments before launch.
+
+## 2026-11-04 — proposed float conversion for an integer reduction
+
+The agent was assigned typed tensor gather and required to preserve the
+authored numerical semantics. It briefly inserted a counted int64-to-float64
+conversion before `sum_double` while treating the gather's int64 span as an
+ABI mismatch. That ignored the existing NumPy backend's int64 sum contract:
+values above 2**53 would round. The patch cost one insertion and a full
+removal before testing; no generated program used it. The agent restored the
+sum branch and selected the typed int64 kernel only after the backend contract
+was checked. Reading the authored sum contract before editing the reduction
+writer would have prevented the churn.
+
+## 2026-11-04 — hazard receipt read after focused gather tests
+
+The agent was required to read the newest hazards before testing. A teammate
+created a newer gather receipt while the agent continued focused reruns, and
+the agent did not reread it first. The later read also initially failed under
+cp1252 because the receipt contained a Unicode arrow. The previous test
+results could not satisfy the required ordering; the agent reread with
+`PYTHONIOENCODING=utf-8` and repeated the focused gate and mapping audit.
+Checking the newest log and its exit status immediately before each gate
+would have prevented the repeated work.
