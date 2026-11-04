@@ -4628,7 +4628,7 @@ TENSOR_RUNTIME_VIEW_GEOMETRY = declare_page("tensor_runtime_view_geometry", (
     RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
     RowField("result", K.VALUE_ID),
 ), tuple)                              # DERIVED(SSA values/axis transform); CONCORD
-#: A mixed binary result's rank-two runtime broadcast. Fact names the
+#: A binary result's positive-rank runtime broadcast. Fact names the
 #: ordered data operands, their shape/rank/count IDs, the aligned right
 #: shape, output shape/rank/count, helper status, helper callee, and guarded
 #: fault/pass blocks. The helper is the accepted authored
@@ -4704,7 +4704,8 @@ CROSS_FUNCTION_REFERENCES = declare_page("cross_function_references", (
     RowField("owner", K.SCOPE), RowField("value", K.VALUE_ID),
 ), tuple)
 #: A binary tensor result with one proven scalar operand retains the tensor
-#: operand's exact runtime shape/rank/count formals. The fact records
+#: operand's exact runtime shape/rank/count values, whether local extent
+#: operations or transported formals. The fact records
 #: (canonical operation, tensor operand, scalar operand, shape, rank, count);
 #: the ordered SSA instruction operands remain the execution authority.
 TENSOR_ELEMENTWISE_EXTENT_BINDING = declare_page(

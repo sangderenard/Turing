@@ -471,3 +471,26 @@ results could not satisfy the required ordering; the agent reread with
 `PYTHONIOENCODING=utf-8` and repeated the focused gate and mapping audit.
 Checking the newest log and its exit status immediately before each gate
 would have prevented the repeated work.
+
+## 2026-11-04 — scalar kernel proof failure attributed before measurement
+
+The agent added a scalar-kernel receipt check that refused the float native
+case after 10.07 seconds. It first described `minted#` labels and numeric SSA
+IDs as different identities without checking their equality. That claim was
+wrong: the label prints the same numeric ID. The claim cost two bounded
+captures and inspection runs before the direct receipt causes were checked.
+The writer now cites `ssa_value_identity_cell` cells; the audit checks the
+exact SSA_VALUE cells cited when that receipt was published. The preventing
+constraint is to compare reference objects and their direct edges before
+naming an identity split.
+
+## 2026-11-04 — broad profile and late tensor retry before narrowing the slice
+
+The rank-two reduction task required a bounded first-writer trace. The agent
+started a whole-lowering `sys.setprofile` scratch probe that ran for more
+than 50 seconds before interruption, then used a direct PlanClosure hook to
+capture the exact wrong dtype writer. The agent also first replayed the full
+late tensor slice; its 27.40-second focused test produced two unrelated
+broadcast-helper resident-shape audit conflicts. Retrying only the changed
+formal's exact Call closure resolved the rank-two and rank-three cases.
+The direct writer hook and call-closure selection should have been used first.

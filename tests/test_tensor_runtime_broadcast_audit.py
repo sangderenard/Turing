@@ -10,7 +10,7 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
 )
 from src.compiler import tensor_ssa_lowering
-from src.compiler.concordance_declarations import TENSOR_RUNTIME_BROADCAST_VALIDITY
+from src.compiler.concordance_declarations import SSA_VALUE, TENSOR_RUNTIME_BROADCAST_VALIDITY
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import (
@@ -76,6 +76,21 @@ def test_mixed_broadcast_has_complete_guarded_helper_proof(broadcast_module):
     assert not CorrelationTable._tensor_runtime_broadcast_validity_findings(module)
     assert not CorrelationTable._tensor_elementwise_extent_binding_findings(module)
     assert module.functions[row[1]].blocks["entry.broadcast_fault"].instrs[-1].op == "Trap"
+
+
+def test_raw_integer_broadcast_requires_its_integer_physical_result(broadcast_module):
+    module = broadcast_module
+    book = identity_book(module)
+    row, = tuple(book.page(TENSOR_RUNTIME_BROADCAST_VALIDITY).rows())
+    ref = book.latest_ref(SSA_VALUE, (row[0], row[2]))
+    page = book.page(SSA_VALUE)
+    original = page.cell(ref.row, ref.column)
+    assert original.physical_dtype == "int64"
+    page.cells[(ref.row, ref.column)] = replace(original, physical_dtype="float64")
+    try:
+        assert CorrelationTable._tensor_runtime_broadcast_validity_findings(module)
+    finally:
+        page.cells[(ref.row, ref.column)] = original
 
 
 @pytest.mark.parametrize("field,replacement", [
@@ -153,3 +168,39 @@ def test_mixed_broadcast_audit_rejects_unchecked_count(broadcast_module):
         assert CorrelationTable._tensor_runtime_broadcast_validity_findings(module)
     finally:
         count.attributes = original
+
+
+@pytest.mark.parametrize("corruption", ("intermediate_overflow", "empty_seed"))
+def test_broadcast_count_requires_checked_chain_and_zero_axis_seed(broadcast_module, corruption):
+    module = broadcast_module
+    book = identity_book(module)
+    page = book.page(TENSOR_RUNTIME_BROADCAST_VALIDITY)
+    row, = tuple(page.rows())
+    fact = page.latest(row)
+    function = module.functions[row[1]]
+    definitions = {int(instruction.res.id): instruction
+                   for block in function.blocks.values() for instruction in block.instrs
+                   if instruction.res is not None}
+    last = definitions[fact[14]]
+    product = definitions[int(last.args[0].id)]
+    previous_widen = definitions[int(product.args[0].id)]
+    previous = definitions[int(previous_widen.args[0].id)]
+    assert previous.op == "Cast"
+    if corruption == "intermediate_overflow":
+        original = dict(previous.attributes)
+        previous.attributes = {**original, "overflow": "wrap"}
+        try:
+            assert CorrelationTable._tensor_runtime_broadcast_validity_findings(module)
+        finally:
+            previous.attributes = original
+    else:
+        product = definitions[int(previous.args[0].id)]
+        previous_widen = definitions[int(product.args[0].id)]
+        seed = definitions[int(previous_widen.args[0].id)]
+        assert seed.op == "Select"
+        original = seed.args
+        seed.args = [original[0], original[2], original[1]]
+        try:
+            assert CorrelationTable._tensor_runtime_broadcast_validity_findings(module)
+        finally:
+            seed.args = original

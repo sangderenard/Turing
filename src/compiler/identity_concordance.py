@@ -5675,7 +5675,16 @@ class CorrelationTable:
                     if int(output.id) in metadata_ids:
                         continue
                     descriptor = table.by_id(int(output.id))
-                    if descriptor is None:
+                    # The fully lowered private mixed broadcast now retains
+                    # a static descriptor for its scalar sum. It still needs
+                    # the same posted numeric scalar storage proof as the
+                    # earlier descriptor-free return.
+                    if descriptor is None or (
+                        descriptor.metadata_state == "static"
+                        and tuple(descriptor.shape) == ()
+                        and int(descriptor.data_value_id) == int(output.id)
+                        and descriptor.alias_of is None
+                    ):
                         from ..transmogrifier.dtype_layout import resolve
                         from .ssa_record_return_state import posted_ssa_value_fact
 
@@ -5688,6 +5697,10 @@ class CorrelationTable:
                         if (scalar is None or scalar.storage != "scalar"
                                 or scalar.rank != 0 or layout is None
                                 or layout.kind not in {"int", "uint", "float", "bool"}):
+                            valid = False
+                            break
+                        if (descriptor is not None
+                                and str(descriptor.dtype) != str(scalar.dtype)):
                             valid = False
                             break
                         layouts.append((int(output.id), int(output.id), None))
@@ -6357,8 +6370,7 @@ class CorrelationTable:
         from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
         from .concordance_declarations import (
             CALL_INPUT_CONVERSION, KERNEL_INPUT_CONVERSION,
-            SSA_BLOCK, SSA_CONTROL_EDGE, SSA_VALUE,
-            TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+            SSA_CONTROL_EDGE, SSA_VALUE,
             TENSOR_RUNTIME_BROADCAST_VALIDITY,
             TENSOR_OWNED_HEAP_BINDING,
         )
@@ -6367,7 +6379,9 @@ class CorrelationTable:
             accepted_ssa_component, function_scope_of,
             posted_ssa_value_fact, ssa_block_identity_cell,
         )
-        from .tensor_ssa_lowering import _SHAPED_SSA_OPERATIONS
+        from .tensor_ssa_lowering import (
+            _SHAPED_SSA_OPERATIONS, _dynamic_tensor_geometry_evidence,
+        )
 
         book = identity_book(module)
         page = book.page(TENSOR_RUNTIME_BROADCAST_VALIDITY)
@@ -6409,8 +6423,11 @@ class CorrelationTable:
                         output_desc, wide_fact, narrow_fact, result_fact,
                     ))
                     and wide_fact.storage == narrow_fact.storage == "span"
-                    and wide_fact.rank == 2 and narrow_fact.rank in {1, 2}
-                    and result_fact.storage == "span" and result_fact.rank == 2
+                    and type(wide_fact.rank) is int and wide_fact.rank > 0
+                    and type(narrow_fact.rank) is int
+                    and 0 < narrow_fact.rank <= wide_fact.rank
+                    and result_fact.storage == "span"
+                    and result_fact.rank == wide_fact.rank
                     and wide_desc.metadata_state in {"dynamic", "static"}
                     and narrow_desc.metadata_state in {"dynamic", "static"}
                     and output_desc.metadata_state == "dynamic"
@@ -6673,6 +6690,7 @@ class CorrelationTable:
                 signature = c_tensor_opcode(operation)
                 raw_int64 = (
                     source is not None
+                    and result_fact.physical_dtype == "int64"
                     and c_tensor_opcode(
                         _SHAPED_SSA_OPERATIONS.get(source.op, source.op)
                     ) == signature
@@ -6701,9 +6719,10 @@ class CorrelationTable:
                     and helper_call.attributes.get("callee") == helper_name
                     and len(helper_call.args) == 5
                     and output_vector is not None
-                    and tuple(output_vector.attributes.get("values", ())) == (0, 0)
+                    and tuple(output_vector.attributes.get("values", ()))
+                    == (0,) * wide_fact.rank
                     and rank_def is not None
-                    and rank_def.attributes.get("constant") == 2
+                    and rank_def.attributes.get("constant") == wide_fact.rank
                     and count_def is not None
                     and count_def.attributes.get("conversion_kind")
                     == "integer_conversion"
@@ -6714,35 +6733,78 @@ class CorrelationTable:
                     and count_def.attributes.get("target_dtype") == "int32"
                 )
                 if valid:
-                    product = definition(int(count_def.args[0].id), "Mul")
-                    derived_ids = {int(count_def.args[0].id)}
-                    dimensions = () if product is None else tuple(
-                        definition(int(value.id), "Cast")
-                        for value in product.args
-                    )
-                    slots = []
-                    for converted in dimensions:
-                        if (converted is None or len(converted.args) != 1
-                                or converted.attributes.get("source_dtype") != "int32"
-                                or converted.attributes.get("target_dtype") != "int64"):
+                    # The writer checks every int32 count before multiplying
+                    # another dimension. Its zero seed is proved from all axes,
+                    # so an empty tensor cannot overflow on preceding axes.
+                    derived_ids = set()
+                    dimensions = []
+                    previous_count = output_count
+                    valid = True
+                    for axis in reversed(range(wide_fact.rank)):
+                        narrowed = definition(previous_count, "Cast")
+                        if (narrowed is None or len(narrowed.args) != 1
+                                or narrowed.attributes.get("source_dtype") != "int64"
+                                or narrowed.attributes.get("target_dtype") != "int32"
+                                or narrowed.attributes.get("conversion_kind") != "integer_conversion"
+                                or narrowed.attributes.get("overflow") != "trap"
+                                or narrowed.attributes.get("binding") != "broadcast-count-narrowing"):
+                            valid = False
                             break
-                        loaded = definition(int(converted.args[0].id), "Load")
+                        product = definition(int(narrowed.args[0].id), "Mul")
+                        if product is None or len(product.args) != 2:
+                            valid = False
+                            break
+                        converted = [definition(int(value.id), "Cast") for value in product.args]
+                        if any(item is None or len(item.args) != 1
+                               or item.attributes.get("source_dtype") != "int32"
+                               or item.attributes.get("target_dtype") != "int64"
+                               for item in converted):
+                            valid = False
+                            break
+                        loaded = definition(int(converted[1].args[0].id), "Load")
                         address = (definition(int(loaded.args[0].id), "GetElementPtr")
-                                   if loaded is not None and len(loaded.args) == 1
-                                   else None)
+                                   if loaded is not None and len(loaded.args) == 1 else None)
                         index = (definition(int(address.args[1].id), "Const")
-                                 if address is not None and len(address.args) == 2
-                                 else None)
+                                 if address is not None and len(address.args) == 2 else None)
                         if (address is None or int(address.args[0].id) != output_shape
-                                or index is None):
+                                or index is None or index.attributes.get("constant") != axis):
+                            valid = False
                             break
-                        derived_ids.update((
-                            int(converted.res.id), int(loaded.res.id),
-                            int(index.res.id),
-                        ))
-                        slots.append(index.attributes.get("constant"))
-                    valid = (product is not None and len(product.args) == 2
-                             and slots == [0, 1])
+                        derived_ids.update((previous_count, int(product.res.id),
+                                            *(int(item.res.id) for item in converted),
+                                            int(loaded.res.id), int(index.res.id)))
+                        dimensions.append(int(loaded.res.id))
+                        previous_count = int(converted[0].args[0].id)
+                    seed = definition(previous_count, "Select") if valid else None
+                    if seed is None or len(seed.args) != 3:
+                        valid = False
+                    else:
+                        zero32 = definition(int(seed.args[1].id), "Const")
+                        one32 = definition(int(seed.args[2].id), "Const")
+                        valid = (zero32 is not None and one32 is not None
+                                 and zero32.attributes.get("constant") == 0
+                                 and one32.attributes.get("constant") == 1)
+                    if valid:
+                        derived_ids.update((previous_count, int(zero32.res.id), int(one32.res.id)))
+                        predicate_id = int(seed.args[0].id)
+                        for axis, dimension_id in zip(reversed(range(wide_fact.rank)), dimensions, strict=True):
+                            if axis:
+                                combined = definition(predicate_id, "LOr")
+                                if combined is None or len(combined.args) != 2:
+                                    valid = False
+                                    break
+                                derived_ids.add(predicate_id)
+                                zero_predicate_id = int(combined.args[1].id)
+                                predicate_id = int(combined.args[0].id)
+                            else:
+                                zero_predicate_id = predicate_id
+                            predicate = definition(zero_predicate_id, "Eq")
+                            if (predicate is None or len(predicate.args) != 2
+                                    or tuple(int(value.id) for value in predicate.args)
+                                    != (dimension_id, int(zero32.res.id))):
+                                valid = False
+                                break
+                            derived_ids.add(zero_predicate_id)
                 if valid:
                     # The live binary consumes the two checked broadcast
                     # results in authored operand order. A proved shape on
@@ -6782,52 +6844,40 @@ class CorrelationTable:
                                 strict=True,
                             ))
                         )
-                if valid and narrow_fact.rank == 2:
+                if valid and narrow_fact.rank == wide_fact.rank:
                     valid = aligned == narrow_shape
                 elif valid:
                     aligned_def = definition(aligned, "Const")
-                    stores = tuple(
-                        instruction for block in function.blocks.values()
-                        for instruction in block.instrs
-                        if instruction.op == "Store"
-                        and len(instruction.args) == 2
-                    )
-                    exact_store = False
+                    padding = wide_fact.rank - narrow_fact.rank
+                    stores = tuple(instruction for block in function.blocks.values()
+                                   for instruction in block.instrs
+                                   if instruction.op == "Store" and len(instruction.args) == 2)
+                    copies = []
                     for store in stores:
-                        destination = definition(
-                            int(store.args[1].id), "GetElementPtr",
-                        )
+                        destination = definition(int(store.args[1].id), "GetElementPtr")
                         copied = definition(int(store.args[0].id), "Load")
-                        source_address = (
-                            definition(int(copied.args[0].id), "GetElementPtr")
-                            if copied is not None and len(copied.args) == 1
-                            else None
-                        )
+                        source_address = (definition(int(copied.args[0].id), "GetElementPtr")
+                                          if copied is not None and len(copied.args) == 1 else None)
                         if (destination is None or source_address is None
-                                or len(destination.args) != 2
-                                or len(source_address.args) != 2
-                                or int(destination.args[0].id) != aligned
-                                or int(source_address.args[0].id)
-                                != narrow_shape):
+                                or len(destination.args) != 2 or len(source_address.args) != 2
+                                or int(destination.args[0].id) != aligned):
                             continue
-                        target_index = definition(
-                            int(destination.args[1].id), "Const",
-                        )
-                        source_index = definition(
-                            int(source_address.args[1].id), "Const",
-                        )
-                        if (target_index is not None and source_index is not None
-                                and target_index.attributes.get("constant") == 1
-                                and source_index.attributes.get("constant") == 0):
-                            exact_store = True
-                            derived_ids.update((
-                                int(copied.res.id), int(source_address.res.id),
-                                int(destination.res.id), int(target_index.res.id),
-                                int(source_index.res.id),
-                            ))
-                    valid = (aligned_def is not None
+                        target_index = definition(int(destination.args[1].id), "Const")
+                        source_index = definition(int(source_address.args[1].id), "Const")
+                        if (target_index is None or source_index is None
+                                or int(source_address.args[0].id) != narrow_shape):
+                            valid = False
+                            break
+                        copies.append((source_index.attributes.get("constant"),
+                                       target_index.attributes.get("constant")))
+                        derived_ids.update((int(copied.res.id), int(source_address.res.id),
+                                            int(destination.res.id), int(target_index.res.id),
+                                            int(source_index.res.id)))
+                    valid = (valid and aligned_def is not None
                              and tuple(aligned_def.attributes.get("values", ()))
-                             == (1, 0) and exact_store)
+                             == (1,) * padding + (0,) * narrow_fact.rank
+                             and sorted(copies) == [(axis, padding + axis)
+                                                    for axis in range(narrow_fact.rank)])
             if valid:
                 helper = module.functions.get(helper_name)
                 valid = helper is not None and accepted_ssa_component(helper)
@@ -6892,53 +6942,21 @@ class CorrelationTable:
                         SSA_VALUE, (function_scope_of(helper), int(formal.id)),
                     ) is not None for formal in helper.args)
             if valid:
-                # The complete Call binding selects each projected caller
-                # metadata triple by exact predecessor result identity.
-                calls = tuple(cause for cause in causes
-                              if cause.page == TENSOR_METADATA_CALL_BINDING)
-                predecessors = tuple(cause for cause in causes
-                                     if cause.page == TENSOR_METADATA_RESULT_BINDING)
-                dynamic_sources = tuple(
-                    (value_id, triple)
-                    for value_id, descriptor, triple in (
-                        (wide, wide_desc,
-                         (wide_shape, wide_rank, wide_count)),
-                        (narrow, narrow_desc,
-                         (narrow_shape, narrow_rank, narrow_count)),
-                    ) if descriptor.metadata_state == "dynamic"
-                )
-                valid = (
-                    len(calls) == 1
-                    and len(predecessors) == len(dynamic_sources)
-                    and all(
-                        book.latest_ref(SSA_VALUE, (row[0], value_id))
-                        in causes
-                        for value_id, _descriptor, _fact, _triple
-                        in static_sources
-                    )
-                )
-                if valid:
-                    call_fact = book.page(TENSOR_METADATA_CALL_BINDING).cell(
-                        calls[0].row, calls[0].column,
-                    )
-                    pairs = tuple(zip(*call_fact, strict=True))
-                    valid = (
-                        calls[0].row[4] == function.name
-                        and {cause.row[3] for cause in predecessors}
-                        == {value_id for value_id, _ in dynamic_sources}
-                        and all(
-                            all(sum(actual == projected and formal == required
-                                    for actual, formal in pairs) == 1
-                                for projected, required in zip(
-                                    book.page(TENSOR_METADATA_RESULT_BINDING).cell(
-                                        predecessor.row, predecessor.column,
-                                    )[2], group, strict=True,
-                                ))
-                            for source_id, group in dynamic_sources
-                            for predecessor in predecessors
-                            if predecessor.row[3] == source_id
-                        )
-                    )
+                # Each dynamic source has an exact local extent program or
+                # exact transported metadata. Read the same authorities used
+                # by the writer, then require their cells as this row's causes.
+                valid = all(book.latest_ref(SSA_VALUE, (row[0], value_id)) in causes
+                            for value_id, _descriptor, _fact, _triple in static_sources)
+                for value_id, descriptor, triple in (
+                    (wide, wide_desc, (wide_shape, wide_rank, wide_count)),
+                    (narrow, narrow_desc, (narrow_shape, narrow_rank, narrow_count)),
+                ):
+                    if descriptor.metadata_state != "dynamic":
+                        continue
+                    evidence = _dynamic_tensor_geometry_evidence(module, function, value_id)
+                    valid = (valid and evidence is not None
+                             and tuple(int(value.id) for value in evidence[0]) == triple
+                             and set(evidence[1]) <= causes)
             if valid:
                 guard = tuple((block, instruction)
                               for block in function.blocks.values()
@@ -7019,7 +7037,10 @@ class CorrelationTable:
         from .ssa_record_return_state import (
             function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
         )
-        from .tensor_ssa_lowering import _SHAPED_SSA_OPERATIONS
+        from .tensor_ssa_lowering import (
+            _SHAPED_SSA_OPERATIONS, _dynamic_tensor_geometry_evidence,
+            _scalar_elementwise_execution,
+        )
 
         book = identity_book(module)
         page = book.page(TENSOR_ELEMENTWISE_EXTENT_BINDING)
@@ -7048,14 +7069,15 @@ class CorrelationTable:
                 scalar_fact = posted_ssa_value_fact(function, scalar_id, book=book)
                 result_fact = posted_ssa_value_fact(function, row[2], book=book)
                 ids = (shape_id, rank_id, count_id)
+                execution = (
+                    _scalar_elementwise_execution(
+                        module, function, instructions[0], fact, book=book,
+                    ) if len(instructions) == 1 else None
+                )
                 valid = (
                     signature is not None and signature[0] == "binary"
                     and len(instructions) == 1
-                    and c_tensor_opcode(_SHAPED_SSA_OPERATIONS.get(
-                        instructions[0].op, str(instructions[0].op),
-                    )) == signature
-                    and tuple(int(arg.id) for arg in instructions[0].args)
-                    in ((source_id, scalar_id), (scalar_id, source_id))
+                    and execution is not None
                     and source is not None and result is not None
                     and source.metadata_state == result.metadata_state == "dynamic"
                     and tuple(getattr(source, field) for field in (
@@ -7068,39 +7090,19 @@ class CorrelationTable:
                     and scalar_fact.rank == 0
                     and result_fact is not None and result_fact.storage == "span"
                     and result_fact.rank == source_fact.rank
-                    and all(any(int(arg.id) == value_id for arg in function.args)
-                            for value_id in ids)
                 )
                 if valid:
                     causes = {cause for cause, _stage in book.edges_into(ref)}
                     value_cells = tuple(ssa_value_identity_cell(
                         function, value_id, book=book,
                     ) for value_id in (source_id, scalar_id, row[2], *ids))
-                    metadata_calls = [cause for cause in causes
-                                      if cause.page == TENSOR_METADATA_CALL_BINDING]
-                    metadata_results = [cause for cause in causes
-                                        if cause.page == TENSOR_METADATA_RESULT_BINDING
-                                        and cause.row[3] == source_id]
+                    evidence = _dynamic_tensor_geometry_evidence(module, function, source_id)
                     valid = (
                         all(cell is not None and cell in causes for cell in value_cells)
-                        and len(metadata_calls) == len(metadata_results) == 1
-                        and metadata_results[0] in {
-                            cause for cause, _stage in book.edges_into(metadata_calls[0])
-                        }
-                        and all(sum(
-                            actual == projected and formal == required
-                            for actual, formal in zip(
-                                *book.page(TENSOR_METADATA_CALL_BINDING).cell(
-                                    metadata_calls[0].row,
-                                    metadata_calls[0].column,
-                                ), strict=True,
-                            )
-                        ) == 1 for projected, required in zip(
-                            book.page(TENSOR_METADATA_RESULT_BINDING).cell(
-                                metadata_results[0].row,
-                                metadata_results[0].column,
-                            )[2], ids, strict=True,
-                        ))
+                        and evidence is not None
+                        and tuple(int(value.id) for value in evidence[0]) == ids
+                        and set(evidence[1]) <= causes
+                        and set(execution) <= causes
                     )
             if not valid:
                 found.append(Finding(

@@ -564,7 +564,7 @@ def _argument_binding_ref(
             return ref
         # A current four-field page with no exact caller row is a missing
         # binding. Do not recover it from an old caller-blind projection.
-        if len(page.row_fields) == 4:
+        if len(ARGUMENT_BINDING.row_fields) == 4:
             return None
     row = (callee, int(formal_id), callsite_id)
     ref = book.latest_ref(ARGUMENT_BINDING, row)

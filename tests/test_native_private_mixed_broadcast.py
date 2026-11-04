@@ -80,15 +80,29 @@ def test_scalar_nonescape_requires_posted_numeric_scalar_storage(private_broadca
         for fact in (proofs.latest(row),)
         for logical, data, alias in fact[3]
         if logical == data and alias is None
-        and module.tensor_tables[fact[0]].by_id(logical) is None
+        and (scalar := book.page(SSA_VALUE).latest(
+            (function_scope_of(module.functions[fact[0]]), logical)
+        )) is not None
+        and scalar.storage == "scalar" and scalar.rank == 0
     )
     values = book.page(SSA_VALUE)
     ref = book.latest_ref(SSA_VALUE, (function_scope_of(module.functions[target]), output_id))
     original = values.cell(ref.row, ref.column)
-    for changed in (replace(original, storage="span", rank=1),
-                    replace(original, physical_dtype="ptr")):
-        values.cells[(ref.row, ref.column)] = changed
+    table = module.tensor_tables[target]
+    descriptor = table.by_id(output_id)
+    assert descriptor is not None and descriptor.metadata_state == "static"
+    assert descriptor.shape == () and descriptor.data_value_id == output_id
+    for with_descriptor in (True, False):
+        if not with_descriptor:
+            table.tensors.pop(output_id)
         try:
-            assert CorrelationTable._tensor_heap_consumer_nonescape_findings(module)
+            assert not CorrelationTable._tensor_heap_consumer_nonescape_findings(module)
+            for changed in (replace(original, storage="span", rank=1),
+                            replace(original, physical_dtype="ptr")):
+                values.cells[(ref.row, ref.column)] = changed
+                try:
+                    assert CorrelationTable._tensor_heap_consumer_nonescape_findings(module)
+                finally:
+                    values.cells[(ref.row, ref.column)] = original
         finally:
-            values.cells[(ref.row, ref.column)] = original
+            table.tensors[output_id] = descriptor
