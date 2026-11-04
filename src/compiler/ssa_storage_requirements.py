@@ -30,6 +30,42 @@ class SSAStorageRequirement:
 
 
 @dataclass(frozen=True, slots=True)
+class OwnedTensorDataBinding:
+    tensor_id: int
+    data_value_id: int
+    owner_value_id: int
+    count_value_id: int
+    element_dtype: str
+    cell: Any
+
+
+def owned_tensor_data_bindings(module: Any, function_name: str) -> tuple[OwnedTensorDataBinding, ...]:
+    """The audited owned pointer carriers of one exact native frame."""
+
+    from .concordance_declarations import TENSOR_OWNED_HEAP_BINDING
+    from .identity_concordance import CorrelationTable, identity_book
+    from .ssa_record_return_state import function_scope_of
+
+    book = identity_book(module)
+    scope = function_scope_of(module.functions[function_name])
+    page = book.page(TENSOR_OWNED_HEAP_BINDING)
+    rows = tuple(row for row in page.scope_rows(scope)
+                 if row[1] == function_name)
+    if not rows:
+        return ()
+    if CorrelationTable._tensor_owned_heap_binding_findings(module):
+        return ()
+    bindings = []
+    for row in rows:
+        cell = book.latest_ref(TENSOR_OWNED_HEAP_BINDING, row)
+        data, owner, count, dtype = page.cell(cell.row, cell.column)
+        bindings.append(OwnedTensorDataBinding(
+            int(row[2]), int(data), int(owner), int(count), str(dtype), cell,
+        ))
+    return tuple(bindings)
+
+
+@dataclass(frozen=True, slots=True)
 class PublicSequenceCapacitySource:
     """Caller-owned output capacity bounded by an exact input sequence."""
 
@@ -44,6 +80,72 @@ class PublicSequenceCapacitySource:
     bound_cell: Any
     output_descriptor_cell: Any
     input_descriptor_cell: Any
+
+
+@dataclass(frozen=True, slots=True)
+class PublicTensorCapacitySource:
+    """Exact output/input and computed metadata ports of a bounded tensor."""
+
+    output_data_id: int
+    input_data_id: int
+    output_shape_id: int
+    output_count_id: int
+    bound_cell: Any
+    metadata_binding_cell: Any
+
+
+def public_tensor_capacity_sources(module: Any, function_name: str) -> tuple[PublicTensorCapacitySource, ...]:
+    """Read source capacity through the exact computed-result call binding."""
+
+    from .concordance_declarations import (
+        TENSOR_METADATA_RESULT_BINDING, TENSOR_OUTPUT_CAPACITY_BOUND,
+    )
+    from .ssa_record_return_state import function_scope_of
+
+    function = (getattr(module, "functions", {}) or {}).get(function_name)
+    book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+    if function is None or book is None:
+        return ()
+    scope = function_scope_of(function)
+    inputs = {int(value.id) for value in function.args}
+    returns = {
+        int(value.id): value
+        for block in function.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+        for value in instruction.args
+    }
+    bounds = book.page(TENSOR_OUTPUT_CAPACITY_BOUND)
+    bindings = book.page(TENSOR_METADATA_RESULT_BINDING)
+    result = []
+    for row in bindings.rows():
+        if row[0] != scope or row[3] not in returns:
+            continue
+        bound_row = (scope, row[3])
+        bound_ref = book.latest_ref(TENSOR_OUTPUT_CAPACITY_BOUND, bound_row)
+        binding_ref = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
+        if bound_ref is None or binding_ref is None:
+            continue
+        bound = bounds.cell(bound_ref.row, bound_ref.column)
+        binding = bindings.cell(binding_ref.row, binding_ref.column)
+        input_id = int(bound.input_cell.row[-1])
+        if input_id not in inputs or binding[0] != row[3]:
+            continue
+        if tuple(binding[1]) != (
+            int(bound.shape_cell.row[-1]), int(bound.rank_cell.row[-1]),
+            int(bound.count_cell.row[-1]),
+        ):
+            continue
+        output_shape_id, _rank_id, output_count_id = binding[2]
+        output = returns[row[3]]
+        accounting = output.accounting or {}
+        if (accounting.get("tensor_shape_value_id") != output_shape_id
+                or accounting.get("tensor_element_count_value_id") != output_count_id):
+            continue
+        result.append(PublicTensorCapacitySource(
+            int(row[3]), input_id, int(output_shape_id),
+            int(output_count_id), bound_ref, binding_ref,
+        ))
+    return tuple(result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -481,6 +583,28 @@ def module_storage_requirements(
                 shapes[function_name].setdefault(value_id, set()).add(shape)
 
     tensor_tables = dict(getattr(module, "tensor_tables", {}) or {})
+    # Dynamic topk keeps its logical extent in SSA metadata.  Its separate
+    # concorded capacity is the input tensor's static physical span: Min(k,
+    # axis_extent) can never require more storage on that axis.
+    from .concordance_declarations import TENSOR_OUTPUT_CAPACITY_BOUND
+    from .ssa_record_return_state import function_scope_of
+    capacity_book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+    if capacity_book is not None:
+        capacity_page = capacity_book.page(TENSOR_OUTPUT_CAPACITY_BOUND)
+        for row in capacity_page.rows():
+            bound = capacity_page.latest(row)
+            if bound is None or not bound.capacity_shape:
+                continue
+            if int(row[1]) != int(bound.output_cell.row[-1]):
+                continue
+            for owner, function in functions.items():
+                if function_scope_of(function) != row[0]:
+                    continue
+                if int(row[1]) not in values[str(owner)]:
+                    continue
+                shapes[str(owner)].setdefault(int(row[1]), set()).add(
+                    tuple(map(int, bound.capacity_shape))
+                )
     for function_name, table in (getattr(module, "sequence_tables", {}) or {}).items():
         function = functions.get(function_name)
         if function is None:
@@ -568,6 +692,22 @@ def module_storage_requirements(
 
     # Formal/actual bindings describe the same physical span. Aggregate
     # projections similarly bind a callee output slot to caller storage.
+    from .ssa_aggregate_abi import analyze_aggregate_abi
+    aggregate_calls = {
+        id(record.call): record
+        for record in analyze_aggregate_abi(module, tuple(functions)).calls
+    }
+
+    def join_dynamic(left_function, left_id, right_function, right_id):
+        left = dynamic_ids[left_function]
+        right = dynamic_ids[right_function]
+        if int(left_id) not in left and int(right_id) not in right:
+            return False
+        changed = int(left_id) not in left or int(right_id) not in right
+        left.add(int(left_id))
+        right.add(int(right_id))
+        return changed
+
     changed = True
     while changed:
         changed = False
@@ -650,6 +790,9 @@ def module_storage_requirements(
                     if callee is None:
                         continue
                     for actual, formal in zip(call.args, callee.args):
+                        changed |= join_dynamic(
+                            caller_name, actual.id, callee_name, formal.id,
+                        )
                         actual_shapes = shapes[caller_name].setdefault(
                             int(actual.id), set()
                         )
@@ -663,13 +806,14 @@ def module_storage_requirements(
                         if union != formal_shapes:
                             formal_shapes.update(union)
                             changed = True
+                    aggregate = aggregate_calls.get(id(call))
                     named_outputs = tuple(
                         value_id
                         for _name, value_id in (
                             getattr(callee, "metadata", {}) or {}
                         ).get("named_outputs", ())
                     )
-                    if not named_outputs or call.res is None:
+                    if call.res is None or (not named_outputs and aggregate is None):
                         continue
                     projected: dict[int, int] = {}
                     addresses: dict[int, int] = {}
@@ -693,10 +837,27 @@ def module_storage_requirements(
                             projected[addresses[int(candidate.args[0].id)]] = int(
                                 candidate.res.id
                             )
-                    for index, callee_value_id in enumerate(named_outputs):
-                        caller_value_id = projected.get(index)
+                    # arange -> cast -> sum returns dynamic spans through
+                    # ordinary region aggregate projections. Those regions
+                    # have no named_outputs table; reading only that table
+                    # lost the callee's dynamic storage state and described
+                    # root values 6/8 as scalar one-cell allocations. The
+                    # common aggregate ABI is the exact output binding.
+                    output_bindings = (
+                        tuple((projection.output_id, projection.value.id)
+                              for projection in aggregate.projections)
+                        if aggregate is not None else tuple(
+                            (value_id, projected.get(index))
+                            for index, value_id in enumerate(named_outputs)
+                        )
+                    )
+                    for callee_value_id, caller_value_id in output_bindings:
                         if caller_value_id is None:
                             continue
+                        changed |= join_dynamic(
+                            caller_name, caller_value_id,
+                            callee_name, callee_value_id,
+                        )
                         caller_shapes = shapes[caller_name].setdefault(
                             caller_value_id, set()
                         )
@@ -786,6 +947,7 @@ def function_storage_requirements(
 
 
 __all__ = [
+    "OwnedTensorDataBinding", "owned_tensor_data_bindings",
     "PublicSequenceCapacitySource", "PublicSequenceInputPorts",
     "PublicOwnedSequencePorts", "SSAStorageRequirement",
     "function_storage_requirements", "public_sequence_capacity_sources",

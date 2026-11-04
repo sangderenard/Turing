@@ -1533,6 +1533,12 @@ class CorrelationTable:
         found.extend(self._repository_ssa_signature_findings(module))
         found.extend(self._scope_local_accounting_findings(module))
         found.extend(self._tensor_metadata_result_binding_findings(module))
+        found.extend(self._tensor_owned_heap_binding_findings(module))
+        found.extend(self._tensor_heap_owner_call_binding_findings(module))
+        found.extend(self._tensor_heap_consumer_nonescape_findings(module))
+        found.extend(self._tensor_heap_release_binding_findings(module))
+        found.extend(self._tensor_metadata_call_binding_findings(module))
+        found.extend(self._tensor_output_capacity_bound_findings(module))
         for name, function in module.functions.items():
             found.extend(self._function_findings(module, str(name), function))
             found.extend(
@@ -4914,11 +4920,675 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _tensor_output_capacity_bound_findings(module: Any) -> list[Finding]:
+        """A bounded output allocation cites the guarded Min and input span."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, GUARDED_CALL_ACTUAL_RANGE,
+            PROCESS_GRAPH_OPERANDS, SSA_VALUE,
+            TENSOR_OUTPUT_CAPACITY_BOUND, TensorOutputCapacityBound,
+        )
+        from .ssa_record_return_state import function_scope_of
+
+        book = identity_book(module)
+        page = book.page(TENSOR_OUTPUT_CAPACITY_BOUND)
+        found: list[Finding] = []
+        for row in page.rows():
+            ref = book.latest_ref(TENSOR_OUTPUT_CAPACITY_BOUND, row)
+            fact = page.cell(ref.row, ref.column)
+            valid = isinstance(fact, TensorOutputCapacityBound)
+            if valid:
+                cited = {source for source, _stage in book.edges_into(ref)}
+                required = (
+                    fact.input_cell, fact.selection_input_cell,
+                    fact.axis_bound_cell, fact.selection_cell,
+                    fact.output_cell, fact.shape_cell, fact.rank_cell,
+                    fact.count_cell, fact.layout_cell, *fact.guard_cells,
+                )
+                valid = (set(required) <= cited and fact.guard_cells
+                         and fact.output_cell.row == row
+                         and all(cell.page == SSA_VALUE and cell.row[0] == row[0]
+                                 for cell in required[:8])
+                         and all(cell.page == GUARDED_CALL_ACTUAL_RANGE
+                                 for cell in fact.guard_cells)
+                         and fact.layout_cell.page.name == "source_aggregate_layout")
+            if valid:
+                input_fact = book.page(SSA_VALUE).cell(
+                    fact.input_cell.row, fact.input_cell.column)
+                shape = tuple(getattr(input_fact, "shape", ()) or ())
+                valid = (shape == fact.capacity_shape and shape
+                         and all(type(extent) is int and extent >= 0
+                                 for extent in shape)
+                         and 0 <= fact.axis < len(shape)
+                         and shape[fact.axis] <= (1 << 31) - 1)
+                for guard_cell in fact.guard_cells:
+                    interval = book.page(GUARDED_CALL_ACTUAL_RANGE).cell(
+                        guard_cell.row, guard_cell.column)
+                    valid = valid and (isinstance(interval, tuple)
+                                       and len(interval) == 2
+                                       and type(interval[0]) is int
+                                       and type(interval[1]) is int
+                                       and 0 <= interval[0] <= interval[1])
+                call_cell = book.latest_ref(CANONICAL_VALUE, fact.layout_cell.row)
+                operands_cell = book.latest_ref(
+                    PROCESS_GRAPH_OPERANDS, fact.layout_cell.row)
+                operands = (() if operands_cell is None else book.page(
+                    PROCESS_GRAPH_OPERANDS).cell(operands_cell.row,
+                                                 operands_cell.column))
+                k_cells = tuple(parent for parent, role in operands
+                                if role == "kw:k" and parent.page == CANONICAL_VALUE)
+                def fork_ancestors(cell):
+                    pending, seen = [cell], set()
+                    while pending:
+                        current = pending.pop()
+                        if current is None or current in seen:
+                            continue
+                        seen.add(current)
+                        pending.extend(source for source, stage in book.edges_into(current)
+                                       if source.page == CANONICAL_VALUE
+                                       and stage.name == "read_scope_fork")
+                    return seen
+                if call_cell is None or len(k_cells) != 1:
+                    valid = False
+                else:
+                    call_causes = fork_ancestors(call_cell)
+                    actual_causes = fork_ancestors(k_cells[0])
+                    valid = valid and all(
+                        (causes := {source for source, _stage
+                                    in book.edges_into(guard_cell)}) & call_causes
+                        and causes & actual_causes
+                        for guard_cell in fact.guard_cells
+                    )
+            if valid:
+                matches = []
+                for name, function in module.functions.items():
+                    if function_scope_of(function) != row[0]:
+                        continue
+                    table = (getattr(module, "tensor_tables", {}) or {}).get(name)
+                    descriptor = None if table is None else table.tensors.get(row[1])
+                    if descriptor is None:
+                        continue
+                    instructions = tuple(instruction for block in function.blocks.values()
+                                         for instruction in block.instrs)
+                    ids = lambda instruction: tuple(int(arg.id) for arg in instruction.args)
+                    selection_id = int(fact.selection_cell.row[-1])
+                    input_id = int(fact.selection_input_cell.row[-1])
+                    bound_id = int(fact.axis_bound_cell.row[-1])
+                    min_def = [instruction for instruction in instructions
+                               if instruction.op == "Min" and instruction.res is not None
+                               and int(instruction.res.id) == selection_id
+                               and ids(instruction) == (input_id, bound_id)
+                               and instruction.attributes.get("source_operator") == "topk"]
+                    const_def = [instruction for instruction in instructions
+                                 if instruction.op == "Const" and instruction.res is not None
+                                 and int(instruction.res.id) == bound_id
+                                 and instruction.attributes.get("constant")
+                                 == shape[fact.axis]]
+                    count_id = int(fact.count_cell.row[-1])
+                    cast_ids = {
+                        int(instruction.res.id)
+                        for instruction in instructions
+                        if instruction.res is not None
+                        and instruction.op == "Cast"
+                        and ids(instruction) == (selection_id,)
+                        and instruction.attributes.get("target_dtype") == "int32"
+                    }
+                    other_extent = 1
+                    for axis, extent in enumerate(shape):
+                        if axis != fact.axis:
+                            other_extent *= extent
+                    selected_count = other_extent == 1 and count_id in cast_ids
+                    selected_count = selected_count or any(
+                        instruction.res is not None
+                        and int(instruction.res.id) == count_id
+                        and instruction.op == "Mul"
+                        and any(
+                            cast_id in ids(instruction)
+                            and any(
+                                constant.op == "Const"
+                                and constant.res is not None
+                                and int(constant.res.id) in ids(instruction)
+                                and int(constant.res.id) != cast_id
+                                and constant.attributes.get("constant") == other_extent
+                                for constant in instructions
+                            )
+                            for cast_id in cast_ids
+                        )
+                        for instruction in instructions
+                    ) if other_extent != 1 else selected_count
+                    shape_id = int(fact.shape_cell.row[-1])
+                    rank_id = int(fact.rank_cell.row[-1])
+                    shape_seed = any(
+                        instruction.op == "Const" and instruction.res is not None
+                        and int(instruction.res.id) == shape_id
+                        and tuple(instruction.attributes.get("values", ())) == shape
+                        for instruction in instructions
+                    )
+                    rank_def = any(
+                        instruction.op == "Const" and instruction.res is not None
+                        and int(instruction.res.id) == rank_id
+                        and instruction.attributes.get("constant") == len(shape)
+                        for instruction in instructions
+                    )
+                    matches.append(
+                        len(min_def) == len(const_def) == 1 and selected_count
+                        and shape_seed and rank_def
+                        and int(descriptor.data_value_id) == row[1]
+                        and descriptor.metadata_state == "dynamic"
+                        and descriptor.owns_allocation
+                        and descriptor.shape_value_id == shape_id
+                        and descriptor.rank_value_id == rank_id
+                        and descriptor.element_count_value_id == count_id
+                    )
+                valid = any(matches)
+            if not valid:
+                found.append(Finding(
+                    "tensor-output-capacity-bound-disagreement",
+                    str(row[0]), int(row[1]),
+                    "capacity lacks exact guarded Min, input shape, result "
+                    "metadata, or direct concordance causes",
+                ))
+        return found
+
+    @staticmethod
+    def _tensor_metadata_call_binding_findings(module: Any) -> list[Finding]:
+        """An input binding names one live Call by its SSA result identity."""
+
+        from .concordance_declarations import (
+            SSA_VALUE, TENSOR_METADATA_CALL_BINDING,
+            TENSOR_METADATA_RESULT_BINDING, TENSOR_SHAPE_CONCORDANCE,
+        )
+        from .ssa_record_return_state import function_scope_of
+
+        book = identity_book(module)
+        page = book.page(TENSOR_METADATA_CALL_BINDING)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(TENSOR_METADATA_CALL_BINDING, row)
+            fact = page.cell(cell.row, cell.column)
+            caller = module.functions.get(str(row[1]))
+            callee = module.functions.get(str(row[4]))
+            block = None if caller is None else caller.blocks.get(str(row[2]))
+            matching = () if block is None else tuple(
+                instruction for instruction in block.instrs
+                if instruction.op in {"Call", "call"}
+                and instruction.res is not None
+                and int(instruction.res.id) == row[3]
+            )
+            valid = (
+                len(row) == 5 and caller is not None and callee is not None
+                and block is not None
+                and row[0] == function_scope_of(caller)
+                and type(row[3]) is int and len(matching) == 1
+                and isinstance(fact, tuple) and len(fact) == 2
+                and all(isinstance(ids, tuple) and ids
+                        and all(type(value_id) is int for value_id in ids)
+                        for ids in fact)
+                and len(fact[0]) == len(fact[1])
+            )
+            if valid:
+                instruction = matching[0]
+                valid = (
+                    instruction.attributes.get("callee") == row[4]
+                    and len(instruction.args) == len(callee.args)
+                    and all(sum(
+                        int(actual.id) == actual_id
+                        and int(formal.id) == formal_id
+                        for actual, formal in zip(
+                            instruction.args, callee.args, strict=True,
+                        )
+                    ) == 1 for actual_id, formal_id in zip(
+                        fact[0], fact[1], strict=True,
+                    ))
+                )
+            if valid:
+                causes = {parent for parent, _ in book.edges_into(cell)}
+                required_rows = {
+                    (function_scope_of(caller), row[3]),
+                    *((function_scope_of(caller), value_id)
+                      for value_id in fact[0]),
+                    *((function_scope_of(callee), value_id)
+                      for value_id in fact[1]),
+                }
+                cited_rows = {parent.row for parent in causes
+                              if parent.page == SSA_VALUE}
+                valid = (
+                    required_rows <= cited_rows
+                    and any(parent.page in {
+                        TENSOR_SHAPE_CONCORDANCE,
+                        TENSOR_METADATA_RESULT_BINDING,
+                    } for parent in causes)
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-metadata-call-binding-disagreement",
+                    str(row[1]), int(row[3]),
+                    "metadata binding has no exact live Call or SSA actual/formal proof",
+                ))
+        return found
+
+    @staticmethod
+    def _tensor_owned_heap_binding_findings(module: Any) -> list[Finding]:
+        """Check one logical tensor's exact owned native data carrier."""
+
+        from .concordance_declarations import SSA_VALUE, TENSOR_OWNED_HEAP_BINDING
+        from .ssa_heap_allocation import validate_heap_allocation
+        from .ssa_record_return_state import function_scope_of
+
+        book = identity_book(module)
+        page = book.page(TENSOR_OWNED_HEAP_BINDING)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(TENSOR_OWNED_HEAP_BINDING, row)
+            fact = page.cell(cell.row, cell.column)
+            valid = (
+                isinstance(fact, tuple) and len(fact) == 4
+                and all(type(value_id) is int for value_id in fact[:3])
+                and isinstance(fact[3], str)
+            )
+            function = module.functions.get(str(row[1]))
+            valid = (valid and function is not None
+                     and function_scope_of(function) == row[0])
+            if valid:
+                table = (getattr(module, "tensor_tables", {}) or {}).get(str(row[1]))
+                descriptor = None if table is None else table.tensors.get(int(row[2]))
+                carrier_id, owner_id, count_id, element_dtype = fact
+                valid = (
+                    descriptor is not None
+                    and descriptor.tensor_id == int(row[2])
+                    and descriptor.data_value_id == carrier_id
+                    and getattr(descriptor, "heap_owner_value_id", None) == owner_id
+                    and descriptor.element_count_value_id == count_id
+                    and descriptor.dtype == element_dtype
+                    and carrier_id != int(row[2])
+                    and len({carrier_id, owner_id, count_id, int(row[2])}) == 4
+                )
+            if valid:
+                ids = (int(row[2]), carrier_id, owner_id, count_id)
+                causes = {source for source, _stage in book.edges_into(cell)}
+                valid = all(
+                    sum(1 for source in causes
+                        if source.page == SSA_VALUE and source.row == (row[0], value_id)) == 1
+                    for value_id in ids
+                )
+                allocations = tuple(
+                    instruction for block in function.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Alloca" and instruction.res is not None
+                    and int(instruction.res.id) == carrier_id
+                )
+                valid = valid and len(allocations) == 1
+            if valid:
+                allocation = allocations[0]
+                try:
+                    count, owner, layout = validate_heap_allocation(allocation)
+                    valid = (
+                        int(count.id) == count_id
+                        and int(owner.id) == owner_id
+                        and layout.name == element_dtype
+                    )
+                except (KeyError, ValueError, TypeError):
+                    valid = False
+            if not valid:
+                found.append(Finding(
+                    "tensor-owned-heap-binding", str(row[1]), int(row[2]),
+                    "logical tensor lacks exact carrier, owner, count or live Alloca proof",
+                ))
+        return found
+
+    @staticmethod
+    def _tensor_heap_owner_call_binding_findings(module: Any) -> list[Finding]:
+        """An owned tensor's caller and callee share one mutable owner cell."""
+
+        from .concordance_declarations import (
+            SSA_VALUE, TENSOR_HEAP_OWNER_CALL_BINDING,
+            TENSOR_HEAP_RELEASE_BINDING,
+            TENSOR_OWNED_HEAP_BINDING,
+        )
+        from .ssa_record_return_state import function_scope_of
+
+        book = identity_book(module)
+        page = book.page(TENSOR_HEAP_OWNER_CALL_BINDING)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(TENSOR_HEAP_OWNER_CALL_BINDING, row)
+            fact = page.cell(cell.row, cell.column)
+            valid = (
+                isinstance(fact, tuple) and len(fact) == 3
+                and all(type(value_id) is int for value_id in fact)
+                and fact[0] == int(row[4])
+            )
+            caller = module.functions.get(str(row[1]))
+            callee = module.functions.get(str(row[3]))
+            valid = (valid and caller is not None and callee is not None
+                     and function_scope_of(caller) == row[0])
+            if valid:
+                calls = tuple(
+                    instruction for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Call" and instruction.res is not None
+                    and int(instruction.res.id) == int(row[2])
+                    and instruction.attributes.get("callee") == row[3]
+                )
+                binding = book.latest_ref(
+                    TENSOR_OWNED_HEAP_BINDING,
+                    (function_scope_of(callee), str(row[3]), int(row[4])),
+                )
+                valid = len(calls) == 1 and binding is not None
+            if valid:
+                call = calls[0]
+                tensor_fact = book.page(TENSOR_OWNED_HEAP_BINDING).cell(
+                    binding.row, binding.column,
+                )
+                pairs = tuple(zip(
+                    call.attributes.get("callee_input_ids", ()),
+                    call.args,
+                ))
+                pair = tuple(
+                    actual for formal_id, actual in pairs
+                    if int(formal_id) == fact[2] and int(actual.id) == fact[1]
+                )
+                formal = tuple(value for value in callee.args
+                               if int(value.id) == fact[2])
+                valid = (
+                    isinstance(tensor_fact, tuple) and len(tensor_fact) == 4
+                    and tensor_fact[1] == fact[2]
+                    and len(call.attributes.get("callee_input_ids", ()))
+                    == len(call.args)
+                    and len(pair) == len(formal) == 1
+                    and pair[0].dtype == formal[0].dtype == "ptr"
+                    and tuple(pair[0].shape or ()) == (1,)
+                    and tuple(formal[0].shape or ()) == (1,)
+                    and bool((pair[0].accounting or {}).get("heap_owner"))
+                    and bool((formal[0].accounting or {}).get("heap_owner"))
+                    and bool((pair[0].accounting or {}).get(
+                        "compiler_frame_storage"))
+                )
+            if valid:
+                causes = {source for source, _stage in book.edges_into(cell)}
+                required = {
+                    binding,
+                    book.latest_ref(SSA_VALUE, (row[0], int(row[2]))),
+                    book.latest_ref(SSA_VALUE, (row[0], fact[1])),
+                    book.latest_ref(SSA_VALUE,
+                                    (function_scope_of(callee), fact[2])),
+                }
+                valid = None not in required and required <= causes
+            if valid:
+                # Every private caller-owned heap cell must have an exact
+                # release receipt. Checking only existing release rows misses
+                # a lost release instruction and its missing row together.
+                release = book.latest_ref(TENSOR_HEAP_RELEASE_BINDING, (
+                    row[0], row[1], fact[1],
+                ))
+                valid = (
+                    release is not None
+                    and cell in {source for source, _stage
+                                 in book.edges_into(release)}
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-heap-owner-call-binding", str(row[1]), int(row[2]),
+                    "owned tensor lacks exact live Call, formal, actual or owner proof",
+                ))
+        return found
+
+    @staticmethod
+    def _tensor_heap_consumer_nonescape_findings(module: Any) -> list[Finding]:
+        """A private tensor consumer must return no view of the borrowed data."""
+
+        from .concordance_declarations import (
+            SSA_VALUE, TENSOR_HEAP_CONSUMER_NONESCAPE,
+            TENSOR_HEAP_OWNER_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+        )
+        from .ssa_record_return_state import function_scope_of
+
+        book = identity_book(module)
+        page = book.page(TENSOR_HEAP_CONSUMER_NONESCAPE)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(TENSOR_HEAP_CONSUMER_NONESCAPE, row)
+            fact = page.cell(cell.row, cell.column)
+            valid = (
+                isinstance(fact, tuple) and len(fact) == 4
+                and isinstance(fact[0], str) and type(fact[1]) is int
+                and isinstance(fact[2], tuple)
+                and isinstance(fact[3], tuple)
+            )
+            caller = module.functions.get(str(row[1]))
+            callee = module.functions.get(fact[0]) if valid else None
+            valid = (valid and caller is not None and callee is not None
+                     and function_scope_of(caller) == row[0]
+                     and "__planned_region_" in callee.name)
+            if valid:
+                calls = tuple(
+                    instruction for block in caller.blocks.values()
+                    for instruction in block.instrs
+                    if instruction.op == "Call" and instruction.res is not None
+                    and int(instruction.res.id) == int(row[2])
+                    and instruction.attributes.get("callee") == callee.name
+                )
+                owner_bindings = tuple(
+                    book.latest_ref(TENSOR_HEAP_OWNER_CALL_BINDING, candidate)
+                    for candidate in book.page(TENSOR_HEAP_OWNER_CALL_BINDING).rows()
+                    if candidate[:2] == row[:2]
+                    and book.page(TENSOR_HEAP_OWNER_CALL_BINDING).latest(
+                        candidate)[0:2] == (fact[1], int(row[3]))
+                )
+                valid = len(calls) == len(owner_bindings) == 1
+            if valid:
+                call = calls[0]
+                declared = call.attributes.get("callee_input_ids")
+                valid = (isinstance(declared, (tuple, list))
+                         and len(declared) == len(call.args))
+            if valid:
+                formals = tuple(sorted(
+                    int(formal_id) for formal_id, actual in zip(
+                        declared, call.args)
+                    if int(actual.id) == fact[1]
+                ))
+                returned = tuple(instruction for block in callee.blocks.values()
+                                 for instruction in block.instrs
+                                 if instruction.op == "Ret")
+                table = (getattr(module, "tensor_tables", {}) or {}).get(callee.name)
+                valid = (formals == fact[2] and bool(formals)
+                         and len(returned) == 1 and table is not None)
+            if valid:
+                metadata_refs = tuple(
+                    book.latest_ref(TENSOR_METADATA_RESULT_BINDING, candidate)
+                    for candidate in book.page(TENSOR_METADATA_RESULT_BINDING).rows()
+                    if candidate[:3] == (row[0], int(row[2]), callee.name)
+                )
+                metadata_ids = {
+                    int(value_id)
+                    for ref in metadata_refs
+                    for value_id in book.page(TENSOR_METADATA_RESULT_BINDING).cell(
+                        ref.row, ref.column)[1]
+                }
+                layouts = []
+                for output in returned[0].args:
+                    if int(output.id) in metadata_ids:
+                        continue
+                    descriptor = table.by_id(int(output.id))
+                    if descriptor is None:
+                        valid = False
+                        break
+                    layouts.append((
+                        int(output.id), int(descriptor.data_value_id),
+                        None if descriptor.alias_of is None
+                        else int(descriptor.alias_of),
+                    ))
+                valid = (valid and tuple(layouts) == fact[3]
+                         and all(data not in formals and alias not in formals
+                                 for _logical, data, alias in layouts))
+            if valid:
+                causes = {source for source, _stage in book.edges_into(cell)}
+                expected = {
+                    owner_bindings[0], *metadata_refs,
+                }
+                value_ids = (int(row[2]), fact[1], *(
+                    value_id for logical, data, alias in layouts
+                    for value_id in (logical, data, *((alias,) if alias is not None
+                                                     else ()))
+                ))
+                valid = (
+                    expected <= causes
+                    and all(any(source.page == SSA_VALUE
+                                and source.row == (scope, value_id)
+                                for source in causes)
+                            for scope, value_id in (
+                                *((row[0], value_id)
+                                  for value_id in (int(row[2]), fact[1])),
+                                *((function_scope_of(callee), value_id)
+                                  for value_id in value_ids[2:]),
+                            ))
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-heap-consumer-nonescape", str(row[1]), int(row[2]),
+                    "private tensor consumer lacks exact call, formal or nonescaping return proof",
+                ))
+        return found
+
+    @staticmethod
+    def _tensor_heap_release_binding_findings(module: Any) -> list[Finding]:
+        """A private owned tensor releases its caller cell after its last use."""
+
+        from .concordance_declarations import (
+            SSA_VALUE, TENSOR_HEAP_CONSUMER_NONESCAPE,
+            TENSOR_HEAP_OWNER_CALL_BINDING,
+            TENSOR_HEAP_RELEASE_BINDING,
+        )
+        from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL
+        from .ssa_record_return_state import (
+            function_scope_of, ssa_block_identity_cell,
+        )
+
+        book = identity_book(module)
+        page = book.page(TENSOR_HEAP_RELEASE_BINDING)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(TENSOR_HEAP_RELEASE_BINDING, row)
+            fact = page.cell(cell.row, cell.column)
+            valid = (
+                isinstance(fact, tuple) and len(fact) == 3
+                and type(fact[0]) is int and type(fact[1]) is int
+                and isinstance(fact[2], str)
+            )
+            function = module.functions.get(str(row[1]))
+            valid = (valid and function is not None
+                     and function_scope_of(function) == row[0]
+                     and fact[2] in function.blocks)
+            if valid:
+                block = function.blocks[fact[2]]
+                instructions = block.instrs
+                producers = tuple(
+                    (index, instruction)
+                    for index, instruction in enumerate(instructions)
+                    if instruction.op == "Call" and instruction.res is not None
+                    and int(instruction.res.id) == fact[0]
+                )
+                releases = tuple(
+                    (index, instruction)
+                    for index, instruction in enumerate(instructions)
+                    if instruction.op == "Call" and instruction.res is None
+                    and instruction.attributes.get("callee") == HEAP_RELEASE_SYMBOL
+                    and instruction.attributes.get("native_heap_abi")
+                    == "release_owner"
+                    and len(instruction.args) == 1
+                    and int(instruction.args[0].id) == int(row[2])
+                )
+                returns = tuple(
+                    (index, instruction)
+                    for index, instruction in enumerate(instructions)
+                    if instruction.op == "Ret"
+                )
+                valid = (len(producers) == len(releases) == len(returns) == 1
+                         and sum(instruction.op == "Ret"
+                                 for other in function.blocks.values()
+                                 for instruction in other.instrs) == 1)
+            if valid:
+                producer_index, producer = producers[0]
+                release_index, release = releases[0]
+                return_index, terminal = returns[0]
+                owner_calls = tuple(
+                    ref for candidate in book.page(
+                        TENSOR_HEAP_OWNER_CALL_BINDING).rows()
+                    if candidate[:3] == (row[0], row[1], fact[0])
+                    and candidate[3] == producer.attributes.get("callee")
+                    and candidate[4] == fact[1]
+                    for ref in (book.latest_ref(
+                        TENSOR_HEAP_OWNER_CALL_BINDING, candidate),)
+                    if ref is not None
+                )
+                valid = (
+                    len(owner_calls) == 1
+                    and book.page(TENSOR_HEAP_OWNER_CALL_BINDING).cell(
+                        owner_calls[0].row, owner_calls[0].column,
+                    )[1] == int(row[2])
+                    and producer_index < release_index < return_index
+                    and all(int(value.id) not in (fact[1], int(row[2]))
+                            for value in terminal.args)
+                    and all(
+                        other is block and index < release_index
+                        and (not any(int(value.id) == fact[1]
+                                     for value in instruction.args)
+                             or index > producer_index)
+                        for other in function.blocks.values()
+                        for index, instruction in enumerate(other.instrs)
+                        if instruction is not release
+                        and any(int(value.id) in (fact[1], int(row[2]))
+                                for value in instruction.args)
+                    )
+                )
+            if valid:
+                causes = {source for source, _stage in book.edges_into(cell)}
+                consumers = tuple(
+                    instruction for instruction in instructions
+                    if instruction is not producer and instruction is not release
+                    and any(int(value.id) == fact[1]
+                            for value in instruction.args)
+                )
+                consumer_refs = tuple(
+                    book.latest_ref(TENSOR_HEAP_CONSUMER_NONESCAPE, (
+                        row[0], row[1], int(instruction.res.id), int(row[2]),
+                    )) if instruction.op == "Call" and instruction.res is not None
+                    else None
+                    for instruction in consumers
+                )
+                required = {
+                    owner_calls[0],
+                    ssa_block_identity_cell(function, fact[2], book=book),
+                }
+                valid = (
+                    None not in required and required <= causes
+                    and all(ref is not None and ref in causes
+                            for ref in consumer_refs)
+                    and {source for source in causes
+                         if source.page == TENSOR_HEAP_CONSUMER_NONESCAPE}
+                    == set(consumer_refs)
+                    and all(sum(
+                        source.page == SSA_VALUE
+                        and source.row == (row[0], value_id)
+                        for source in causes
+                    ) == 1 for value_id in (fact[0], fact[1], int(row[2])))
+                    and not CorrelationTable._tensor_heap_consumer_nonescape_findings(
+                        module)
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-heap-release-binding", str(row[1]), int(row[2]),
+                    "private tensor release lacks exact call, owner, last-use or terminal proof",
+                ))
+        return found
+
+    @staticmethod
     def _tensor_metadata_result_binding_findings(module: Any) -> list[Finding]:
         """Computed metadata must traverse one exact aggregate call output."""
 
         from .concordance_declarations import (
             SSA_VALUE, TENSOR_METADATA_RESULT_BINDING,
+            TENSOR_OWNED_HEAP_BINDING,
         )
         from .ssa_record_return_state import function_scope_of
 
@@ -4968,9 +5638,32 @@ class CorrelationTable:
                 returned = [instruction for block in callee.blocks.values()
                             for instruction in block.instrs
                             if instruction.op == "Ret"]
-                valid = valid and len(returned) == 1 and tuple(
-                    int(value.id) for value in returned[0].args
-                ) == callee_ids
+                def exact_return_carrier(value, carried_id):
+                    if int(value.id) == int(carried_id):
+                        return True
+                    table = module.tensor_tables.get(callee.name)
+                    descriptor = None if table is None else table.by_id(
+                        int(value.id)
+                    )
+                    binding = book.page(TENSOR_OWNED_HEAP_BINDING).latest((
+                        function_scope_of(callee), callee.name, int(value.id),
+                    ))
+                    return (
+                        descriptor is not None
+                        and descriptor.data_value_id == int(carried_id)
+                        and isinstance(binding, tuple)
+                        and len(binding) == 4
+                        and binding[0] == int(carried_id)
+                    )
+
+                valid = valid and len(returned) == 1 and len(
+                    returned[0].args
+                ) == len(callee_ids) and all(
+                    exact_return_carrier(value, carried_id)
+                    for value, carried_id in zip(
+                        returned[0].args, callee_ids
+                    )
+                )
                 projections = [instruction for block in caller.blocks.values()
                                for instruction in block.instrs
                                if instruction.op == "Load"
@@ -9763,10 +10456,14 @@ class CorrelationTable:
 
         from .concordance_declarations import (
             ArtifactFact, ArtifactPart, Backend, EMISSION_ARTIFACT,
+            SSA_VALUE,
         )
         from .ssa_storage_requirements import (
             public_owned_sequence_returns, public_sequence_capacity_sources,
+            public_tensor_capacity_sources,
         )
+        from .ssa_record_return_state import function_scope_of
+        from .ssa_llvm_backend import _declared_span_rank
 
         book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
         if book is None:
@@ -9916,33 +10613,93 @@ class CorrelationTable:
             # artifact select one owning root; a name coincidence does not.
             owners = []
             for function_name in module.functions:
-                candidates = public_sequence_capacity_sources(
+                sequence_candidates = public_sequence_capacity_sources(
                     module, str(function_name),
                 )
-                if candidates and all(
+                tensor_candidates = public_tensor_capacity_sources(
+                    module, str(function_name),
+                )
+                function = module.functions[str(function_name)]
+                function_scope = function_scope_of(function)
+                tensor_values = tuple(
+                    book.latest_ref(SSA_VALUE, (function_scope, value_id))
+                    for relation in tensor_candidates
+                    for value_id in (
+                        relation.output_data_id, relation.input_data_id,
+                        relation.output_shape_id, relation.output_count_id,
+                    )
+                )
+                if (sequence_candidates or tensor_candidates) and all(
                     proof in causes
-                    for relation in candidates
+                    for relation in sequence_candidates
                     for proof in (
                         relation.bound_cell,
                         relation.output_descriptor_cell,
                         relation.input_descriptor_cell,
                     )
+                ) and all(
+                    proof in causes
+                    for relation in tensor_candidates
+                    for proof in (
+                        relation.bound_cell, relation.metadata_binding_cell,
+                    )
+                ) and all(
+                    proof is not None and proof in causes
+                    for proof in tensor_values
                 ):
-                    owners.append((function_name, candidates))
+                    owners.append((
+                        function_name, sequence_candidates,
+                        tensor_candidates, tensor_values,
+                    ))
             if len(owners) != 1:
                 issue("runtime ABI has no unique descriptor-owned source root")
                 continue
-            _owner, relations = owners[0]
+            _owner, relations, tensor_relations, tensor_values = owners[0]
             expected_capacities = {}
             expected_lengths = {}
+            expected_shapes = {}
+            complete_relations = True
             for relation in relations:
                 output = relation.output_data_id
                 if output not in buffer_index or relation.input_data_id not in buffer_index:
+                    complete_relations = False
                     continue
                 if relation.output_length_id not in buffer_index:
+                    complete_relations = False
                     continue
                 expected_capacities[output] = buffer_index[relation.input_data_id]
                 expected_lengths[output] = buffer_index[relation.output_length_id]
+            function = module.functions[str(_owner)]
+            returned = {
+                int(value.id): value
+                for block in function.blocks.values()
+                for instruction in block.instrs
+                if instruction.op == "Ret"
+                for value in instruction.args
+            }
+            for relation in tensor_relations:
+                output = relation.output_data_id
+                if any(value_id not in buffer_index for value_id in (
+                    output, relation.input_data_id,
+                    relation.output_shape_id, relation.output_count_id,
+                )):
+                    complete_relations = False
+                    continue
+                value = returned.get(output)
+                if value is None:
+                    complete_relations = False
+                    continue
+                expected_capacities[output] = buffer_index[relation.input_data_id]
+                rank = _declared_span_rank(value)
+                if (rank < 1 or description["buffers"][buffer_index[output]].get(
+                    "rank"
+                ) != rank):
+                    complete_relations = False
+                    continue
+                if rank == 1 and relation.output_count_id in buffer_index:
+                    expected_lengths[output] = buffer_index[relation.output_count_id]
+                elif rank > 1 and relation.output_shape_id in buffer_index:
+                    expected_shapes[output] = buffer_index[relation.output_shape_id]
             actual_capacities = {
                 int(buffer["value_id"]): buffer["capacity_from"]
                 for buffer in description["buffers"]
@@ -9969,13 +10726,25 @@ class CorrelationTable:
                         relation.input_descriptor_cell,
                     )
                 ),
+                *(
+                    proof for relation in tensor_relations
+                    for proof in (
+                        relation.bound_cell, relation.metadata_binding_cell,
+                    )
+                ),
+                *tensor_values,
             }
             if (
                 None in required or not required <= causes
+                or not complete_relations
                 or actual_capacities != expected_capacities
                 or actual_lengths != expected_lengths
-                or actual_shapes
-                or not relations
+                or actual_shapes != expected_shapes
+                or not (relations or tensor_relations)
+                or bool(tensor_relations) and (
+                    CorrelationTable._tensor_output_capacity_bound_findings(module)
+                    or CorrelationTable._tensor_metadata_result_binding_findings(module)
+                )
                 or page.cell(order_cell.row, order_cell.column).location != order
                 or order_cell not in {
                     parent for parent, _stage in book.edges_into(api_cell)

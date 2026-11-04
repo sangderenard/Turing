@@ -141,6 +141,15 @@ def analyze_aggregate_abi(
     values = {
         name: _function_values(module.functions[name]) for name in selected
     }
+    from .ssa_storage_requirements import owned_tensor_data_bindings
+
+    owned_outputs = {
+        name: {
+            binding.tensor_id: binding
+            for binding in owned_tensor_data_bindings(module, name)
+        }
+        for name in selected
+    }
     calls: list[AggregateCallRecord] = []
     output_candidates: dict[str, dict[int, SSAValue]] = {}
     output_order: dict[str, list[int]] = {}
@@ -172,10 +181,29 @@ def analyze_aggregate_abi(
                     values[function_name][value_id]
                     for value_id in aggregate_ids
                 )
-        returned_layouts[function_name] = tuple(returned)
+        # Program: arange(bit_count) crosses a planned region as logical
+        # tensor 6, whose exact owned data carrier is ptr 4001.  Wrong
+        # record: seeding native outputs from Ret's logical 6 and then
+        # appending the caller's canonical 4001 creates two output ports for
+        # one tensor.  The audited descriptor binding identifies the sole
+        # physical output; retain Ret unchanged as the semantic source.
+        canonical_returned = []
+        for value in returned:
+            binding = owned_outputs[function_name].get(int(value.id))
+            if binding is None:
+                canonical_returned.append(value)
+                continue
+            carrier = values[function_name].get(binding.data_value_id)
+            if carrier is None or str(carrier.dtype) != "ptr":
+                raise ValueError(
+                    f"owned tensor %{value.id} in {function_name} has no "
+                    "exact native pointer carrier"
+                )
+            canonical_returned.append(carrier)
+        returned_layouts[function_name] = tuple(canonical_returned)
         order = output_order.setdefault(function_name, [])
         candidates = output_candidates.setdefault(function_name, {})
-        for value in returned:
+        for value in canonical_returned:
             value_id = int(value.id)
             if value_id not in order:
                 order.append(value_id)

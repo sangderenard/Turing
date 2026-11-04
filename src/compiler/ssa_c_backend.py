@@ -2460,6 +2460,23 @@ def emit_ssa_module_to_c(
             stage=EMISSION_C, symbol=_c_symbol(fn),
         )
     storage_requirements_by_function = module_storage_requirements(module)
+    from .ssa_storage_requirements import (
+        public_tensor_capacity_sources, owned_tensor_data_bindings,
+    )
+    tensor_capacity_relations = public_tensor_capacity_sources(module, function_name)
+    owned_tensor_carriers = {
+        (fn, binding.data_value_id): binding
+        for fn in reachable
+        for binding in owned_tensor_data_bindings(module, fn)
+    }
+    # Computed result geometry is ordinary caller SSA. Expose those exact
+    # values through the incumbent physical output/watch path; copying their
+    # IDs into artifact metadata alone would leave no native-written port.
+    watch = tuple(dict.fromkeys((
+        *map(int, watch),
+        *(value_id for relation in tensor_capacity_relations
+          for value_id in (relation.output_shape_id, relation.output_count_id)),
+    )))
     aggregate_abi = analyze_aggregate_abi(module, reachable)
     aggregate_calls = {
         id(record.call): record for record in aggregate_abi.calls
@@ -3166,6 +3183,7 @@ def emit_ssa_module_to_c(
             if instruction.res is not None
         }
         frame_allocations: list[tuple[str, str, int]] = []
+        tensor_storage_cells = set()
         owns_threads = any(i.op == "ThreadCreate" for b in function.blocks.values() for i in b.instrs)
         owns_sync = any(i.op in {"MutexCreate", "WaitQueueCreate", "LatchCreate", "BarrierCreate"} for b in function.blocks.values() for i in b.instrs)
 
@@ -3471,6 +3489,18 @@ def emit_ssa_module_to_c(
                 value_id
             )
             shape = tuple(value.shape or ())
+            if (requirement is not None and requirement.dynamic
+                    and requirement.element_count is None
+                    and _runtime_sized_span(value)):
+                # arange -> cast -> sum: the projected dynamic outputs
+                # have no pre-call capacity. Empty display shape cannot
+                # authorize a one-cell compiler frame for a runtime span.
+                shortfalls.append(CEmissionShortfall(
+                    "compiler_frame_storage",
+                    f"dynamic tensor %t{value_id} has no native "
+                    f"activation-storage capacity in {fn}",
+                ))
+                continue
             element_count = (
                 int(requirement.element_count)
                 if requirement is not None
@@ -3600,6 +3630,7 @@ def emit_ssa_module_to_c(
         aggregate_projection_storage: dict[
             tuple[int, int], tuple[str, str]
         ] = {}
+        owned_tensor_projection_sources = []
         for record in aggregate_abi.calls:
             if record.caller != fn or record.callee not in native_outputs:
                 continue
@@ -3690,6 +3721,19 @@ def emit_ssa_module_to_c(
                         next(iter(projection_shapes))
                         if sparse_output_formal else tuple(output.shape or ())
                     )
+                    owned_carrier = owned_tensor_carriers.get(
+                        (record.callee, int(output.id))
+                    )
+                    if owned_carrier is not None:
+                        # A computed tensor's owned allocation lives behind
+                        # its pointer carrier. The caller allocates one
+                        # pointer cell, not an element buffer of logical rank.
+                        shape = ()
+                        tensor_storage_cells.add(owned_carrier.cell)
+                        owned_tensor_projection_sources.extend(
+                            (projection.value, owned_carrier)
+                            for projection in projections
+                        )
                     runtime_slot = (
                         extent_slot(
                             fn if sparse_output_formal else record.callee,
@@ -3697,16 +3741,15 @@ def emit_ssa_module_to_c(
                             else int(output.id),
                             "element_count", None,
                         )
-                        if not shape and _runtime_sized_span(
+                        if owned_carrier is None and not shape and _runtime_sized_span(
                             projections[0].value if sparse_output_formal
                             else output
                         ) else None
                     )
-                    if (
-                        sparse_output_formal and not shape
-                        and _runtime_sized_span(projections[0].value)
-                        and runtime_slot is None
-                    ):
+                    if (owned_carrier is None and not shape and runtime_slot is None
+                            and (_runtime_sized_span(output)
+                                 or any(_runtime_sized_span(projection.value)
+                                        for projection in projections))):
                         shortfalls.append(CEmissionShortfall(
                             "Call", f"aggregate output {output.id} in {fn} "
                             "has no exact caller element-count storage origin",
@@ -4526,6 +4569,8 @@ def emit_ssa_module_to_c(
                         ))
             return tuple(values)
 
+        owned_publication_causes: list[Any] = []
+
         def output_publications(returned_values: Sequence = ()) -> list[str]:
             """Publish results by the same authority as the LLVM lane.
 
@@ -4535,6 +4580,7 @@ def emit_ssa_module_to_c(
             fall back to the declared output ids, exactly as LLVM does after
             its aggregate-output analysis.
             """
+            owned_publication_causes.clear()
             publications = []
             published_ids: set[int] = set()
             for output_index, output in enumerate(native_outputs[fn]):
@@ -4544,6 +4590,71 @@ def emit_ssa_module_to_c(
                 source_value = _publication_source_value(
                     output, output_index, returned_values,
                 )
+                # Program: arange(bit_count) crosses a planned region before
+                # its cast and reduction.  Ret names logical tensor 6, while
+                # the exact owned-heap binding names native carrier 4001.
+                # Wrong record: copying one value from the carrier address
+                # reads the first int64 element as a pointer.  The Alloca
+                # result is the arena address itself; publish that address
+                # into the caller's pointer cell, then let its descriptor
+                # carry the separate logical dtype and extent.
+                binding = owned_tensor_carriers.get((fn, output_id))
+                if binding is not None:
+                    if (
+                        binding.tensor_id != int(source_value.id)
+                        or str(output.dtype) != "ptr"
+                        or destination is None
+                    ):
+                        shortfalls.append(CEmissionShortfall(
+                            "Ret", f"owned tensor %{source_value.id} has no "
+                            f"exact native carrier publication in {fn}",
+                        ))
+                        continue
+                    carrier = next(
+                        (
+                            instruction.res for block in function.blocks.values()
+                            for instruction in block.instrs
+                            if instruction.op == "Alloca"
+                            and instruction.res is not None
+                            and int(instruction.res.id) == binding.data_value_id
+                        ),
+                        None,
+                    )
+                    if carrier is None:
+                        shortfalls.append(CEmissionShortfall(
+                            "Ret", f"owned tensor %{source_value.id} has no "
+                            f"live carrier Alloca in {fn}",
+                        ))
+                        continue
+                    arena = heap_data(carrier)
+                    if arena is None:
+                        continue
+                    from .concordance_declarations import SSA_VALUE
+                    from .identity_concordance import identity_book
+
+                    book = identity_book(module)
+                    scope = function_scope_of(function)
+                    physical_causes = tuple(
+                        book.latest_ref(SSA_VALUE, (scope, value_id))
+                        for value_id in (
+                            binding.data_value_id,
+                            binding.owner_value_id,
+                            binding.count_value_id,
+                        )
+                    )
+                    if any(cell is None for cell in physical_causes):
+                        shortfalls.append(CEmissionShortfall(
+                            "Ret", f"owned tensor %{source_value.id} lacks "
+                            f"carrier, owner or count SSA evidence in {fn}",
+                        ))
+                        continue
+                    owned_publication_causes.extend(
+                        (binding.cell, *physical_causes)
+                    )
+                    publications.append(
+                        f"        *((void **)({destination})) = (void *)({arena});"
+                    )
+                    continue
                 source_id = freshened_synthetic_ids.get(
                     int(source_value.id), int(source_value.id)
                 )
@@ -5438,6 +5549,9 @@ def emit_ssa_module_to_c(
                     span.take(
                         UnitKind.OUTPUT_STORE,
                         args=(*instruction.args, *native_outputs[fn]),
+                        extra_cells=tuple(dict.fromkeys(
+                            owned_publication_causes,
+                        )),
                     )
                     # Outputs live in caller-visible buffers already. Route
                     # every exit through the activation-storage cleanup.
@@ -5900,6 +6014,144 @@ def emit_ssa_module_to_c(
                     kind = str(instruction.attributes.get("extent_kind") or "")
                     result_id = int(instruction.res.id)
                     if dynamic:
+                        # Program: a computed arange span crosses root ->
+                        # cast region -> sum region.  Each private region has
+                        # exact shape/rank/count formals on the concorded
+                        # metadata call edge.  Its local `extent` result is
+                        # a read of that formal, not a new public extent
+                        # slot.  Use the call binding and this descriptor's
+                        # own extent identity before querying public storage.
+                        from .concordance_declarations import (
+                            TENSOR_METADATA_CALL_BINDING,
+                            TENSOR_METADATA_RESULT_BINDING,
+                        )
+                        extent_field = (
+                            "element_count_value_id"
+                            if kind in {"element_count", "numel"}
+                            else "shape_value_id" if kind == "shape"
+                            else "rank_value_id" if kind == "rank"
+                            else None
+                        )
+                        bound_formals = set()
+                        if (
+                            extent_field is not None
+                            and descriptor is not None
+                            and getattr(descriptor, extent_field) == result_id
+                            and physical_book is not None
+                        ):
+                            binding_page = physical_book.page(
+                                TENSOR_METADATA_CALL_BINDING
+                            )
+                            formal_positions = {
+                                int(formal.id): position
+                                for position, formal in enumerate(function.args)
+                            }
+                            for binding_row in binding_page.rows():
+                                if (
+                                    not isinstance(binding_row, tuple)
+                                    or len(binding_row) != 5
+                                    or str(binding_row[4]) != str(fn)
+                                ):
+                                    continue
+                                caller = module.functions.get(str(binding_row[1]))
+                                call_block = (
+                                    caller.blocks.get(str(binding_row[2]))
+                                    if caller is not None else None
+                                )
+                                if call_block is None:
+                                    continue
+                                matching_calls = tuple(
+                                    item for item in call_block.instrs
+                                    if item.op in {"Call", "call"}
+                                    and item.res is not None
+                                    and int(item.res.id) == int(binding_row[3])
+                                )
+                                if len(matching_calls) != 1:
+                                    continue
+                                bound_call = matching_calls[0]
+                                if (
+                                    bound_call.op not in {"Call", "call"}
+                                    or bound_call.attributes.get("callee") != fn
+                                ):
+                                    continue
+                                binding = binding_page.latest(binding_row)
+                                if (
+                                    not isinstance(binding, tuple)
+                                    or len(binding) != 2
+                                    or len(binding[0]) != len(binding[1])
+                                ):
+                                    continue
+                                for actual_id, formal_id in zip(*binding):
+                                    formal_position = formal_positions.get(
+                                        int(formal_id)
+                                    )
+                                    if (
+                                        formal_position is None
+                                        or formal_position >= len(bound_call.args)
+                                        or int(bound_call.args[formal_position].id)
+                                        != int(actual_id)
+                                    ):
+                                        continue
+                                    formal = function.args[formal_position]
+                                    accounting = formal.accounting or {}
+                                    if (
+                                        int(accounting.get(
+                                            "tensor_extent_for", -1
+                                        )) == int(source.id)
+                                        and accounting.get(
+                                            "tensor_extent_kind"
+                                        ) == (
+                                            "element_count"
+                                            if kind == "numel" else kind
+                                        )
+                                    ):
+                                        # The metadata actual must be the
+                                        # projection of this very tensor's
+                                        # computed result, at the selected
+                                        # shape/rank/count position. A call
+                                        # binding alone permits two dynamic
+                                        # inputs to swap their extent actuals.
+                                        result_page = physical_book.page(
+                                            TENSOR_METADATA_RESULT_BINDING
+                                        )
+                                        kind_index = {
+                                            "shape": 0, "rank": 1,
+                                            "element_count": 2, "numel": 2,
+                                        }[kind]
+                                        proven_actual = any(
+                                            isinstance(result_row, tuple)
+                                            and len(result_row) == 4
+                                            and result_row[0] == binding_row[0]
+                                            and int(result_row[3]) == int(source.id)
+                                            and isinstance(result_fact, tuple)
+                                            and len(result_fact) == 3
+                                            and int(result_fact[0]) == int(source.id)
+                                            and len(result_fact[2]) == 3
+                                            and int(result_fact[2][kind_index])
+                                            == int(actual_id)
+                                            for result_row in result_page.scope_rows(
+                                                binding_row[0]
+                                            )
+                                            for result_fact in (
+                                                result_page.latest(result_row),
+                                            )
+                                        )
+                                        if proven_actual:
+                                            bound_formals.add(int(formal_id))
+                        if len(bound_formals) == 1:
+                            formal_id = next(iter(bound_formals))
+                            expressions[result_id] = expressions[formal_id]
+                            # arange -> cast -> sum: the cast Alloca read
+                            # count4004 through this expression, while its
+                            # kernel Call still took the unwritten out4004
+                            # address. Both are views of the same exact input
+                            # metadata formal and must use its live cell.
+                            addresses[result_id] = addresses[formal_id]
+                            object_expressions[id(instruction.res)] = expressions[formal_id]
+                            object_addresses[id(instruction.res)] = addresses[formal_id]
+                            if kind != "shape":
+                                integer_ids.add(result_id)
+                            continue
                         sequence_extent = sequence_extent_parts(source)
                         if sequence_extent is not None:
                             live_length, row_shape = sequence_extent
@@ -6345,6 +6597,7 @@ def emit_ssa_module_to_c(
                         for actual_position, formal in enumerate(input_formals)
                     }
                     rendered_args = [None] * len(target.args)
+                    call_tensor_storage_cells = set()
                     call_token = instruction.attributes.get(
                         "callsite_id",
                         instruction.res.id
@@ -6376,6 +6629,41 @@ def emit_ssa_module_to_c(
                             int(output.id)
                             for output in native_outputs.get(callee, ())
                         }
+                        owned_sources = {
+                            binding.cell: binding
+                            for projected, binding in owned_tensor_projection_sources
+                            if int(actual.id) == int(projected.id)
+                            and is_storage_view(actual, projected,
+                                                function=function, book=physical_book)
+                        }
+                        if owned_sources and _pointer_value_depth(formal) == 0:
+                            # The region aggregate returns one pointer cell.
+                            # A downstream numerical span formal receives its
+                            # arena, not the address of that pointer cell.
+                            # arange -> cast previously passed &callout6_0 and
+                            # cast read the stored pointer bits as int64 data.
+                            if len(owned_sources) != 1 or not formal_has_array_contract:
+                                shortfalls.append(CEmissionShortfall(
+                                    op, f"owned tensor input %{actual.id} has no "
+                                    f"unique span binding in {fn} -> {callee}",
+                                ))
+                                rendered_args = None
+                                break
+                            binding = next(iter(owned_sources.values()))
+                            if buffer_type(formal) != _buffer_c_type(binding.element_dtype):
+                                shortfalls.append(CEmissionShortfall(
+                                    op, f"owned tensor input %{actual.id} disagrees "
+                                    f"with native element storage in {fn} -> {callee}",
+                                ))
+                                rendered_args = None
+                                break
+                            cell_address = address_operand(actual)
+                            if cell_address is None:
+                                rendered_args = None
+                                break
+                            rendered_args[formal_slot] = f"(*((void **)({cell_address})))"
+                            call_tensor_storage_cells.add(binding.cell)
+                            continue
                         # The in-place convention: an actual that IS the
                         # call's own result (or one of this function's own
                         # output ports) is the destination the callee
@@ -6807,6 +7095,9 @@ def emit_ssa_module_to_c(
                             integer_ids.add(result_id)
                     else:
                         body.append(f"        {invocation};")
+                    if call_tensor_storage_cells:
+                        span.take(UnitKind.CALL, instruction=instruction,
+                                  extra_cells=tuple(call_tensor_storage_cells))
                     continue
                 if op in {"Deploy", "Join"} and instruction.res is None:
                     # The sequential C lane has already serialized the
@@ -7962,7 +8253,10 @@ def emit_ssa_module_to_c(
             for instruction in block.instrs
         ):
             body.extend(output_publications())
-            span.take(UnitKind.OUTPUT_STORE, args=native_outputs[fn])
+            span.take(
+                UnitKind.OUTPUT_STORE, args=native_outputs[fn],
+                extra_cells=tuple(dict.fromkeys(owned_publication_causes)),
+            )
 
         declarations = [
             f"    {kind} t{phi_id};"
@@ -7986,7 +8280,8 @@ def emit_ssa_module_to_c(
         # Tensor temporaries and frame storage: declared storage, no value
         # of their own in the line (derived from the function cell only).
         for line in declarations[len(phi_declarations):]:
-            recorder.unit(UnitKind.DECLARATION, line)
+            recorder.unit(UnitKind.DECLARATION, line,
+                          extra_cells=tuple(tensor_storage_cells))
         allocation_setup = [
             line
             for element_type, storage_name, count in frame_allocations
@@ -8008,7 +8303,8 @@ def emit_ssa_module_to_c(
             "    return;",
         ]
         for line in allocation_setup:
-            recorder.unit(UnitKind.STATEMENT, line)
+            recorder.unit(UnitKind.STATEMENT, line,
+                          extra_cells=tuple(tensor_storage_cells))
         recorder.unit(UnitKind.RETURN, "\n".join((*cleanup, "}")))
         prototypes.append(
             f"static {function_return_type} {_c_symbol(fn)}("
@@ -8058,14 +8354,34 @@ def emit_ssa_module_to_c(
         value_id for sequence in output_heap_sequences for value_id in sequence[:4]
     }
     release_entry_name = f"{name}_release_owned_results" if owned_sequence_ports else None
+    # Guarded topk(values, k).indices has a dynamic logical extent even
+    # when its allocation is bounded by the input tensor. The bound and
+    # result binding identify that storage separately from the computed
+    # count (rank one) or shape vector (higher ranks); none is an input
+    # extent copied onto the returned tensor.
     output_capacity_sources = tuple(
         (item.output_data_id, item.input_data_id)
         for item in sequence_capacity_relations
-    )
+    ) + tuple((item.output_data_id, item.input_data_id)
+              for item in tensor_capacity_relations)
+    returned_values = {
+        int(value.id): value
+        for block in root.blocks.values()
+        for instruction in block.instrs if instruction.op == "Ret"
+        for value in instruction.args
+    }
     output_length_sources = tuple(
         (item.output_data_id, item.output_length_id)
         for item in sequence_capacity_relations
+    ) + tuple((item.output_data_id, item.output_count_id)
+              for item in tensor_capacity_relations
+              if _declared_span_rank(returned_values[item.output_data_id]) == 1)
+    output_shape_sources = tuple(
+        (item.output_data_id, item.output_shape_id)
+        for item in tensor_capacity_relations
+        if item.output_data_id not in dict(output_length_sources)
     )
+    bounded_tensor_output_ids = {item.output_data_id for item in tensor_capacity_relations}
     buffer_dtypes: list[str] = []
     entry_lines: list[str] = []
     root_allocations: list[tuple[str, str, int]] = []
@@ -8261,7 +8577,7 @@ def emit_ssa_module_to_c(
         if output_id in buffer_order:
             rendered_actuals.append(f"b{buffer_order.index(output_id)}")
             continue
-        if _runtime_sized_span(output):
+        if _runtime_sized_span(output) and output_id not in bounded_tensor_output_ids:
             # A runtime-sized public result is allocated from the public
             # input whose extents it takes (``output_extent_sources``),
             # followed from the call-result hop through the shape edges.
@@ -8713,7 +9029,7 @@ def emit_ssa_module_to_c(
         "inout" if value_id in native_written_members else role
         for value_id, role in zip(buffer_order, public_roles, strict=True)
     )
-    if sequence_capacity_relations or owned_sequence_ports:
+    if sequence_capacity_relations or tensor_capacity_relations or owned_sequence_ports:
         description = runtime_abi_description(
             entry=name, backend="c", extent_type="int64_t",
             buffer_order=buffer_order, buffer_dtypes=buffer_dtypes,
@@ -8722,6 +9038,7 @@ def emit_ssa_module_to_c(
             output_extent_sources=output_extent_sources,
             output_capacity_sources=output_capacity_sources,
             output_length_sources=output_length_sources,
+            output_shape_sources=output_shape_sources,
             output_heap_sequences=output_heap_sequences,
             release_entry=release_entry_name,
         )
@@ -8737,6 +9054,12 @@ def emit_ssa_module_to_c(
                 cell for ports in owned_sequence_ports
                 for cell in (ports.public_cell, ports.source_cell, ports.descriptor_cell,
                              ports.owner_cell, ports.return_slot_cell)
+            ), *(
+                cell for item in tensor_capacity_relations
+                for cell in (item.bound_cell, item.metadata_binding_cell,
+                             *(value_cell(emission, root, value_id) for value_id in (
+                                 item.output_data_id, item.input_data_id,
+                                 item.output_shape_id, item.output_count_id)))
             )), stage=EMISSION_C,
         )
     return CModuleArtifact(
@@ -8755,6 +9078,7 @@ def emit_ssa_module_to_c(
         output_extent_sources=tuple(output_extent_sources),
         output_capacity_sources=output_capacity_sources,
         output_length_sources=output_length_sources,
+        output_shape_sources=output_shape_sources,
         output_heap_sequences=output_heap_sequences,
         release_entry_name=release_entry_name,
         buffer_ranks=public_ranks,
