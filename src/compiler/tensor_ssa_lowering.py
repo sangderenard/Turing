@@ -4588,6 +4588,22 @@ def lower_tensor_calls_to_repository_ssa(
                 (function.metadata or {}).get("scalar_variant_argument_ids")
                 or ()
             )))
+            # In compact_codewords, symbol_count * max_bits shares a region
+            # with tensor arithmetic after arange.  Its formal symbol_count
+            # has an exact scalar SSA_VALUE receipt but empty accounting;
+            # ignoring that receipt deferred the whole tensor region.  Read
+            # the function-scoped physical fact rather than guessing from an
+            # empty shape or requiring a second accounting copy of it.
+            from .ssa_record_return_state import posted_ssa_value_fact
+
+            scalar_formals.update(
+                int(formal.id) for formal in function.args
+                if (fact := posted_ssa_value_fact(
+                    function, int(formal.id), book=book,
+                )) is not None
+                and fact.physical_dtype is not None
+                and fact.storage == "scalar" and fact.rank == 0
+            )
             unresolved_formals = {
                 int(formal.id)
                 for formal in function.args
