@@ -5270,13 +5270,12 @@ TENSOR_SHAPE_ENRICHMENT = declare_page("tensor_shape_enrichment", (
     RowField("field", K.LABEL),
 ), tuple)
 #: ``_call_result_bindings``: the Indexed or declared named projection of one output path
-#: of a call, ``(calling function, call node, projection node)`` -> path;
+#: of a call, ``(exact lexical read scope, call node, projection node)`` -> path;
 #: CONCORD, DERIVED(the call node's cell, the projection node's cell). Named
 #: intrinsic members additionally cite their admitted return class/layout,
 #: selected field and exact projection operand snapshot. Node
-#: ids are local to one function's graph, so the calling function is part of
-#: the row: two functions' calls of one callee share node ids and differ in
-#: what each projection reads.
+#: ids are local to one graph copy. Two functions, or two copies of the same
+#: function, can share node ids while naming different operand snapshots.
 CALL_RESULT_PROJECTION = declare_page("call_result_projection_concordance", (
     RowField("function", K.SCOPE), RowField("call", K.VALUE_ID),
     RowField("projection", K.VALUE_ID),

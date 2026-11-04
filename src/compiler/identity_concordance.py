@@ -10018,6 +10018,7 @@ class CorrelationTable:
                     and projection[0] in direct
                     and receiver.row[:-1] == projection[0].row[:-1]
                     and projection[0].row == operands[0].row
+                    and row[0] == receiver.row[0]
                     and row[1:] == (
                         receiver.row[-1], projection[0].row[-1],
                     )

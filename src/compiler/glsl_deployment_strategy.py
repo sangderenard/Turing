@@ -2140,21 +2140,28 @@ def _authored_output_paths(graph, outputs):
     return paths
 
 
-def _call_projection_scope(graph) -> str:
-    """The calling function a CALL_RESULT_PROJECTION row is scoped to.
+def _call_projection_scope(graph):
+    """The exact read scope owning a call and its result projections.
 
     Program: ``env, s, t = v.batch(...)`` in ``root`` and again in ``one``
     (string-core ``intern_batch`` then ``intern``).  Wrong record: rows were
     keyed by (call node, projection node) alone, and node ids are local to
     one function's graph, so ``root``'s ``t[0]`` and ``one``'s ``s[0]``
     shared a row and the second post was refused as a disagreement.  Rule:
-    the row names its calling function.
+    the row names its graph copy, including copies of the same function.
+
+    _ascending_order's projection18/19 was posted by read-scope forks3 and4
+    under one function-name key. CONCORD accumulated both operand snapshots
+    in one cell, so the exact named-result audit correctly refused two
+    incompatible projection claims. The scope already owning their canonical
+    identities is the key; the display function name cannot distinguish them.
     """
 
     attributes = getattr(graph, "G", graph).graph
-    return str(
-        attributes.get("qualified_name") or attributes.get("function_name") or ""
-    )
+    scope = attributes.get("lexical_read_scope")
+    if scope is None:
+        raise ValueError("call result projection has no exact lexical read scope")
+    return scope
 
 
 def _post_call_result_projections(graph, node_id):
