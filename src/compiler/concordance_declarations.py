@@ -896,6 +896,7 @@ GUARDED_CALL_ACTUAL_RANGE = declare_page("guarded_call_actual_range", (
 # -- stages ------------------------------------------------------------------
 REDUCER_FIELD_WRITE = declare_stage("reducer_field_write")
 REDUCER_FIELD_MERGE = declare_stage("reducer_field_merge")
+REDUCER_LOOP_STORAGE_VERSION = declare_stage("reducer_loop_storage_version")
 REDUCER_RETURN = declare_stage("reducer_return")
 OPERAND_POSITION = declare_stage("operand_position")
 CONTROL_SSA = declare_stage("control_ssa")
@@ -1395,6 +1396,14 @@ LOOP_CARRIED_BINDING = declare_page("loop_carried_binding", (
     RowField("read_scope", K.SCOPE), RowField("loop", K.VALUE_ID),
     RowField("updated", K.VALUE_ID), RowField("initial", K.VALUE_ID),
 ), tuple)                              # binding names; mode CONCORD
+#: An IndexedStore/Phi version reaches the same initial storage through
+#: every control arm.  Row: the loop and its initial/updated identity cells.
+#: Fact: ordered (node cell, kind, role/child-cell edges) proof tree.  This
+#: excludes only a redundant *value* carry; the store effects remain live.
+LOOP_STORAGE_VERSION = declare_page("loop_storage_version", (
+    RowField("loop", K.PAGE_REF), RowField("initial", K.PAGE_REF),
+    RowField("updated", K.PAGE_REF),
+), tuple)
 #: Fact: the region ordinals this loop owns (the read view the placement
 #: pass consumes; plan 80 A1.2 names the ``deployment_region`` cells as the
 #: fact -- those rows live under the planning scope, which this writer

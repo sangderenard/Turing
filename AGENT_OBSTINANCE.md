@@ -274,3 +274,16 @@ accepted owner repair and delayed reporting the measured three private
 sequence capacity shortfalls. The preventing constraint is to stop testing
 once the focused proof and concordance audit answer the assigned boundary;
 an adjacent file is not a narrow test selection.
+
+## 2026-11-04 — broad reducer line trace for the broadcast helper
+
+The agent was instructed to use a bounded hook on the exact authored
+`broadcast_shape_extents` loop writer. Its first scratch `sys.settrace` hook
+matched every reducer call and printed unrelated functions' `output` bindings.
+It exceeded the ordinary 30-second bounded probe and was interrupted; the
+output did not identify the authored writer. A second trace restricted to the
+authored While line still incurred 30 seconds of interpreter tracing and was
+interrupted after recording the missing operand page. This cost two unusable
+partial runs and delayed the exact writer report. The preventing constraint
+is to hook the specific reducer function and AST occurrence without tracing
+the whole compiler, or read the retained graph and concordance records.

@@ -1592,6 +1592,7 @@ class CorrelationTable:
         found.extend(self._source_numeric_type_dependency_findings(module))
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
+        found.extend(self._loop_storage_version_findings(module))
         found.extend(self._source_private_dynamic_sequence_findings(module))
         found.extend(self._source_sequence_constructor_snapshot_findings(module))
         found.extend(self._source_sequence_capacity_bound_findings(module))
@@ -7316,6 +7317,135 @@ class CorrelationTable:
                     str(function_name), int(result_id),
                     f"concordance records {facts!r}, emitted call records "
                     f"{receipts!r}",
+                ))
+        return found
+
+    @staticmethod
+    def _loop_storage_version_findings(module: Any) -> list[Finding]:
+        """A skipped loop value carry is one storage through every store arm."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE, LOOP_STORAGE_VERSION,
+            PROCESS_GRAPH_OPERANDS, NodeFact,
+        )
+
+        book = identity_book(module)
+        page = book.page(LOOP_STORAGE_VERSION)
+        found = []
+        # Ingestion's Subscript node is later rewritten to IndexedStore.
+        # Its ingestion NodeFact retains the authored syntactic type. Match
+        # through the exact canonical relabel edge, then read the canonical
+        # operand snapshot for the final store/Phi base and arm relations.
+        canonical_by_origin = {}
+        for canonical_row in book.page(CANONICAL_VALUE).rows():
+            canonical = book.latest_ref(CANONICAL_VALUE, canonical_row)
+            for origin, _stage in book.edges_into(canonical):
+                if origin.page == INGESTION_VALUE:
+                    canonical_by_origin.setdefault(
+                        (canonical_row[0], origin), [],
+                    ).append(canonical)
+        for row in page.rows():
+            ref = book.latest_ref(LOOP_STORAGE_VERSION, row)
+            proof = page.cell(ref.row, ref.column)
+            causes = {source for source, _stage in book.edges_into(ref)}
+            valid = (
+                isinstance(row, tuple) and len(row) == 3
+                and all(isinstance(cell, Ref)
+                        and cell.page in (CANONICAL_VALUE, INGESTION_VALUE)
+                        for cell in row)
+                and isinstance(proof, tuple) and bool(proof)
+                and all(cell in causes for cell in row)
+            )
+            nodes = {}
+            if valid:
+                for step in proof:
+                    if not (isinstance(step, tuple) and len(step) == 3
+                            and isinstance(step[0], Ref)
+                            and step[0].page in (CANONICAL_VALUE, INGESTION_VALUE)
+                            and isinstance(step[1], str)
+                            and isinstance(step[2], tuple)
+                            and step[0] not in nodes):
+                        valid = False
+                        break
+                    node, kind, edges = step
+                    identity = book.page(node.page).cell(node.row, node.column)
+                    if (node not in causes
+                            or not isinstance(identity, NodeFact)
+                            or not all(isinstance(edge, tuple)
+                                       and len(edge) == 2
+                                       and isinstance(edge[0], str)
+                                       and isinstance(edge[1], Ref)
+                                       and edge[1] in causes for edge in edges)):
+                        valid = False
+                        break
+                    nodes[node] = (kind, edges)
+            if valid:
+                loop_scopes = tuple(
+                    scope for (scope, origin) in canonical_by_origin
+                    if origin == row[0]
+                )
+                valid = len(loop_scopes) == 1
+            if valid:
+                scope = loop_scopes[0]
+                wanted_cells = {
+                    *row,
+                    *(node for node, _kind, edges in proof),
+                    *(child for _node, _kind, edges in proof
+                      for _role, child in edges),
+                }
+                canonical = {}
+                for origin in wanted_cells:
+                    matches = canonical_by_origin.get((scope, origin), ())
+                    if len(matches) != 1:
+                        valid = False
+                        break
+                    canonical[origin] = matches[0]
+            if valid:
+                for node, _kind, edges in proof:
+                    current = canonical[node]
+                    operands = book.latest_ref(
+                        PROCESS_GRAPH_OPERANDS, current.row,
+                    )
+                    actual = (() if operands is None else
+                              book.page(PROCESS_GRAPH_OPERANDS).cell(
+                                  operands.row, operands.column,
+                              ))
+                    if operands is None or not all(
+                        (canonical[child], role) in actual
+                        for role, child in edges
+                    ):
+                        valid = False
+                        break
+            if valid:
+                initial = row[1]
+                def resolve(cell: Ref, seen: frozenset) -> tuple[Ref, bool] | None:
+                    if cell == initial:
+                        return cell, False
+                    if cell in seen or cell not in nodes:
+                        return None
+                    kind, edges = nodes[cell]
+                    expected = {
+                        "IndexedStore": ("base",),
+                        "Phi": ("body", "orelse"),
+                        "LoopResult": ("value",),
+                    }.get(kind)
+                    if expected is None or tuple(role for role, _ in edges) != expected:
+                        return None
+                    arms = tuple(resolve(child, seen | {cell})
+                                 for _role, child in edges)
+                    if any(arm is None or arm[0] != initial for arm in arms):
+                        return None
+                    return initial, kind == "IndexedStore" or any(
+                        arm[1] for arm in arms
+                    )
+                resolved = resolve(row[2], frozenset())
+                valid = (resolved is not None and resolved[1]
+                         and set(nodes) == {step[0] for step in proof})
+            if not valid:
+                found.append(Finding(
+                    "loop-storage-version", str(row[0]) if isinstance(row, tuple) and row else str(row),
+                    None,
+                    "suppressed loop value carry lacks an exact same-storage store-arm path",
                 ))
         return found
 
