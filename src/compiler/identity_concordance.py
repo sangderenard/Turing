@@ -8225,7 +8225,10 @@ class CorrelationTable:
                     and value_fact.physical_dtype == arm.dtype
                     and value_fact.storage == "span"
                     and value_fact.rank == arm.rank
-                    and tuple(value_fact.shape) == tuple(arm.shape)
+                    # The ABI's dynamic (-1,) extent is a contract marker;
+                    # the SSA display may remain ().  _contract_physical
+                    # admits only dtype, storage and rank from this arm.
+                    and tuple(value_fact.shape) == tuple(formal.shape)
                     and bool(arm.source_cells)
                     and abi_cell in value_causes
                     and canonical[0] in value_causes
