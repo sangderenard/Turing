@@ -21846,6 +21846,87 @@ def normalize_python_attribute_special_cases(graph: Any) -> None:
         }
 
 
+def _post_source_tensor_shape_dimensions(graph: Any) -> None:
+    """Publish authored ``tensor.shape[axis]`` after canonical operands settle."""
+
+    from ...compiler.concordance_declarations import (
+        REDUCTION, SOURCE_TENSOR_SHAPE_DIMENSION, SOURCE_VALUE_CLASS,
+    )
+    from ...compiler.concorded_literals import literal as concorded_literal
+    from ...compiler.identity_concordance import (
+        Derived, Mode, current_identity_book,
+    )
+    from ...compiler.process_graph_facts import local_operands
+
+    book = current_identity_book()
+    read_scope = tuple(graph.G.graph.get("lexical_read_scope") or ())
+    class_scope = _source_numeric_scope(graph)
+    if not read_scope:
+        return
+    for projection_id, data in graph.G.nodes(data=True):
+        expression = data.get("expr_obj")
+        if not (
+            isinstance(expression, ast.Subscript)
+            and isinstance(expression.ctx, ast.Load)
+            and isinstance(expression.value, ast.Attribute)
+            and expression.value.attr == "shape"
+        ):
+            continue
+        projection_parents, projection_edges = local_operands(
+            graph, int(projection_id),
+        )
+        if tuple(role for _parent, role in projection_parents) != (
+            "base", "index",
+        ):
+            continue
+        shape_id, index_id = (
+            int(parent) for parent, _role in projection_parents
+        )
+        shape_expression = graph.G.nodes[shape_id].get("expr_obj")
+        if not (
+            isinstance(shape_expression, ast.Attribute)
+            and shape_expression.attr == "shape"
+        ):
+            continue
+        shape_parents, shape_edges = local_operands(graph, shape_id)
+        if tuple(role for _parent, role in shape_parents) != ("value",):
+            continue
+        receiver_id = int(shape_parents[0][0])
+        axis, literal_cells = concorded_literal(graph, index_id)
+        if type(axis) is not int or axis < 0 or not literal_cells:
+            continue
+        class_cell = book.latest_ref(
+            SOURCE_VALUE_CLASS, (class_scope, int(projection_id)),
+        )
+        if (
+            class_cell is None
+            or book.page(SOURCE_VALUE_CLASS).cell(
+                class_cell.row, class_cell.column,
+            )[0] != "builtins.int"
+        ):
+            continue
+        receiver = node_identity_cell(graph, receiver_id)
+        shape = node_identity_cell(graph, shape_id)
+        index = node_identity_cell(graph, index_id)
+        projection = node_identity_cell(graph, int(projection_id))
+        if not all(cell.page.name == "canonical_value" for cell in (
+            receiver, shape, index, projection,
+        )):
+            continue
+        book.post(
+            SOURCE_TENSOR_SHAPE_DIMENSION,
+            (read_scope, int(projection_id)),
+            (receiver, shape, index, axis),
+            stage=REDUCTION,
+            provenance=Derived(tuple(dict.fromkeys((
+                projection, receiver, shape, index,
+                projection_edges, shape_edges, class_cell,
+                *literal_cells,
+            )))),
+            mode=Mode.CONCORD,
+        )
+
+
 def reduce_abstract_tensor_topology(graph: Any) -> Any:
     """Apply existing ProcessGraph names to the three structural AST nodes."""
 
@@ -29960,6 +30041,11 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
             # a following method (for example ``wide_product.collapse()``)
             # from the just-concorded result identity before call planning.
             propagate_returned_receiver_types(entry_graph)
+            # Program: ``limit = octets.shape[0]`` in an optional count arm.
+            # Source class proof says the projection is an int, but only the
+            # settled canonical operand rows identify its receiver and axis.
+            # Publish that executable source relation before read-scope forks.
+            _post_source_tensor_shape_dimensions(entry_wrapper)
     # External call references and static Python bindings are two views of the
     # same compile-time environment.  Join them once after every call has been
     # declared so compiled shells can invoke imported constructors/functions

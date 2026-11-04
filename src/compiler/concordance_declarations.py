@@ -1505,6 +1505,9 @@ SOURCE_SORT_CONTRACT = declare_page("source_sort_contract", (
 SOURCE_LITERAL_VALUE = declare_page("source_literal_value", (
     RowField("source_scope", K.SCOPE), RowField("value_id", K.VALUE_ID),
 ), object)
+SOURCE_TENSOR_SHAPE_DIMENSION = declare_page("source_tensor_shape_dimension", (
+    RowField("read_scope", K.SCOPE), RowField("projection", K.VALUE_ID),
+), tuple)  # (receiver Ref, shape-attribute Ref, index Ref, proved axis)
 SOURCE_SEQUENCE_MUTATION = declare_page(
     "source_sequence_mutation_concordance", (
         RowField("source_scope", K.SCOPE),
@@ -1790,6 +1793,7 @@ READ_SCOPE_NODE_KEYED_PAGES = (
     "canonical_value",
     "ingestion_value",
     "source_aggregate_layout",
+    "source_tensor_shape_dimension",
 )
 
 # -- reasons -----------------------------------------------------------------

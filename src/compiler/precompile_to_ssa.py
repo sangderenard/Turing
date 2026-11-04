@@ -2982,14 +2982,22 @@ class _ControlSSABuilder(TiledObject):
                     # test_precompile_contract_rows.py, ``test_union_
                     # parameter_arms_post_their_physical_view``).  Wrong
                     # record: the parameter's ``ssa_value`` row carried no
-                    # storage/rank while accounting named the arm's storage.
+                    # physical dtype/storage/rank while the sole material
+                    # arm named all three (Run45 optional count payload).
                     # Rule: DERIVED from the ``value_type_abi`` row and the
                     # arm's source cells; accounting is then set FROM the
                     # posted fact.
                     self._revise_value(
                         value, type_abi_cell, binding_cell,
-                        *shared_arm.source_cells,
+                        *(cell for arm in material_arms
+                          for cell in arm.source_cells),
                         physical={
+                            **(
+                                {"physical_dtype": str(shared_arm.dtype)}
+                                if str(shared_arm.dtype or "").casefold()
+                                not in {"", "unknown"}
+                                else {}
+                            ),
                             "storage": str(shared_arm.storage),
                             "rank": int(shared_arm.rank),
                         },
@@ -19524,6 +19532,89 @@ class _ControlSSABuilder(TiledObject):
         self.current = joined
         self.child_selection_validity[row_id] = room
 
+    def _materialize_source_tensor_shape_dimension(self, value_id: int) -> None:
+        """Define an authored ``tensor.shape[axis]`` on its control arm."""
+
+        if self.lexical_read_scope is None:
+            return
+        from .concordance_declarations import SOURCE_TENSOR_SHAPE_DIMENSION
+        from .identity_concordance import _canonical_identity_base
+
+        book = self._book()
+        row = (self.lexical_read_scope, int(value_id))
+        dimension_cell = book.latest_ref(SOURCE_TENSOR_SHAPE_DIMENSION, row)
+        if dimension_cell is None:
+            return
+        receiver_cell, shape_cell, index_cell, axis = book.page(
+            SOURCE_TENSOR_SHAPE_DIMENSION
+        ).cell(dimension_cell.row, dimension_cell.column)
+        current_components = tuple(
+            self._canonical_cell(int(source.row[1]))
+            if isinstance(source, Ref)
+            and source.page == CANONICAL_VALUE
+            else None
+            for source in (receiver_cell, shape_cell, index_cell)
+        )
+        if not (
+            type(axis) is int and axis >= 0
+            and self._canonical_cell(value_id) is not None
+            and all(
+                current is not None
+                and _canonical_identity_base(book, current)
+                    == _canonical_identity_base(book, source)
+                for current, source in zip(
+                    current_components,
+                    (receiver_cell, shape_cell, index_cell), strict=True,
+                )
+            )
+        ):
+            raise ConcordanceRefusal(
+                f"source tensor shape dimension {row!r} has no exact current-arm identity"
+            )
+        receiver_id = int(receiver_cell.row[1])
+        receiver = self.external_value(receiver_id)
+        receiver_ssa_cell = self._value_cell(receiver)
+        receiver_fact = book.page(SSA_VALUE).cell(
+            receiver_ssa_cell.row, receiver_ssa_cell.column
+        )
+        result_abi_cell = book.latest_ref(VALUE_TYPE_ABI, row)
+        result_abi = (
+            book.page(VALUE_TYPE_ABI).cell(result_abi_cell.row, result_abi_cell.column)
+            if result_abi_cell is not None else None
+        )
+        result_arms = tuple(getattr(result_abi, "physical_alternatives", ()))
+        if not (
+            isinstance(receiver_fact, SSAValueFact)
+            and receiver_fact.storage == "span"
+            and isinstance(receiver_fact.rank, int)
+            and axis < receiver_fact.rank
+            and len(result_arms) == 1
+            and result_arms[0].storage == "scalar"
+            and result_arms[0].rank == 0
+            and str(result_arms[0].dtype) == "int64"
+        ):
+            raise ConcordanceRefusal(
+                f"source tensor shape dimension {row!r} lacks physical receiver/result proof"
+            )
+        incumbent = self.external_values.get(int(value_id))
+        if incumbent is not None and self._defines(incumbent):
+            return
+        result = self.produced_value(
+            int(value_id), dtype=str(result_arms[0].dtype),
+            claim_provisional_definition=True,
+            cause=(dimension_cell, receiver_cell, receiver_ssa_cell,
+                   result_abi_cell),
+        )
+        self.emit(
+            Handler.Call, [receiver], result,
+            attributes={
+                "tensor_operation": "extent", "extent_kind": "dim",
+                "axis": int(axis),
+                "source_shape_dimension_cell": dimension_cell,
+                "source_value_id": int(value_id),
+            },
+        )
+
     def lower_conditional(
         self, conditional: ConditionalBlock, *, path: str,
     ) -> None:
@@ -19909,6 +20000,14 @@ class _ControlSSABuilder(TiledObject):
             )
             true_carried[position] = true_value
             carried_field_sources[position] = [true_source]
+        # Program: bitstream.tensor_octets_to_bytes, ``count is None`` then
+        # ``octets.shape[0]``. The authored Indexed value 7 is an arm's Phi
+        # input, but dispatch_metadata left it as an undefined root formal.
+        # Its exact source projection owns the receiver and literal axis;
+        # define that same value on its edge before the merge reads it.
+        if body_falls_through:
+            for true_id, _false_id, _result_id in conditional.result_aliases:
+                self._materialize_source_tensor_shape_dimension(int(true_id))
         true_results = {
             int(result_id): self.external_value(int(true_id))
             for true_id, _false_id, result_id in conditional.result_aliases
@@ -19983,6 +20082,12 @@ class _ControlSSABuilder(TiledObject):
             merge_block.name not in self.current.successors
         ):
             self._restore_view(values_before_orelse, conditional_cell, false_continuation_cell)
+        false_falls_through = false_reachable and (
+            not self.current.successors or merge_block.name in self.current.successors
+        )
+        if false_falls_through:
+            for _true_id, false_id, _result_id in conditional.result_aliases:
+                self._materialize_source_tensor_shape_dimension(int(false_id))
         false_results = {
             int(result_id): self.external_value(int(false_id))
             for _true_id, false_id, result_id in conditional.result_aliases

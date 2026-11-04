@@ -1604,6 +1604,7 @@ class CorrelationTable:
         found.extend(self._public_owned_sequence_return_findings(module))
         found.extend(self._runtime_result_abi_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
+        found.extend(self._source_tensor_shape_dimension_findings(module))
         found.extend(self._source_closed_aggregate_length_findings(module))
         found.extend(self._source_closed_class_alternative_findings(module))
         found.extend(self._source_class_union_native_gap_findings(module))
@@ -8023,10 +8024,14 @@ class CorrelationTable:
 
     @staticmethod
     def _ssa_abi_physical_findings(module: Any) -> list[Finding]:
-        """Check a posted scalar physical field against its exact ABI cause."""
+        """Check a scalar field against its ABI or proved shared union slot."""
         from .concordance_declarations import (
-            SSA_VALUE, SSAValueFact, VALUE_TYPE_ABI, ValueTypeABIFact,
+            SSA_VALUE, SSAValueFact, UNION_ALTERNATIVE_STATE,
+            VALUE_TYPE_ABI, VALUE_TYPE_TAG, VALUE_UNION_DESCRIPTOR,
+            ValueTypeABIFact,
+            ValueTypeTagFact, UnionAlternativeStateFact,
         )
+        from .ssa_record_return_state import function_scope_of
 
         book = (getattr(module, 'metadata', {}) or {}).get('identity_book')
         if book is None:
@@ -8048,9 +8053,103 @@ class CorrelationTable:
                         if isinstance(abi, ValueTypeABIFact) else ())
                 views = {(arm.storage, arm.dtype, tuple(arm.shape), arm.rank)
                          for arm in arms}
-                if (len(views) != 1 or next(iter(views)) !=
-                        (fact.storage, fact.physical_dtype,
-                         tuple(fact.shape), fact.rank)):
+                physical = (fact.storage, fact.physical_dtype,
+                            tuple(fact.shape), fact.rank)
+                exact = len(views) == 1 and next(iter(views)) == physical
+                if not exact and len(arms) > 1:
+                    # A None arm has no payload.  A tagged union may share
+                    # one material slot only when the live function's union
+                    # descriptor and both concorded tag/state rows say so.
+                    material = tuple(arm for arm in arms
+                                     if str(arm.storage) != 'none')
+                    material_views = {
+                        (arm.storage, arm.dtype, tuple(arm.shape), arm.rank,
+                         tuple(arm.storage_identity or ()))
+                        for arm in material
+                    }
+                    candidates = tuple(
+                        (name, function, table, table.by_id(int(row[1])))
+                        for name, function in module.functions.items()
+                        if function_scope_of(function) == row[0]
+                        and any(int(arg.id) == int(row[1]) and
+                                (arg.accounting or {}).get(
+                                    'native_value_union_shared_parameter')
+                                for arg in function.args)
+                        for table in (module.value_union_tables.get(name),)
+                        if table is not None
+                    )
+                    if (len(material_views) == 1 and material
+                            and all(arm.storage not in {'sequence', 'record'}
+                                    for arm in material)
+                            and next(iter(material_views))[:4] == physical
+                            and len(candidates) == 1):
+                        _name, function, table, descriptor = candidates[0]
+                        tag_id = (None if descriptor is None else
+                                  descriptor.tag_value_id)
+                        descriptor_ref = book.latest_ref(
+                            VALUE_UNION_DESCRIPTOR,
+                            (table.owner, int(row[1])))
+                        tag_ref = (None if tag_id is None else book.latest_ref(
+                            VALUE_TYPE_TAG, (row[0], int(row[1]), int(tag_id))))
+                        state_ref = book.latest_ref(
+                            UNION_ALTERNATIVE_STATE, (row[0], int(row[1])))
+                        tag = (None if tag_ref is None else
+                               book.page(VALUE_TYPE_TAG).cell(
+                                   tag_ref.row, tag_ref.column))
+                        state = (None if state_ref is None else
+                                 book.page(UNION_ALTERNATIVE_STATE).cell(
+                                     state_ref.row, state_ref.column))
+                        causes = {source for source, _ in book.edges_into(cell)}
+                        state_causes = (set() if state_ref is None else
+                                        {source for source, _ in
+                                         book.edges_into(state_ref)})
+                        tag_causes = (set() if tag_ref is None else
+                                      {source for source, _ in
+                                       book.edges_into(tag_ref)})
+                        descriptor_causes = (
+                            set() if descriptor_ref is None else
+                            {source for source, _ in
+                             book.edges_into(descriptor_ref)})
+                        exact = (
+                            descriptor is not None
+                            and descriptor_ref is not None
+                            and book.page(VALUE_UNION_DESCRIPTOR).cell(
+                                descriptor_ref.row, descriptor_ref.column)
+                            == descriptor
+                            and descriptor.layout == 'shared'
+                            and int(descriptor.tag_value_id) == int(tag_id)
+                            and tuple(descriptor.alternatives) and
+                            tuple(arm.name for arm in descriptor.alternatives)
+                            == tuple(abi.alternatives)
+                            and all(
+                                alternative.storage.value == str(arm.storage)
+                                and alternative.dtype == str(arm.dtype or '')
+                                and tuple(alternative.shape)
+                                == tuple(arm.shape or ())
+                                and alternative.storage_identity == (
+                                    None if not arm.storage_identity else
+                                    repr(tuple(arm.storage_identity)))
+                                and (not alternative.value_ids
+                                     if str(arm.storage) == 'none' else
+                                     tuple(alternative.value_ids)
+                                     == (int(row[1]),))
+                                for arm, alternative in zip(
+                                    arms, descriptor.alternatives, strict=True)
+                            )
+                            and isinstance(tag, ValueTypeTagFact)
+                            and tuple(tag.alternatives) == tuple(abi.alternatives)
+                            and tuple(tag.tags) == tuple(abi.tags)
+                            and isinstance(state, UnionAlternativeStateFact)
+                            and tuple(state.alternatives) == tuple(abi.alternatives)
+                            and int(state.tag_value_id) == int(tag_id)
+                            and abi_cell in state_causes
+                            and abi_cell in tag_causes
+                            and abi_cell in descriptor_causes
+                            and tag_ref in state_causes
+                            and all(source in causes for arm in material
+                                    for source in arm.source_cells)
+                        )
+                if not exact:
                     found.append(Finding(
                         'ssa-abi-physical-disagreement', str(row[0]), row[1],
                         'posted physical SSA fields disagree with their exact type ABI arm',
@@ -11972,6 +12071,160 @@ class CorrelationTable:
                     "source-closed-class-alternative-disagreement",
                     str(row[0]), int(row[1]), problem,
                 ))
+        return found
+
+    @staticmethod
+    def _source_tensor_shape_dimension_findings(module: Any) -> list[Finding]:
+        """The authored Indexed shape read must retain its exact receiver and axis."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, CONTROL_VALUE_BINDING,
+            PROCESS_GRAPH_OPERANDS,
+            SOURCE_TENSOR_SHAPE_DIMENSION, SOURCE_VALUE_CLASS,
+        )
+        from .concorded_literals import MISSING, literal_from_identity
+        from .ssa_record_return_state import function_scope_of
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(SOURCE_TENSOR_SHAPE_DIMENSION)
+        found: list[Finding] = []
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_TENSOR_SHAPE_DIMENSION, row)
+            fact = page.cell(cell.row, cell.column) if cell is not None else None
+            problem = None
+            if not (
+                isinstance(row, tuple) and len(row) == 2
+                and isinstance(fact, tuple) and len(fact) == 4
+                and all(isinstance(ref, Ref) and ref.page == CANONICAL_VALUE
+                        for ref in fact[:3])
+                and type(fact[3]) is int and fact[3] >= 0
+            ):
+                problem = "invalid authored tensor shape dimension fact"
+            else:
+                receiver, shape, index, axis = fact
+                projection = book.latest_ref(CANONICAL_VALUE, row)
+                # A copy-on-read fork retains the authored operands in its
+                # origin.  Its current GetAttr operands may have been pruned
+                # after the shape read was consumed.  Audit the original
+                # publisher and its exact operand causes, then require the
+                # fork projection to descend from that same identity.
+                origin = cell
+                seen = set()
+                while origin not in seen:
+                    seen.add(origin)
+                    parents = tuple(
+                        source for source, stage in book.edges_into(origin)
+                        if source.page == SOURCE_TENSOR_SHAPE_DIMENSION
+                        and stage.name == "read_scope_fork"
+                    )
+                    if len(parents) != 1:
+                        break
+                    origin = parents[0]
+                causes = {source for source, _ in book.edges_into(origin)}
+                projection_edges = next((source for source in causes
+                    if source.page == PROCESS_GRAPH_OPERANDS
+                    and source.row == origin.row), None)
+                shape_edges = next((source for source in causes
+                    if source.page == PROCESS_GRAPH_OPERANDS
+                    and source.row == (origin.row[0], int(shape.row[1]))), None)
+                authored_projection = next((source for source in causes
+                    if source.page == CANONICAL_VALUE
+                    and source.row == origin.row), None)
+                class_cells = tuple(
+                    source for source in causes
+                    if source.page == SOURCE_VALUE_CLASS
+                )
+                literal, literal_cells = literal_from_identity(book, index)
+                if not (
+                    projection is not None
+                    and authored_projection is not None
+                    and _canonical_identity_base(book, projection)
+                        == _canonical_identity_base(book, authored_projection)
+                    and receiver in causes and shape in causes
+                    and index in causes
+                    and projection_edges is not None
+                    and projection_edges in causes
+                    and shape_edges is not None and shape_edges in causes
+                    and book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        projection_edges.row, projection_edges.column)
+                    == ((shape, "base"), (index, "index"))
+                    and book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        shape_edges.row, shape_edges.column)
+                    == ((receiver, "value"),)
+                    and type(literal) is int and literal is not MISSING
+                    and literal == axis and literal_cells
+                    and set(literal_cells) <= causes
+                    and len(class_cells) == 1
+                    and class_cells[0].row[1] == int(row[1])
+                    and book.page(SOURCE_VALUE_CLASS).cell(
+                        class_cells[0].row, class_cells[0].column)[0]
+                    == "builtins.int"
+                ):
+                    problem = "shape read lacks exact receiver, index, literal axis or operand cause"
+            if problem is not None:
+                found.append(Finding(
+                    "source-tensor-shape-dimension-disagreement",
+                    str(row[0]), int(row[1]), problem,
+                ))
+        for function in getattr(module, "functions", {}).values():
+            scope = function_scope_of(function)
+            for block in getattr(function, "blocks", {}).values():
+                for instruction in getattr(block, "instrs", ()):
+                    attributes = getattr(instruction, "attributes", {}) or {}
+                    source = attributes.get("source_shape_dimension_cell")
+                    if source is None:
+                        continue
+                    fact = (
+                        page.cell(source.row, source.column)
+                        if isinstance(source, Ref)
+                        and source.page == SOURCE_TENSOR_SHAPE_DIMENSION
+                        else None
+                    )
+                    def exact_binding(graph_id: int, ssa_id: int, authored: Ref) -> bool:
+                        binding = book.latest_ref(
+                            CONTROL_VALUE_BINDING, (scope, graph_id))
+                        recorded = (book.page(CONTROL_VALUE_BINDING).cell(
+                            binding.row, binding.column)
+                            if binding is not None else None)
+                        return (
+                            recorded is not None
+                            and getattr(recorded, "ssa_value", None) is not None
+                            and recorded.ssa_value.row == (scope, ssa_id)
+                            and any(
+                                cause.page == CANONICAL_VALUE
+                                and _canonical_identity_base(book, cause)
+                                    == _canonical_identity_base(book, authored)
+                                for cause, _ in book.edges_into(binding)
+                            )
+                        )
+                    current_result = (
+                        book.latest_ref(CANONICAL_VALUE, source.row)
+                        if isinstance(source, Ref) else None
+                    )
+                    valid = (
+                        instruction.op == "Call"
+                        and isinstance(fact, tuple) and len(fact) == 4
+                        and attributes.get("source_value_id")
+                            == int(source.row[1])
+                        and len(getattr(instruction, "args", ())) == 1
+                        and current_result is not None
+                        and exact_binding(int(fact[0].row[1]),
+                            int(instruction.args[0].id), fact[0])
+                        and exact_binding(int(source.row[1]),
+                            int(instruction.res.id), current_result)
+                        and attributes.get("tensor_operation") == "extent"
+                        and attributes.get("extent_kind") == "dim"
+                        and attributes.get("axis") == fact[3]
+                    )
+                    if not valid:
+                        found.append(Finding(
+                            "source-tensor-shape-dimension-disagreement",
+                            str(getattr(function, "name", "")),
+                            int(getattr(getattr(instruction, "res", None), "id", -1)),
+                            "live extent call disagrees with exact authored receiver, result or axis",
+                        ))
         return found
 
     @staticmethod

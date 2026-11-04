@@ -342,3 +342,14 @@ interrupted it, so it produced no terminal mapping result and delayed the
 focused report. This repeats the earlier documented departure. The preventing
 constraint is to copy the exact selected command from the prior green gate and
 check its final argument before execution.
+
+## 2026-11-04 — targeted a frozen canonical file during optional geometry edit
+
+The agent was assigned the optional scalar geometry repair in the validation
+worktree. Its first `apply_patch` used the canonical repository path instead.
+The agent immediately reversed that exact hunk in canonical, verified that
+`git diff -- src/compiler/tensor_ssa_lowering.py` was empty there, and applied
+the hunk only in validation. The cost was two unnecessary file writes and a
+status/diff verification; no canonical source change remained. The preventing
+constraint is to copy the explicit validation absolute path into every patch
+header before sending an edit.
