@@ -655,7 +655,7 @@ def _post_referenced_named_tuple_layout(owner, definition, schema):
     book = current_identity_book()
     class_cell = book.latest_ref(
         CLASS_DECLARATION,
-        (schema["class_node_id"][0], schema["class_identity"]),
+        tuple(schema["class_node_id"][:2]),
     )
     base_cell = post_source_span(definition, bases[0])
     if class_cell is None or base_cell is None:
@@ -663,8 +663,7 @@ def _post_referenced_named_tuple_layout(owner, definition, schema):
     members = []
     for item in declarations:
         field_cell = book.latest_ref(CLASS_FIELD_DECLARATION, (
-            schema["class_node_id"][0], schema["class_identity"],
-            item.target.id,
+            *schema["class_node_id"][:2], item.target.id,
         ))
         statement_cell = post_source_span(definition, item)
         if field_cell is None or statement_cell is None:
@@ -1359,9 +1358,9 @@ def _source_owner_annotation_declaration_shells(value, *, source_definition=None
             f"{getattr(referenced, '__qualname__', referenced.__name__)}"
         ).strip(".")
         class_row = (
-            (admitted_schema["class_node_id"][0], admitted_schema["class_identity"])
+            tuple(admitted_schema["class_node_id"][:2])
             if admitted_schema is not None else
-            (str(getattr(referenced, "__module__", "")), str(class_identity))
+            _source_definition_identity(definition)
         )
         class_cell = book.latest_ref(CLASS_DECLARATION, class_row)
         if class_cell is None:
@@ -1379,7 +1378,7 @@ def _source_owner_annotation_declaration_shells(value, *, source_definition=None
             from ...compiler.concordance_declarations import CLASS_FIELD_DECLARATION, PARAMETER_ANNOTATION, FUNCTION_RETURN_ANNOTATION
             callable_cell = _static_symbol_definition_cell(value)
             callable_span = post_source_span(callable_definition, callable_definition)
-            declaration_row = (admitted_schema["class_node_id"][0], admitted_schema["class_identity"])
+            declaration_row = tuple(admitted_schema["class_node_id"][:2])
             declaration_cell = book.latest_ref(CLASS_DECLARATION, declaration_row)
             if callable_cell is None or callable_span is None or declaration_cell is None:
                 raise ValueError("admitted annotation class lacks its exact callable/declaration cells")
@@ -1871,15 +1870,16 @@ def _source_enum_declaration(definition):
 
 
 def class_schema_identity(definition):
-    """The identity ``_class_schema_from_ast`` keys a ClassDef's record by."""
+    """The globally qualified Map IR identity of a source ClassDef."""
 
+    # Map IR's object identity is globally qualified. The declaration rows
+    # below use the source span's (module, lexical qualname) separately;
+    # joining that module into their class component created Run54's second
+    # PackedBitstream field declaration instead of the authored one.
     source_identity = getattr(definition, "_python_source_identity", None)
     return (
         ".".join(part for part in source_identity if part)
         if source_identity is not None
-        # Owner ingestion has already recorded lexical qualification. Two
-        # Visitor classes in lexical_calls/lexical_return_calls are distinct
-        # declarations, not two records for the bare spelling "Visitor".
         else getattr(definition, "_turing_source_qualname", definition.name)
     )
 
@@ -2012,9 +2012,10 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         return schema
     book = current_identity_book()
     module_name = class_span.row[0]
+    declaration_row = tuple(class_span.row[:2])
     class_fact = ClassFact(str(definition.name), ())
     book.post(
-        CLASS_DECLARATION, (module_name, str(class_identity)),
+        CLASS_DECLARATION, declaration_row,
         class_fact,
         stage=INGESTION, provenance=Derived((class_span,)),
         mode=Mode.CONCORD,
@@ -2031,9 +2032,7 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         )
         if not cells:
             continue
-        field_row = (
-            module_name, str(class_identity), str(name),
-        )
+        field_row = (*declaration_row, str(name))
         field_fact = FieldFact(
             str(attribute["storage"]),
             str(attribute["annotation"] or ""),
@@ -2055,7 +2054,9 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         # than reinterpreting the projected annotation as new source.
         if carried_declarations and isinstance(incumbent_fact, FieldFact):
             field_fact = incumbent_fact
-            cells = tuple(dict.fromkeys((*cells, incumbent_cell)))
+            # CONCORD adds this projected statement's source span to the
+            # existing declaration. Citing the target cell itself would
+            # create a self-edge rather than prove the carried field.
         mode = Mode.CONCORD
         # Program: ``SSAReferenceEvaluator.run`` compiled as its own unit.
         # Wrong record: the unit's partition keeps the class with ``run``
@@ -2103,9 +2104,7 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         method_span = post_source_span(definition, method)
         if method_span is None:
             continue
-        method_row = (
-            module_name, str(class_identity), str(method.name),
-        )
+        method_row = (*declaration_row, str(method.name))
         method_fact = MethodFact(
             entry["graph_identity"], tuple(entry["parameters"]),
             (
@@ -2125,9 +2124,8 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         )
         if carried_declarations and isinstance(incumbent_fact, MethodFact):
             method_fact = incumbent_fact
-            method_cells = tuple(dict.fromkeys((
-                *method_cells, incumbent_cell,
-            )))
+            # The incumbent fact is read, while the projected method span
+            # is its additional source; no declaration cites itself.
         declaration_cells.append(book.post(
             CLASS_METHOD_DECLARATION,
             method_row, method_fact,
@@ -2184,7 +2182,7 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         # identity or revision.  A projected class therefore cannot retain
         # its name while cutting away the declarations that define it.
         book.post(
-            CLASS_DECLARATION, (module_name, str(class_identity)),
+            CLASS_DECLARATION, declaration_row,
             class_fact, stage=INGESTION,
             provenance=Derived((class_span, *declaration_cells)),
             mode=Mode.CONCORD,
@@ -2429,9 +2427,8 @@ def _map_ir_from_ast(tree):
         if span_row is None:
             continue
         module_name = span_row[0]
-        declared_derived_identity = str(item["class_identity"])
         derived_cell = book.latest_ref(
-            CLASS_DECLARATION, (module_name, declared_derived_identity),
+            CLASS_DECLARATION, tuple(span_row[:2]),
         )
         if derived_cell is None:
             continue
@@ -7258,7 +7255,7 @@ class ProcessGraph(TiledObject):
             span_row = item.get("class_node_id")
             declared = (
                 None if span_row is None else class_page.latest(
-                    (span_row[0], str(item["class_identity"])),
+                    tuple(span_row[:2]),
                 )
             )
             class_names.append(

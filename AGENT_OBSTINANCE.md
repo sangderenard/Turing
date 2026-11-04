@@ -667,3 +667,17 @@ lowered eight functions and reached a different later tensor-index dtype
 shortfall. Inspecting the exact class declaration and record-view cells in
 the saved Run53 book before selecting a smaller source call chain would have
 avoided the broad encoder attempt.
+
+## 2026-11-04 — used the declaration-row identity as the global Map IR identity
+
+The first Run54 field repair changed `class_schema_identity` itself to return
+only a lexical qualname. That helper also names Map IR objects globally.
+Two distinct `Edge` classes in different modules then collapsed into one
+identity, causing a 14.07-second focused gate to fail one of four tests and
+a 13.82-second root gate to fail one of eight. The untouched validation
+checkout passed the same-name Map IR test in 1.33 seconds. The correction
+keeps the global module-qualified Map IR label and derives every declaration
+row from the authored class source span's `(module, qualname)` pair. The
+class projection and four compatibility targets then passed eight of eight
+in 14.10 seconds. Reading all consumers of the shared helper before changing
+it would have avoided the regression.

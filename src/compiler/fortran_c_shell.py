@@ -8370,9 +8370,11 @@ def _authored_dataclass_record_views(
         span_row = declaration.get("class_node_id")
         if span_row is None:
             continue
-        class_declaration_rows[class_name] = (
-            str(span_row[0]), str(declaration["class_identity"]),
-        )
+        # The source span owns the declaration's (module, lexical qualname)
+        # row. Map IR's globally qualified class_identity is a derived
+        # navigation label; using it as this row's second component doubled
+        # the module for Run54's pursued PackedBitstream field schema.
+        class_declaration_rows[class_name] = tuple(map(str, span_row[:2]))
 
     authored_scalar_identities = _authored_enum_scalar_identities(
         classes.values()
