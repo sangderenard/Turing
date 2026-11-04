@@ -1534,6 +1534,7 @@ class CorrelationTable:
         found.extend(self._scope_local_accounting_findings(module))
         found.extend(self._tensor_metadata_result_binding_findings(module))
         found.extend(self._tensor_runtime_reshape_validity_findings(module))
+        found.extend(self._tensor_elementwise_extent_binding_findings(module))
         found.extend(self._tensor_owned_heap_binding_findings(module))
         found.extend(self._tensor_heap_owner_call_binding_findings(module))
         found.extend(self._tensor_heap_consumer_nonescape_findings(module))
@@ -5873,6 +5874,150 @@ class CorrelationTable:
                     "runtime reshape lacks exact view geometry, checked width, "
                     "guarded SSA control or metadata result proof",
                 ))
+        return found
+
+    @staticmethod
+    def _tensor_elementwise_extent_binding_findings(module: Any) -> list[Finding]:
+        """A binary span result uses its exact input's transported extent."""
+
+        from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
+        from .concordance_declarations import (
+            SSA_VALUE, TENSOR_ELEMENTWISE_EXTENT_BINDING,
+            TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+        )
+        from .ssa_record_return_state import (
+            function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        )
+        from .tensor_ssa_lowering import _SHAPED_SSA_OPERATIONS
+
+        book = identity_book(module)
+        page = book.page(TENSOR_ELEMENTWISE_EXTENT_BINDING)
+        found = []
+        for row in page.rows():
+            ref = book.latest_ref(TENSOR_ELEMENTWISE_EXTENT_BINDING, row)
+            fact = page.cell(ref.row, ref.column)
+            function = module.functions.get(str(row[1])) if isinstance(row, tuple) and len(row) == 3 else None
+            valid = (
+                function is not None and function_scope_of(function) == row[0]
+                and isinstance(fact, tuple) and len(fact) == 6
+                and isinstance(fact[0], str)
+                and all(type(value_id) is int for value_id in fact[1:])
+            )
+            if valid:
+                operation, source_id, scalar_id, shape_id, rank_id, count_id = fact
+                signature = c_tensor_opcode(operation)
+                instructions = [instruction for block in function.blocks.values()
+                                for instruction in block.instrs
+                                if instruction.res is not None
+                                and int(instruction.res.id) == row[2]]
+                table = module.tensor_tables.get(function.name)
+                source = None if table is None else table.by_id(source_id)
+                result = None if table is None else table.by_id(row[2])
+                source_fact = posted_ssa_value_fact(function, source_id, book=book)
+                scalar_fact = posted_ssa_value_fact(function, scalar_id, book=book)
+                result_fact = posted_ssa_value_fact(function, row[2], book=book)
+                ids = (shape_id, rank_id, count_id)
+                valid = (
+                    signature is not None and signature[0] == "binary"
+                    and len(instructions) == 1
+                    and c_tensor_opcode(_SHAPED_SSA_OPERATIONS.get(
+                        instructions[0].op, str(instructions[0].op),
+                    )) == signature
+                    and tuple(int(arg.id) for arg in instructions[0].args)
+                    in ((source_id, scalar_id), (scalar_id, source_id))
+                    and source is not None and result is not None
+                    and source.metadata_state == result.metadata_state == "dynamic"
+                    and tuple(getattr(source, field) for field in (
+                        "shape_value_id", "rank_value_id", "element_count_value_id")) == ids
+                    and tuple(getattr(result, field) for field in (
+                        "shape_value_id", "rank_value_id", "element_count_value_id")) == ids
+                    and source_fact is not None and source_fact.storage == "span"
+                    and isinstance(source_fact.rank, int) and source_fact.rank > 0
+                    and scalar_fact is not None and scalar_fact.storage == "scalar"
+                    and scalar_fact.rank == 0
+                    and result_fact is not None and result_fact.storage == "span"
+                    and result_fact.rank == source_fact.rank
+                    and all(any(int(arg.id) == value_id for arg in function.args)
+                            for value_id in ids)
+                )
+                if valid:
+                    causes = {cause for cause, _stage in book.edges_into(ref)}
+                    value_cells = tuple(ssa_value_identity_cell(
+                        function, value_id, book=book,
+                    ) for value_id in (source_id, scalar_id, row[2], *ids))
+                    metadata_calls = [cause for cause in causes
+                                      if cause.page == TENSOR_METADATA_CALL_BINDING]
+                    metadata_results = [cause for cause in causes
+                                        if cause.page == TENSOR_METADATA_RESULT_BINDING
+                                        and cause.row[3] == source_id]
+                    valid = (
+                        all(cell is not None and cell in causes for cell in value_cells)
+                        and len(metadata_calls) == len(metadata_results) == 1
+                        and metadata_results[0] in {
+                            cause for cause, _stage in book.edges_into(metadata_calls[0])
+                        }
+                        and book.page(TENSOR_METADATA_CALL_BINDING).cell(
+                            metadata_calls[0].row, metadata_calls[0].column)[1] == ids
+                    )
+            if not valid:
+                found.append(Finding(
+                    "tensor-elementwise-extent-binding", str(row[1]) if isinstance(row, tuple) and len(row) > 1 else str(row),
+                    row[2] if isinstance(row, tuple) and len(row) == 3 else None,
+                    "binary span result lacks exact operand, descriptor, transported metadata, or direct SSA causes",
+                ))
+        # The bounded `reshape(-1, width) + 1` source used to return a scalar
+        # `1` even though its Add consumed a rank-two span: no extent receipt
+        # was posted, and the result's SSA fact had no physical geometry.
+        # Read the live binary instruction and the authoritative SSA facts;
+        # a static vector result with proved span geometry remains valid.
+        for function in module.functions.values():
+            scope = function_scope_of(function)
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    if instruction.res is None or len(instruction.args) != 2:
+                        continue
+                    operation = _SHAPED_SSA_OPERATIONS.get(
+                        instruction.op, str(instruction.op),
+                    )
+                    signature = c_tensor_opcode(operation)
+                    if signature is None or signature[0] != "binary":
+                        continue
+                    operands = tuple(posted_ssa_value_fact(
+                        function, int(arg.id), book=book,
+                    ) for arg in instruction.args)
+                    spans = tuple(fact for fact in operands if fact is not None
+                                  and fact.storage == "span"
+                                  and isinstance(fact.rank, int) and fact.rank > 0)
+                    if not spans:
+                        continue
+                    result_id = int(instruction.res.id)
+                    result_fact = posted_ssa_value_fact(
+                        function, result_id, book=book,
+                    )
+                    required_rank = max(fact.rank for fact in spans)
+                    if (result_fact is None or result_fact.storage != "span"
+                            or result_fact.rank != required_rank):
+                        found.append(Finding(
+                            "tensor-elementwise-result-geometry",
+                            function.name, result_id,
+                            "binary span input has no matching physical span result",
+                        ))
+                    table = module.tensor_tables.get(function.name)
+                    source_descriptors = tuple(
+                        table.by_id(int(arg.id)) for arg, operand_fact in zip(
+                            instruction.args, operands,
+                        ) if table is not None and operand_fact in spans
+                    )
+                    if (any(descriptor is not None
+                            and descriptor.metadata_state == "dynamic"
+                            for descriptor in source_descriptors)
+                            and book.latest_ref(TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                                (scope, function.name, result_id)) is None):
+                        found.append(Finding(
+                            "tensor-elementwise-extent-missing",
+                            function.name, result_id,
+                            "dynamic binary span result has no exact metadata binding",
+                        ))
         return found
 
     @staticmethod
