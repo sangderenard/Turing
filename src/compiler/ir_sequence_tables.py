@@ -5137,6 +5137,12 @@ def lower_sequence_replace(
     storage = tuple({value.id: value for value in (
         *_storage_values(destination), *_storage_values(source)
     )}.values())
+    # A dynamic byte row is int64 behind a ptr storage formal. Rebuilding a
+    # replace-body GEP base from the row dtype gave that formal's id a second
+    # int64 occurrence, then metadata transport tried to revise one shape
+    # edge from ptr to int64 without a changed source. Use the actual formal
+    # for every indexed storage base; loaded row values retain their dtype.
+    storage_by_id = {int(value.id): value for value in storage}
     builder = _Builder(_first_fresh_identity(destination, source, values=storage, minimum=first_value_id))
     entry = builder.block("entry")
     header = builder.block("replace_header")
@@ -5153,7 +5159,7 @@ def lower_sequence_replace(
     one = builder.const(entry, 1, dtype="int64")
     source_address = builder.fresh("ptr")
     length = builder.fresh("int64")
-    builder.emit(entry, "GetElementPtr", [SSAValue(source.length_address_id, dtype="int64"), zero], source_address)
+    builder.emit(entry, "GetElementPtr", [storage_by_id[int(source.length_address_id)], zero], source_address)
     builder.emit(entry, "Load", [source_address], length)
     nonnegative, source_fits, destination_fits = (builder.fresh("bool") for _ in range(3))
     builder.emit(entry, "Ge", [length, zero], nonnegative)
@@ -5188,7 +5194,6 @@ def lower_sequence_replace(
         ).functions[0]
         reserve_block = builder.block("replace_reserve")
         builder.cond(entry, valid_source, reserve_block, exhausted)
-        storage_by_id = {int(value.id): value for value in storage}
         reserve_status = builder.fresh("int")
         builder.emit(reserve_block, "Call", [
             *(storage_by_id[int(value.id)] for value in reserve_function.args[:-1]),
@@ -5220,7 +5225,7 @@ def lower_sequence_replace(
     )):
         src_address, dst_address = builder.fresh("ptr"), builder.fresh("ptr")
         value = builder.fresh(dtype)
-        builder.emit(body, "GetElementPtr", [SSAValue(src, dtype=dtype), index], src_address)
+        builder.emit(body, "GetElementPtr", [storage_by_id[int(src)], index], src_address)
         builder.emit(body, "Load", [src_address], value)
         value_map = tuple(column_value_maps.get(int(column_index), ()))
         if value_map:
@@ -5241,13 +5246,13 @@ def lower_sequence_replace(
                 })
                 remapped = selected
             value = remapped
-        builder.emit(body, "GetElementPtr", [SSAValue(dst, dtype=dtype), index], dst_address)
+        builder.emit(body, "GetElementPtr", [storage_by_id[int(dst)], index], dst_address)
         builder.emit(body, "Store", [value, dst_address])
     builder.branch(body, latch)
     builder.emit(latch, "Add", [index, one], next_index)
     builder.branch(latch, header)
     dst_length_address = builder.fresh("ptr")
-    builder.emit(complete, "GetElementPtr", [SSAValue(destination.length_address_id, dtype="int64"), zero], dst_length_address)
+    builder.emit(complete, "GetElementPtr", [storage_by_id[int(destination.length_address_id)], zero], dst_length_address)
     builder.emit(complete, "Store", [length, dst_length_address])
     success = _status_branch(builder, complete, 1, result)
     failure = _status_branch(builder, exhausted, 2, result)
@@ -5325,6 +5330,11 @@ def lower_sequence_extend(
     all_storage = tuple({value.id: value for value in (
         *destination_storage, *source_storage
     )}.values())
+    # tensor_octets_to_bytes' extend helper kept one source column id as an
+    # int64 formal but rebuilt its GEP base as a distinct occurrence. The
+    # later metadata walk made that occurrence ptr and contradicted the same
+    # id's prior shape edge. The one storage formal is the GEP base here.
+    storage_by_id = {int(value.id): value for value in all_storage}
     insert_function = insert_lowering.entry
     insert_ids = {
         value.id
@@ -5363,7 +5373,7 @@ def lower_sequence_extend(
     builder.emit(
         entry,
         "GetElementPtr",
-        [SSAValue(source.length_address_id, dtype="ptr"), zero],
+        [storage_by_id[int(source.length_address_id)], zero],
         source_length_slot,
     )
     builder.emit(
@@ -5396,7 +5406,7 @@ def lower_sequence_extend(
     )):
         address = builder.fresh("ptr")
         value = builder.fresh(dtype)
-        builder.emit(body, "GetElementPtr", [SSAValue(column_id, dtype=dtype), index], address)
+        builder.emit(body, "GetElementPtr", [storage_by_id[int(column_id)], index], address)
         builder.emit(body, "Load", [address], value)
         value_map = tuple(column_value_maps.get(int(column_index), ()))
         if value_map:
@@ -5424,7 +5434,7 @@ def lower_sequence_extend(
         builder.emit(
             body,
             "GetElementPtr",
-            [SSAValue(source.live_flags_value_id, dtype="bool"), index],
+            [storage_by_id[int(source.live_flags_value_id)], index],
             live_address,
         )
         builder.emit(body, "Load", [live_address], live)
