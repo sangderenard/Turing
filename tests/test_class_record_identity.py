@@ -7,8 +7,10 @@ import inspect
 import pytest
 
 from src.common.tensors.compression.bitstream import PackedBitstream
+from src.common.tensors.compression.huffman import CanonicalHuffmanTable
 from src.compiler.concordance_declarations import (
-    CLASS_DECLARATION, CLASS_FIELD_DECLARATION, SOURCE_RECORD_VIEW_SCHEMA,
+    CLASS_DECLARATION, CLASS_FIELD_DECLARATION, CLASS_METHOD_DECLARATION,
+    SOURCE_RECORD_VIEW_SCHEMA,
 )
 from src.compiler.fortran_c_shell import _authored_dataclass_record_views
 from src.compiler.identity_concordance import begin_identity_book, end_identity_book
@@ -53,6 +55,39 @@ def test_projected_packet_schema_keeps_authored_field_cells():
         assert book.latest_ref(
             CLASS_DECLARATION, (row[0], ".".join(row)),
         ) is None
+    finally:
+        end_identity_book(token)
+
+
+def test_pursued_huffman_method_keeps_its_declaration_and_global_map_label():
+    book, token = begin_identity_book()
+    try:
+        definition = ast.parse(inspect.getsource(CanonicalHuffmanTable)).body[0]
+        _stamp_reference_class_identity(CanonicalHuffmanTable, definition)
+        _class_schema_from_ast(definition)
+        owner = (CanonicalHuffmanTable.__module__, CanonicalHuffmanTable.__qualname__)
+        row = (*owner, "from_code_lengths")
+        declaration = book.latest_ref(CLASS_METHOD_DECLARATION, row)
+        assert declaration is not None
+        original = book.page(CLASS_METHOD_DECLARATION).latest(row)
+        projected = copy.deepcopy(definition)
+        projected.body = [item for item in projected.body
+                          if not (isinstance(item, ast.Expr)
+                                  and isinstance(item.value, ast.Constant)
+                                  and isinstance(item.value.value, str))]
+        projected._python_source_identity = owner
+        for member in projected.body:
+            if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                member._python_source_identity = (
+                    owner[0], f"{owner[1]}.{member.name}",
+                )
+        schema = _class_schema_from_ast(projected)
+        assert book.latest_ref(CLASS_METHOD_DECLARATION, row) == declaration
+        assert book.page(CLASS_METHOD_DECLARATION).latest(row) == original
+        method = next(item for item in schema["methods"]
+                      if item["name"] == "from_code_lengths")
+        assert method["graph_identity"] == ".".join((*owner, "from_code_lengths"))
+        assert declaration not in {source for source, _ in book.edges_into(declaration)}
     finally:
         end_identity_book(token)
 

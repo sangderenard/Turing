@@ -2335,7 +2335,9 @@ class CorrelationTable:
                         method.row, method.column)
                     entries = tuple(
                         entry for entry in (getattr(module, 'function_table', ()) or ())
-                        if entry.qualified_name == method_fact.graph_identity
+                        if getattr(entry, 'graph', None) is not None
+                        and tuple(entry.graph.G.graph.get('authored_function_identity')
+                                  or ()) == (method.row[0], method_fact.graph_identity)
                         and (entry.metadata or {}).get('method_owner') == class_fact[0]
                     )
                     wrappers = tuple(

@@ -1,6 +1,7 @@
 """A present mapping payload may name its authored method address exactly."""
 
 import ast
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,8 @@ from src.compiler.exception_graph import MissingResourceControlTopology
 from src.compiler.identity_concordance import (
     CorrelationTable, begin_identity_book, end_identity_book,
 )
-from src.compiler.source_guarded_callable import post_guarded_callables
+from src.compiler.source_guarded_callable import guarded_callable_facts, post_guarded_callables
+from src.transmogrifier.function_table import function_address_identity
 from src.transmogrifier.graph.graph_express2 import ProcessGraph
 from tests.test_cross_function_mapping_resource_evidence import SOURCE
 
@@ -75,6 +77,40 @@ def test_nonterminal_guard_has_no_guarded_callable():
         'authored_function_identity']
     assert not tuple(book.page(SOURCE_GUARDED_MAPPING_PAYLOAD).scope_rows(scope))
     assert not tuple(book.page(CALLABLE_IDENTITY).scope_rows(scope))
+
+
+def test_guarded_method_uses_authored_identity_when_navigation_label_is_qualified():
+    book, graph = _repro()
+    target = graph.function_table.entry('IdentityBook.borrowed')
+    authored = tuple(target.graph.G.graph['authored_function_identity'])
+    qualified = replace(
+        target, qualified_name='.'.join(authored),
+        metadata={**target.metadata,
+                  'function_address_identity': function_address_identity(target)},
+    )
+    assert qualified.qualified_name != target.qualified_name
+    view = SimpleNamespace(
+        function_table=tuple(qualified if entry is target else entry
+                             for entry in graph.function_table), G=graph.G,
+        metadata={'identity_book': book},
+    )
+    scope = graph.function_table.entry('consume').graph.G.graph['authored_function_identity']
+    row, = tuple(book.page(SOURCE_GUARDED_MAPPING_PAYLOAD).scope_rows(scope))
+    guard = book.latest_ref(SOURCE_GUARDED_MAPPING_PAYLOAD, row)
+    facts = guarded_callable_facts(view, book, row, guard)
+    assert facts is not None and facts[0] == target.reference.address
+    assert not CorrelationTable._source_guarded_callable_findings(view)
+
+    # The same navigation label and address cannot redeem another source
+    # module's authored identity.
+    target.graph.G.graph['authored_function_identity'] = (
+        authored[0] + '.foreign', authored[1],
+    )
+    try:
+        assert guarded_callable_facts(view, book, row, guard) is None
+        assert CorrelationTable._source_guarded_callable_findings(view)
+    finally:
+        target.graph.G.graph['authored_function_identity'] = authored
 
 
 def test_audit_rejects_a_different_accessor_on_the_guarded_call():

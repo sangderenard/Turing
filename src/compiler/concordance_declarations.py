@@ -415,6 +415,14 @@ class FieldFact:
 
 @dataclass(frozen=True)
 class MethodFact:
+    """An authored method in its declaration row's module.
+
+    ``graph_identity`` is the lexical qualname. Together with the row's
+    module it names the FunctionTable's ``authored_function_identity``.
+    The schema's Map IR method label is a separate navigation view and may
+    include the module; it is not the method declaration's source key.
+    """
+
     graph_identity: Any
     parameters: tuple
     return_annotation: str = ""

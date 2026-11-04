@@ -88,7 +88,9 @@ def guarded_callable_facts(source_graph, book, row, guarded):
     )
     candidates = tuple(
         entry for entry in source_graph.function_table
-        if entry.qualified_name == str(method_fact.graph_identity)
+        if entry.graph is not None
+        and tuple(entry.graph.G.graph.get('authored_function_identity') or ())
+        == (method_cell.row[0], str(method_fact.graph_identity))
         and (entry.metadata or {}).get('method_owner') == class_name
     )
     if len(candidates) != 1:

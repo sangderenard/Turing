@@ -681,3 +681,28 @@ row from the authored class source span's `(module, qualname)` pair. The
 class projection and four compatibility targets then passed eight of eight
 in 14.10 seconds. Reading all consumers of the shared helper before changing
 it would have avoided the regression.
+
+## 2026-11-04 — used an unpopulated source-identity resolver for method readers
+
+The Run55 method declaration repair needed readers to join the lexical
+MethodFact to the authored method entry. The agent changed two readers to
+`FunctionTable.reference_by_source_identity` before checking whether the
+primary entries carried its `metadata["source_identity"]` index. They did
+not; the guarded callable publisher lost its method address and three of
+22 focused tests failed in a 6.52-second run. The readers now use the
+entries' existing exact `authored_function_identity` graph tuples, require
+one matching method owner, and keep the global Map IR label separate. The
+same 22 tests passed in 6.15 seconds. Inspecting the resolver's indexed
+field against the actual primary entry before adopting it would have
+avoided the failed gate.
+
+## 2026-11-04 — launched the whole concordance case set for a scoped mapping gate
+
+The Run55 method slice called `tools/audit_identity_concordance.py` without
+the `mapping` case argument. Its default walks the whole case set, contrary
+to the bounded mapping gate. Five unrelated cases printed lowering times
+of 6.6, 19.3, 10.5, 7.6 and 8.1 seconds before the agent interrupted it;
+the current mapping case then passed alone in 6.92 seconds with 28 rows,
+zero findings and zero unsourced facts or identities. Reading the script's
+CLI before starting it would have avoided those roughly 52 seconds and the
+unrelated failure output.

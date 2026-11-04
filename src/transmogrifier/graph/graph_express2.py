@@ -2105,8 +2105,17 @@ def _class_schema_from_ast(definition, *, carried_declarations=False):
         if method_span is None:
             continue
         method_row = (*declaration_row, str(method.name))
+        method_identity = _source_definition_identity(method)
+        if method_identity is None:
+            raise ValueError(
+                "authored class method lacks its source definition identity"
+            )
+        # The Run55 CanonicalHuffmanTable.from_code_lengths projection has
+        # the same authored method span as the complete ClassDef.  Its Map IR
+        # label includes the module, while this declaration row already has
+        # a module column.  Keep the method's lexical source identity here.
         method_fact = MethodFact(
-            entry["graph_identity"], tuple(entry["parameters"]),
+            method_identity[1], tuple(entry["parameters"]),
             (
                 ast.unparse(method.returns)
                 if method.returns is not None else ""
