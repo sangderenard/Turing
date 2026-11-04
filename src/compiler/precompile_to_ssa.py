@@ -24772,8 +24772,25 @@ class _ControlSSABuilder(TiledObject):
 
         def register_sequence(table, descriptor):
             # A descriptor stands on the cells of the values it names.
+            from .concordance_declarations import SOURCE_PRIVATE_DYNAMIC_SEQUENCE
+            private_dynamic = (
+                None if self.lexical_read_scope is None else
+                self._book().latest_ref(
+                    SOURCE_PRIVATE_DYNAMIC_SEQUENCE,
+                    (self.lexical_read_scope, int(descriptor.sequence_id)),
+                )
+            )
+            if private_dynamic is not None and (
+                descriptor.capacity_policy is not SSASequenceCapacityPolicy.DYNAMIC
+                or descriptor.heap_owner_value_id is None
+            ):
+                raise ValueError(
+                    "private dynamic sequence admission has no heap descriptor: "
+                    f"{descriptor.sequence_id}"
+                )
             source_cells = self._cells(
                 self._sequence_contract_cell(int(descriptor.sequence_id)),
+                private_dynamic,
                 *(
                     self.ssa_value_objects.get(int(value_id))
                     for value_id in (

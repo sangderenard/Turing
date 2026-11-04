@@ -1503,6 +1503,25 @@ SOURCE_SEQUENCE_MUTATION = declare_page(
     ), tuple,
 )
 @dataclass(frozen=True)
+class SourcePrivateDynamicSequence:
+    """An exact fresh mutable constructor whose rows are grown."""
+
+    constructor_cell: Ref
+    operand_cell: Ref
+    static_use_cell: Ref
+    static_definition_cell: Ref
+    class_cell: Ref
+    mutation_cell: Ref
+    snapshot_cell: Ref | None = None
+
+
+SOURCE_PRIVATE_DYNAMIC_SEQUENCE = declare_page(
+    "source_private_dynamic_sequence", (
+        RowField("source_scope", K.SCOPE),
+        RowField("sequence_value_id", K.VALUE_ID),
+    ), SourcePrivateDynamicSequence,
+)
+@dataclass(frozen=True)
 class SourceSequenceConstructorSnapshot:
     """A mutable constructor owns a copy of its exact sequence argument."""
 
