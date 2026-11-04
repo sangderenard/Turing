@@ -21,6 +21,18 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-04 — global blank-line cleanup during a narrow admission edit
+
+The agent was asked to remove trailing whitespace from the new private
+bytearray admission block. It applied a whole-file regular expression to
+`src/compiler/fortran_c_shell.py` instead. The expression matched whitespace
+across line breaks and deleted about 230 unrelated blank lines, creating
+review churn in a shared compiler file. The root agent restored the file from
+its current HEAD and reapplied only the 143-line admission insertion in both
+the repair and validation checkouts. Limiting whitespace cleanup to the added
+line, then checking the diff before reporting the file frozen, would have
+prevented this departure.
+
 ## 2026-11-03 — hazards read after starting a new checkout's validation gate
 
 The agent was required to read newest hazards before tests. It started the

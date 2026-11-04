@@ -31923,6 +31923,149 @@ def _class_surface_ssa_program(
                 )
             ):
                 dynamic_sequence_ids.add(sequence_id)
+        # Program: `header = bytearray(); header.append(2); if not data:
+        # return bytes(header)`.  The fresh private header had neither a
+        # survey bound nor a heap owner, so C refused its FIXED arena.  The
+        # exact static constructor use, empty call operands, class result,
+        # and authored append are its source admission to the existing
+        # DYNAMIC sequence contract; no capacity is inferred from control.
+        def _post_private_dynamic_bytearrays():
+            if late_book is not None and late_type_scope is not None:
+                from .concordance_declarations import (
+                    PROCESS_GRAPH_OPERANDS as _PRIVATE_OPERANDS,
+                    SOURCE_PRIVATE_DYNAMIC_SEQUENCE as _PRIVATE_DYNAMIC,
+                    SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT as _PRIVATE_SNAPSHOT,
+                    SOURCE_SEQUENCE_MUTATION as _PRIVATE_MUTATION,
+                    STATIC_REFERENCE_USE as _PRIVATE_STATIC_USE,
+                    STATIC_SYMBOL_DEFINITION as _PRIVATE_STATIC_DEFINITION,
+                    SourcePrivateDynamicSequence as _SourcePrivateDynamicSequence,
+                    StaticSymbolKind as _PrivateStaticSymbolKind,
+                )
+                from .concorded_literals import origin_cell as _private_origin
+                from .resident_sequence_materialization import (
+                    _source_contract_rows as _private_source_rows,
+                )
+                from .source_evidence_resolver import require_class as _private_class
+
+                symbol = late_book.latest_ref(
+                    _PRIVATE_STATIC_DEFINITION, ("builtins", "bytearray", ""),
+                )
+                if symbol is not None and late_book.page(
+                    _PRIVATE_STATIC_DEFINITION
+                ).cell(symbol.row, symbol.column).kind is _PrivateStaticSymbolKind.CLASS:
+                    mutation_page = late_book.page(_PRIVATE_MUTATION)
+                    mutation_rows = _private_source_rows(graph_obj, mutation_page)
+                    for sequence_id, node in graph_obj.nodes(data=True):
+                        sequence_id = int(sequence_id)
+                        if (
+                            sequence_id in sequence_capacity_bounds
+                            or sequence_id in output_history_ids
+                            or sequence_id in escaped_sequence_ids
+                            or sequence_id in dynamic_sequence_ids
+                            or (node.get("attributes") or {}).get("producer_kind")
+                            not in {"aggregate", "aggregate_materialization"}
+                            or (node.get("attributes") or {}).get("aggregate_kind")
+                            != "bytearray"
+                        ):
+                            continue
+                        constructor = _identity_cell(graph_obj, sequence_id)
+                        operand = late_book.latest_ref(
+                            _PRIVATE_OPERANDS, (late_type_scope, sequence_id),
+                        )
+                        if constructor is None or operand is None:
+                            continue
+                        operands = late_book.page(_PRIVATE_OPERANDS).cell(
+                            operand.row, operand.column,
+                        )
+                        if not operands or operands[0][1] != "callee":
+                            continue
+                        snapshot = None
+                        if len(operands) == 2 and operands[1][1] == "arg:0":
+                            snapshot = late_book.latest_ref(
+                                _PRIVATE_SNAPSHOT,
+                                (late_type_scope, sequence_id),
+                            )
+                            if snapshot is None:
+                                continue
+                            snapshot_fact = late_book.page(_PRIVATE_SNAPSHOT).cell(
+                                snapshot.row, snapshot.column,
+                            )
+                            if (
+                                snapshot_fact.destination_cell != constructor
+                                or snapshot_fact.operand_cell != operand
+                                or snapshot_fact.source_cell != operands[1][0]
+                            ):
+                                continue
+                        elif len(operands) != 1:
+                            continue
+                        callee = operands[0][0]
+                        if constructor not in {
+                            source for source, _stage in late_book.edges_into(operand)
+                        }:
+                            continue
+                        try:
+                            callee_origin = _private_origin(late_book, callee)
+                            constructor_origin = _private_origin(
+                                late_book, constructor,
+                            )
+                        except ValueError:
+                            continue
+                        uses = tuple(
+                            use for row in late_book.page(_PRIVATE_STATIC_USE).rows()
+                            for use in (late_book.latest_ref(_PRIVATE_STATIC_USE, row),)
+                            if symbol in {
+                                source for source, _stage in late_book.edges_into(use)
+                            }
+                            and callee_origin in {
+                                source for source, _stage in late_book.edges_into(use)
+                            }
+                        )
+                        if len(uses) != 1:
+                            continue
+                        class_evidence = _private_class(
+                            late_numeric_scope, sequence_id,
+                            book=late_book,
+                        )
+                        if getattr(class_evidence, "class_identity", None) != "builtins.bytearray":
+                            continue
+                        class_cell = class_evidence.class_cell
+                        mutations = []
+                        for row in mutation_rows:
+                            mutation = late_book.latest_ref(_PRIVATE_MUTATION, row)
+                            fact = mutation_page.cell(mutation.row, mutation.column)
+                            if (
+                                not isinstance(fact, tuple) or len(fact) < 2
+                                or int(fact[0]) != sequence_id
+                                or fact[1] != "append"
+                                or int(row[-1]) not in graph_obj
+                            ):
+                                continue
+                            causes = {
+                                source for source, _stage in late_book.edges_into(mutation)
+                            }
+                            if any(
+                                source.page == constructor.page
+                                and _private_origin(late_book, source) == constructor_origin
+                                for source in causes
+                            ):
+                                mutations.append(mutation)
+                        if not mutations:
+                            continue
+                        receipt = _SourcePrivateDynamicSequence(
+                            constructor, operand, uses[0], symbol, class_cell,
+                            mutations[0], snapshot,
+                        )
+                        late_book.post(
+                            _PRIVATE_DYNAMIC, (late_type_scope, sequence_id),
+                            receipt, stage=SHELL_HANDOFF,
+                            provenance=_LateDerived(tuple(dict.fromkeys((
+                                constructor, operand, callee, uses[0], symbol,
+                                class_cell, mutations[0],
+                                *((snapshot,) if snapshot is not None else ()),
+                            )))), mode=Mode.CONCORD,
+                        )
+                        dynamic_sequence_ids.add(sequence_id)
+        _post_private_dynamic_bytearrays()
         # Program: f"a@{n}".  Wrong record: the JoinedStr destination is
         # cleared and extended from the formatter's token list, which is
         # DYNAMIC, while the destination stayed FIXED with no bound (C

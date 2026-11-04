@@ -80,17 +80,6 @@ def test_returned_bytes_views_keep_source_operand_owner_proof(tmp_path, early_re
     finally:
         operand_page.cells[key] = operands
     artifact = emit_ssa_module_to_c(module, function_name)
-    if early_return:
-        # The control merge now settles with one exact storage identity.
-        # Its earlier header arena still lacks a proven capacity; keep that
-        # separate native limitation explicit rather than inventing a bound.
-        assert not artifact.complete
-        assert all(
-            shortfall.operation == "sequence"
-            and "dynamic-growth-unavailable" in shortfall.reason
-            for shortfall in artifact.shortfalls
-        )
-        return
     assert artifact.complete, artifact.shortfalls
     artifact.compile(tmp_path / "owned_bytes_views")
     parameter_id = dict(module.functions[function_name].metadata[

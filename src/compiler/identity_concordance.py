@@ -1589,6 +1589,7 @@ class CorrelationTable:
         found.extend(self._source_numeric_type_dependency_findings(module))
         found.extend(self._source_numeric_operator_specialization_findings(module))
         found.extend(self._source_sequence_mutation_findings(module))
+        found.extend(self._source_private_dynamic_sequence_findings(module))
         found.extend(self._source_sequence_constructor_snapshot_findings(module))
         found.extend(self._source_sequence_capacity_bound_findings(module))
         found.extend(self._source_bytes_concat_class_findings(module))
@@ -10118,6 +10119,190 @@ class CorrelationTable:
                 "source mutation changed resident sequence, operator, "
                 f"arguments, policy, or mutation kind: {distinct!r}",
             ))
+        return found
+
+    @staticmethod
+    def _source_private_dynamic_sequence_findings(module: Any) -> list[Finding]:
+        """A private heap birth follows the exact builtin use and append."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, PROCESS_GRAPH_OPERANDS, SEQUENCE_CONTRACT_CONCORDANCE,
+            SEQUENCE_DESCRIPTOR,
+            SOURCE_PRIVATE_DYNAMIC_SEQUENCE, SOURCE_SEQUENCE_MUTATION,
+            SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT,
+            SOURCE_VALUE_CLASS, STATIC_REFERENCE_USE,
+            STATIC_SYMBOL_DEFINITION, SourcePrivateDynamicSequence,
+            StaticSymbolKind,
+        )
+        from .concorded_literals import origin_cell
+        from .source_bytes_concat_class import _class_matches_operand
+
+        book = dict(getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        page = book.page(SOURCE_PRIVATE_DYNAMIC_SEQUENCE)
+
+        def descriptor_contract_origins(table, sequence_id):
+            descriptor = table.sequences.get(int(sequence_id))
+            descriptor_cell = book.latest_ref(
+                SEQUENCE_DESCRIPTOR, (table.owner, int(sequence_id)),
+            )
+            if descriptor is None or descriptor_cell is None:
+                return None
+            if book.page(SEQUENCE_DESCRIPTOR).cell(
+                descriptor_cell.row, descriptor_cell.column,
+            ) != descriptor:
+                return None
+            contracts = tuple(
+                source for source, _stage in book.edges_into(descriptor_cell)
+                if source.page == SEQUENCE_CONTRACT_CONCORDANCE
+            )
+            if len(contracts) != 1:
+                return None
+            pending = list(contracts)
+            visited = set()
+            origins = set()
+            while pending:
+                contract = pending.pop()
+                if contract in visited:
+                    continue
+                visited.add(contract)
+                for source, _stage in book.edges_into(contract):
+                    if source.page == SEQUENCE_CONTRACT_CONCORDANCE:
+                        pending.append(source)
+                    elif source.page == CANONICAL_VALUE:
+                        origins.add(origin_cell(book, source))
+            return descriptor, descriptor_cell, frozenset(origins)
+
+        for row in page.rows():
+            cell = book.latest_ref(SOURCE_PRIVATE_DYNAMIC_SEQUENCE, row)
+            fact = page.cell(cell.row, cell.column)
+            valid = isinstance(fact, SourcePrivateDynamicSequence)
+            if valid:
+                constructor = fact.constructor_cell
+                operands = fact.operand_cell
+                use = fact.static_use_cell
+                symbol = fact.static_definition_cell
+                class_cell = fact.class_cell
+                mutation = fact.mutation_cell
+                snapshot = fact.snapshot_cell
+                causes = {source for source, _stage in book.edges_into(cell)}
+                valid = (
+                    constructor.page == CANONICAL_VALUE
+                    and constructor.row == row
+                    and operands.page == PROCESS_GRAPH_OPERANDS
+                    and operands.row == row
+                    and use.page == STATIC_REFERENCE_USE
+                    and symbol.page == STATIC_SYMBOL_DEFINITION
+                    and symbol.row == ("builtins", "bytearray", "")
+                    and class_cell.page == SOURCE_VALUE_CLASS
+                    and class_cell.row[-1] == row[1]
+                    and mutation.page == SOURCE_SEQUENCE_MUTATION
+                    and {constructor, operands, use, symbol, class_cell,
+                         mutation} <= causes
+                    and (snapshot is None or (
+                        snapshot.page == SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT
+                        and snapshot.row == row
+                        and snapshot in causes
+                    ))
+                )
+            if valid:
+                try:
+                    operand_fact = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operands.row, operands.column,
+                    )
+                    callee = operand_fact[0][0]
+                    constructor_origin = origin_cell(book, constructor)
+                    callee_origin = origin_cell(book, callee)
+                    mutation_fact = book.page(SOURCE_SEQUENCE_MUTATION).cell(
+                        mutation.row, mutation.column,
+                    )
+                    mutation_causes = {
+                        source for source, _stage in book.edges_into(mutation)
+                    }
+                    use_causes = {
+                        source for source, _stage in book.edges_into(use)
+                    }
+                    class_fact = book.page(SOURCE_VALUE_CLASS).cell(
+                        class_cell.row, class_cell.column,
+                    )
+                    valid = (
+                        operand_fact[:1] == ((callee, "callee"),)
+                        and (
+                            (snapshot is None and len(operand_fact) == 1)
+                            or (snapshot is not None
+                                and len(operand_fact) == 2
+                                and operand_fact[1][1] == "arg:0"
+                                and book.page(
+                                    SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT
+                                ).cell(snapshot.row, snapshot.column)
+                                .destination_cell == constructor
+                                and book.page(
+                                    SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT
+                                ).cell(snapshot.row, snapshot.column)
+                                .operand_cell == operands
+                                and book.page(
+                                    SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT
+                                ).cell(snapshot.row, snapshot.column)
+                                .source_cell == operand_fact[1][0])
+                        )
+                        and callee.page == CANONICAL_VALUE
+                        and callee.row[0] == row[0]
+                        and callee in causes
+                        and symbol in use_causes
+                        and callee_origin in use_causes
+                        and book.page(STATIC_SYMBOL_DEFINITION).cell(
+                            symbol.row, symbol.column,
+                        ).kind is StaticSymbolKind.CLASS
+                        and class_fact[0] == "builtins.bytearray"
+                        and _class_matches_operand(book, class_cell,
+                                                   constructor)
+                        and isinstance(mutation_fact, tuple)
+                        and len(mutation_fact) >= 2
+                        and int(mutation_fact[0]) == int(row[1])
+                        and mutation_fact[1] == "append"
+                        and any(
+                            source.page == CANONICAL_VALUE
+                            and origin_cell(book, source) == constructor_origin
+                            for source in mutation_causes
+                        )
+                    )
+                    if valid:
+                        valid = any(
+                            identity is not None
+                            and constructor_origin in identity[2]
+                            and cell in {
+                                source for source, _stage in book.edges_into(
+                                    identity[1]
+                                )
+                            }
+                            and getattr(getattr(identity[0], "capacity_policy",
+                                                None), "value", None) == "dynamic"
+                            and identity[0].heap_owner_value_id is not None
+                            for function_name, table in (
+                                (getattr(module, "sequence_tables", {}) or {})
+                                .items()
+                            )
+                            for function in (
+                                module.functions.get(function_name),
+                            )
+                            if function is not None
+                            and function.metadata.get("source_numeric_scope")
+                            == class_cell.row[0]
+                            for identity in (
+                                descriptor_contract_origins(table, int(row[1])),
+                            )
+                        )
+                except (IndexError, KeyError, TypeError, ValueError):
+                    valid = False
+            if not valid:
+                found.append(Finding(
+                    "source-private-dynamic-sequence", str(row[0]),
+                    int(row[1]),
+                    "private dynamic sequence lacks its exact constructor "
+                    "identity, class, empty operands, or append cause",
+                ))
         return found
 
     @staticmethod
