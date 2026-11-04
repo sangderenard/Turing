@@ -5459,7 +5459,7 @@ class CorrelationTable:
         """A private owned tensor releases its caller cell after its last use."""
 
         from .concordance_declarations import (
-            SSA_VALUE, TENSOR_HEAP_CONSUMER_NONESCAPE,
+            SSA_CONTROL_EDGE, SSA_VALUE, TENSOR_HEAP_CONSUMER_NONESCAPE,
             TENSOR_HEAP_OWNER_CALL_BINDING,
             TENSOR_HEAP_RELEASE_BINDING,
         )
@@ -5487,8 +5487,9 @@ class CorrelationTable:
                 block = function.blocks[fact[2]]
                 instructions = block.instrs
                 producers = tuple(
-                    (index, instruction)
-                    for index, instruction in enumerate(instructions)
+                    (producer_block, index, instruction)
+                    for producer_block in function.blocks.values()
+                    for index, instruction in enumerate(producer_block.instrs)
                     if instruction.op == "Call" and instruction.res is not None
                     and int(instruction.res.id) == fact[0]
                 )
@@ -5512,9 +5513,51 @@ class CorrelationTable:
                                  for other in function.blocks.values()
                                  for instruction in other.instrs) == 1)
             if valid:
-                producer_index, producer = producers[0]
+                producer_block, producer_index, producer = producers[0]
                 release_index, release = releases[0]
                 return_index, terminal = returns[0]
+                control_refs = ()
+                if producer_block is not block:
+                    dominators = CorrelationTable._dominators(function)
+                    reachable = set(dominators)
+                    live_edges = {
+                        (name, successor)
+                        for name in reachable
+                        for successor in function.blocks[name].successors
+                        if successor in reachable
+                    }
+                    edge_refs = {}
+                    for edge_row in book.page(SSA_CONTROL_EDGE).rows():
+                        if edge_row[:2] != (row[0], row[1]):
+                            continue
+                        before, after = edge_row[2:4]
+                        edge = (str(before.row[2]), str(after.row[2]))
+                        if edge not in live_edges:
+                            continue
+                        if (
+                            before != ssa_block_identity_cell(
+                                function, edge[0], book=book,
+                            )
+                            or after != ssa_block_identity_cell(
+                                function, edge[1], book=book,
+                            )
+                        ):
+                            continue
+                        edge_ref = book.latest_ref(SSA_CONTROL_EDGE, edge_row)
+                        if edge_ref is not None and book.page(
+                            SSA_CONTROL_EDGE
+                        ).cell(edge_ref.row, edge_ref.column) is True:
+                            edge_refs.setdefault(edge, set()).add(edge_ref)
+                    valid = (
+                        producer_block.name in dominators.get(block.name, ())
+                        and all(len(edge_refs.get(edge, ())) == 1
+                                for edge in live_edges)
+                    )
+                    if valid:
+                        control_refs = tuple(
+                            next(iter(edge_refs[edge]))
+                            for edge in sorted(live_edges)
+                        )
                 owner_calls = tuple(
                     ref for candidate in book.page(
                         TENSOR_HEAP_OWNER_CALL_BINDING).rows()
@@ -5530,14 +5573,22 @@ class CorrelationTable:
                     and book.page(TENSOR_HEAP_OWNER_CALL_BINDING).cell(
                         owner_calls[0].row, owner_calls[0].column,
                     )[1] == int(row[2])
-                    and producer_index < release_index < return_index
+                    and valid
+                    and (producer_block is not block
+                         or producer_index < release_index)
+                    and release_index < return_index
                     and all(int(value.id) not in (fact[1], int(row[2]))
                             for value in terminal.args)
                     and all(
-                        other is block and index < release_index
-                        and (not any(int(value.id) == fact[1]
-                                     for value in instruction.args)
-                             or index > producer_index)
+                        ((other is producer_block and index > producer_index
+                          and (other is not block or index < release_index))
+                         if any(int(value.id) == fact[1]
+                                for value in instruction.args)
+                         else (
+                             (instruction is producer
+                              and other is producer_block)
+                             or (other is block and index < release_index)
+                         ))
                         for other in function.blocks.values()
                         for index, instruction in enumerate(other.instrs)
                         if instruction is not release
@@ -5548,7 +5599,8 @@ class CorrelationTable:
             if valid:
                 causes = {source for source, _stage in book.edges_into(cell)}
                 consumers = tuple(
-                    instruction for instruction in instructions
+                    instruction for other in function.blocks.values()
+                    for instruction in other.instrs
                     if instruction is not producer and instruction is not release
                     and any(int(value.id) == fact[1]
                             for value in instruction.args)
@@ -5563,7 +5615,12 @@ class CorrelationTable:
                 required = {
                     owner_calls[0],
                     ssa_block_identity_cell(function, fact[2], book=book),
+                    *control_refs,
                 }
+                if producer_block is not block:
+                    required.add(ssa_block_identity_cell(
+                        function, producer_block.name, book=book,
+                    ))
                 valid = (
                     None not in required and required <= causes
                     and all(ref is not None and ref in causes
@@ -5571,6 +5628,9 @@ class CorrelationTable:
                     and {source for source in causes
                          if source.page == TENSOR_HEAP_CONSUMER_NONESCAPE}
                     == set(consumer_refs)
+                    and {source for source in causes
+                         if source.page == SSA_CONTROL_EDGE}
+                    == set(control_refs)
                     and all(sum(
                         source.page == SSA_VALUE
                         and source.row == (row[0], value_id)
