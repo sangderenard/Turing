@@ -1534,6 +1534,8 @@ class CorrelationTable:
         found.extend(self._scope_local_accounting_findings(module))
         found.extend(self._tensor_metadata_result_binding_findings(module))
         found.extend(self._tensor_runtime_reshape_validity_findings(module))
+        found.extend(self._tensor_runtime_view_geometry_findings(module))
+        found.extend(self._tensor_runtime_broadcast_validity_findings(module))
         found.extend(self._tensor_elementwise_extent_binding_findings(module))
         found.extend(self._tensor_owned_heap_binding_findings(module))
         found.extend(self._tensor_heap_owner_call_binding_findings(module))
@@ -5102,7 +5104,8 @@ class CorrelationTable:
         """An input binding names one live Call by its SSA result identity."""
 
         from .concordance_declarations import (
-            SSA_VALUE, TENSOR_METADATA_CALL_BINDING,
+            AGGREGATE_PASSTHROUGH_REBINDING, SSA_VALUE,
+            TENSOR_METADATA_CALL_BINDING,
             TENSOR_METADATA_RESULT_BINDING, TENSOR_SHAPE_CONCORDANCE,
         )
         from .ssa_record_return_state import function_scope_of
@@ -5159,13 +5162,143 @@ class CorrelationTable:
                 }
                 cited_rows = {parent.row for parent in causes
                               if parent.page == SSA_VALUE}
+                if cell.column > 0:
+                    previous = Ref(TENSOR_METADATA_CALL_BINDING, row,
+                                   cell.column - 1)
+                    previous_fact = page.cell(previous.row, previous.column)
+                    previous_causes = {
+                        parent for parent, _ in book.edges_into(previous)
+                    }
+                    rebindings = tuple(
+                        parent for parent in causes
+                        if parent.page == AGGREGATE_PASSTHROUGH_REBINDING
+                    )
+                    result_page = book.page(TENSOR_METADATA_RESULT_BINDING)
+                    result_refs = tuple(
+                        parent for parent in causes
+                        if parent.page == TENSOR_METADATA_RESULT_BINDING
+                    )
+                    valid = (
+                        previous in causes
+                        and isinstance(previous_fact, tuple)
+                        and len(previous_fact) == 2
+                        and previous_fact[1] == fact[1]
+                        and len(previous_fact[0]) == len(fact[0]) == 3
+                        and len(rebindings) == 3
+                        and len(result_refs) == 1
+                    )
+                    if valid:
+                        result_fact = result_page.cell(
+                            result_refs[0].row, result_refs[0].column,
+                        )
+                        valid = (
+                            isinstance(result_fact, tuple)
+                            and len(result_fact) == 3
+                            and result_fact[2] == fact[0]
+                            and result_refs[0].row[0] == row[0]
+                            and result_refs[0].row[3] == result_fact[0]
+                        )
+                    if valid:
+                        rebind_page = book.page(
+                            AGGREGATE_PASSTHROUGH_REBINDING
+                        )
+                        mapping = {
+                            int(parent.row[1]): (
+                                parent,
+                                rebind_page.cell(parent.row, parent.column),
+                            ) for parent in rebindings
+                        }
+                        valid = set(previous_fact[0]) == set(mapping)
+                        for old_id, new_id in zip(
+                            previous_fact[0], fact[0], strict=True,
+                        ):
+                            item = mapping.get(int(old_id))
+                            if (item is None or item[1] != (
+                                    int(new_id), result_refs[0].row[2],
+                                    int(old_id),
+                                )):
+                                valid = False
+                                break
+                            cited_rows.update(
+                                parent.row for parent, _ in book.edges_into(
+                                    item[0]
+                                ) if parent.page == SSA_VALUE
+                            )
+                        cited_rows.update(
+                            parent.row for parent in previous_causes
+                            if parent.page == SSA_VALUE
+                        )
                 valid = (
-                    required_rows <= cited_rows
+                    valid and required_rows <= cited_rows
                     and any(parent.page in {
                         TENSOR_SHAPE_CONCORDANCE,
                         TENSOR_METADATA_RESULT_BINDING,
                     } for parent in causes)
                 )
+                if valid:
+                    # Two computed views can feed one region Call. The Call
+                    # has one booked result identity, so its binding must
+                    # contain the metadata for every result it consumes.
+                    # The predecessor result page identifies each exact
+                    # projected caller triple; Call argument/formal pairs
+                    # identify its corresponding callee triple.
+                    result_page = book.page(TENSOR_METADATA_RESULT_BINDING)
+                    pairs = tuple(zip(fact[0], fact[1], strict=True))
+                    source_pairs = tuple(zip(
+                        instruction.args, callee.args, strict=True,
+                    ))
+                    for result_row in result_page.rows():
+                        if (result_row[0] != row[0]
+                                or result_row[3] not in {
+                                    int(actual.id) for actual, _ in source_pairs
+                                }):
+                            continue
+                        predecessor = book.latest_ref(
+                            TENSOR_METADATA_RESULT_BINDING, result_row,
+                        )
+                        result_fact = result_page.cell(
+                            predecessor.row, predecessor.column,
+                        )
+                        data_matches = tuple(
+                            formal for actual, formal in source_pairs
+                            if int(actual.id) == result_row[3]
+                        )
+                        projected = (
+                            tuple(result_fact[2])
+                            if isinstance(result_fact, tuple)
+                            and len(result_fact) == 3 else ()
+                        )
+                        metadata_matches = tuple(
+                            tuple(formal for actual, formal in pairs
+                                  if actual == value_id)
+                            for value_id in projected
+                        )
+                        formal_ids = tuple(matches[0] for matches in metadata_matches
+                                           if len(matches) == 1)
+                        table = module.tensor_tables.get(callee.name)
+                        descriptor = (
+                            None if table is None or len(data_matches) != 1
+                            else table.by_id(int(data_matches[0].id))
+                        )
+                        if (predecessor not in causes
+                                or not isinstance(result_fact, tuple)
+                                or len(result_fact) != 3
+                                or result_fact[0] != result_row[3]
+                                or len(projected) != 3
+                                or len(formal_ids) != 3
+                                or descriptor is None
+                                or tuple(getattr(descriptor, field) for field in (
+                                    "shape_value_id", "rank_value_id",
+                                    "element_count_value_id",
+                                )) != formal_ids
+                                or tuple((data_matches[0].accounting or {}).get(key)
+                                         for key in (
+                                             "tensor_shape_value_id",
+                                             "tensor_rank_value_id",
+                                             "tensor_element_count_value_id",
+                                         )) != formal_ids):
+                            valid = False
+                            break
             if not valid:
                 found.append(Finding(
                     "tensor-metadata-call-binding-disagreement",
@@ -5418,8 +5551,22 @@ class CorrelationTable:
                         continue
                     descriptor = table.by_id(int(output.id))
                     if descriptor is None:
-                        valid = False
-                        break
+                        from ..transmogrifier.dtype_layout import resolve
+                        from .ssa_record_return_state import posted_ssa_value_fact
+
+                        scalar = posted_ssa_value_fact(
+                            callee, int(output.id), book=book,
+                        )
+                        layout = resolve(
+                            None if scalar is None else scalar.physical_dtype
+                        )
+                        if (scalar is None or scalar.storage != "scalar"
+                                or scalar.rank != 0 or layout is None
+                                or layout.kind not in {"int", "uint", "float", "bool"}):
+                            valid = False
+                            break
+                        layouts.append((int(output.id), int(output.id), None))
+                        continue
                     layouts.append((
                         int(output.id), int(descriptor.data_value_id),
                         None if descriptor.alias_of is None
@@ -5878,6 +6025,574 @@ class CorrelationTable:
         return found
 
     @staticmethod
+    def _tensor_runtime_view_geometry_findings(module: Any) -> list[Finding]:
+        """An axis-changing view owns an exact transform of its storage."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, SSA_VALUE, TENSOR_METADATA_RESULT_BINDING,
+            TENSOR_RUNTIME_VIEW_GEOMETRY,
+        )
+        from .concorded_literals import literal_from_identity
+        from .ssa_record_return_state import (
+            function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
+        )
+        from .tensor_ssa_lowering import _constant_payload
+
+        book = identity_book(module)
+        page = book.page(TENSOR_RUNTIME_VIEW_GEOMETRY)
+        found = []
+        for row in page.rows():
+            ref = book.latest_ref(TENSOR_RUNTIME_VIEW_GEOMETRY, row)
+            fact = page.cell(ref.row, ref.column)
+            function = (module.functions.get(str(row[1]))
+                        if isinstance(row, tuple) and len(row) == 3 else None)
+            unsqueeze = isinstance(fact, tuple) and len(fact) == 9 and fact[0] == "unsqueeze"
+            flatten = isinstance(fact, tuple) and len(fact) == 7 and fact[0] == "flatten"
+            valid = (
+                function is not None and function_scope_of(function) == row[0]
+                and (unsqueeze or flatten)
+                and all(type(value) is int for value in fact[1:])
+            )
+            if valid:
+                if unsqueeze:
+                    (_, source_id, axis_id, axis, source_shape, source_rank,
+                     source_count, result_shape, result_rank) = fact
+                else:
+                    (_, source_id, source_shape, source_rank, source_count,
+                     result_shape, result_rank) = fact
+                source_fact = posted_ssa_value_fact(function, source_id, book=book)
+                result_fact = posted_ssa_value_fact(function, row[2], book=book)
+                table = module.tensor_tables.get(function.name)
+                source = None if table is None else table.by_id(source_id)
+                result = None if table is None else table.by_id(row[2])
+                valid = (
+                    source_fact is not None and source_fact.storage == "span"
+                    and source_fact.physical_dtype is not None
+                    and type(source_fact.rank) is int and source_fact.rank > 0
+                    and result_fact is not None and result_fact.storage == "span"
+                    and result_fact.rank == (source_fact.rank + 1 if unsqueeze else 1)
+                    and result_fact.physical_dtype == source_fact.physical_dtype
+                    and source is not None and result is not None
+                    and source.metadata_state == result.metadata_state == "dynamic"
+                    and result.storage == "view" and result.alias_of == source_id
+                    and result.data_value_id == source.data_value_id
+                    and (source.shape_value_id, source.rank_value_id,
+                         source.element_count_value_id)
+                    == (source_shape, source_rank, source_count)
+                    and (result.shape_value_id, result.rank_value_id,
+                         result.element_count_value_id)
+                    == (result_shape, result_rank, source_count)
+                )
+            if valid:
+                causes = {cause for cause, _stage in book.edges_into(ref)}
+                rank = source_fact.rank
+                output_rank = rank + 1 if unsqueeze else 1
+                values = (source_id, row[2], source_shape, source_rank,
+                          source_count, result_shape, result_rank)
+                if unsqueeze:
+                    axis_cell = ssa_value_identity_cell(function, axis_id, book=book)
+                    canonical_axes = (tuple(cause for cause, _stage in book.edges_into(
+                        axis_cell) if cause.page == CANONICAL_VALUE)
+                        if axis_cell is not None else ())
+                    literal, literal_cells = (
+                        literal_from_identity(book, canonical_axes[0])
+                        if len(canonical_axes) == 1 else (None, ())
+                    )
+                    valid = (
+                        type(literal) is int and -rank - 1 <= literal <= rank
+                        and axis == (literal if literal >= 0 else literal + rank + 1)
+                        and canonical_axes[0] in causes and bool(literal_cells)
+                        and set(literal_cells) <= causes
+                    )
+                    values = (*values, axis_id)
+                valid = valid and all((cell := ssa_value_identity_cell(
+                        function, value_id, book=book,
+                    )) is not None and cell in causes for value_id in values)
+            if valid:
+                definitions = {}
+                for block in function.blocks.values():
+                    for instruction in block.instrs:
+                        if instruction.res is not None:
+                            definitions.setdefault(int(instruction.res.id), []).append(instruction)
+
+                def definition(value_id, operation, arguments=None):
+                    items = definitions.get(value_id, ())
+                    return (items[0] if len(items) == 1
+                            and items[0].op == operation
+                            and (arguments is None or tuple(
+                                int(value.id) for value in items[0].args
+                            ) == arguments) else None)
+
+                vector = definition(result_shape, "Const")
+                rank_definition = definition(result_rank, "Const")
+                valid = (
+                    vector is not None
+                    and tuple(vector.attributes.get("values", ())) == (0,) * output_rank
+                    and rank_definition is not None
+                    and _constant_payload(rank_definition) == output_rank
+                )
+                for value_id, kind in ((source_shape, "shape"),
+                                       (source_rank, "rank"),
+                                       (source_count, "element_count")):
+                    extent = definition(value_id, "extent", (source_id,))
+                    valid = (valid and extent is not None
+                             and extent.attributes.get("extent_kind") == kind)
+                for value_id, storage, physical_rank, shape in (
+                    (source_shape, "span", 1, (rank,)),
+                    (source_rank, "scalar", 0, ()),
+                    (source_count, "scalar", 0, ()),
+                    (result_shape, "span", 1, (output_rank,)),
+                    (result_rank, "scalar", 0, ()),
+                ):
+                    physical = posted_ssa_value_fact(function, value_id, book=book)
+                    valid = (valid and physical is not None
+                             and physical.physical_dtype == "int32"
+                             and physical.storage == storage
+                             and physical.rank == physical_rank
+                             and physical.shape == shape)
+            if valid:
+                slots = {}
+                for block in function.blocks.values():
+                    for store in block.instrs:
+                        if store.op != "Store" or len(store.args) != 2:
+                            continue
+                        address = definition(int(store.args[1].id), "GetElementPtr")
+                        if (address is None or len(address.args) != 2
+                                or int(address.args[0].id) != result_shape):
+                            continue
+                        index = definition(int(address.args[1].id), "Const")
+                        if index is not None and type(_constant_payload(index)) is int:
+                            slots.setdefault(_constant_payload(index), []).append(int(store.args[0].id))
+                valid = (set(slots) == set(range(output_rank))
+                         and all(len(items) == 1 for items in slots.values()))
+                for position in range(output_rank):
+                    if not valid:
+                        break
+                    value_id = slots[position][0]
+                    dimension = posted_ssa_value_fact(function, value_id, book=book)
+                    valid = (
+                        dimension is not None and dimension.physical_dtype == "int32"
+                        and dimension.storage == "scalar" and dimension.rank == 0
+                        and any(cause.page == SSA_VALUE
+                                and cause.row == (row[0], value_id) for cause in causes)
+                    )
+                    if not valid:
+                        break
+                    if flatten:
+                        valid = value_id == source_count
+                    elif position == axis:
+                        one = definition(value_id, "Const")
+                        valid = one is not None and _constant_payload(one) == 1
+                    else:
+                        load = definition(value_id, "Load")
+                        address = (definition(int(load.args[0].id), "GetElementPtr")
+                                   if load is not None and len(load.args) == 1 else None)
+                        index = (definition(int(address.args[1].id), "Const")
+                                 if address is not None and len(address.args) == 2 else None)
+                        valid = (
+                            index is not None and int(address.args[0].id) == source_shape
+                            and _constant_payload(index) == position - (position > axis)
+                        )
+            if valid:
+                bindings = tuple(binding for binding in book.page(
+                    TENSOR_METADATA_RESULT_BINDING).rows()
+                    if binding[2:] == (function.name, int(row[2])))
+                expected = {
+                    (function_scope_of(caller), int(call.res.id), function.name, int(row[2]))
+                    for caller in module.functions.values()
+                    for block in caller.blocks.values() for call in block.instrs
+                    if call.op == "Call" and call.res is not None
+                    and call.attributes.get("callee") == function.name
+                    and int(row[2]) in tuple(map(int, call.attributes.get("output_ids", ())))
+                }
+                valid = set(bindings) == expected and all(
+                    book.page(TENSOR_METADATA_RESULT_BINDING).latest(binding)[1]
+                    == (result_shape, result_rank, source_count)
+                    and ref in {cause for cause, _stage in book.edges_into(
+                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING, binding))}
+                    for binding in bindings
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-runtime-view-geometry", str(row[1]) if function is not None else str(row),
+                    row[2] if isinstance(row, tuple) and len(row) == 3 else None,
+                    "runtime view lacks exact source storage, axis transform or metadata transport",
+                ))
+        return found
+
+    @staticmethod
+    def _tensor_runtime_broadcast_validity_findings(module: Any) -> list[Finding]:
+        """Check an authored mixed broadcast's two sources and guarded result."""
+
+        from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
+        from .concordance_declarations import (
+            SSA_BLOCK, SSA_CONTROL_EDGE, SSA_VALUE,
+            TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+            TENSOR_RUNTIME_BROADCAST_VALIDITY,
+        )
+        from .native_faults import BROADCAST_INCOMPATIBLE_SHAPE
+        from .ssa_record_return_state import (
+            accepted_ssa_component, function_scope_of,
+            posted_ssa_value_fact, ssa_block_identity_cell,
+        )
+        from .tensor_ssa_lowering import _SHAPED_SSA_OPERATIONS
+
+        book = identity_book(module)
+        page = book.page(TENSOR_RUNTIME_BROADCAST_VALIDITY)
+        found = []
+        for row in page.rows():
+            ref = book.latest_ref(TENSOR_RUNTIME_BROADCAST_VALIDITY, row)
+            fact = page.cell(ref.row, ref.column)
+            valid = (
+                isinstance(row, tuple) and len(row) == 3
+                and isinstance(fact, tuple) and len(fact) == 19
+                and isinstance(fact[0], str)
+                and all(type(item) is int for item in fact[1:16])
+                and all(isinstance(item, str) for item in fact[16:])
+            )
+            function = module.functions.get(str(row[1])) if valid else None
+            if valid:
+                valid = function is not None and function_scope_of(function) == row[0]
+            if valid:
+                (operation, left, right, wide, narrow,
+                 wide_shape, wide_rank, wide_count,
+                 narrow_shape, narrow_rank, narrow_count,
+                 aligned, output_shape, output_rank, output_count,
+                 status, helper_name, fault_name, pass_name) = fact
+                table = module.tensor_tables.get(function.name)
+                left_desc = None if table is None else table.by_id(left)
+                right_desc = None if table is None else table.by_id(right)
+                wide_desc = None if table is None else table.by_id(wide)
+                narrow_desc = None if table is None else table.by_id(narrow)
+                output_desc = None if table is None else table.by_id(row[2])
+                wide_fact = posted_ssa_value_fact(function, wide, book=book)
+                narrow_fact = posted_ssa_value_fact(function, narrow, book=book)
+                result_fact = posted_ssa_value_fact(function, row[2], book=book)
+                valid = (
+                    c_tensor_opcode(operation) is not None
+                    and c_tensor_opcode(operation)[0] == "binary"
+                    and left != right and {wide, narrow} == {left, right}
+                    and all(item is not None for item in (
+                        left_desc, right_desc, wide_desc, narrow_desc,
+                        output_desc, wide_fact, narrow_fact, result_fact,
+                    ))
+                    and wide_fact.storage == narrow_fact.storage == "span"
+                    and wide_fact.rank == 2 and narrow_fact.rank in {1, 2}
+                    and result_fact.storage == "span" and result_fact.rank == 2
+                    and wide_desc.metadata_state == narrow_desc.metadata_state
+                    == output_desc.metadata_state == "dynamic"
+                    and (wide_desc.shape_value_id, wide_desc.rank_value_id,
+                         wide_desc.element_count_value_id) == (
+                             wide_shape, wide_rank, wide_count)
+                    and (narrow_desc.shape_value_id, narrow_desc.rank_value_id,
+                         narrow_desc.element_count_value_id) == (
+                             narrow_shape, narrow_rank, narrow_count)
+                    and (output_desc.shape_value_id, output_desc.rank_value_id,
+                         output_desc.element_count_value_id) == (
+                             output_shape, output_rank, output_count)
+                    and fault_name in function.blocks
+                    and pass_name in function.blocks
+                )
+            if valid:
+                definitions = {}
+                for block in function.blocks.values():
+                    for instruction in block.instrs:
+                        if instruction.res is not None:
+                            definitions.setdefault(int(instruction.res.id), []).append(
+                                (block, instruction)
+                            )
+
+                def definition(value_id, op=None):
+                    matches = definitions.get(int(value_id), ())
+                    return (matches[0][1] if len(matches) == 1
+                            and (op is None or matches[0][1].op == op)
+                            else None)
+
+                source = definition(row[2])
+                helper_call = definition(status, "Call")
+                output_vector = definition(output_shape, "Const")
+                rank_def = definition(output_rank, "Const")
+                count_def = definition(output_count, "Cast")
+                valid = (
+                    source is not None and c_tensor_opcode(
+                        _SHAPED_SSA_OPERATIONS.get(source.op, source.op)
+                    ) == c_tensor_opcode(operation)
+                    and len(source.args) == 2
+                    and helper_call is not None
+                    and helper_call.attributes.get("callee") == helper_name
+                    and len(helper_call.args) == 5
+                    and output_vector is not None
+                    and tuple(output_vector.attributes.get("values", ())) == (0, 0)
+                    and rank_def is not None
+                    and rank_def.attributes.get("constant") == 2
+                    and count_def is not None
+                    and count_def.attributes.get("conversion_kind")
+                    == "integer_conversion"
+                    and count_def.attributes.get("overflow") == "trap"
+                    and count_def.attributes.get("binding")
+                    == "broadcast-count-narrowing"
+                    and count_def.attributes.get("source_dtype") == "int64"
+                    and count_def.attributes.get("target_dtype") == "int32"
+                )
+                if valid:
+                    product = definition(int(count_def.args[0].id), "Mul")
+                    derived_ids = {int(count_def.args[0].id)}
+                    dimensions = () if product is None else tuple(
+                        definition(int(value.id), "Cast")
+                        for value in product.args
+                    )
+                    slots = []
+                    for converted in dimensions:
+                        if (converted is None or len(converted.args) != 1
+                                or converted.attributes.get("source_dtype") != "int32"
+                                or converted.attributes.get("target_dtype") != "int64"):
+                            break
+                        loaded = definition(int(converted.args[0].id), "Load")
+                        address = (definition(int(loaded.args[0].id), "GetElementPtr")
+                                   if loaded is not None and len(loaded.args) == 1
+                                   else None)
+                        index = (definition(int(address.args[1].id), "Const")
+                                 if address is not None and len(address.args) == 2
+                                 else None)
+                        if (address is None or int(address.args[0].id) != output_shape
+                                or index is None):
+                            break
+                        derived_ids.update((
+                            int(converted.res.id), int(loaded.res.id),
+                            int(index.res.id),
+                        ))
+                        slots.append(index.attributes.get("constant"))
+                    valid = (product is not None and len(product.args) == 2
+                             and slots == [0, 1])
+                if valid:
+                    # The live binary consumes the two checked broadcast
+                    # results in authored operand order. A proved shape on
+                    # an unrelated result must not discharge this row.
+                    broadcast_calls = tuple(
+                        definition(int(value.id), "Call") for value in source.args
+                    )
+                    valid = all(call is not None for call in broadcast_calls)
+                    if valid:
+                        valid = all(
+                            call.attributes.get("callee") == "broadcast_int64"
+                            and len(call.args) >= 6
+                            and int(call.args[0].id) == operand_id
+                            and int(call.args[4].id) == output_shape
+                            and int(call.args[5].id) == output_rank
+                            for call, operand_id in zip(
+                                broadcast_calls, (left, right), strict=True,
+                            )
+                        )
+                if valid and narrow_fact.rank == 2:
+                    valid = aligned == narrow_shape
+                elif valid:
+                    aligned_def = definition(aligned, "Const")
+                    stores = tuple(
+                        instruction for block in function.blocks.values()
+                        for instruction in block.instrs
+                        if instruction.op == "Store"
+                        and len(instruction.args) == 2
+                    )
+                    exact_store = False
+                    for store in stores:
+                        destination = definition(
+                            int(store.args[1].id), "GetElementPtr",
+                        )
+                        copied = definition(int(store.args[0].id), "Load")
+                        source_address = (
+                            definition(int(copied.args[0].id), "GetElementPtr")
+                            if copied is not None and len(copied.args) == 1
+                            else None
+                        )
+                        if (destination is None or source_address is None
+                                or len(destination.args) != 2
+                                or len(source_address.args) != 2
+                                or int(destination.args[0].id) != aligned
+                                or int(source_address.args[0].id)
+                                != narrow_shape):
+                            continue
+                        target_index = definition(
+                            int(destination.args[1].id), "Const",
+                        )
+                        source_index = definition(
+                            int(source_address.args[1].id), "Const",
+                        )
+                        if (target_index is not None and source_index is not None
+                                and target_index.attributes.get("constant") == 1
+                                and source_index.attributes.get("constant") == 0):
+                            exact_store = True
+                            derived_ids.update((
+                                int(copied.res.id), int(source_address.res.id),
+                                int(destination.res.id), int(target_index.res.id),
+                                int(source_index.res.id),
+                            ))
+                    valid = (aligned_def is not None
+                             and tuple(aligned_def.attributes.get("values", ()))
+                             == (1, 0) and exact_store)
+            if valid:
+                helper = module.functions.get(helper_name)
+                valid = helper is not None and accepted_ssa_component(helper)
+                if valid:
+                    accepted = helper.metadata["accepted_ssa_component"]
+                    owner = accepted["identity_book"]
+                    digest = accepted["artifact_sha256"]
+                    parameter_names = dict(helper.metadata.get("parameter_names") or ())
+                    expected = {
+                        "rank": output_rank,
+                        "left": wide_shape,
+                        "right": aligned,
+                        "output": output_shape,
+                    }
+                    start = parameter_names.get("start")
+                    valid = (
+                        set(parameter_names) == {
+                            "rank", "start", "left", "right", "output",
+                        }
+                        and set(map(int, parameter_names.values())) == {
+                            int(formal.id) for formal in helper.args
+                        }
+                        and tuple(map(int, helper_call.attributes.get(
+                            "callee_input_ids", ())))
+                        == tuple(int(formal.id) for formal in helper.args)
+                        and len(helper_call.args) == len(helper.args) == 5
+                        and all(int(actual.id) == expected[name]
+                                for name in expected
+                                for actual, formal in zip(
+                                    helper_call.args, helper.args, strict=True,
+                                ) if int(formal.id) == parameter_names[name])
+                        and start is not None
+                        and len(tuple(formal for formal in helper.args
+                                      if int(formal.id) == start)) == 1
+                    )
+                    if valid:
+                        start_actual = next(actual for actual, formal in zip(
+                            helper_call.args, helper.args, strict=True,
+                        ) if int(formal.id) == start)
+                        start_def = definition(int(start_actual.id), "Const")
+                        valid = start_def is not None and start_def.attributes.get(
+                            "constant") == 0
+                if valid:
+                    causes = {cause for cause, _ in book.edges_into(ref)}
+                    imported = tuple(cause for cause in causes
+                                     if cause.page == IMPORTED_CELL)
+                    valid = len(imported) == 5 and all(
+                        any(
+                            receipt.row == (digest, source_ref.key)
+                            and book.page(IMPORTED_CELL).cell(
+                                receipt.row, receipt.column,
+                            ).owner is owner
+                            for receipt in imported
+                        )
+                        for formal in helper.args
+                        if (source_ref := owner.latest_ref(
+                            SSA_VALUE,
+                            (function_scope_of(helper), int(formal.id)),
+                        )) is not None
+                    )
+                    valid = valid and all(owner.latest_ref(
+                        SSA_VALUE, (function_scope_of(helper), int(formal.id)),
+                    ) is not None for formal in helper.args)
+            if valid:
+                # The complete Call binding selects each projected caller
+                # metadata triple by exact predecessor result identity.
+                calls = tuple(cause for cause in causes
+                              if cause.page == TENSOR_METADATA_CALL_BINDING)
+                predecessors = tuple(cause for cause in causes
+                                     if cause.page == TENSOR_METADATA_RESULT_BINDING)
+                valid = len(calls) == 1 and len(predecessors) == 2
+                if valid:
+                    call_fact = book.page(TENSOR_METADATA_CALL_BINDING).cell(
+                        calls[0].row, calls[0].column,
+                    )
+                    pairs = tuple(zip(*call_fact, strict=True))
+                    source_ids = (wide, narrow)
+                    groups = ((wide_shape, wide_rank, wide_count),
+                              (narrow_shape, narrow_rank, narrow_count))
+                    valid = (
+                        calls[0].row[4] == function.name
+                        and {cause.row[3] for cause in predecessors}
+                        == set(source_ids)
+                        and all(
+                            all(sum(actual == projected and formal == required
+                                    for actual, formal in pairs) == 1
+                                for projected, required in zip(
+                                    book.page(TENSOR_METADATA_RESULT_BINDING).cell(
+                                        predecessor.row, predecessor.column,
+                                    )[2], group, strict=True,
+                                ))
+                            for source_id, group in zip(source_ids, groups)
+                            for predecessor in predecessors
+                            if predecessor.row[3] == source_id
+                        )
+                    )
+            if valid:
+                guard = tuple((block, instruction)
+                              for block in function.blocks.values()
+                              for instruction in block.instrs
+                              if instruction.op == "CondBr"
+                              and instruction.attributes.get("true_target")
+                              == fault_name
+                              and instruction.attributes.get("false_target")
+                              == pass_name)
+                fault = function.blocks[fault_name]
+                passed = function.blocks[pass_name]
+                valid = (
+                    len(guard) == 1 and len(guard[0][1].args) == 1
+                    and guard[0][0].successors == [fault_name, pass_name]
+                    and guard[0][1].attributes.get("runtime_broadcast_error")
+                    == BROADCAST_INCOMPATIBLE_SHAPE
+                    and not fault.successors and passed.instrs
+                    and len(fault.instrs) == 2
+                    and fault.instrs[0].op == "Call"
+                    and fault.instrs[0].attributes.get("callee")
+                    == "turing_validation_error"
+                    and fault.instrs[0].attributes.get("error_code")
+                    == BROADCAST_INCOMPATIBLE_SHAPE
+                    and fault.instrs[1].op == "Trap"
+                    and fault.instrs[1].attributes.get("fault_exit") is True
+                    and definition(int(guard[0][1].args[0].id), "Eq") is not None
+                )
+                if valid:
+                    predicate = definition(int(guard[0][1].args[0].id), "Eq")
+                    valid = (len(predicate.args) == 2
+                             and int(predicate.args[0].id) == status
+                             and (zero := definition(int(predicate.args[1].id),
+                                                     "Const")) is not None
+                             and zero.attributes.get("constant") == 0)
+            if valid:
+                before = ssa_block_identity_cell(
+                    function, guard[0][0].name, book=book,
+                )
+                failed = ssa_block_identity_cell(function, fault_name, book=book)
+                passing = ssa_block_identity_cell(function, pass_name, book=book)
+                edges = tuple(book.latest_ref(SSA_CONTROL_EDGE, (
+                    row[0], function.name, first, second, arm,
+                )) for first, second, arm in (
+                    (before, failed, "body"),
+                    (before, passing, "orelse"),
+                )) if all((before, failed, passing)) else ()
+                required_values = {row[2], *fact[1:16], *derived_ids,
+                                   int(guard[0][1].args[0].id)}
+                cited_values = {cause.row[1] for cause in causes
+                                if cause.page == SSA_VALUE
+                                and cause.row[0] == row[0]}
+                valid = (
+                    all((before, failed, passing))
+                    and len(edges) == 2 and all(edge is not None for edge in edges)
+                    and {before, failed, passing, *edges} <= causes
+                    and required_values <= cited_values
+                    and passed.instrs[-1].op == "Ret"
+                )
+            if not valid:
+                found.append(Finding(
+                    "tensor-runtime-broadcast-validity", str(row[1]), row[2],
+                    "mixed binary lacks exact operands, imported helper, "
+                    "metadata pairs, checked geometry, or guarded control",
+                ))
+        return found
+
+
+    @staticmethod
     def _tensor_elementwise_extent_binding_findings(module: Any) -> list[Finding]:
         """A binary span result uses its exact input's transported extent."""
 
@@ -5885,6 +6600,7 @@ class CorrelationTable:
         from .concordance_declarations import (
             SSA_VALUE, TENSOR_ELEMENTWISE_EXTENT_BINDING,
             TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+            TENSOR_RUNTIME_BROADCAST_VALIDITY,
         )
         from .ssa_record_return_state import (
             function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
@@ -5957,8 +6673,20 @@ class CorrelationTable:
                         and metadata_results[0] in {
                             cause for cause, _stage in book.edges_into(metadata_calls[0])
                         }
-                        and book.page(TENSOR_METADATA_CALL_BINDING).cell(
-                            metadata_calls[0].row, metadata_calls[0].column)[1] == ids
+                        and all(sum(
+                            actual == projected and formal == required
+                            for actual, formal in zip(
+                                *book.page(TENSOR_METADATA_CALL_BINDING).cell(
+                                    metadata_calls[0].row,
+                                    metadata_calls[0].column,
+                                ), strict=True,
+                            )
+                        ) == 1 for projected, required in zip(
+                            book.page(TENSOR_METADATA_RESULT_BINDING).cell(
+                                metadata_results[0].row,
+                                metadata_results[0].column,
+                            )[2], ids, strict=True,
+                        ))
                     )
             if not valid:
                 found.append(Finding(
@@ -6013,6 +6741,8 @@ class CorrelationTable:
                             and descriptor.metadata_state == "dynamic"
                             for descriptor in source_descriptors)
                             and book.latest_ref(TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                                                (scope, function.name, result_id)) is None
+                            and book.latest_ref(TENSOR_RUNTIME_BROADCAST_VALIDITY,
                                                 (scope, function.name, result_id)) is None):
                         found.append(Finding(
                             "tensor-elementwise-extent-missing",
@@ -6026,7 +6756,8 @@ class CorrelationTable:
         """Computed metadata must traverse one exact aggregate call output."""
 
         from .concordance_declarations import (
-            SSA_VALUE, TENSOR_METADATA_RESULT_BINDING,
+            AGGREGATE_PASSTHROUGH_REBINDING, SSA_VALUE,
+            TENSOR_METADATA_RESULT_BINDING,
             TENSOR_OWNED_HEAP_BINDING,
         )
         from .ssa_record_return_state import function_scope_of
@@ -6058,6 +6789,100 @@ class CorrelationTable:
                                    for instruction in block.instrs)), None)
             callee = module.functions.get(row[2])
             valid = valid and caller is not None and callee is not None
+            # A legal aggregate pass-through removes three metadata Loads.
+            # The revised result row names their exact caller input actuals,
+            # with the predecessor result and three rebinding receipts as
+            # its authority. Program: arange -> cast -> sum. The original
+            # projected ids 4019/4022/4025 were no longer live after the
+            # rewrite; accepting them from the old row silently described
+            # deleted SSA instructions.
+            if valid and ref.column > 0:
+                previous = Ref(TENSOR_METADATA_RESULT_BINDING, row,
+                               ref.column - 1)
+                previous_fact = page.cell(previous.row, previous.column)
+                causes = {source for source, _ in book.edges_into(ref)}
+                rebinding_cells = tuple(
+                    source for source in causes
+                    if source.page == AGGREGATE_PASSTHROUGH_REBINDING
+                )
+                call = next(instruction for block in caller.blocks.values()
+                            for instruction in block.instrs
+                            if instruction.op == "Call"
+                            and instruction.res is not None
+                            and int(instruction.res.id) == row[1]
+                            and instruction.attributes.get("callee") == row[2])
+                passthroughs = tuple(call.attributes.get(
+                    "aggregate_output_passthrough_bindings", ()))
+                returns = tuple(instruction for block in callee.blocks.values()
+                                for instruction in block.instrs
+                                if instruction.op == "Ret")
+                mapping = {
+                    int(source.row[1]): (
+                        source,
+                        book.page(AGGREGATE_PASSTHROUGH_REBINDING).cell(
+                            source.row, source.column,
+                        ),
+                    ) for source in rebinding_cells
+                }
+                valid = (
+                    previous in causes and len(rebinding_cells) == 3
+                    and isinstance(previous_fact, tuple)
+                    and len(previous_fact) == 3
+                    and previous_fact[0] == fact[0]
+                    and previous_fact[1] == fact[1]
+                    and len(returns) == 1
+                    and row[3] in tuple(map(int, call.attributes.get(
+                        "output_ids", ())))
+                    and set(map(int, previous_fact[2])) == set(mapping)
+                    and len(passthroughs) >= 3
+                )
+                if valid:
+                    for old_id, new_id, callee_id in zip(
+                        previous_fact[2], fact[2], fact[1], strict=True,
+                    ):
+                        rebind = mapping.get(int(old_id))
+                        matching = tuple(binding for binding in passthroughs
+                                         if len(binding) >= 4
+                                         and int(binding[1]) == int(old_id))
+                        if (rebind is None or len(matching) != 1
+                                or tuple(rebind[1][:3]) != (
+                                    int(new_id), callee.name,
+                                    int(old_id),
+                                )
+                                or int(matching[0][2]) != int(callee_id)
+                                or int(matching[0][3]) != int(new_id)
+                                or int(matching[0][0]) >= len(returns[0].args)
+                                or int(returns[0].args[
+                                    int(matching[0][0])
+                                ].id) != int(callee_id)
+                                or sum(int(actual.id) == int(new_id)
+                                       and int(formal.id) == int(callee_id)
+                                       for actual, formal in zip(
+                                           call.args, callee.args,
+                                       )) != 1):
+                            valid = False
+                            break
+                if valid:
+                    projections = tuple(instruction for block in caller.blocks.values()
+                                        for instruction in block.instrs
+                                        if instruction.op == "Load"
+                                        and instruction.res is not None
+                                        and int(instruction.res.id) == row[3])
+                    valid = (
+                        len(projections) == 1
+                        and all((projections[0].res.accounting or {}).get(key)
+                                == value_id for key, value_id in zip(
+                                    keys, fact[2], strict=True,
+                                ))
+                    )
+                if not valid:
+                    found.append(Finding(
+                        "tensor-metadata-result-binding-disagreement",
+                        str(row[2]), int(row[3]),
+                        "computed metadata pass-through lacks exact return, "
+                        "rebound actual, or predecessor result proof",
+                    ))
+                continue
             if valid:
                 call = next(instruction for block in caller.blocks.values()
                             for instruction in block.instrs

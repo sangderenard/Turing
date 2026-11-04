@@ -800,12 +800,102 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
     from .concordance_declarations import (
         CALL_RECORD, ARGUMENT_BINDING, RESULT_STORAGE_BINDING,
         SEQUENCE_DESCRIPTOR, AGGREGATE_ABI_LEGALIZATION,
-        TENSOR_RUNTIME_RESHAPE_VALIDITY,
+        TENSOR_RUNTIME_RESHAPE_VALIDITY, TENSOR_RUNTIME_VIEW_GEOMETRY,
+        TENSOR_METADATA_RESULT_BINDING, AGGREGATE_PASSTHROUGH_REBINDING,
+        TENSOR_METADATA_CALL_BINDING,
     )
-    from .identity_concordance import current_identity_book
+    from .identity_concordance import Derived, Mode, current_identity_book
     from .ssa_record_return_state import function_scope_of
 
     book = current_identity_book()
+
+    def project_metadata_passthrough(function, call_id, callee_name, bindings):
+        """Carry one computed metadata triple through exact aggregate folds."""
+        replacements = {
+            int(original): (int(actual), int(callee_id))
+            for _position, original, callee_id, actual, *_ in bindings
+        }
+        page = book.page(TENSOR_METADATA_RESULT_BINDING)
+        for row in tuple(page.rows()):
+            if row[:3] != (function_scope_of(function), int(call_id), callee_name):
+                continue
+            prior = book.latest_ref(TENSOR_METADATA_RESULT_BINDING, row)
+            output_id, formal_ids, caller_ids = page.cell(prior.row, prior.column)
+            if not any(int(value_id) in replacements for value_id in caller_ids):
+                continue
+            if not all(
+                int(value_id) in replacements
+                and replacements[int(value_id)][1] == int(formal_id)
+                for value_id, formal_id in zip(caller_ids, formal_ids, strict=True)
+            ):
+                raise ValueError("computed metadata has an incomplete aggregate fold")
+            current_ids = tuple(replacements[int(value_id)][0]
+                                for value_id in caller_ids)
+            rebinding_cells = tuple(
+                book.latest_ref(AGGREGATE_PASSTHROUGH_REBINDING,
+                                (function_scope_of(function), int(value_id)))
+                for value_id in caller_ids
+            )
+            if any(cell is None for cell in rebinding_cells):
+                raise ValueError("computed metadata fold lacks its exact rebinding")
+            occurrences = list(function.args)
+            for block in function.blocks.values():
+                for instruction in block.instrs:
+                    occurrences.extend(instruction.args)
+                    if instruction.res is not None:
+                        occurrences.append(instruction.res)
+            for value in occurrences:
+                if int(value.id) != int(output_id):
+                    continue
+                accounting = dict(value.accounting or {})
+                for key, old_id, new_id in zip(
+                    ("tensor_shape_value_id", "tensor_rank_value_id",
+                     "tensor_element_count_value_id"),
+                    caller_ids, current_ids, strict=True,
+                ):
+                    if accounting.get(key) not in (None, int(old_id), int(new_id)):
+                        raise ValueError(
+                            "computed metadata fold disagrees with result accounting"
+                        )
+                    accounting[key] = int(new_id)
+                value.accounting = accounting
+            book.post(
+                TENSOR_METADATA_RESULT_BINDING, row,
+                (int(output_id), tuple(map(int, formal_ids)), current_ids),
+                stage=AGGREGATE_ABI_LEGALIZATION,
+                provenance=Derived((prior, *rebinding_cells)), mode=Mode.REVISE,
+            )
+            # The same projected values can already be actuals of a later
+            # planned Call. The fold rewrites its live operands; revise the
+            # one booked Call binding through the same exact three rebindings.
+            call_page = book.page(TENSOR_METADATA_CALL_BINDING)
+            for call_row in tuple(call_page.rows()):
+                if call_row[0] != function_scope_of(function) or call_row[1] != function.name:
+                    continue
+                previous_call = book.latest_ref(TENSOR_METADATA_CALL_BINDING, call_row)
+                actual_ids, formal_input_ids = call_page.cell(
+                    previous_call.row, previous_call.column,
+                )
+                if not any(int(value_id) in caller_ids for value_id in actual_ids):
+                    continue
+                if not all(sum(int(actual_id) == int(old_id)
+                               for actual_id in actual_ids) == 1
+                           for old_id in caller_ids):
+                    raise ValueError("computed metadata Call fold is incomplete")
+                revised_actuals = tuple(
+                    replacements[int(value_id)][0]
+                    if int(value_id) in caller_ids else int(value_id)
+                    for value_id in actual_ids
+                )
+                book.post(
+                    TENSOR_METADATA_CALL_BINDING, call_row,
+                    (revised_actuals, tuple(map(int, formal_input_ids))),
+                    stage=AGGREGATE_ABI_LEGALIZATION,
+                    provenance=Derived((previous_call, *rebinding_cells,
+                                        book.latest_ref(TENSOR_METADATA_RESULT_BINDING,
+                                                        row))),
+                    mode=Mode.REVISE,
+                )
 
     def returned_formal_cells(function, call, callee_id, caller_id, actual):
         """The exact callsite's incumbent formal/result/storage relation."""
@@ -951,6 +1041,7 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                 ))
                 if not caller_ids:
                     continue
+                call_id = int(call.res.id)
                 debug_callsite = os.environ.get(
                     "TURING_DEBUG_AGGREGATE_CALLSITE"
                 )
@@ -1039,17 +1130,44 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                         None if table is None else table.by_id(caller_id)
                     )
                     target = module.functions.get(callee_name)
+                    view_row = (
+                        (function_scope_of(target), target.name, int(caller_id))
+                        if target is not None else None
+                    )
+                    reshape_proof = (
+                        book.latest_ref(TENSOR_RUNTIME_RESHAPE_VALIDITY,
+                                        view_row)
+                        if view_row is not None else None
+                    )
+                    unsqueeze_proof = (
+                        book.latest_ref(TENSOR_RUNTIME_VIEW_GEOMETRY,
+                                        view_row)
+                        if view_row is not None else None
+                    )
+                    unsqueeze_source = (
+                        int(book.page(TENSOR_RUNTIME_VIEW_GEOMETRY).cell(
+                            unsqueeze_proof.row, unsqueeze_proof.column,
+                        )[1]) if unsqueeze_proof is not None else None
+                    )
+                    source_descriptor = (
+                        table.by_id(unsqueeze_source)
+                        if table is not None and unsqueeze_source is not None
+                        else None
+                    )
                     runtime_view = (
-                        target is not None
-                        and output_descriptor is not None
+                        output_descriptor is not None
                         and output_descriptor.metadata_state == "dynamic"
                         and output_descriptor.data_value_id == callee_id
-                        and output_descriptor.alias_of == callee_id
-                        and book.latest_ref(
-                            TENSOR_RUNTIME_RESHAPE_VALIDITY,
-                            (function_scope_of(target), target.name,
-                             int(caller_id)),
-                        ) is not None
+                        and (
+                            (reshape_proof is not None
+                             and output_descriptor.alias_of == callee_id)
+                            or (unsqueeze_proof is not None
+                                and output_descriptor.alias_of
+                                == unsqueeze_source
+                                and source_descriptor is not None
+                                and source_descriptor.data_value_id
+                                == callee_id)
+                        )
                     )
                     if runtime_view:
                         # The exact reshape validity receipt gives this view
@@ -1234,6 +1352,10 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                     call.attributes[
                         "aggregate_output_passthrough_bindings"
                     ] = tuple(passthrough_bindings)
+                    project_metadata_passthrough(
+                        function, int(call_id), callee_name,
+                        passthrough_bindings,
+                    )
                 if debug_this_call:
                     print(
                         "DEBUG-AGGREGATE-AFTER "

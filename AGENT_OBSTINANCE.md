@@ -287,3 +287,11 @@ interrupted after recording the missing operand page. This cost two unusable
 partial runs and delayed the exact writer report. The preventing constraint
 is to hook the specific reducer function and AST occurrence without tracing
 the whole compiler, or read the retained graph and concordance records.
+
+## 2026-11-04 — broad trace during the private reshape audit regression
+
+The agent was assigned a seconds-long trace of one failing metadata Call audit row. Its scratch script enabled `sys.settrace` before the entire public lowering, rather than only while `_tensor_metadata_call_binding_findings` ran. The traced reproduction took 24 seconds; the same source without tracing took about 9 seconds. The trace did identify the missing region2 formal tensor descriptor, but spent roughly 15 unnecessary seconds on unrelated compiler frames and delayed the writer handoff. The preventing constraint is to install tracing only around the named audit method or return `None` immediately for unrelated frames.
+
+## 2026-11-04 — full concordance audit instead of mapping selection
+
+The agent intended to run the short `tools/audit_identity_concordance.py mapping` gate after its metadata audit edit. It launched the full audit command instead. That run spent 56 seconds on unrelated examples and did not provide a terminal result relevant to the metadata slice. The selected mapping audit later completed in 7.88 seconds with 28 rows and zero findings. The preventing constraint is to use the exact named selection in the command, and widen only for a concrete remaining risk.
