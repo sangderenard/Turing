@@ -368,3 +368,16 @@ extended with the earlier adopted row and the writer had to use the existing
 concordance revision operation. Inspecting the SSA row's full history and
 covering the observed prior row before accepting the producer test would have
 prevented this repeated diagnostic.
+
+## 2026-11-04 — oversized unit replay output lost the requested seed witness
+
+The agent was authorized a bounded Run48 unit0 replay to print the exact
+parameter seed ABI, SSA fact and causes. Its scratch callback printed every
+compiler progress event and the rejected module's large `repr`, yielding about
+49,309 tokens before truncation. The 6.76-second replay reproduced the refusal
+but the intended witness lines were lost in the middle of the output. The
+authorized second compact replay took 7.32 seconds and saved the rejected
+module before printing 382 tokens of exact records. The preventing constraint
+is to suppress routine
+progress, retain the rejected module through the existing artifact writer,
+and print only bounded row facts, causes and failed predicates.

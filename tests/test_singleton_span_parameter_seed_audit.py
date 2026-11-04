@@ -3,6 +3,9 @@
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
+from src.common.tensors.fused_ir import Meta
 from src.compiler.concordance_declarations import (
     CANONICAL_VALUE, INGESTION, INGEST_SOURCE, SSA_VALUE, VALUE_TYPE_ABI,
     ValueTypeABIAlternative, ValueTypeABIFact,
@@ -16,7 +19,8 @@ from src.compiler.precompile_to_ssa import lower_control_program_to_ssa
 from src.compiler.ssa_record_return_state import function_scope_of
 
 
-def test_singleton_span_seed_refuses_erased_physical_fields():
+@pytest.mark.parametrize("abi_shape", ((), (-1,)), ids=("empty", "dynamic"))
+def test_singleton_span_seed_refuses_erased_physical_fields(abi_shape):
     book, token = begin_identity_book()
     try:
         lexical = ("seed_span_audit", 0)
@@ -26,7 +30,7 @@ def test_singleton_span_seed_refuses_erased_physical_fields():
             mode=Mode.CONCORD,
         )
         arm = ValueTypeABIAlternative(
-            "AbstractTensor", "span", "int64", (), 1,
+            "AbstractTensor", "span", "int64", abi_shape, 1,
             (("program_abi", "octets"),), (canonical,),
             metadata_state="dynamic",
         )
@@ -40,7 +44,8 @@ def test_singleton_span_seed_refuses_erased_physical_fields():
             ControlProgram(SequenceBlock(())),
             function_name="seed_span_audit", lexical_read_scope=lexical,
             value_name_histories={"octets": (2,)},
-            parameter_names=("octets",), region_value_meta={},
+            parameter_names=("octets",),
+            region_value_meta={2: Meta((), "int64")},
         )
         assert shortfalls == ()
         module = SimpleNamespace(
@@ -53,6 +58,12 @@ def test_singleton_span_seed_refuses_erased_physical_fields():
         original = book.page(SSA_VALUE).cell(cell.row, cell.column)
         book.page(SSA_VALUE).cells[(cell.row, cell.column)] = replace(
             original, physical_dtype=None, storage=None, rank=None,
+        )
+        assert [finding.kind for finding in findings(module)] == [
+            "singleton-span-parameter-seed-disagreement"]
+        book.page(SSA_VALUE).cells[(cell.row, cell.column)] = original
+        book.page(SSA_VALUE).cells[(cell.row, cell.column)] = replace(
+            original, shape=(2,),
         )
         assert [finding.kind for finding in findings(module)] == [
             "singleton-span-parameter-seed-disagreement"]
