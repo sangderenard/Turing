@@ -1815,6 +1815,15 @@ def _publish_exact_ssa_call_shapes(module: IRModule) -> dict[
                     explicit_view = (actual.accounting or {}).get(
                         "ssa_storage_view"
                     )
+                    # compact_codewords: the Mul feeding sum has a display
+                    # shape (1, 8), but its producer descriptor has runtime
+                    # shape/rank/count. An SSA occurrence alone cannot state
+                    # full extents for the next region's formal. Wait for the
+                    # existing computed-metadata Call binding to carry them.
+                    if (native_result is None and not explicit_view
+                            and (descriptor is None
+                                 or descriptor.metadata_state != "static")):
+                        continue
                     extents = tuple(
                         native_result[0]
                         if native_result is not None and not explicit_view
@@ -4910,6 +4919,7 @@ def lower_tensor_calls_to_repository_ssa(
                     str(descriptor.dtype),
                     tuple(descriptor.shape),
                     tuple(descriptor.strides),
+                    str(descriptor.metadata_state),
                 )
                 for descriptor in candidates
             }
@@ -5114,6 +5124,18 @@ def lower_tensor_calls_to_repository_ssa(
                 == "dynamic"
                 or declared_rank > len(shape)
             )
+            # The source-integral producer of compact_codewords' Mul already
+            # owns dynamic extents when the later sum region first sees this
+            # formal. Its (1, 8) display shape is not a fixed allocation.
+            # Keep the formal unresolved until computed metadata crosses the
+            # booked Call edge; the static byte-weight view remains static.
+            incoming = (
+                owner_tensor_descriptor(value)
+                if storage == "input" and tensor_id in function_argument_ids
+                else None
+            )
+            if incoming is not None and incoming.metadata_state == "dynamic":
+                declared_dynamic = True
             state = metadata_state or (
                 "dynamic"
                 if declared_dynamic
