@@ -24212,26 +24212,28 @@ def _class_surface_ssa_program(
             _VALUE_SHAPE_POLYMORPHISM, row,
         ) is not None:
             return
-        if stated:
-            cell = post_shape_statement(owner, value_id, fact, source, also=also)
-            disagreeing = tuple(
-                other for other_row in copy_statement_rows.get(row, ())
-                if other_row != cell.row
-                for other in (shape_identity_book.latest_ref(
-                    _COPY_VALUE_SHAPE, other_row,
-                ),)
-                if other is not None
-                and tuple(_cell_fact(other).shape)
-                and tuple(_cell_fact(other).shape) != stated
-            )
-            if disagreeing:
-                post_shape_polymorphism(row, (cell, *disagreeing))
-                return
+        # Program: lz_encode's list actual gives _tensor's forked formal a
+        # known (1,) shape; its later bytes Add actual92 reaches a different
+        # _tensor fork with dynamic, unstated extents. The latter is an exact
+        # copy statement even though shape=() means unknown here. Post it
+        # before withdrawing the former proof so both the polymorphism and
+        # withdrawal cite the new copy's own canonical/caller identities.
+        cell = post_shape_statement(owner, value_id, fact, source, also=also)
+        disagreeing = tuple(
+            other for other_row in copy_statement_rows.get(row, ())
+            if other_row != cell.row
+            for other in (shape_identity_book.latest_ref(
+                _COPY_VALUE_SHAPE, other_row,
+            ),)
+            if other is not None
+            and tuple(_cell_fact(other).shape) != stated
+        )
         # A fact is the shape, not who said it.  Two callsites agreeing is one
         # fact recorded once; otherwise every additional caller reads as a
         # change and a round trip between equal shapes reads as oscillation.
         previous = shape_page.latest(row)
-        if isinstance(previous, _ValueShapeFact) and tuple(previous[1:]) == tuple(fact[1:]):
+        if (not disagreeing and isinstance(previous, _ValueShapeFact)
+                and tuple(previous[1:]) == tuple(fact[1:])):
             return
         if previous is not None and tuple(previous[1] or ()) != stated:
             from .glsl_deployment_strategy import (
@@ -24247,16 +24249,18 @@ def _class_surface_ssa_program(
             )
             _invalidate_tensor_descriptor_dependents(
                 graph_wrappers[id(owner)], source_nodes,
-                "declared_abi_shape_revision",
+                "declared_abi_shape_revision", source_cells=(cell,),
             )
             _invalidate_abi_shape(
                 _abi_shape_scope_of(owner), int(value_id), int(value_id),
-                "declared_abi_shape_revision",
+                "declared_abi_shape_revision", source_cells=(cell,),
             )
+        if disagreeing:
+            post_shape_polymorphism(row, (cell, *disagreeing))
+            return
         # A second lowering of one law may declare a different batch ABI on
         # the same book. Its copy statement is the cause of this revision;
         # downstream SSA materialization must read this exact cell.
-        cell = post_shape_statement(owner, value_id, fact, source)
         shape_cell = shape_identity_book.post(
             _VALUE_SHAPE, row, _ValueShapeFact(*fact),
             stage=_LINKED_VALUE_ABI_SETTLEMENT,
