@@ -353,3 +353,18 @@ the hunk only in validation. The cost was two unnecessary file writes and a
 status/diff verification; no canonical source change remained. The preventing
 constraint is to copy the explicit validation absolute path into every patch
 header before sending an edit.
+
+## 2026-11-04 — full rerun before covering the earlier adopted SSA row
+
+The root agent was required to trace the complete writer chain and reproduce
+the actual failure before another long compressor lowering. It accepted a
+parameter-seed regression that created a fresh SSA row, although Run46's
+receiver had already been adopted from a region signature. The repair changed
+the SSA object and called an adoption lookup, which returned the old unknown
+row without recording a revision. Root launched Run47 before testing that
+existing-row case. The run spent 452.23 seconds and stopped at the same shape
+proof refusal; its DLL checks were never reached. The regression had to be
+extended with the earlier adopted row and the writer had to use the existing
+concordance revision operation. Inspecting the SSA row's full history and
+covering the observed prior row before accepting the producer test would have
+prevented this repeated diagnostic.
