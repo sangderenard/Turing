@@ -1619,6 +1619,7 @@ class CorrelationTable:
         found.extend(self._ssa_publication_findings(module))
         found.extend(self._value_type_abi_findings(module))
         found.extend(self._ssa_abi_physical_findings(module))
+        found.extend(self._singleton_span_parameter_seed_findings(module))
         found.extend(self._source_callsite_activation_findings(module))
         found.extend(self._frame_aliased_result_findings(module))
         found.extend(self._physical_call_input_conversion_findings(module))
@@ -8153,6 +8154,89 @@ class CorrelationTable:
                     found.append(Finding(
                         'ssa-abi-physical-disagreement', str(row[0]), row[1],
                         'posted physical SSA fields disagree with their exact type ABI arm',
+                    ))
+        return found
+
+    @staticmethod
+    def _singleton_span_parameter_seed_findings(module: Any) -> list[Finding]:
+        """A live call-only tensor seed must retain its exact singleton ABI.
+
+        Run46's tensor_octets_to_bytes receiver had an authored span/int64
+        ABI but was seeded as an unphysical unknown SSA value.  Check the
+        seed's own bound SSA cell, before later frame rewrites can obscure it.
+        """
+        from .concordance_declarations import (
+            BindingKind, CANONICAL_VALUE, CONTROL_VALUE_BINDING,
+            SSA_VALUE, SSAValueFact, VALUE_TYPE_ABI, ValueTypeABIFact,
+        )
+        from .ssa_record_return_state import function_scope_of
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        found = []
+        for function in getattr(module, "functions", {}).values():
+            scope = function_scope_of(function)
+            for formal in function.args:
+                row = (scope, int(formal.id))
+                binding = book.latest_ref(CONTROL_VALUE_BINDING, row)
+                recorded = (None if binding is None else
+                    book.page(CONTROL_VALUE_BINDING).cell(
+                        binding.row, binding.column))
+                if getattr(recorded, "kind", None) != BindingKind.PARAMETER_SEED:
+                    continue
+                binding_causes = {
+                    source for source, _ in book.edges_into(binding)}
+                abi_cells = tuple(source for source in binding_causes
+                                  if source.page == VALUE_TYPE_ABI)
+                if len(abi_cells) != 1:
+                    continue  # A still-unresolved seed has no settled ABI.
+                abi_cell = abi_cells[0]
+                abi = book.page(VALUE_TYPE_ABI).cell(
+                    abi_cell.row, abi_cell.column)
+                arms = (tuple(abi.physical_alternatives)
+                        if isinstance(abi, ValueTypeABIFact) else ())
+                if not (len(arms) == 1 and arms[0].storage == "span"
+                        and isinstance(arms[0].rank, int)
+                        and arms[0].rank >= 1
+                        and str(arms[0].dtype or "unknown")
+                            not in {"", "unknown"}):
+                    continue
+                arm = arms[0]
+                value_cell = getattr(recorded, "ssa_value", None)
+                value_fact = (
+                    book.page(SSA_VALUE).cell(
+                        value_cell.row, value_cell.column)
+                    if isinstance(value_cell, Ref)
+                    and value_cell.page == SSA_VALUE else None
+                )
+                value_causes = (set() if value_cell is None else {
+                    source for source, _ in book.edges_into(value_cell)})
+                abi_causes = {source for source, _ in
+                              book.edges_into(abi_cell)}
+                canonical = tuple(source for source in binding_causes
+                                  if source.page == CANONICAL_VALUE
+                                  and source.row == abi_cell.row)
+                valid = (
+                    len(canonical) == 1
+                    and value_cell is not None and value_cell.row == row
+                    and isinstance(value_fact, SSAValueFact)
+                    and value_fact.dtype == arm.dtype
+                    and value_fact.physical_dtype == arm.dtype
+                    and value_fact.storage == "span"
+                    and value_fact.rank == arm.rank
+                    and tuple(value_fact.shape) == tuple(arm.shape)
+                    and bool(arm.source_cells)
+                    and abi_cell in value_causes
+                    and canonical[0] in value_causes
+                    and all(source in abi_causes
+                            for source in arm.source_cells)
+                )
+                if not valid:
+                    found.append(Finding(
+                        "singleton-span-parameter-seed-disagreement",
+                        str(function.name), int(formal.id),
+                        "parameter seed lacks its exact ABI physical fields or causes",
                     ))
         return found
 
