@@ -6894,6 +6894,128 @@ def _merge_conditional_value_type_abi_arm(
     )
 
 
+def _refresh_linked_value_type_abi_arm(
+    incumbent: Any,
+    incoming: Any,
+    *,
+    source_contract: Mapping[str, Any],
+    target_contract: Mapping[str, Any],
+    book: Any,
+):
+    """Read a newer shape revision of the same authored call-result arm."""
+
+    # Run57: _code_lengths result37 feeds encode_octets result34.  The
+    # incumbent arm cites result37's dynamic shape-state column 1; the new
+    # arm cites column 3, resolved to 256 elements after the same to_dtype
+    # source35 settled.  The target contract already states that exact 256.
+    # Later revisions can retain both historical cells; compare their latest
+    # state on this same authored value, never two different callsite values.
+    from .concordance_declarations import CANONICAL_VALUE
+    from .identity_concordance import Ref, SHAPE_EDGE_PAGE
+
+    if not (
+        incumbent.identity == incoming.identity
+        and incumbent.storage == incoming.storage == "span"
+        and incumbent.dtype == incoming.dtype
+        and incumbent.rank == incoming.rank > 0
+        and incumbent.storage_identity == incoming.storage_identity
+        and incumbent.row_shape == incoming.row_shape
+        and (incumbent.shape, incumbent.metadata_state)
+        != (incoming.shape, incoming.metadata_state)
+        and incoming.metadata_state == "static"
+        and len(incoming.shape) == incoming.rank
+        and tuple(source_contract.get("shape") or ()) == incoming.shape
+        and tuple(target_contract.get("shape") or ()) == incoming.shape
+        and source_contract.get("storage") == target_contract.get("storage") == "span"
+        and str(source_contract.get("dtype") or "") == incoming.dtype
+        and str(target_contract.get("dtype") or "") in {
+            "", "unknown", incoming.dtype,
+        }
+        and int(source_contract.get("rank") or 0) == incoming.rank
+        and int(target_contract.get("rank") or 0) == incoming.rank
+    ):
+        return None
+    page = book.page("shape_transformation_state")
+    old_states = tuple(
+        cell for cell in incumbent.source_cells if cell.page.name == page.name
+    )
+    new_states = tuple(
+        cell for cell in incoming.source_cells if cell.page.name == page.name
+    )
+    if not old_states or not new_states:
+        return None
+    if len({cell.row for cell in (*old_states, *new_states)}) != 1:
+        return None
+    old_state = max(old_states, key=lambda cell: cell.column)
+    new_state = max(new_states, key=lambda cell: cell.column)
+    current_state = book.latest_ref(page, new_state.row)
+    old_canonical = {
+        cell.key for cell in incumbent.source_cells
+        if cell.page.name == CANONICAL_VALUE.name
+    }
+    new_canonical = {
+        cell.key for cell in incoming.source_cells
+        if cell.page.name == CANONICAL_VALUE.name
+    }
+    if not (
+        old_state.row == new_state.row
+        and old_state.column < new_state.column
+        and current_state is not None and current_state.key == new_state.key
+        and {cell.key for cell in incumbent.source_cells
+             if cell.page.name != page.name}
+        == {cell.key for cell in incoming.source_cells
+            if cell.page.name != page.name}
+        and len(old_canonical) == len(new_canonical) == 1
+        and old_canonical == new_canonical
+    ):
+        return None
+    try:
+        old_fact = page.cell(old_state.row, old_state.column)
+        new_fact = page.cell(new_state.row, new_state.column)
+    except (IndexError, KeyError, ValueError):
+        return None
+    if not (
+        isinstance(old_fact, tuple) and len(old_fact) >= 3
+        and isinstance(new_fact, tuple) and len(new_fact) >= 3
+        and old_fact[0] == new_fact[0] == "resolved"
+        and old_fact[2] == new_fact[2]
+        and tuple(old_fact[1]) == (
+            incumbent.shape, incumbent.dtype, incumbent.rank,
+            incumbent.metadata_state, incumbent.row_shape,
+        )
+        and tuple(new_fact[1]) == (
+            incoming.shape, incoming.dtype, incoming.rank,
+            incoming.metadata_state, incoming.row_shape,
+        )
+    ):
+        return None
+    old_edges = tuple(
+        cell for cell, _stage in book.edges_into(
+            Ref(page, old_state.row, old_state.column))
+        if cell.page.name == SHAPE_EDGE_PAGE.name and cell.row == old_fact[2]
+    )
+    new_edges = tuple(
+        cell for cell, _stage in book.edges_into(
+            Ref(page, new_state.row, new_state.column))
+        if cell.page.name == SHAPE_EDGE_PAGE.name and cell.row == new_fact[2]
+    )
+    edge_page = book.page(SHAPE_EDGE_PAGE)
+    current_edge = book.latest_ref(SHAPE_EDGE_PAGE, new_fact[2])
+    if not (
+        len(old_edges) == len(new_edges) == 1
+        and old_edges[0].column < new_edges[0].column
+        and current_edge is not None and current_edge.key == new_edges[0].key
+        and tuple(edge_page.cell(old_edges[0].row, old_edges[0].column)[1])
+        == tuple(old_fact[1])
+        and tuple(edge_page.cell(new_edges[0].row, new_edges[0].column)[1])
+        == tuple(new_fact[1])
+    ):
+        return None
+    return replace(incoming, source_cells=tuple(dict.fromkeys((
+        *incumbent.source_cells, *incoming.source_cells,
+    ))))
+
+
 def _none_guarded_operator_arm_contract(
     planned_graph: Any,
     data: Mapping[str, Any],
@@ -27477,6 +27599,16 @@ def _class_surface_ssa_program(
                                         ))),
                                     )
                                     incumbent_arms[identity] = incoming_arm
+                                    continue
+                            if incumbent_physical != incoming_physical:
+                                refreshed_arm = _refresh_linked_value_type_abi_arm(
+                                    incumbent_arm, incoming_arm,
+                                    source_contract=source,
+                                    target_contract=existing,
+                                    book=shape_identity_book,
+                                )
+                                if refreshed_arm is not None:
+                                    incumbent_arms[identity] = refreshed_arm
                                     continue
                             if incumbent_physical != incoming_physical:
                                 # Two callsites binding the same class to
