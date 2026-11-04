@@ -800,8 +800,10 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
     from .concordance_declarations import (
         CALL_RECORD, ARGUMENT_BINDING, RESULT_STORAGE_BINDING,
         SEQUENCE_DESCRIPTOR, AGGREGATE_ABI_LEGALIZATION,
+        TENSOR_RUNTIME_RESHAPE_VALIDITY,
     )
     from .identity_concordance import current_identity_book
+    from .ssa_record_return_state import function_scope_of
 
     book = current_identity_book()
 
@@ -1033,6 +1035,29 @@ def legalize_aggregate_output_views(module: IRModule) -> bool:
                 for index, (caller_id, callee_id, output_position) in enumerate(
                     zip(caller_ids, settled, output_positions)
                 ):
+                    output_descriptor = (
+                        None if table is None else table.by_id(caller_id)
+                    )
+                    target = module.functions.get(callee_name)
+                    runtime_view = (
+                        target is not None
+                        and output_descriptor is not None
+                        and output_descriptor.metadata_state == "dynamic"
+                        and output_descriptor.data_value_id == callee_id
+                        and output_descriptor.alias_of == callee_id
+                        and book.latest_ref(
+                            TENSOR_RUNTIME_RESHAPE_VALIDITY,
+                            (function_scope_of(target), target.name,
+                             int(caller_id)),
+                        ) is not None
+                    )
+                    if runtime_view:
+                        # The exact reshape validity receipt gives this view
+                        # runtime geometry distinct from its input storage.
+                        # Folding its aggregate slot to that storage would
+                        # make its metadata projections feed their own Call.
+                        retained.append(index)
+                        continue
                     formal_position = formal_positions.get(callee_id)
                     if (
                         formal_position is None

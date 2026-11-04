@@ -207,7 +207,8 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
 
     from .concordance_declarations import (
         ADDRESS, LOAD, SSA_VALUE, TENSOR_LOWERING_VALUE,
-        TENSOR_METADATA_RESULT_BINDING, TENSOR_SSA_LOWERING,
+        TENSOR_METADATA_RESULT_BINDING, TENSOR_RUNTIME_RESHAPE_VALIDITY,
+        TENSOR_SSA_LOWERING,
     )
     from .identity_concordance import Derived, Mode
     from .precompile_to_ssa import _mint_ssa_id
@@ -234,9 +235,33 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
             continue
         returned = returns[0]
         original_outputs = tuple(returned.args)
+        region_outputs = tuple(map(int, (
+            (callee.metadata or {}).get("source_region_integral") or {}
+        ).get("output_value_ids", ())))
+        semantic_outputs = (
+            region_outputs if len(region_outputs) == len(original_outputs)
+            else tuple(int(value.id) for value in original_outputs)
+        )
         computed = {}
-        for output in original_outputs:
-            descriptor = table.by_id(int(output.id))
+        view_proofs = {}
+        for output, semantic_id in zip(original_outputs, semantic_outputs):
+            descriptor = table.by_id(int(semantic_id))
+            if int(semantic_id) != int(output.id):
+                # A runtime reshape returns its source's data carrier. Its
+                # semantic output is the distinct view whose shape vector
+                # was validated above, not the storage owner's geometry.
+                view_row = (function_scope_of(callee), callee.name,
+                            int(semantic_id))
+                proof = book.latest_ref(
+                    TENSOR_RUNTIME_RESHAPE_VALIDITY, view_row,
+                )
+                if (
+                    proof is None or descriptor is None
+                    or descriptor.alias_of != int(output.id)
+                    or descriptor.data_value_id != int(output.id)
+                ):
+                    continue
+                view_proofs[int(semantic_id)] = proof
             if descriptor is None or descriptor.metadata_state != "dynamic":
                 continue
             ids = (
@@ -245,7 +270,7 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
             )
             if any(item is None for item in ids):
                 continue
-            computed[int(output.id)] = tuple(map(int, ids))
+            computed[int(semantic_id)] = tuple(map(int, ids))
         if not computed:
             continue
         callee_values = {
@@ -274,7 +299,7 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
             continue
         if any(
             tuple(map(int, call.attributes.get("output_ids", ())))
-            != tuple(int(value.id) for value in original_outputs)
+            != semantic_outputs
             for _, _, call in calls
         ):
             continue
@@ -364,6 +389,7 @@ def publish_computed_region_result_metadata(module: IRModule) -> bool:
                 sources = tuple(dict.fromkeys((
                     call_cell,
                     ssa_value_identity_cell(callee, output_id, book=book),
+                    view_proofs.get(output_id),
                     *(ssa_value_identity_cell(callee, item, book=book)
                       for item in callee_ids),
                     *(ssa_value_identity_cell(caller, item, book=book)
@@ -5086,6 +5112,7 @@ def lower_tensor_calls_to_repository_ssa(
             return value
 
         aliases: dict[int, SSAValue] = {}
+        pending_runtime_view_guards = []
 
         def resolve(value: SSAValue) -> SSAValue:
             seen: set[int] = set()
@@ -5243,6 +5270,30 @@ def lower_tensor_calls_to_repository_ssa(
                     _settle_operand_shapes(
                         function, (instruction.res,), owner_tensor_descriptor,
                     )
+                # The runtime reshape's checked quotient and remainder are
+                # ordinary rank-zero SSA arithmetic.  A later tensor pass
+                # otherwise lifts their Mod/FloorDiv into tensor kernels and
+                # asks for an extent of the result before defining it.  The
+                # posted physical SSA cells, including the result's, decide
+                # this scalar case; an unknown or span operand stays on the
+                # ordinary tensor decision path below.
+                from .ssa_record_return_state import posted_ssa_value_fact
+
+                scalar_facts = tuple(
+                    posted_ssa_value_fact(function, int(value.id), book=book)
+                    for value in (*instruction.args, instruction.res)
+                    if value is not None
+                )
+                if (
+                    instruction.op in _SHAPED_SSA_OPERATIONS
+                    or c_tensor_opcode(str(instruction.op)) is not None
+                ) and scalar_facts and all(
+                    fact is not None
+                    and fact.storage == "scalar" and fact.rank == 0
+                    for fact in scalar_facts
+                ):
+                    rewritten.append(instruction)
+                    continue
                 candidate_only = bool(
                     instruction.attributes.get("tensor_candidate") is not None
                     and instruction.attributes.get("tensor_operation") is None
@@ -6614,6 +6665,153 @@ def lower_tensor_calls_to_repository_ssa(
                                 if -1 not in resolved:
                                     result.shape = tuple(resolved)
                                     explicit_reshape_shape = True
+                    # compact_codewords reshapes `bits` with (-1, max_bits),
+                    # where max_bits is an SSA formal.  The former rewrite
+                    # erased that view while its target descriptor still had
+                    # no shape, rank, or count; the later region then read the
+                    # returned storage as a scalar.  A runtime view remains
+                    # an operation until its own geometry is on the ledger.
+                    if operation in {"reshape", "view"}:
+                        result_metadata = dict(result.accounting or {})
+                        complete_dynamic = (
+                            result_metadata.get("tensor_metadata_state")
+                            == "dynamic"
+                            and all(
+                                result_metadata.get(key) is not None
+                                for key in (
+                                    "tensor_shape_value_id",
+                                    "tensor_rank_value_id",
+                                    "tensor_element_count_value_id",
+                                )
+                            )
+                        )
+                        runtime_inferred_axis = (
+                            len(args) == 3
+                            and constants.get(int(args[1].id)) == -1
+                            and str(args[2].dtype or "").lower()
+                            in {"int", "int32", "i32", "int64", "i64", "long"}
+                            and tuple(args[2].shape or ()) == ()
+                            and str((source.accounting or {}).get(
+                                "program_abi_storage") or "") == "span"
+                            and int((source.accounting or {}).get(
+                                "program_abi_rank", 0) or 0) > 0
+                            and len(function.blocks) == 1
+                            and not pending_runtime_view_guards
+                        )
+                        if (
+                            runtime_inferred_axis
+                            and not explicit_reshape_shape
+                            and not tuple(result.shape or ())
+                            and not complete_dynamic
+                        ):
+                            from .native_faults import RESHAPE_INVALID_SHAPE
+
+                            scalar32 = {
+                                "physical_dtype": "int32", "storage": "scalar",
+                                "rank": 0,
+                            }
+                            shape_value, shape_definition = int_vector(
+                                (0, 0), physical={
+                                    "physical_dtype": "int32", "storage": "span",
+                                    "rank": 1,
+                                },
+                            )
+                            source_count = ensure_dynamic(
+                                rewritten, source,
+                            )["element_count"]
+                            width32 = fresh(dtype="int32", physical=scalar32)
+                            one, one_definition = constant(
+                                1, "int32", physical=scalar32,
+                            )
+                            zero, zero_definition = constant(
+                                0, "int32", physical=scalar32,
+                            )
+                            safe_width = fresh(dtype="int32", physical=scalar32)
+                            remainder = fresh(dtype="int32", physical=scalar32)
+                            quotient = fresh(dtype="int32", physical=scalar32)
+                            bool_scalar = {
+                                "physical_dtype": "bool", "storage": "scalar",
+                                "rank": 0,
+                            }
+                            invalid_width = fresh(
+                                dtype="bool", physical=bool_scalar,
+                            )
+                            invalid_remainder = fresh(
+                                dtype="bool", physical=bool_scalar,
+                            )
+                            invalid = fresh(dtype="bool", physical=bool_scalar)
+                            rewritten.extend((
+                                Instr("Cast", [args[2]], width32, attributes={
+                                    "source_dtype": str(args[2].dtype),
+                                    "target_dtype": "int32",
+                                    "conversion_kind": "integer_conversion",
+                                    "overflow": "trap",
+                                    "binding": "tensor-reshape-width",
+                                }),
+                                one_definition, zero_definition,
+                                Instr("Max", [width32, one], safe_width),
+                                Instr("Mod", [source_count, safe_width], remainder),
+                                Instr("FloorDiv", [source_count, safe_width], quotient),
+                                Instr("Le", [width32, zero], invalid_width),
+                                Instr("Ne", [remainder, zero], invalid_remainder),
+                                Instr("Or", [invalid_width, invalid_remainder], invalid),
+                                shape_definition,
+                            ))
+                            for position, dimension in enumerate((quotient, width32)):
+                                index, index_definition = constant(
+                                    position, "int64",
+                                )
+                                address = fresh(dtype="ptr")
+                                rewritten.extend((
+                                    index_definition,
+                                    Instr("GetElementPtr", [shape_value, index],
+                                          address, attributes={
+                                              "binding": "tensor-reshape-shape",
+                                          }),
+                                    Instr("Store", [dimension, address], None,
+                                          attributes={
+                                              "binding": "tensor-reshape-shape",
+                                          }),
+                                ))
+                            rank, rank_definition = constant(
+                                2, "int32", physical=scalar32,
+                            )
+                            rewritten.append(rank_definition)
+                            result.accounting = {
+                                **result_metadata,
+                                "program_abi_storage": "span",
+                                "program_abi_rank": 2,
+                                "tensor_metadata_state": "dynamic",
+                                "tensor_shape_value_id": int(shape_value.id),
+                                "tensor_rank_value_id": int(rank.id),
+                                "tensor_element_count_value_id": int(
+                                    source_count.id
+                                ),
+                            }
+                            guard = Instr("CondBr", [invalid], None,
+                                          attributes={
+                                              "runtime_reshape_error":
+                                              RESHAPE_INVALID_SHAPE,
+                                          })
+                            rewritten.append(guard)
+                            pending_runtime_view_guards.append((
+                                block, guard, source, args[2], width32, result,
+                                source_count, safe_width, remainder, quotient,
+                                shape_value, rank, invalid,
+                            ))
+                            complete_dynamic = True
+                        if (
+                            not explicit_reshape_shape
+                            and not tuple(result.shape or ())
+                            and not complete_dynamic
+                        ):
+                            shortfalls.append(TensorSSALoweringShortfall(
+                                function_name, block_name, operation,
+                                "runtime view target has no exact shape, "
+                                "rank and element-count proof",
+                            ))
+                            rewritten.append(instruction)
+                            continue
                     source_descriptor = register_tensor(
                         source,
                         storage=(
@@ -6625,7 +6823,11 @@ def lower_tensor_calls_to_repository_ssa(
                     register_tensor(
                         result,
                         storage="view",
-                        metadata_state=source_descriptor.metadata_state,
+                        metadata_state=(
+                            "dynamic" if complete_dynamic
+                            else source_descriptor.metadata_state
+                        ) if operation in {"reshape", "view"}
+                        else source_descriptor.metadata_state,
                         alias_of=source_descriptor.tensor_id,
                         data_value_id=source_descriptor.data_value_id,
                     )
@@ -9127,6 +9329,115 @@ def lower_tensor_calls_to_repository_ssa(
                     ))
                 rewritten.append(instruction)
             block.instrs[:] = rewritten
+
+        for (
+            guarded_block, guard, source, width, width32, result,
+            source_count, safe_width, remainder, quotient,
+            shape_value, rank, invalid,
+        ) in pending_runtime_view_guards:
+            from ..transmogrifier.ssa import BasicBlock
+            from .concordance_declarations import (
+                SSA_BLOCK, SSA_CONTROL_EDGE, SSABlockKind,
+                TENSOR_RUNTIME_RESHAPE_VALIDITY, TENSOR_SSA_LOWERING,
+            )
+            from .identity_concordance import Derived, Mode
+            from .ssa_record_return_state import (
+                function_scope_of, ssa_value_identity_cell,
+            )
+
+            position = guarded_block.instrs.index(guard)
+            continuation = guarded_block.instrs[position + 1:]
+            old_successors = list(guarded_block.successors)
+            fault_name = guarded_block.name + ".reshape_fault"
+            pass_name = guarded_block.name + ".reshape_checked"
+            if (
+                fault_name in function.blocks or pass_name in function.blocks
+                or not continuation or continuation[-1].op != "Ret"
+            ):
+                raise ValueError(
+                    "runtime reshape has no single-block validation continuation"
+                )
+            guard.attributes = {
+                **dict(guard.attributes),
+                "true_target": fault_name,
+                "false_target": pass_name,
+            }
+            guarded_block.instrs[:] = guarded_block.instrs[:position + 1]
+            guarded_block.successors = [fault_name, pass_name]
+            fault = BasicBlock(fault_name, [
+                Instr("Call", [], None, attributes={
+                    "callee": "turing_validation_error",
+                    "error_code": int(guard.attributes["runtime_reshape_error"]),
+                    "failure": "reshape invalid shape",
+                }),
+                Instr("Trap", [], None, attributes={"fault_exit": True}),
+            ], [])
+            passing = BasicBlock(pass_name, continuation, old_successors)
+            function.blocks[fault_name] = fault
+            function.blocks[pass_name] = passing
+            scope = function_scope_of(function)
+            causes = tuple(dict.fromkeys(
+                cell for value in (
+                    source, width, width32, result, source_count,
+                    safe_width, remainder, quotient, shape_value,
+                    rank, invalid,
+                )
+                if (cell := ssa_value_identity_cell(
+                    function, int(value.id), book=book,
+                )) is not None
+            ))
+            for name, kind in (
+                (fault_name, SSABlockKind.VALIDATION_FAIL),
+                (pass_name, SSABlockKind.VALIDATION_PASS),
+            ):
+                row = (scope, function.name, name)
+                book.post(
+                    SSA_BLOCK, row, kind, stage=TENSOR_SSA_LOWERING,
+                    provenance=Derived(causes), mode=Mode.CONCORD,
+                )
+            before = book.latest_ref(
+                SSA_BLOCK, (scope, function.name, guarded_block.name),
+            )
+            fail_cell = book.latest_ref(
+                SSA_BLOCK, (scope, function.name, fault_name),
+            )
+            pass_cell = book.latest_ref(
+                SSA_BLOCK, (scope, function.name, pass_name),
+            )
+            if before is None:
+                raise ValueError("runtime reshape lost its source block cell")
+            for first, second, arm in (
+                (before, fail_cell, "body"),
+                (before, pass_cell, "orelse"),
+            ):
+                book.post(
+                    SSA_CONTROL_EDGE,
+                    (scope, function.name, first, second, arm), True,
+                    stage=TENSOR_SSA_LOWERING,
+                    provenance=Derived((first, second, *causes)),
+                    mode=Mode.CONCORD,
+                )
+            edge_cells = tuple(
+                book.latest_ref(SSA_CONTROL_EDGE,
+                                (scope, function.name, first, second, arm))
+                for first, second, arm in (
+                    (before, fail_cell, "body"),
+                    (before, pass_cell, "orelse"),
+                )
+            )
+            reshape_row = (scope, function.name, int(result.id))
+            book.post(
+                TENSOR_RUNTIME_RESHAPE_VALIDITY, reshape_row,
+                (int(source.id), int(width.id), int(width32.id),
+                 int(source_count.id), int(safe_width.id),
+                 int(remainder.id), int(quotient.id),
+                 int(shape_value.id), int(rank.id), int(invalid.id),
+                 fault_name, pass_name),
+                stage=TENSOR_SSA_LOWERING,
+                provenance=Derived((*causes, before, fail_cell, pass_cell,
+                                    *edge_cells)),
+                mode=Mode.CONCORD,
+            )
 
         # Slice objects are compile-time selector syntax, never runtime scalar
         # constants.  Once every consumer has normalized away, discard their

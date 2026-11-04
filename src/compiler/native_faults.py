@@ -65,7 +65,7 @@ FLOAT_MATH_RANGE = 96
 
 #: ``reshape(-1, width)`` with invalid width or a source element count not
 #: divisible by width: the authored tensor operation raises ``ValueError``.
-RESHAPE_INVALID_SHAPE = 97
+RESHAPE_INVALID_SHAPE = 98
 
 
 class NativeIndexError(RuntimeError, IndexError):
