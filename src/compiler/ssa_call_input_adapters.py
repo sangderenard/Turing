@@ -18,9 +18,16 @@ from .ssa_record_return_state import (
 )
 from .frame_identity_book import _frame_owner_book, _frame_cite, _frame_value_cell
 from ..transmogrifier.ssa import Instr, SSAValue
+from ..transmogrifier.dtype_layout import resolve as resolve_dtype_layout
 
 
 _NUMERIC_DTYPES = {'bool', 'int32', 'int64', 'float32', 'float64'}
+
+
+def _numeric_physical_name(dtype):
+    """Return the declared storage name for a supported numeric spelling."""
+    layout = resolve_dtype_layout(dtype)
+    return layout.name if layout is not None and layout.name in _NUMERIC_DTYPES else None
 
 
 def _publish_converted_frame_binding(call_records, caller, callee, instruction,
@@ -1619,7 +1626,8 @@ def _adapt_physical_call_inputs_round(
                             target_dtype = formal_physical.physical_dtype
                         else:
                             target_dtype = (formal.accounting or {}).get('physical_dtype')
-                        numeric = {'bool', 'int32', 'int64', 'float32', 'float64'}
+                        source_numeric_dtype = _numeric_physical_name(source_dtype)
+                        target_numeric_dtype = _numeric_physical_name(target_dtype)
                         # A generated scalar (most importantly a loop-carried
                         # induction value) may feed an authored tensor helper
                         # whose scalar formal is consumed in the tensor's
@@ -1639,9 +1647,9 @@ def _adapt_physical_call_inputs_round(
                             and not accounting.get('sequence_arena')
                             and 'sequence_row_shape' not in accounting
                             and formal.dtype == 'ptr'
-                            and source_dtype in numeric
-                            and target_dtype in numeric
-                            and source_dtype != target_dtype
+                            and source_numeric_dtype is not None
+                            and target_numeric_dtype is not None
+                            and source_numeric_dtype != target_numeric_dtype
                             and not _call_writes_argument(instruction, index)
                             and read_only(callee, formal.id)
                         )
@@ -1682,9 +1690,9 @@ def _adapt_physical_call_inputs_round(
                             # A sequence arena (a record's list column) is
                             # storage passed by reference, not a scalar value.
                             and not sequence_arena_by_reference
-                            and source_dtype in numeric
-                            and formal.dtype in numeric
-                            and source_dtype != formal.dtype
+                            and source_numeric_dtype is not None
+                            and _numeric_physical_name(formal.dtype) is not None
+                            and source_numeric_dtype != _numeric_physical_name(formal.dtype)
                             and not _call_writes_argument(instruction, index)
                             and read_only(callee, formal.id)
                         )
@@ -1693,12 +1701,14 @@ def _adapt_physical_call_inputs_round(
                         # a double-backed formal cannot read in place.
                         float32_span = bool(
                             tuple(actual.shape or ())
-                            and str(source_dtype).casefold() == 'float32'
+                            and source_numeric_dtype == 'float32'
                         )
                         physical_conversion = not (
                             not (accounting.get('program_abi_storage') or accounting.get('physical_dtype')
                                  or int(actual.id) in caller_formals or float32_span)
-                            or source_dtype == target_dtype
+                            or (source_numeric_dtype == target_numeric_dtype
+                                if source_numeric_dtype is not None and target_numeric_dtype is not None
+                                else source_dtype == target_dtype)
                             or (not scalar_region and formal.dtype != 'ptr' and actual.dtype != formal.dtype)
                             or (scalar_region and actual.shape)
                             or (not actual.shape and (accounting.get('program_abi_storage') == 'span'
@@ -1725,7 +1735,8 @@ def _adapt_physical_call_inputs_round(
                         if logical_scalar_conversion:
                             target_dtype = formal.dtype
                         if not proven_integer_edge and (
-                                source_dtype not in numeric or target_dtype not in numeric):
+                                source_numeric_dtype is None
+                                or _numeric_physical_name(target_dtype) is None):
                             continue
                         # Program: ``ys = [n]; ys.append(n * 0.5); ys[1]``
                         # (c265).  Wrong record: the append helper's row
@@ -1956,8 +1967,13 @@ def _adapt_physical_call_inputs_round(
                     formal = callee.args[position]
                     target_dtype = (original.accounting or {}).get('physical_dtype') or original.dtype
                     backend_dtype = (formal.accounting or {}).get('physical_dtype') or formal.dtype
-                    numeric = {'bool', 'int32', 'int64', 'float32', 'float64'}
-                    if (target_dtype in numeric and backend_dtype in numeric and target_dtype != backend_dtype
+                    target_numeric_dtype = _numeric_physical_name(target_dtype)
+                    backend_numeric_dtype = _numeric_physical_name(backend_dtype)
+                    # Meowdoku conflict.to_dtype('float') is float32 by the
+                    # declared dtype layout. Its selected C output formal is
+                    # float64, so the existing output Cast must bridge them.
+                    if (target_numeric_dtype is not None and backend_numeric_dtype is not None
+                            and target_numeric_dtype != backend_numeric_dtype
                             and int(instruction.res.id) == int(original.id)
                             and not (not original.shape and (original.accounting or {}).get('program_abi_storage') == 'span')
                             and int(original.id) not in {int(value.id) for value in caller.args}):
