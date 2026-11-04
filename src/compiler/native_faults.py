@@ -63,6 +63,10 @@ FLOAT_POW_OVERFLOW = 95
 #: ``math.pow`` overflow: ``OverflowError("math range error")``.
 FLOAT_MATH_RANGE = 96
 
+#: ``reshape(-1, width)`` with invalid width or a source element count not
+#: divisible by width: the authored tensor operation raises ``ValueError``.
+RESHAPE_INVALID_SHAPE = 97
+
 
 class NativeIndexError(RuntimeError, IndexError):
     """``IndexError`` raised from a native validation code."""
@@ -152,4 +156,6 @@ def validation_fault(code: int, runtime_message: str) -> RuntimeError:
         )
     if int(code) == FLOAT_MATH_RANGE:
         return NativeFloatOverflow(f"math range error ({runtime_message})")
+    if int(code) == RESHAPE_INVALID_SHAPE:
+        return NativeValueError(f"invalid reshape shape ({runtime_message})")
     return RuntimeError(runtime_message)
