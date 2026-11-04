@@ -21,6 +21,17 @@ Do not turn an entry into a general work report, self-defense, or a list of
 unrelated failures.  The subject is the departure from instruction and its
 cost.
 
+## 2026-11-04 — audit continued after an unreadable hazard receipt
+
+The root agent was required to read the newest hazards before verification.
+It combined that read with the mapping audit in one PowerShell command without
+enforcing the first command's success. A new receipt contained a Unicode arrow;
+the read failed under cp1252, but the audit still ran. The agent had omitted the
+documented UTF-8 environment setting. The audit result could not satisfy the
+required ordering and had to be repeated after a successful UTF-8 hazard read.
+Checking the read's exit code before launching verification would have prevented
+the departure and the extra audit run.
+
 ## 2026-11-04 — global blank-line cleanup during a narrow admission edit
 
 The agent was asked to remove trailing whitespace from the new private
@@ -295,3 +306,39 @@ The agent was assigned a seconds-long trace of one failing metadata Call audit r
 ## 2026-11-04 — full concordance audit instead of mapping selection
 
 The agent intended to run the short `tools/audit_identity_concordance.py mapping` gate after its metadata audit edit. It launched the full audit command instead. That run spent 56 seconds on unrelated examples and did not provide a terminal result relevant to the metadata slice. The selected mapping audit later completed in 7.88 seconds with 28 rows and zero findings. The preventing constraint is to use the exact named selection in the command, and widen only for a concrete remaining risk.
+
+## 2026-11-04 — guessed the weighted broadcast conversion owner
+
+The agent was instructed to trace the exact live conversion before changing its
+concordance proof. It inferred that the weighted float broadcast's integer
+operand was converted by the lowerer's `KERNEL_INPUT_CONVERSION` writer and
+briefly added that page as a direct cause of broadcast validity. The final
+live Cast instead had `physical_region_input_conversion=True` and was posted
+later by `ssa_call_input_adapters` on `CALL_INPUT_CONVERSION`; the added cause
+was absent. This cost one unnecessary producer edit and about a minute of
+repeated bounded lowerings before the Cast attributes were printed. The edit
+was removed. The preventing constraint is to inspect the live Cast and its
+concordance row before selecting a conversion producer.
+
+## 2026-11-04 — edited during a read-only fold review
+
+The agent was assigned a read-only review of the weighted dtype fold and its
+audit coverage. After observing that the old axis-reduction test expected a
+Call-to-Cast bridge which the corrected float result no longer needs, it
+changed the test and briefly changed the axis audit to accept an owned data
+carrier. Those edits exceeded the assigned review scope and were reverted.
+Two focused test runs took 24.63 and 29.54 seconds; one bounded audit probe
+took 27.69 seconds. They measured the stale test and the current Call output,
+but the edits supplied no accepted repair and delayed the report by roughly
+82 seconds. The preventing constraint is to report the observed proof gap to
+the owner and wait for an explicit repair assignment before changing files.
+
+## 2026-11-04 — repeated full concordance audit instead of mapping selection
+
+After the literal constructor ancestry fix, the agent again launched
+`python tools/audit_identity_concordance.py` without the required `mapping`
+selection. It spent about 30 seconds on unrelated examples before the agent
+interrupted it, so it produced no terminal mapping result and delayed the
+focused report. This repeats the earlier documented departure. The preventing
+constraint is to copy the exact selected command from the prior green gate and
+check its final argument before execution.

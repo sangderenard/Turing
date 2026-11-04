@@ -8,7 +8,8 @@ SSA and continue ordinary SSA compilation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import inspect
 from typing import Mapping
 
 from .ssa import Function, IRModule
@@ -34,10 +35,16 @@ class SSATensorCodeReference:
     operations: Mapping[str, SSATensorOperationReference]
     source_identity: str
     external_primitives: frozenset[str] = frozenset()
+    # Constructor source declarations produce compile-time SSA constants.
+    # They have no runtime kernel entrypoint in ``operations``.
+    compile_time_constructors: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.name or not self.source_identity:
             raise ValueError("SSA tensor code references require source identity")
+        if any(not name or not inspect.isfunction(source)
+               for name, source in self.compile_time_constructors.items()):
+            raise ValueError("SSA tensor compile-time constructors require source functions")
         legal = {handler.value for handler in Handler}
         missing = {
             entrypoint

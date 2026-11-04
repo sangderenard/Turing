@@ -1,0 +1,4 @@
+2026-11-04 Source-first constructor birth needs no later SSA revision (MEASURED, validation):
+
+- A fresh bounded public source `return bits.ensure_tensor((13,-7,0,42,5,9,1,11))` refused at final constructor audit. Its result12 `SSA_VALUE` birth and latest were both column zero, already float64/span/rank1. The birth cites the exact shape state, whose selected source-default chain is checked by the existing upstream audit arm. The late literal receipt cites this earlier SSA birth, so it cannot be its ancestor.
+- The audit required `latest != result_ssa` even after proving `upstream_default`. It now permits equality only when that complete upstream default chain is proved. The separate receipt-ancestry arm remains required for a later materialization change. Entire `tests/test_literal_tensor_constructor_default.py` passed 3/3 in 31.24 s after the one-line audit change. No native whole compressor run or producer revision was made here.

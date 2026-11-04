@@ -5166,10 +5166,12 @@ OPERATOR_RESULT_TYPE = declare_page("operator_result_type_concordance", (
 SCALAR_KERNEL_OPERAND = declare_page("scalar_kernel_operand_concordance", (
     RowField("function", K.SCOPE), RowField("result", K.VALUE_ID),
 ), tuple)
-#: ``lower_tensor_calls_to_repository_ssa``: the flat domain an all-axis
-#: reduction views its source through, ``(function, result id)`` ->
-#: ``(source id, operation, source shape, element count)``, CONCORD,
-#: DERIVED(the result's and the source's ``ssa_value`` cells).
+#: ``lower_tensor_calls_to_repository_ssa``: a reduction's native domain,
+#: ``(function, result id)`` -> either the all-axis flat view
+#: ``(source id, operation, source shape, element count)`` or the tagged
+#: ``('axis-runtime', source id, operation, axis, keepdim, source
+#: shape/rank/count ids, result shape/rank/count ids)``. CONCORD,
+#: DERIVED(the scoped result, source, and runtime geometry ``ssa_value`` cells).
 TENSOR_REDUCTION_DOMAIN = declare_page("tensor_reduction_domain_concordance", (
     RowField("function", K.SCOPE), RowField("result", K.VALUE_ID),
 ), tuple)

@@ -26906,6 +26906,14 @@ def _tensor_descriptor(
                     ))
                     if len(payloads) == 1:
                         _row_dtype, source_cells = materialized_sequence_row_dtype(graph, payloads[0])
+                elif operation.casefold() == "ensure_tensor":
+                    from .numerical_constructor_defaults import (
+                        source_literal_constructor_default,
+                    )
+
+                    _selected_dtype, source_cells = (
+                        source_literal_constructor_default(graph, int(node_id))
+                    )
                 loop_owner = _arithmetic_loop_target_owner(graph, int(node_id))
                 if not semantic_sources and loop_owner is not None:
                     # A ``range`` target is the loop's own product: the edge
@@ -29666,12 +29674,10 @@ def _tensor_descriptor_rule(
                 if literal_dtype is not None:
                     return {"shape": (), "dtype": literal_dtype, "rank": 0}
         if operation == "ensure_tensor":
-            # ``receiver.ensure_tensor(value)`` normalizes VALUE to the
-            # receiver's backend class.  Its numerical shape and dtype are
-            # the explicit argument's, not the receiver's.  In lz_encode the
-            # receiver is ``octets`` and the value is ``topk(...).indices``;
-            # following the receiver would correlate order with the wrong
-            # value even when their incidental ranks match.
+            # A tensor argument retains its dtype. A proved numeric tuple or
+            # list takes the selected constructor's declared physical default;
+            # its Python leaf dtype is only the payload's type. In lz_encode,
+            # topk(...).indices follows the tensor argument path unchanged.
             values = tuple(
                 int(parent)
                 for parent, role in data.get("parents") or ()
@@ -29681,6 +29687,15 @@ def _tensor_descriptor_rule(
             if len(values) == 1:
                 normalized = _tensor_descriptor(graph, values[0], seen)
                 if normalized is not None:
+                    from .numerical_constructor_defaults import (
+                        source_literal_constructor_default,
+                    )
+
+                    selected_dtype, _selected_cells = (
+                        source_literal_constructor_default(graph, int(node_id))
+                    )
+                    if selected_dtype is not None:
+                        return {**normalized, "dtype": selected_dtype}
                     return normalized
         if operation in {
             "neg", "abs", "sin", "cos", "tan", "exp", "log", "sqrt",
@@ -33281,6 +33296,14 @@ def _fold_callsite_structural_values(
                     )
                     if runtime_scalar_broadcast:
                         shape = ()
+                    elif runtime_parents:
+                        # The weighted compressor multiplies a runtime
+                        # reshape by a static (1, 8) weight.  The runtime
+                        # operand's empty extent tuple means unknown extents,
+                        # not a scalar that broadcasts to (1, 8).  Retain
+                        # only the result rank and promoted element type;
+                        # the runtime broadcast publisher proves extents.
+                        shape = ()
                     else:
                         try:
                             shape = tuple(np.broadcast_shapes(*(
@@ -33290,16 +33313,22 @@ def _fold_callsite_structural_values(
                         except ValueError:
                             shape = None
                     if shape is not None:
+                        promoting_dtypes = tuple(
+                            str(side.get("dtype"))
+                            for side in _promoting_sides(
+                                graph, numerical_parents,
+                                list(parent_descriptors),
+                            )
+                            if str(side.get("dtype") or "unknown")
+                            != "unknown"
+                        )
                         result_dtype = (
                             "bool" if (
                                 operation in comparison_operations
                                 or semantic_operation
                                 in comparison_operations
-                            ) else next((
-                                descriptor["dtype"]
-                                for descriptor in parent_descriptors
-                                if tuple(descriptor["shape"])
-                            ), parent_descriptors[0]["dtype"])
+                            ) else _operand_result_dtype(promoting_dtypes)
+                            if promoting_dtypes else "unknown"
                         )
                         # Program: ``if c == 2: s = n else: s = n * 0.5;
                         # return s + 0.25`` (corpus c770, c771).  Wrong
@@ -33352,15 +33381,19 @@ def _fold_callsite_structural_values(
                                     "has no float result record: an operand's "
                                     "dtype is neither float nor integral"
                                 )
+                        runtime_result = bool(runtime_parents)
                         data["tensor"] = {
                             "shape": shape,
                             "dtype": result_dtype,
                             **(
                                 {
-                                    "rank": next(iter(runtime_ranks)),
+                                    "rank": max(
+                                        int(descriptor.get("rank") or 0)
+                                        for descriptor in parent_descriptors
+                                    ),
                                     "metadata_state": "dynamic",
                                 }
-                                if runtime_scalar_broadcast else {}
+                                if runtime_result else {}
                             ),
                         }
                         # Program: ``def f(a: bool, b: bool): return a + b``.
