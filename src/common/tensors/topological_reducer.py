@@ -28287,15 +28287,6 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
         formal_evidence: dict[
             tuple[str, int], dict[str, Any]
         ] = {}
-        numeric_class_identities = set(_NUMERIC_TYPE_FEATURES)
-        pending_numeric_bases = list(numeric_class_identities)
-        while pending_numeric_bases:
-            derived = pending_numeric_bases.pop()
-            for base in class_bases.get(derived, ()):
-                if base not in numeric_class_identities:
-                    numeric_class_identities.add(base)
-                    pending_numeric_bases.append(base)
-
         def publish_formal_class(
             callee_scope: str,
             formal_id: int,
@@ -29281,17 +29272,10 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                         )
                         if isinstance(cell, _Ref)
                     ))
-                    if str(class_identity) in numeric_class_identities:
-                        publish_formal_class(
-                            callee_scope, formal_id, callee,
-                            str(class_identity), int(limbs), transfer_source,
-                            transfer_cells,
-                        )
-                    else:
-                        evidence["facts"].append((
-                            str(class_identity), int(limbs), transfer_source,
-                            transfer_cells,
-                        ))
+                    evidence["facts"].append((
+                        str(class_identity), int(limbs), transfer_source,
+                        transfer_cells,
+                    ))
         for (callee_scope, formal_id), evidence in formal_evidence.items():
             # Program: ``span_total(atoms, ...)`` unannotated, called with
             # ``xs: list[int]`` (corpus c690).  Wrong record: the formal had
@@ -29398,14 +29382,15 @@ def reduce_abstract_tensor_topology(graph: Any) -> Any:
                 (class_identity, limbs)
                 for class_identity, limbs, _source, _cells in facts
             }
-            # A formal owns one class concordance row.  Publish it only when
-            # all resolved authored incoming call edges prove the same
-            # identity.  Multiple legitimate record variants mean the formal
-            # remains generic; selecting the first call would invent an
-            # identity and make traversal order semantic.  Unknown actuals
-            # supply no contradictory class fact and may settle in a later
-            # fixed-point round.
-            if len(distinct) != 1:
+            # Program: octet_lz._tensor(values) is called with [0] and later
+            # dictionary + data (bytes). The bytes Add receives its class in
+            # the post-reduction evidence flush. A list class from the first
+            # known actual was posted globally on Input0; the bytes-bound
+            # specialization then read that list class but held only a bytes
+            # physical arm. A class inferred for a generic formal is closed
+            # only when every reached, exactly bound actual has a class now.
+            # Missing actual evidence cannot be treated as agreement.
+            if len(distinct) != 1 or len(facts) != len(evidence["elements"]):
                 continue
             class_identity, limbs = next(iter(distinct))
             transfer_source = facts[0][2]
