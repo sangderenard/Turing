@@ -11429,6 +11429,32 @@ class CorrelationTable:
         selected_reference = (getattr(module, "metadata", {}) or {}).get(
             "tensor_ssa_reference"
         ) or code_reference
+        # Program: _ascending_order selects ensure_tensor from the C code
+        # reference, then a mixed binary adds the authored broadcast extent
+        # helper to that same reference.  The constructor declaration remains
+        # keyed by the original source identity; comparing it with the
+        # augmented helper's digest-qualified identity falsely refused a
+        # valid SOURCE_CALLABLE_SIGNATURE.  The incumbent augmentation reader
+        # proves the selected reference still owns that exact constructor.
+        selected_constructor_source = (
+            selected_reference.source_identity == code_reference.source_identity
+        )
+        if not selected_constructor_source:
+            from .authored_broadcast_reference import (
+                retained_authored_broadcast_reference,
+            )
+
+            try:
+                retained = retained_authored_broadcast_reference(
+                    code_reference, module,
+                )
+            except (KeyError, ValueError):
+                retained = None
+            selected_constructor_source = (
+                retained is not None
+                and retained.source_identity
+                == selected_reference.source_identity
+            )
         for row in declarations.rows():
             cell = book.latest_ref(NUMERICAL_CONSTRUCTOR_CODE_REFERENCE, row)
             fact = declarations.latest(row)
@@ -11438,7 +11464,17 @@ class CorrelationTable:
                 )
                 valid = (
                     constructor is not None
-                    and row[0] == selected_reference.source_identity
+                    and (
+                        row[0] == selected_reference.source_identity
+                        or (
+                            selected_constructor_source
+                            and row[0] == code_reference.source_identity
+                            and constructor is
+                            code_reference.compile_time_constructors.get(
+                                "ensure_tensor"
+                            )
+                        )
+                    )
                     and isinstance(fact, tuple) and len(fact) == 1
                     and isinstance(fact[0], Ref)
                     and fact[0].page == SOURCE_CALLABLE_SIGNATURE

@@ -1,6 +1,9 @@
 """The authored extent law remains a completed SSA dependency component."""
 
+from dataclasses import replace
 from types import SimpleNamespace
+
+import pytest
 
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
@@ -32,9 +35,21 @@ def test_authored_broadcast_reference_preserves_c_kernels_and_imports_owner():
     )
     assert result.operation("topk") == base.operation("topk")
     assert result.operation("zeros") == base.operation("zeros")
+    assert result.backend_source == base.backend_source
     assert base.operation("broadcast_shape_extents") is None
     ambient = SimpleNamespace(metadata={"tensor_ssa_reference": result})
     assert with_authored_broadcast_extents(base, module=ambient) is result
+    ambient.metadata["tensor_ssa_reference"] = replace(
+        result, source_identity=result.source_identity + "-forged",
+    )
+    with pytest.raises(ValueError, match="exact digest"):
+        with_authored_broadcast_extents(base, module=ambient)
+    ambient.metadata["tensor_ssa_reference"] = replace(
+        result, compile_time_constructors={},
+    )
+    with pytest.raises(ValueError, match="base contract"):
+        with_authored_broadcast_extents(base, module=ambient)
+    ambient.metadata["tensor_ssa_reference"] = result
 
     book, token = begin_identity_book()
     try:

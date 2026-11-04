@@ -32,13 +32,7 @@ def with_authored_broadcast_extents(
         if isinstance(recorded, SSATensorCodeReference) and recorded.operation(
             canonical_op
         ) is not None:
-            if any(recorded.operation(key) != operation
-                   for key, operation in reference.operations.items()):
-                raise ValueError(
-                    "authored broadcast reference conflicts with the compile's "
-                    "existing code reference"
-                )
-            return recorded
+            return retained_authored_broadcast_reference(reference, module)
     if reference.operation(canonical_op) is not None:
         return reference
 
@@ -121,6 +115,7 @@ def with_authored_broadcast_extents(
         f"{reference.source_identity}+sha256:{digest}",
         reference.external_primitives,
         reference.compile_time_constructors,
+        reference.backend_source,
     )
     if module is not None:
         module.metadata["tensor_ssa_reference"] = augmented
@@ -143,14 +138,16 @@ def retained_authored_broadcast_reference(
            for key, operation in reference.operations.items()):
         raise ValueError("authored broadcast reference changed a selected operation")
     if (
-        recorded.source_identity != reference.source_identity
-        and not recorded.source_identity.startswith(
-            f"{reference.source_identity}+sha256:"
-        )
+        dict(recorded.compile_time_constructors)
+        != dict(reference.compile_time_constructors)
+        or recorded.external_primitives != reference.external_primitives
+        or recorded.backend_source != reference.backend_source
     ):
-        raise ValueError("authored broadcast reference lost its source identity")
+        raise ValueError("authored broadcast reference changed its base contract")
     operation = recorded.operation("broadcast_shape_extents")
     if operation is None:
+        if recorded.source_identity != reference.source_identity:
+            raise ValueError("tensor SSA reference changed its base source")
         return reference
     if len(operation.entrypoints) != 1:
         raise ValueError("authored broadcast reference has no unique helper")
@@ -162,7 +159,11 @@ def retained_authored_broadcast_reference(
         or accepted.get("identity_book") is None
     ):
         raise ValueError("authored broadcast helper has no accepted owner book")
-    resident = module.functions.get(name)
+    if recorded is not reference and recorded.source_identity != (
+        f"{reference.source_identity}+sha256:{accepted['artifact_sha256']}"
+    ):
+        raise ValueError("authored broadcast reference lost its exact digest")
+    resident = (getattr(module, "functions", {}) or {}).get(name)
     if resident is not None and resident is not helper:
         raise ValueError("authored broadcast helper has a different owner")
     return recorded
