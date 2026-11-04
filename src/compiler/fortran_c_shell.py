@@ -3985,7 +3985,9 @@ def _resident_call_inputs(call: Any, caller_values: Mapping[int, Any]) -> dict[i
     }
 
 
-def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
+def _complete_propagated_frame_tails(
+    functions: Mapping[str, Any], *, call_records: Any = None,
+) -> int:
     """Complete every call whose callee's signature grew a frame-storage tail.
 
     Linking a callee to ITS callees can append propagated frame-storage
@@ -4017,9 +4019,85 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
     from ..transmogrifier.ssa import SSAValue
     from .concordance_declarations import (
         ARGUMENT_BINDING, FORMAL_UNBOUND_AT_TAIL, FRAME_TAIL, FRAME_TAIL_SLOT,
-        FRAME_TAIL_STAGE,
+        FRAME_TAIL_STAGE, CALL_RECORD, ArgumentBindingFact,
     )
-    from .identity_concordance import Ref, Unresolved, current_identity_book
+    from .identity_concordance import Ref, Unresolved, Mode, current_identity_book
+
+    def publish_tail_record(owner, call, callee):
+        # make(count)->arange(count).to_dtype('int64') gains an owner
+        # formal after source linking. The live Call acquired its caller
+        # slot while CALL_RECORD still omitted that formal. FRAME_TAIL is
+        # the decision's existing authority; publish its argument and Call
+        # views in this same writer, including replay of an already bound
+        # tail, before source-return ownership can consume them.
+        callsite = call.attributes.get("plan_callsite_id")
+        declared = call.attributes.get("callee_input_ids")
+        if (callsite is None or declared is None or call_records is None
+                or not hasattr(call_records, "assign")):
+            return
+        book = current_identity_book()
+        records = tuple(call_records.get(owner.name, ()))
+        matches = tuple(index for index, record in enumerate(records)
+                        if record.callee_symbol == callee.name
+                        and record.callsite_id == callsite)
+        if not matches:
+            return  # The source Call record has not been constructed yet.
+        if len(matches) != 1 or len(declared) != len(call.args):
+            raise ValueError("propagated frame tail has no unique live source Call")
+        pairs = tuple((int(formal), int(actual.id))
+                      for formal, actual in zip(declared, call.args, strict=True))
+        live_formals = {int(formal.id) for formal in callee.args}
+        additions = []
+        proof = []
+        for row in book.page(FRAME_TAIL).rows():
+            if row[:3] != (owner.name, callsite, callee.name) or row[3] not in live_formals:
+                continue
+            tail_ref = book.latest_ref(FRAME_TAIL, row)
+            actual_id, _storage_kind = book.page(FRAME_TAIL).cell(
+                tail_ref.row, tail_ref.column,
+            )
+            if pairs.count((int(row[3]), int(actual_id))) != 1:
+                raise ValueError("propagated frame tail disagrees with its live Call")
+            argument_ref = _frame_post(
+                ARGUMENT_BINDING,
+                (callee.name, owner.name, int(row[3]), callsite),
+                ArgumentBindingFact("caller_storage", int(actual_id)),
+                stage=FRAME_TAIL_STAGE, mode=Mode.REVISE,
+                cells=(tail_ref, _frame_value_cell(owner, actual_id),
+                       _frame_value_cell(callee, row[3])),
+            )
+            additions.append((int(row[3]), "caller_storage", int(actual_id)))
+            proof.extend((tail_ref, argument_ref))
+        if not additions:
+            return
+        index = matches[0]
+        record = records[index]
+        bindings = {int(formal): (int(formal), kind, source)
+                    for formal, kind, source in record.frame_bindings}
+        if len(bindings) != len(record.frame_bindings):
+            raise ValueError("source Call has duplicate formal frame bindings")
+        for addition in additions:
+            previous = bindings.get(addition[0])
+            if previous is not None and previous != addition:
+                raise ValueError("source Call conflicts with its propagated storage binding")
+            bindings[addition[0]] = addition
+        revised = replace(
+            record,
+            callee_storage_value_ids=tuple(int(formal.id) for formal in callee.args),
+            frame_bindings=tuple(bindings[int(formal.id)] for formal in callee.args
+                                 if int(formal.id) in bindings),
+            unresolved_frame_value_ids=tuple(int(formal.id) for formal in callee.args
+                                             if int(formal.id) not in bindings),
+        )
+        if revised != record:
+            previous_ref = book.latest_ref(CALL_RECORD, (call_records.owner, owner.name))
+            updated = list(records)
+            updated[index] = revised
+            call_records.assign(
+                owner.name, tuple(updated),
+                sources=_frame_cells(previous_ref, *proof), stage=FRAME_TAIL_STAGE,
+            )
+            _refresh_frame_aliased_result(call, callee)
 
     def calls_into(callee_name: str) -> list[tuple[Any, Any]]:
         return [
@@ -4057,6 +4135,7 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                 else:
                     tail = callee.args[len(call.args):]
                 if len(call.args) >= len(callee.args):
+                    publish_tail_record(owner, call, callee)
                     continue
                 book = current_identity_book()
                 callsite_id = call.attributes.get("plan_callsite_id")
@@ -4169,15 +4248,16 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                                 dtype=formal.dtype,
                                 shape=tuple(formal.shape or ()),
                                 stage=FRAME_TAIL_STAGE,
+                                physical=_frame_physical_fields(callee, formal.id),
                             ),
                             dtype=formal.dtype,
                             shape=tuple(formal.shape or ()),
                             device=formal.device,
-                            accounting={
+                            accounting=_frame_accounting_from_posted({
                                 "linked_call_frame_storage": str(callee_name),
                                 "callsite_id": callsite_id,
                                 "propagated_formal_id": int(formal.id),
-                            },
+                            }, _frame_physical_fields(callee, formal.id)),
                         )
                         storage_kind = (
                             "returned_record_storage"
@@ -4239,6 +4319,7 @@ def _complete_propagated_frame_tails(functions: Mapping[str, Any]) -> int:
                     call.args = [bound[int(formal.id)] for formal in callee.args]
                     call.attributes["callee_input_ids"] = tuple(int(formal.id) for formal in callee.args)
                     _refresh_frame_aliased_result(call, callee)
+                publish_tail_record(owner, call, callee)
     return appended
 
 
@@ -4494,7 +4575,7 @@ def _prune_unused_callee_formals_once(
             )
         ]
 
-    _complete_propagated_frame_tails(functions)
+    _complete_propagated_frame_tails(functions, call_records=call_records)
     for callee_name, callee in functions.items():
         if callee.metadata.get("native_interface") or callee.metadata.get("linked_piece_interface"):
             continue  # Already compiled object: its accepted ABI cannot shrink.
@@ -32894,6 +32975,29 @@ def _class_surface_ssa_program(
             )
             for call_id in lexical_query_shortfalls
         )
+        if tensor_ssa_reference is not None:
+            from .authored_broadcast_reference import (
+                retained_authored_broadcast_reference,
+            )
+
+            retained_reference = retained_authored_broadcast_reference(
+                tensor_ssa_reference, module_ir,
+            )
+            for imported_name, imported_function in module_ir.functions.items():
+                resident = all_functions.get(imported_name)
+                if (
+                    resident is not None and resident is not imported_function
+                    and (
+                        resident.metadata.get("accepted_ssa_component")
+                        or imported_function.metadata.get("accepted_ssa_component")
+                    )
+                ):
+                    raise ValueError(
+                        "accepted repository SSA function has two owners: "
+                        f"{imported_name}"
+                    )
+            tensor_ssa_reference = retained_reference
+            module_metadata["tensor_ssa_reference"] = retained_reference
         all_functions.update(module_ir.functions)
         lowered_control = module_ir.functions.get(symbol)
         _publish_host_callback_formals(
@@ -58644,7 +58748,7 @@ def _class_surface_ssa_program(
     # short by that tail; complete those calls (stamping the propagated
     # identity the harmonizer reads) before anything judges call shapes.
     compile_substage("complete propagated call frame tails")
-    _complete_propagated_frame_tails(all_functions)
+    _complete_propagated_frame_tails(all_functions, call_records=call_records)
     compile_substage("propagate exact record field demand")
     _propagate_record_field_demand(
         all_functions, call_records, all_record_tables, all_sequence_tables,
@@ -62496,162 +62600,16 @@ def _class_surface_ssa_program(
         settle_repository_ssa_static_extent_operands,
     )
     if tensor_ssa_reference is not None:
-        # Projected sequence rows only acquire their physical element shape
-        # after whole-program call linking.  Carry that newly authoritative
-        # metadata across every existing call edge before deciding which
-        # unresolved tensor operations need one final lowering attempt.
-        propagate_repository_ssa_call_metadata(lowered_module)
+        # The same changed-geometry Call closure completes both local
+        # precompile and linked whole-program tensor work. In particular,
+        # _ascending_order's region2 topk must be revisited only after
+        # region1 has published Neg17's runtime metadata through its Call.
+        from .tensor_ssa_lowering import complete_tensor_call_closure
 
-        def _raw_binary_span_ready(function, instruction) -> bool:
-            operation = _SHAPED_SSA_OPERATIONS.get(str(instruction.op))
-            signature = None if operation is None else c_tensor_opcode(operation)
-            if signature is None or signature[0] != "binary":
-                return False
-            return any(
-                (fact := _posted_ssa_value_fact(
-                    function, int(argument.id),
-                )) is not None
-                and fact.physical_dtype is not None
-                and fact.storage == "span"
-                and fact.rank is not None and fact.rank > 0
-                for argument in instruction.args
-            )
-
-        # Tensor lowering owns both sides of every repository call edge: a
-        # dynamic operation may add shape/rank/count formals to a planned
-        # region and must add their actuals to its parent call in the same
-        # transaction.  Begin with functions that still contain semantic
-        # tensor work, then close that set backwards over exact Call edges.
-        # This is the graph slice affected by the retry: it includes every
-        # caller whose ABI can change without revisiting unrelated regions
-        # whose tensor contracts have already settled.
-        late_tensor_names = {
-            str(name)
-            for name, function in lowered_module.functions.items()
-            if any(
-                instruction.attributes.get(
-                    "recovered_structural_input_view"
-                )
-                or str(instruction.op) in {"Indexed", "IndexedStore"}
-                or any(
-                    instruction.attributes.get(key) is not None
-                    for key in (
-                        "tensor_operation", "tensor", "tensor_candidate",
-                    )
-                )
-                or _raw_binary_span_ready(function, instruction)
-                for block in function.blocks.values()
-                for instruction in block.instrs
-            )
-        }
-        changed = True
-        while changed:
-            changed = False
-            for caller_name, caller in lowered_module.functions.items():
-                if str(caller_name) in late_tensor_names:
-                    continue
-                if any(
-                    str(instruction.attributes.get("callee") or "")
-                    in late_tensor_names
-                    for block in caller.blocks.values()
-                    for instruction in block.instrs
-                    if str(instruction.op).casefold() == "call"
-                ):
-                    late_tensor_names.add(str(caller_name))
-                    changed = True
-        def _late_value_geometry():
-            geometry = []
-            for name in sorted(late_tensor_names):
-                if name not in lowered_module.functions:
-                    continue
-                function = lowered_module.functions[name]
-                table = lowered_module.tensor_tables.get(name)
-                value_ids = {
-                    int(formal.id) for formal in function.args
-                    if not (formal.accounting or {}).get("heap_owner")
-                    and (formal.accounting or {}).get("tensor_extent_for") is None
-                }
-                if table is not None:
-                    value_ids.update(int(identity) for identity, descriptor in table.tensors.items()
-                                     if descriptor.metadata_state == "dynamic")
-                for identity in sorted(value_ids):
-                    descriptor = None if table is None else table.by_id(identity)
-                    geometry.append(((name, identity), None if descriptor is None else (
-                        descriptor.metadata_state, descriptor.shape,
-                        descriptor.shape_value_id, descriptor.rank_value_id,
-                        descriptor.element_count_value_id,
-                    )))
-            return tuple(geometry)
-
-        # The rank-two `(data * multiplier + index).sum().item()` region
-        # receives its exact input shape/rank/count during this late pass,
-        # after its raw sum was deferred on an unresolved descriptor. Retry
-        # only the existing affected call closure when that booked formal
-        # geometry changes; settle the private owner after it stops changing.
-        # A local Neg following a newly completed broadcast also waits for
-        # that exact geometry receipt. Include dynamic local identities in
-        # the same worklist; a formal-only view lost this dependency.
-        pending_late_names = set(late_tensor_names)
-        late_shortfalls_by_function = {}
-        first_late_pass = True
-        while first_late_pass or pending_late_names:
-            first_late_pass = False
-            prior_geometry = dict(_late_value_geometry())
-            late_tensor_module = IRModule(
-                {
-                    name: lowered_module.functions[name]
-                    for name in pending_late_names
-                },
-                tensor_tables={
-                    name: lowered_module.tensor_tables[name]
-                    for name in pending_late_names
-                    if name in lowered_module.tensor_tables
-                },
-            )
-            current_shortfalls = lower_tensor_calls_to_repository_ssa(
-                late_tensor_module, tensor_ssa_reference,
-                finalize_private_owners=False,
-            )
-            for name in pending_late_names:
-                late_shortfalls_by_function.pop(name, None)
-            for item in current_shortfalls:
-                late_shortfalls_by_function.setdefault(item.function, []).append(item)
-            for name, function in late_tensor_module.functions.items():
-                lowered_module.functions.setdefault(name, function)
-            for name, table in late_tensor_module.tensor_tables.items():
-                lowered_module.tensor_tables.setdefault(name, table)
-            propagate_repository_ssa_call_metadata(lowered_module)
-            settle_repository_ssa_static_extent_operands(lowered_module)
-            revised_geometry = dict(_late_value_geometry())
-            changed_geometry_names = {
-                name for (name, value_id), geometry in revised_geometry.items()
-                if geometry != prior_geometry.get((name, value_id))
-            }
-            pending_late_names = set(changed_geometry_names)
-            changed = True
-            while changed:
-                changed = False
-                for caller_name in late_tensor_names - pending_late_names:
-                    caller = lowered_module.functions[caller_name]
-                    if any(
-                        str(instruction.attributes.get('callee') or '')
-                        in pending_late_names
-                        for block in caller.blocks.values()
-                        for instruction in block.instrs
-                        if str(instruction.op).casefold() == 'call'
-                    ):
-                        pending_late_names.add(caller_name)
-                        changed = True
-        late_tensor_shortfalls = tuple(
-            item
-            for name in sorted(late_shortfalls_by_function)
-            for item in late_shortfalls_by_function[name]
+        late_tensor_shortfalls = complete_tensor_call_closure(
+            lowered_module, tensor_ssa_reference,
+            finalize_private_owners=False,
         )
-        # A computed result may first acquire its shape/rank/count while the
-        # late tensor slice is lowering. Its caller's owner lifetime is proved
-        # only after all affected functions and call edges are back on this
-        # full module; the same strict publisher checks those live consumers.
-        publish_computed_region_result_metadata(lowered_module)
         if late_tensor_shortfalls:
             lowered_module.metadata["late_tensor_lowering_shortfalls"] = tuple(
                 {
@@ -62789,7 +62747,16 @@ def _class_surface_ssa_program(
     # seven. Complete that exact propagated storage tail before the heap
     # projector reads the live call edge.
     compile_substage("complete late propagated call frame tails")
-    _complete_propagated_frame_tails(all_functions)
+    _complete_propagated_frame_tails(
+        all_functions, call_records=lowered_module.call_table,
+    )
+    if tensor_ssa_reference is not None:
+        # The computed source result's late owner formal is now bound on its
+        # exact outer Call. Finalize lifetime on that live frame edge, after
+        # aggregate output views have been legalized.
+        publish_computed_region_result_metadata(
+            lowered_module, finalize_private_owners=False,
+        )
 
     # Native heap cell/owner contracts cross the SAME exact linked call edge
     # as its values. Raw ptr alone cannot state pointer-cell storage at the
@@ -62803,6 +62770,12 @@ def _class_surface_ssa_program(
     from .ssa_heap_allocation import project_native_heap_call_contexts
     compile_substage("project native heap call contexts")
     project_native_heap_call_contexts(all_functions)
+    if tensor_ssa_reference is not None:
+        # The frame binder forwards the storage identity, and this incumbent
+        # projector forwards its heap-owner declaration. Lifetime consumes
+        # both exact records; running it before this projection rejected a
+        # valid ptr cell whose heap_owner declaration had not arrived yet.
+        publish_computed_region_result_metadata(lowered_module)
 
     # Physical record/call legalization can materialize a pure field
     # projection after control lowering has already built the Phi that reads

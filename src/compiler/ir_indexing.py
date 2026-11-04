@@ -603,11 +603,18 @@ def _propagate_scalar_dtypes(functions) -> None:
                         # that explicit scalar contract with ``ptr``.
                         inferred = declared
                     else:
+                        # Program: an owned tensor returned by make(count)
+                        # has a second field-zero Load whose booked result is
+                        # ptr.  The GEP base is the aggregate Call result;
+                        # copying that container's ssa.aggregate dtype onto
+                        # the loaded pointer revised ptr/scalar to aggregate.
+                        # A container type is not a field type.  Preserve an
+                        # exact declared Load contract, otherwise infer only
+                        # from a scalar element dtype proved on the base.
                         inferred = (
-                            None
-                            if candidate is not None
-                            and "ptr" in str(candidate).casefold()
-                            else candidate
+                            declared if declared not in {"", "unknown"}
+                            else candidate if candidate in integers | floats | {"bool"}
+                            else None
                         )
                 elif instruction.op == "BitLength":
                     inferred = "int64"

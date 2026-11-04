@@ -47,7 +47,9 @@ def with_authored_broadcast_extents(
     from .identity_concordance import CorrelationTable, identity_book
 
     repository = Path(__file__).resolve().parents[2]
-    source = Path(__file__).with_name("graph_refinement_kernels.py").read_text()
+    source = Path(__file__).with_name("graph_refinement_kernels.py").read_text(
+        encoding="utf-8",
+    )
     parameters = ("rank", "start", "left", "right", "output")
     contract = ExtractionContract(
         repository / "extraction_contracts/program_extraction.yaml"
@@ -125,6 +127,47 @@ def with_authored_broadcast_extents(
     return augmented
 
 
+def retained_authored_broadcast_reference(
+    reference: SSATensorCodeReference, module: Any,
+) -> SSATensorCodeReference:
+    """Read the accepted helper and its owner book from this module's record."""
+
+    recorded = (getattr(module, "metadata", {}) or {}).get(
+        "tensor_ssa_reference"
+    )
+    if recorded is None:
+        return reference
+    if not isinstance(recorded, SSATensorCodeReference):
+        raise ValueError("tensor SSA reference metadata has no code reference")
+    if any(recorded.operation(key) != operation
+           for key, operation in reference.operations.items()):
+        raise ValueError("authored broadcast reference changed a selected operation")
+    if (
+        recorded.source_identity != reference.source_identity
+        and not recorded.source_identity.startswith(
+            f"{reference.source_identity}+sha256:"
+        )
+    ):
+        raise ValueError("authored broadcast reference lost its source identity")
+    operation = recorded.operation("broadcast_shape_extents")
+    if operation is None:
+        return reference
+    if len(operation.entrypoints) != 1:
+        raise ValueError("authored broadcast reference has no unique helper")
+    name = operation.entrypoints[0]
+    helper = recorded.module.functions[name]
+    accepted = helper.metadata.get("accepted_ssa_component") or {}
+    if (
+        not accepted.get("artifact_sha256")
+        or accepted.get("identity_book") is None
+    ):
+        raise ValueError("authored broadcast helper has no accepted owner book")
+    resident = module.functions.get(name)
+    if resident is not None and resident is not helper:
+        raise ValueError("authored broadcast helper has a different owner")
+    return recorded
+
+
 def authored_broadcast_call_actuals(
     reference: SSATensorCodeReference, values: Mapping[str, Any],
 ) -> tuple[Any, tuple[Any, ...], tuple[Any, ...]]:
@@ -156,4 +199,7 @@ def authored_broadcast_call_actuals(
     return helper, actuals, cells
 
 
-__all__ = ["with_authored_broadcast_extents", "authored_broadcast_call_actuals"]
+__all__ = [
+    "with_authored_broadcast_extents", "authored_broadcast_call_actuals",
+    "retained_authored_broadcast_reference",
+]

@@ -37,12 +37,20 @@ class OwnedTensorDataBinding:
     count_value_id: int
     element_dtype: str
     cell: Any
+    inherited: bool = False
+    proof_cells: tuple[Any, ...] = ()
 
 
 def owned_tensor_data_bindings(module: Any, function_name: str) -> tuple[OwnedTensorDataBinding, ...]:
-    """The audited owned pointer carriers of one exact native frame."""
+    """The audited owned pointer carriers of one exact native frame.
 
-    from .concordance_declarations import TENSOR_OWNED_HEAP_BINDING
+    Source Calls may inherit a region allocation through an exact result and
+    owner binding. Their loaded pointer carriers are not local Alloca results.
+    """
+
+    from .concordance_declarations import (
+        TENSOR_OWNED_HEAP_BINDING, TENSOR_SOURCE_OWNED_RETURN,
+    )
     from .identity_concordance import CorrelationTable, identity_book
     from .ssa_record_return_state import function_scope_of
 
@@ -51,9 +59,15 @@ def owned_tensor_data_bindings(module: Any, function_name: str) -> tuple[OwnedTe
     page = book.page(TENSOR_OWNED_HEAP_BINDING)
     rows = tuple(row for row in page.scope_rows(scope)
                  if row[1] == function_name)
-    if not rows:
+    inherited_page = book.page(TENSOR_SOURCE_OWNED_RETURN)
+    inherited_rows = tuple(
+        row for row in inherited_page.rows()
+        if row[1] == function_name or row[3] == function_name
+    )
+    if (rows and CorrelationTable._tensor_owned_heap_binding_findings(module)):
         return ()
-    if CorrelationTable._tensor_owned_heap_binding_findings(module):
+    if (inherited_rows
+            and CorrelationTable._tensor_source_owned_return_findings(module)):
         return ()
     bindings = []
     for row in rows:
@@ -61,8 +75,86 @@ def owned_tensor_data_bindings(module: Any, function_name: str) -> tuple[OwnedTe
         data, owner, count, dtype = page.cell(cell.row, cell.column)
         bindings.append(OwnedTensorDataBinding(
             int(row[2]), int(data), int(owner), int(count), str(dtype), cell,
+            proof_cells=(cell,),
         ))
-    return tuple(bindings)
+    table = (getattr(module, "tensor_tables", {}) or {}).get(function_name)
+    for row in inherited_rows:
+        cell = book.latest_ref(TENSOR_SOURCE_OWNED_RETURN, row)
+        if (cell is None or table is None
+                or (row[1] == function_name and row[3] == function_name)):
+            return ()
+        (source_carrier, source_owner, caller_carrier, caller_owner,
+         caller_tensor, source_count, dtype) = inherited_page.cell(
+             cell.row, cell.column,
+         )
+        # The page identifies two distinct SSA frames. The source count is
+        # local to the source function; the outer caller's descriptor carries
+        # its own projected count. Never copy an SSA id across frames.
+        if row[3] == function_name:
+            tensor_id, data_id, owner_id = (
+                int(row[4]), int(source_carrier), int(source_owner),
+            )
+            expected_count = int(source_count)
+        else:
+            tensor_id, data_id, owner_id = (
+                int(caller_tensor), int(caller_carrier), int(caller_owner),
+            )
+            expected_count = None
+        descriptor = table.by_id(tensor_id)
+        if (descriptor is None
+                or descriptor.data_value_id != data_id
+                or descriptor.heap_owner_value_id != owner_id
+                or descriptor.element_count_value_id is None
+                or (expected_count is not None
+                    and descriptor.element_count_value_id != expected_count)
+                or str(descriptor.dtype) != str(dtype)):
+            return ()
+        bindings.append(OwnedTensorDataBinding(
+            tensor_id, data_id, owner_id,
+            int(descriptor.element_count_value_id), str(dtype), cell,
+            inherited=True, proof_cells=(cell,),
+        ))
+    # The same source tensor can be returned to several callers. All source
+    # views must still name one allocation, owner, count and element layout.
+    by_tensor: dict[int, list[OwnedTensorDataBinding]] = {}
+    for binding in bindings:
+        by_tensor.setdefault(binding.tensor_id, []).append(binding)
+    settled = []
+    for group in by_tensor.values():
+        first = group[0]
+        if any((
+            item.data_value_id, item.owner_value_id, item.count_value_id,
+            item.element_dtype, item.inherited,
+        ) != (
+            first.data_value_id, first.owner_value_id,
+            first.count_value_id, first.element_dtype, first.inherited,
+        ) for item in group[1:]):
+            return ()
+        if len(group) == 1:
+            settled.append(first)
+            continue
+        # Only a source function may present one inherited tensor to several
+        # outer callers. Each row must derive from the same region allocation;
+        # a caller's repeated semantic output would be ambiguous.
+        if (not first.inherited or any(
+            item.cell.row[3] != function_name for item in group
+        )):
+            return ()
+        origin_sets = tuple({
+            source for source, _stage in book.edges_into(item.cell)
+            if source.page == TENSOR_OWNED_HEAP_BINDING
+        } for item in group)
+        if (any(len(origins) != 1 for origins in origin_sets)
+                or any(origins != origin_sets[0] for origins in origin_sets[1:])):
+            return ()
+        origin = next(iter(origin_sets[0]))
+        settled.append(OwnedTensorDataBinding(
+            first.tensor_id, first.data_value_id, first.owner_value_id,
+            first.count_value_id, first.element_dtype, origin,
+            inherited=True,
+            proof_cells=(origin, *(item.cell for item in group)),
+        ))
+    return tuple(settled)
 
 
 @dataclass(frozen=True, slots=True)

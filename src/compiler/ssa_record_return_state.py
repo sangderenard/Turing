@@ -30,6 +30,139 @@ def function_scope_of(function):
     return str(metadata.get("tensor_shape_concordance_scope") or function.name)
 
 
+def metadata_result_caller_value(module, caller, call, result_ref, *, book=None):
+    """Project one booked result's callee data identity to this Call's caller.
+
+    A planned-region Call normally preserves the numeric data ID. An ordinary
+    source Call does not: its exact CALL_RECORD result binding maps the
+    callee's Ret value to the caller's distinct projection identity.
+    """
+    from .identity_concordance import identity_book
+    from .concordance_declarations import (
+        CALL_RECORD, TENSOR_METADATA_RESULT_BINDING,
+        TENSOR_OWNED_HEAP_BINDING, TENSOR_SOURCE_OWNED_RETURN,
+    )
+
+    book = identity_book(module) if book is None else book
+    if (result_ref is None or result_ref.page != TENSOR_METADATA_RESULT_BINDING
+            or book.latest_ref(result_ref.page, result_ref.row) != result_ref
+            or result_ref.row[0] != function_scope_of(caller)
+            or call.op != "Call" or call.res is None
+            or int(call.res.id) != int(result_ref.row[1])
+            or call.attributes.get("callee") != result_ref.row[2]):
+        return None
+    callee_id = int(result_ref.row[3])
+    callee_outputs = tuple(map(int, call.attributes.get("callee_output_ids", ())))
+    caller_outputs = tuple(map(int, call.attributes.get("output_ids", ())))
+    if len(callee_outputs) != len(caller_outputs):
+        return None
+    matches = tuple(caller_id for source_id, caller_id in zip(
+        callee_outputs, caller_outputs, strict=True,
+    ) if source_id == callee_id)
+    carrier_proofs = ()
+    if not matches:
+        callee = module.functions.get(str(result_ref.row[2]))
+        table = module.tensor_tables.get(str(result_ref.row[2]))
+        descriptor = None if table is None else table.by_id(callee_id)
+        owned_ref = None if callee is None else book.latest_ref(
+            TENSOR_OWNED_HEAP_BINDING,
+            (function_scope_of(callee), callee.name, callee_id),
+        )
+        owned = None if owned_ref is None else book.page(
+            TENSOR_OWNED_HEAP_BINDING
+        ).cell(owned_ref.row, owned_ref.column)
+        if (descriptor is not None and owned is not None
+                and descriptor.data_value_id == int(owned[0])):
+            matches = tuple(caller_id for source_id, caller_id in zip(
+                callee_outputs, caller_outputs, strict=True,
+            ) if source_id == int(owned[0]))
+            carrier_proofs = (owned_ref,)
+    if not matches:
+        # A source function can return a region-allocated tensor. Its outer
+        # Call publishes the source's loaded pointer carrier, while the
+        # semantic RESULT_BINDING still names the source tensor. The exact
+        # source-owned return edge joins those two views without changing the
+        # semantic result row or importing a foreign SSA id as caller data.
+        page = book.page(TENSOR_SOURCE_OWNED_RETURN)
+        source_rows = tuple(
+            row for row in page.rows()
+            if row == (
+                function_scope_of(caller), caller.name, int(call.res.id),
+                str(result_ref.row[2]), callee_id,
+            )
+        )
+        if len(source_rows) == 1:
+            source_ref = book.latest_ref(TENSOR_SOURCE_OWNED_RETURN, source_rows[0])
+            source_fact = (None if source_ref is None else page.cell(
+                source_ref.row, source_ref.column,
+            ))
+            if (isinstance(source_fact, tuple) and len(source_fact) == 7
+                    and result_ref in {
+                        source for source, _stage in book.edges_into(source_ref)
+                    }):
+                source_carrier, _source_owner, caller_carrier, _caller_owner, \
+                    caller_semantic, _source_count, _dtype = source_fact
+                matched = tuple(caller_id for source_id, caller_id in zip(
+                    callee_outputs, caller_outputs, strict=True,
+                ) if (source_id == source_carrier
+                      and caller_id == caller_semantic))
+                if len(matched) == 1 and caller_carrier != source_carrier:
+                    matches = matched
+                    carrier_proofs = (source_ref,)
+    if len(matches) != 1:
+        return None
+    caller_id = int(matches[0])
+    if call.attributes.get("source_linked"):
+        table = getattr(module, "call_table", None)
+        if table is None:
+            return None
+        record_ref = book.latest_ref(CALL_RECORD, (table.owner, caller.name))
+        if record_ref is None:
+            return None
+        records = book.page(CALL_RECORD).cell(record_ref.row, record_ref.column)
+        matching = tuple(record for record in records
+                         if record.callee_symbol == result_ref.row[2]
+                         and record.callsite_id == call.attributes.get(
+                             "plan_callsite_id")
+                         and (callee_id, caller_id) in record.result_bindings)
+        if len(matching) != 1:
+            return None
+        # Source return geometry was proved before a later frame-tail writer
+        # appended an owner formal. That new CALL_RECORD revision does not
+        # retroactively become a cause of an earlier elementwise receipt.
+        # Keep its cited result edge, but prove the exact same semantic pair
+        # in both that record and the current record along their real lineage.
+        cited = tuple(source for source, _stage in book.edges_into(result_ref)
+                      if source.page == CALL_RECORD and source.row == record_ref.row)
+        if len(cited) != 1:
+            return None
+        original = cited[0]
+        historic = book.page(CALL_RECORD).cell(original.row, original.column)
+        historic_matching = tuple(record for record in historic
+                                  if record.callee_symbol == result_ref.row[2]
+                                  and record.callsite_id == call.attributes.get(
+                                      "plan_callsite_id")
+                                  and (callee_id, caller_id) in record.result_bindings)
+        if len(historic_matching) != 1:
+            return None
+        ancestors = set()
+        pending = [record_ref]
+        while pending:
+            current = pending.pop()
+            if current in ancestors:
+                continue
+            ancestors.add(current)
+            pending.extend(parent for parent, _stage in book.edges_into(current)
+                           if parent.page == CALL_RECORD
+                           and parent.row == record_ref.row)
+        if original not in ancestors:
+            return None
+        return caller_id, (original, *carrier_proofs)
+    if caller_id != callee_id:
+        return None
+    return caller_id, carrier_proofs
+
+
 def frame_aliased_result_binding(instruction, callee, *, book=None, record=None, require_complete=True):
     """Project an emitted output position from its exact call/frame record."""
     if not instruction.attributes.get("result_aliases_frame"):

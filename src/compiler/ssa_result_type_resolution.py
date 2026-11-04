@@ -177,7 +177,7 @@ def _refresh_scope_occurrences(functions):
 def settle_call_result_types(functions, emit_outputs, function_values):
     from .concordance_declarations import (
         PLANNING_VALUE, TENSOR_RUNTIME_RESHAPE_VALIDITY,
-        TENSOR_RUNTIME_VIEW_GEOMETRY,
+        TENSOR_RUNTIME_VIEW_GEOMETRY, TENSOR_SOURCE_OWNED_RETURN,
     )
     from .identity_concordance import current_identity_book
     from .ssa_record_return_state import (
@@ -298,6 +298,7 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                  structure.physical_dtype), physical, cell)
 
     def bindings():
+        book = current_identity_book()
         for caller in functions.values():
             if accepted_ssa_component(caller):
                 continue
@@ -309,6 +310,11 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             # projection instead of typing only the first semantic slot.
             projections = {}
             pointer_origins = {}
+            aggregate_calls = {
+                id(item.res): item
+                for item in instructions
+                if item.op == 'Call' and item.res is not None
+            }
             for item in instructions:
                 if item.op == 'GetElementPtr' and item.res is not None and item.args:
                     position = (item.attributes or {}).get('source_output_id')
@@ -320,6 +326,46 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                         pointer_origins[id(item.res)] = (id(item.args[0]), position)
             for item in instructions:
                 if item.op == 'Load' and item.res is not None and item.args:
+                    if (item.attributes or {}).get('source_owned_carrier'):
+                        # Program: make(count) returns an owned tensor.  Its
+                        # aggregate field zero has a semantic int64 Load and
+                        # a distinct ptr Load for the inherited data arena.
+                        # The old projection scan typed both from the tensor
+                        # Ret, turning the booked ptr carrier into int64.
+                        scope = function_scope_of(caller)
+                        page = book.page(TENSOR_SOURCE_OWNED_RETURN)
+                        origin = pointer_origins.get(id(item.args[0]))
+                        call = None if origin is None else aggregate_calls.get(origin[0])
+                        carrier_rows = tuple(
+                            row for row in page.rows()
+                            if (
+                                row[1] == caller.name
+                                and row[0] == scope
+                                and call is not None
+                                and int(row[2]) == int(call.res.id)
+                                and str(call.attributes.get('callee')) == row[3]
+                                and origin[1] == ('source', int(page.latest(row)[4]))
+                                and int(page.latest(row)[2]) == int(item.res.id)
+                            ) or (
+                                row[3] == caller.name
+                                and call is not None
+                                and origin[1] == ('source', int(row[4]))
+                                and int(page.latest(row)[0]) == int(item.res.id)
+                            )
+                        )
+                        if (
+                            not carrier_rows
+                            or str(item.res.dtype) != 'ptr'
+                            or _row_physical(caller, item.res).get('physical_dtype') != 'ptr'
+                            or call is None
+                            or int(origin[1][1]) not in tuple(map(
+                                int, call.attributes.get('output_ids', ()),
+                            ))
+                        ):
+                            raise ValueError(
+                                'source-owned aggregate carrier lacks exact ptr receipt'
+                            )
+                        continue
                     origin = pointer_origins.get(id(item.args[0]))
                     if origin is not None:
                         projections.setdefault(origin[0], []).append((origin[1], item.res))
@@ -432,7 +478,6 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             # its cut-time dtype while the actual was the settled bool/int.
             # Rule: the capture id is resolved through the posted planning
             # value row; no row means the capture id is the resident.
-            book = current_identity_book()
             planning_page = book.page(PLANNING_VALUE)
             for target in region.args:
                 value_id = int(target.id)

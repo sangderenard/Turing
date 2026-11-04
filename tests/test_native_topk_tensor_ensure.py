@@ -18,6 +18,7 @@ from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 def _assert_family_audit_rejects_other_type_and_member(module):
     from src.compiler.concordance_declarations import (
         NATIVE_TENSOR_FAMILY_SOURCE, NATIVE_TENSOR_RESULT_FAMILY,
+        NATIVE_TENSOR_WRAP,
     )
     from src.compiler.native_tensor_family import family_findings
 
@@ -40,6 +41,42 @@ def _assert_family_audit_rejects_other_type_and_member(module):
     finally:
         source_page.cells[source_key] = source
         page.cells[key] = fact
+    assert family_findings(module) == []
+    from dataclasses import replace
+    from src.compiler.ssa_record_return_state import function_scope_of
+
+    wrap_row = next(iter(book.page(NATIVE_TENSOR_WRAP).rows()))
+    table = next(table for name, table in module.tensor_tables.items()
+                 if function_scope_of(module.functions[name]) == wrap_row[0]
+                 and (descriptor := table.by_id(wrap_row[1])) is not None
+                 and descriptor.alias_of is not None)
+    descriptor = table.by_id(wrap_row[1])
+    try:
+        table.tensors[wrap_row[1]] = replace(
+            descriptor, data_value_id=descriptor.tensor_id,
+            alias_of=None, owns_allocation=True,
+        )
+        assert any(item.kind == "native-tensor-wrap-storage"
+                   for item in family_findings(module))
+    finally:
+        table.tensors[wrap_row[1]] = descriptor
+    assert family_findings(module) == []
+    try:
+        table.tensors[wrap_row[1]] = replace(descriptor, storage="output")
+        assert any(item.kind == "native-tensor-wrap-storage"
+                   for item in family_findings(module))
+    finally:
+        table.tensors[wrap_row[1]] = descriptor
+    wrap_page = book.page(NATIVE_TENSOR_WRAP)
+    wrap_ref = book.latest_ref(NATIVE_TENSOR_WRAP, wrap_row)
+    wrap_key = (wrap_ref.row, wrap_ref.column)
+    wrapping = wrap_page.cells[wrap_key]
+    try:
+        wrap_page.cells[wrap_key] = (*wrapping[:4], None)
+        assert any(item.kind == "native-tensor-wrap"
+                   for item in family_findings(module))
+    finally:
+        wrap_page.cells[wrap_key] = wrapping
     assert family_findings(module) == []
 
 

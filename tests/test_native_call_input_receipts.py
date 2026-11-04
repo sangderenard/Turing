@@ -361,3 +361,71 @@ def test_declared_region_inout_interns_its_producer_without_field_metadata():
     assert producer.res is formal
     assert ret.args[0] is formal
     assert function.metadata['interned_program_abi_output_ids'] == (7,)
+
+
+def test_late_frame_tail_publishes_call_record_and_posted_physical_layout():
+    from src.compiler.concordance_declarations import FRAME_TAIL
+
+    book = current_identity_book()
+    actual = SSAValue(20, 'int64')
+    formal = SSAValue(1, 'int64')
+    owner = SSAValue(7, 'ptr', shape=(1,), accounting={
+        'heap_owner': True, 'compiler_frame_storage': 'helper',
+    })
+    roots = []
+    for scope, value, physical in (
+        ('root', actual, {'physical_dtype': 'int64', 'storage': 'scalar', 'rank': 0}),
+        ('helper', formal, {'physical_dtype': 'int64', 'storage': 'scalar', 'rank': 0}),
+        ('helper', owner, {'physical_dtype': 'ptr', 'storage': 'span', 'rank': 1}),
+    ):
+        roots.append(book.post(
+            SSA_VALUE, (scope, value.id),
+            SSAValueFact(value.dtype, tuple(value.shape or ()),
+                         SSAValueOrigin.ADOPTED_GRAPH_ID, **physical),
+            stage=CONTROL_SSA, provenance=Novel(INGEST_SOURCE, ()),
+            mode=Mode.CONCORD,
+        ))
+    call = Instr('Call', [actual], None, attributes={
+        'callee': 'helper', 'callee_input_ids': (1,),
+        'plan_callsite_id': 9, 'source_linked': True,
+    })
+    root = Function('root', [actual], {'entry': BasicBlock('entry', [call])})
+    helper = Function('helper', [formal, owner], {'entry': BasicBlock('entry', [])})
+    records = SSACallTable(owner='late-owner-record-fixture')
+    original = records.assign('root', (SSACallRecord(
+        caller='root', callsite_id=9, callee_reference=None,
+        callee_name='helper', callee_symbol='helper',
+        argument_bindings=((20, 1),), callee_storage_value_ids=(1,),
+        frame_bindings=((1, 'caller_value', 20),), resolution='native_call',
+    ),), sources=tuple(roots), stage=FRAME_BINDING)
+    functions = {'root': root, 'helper': helper}
+
+    assert _complete_propagated_frame_tails(functions, call_records=records) == 1
+    slot = call.args[-1]
+    assert slot is root.args[-1]
+    physical = book.page(SSA_VALUE).latest(('root', slot.id))
+    assert (physical.physical_dtype, physical.storage, physical.rank) == ('ptr', 'span', 1)
+    assert slot.accounting['physical_dtype'] == 'ptr'
+    record = tuple(records['root'])[0]
+    assert record.callee_storage_value_ids == (1, 7)
+    assert record.frame_bindings == ((1, 'caller_value', 20), (7, 'caller_storage', slot.id))
+    assert record.unresolved_frame_value_ids == ()
+    argument_ref = book.latest_ref(ARGUMENT_BINDING, ('helper', 'root', 7, 9))
+    assert book.page(ARGUMENT_BINDING).latest(argument_ref.row) == ('caller_storage', slot.id)
+    tail_ref = book.latest_ref(FRAME_TAIL, ('root', 9, 'helper', 7))
+    current = book.latest_ref(CALL_RECORD, (records.owner, 'root'))
+    assert {original, argument_ref, tail_ref} <= {
+        source for source, _stage in book.edges_into(current)
+    }
+    assert _complete_propagated_frame_tails(functions, call_records=records) == 0
+    assert book.latest_ref(CALL_RECORD, (records.owner, 'root')) == current
+
+    page = book.page(FRAME_TAIL)
+    key = (tail_ref.row, tail_ref.column)
+    fact = page.cells[key]
+    try:
+        page.cells[key] = (slot.id + 1, fact[1])
+        with pytest.raises(ValueError, match='disagrees with its live Call'):
+            _complete_propagated_frame_tails(functions, call_records=records)
+    finally:
+        page.cells[key] = fact
