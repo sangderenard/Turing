@@ -10310,7 +10310,8 @@ class CorrelationTable:
                     operand_fact = book.page(PROCESS_GRAPH_OPERANDS).cell(
                         operands.row, operands.column,
                     )
-                    callee = operand_fact[0][0]
+                    role_cells = {role: source for source, role in operand_fact}
+                    callee = role_cells["callee"]
                     constructor_origin = origin_cell(book, constructor)
                     callee_origin = origin_cell(book, callee)
                     mutation_fact = book.page(SOURCE_SEQUENCE_MUTATION).cell(
@@ -10326,12 +10327,13 @@ class CorrelationTable:
                         class_cell.row, class_cell.column,
                     )
                     valid = (
-                        operand_fact[:1] == ((callee, "callee"),)
+                        len(operand_fact) == len(role_cells)
+                        and set(role_cells) in ({"callee"},
+                                                {"callee", "arg:0"})
                         and (
-                            (snapshot is None and len(operand_fact) == 1)
+                            (snapshot is None and set(role_cells) == {"callee"})
                             or (snapshot is not None
-                                and len(operand_fact) == 2
-                                and operand_fact[1][1] == "arg:0"
+                                and set(role_cells) == {"callee", "arg:0"}
                                 and book.page(
                                     SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT
                                 ).cell(snapshot.row, snapshot.column)
@@ -10343,7 +10345,7 @@ class CorrelationTable:
                                 and book.page(
                                     SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT
                                 ).cell(snapshot.row, snapshot.column)
-                                .source_cell == operand_fact[1][0])
+                                .source_cell == role_cells["arg:0"])
                         )
                         and callee.page == CANONICAL_VALUE
                         and callee.row[0] == row[0]

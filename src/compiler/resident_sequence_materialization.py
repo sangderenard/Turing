@@ -3429,6 +3429,14 @@ def _sequence_append_call_mutations(graph_obj: Any):
 
     expanded_mutations = []
     for mutation in mutations:
+        # Program: ``header = bytearray((2,)); header.append(3)``.
+        # The constructor snapshot records tuple 3 as the source sequence;
+        # expanding its one member to scalar 2 loses the copied object's
+        # length and gives the later mutable header a scalar capacity source.
+        # A snapshot copies the exact resident source named by its receipt.
+        if mutation.snapshot_cell is not None:
+            expanded_mutations.append(mutation)
+            continue
         arguments: list[int] = []
         for value_id in mutation.argument_value_ids:
             attributes = (

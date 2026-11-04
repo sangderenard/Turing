@@ -12933,6 +12933,53 @@ def _sequence_concat_ops(
     from .identity_concordance import current_identity_book as _concat_book
     from .source_evidence_resolver import ClassEvidence as _ConcatClassEvidence, require_class as _concat_class
     concat_book = _concat_book()
+    from .concordance_declarations import (
+        CANONICAL_VALUE as _CONCAT_CANONICAL,
+        SOURCE_SEQUENCE_MUTATION as _CONCAT_MUTATION,
+    )
+    from .concorded_literals import origin_cell as _concat_origin
+    from .resident_sequence_materialization import (
+        _source_contract_rows as _concat_source_rows,
+    )
+    mutation_page = concat_book.page(_CONCAT_MUTATION)
+    mutated_origins = set()
+    concat_scope = graph_obj.graph.get("lexical_read_scope")
+
+    def concat_cell(value_id):
+        return (
+            None if concat_scope is None else
+            concat_book.latest_ref(
+                _CONCAT_CANONICAL, (concat_scope, int(value_id)),
+            )
+        )
+
+    if any(graph_obj.graph.get(key) is not None for key in (
+        "source_numeric_scope", "authored_function_identity",
+        "source_numeric_base_scope",
+    )):
+        for mutation_row in _concat_source_rows(graph_obj, mutation_page):
+            mutation_cell = concat_book.latest_ref(
+                _CONCAT_MUTATION, mutation_row,
+            )
+            mutation_fact = mutation_page.cell(
+                mutation_cell.row, mutation_cell.column,
+            )
+            if not isinstance(mutation_fact, tuple) or len(mutation_fact) < 2:
+                continue
+            sequence_id = int(mutation_fact[0])
+            sequence_cell = concat_cell(sequence_id)
+            if sequence_cell is None:
+                continue
+            try:
+                sequence_origin = _concat_origin(concat_book, sequence_cell)
+                if any(
+                    source.page == _CONCAT_CANONICAL
+                    and _concat_origin(concat_book, source) == sequence_origin
+                    for source, _stage in concat_book.edges_into(mutation_cell)
+                ):
+                    mutated_origins.add(sequence_origin)
+            except ValueError:
+                continue
     concat_class_scope = (
         graph_obj.graph.get("source_numeric_scope")
         or graph_obj.graph.get("authored_function_identity")
@@ -13050,7 +13097,20 @@ def _sequence_concat_ops(
         leaves = tuple(map(int, attributes.get(
             "aggregate_leaf_value_ids", ()
         )))
-        if len(leaves) == 1:
+        # A constructor's one initial leaf is not its current mutable extent.
+        # `bytearray((VERSION,)); header.append(...)` has a copy receipt and
+        # an append receipt on the same source identity. Its later bytes view
+        # is a sequence, while immutable `bytes([value])` still takes the
+        # proven one-byte scalar path.
+        source_cell = concat_cell(value_id)
+        try:
+            mutated = (source_cell is not None and
+                       _concat_origin(concat_book, source_cell)
+                       in mutated_origins)
+        except ValueError:
+            mutated = True
+        if (len(leaves) == 1 and value_id not in snapshot_destinations
+                and not mutated):
             singleton_by_resident[value_id] = leaves[0]
 
     for value_id, kind in dict(call_result_kinds or {}).items():
@@ -30027,6 +30087,67 @@ def _class_surface_ssa_program(
         joined_literal_mutations = _joined_list_literal_mutations(
             graph_obj, joined_sequence_ids
         )
+        # Program: ``header = bytearray((2,)); header.append(3)``.
+        # The snapshot names the tuple object, while its aggregate layout
+        # names scalar member 2. The tuple has no binding and so the ordinary
+        # declaration survey omits its resident birth; replace would read a
+        # zeroed tuple arena before the append. Admit exactly the snapshot's
+        # source tuple through the existing display birth path, with both
+        # source cells cited by its sequence contract.
+        from .concordance_declarations import (
+            SOURCE_AGGREGATE_LAYOUT as _SNAPSHOT_SOURCE_LAYOUT,
+            SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT as _SNAPSHOT_SOURCE_PAGE,
+            SourceAggregateLayout as _SnapshotSourceLayout,
+            SourceSequenceConstructorSnapshot as _SnapshotSourceFact,
+        )
+        from .identity_concordance import current_identity_book as _snapshot_book
+        snapshot_source_declaration_cells = {}
+        snapshot_book = _snapshot_book()
+        snapshot_layout_scope = graph_obj.graph.get(
+            "source_aggregate_layout_scope"
+        )
+        for mutation in control_mutations:
+            snapshot_cell = mutation.snapshot_cell
+            if snapshot_cell is None or snapshot_layout_scope is None:
+                continue
+            snapshot = snapshot_book.page(_SNAPSHOT_SOURCE_PAGE).cell(
+                snapshot_cell.row, snapshot_cell.column,
+            )
+            if not isinstance(snapshot, _SnapshotSourceFact):
+                continue
+            source_id = int(snapshot.source_cell.row[-1])
+            if tuple(map(int, mutation.argument_value_ids)) != (source_id,):
+                continue
+            layout_cell = snapshot_book.latest_ref(
+                _SNAPSHOT_SOURCE_LAYOUT,
+                (snapshot_layout_scope, source_id),
+            )
+            if layout_cell is None:
+                continue
+            layout = snapshot_book.page(_SNAPSHOT_SOURCE_LAYOUT).cell(
+                layout_cell.row, layout_cell.column,
+            )
+            if not isinstance(layout, _SnapshotSourceLayout) or (
+                layout.aggregate_kind != "tuple" or not layout.members
+            ):
+                continue
+            source_data = graph_obj.nodes.get(source_id, {})
+            source_attrs = source_data.get("attributes") or {}
+            if (
+                source_attrs.get("aggregate_kind") != "tuple"
+                or source_attrs.get("producer_kind") != "aggregate"
+                or source_id in declared_sequence_ids
+            ):
+                continue
+            sequence_declarations = (*sequence_declarations, (
+                # As for iterated tuple displays above, the resident arena
+                # is writable during its lexical clear and member birth.
+                source_id, "duplicates", 1, True,
+            ))
+            declared_sequence_ids.add(source_id)
+            snapshot_source_declaration_cells[source_id] = (
+                snapshot_cell, layout_cell,
+            )
         literal_mutations = (*joined_literal_mutations, *_list_literal_mutations(
             graph_obj,
             declared_sequence_ids - set(joined_sequence_ids) - native_handle_ids
@@ -31452,6 +31573,8 @@ def _class_surface_ssa_program(
             int(sequence_id): list(cells)
             for sequence_id, cells in glyph_sequence_declaration_cells.items()
         }
+        for source_id, cells in snapshot_source_declaration_cells.items():
+            authored_declaration_cells.setdefault(source_id, []).extend(cells)
         for mutation in (*glyph_sequence_mutations, *token_glyph_mutations):
             for cell in (
                 mutation.step_cell, mutation.source_contract_cell,
@@ -31977,10 +32100,16 @@ def _class_surface_ssa_program(
                         operands = late_book.page(_PRIVATE_OPERANDS).cell(
                             operand.row, operand.column,
                         )
-                        if not operands or operands[0][1] != "callee":
+                        if len(operands) not in {1, 2} or len({
+                            role for _cell, role in operands
+                        }) != len(operands):
+                            continue
+                        role_cells = {role: cell for cell, role in operands}
+                        if set(role_cells) not in ({"callee"},
+                                                   {"callee", "arg:0"}):
                             continue
                         snapshot = None
-                        if len(operands) == 2 and operands[1][1] == "arg:0":
+                        if "arg:0" in role_cells:
                             snapshot = late_book.latest_ref(
                                 _PRIVATE_SNAPSHOT,
                                 (late_type_scope, sequence_id),
@@ -31993,12 +32122,11 @@ def _class_surface_ssa_program(
                             if (
                                 snapshot_fact.destination_cell != constructor
                                 or snapshot_fact.operand_cell != operand
-                                or snapshot_fact.source_cell != operands[1][0]
+                                or snapshot_fact.source_cell
+                                != role_cells["arg:0"]
                             ):
                                 continue
-                        elif len(operands) != 1:
-                            continue
-                        callee = operands[0][0]
+                        callee = role_cells["callee"]
                         if constructor not in {
                             source for source, _stage in late_book.edges_into(operand)
                         }:

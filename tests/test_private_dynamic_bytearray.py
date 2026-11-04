@@ -4,12 +4,16 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
     c_backend_repository_ssa_reference,
 )
 from src.compiler.concordance_declarations import (
+    SEQUENCE_CONTRACT_CONCORDANCE,
+    SOURCE_AGGREGATE_LAYOUT,
     SOURCE_PRIVATE_DYNAMIC_SEQUENCE,
+    SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT,
 )
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
@@ -18,11 +22,15 @@ from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 from src.compiler.ssa_storage_requirements import public_owned_sequence_returns
 
 
-def test_private_fresh_bytearray_early_return_native(tmp_path):
+@pytest.mark.parametrize("initialized", (False, True))
+def test_private_fresh_bytearray_early_return_native(tmp_path, initialized):
     source = (
         "def root(data: bytes) -> bytes:\n"
-        "    header = bytearray()\n"
-        "    header.append(2)\n"
+        + ("    header = bytearray((2,))\n"
+           "    header.append(3)\n" if initialized else
+           "    header = bytearray()\n"
+           "    header.append(2)\n")
+        +
         "    for _ in range(1):\n"
         "        if not data:\n"
         "            return bytes(header)\n"
@@ -47,17 +55,46 @@ def test_private_fresh_bytearray_early_return_native(tmp_path):
     book = module.metadata["identity_book"]
     page = book.page(SOURCE_PRIVATE_DYNAMIC_SEQUENCE)
     rows = tuple(page.rows())
-    assert len(rows) == 1
-    cell = book.latest_ref(SOURCE_PRIVATE_DYNAMIC_SEQUENCE, rows[0])
-    fact = page.cell(cell.row, cell.column)
+    assert len(rows) <= 1
+    assert rows or initialized
     assert CorrelationTable._source_private_dynamic_sequence_findings(module) == []
     assert CorrelationTable.build(module).findings(module) == []
-    key = (cell.row, cell.column)
-    page.cells[key] = replace(fact, static_definition_cell=fact.mutation_cell)
-    try:
-        assert CorrelationTable._source_private_dynamic_sequence_findings(module)
-    finally:
-        page.cells[key] = fact
+    if initialized:
+        snapshot_page = book.page(SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT)
+        (snapshot_row,) = tuple(snapshot_page.rows())
+        snapshot_cell = book.latest_ref(
+            SOURCE_SEQUENCE_CONSTRUCTOR_SNAPSHOT, snapshot_row,
+        )
+        snapshot = snapshot_page.cell(snapshot_cell.row, snapshot_cell.column)
+        source_id = int(snapshot.source_cell.row[-1])
+        contract_cell = book.latest_ref(
+            SEQUENCE_CONTRACT_CONCORDANCE, (function_name, source_id),
+        )
+        assert contract_cell is not None
+        contract_causes = {
+            cause for cause, _stage in book.edges_into(contract_cell)
+        }
+        contract_causes.update(
+            ancestor
+            for cause in tuple(contract_causes)
+            if cause.page == SEQUENCE_CONTRACT_CONCORDANCE
+            for ancestor, _stage in book.edges_into(cause)
+        )
+        assert snapshot_cell in contract_causes
+        assert any(
+            cause.page == SOURCE_AGGREGATE_LAYOUT
+            for cause in contract_causes
+        )
+    if rows:
+        cell = book.latest_ref(SOURCE_PRIVATE_DYNAMIC_SEQUENCE, rows[0])
+        fact = page.cell(cell.row, cell.column)
+        assert (fact.snapshot_cell is not None) is initialized
+        key = (cell.row, cell.column)
+        page.cells[key] = replace(fact, static_definition_cell=fact.mutation_cell)
+        try:
+            assert CorrelationTable._source_private_dynamic_sequence_findings(module)
+        finally:
+            page.cells[key] = fact
 
     (ports,) = public_owned_sequence_returns(module, function_name)
     artifact = emit_ssa_module_to_c(module, function_name)
