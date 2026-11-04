@@ -4193,7 +4193,11 @@ def emit_ssa_module_to_c(
                                 geometry_fact = physical_book.page(
                                     TENSOR_ELEMENTWISE_EXTENT_BINDING,
                                 ).cell(geometry_cell.row, geometry_cell.column)
-                                geometry_ids = tuple(map(int, geometry_fact[3:6]))
+                                geometry_ids = (
+                                    tuple(map(int, geometry_fact[-3:]))
+                                    if isinstance(geometry_fact, tuple) and len(geometry_fact) in (5, 6)
+                                    else ()
+                                )
                                 descriptor_ids = (
                                     result_descriptor.shape_value_id,
                                     result_descriptor.rank_value_id,

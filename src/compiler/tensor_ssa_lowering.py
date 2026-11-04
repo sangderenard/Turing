@@ -2003,6 +2003,53 @@ def _scalar_elementwise_execution(module, function, instruction, fact, *, book):
     return (position_ref, conversion)
 
 
+def _elementwise_extent_execution(module, function, instruction, fact, *, book):
+    """Read the live execution of the existing elementwise geometry receipt."""
+    if len(fact) == 6:
+        return _scalar_elementwise_execution(module, function, instruction, fact, book=book)
+    from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
+    from .ssa_record_return_state import posted_ssa_value_fact, ssa_value_identity_cell
+
+    operation, source_id, _shape, _rank, count_id = fact
+    signature = c_tensor_opcode(operation)
+    if signature is None or signature[0] != "unary" or instruction.res is None:
+        return None
+    source = posted_ssa_value_fact(function, source_id, book=book)
+    result = posted_ssa_value_fact(function, int(instruction.res.id), book=book)
+    if (source is None or result is None or source.storage != "span"
+            or result.storage != "span" or source.rank != result.rank):
+        return None
+    if instruction.op != "Call":
+        return () if (
+            source.physical_dtype == result.physical_dtype == "int64"
+            and c_tensor_opcode(_SHAPED_SSA_OPERATIONS.get(instruction.op, instruction.op)) == signature
+            and tuple(int(value.id) for value in instruction.args) == (source_id,)
+        ) else None
+    args = instruction.args
+    selected = module.functions.get("unary_double")
+    table = module.tensor_tables.get(function.name)
+    descriptor = None if table is None else table.by_id(int(instruction.res.id))
+    if (instruction.attributes.get("callee") != "unary_double"
+            or instruction.attributes.get("ssa_output_argument") != 1
+            or len(args) != 4 or int(args[0].id) != source_id
+            or int(args[2].id) != count_id
+            or descriptor is None or int(args[1].id) != descriptor.data_value_id
+            or source.physical_dtype != "float64" or result.physical_dtype != "float64"
+            or selected is None or len(selected.args) != 4
+            or selected.metadata.get("ssa_output_argument") != 1):
+        return None
+    constants = tuple(candidate for block in function.blocks.values() for candidate in block.instrs
+                      if candidate.op == "Const" and candidate.res is not None
+                      and int(candidate.res.id) == int(args[3].id))
+    if len(constants) != 1 or constants[0].attributes.get("constant") != signature[1]:
+        return None
+    cells = tuple(ssa_value_identity_cell(owner, int(value.id), book=book)
+                  for owner, values in ((function, (*args, instruction.res)),
+                                        (selected, tuple(selected.args)))
+                  for value in values)
+    return tuple(dict.fromkeys(cells)) if all(cell is not None for cell in cells) else None
+
+
 def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(), _ancestors=()):
     """Read exact local extents or the existing transported metadata binding.
 
@@ -2015,6 +2062,7 @@ def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(),
         BindingKind, CONTROL_VALUE_BINDING, ControlBinding,
         TENSOR_ELEMENTWISE_EXTENT_BINDING,
         TENSOR_METADATA_CALL_BINDING, TENSOR_METADATA_RESULT_BINDING,
+        TENSOR_RUNTIME_BROADCAST_VALIDITY,
     )
     from .ssa_record_return_state import (
         function_scope_of, posted_ssa_value_fact, ssa_value_identity_cell,
@@ -2058,24 +2106,46 @@ def _dynamic_tensor_geometry_evidence(module, function, value_id, *, pending=(),
                 or fact.rank != (1 if index == 0 else 0)):
             return None
     kinds = ("shape", "rank", "element_count")
+    broadcast = book.latest_ref(TENSOR_RUNTIME_BROADCAST_VALIDITY, (
+        function_scope_of(function), function.name, value_id,
+    ))
+    if broadcast is not None:
+        fact = book.page(broadcast.page).cell(broadcast.row, broadcast.column)
+        producers = definitions.get(int(value_id), ())
+        if (not isinstance(fact, tuple) or len(fact) != 19
+                or tuple(fact[12:15]) != ids or len(producers) != 1):
+            return None
+        from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
+        instruction = producers[0][2]
+        signature = c_tensor_opcode(fact[0])
+        raw = (instruction.op != "Call" and physical.physical_dtype == "int64"
+               and c_tensor_opcode(_SHAPED_SSA_OPERATIONS.get(instruction.op, instruction.op)) == signature)
+        native = (instruction.op == "Call" and physical.physical_dtype == "float64"
+                  and instruction.attributes.get("callee") == "binary_double"
+                  and instruction.attributes.get("ssa_output_argument") == 2
+                  and len(instruction.args) == 5 and int(instruction.args[3].id) == ids[2]
+                  and int(instruction.args[2].id) == descriptor.data_value_id)
+        if signature is None or signature[0] != "binary" or not (raw or native):
+            return None
+        return metadata, (*cells, broadcast)
     inherited = book.latest_ref(TENSOR_ELEMENTWISE_EXTENT_BINDING, (
         function_scope_of(function), function.name, value_id,
     ))
     if inherited is not None:
         fact = book.page(inherited.page).cell(inherited.row, inherited.column)
         source_definitions = definitions.get(int(value_id), ())
-        if (not isinstance(fact, tuple) or len(fact) != 6
+        if (not isinstance(fact, tuple) or len(fact) not in (5, 6)
                 or not isinstance(fact[0], str)
                 or any(type(identity) is not int for identity in fact[1:])
-                or tuple(fact[3:]) != ids or len(source_definitions) != 1):
+                or tuple(fact[-3:]) != ids or len(source_definitions) != 1):
             return None
         instruction = source_definitions[0][2]
-        scalar = posted_ssa_value_fact(function, fact[2], book=book)
-        execution = _scalar_elementwise_execution(
+        scalar = posted_ssa_value_fact(function, fact[2], book=book) if len(fact) == 6 else None
+        execution = _elementwise_extent_execution(
             module, function, instruction, fact, book=book,
         )
-        if (execution is None or scalar is None
-                or scalar.storage != "scalar" or scalar.rank != 0):
+        if (execution is None or len(fact) == 6 and (scalar is None
+                or scalar.storage != "scalar" or scalar.rank != 0)):
             return None
         evidence = _dynamic_tensor_geometry_evidence(
             module, function, fact[1], pending=pending,
@@ -5704,10 +5774,36 @@ def lower_tensor_calls_to_repository_ssa(
             alias_of: int | None = None,
             data_value_id: int | None = None,
             extent_ids_from: SSATensorDescriptor | None = None,
+            extent_values: tuple[SSAValue, SSAValue, SSAValue] | None = None,
         ) -> SSATensorDescriptor:
             tensor_id = int(value.id)
             existing = tensor_table.by_id(tensor_id)
             if existing is not None:
+                # _ascending_order's Neg17 was registered before Add16's
+                # metadata arrived. A later shape-preserving request supplied
+                # all three exact source16 extents, but this incumbent return
+                # kept Neg17 unresolved. Settle the same descriptor from the
+                # writer's explicit geometry; keep its carrier/owner/alias.
+                if existing.metadata_state == "unresolved" and metadata_state == "dynamic":
+                    requested = (
+                        tuple(int(member.id) for member in extent_values)
+                        if extent_values is not None else
+                        tuple(getattr(extent_ids_from, field) for field in (
+                            "shape_value_id", "rank_value_id", "element_count_value_id",
+                        )) if extent_ids_from is not None
+                        and extent_ids_from.metadata_state == "dynamic" else ()
+                    )
+                    from .ssa_record_return_state import ssa_value_identity_cell
+                    if (len(requested) == 3
+                            and all(type(identity) is int for identity in requested)
+                            and all(ssa_value_identity_cell(function, identity, book=book) is not None
+                                    for identity in requested)):
+                        existing = dataclasses.replace(
+                            existing, metadata_state="dynamic", byte_size=None,
+                            shape_value_id=requested[0], rank_value_id=requested[1],
+                            element_count_value_id=requested[2],
+                        )
+                        tensor_table.tensors[tensor_id] = existing
                 return existing
             shape = tuple(map(int, value.shape))
             value_accounting = dict(value.accounting or {})
@@ -5885,6 +5981,11 @@ def lower_tensor_calls_to_repository_ssa(
                     "tensor_element_count_value_id"
                 ),
             }
+            if extent_values is not None:
+                extent_ids = dict(zip(
+                    ("shape_value_id", "rank_value_id", "element_count_value_id"),
+                    (int(member.id) for member in extent_values), strict=True,
+                ))
             if state == "dynamic":
                 if all(value_id is not None for value_id in extent_ids.values()):
                     extent_ids = {
@@ -6176,6 +6277,32 @@ def lower_tensor_calls_to_repository_ssa(
                     for value in instruction.args
                 )
                 for caller, _call in callers
+            )
+
+        def private_dynamic_result(result: SSAValue) -> bool:
+            return not any(
+                instruction.op == "Ret" and any(int(value.id) == int(result.id)
+                                                for value in instruction.args)
+                for block in function.blocks.values() for instruction in block.instrs
+            ) or has_private_region_result(result)
+
+        def post_unary_geometry(operation, source, result, evidence, execution_cells=()):
+            from .concordance_declarations import TENSOR_ELEMENTWISE_EXTENT_BINDING, TENSOR_SSA_LOWERING
+            from .identity_concordance import Derived, Mode
+            from .ssa_record_return_state import function_scope_of, ssa_value_identity_cell
+            metadata, proof = evidence
+            cells = tuple(dict.fromkeys((
+                *proof, *execution_cells,
+                *(ssa_value_identity_cell(function, int(value.id), book=book)
+                  for value in (source, result, *metadata)),
+            )))
+            if any(cell is None for cell in cells):
+                raise ValueError("unary geometry lost its exact SSA evidence")
+            book.post(
+                TENSOR_ELEMENTWISE_EXTENT_BINDING,
+                (function_scope_of(function), function.name, int(result.id)),
+                (str(operation), int(source.id), *(int(value.id) for value in metadata)),
+                stage=TENSOR_SSA_LOWERING, provenance=Derived(cells), mode=Mode.CONCORD,
             )
 
         constants: dict[int, Any] = {}
@@ -9686,9 +9813,6 @@ def lower_tensor_calls_to_repository_ssa(
                 if (
                     source is not None
                     and opcode_contract is not None
-                    and not _int64_lane_stays_elementwise(
-                        instruction, operation, result, data_args,
-                    )
                 ):
                     # A checked int64 binary stays a raw SSA Add/Sub/Mul at
                     # dispatch, but its output still needs the operand-proved
@@ -9744,8 +9868,9 @@ def lower_tensor_calls_to_repository_ssa(
                                 book=_opcode_book,
                                 physical={
                                     "physical_dtype": (
-                                        "int64" if opcode_contract[0] == "binary"
-                                        and _int64_binary_kernel(
+                                        "int64" if _int64_lane_stays_elementwise(
+                                            instruction, operation, result, data_args,
+                                        ) or opcode_contract[0] == "binary" and _int64_binary_kernel(
                                             operation, result, data_args,
                                         ) else "float64"
                                     ),
@@ -9996,6 +10121,17 @@ def lower_tensor_calls_to_repository_ssa(
                             rewritten.append(instruction)
                         continue
                 source_descriptor = None
+                from .concordance_declarations import TENSOR_RUNTIME_BROADCAST_VALIDITY
+                from .ssa_record_return_state import function_scope_of
+                completed_broadcast = book.latest_ref(TENSOR_RUNTIME_BROADCAST_VALIDITY, (
+                    function_scope_of(function), function.name, int(result.id),
+                ))
+                if completed_broadcast is not None:
+                    # A raw checked Add remains executable after its broadcast
+                    # program is complete. Later geometry arrival for another
+                    # local value must not emit that program a second time.
+                    rewritten.append(instruction)
+                    continue
                 if source is not None:
                     source_descriptor = register_tensor(
                         source,
@@ -10016,7 +10152,9 @@ def lower_tensor_calls_to_repository_ssa(
                     )
                 from .ssa_record_return_state import function_scope_of, posted_ssa_value_fact
                 scalar_geometry = None
-                if opcode_contract is not None and opcode_contract[0] == "binary" and len(data_args) == 2:
+                if (opcode_contract is not None
+                        and (opcode_contract[0] == "binary" and len(data_args) == 2
+                             or opcode_contract[0] == "unary" and len(data_args) == 1)):
                     facts = tuple(posted_ssa_value_fact(function, int(value.id), book=book)
                                   for value in data_args)
                     from .concordance_declarations import BindingKind, CONTROL_VALUE_BINDING, ControlBinding
@@ -10042,7 +10180,7 @@ def lower_tensor_calls_to_repository_ssa(
                     span_positions = [index for index, fact in enumerate(facts)
                                       if fact is not None and fact.storage == "span"
                                       and type(fact.rank) is int and fact.rank > 0]
-                    if len(span_positions) == 1:
+                    if len(data_args) == 2 and len(span_positions) == 1:
                         span_position = span_positions[0]
                         span = data_args[span_position]
                         scalar = data_args[1 - span_position]
@@ -10382,17 +10520,10 @@ def lower_tensor_calls_to_repository_ssa(
                             "tensor_rank_value_id": int(rank.id),
                             "tensor_element_count_value_id": int(count.id),
                         }
-                        existing_result = tensor_table.by_id(int(result.id))
-                        if existing_result is not None and existing_result.metadata_state == "unresolved":
-                            # The first visit registered this raw binary before
-                            # its other operand's Call metadata arrived. The
-                            # geometry writer now settles that same descriptor;
-                            # updating accounting alone leaves its IDs empty.
-                            tensor_table.tensors[int(result.id)] = dataclasses.replace(
-                                existing_result, metadata_state="dynamic", byte_size=None,
-                                shape_value_id=int(output_shape.id),
-                                rank_value_id=int(rank.id), element_count_value_id=int(count.id),
-                            )
+                        register_tensor(
+                            result, storage="temporary", metadata_state="dynamic",
+                            extent_values=(output_shape, rank, count),
+                        )
                         for operand, values in ((wide, wide_metadata),
                                                 (narrow, narrow_metadata)):
                             dynamic_extents[int(operand.id)] = dict(zip(
@@ -10437,6 +10568,14 @@ def lower_tensor_calls_to_repository_ssa(
                         else None
                     ),
                     extent_ids_from=(None if scalar_result else source_descriptor),
+                    extent_values=(None if scalar_geometry is None else scalar_geometry[2][0]),
+                )
+                unary_geometry = (
+                    _dynamic_tensor_geometry_evidence(module, function, int(source.id), pending=prefix)
+                    if opcode_contract is not None and opcode_contract[0] == "unary"
+                    and len(data_args) == 1 and source_descriptor is not None
+                    and source_descriptor.metadata_state == "dynamic"
+                    else None
                 )
                 # Program: a dynamic arange span is captured by the next
                 # planned region as a typed formal with display shape ().
@@ -11893,6 +12032,11 @@ def lower_tensor_calls_to_repository_ssa(
                     # instruction itself, which each backend's elementwise
                     # span loop spells on the integer path, wrapping at
                     # INT64_MIN exactly as the NumPy reference does.
+                    if unary_geometry is not None:
+                        post_unary_geometry(operation, source, result, unary_geometry)
+                        if private_dynamic_result(result):
+                            own_dynamic_tensor(result, unary_geometry[0][2], "int64", prefix)
+                    rewritten.extend(prefix)
                     rewritten.append(instruction)
                     continue
 
@@ -11924,14 +12068,8 @@ def lower_tensor_calls_to_repository_ssa(
                         binary_output = result
                         if (
                             kind == "binary" and count is not None
-                            and (int(result.id) in mixed_runtime_geometry
-                                 and has_private_region_result(result)
-                                 or scalar_geometry is not None and (
-                                     not any(item.op == "Ret" and any(int(value.id) == int(result.id)
-                                             for value in item.args)
-                                             for item_block in function.blocks.values()
-                                             for item in item_block.instrs)
-                                     or has_private_region_result(result)))
+                            and (int(result.id) in mixed_runtime_geometry or scalar_geometry is not None)
+                            and private_dynamic_result(result)
                         ):
                             binary_output = own_dynamic_tensor(
                                 result, count, kernel_dtype, prefix,
@@ -11940,10 +12078,32 @@ def lower_tensor_calls_to_repository_ssa(
                         if count is not None:
                             prefix.append(opcode_instruction)
                             if kind == "unary":
+                                unary_output = (
+                                    own_dynamic_tensor(result, count, "float64", prefix)
+                                    if unary_geometry is not None and private_dynamic_result(result)
+                                    else result
+                                )
                                 emitted.append(call(
-                                    "unary_double", [source, result, count, opcode_ssa], result,
+                                    "unary_double", [source, unary_output, count, opcode_ssa], result,
                                     instruction, output_argument=1,
                                 ))
+                                if unary_geometry is not None:
+                                    selected = reference.module.functions["unary_double"]
+                                    link_repository_function("unary_double", selected)
+                                    # unary_double's pointer formals acquire
+                                    # their exact pointee types from its Loads
+                                    # and Stores. Publish that incumbent ABI
+                                    # before this receipt cites the formals;
+                                    # late inference otherwise revises them
+                                    # after the receipt was closed.
+                                    from .ssa_call_input_adapters import _infer_pointer_storage
+                                    _infer_pointer_storage({selected.name: selected})
+                                    from .ssa_record_return_state import ssa_value_identity_cell
+                                    post_unary_geometry(operation, source, result, unary_geometry,
+                                        tuple(ssa_value_identity_cell(owner, int(value.id), book=book)
+                                              for owner, values in ((function, tuple(emitted[-1].args)),
+                                                                    (selected, tuple(selected.args)))
+                                              for value in values))
                             elif kind == "binary" and len(data_args) == 2 and scalar_geometry is not None and _int64_lane_checked(instruction, operation, result):
                                 emitted.append(instruction)
                             elif kind == "binary" and len(data_args) == 2 and scalar_geometry is not None:

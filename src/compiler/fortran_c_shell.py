@@ -62559,38 +62559,44 @@ def _class_surface_ssa_program(
                 ):
                     late_tensor_names.add(str(caller_name))
                     changed = True
-        def _late_formal_geometry():
-            return tuple(
-                (
-                    (name, int(formal.id)),
-                    None if descriptor is None else (
+        def _late_value_geometry():
+            geometry = []
+            for name in sorted(late_tensor_names):
+                if name not in lowered_module.functions:
+                    continue
+                function = lowered_module.functions[name]
+                table = lowered_module.tensor_tables.get(name)
+                value_ids = {
+                    int(formal.id) for formal in function.args
+                    if not (formal.accounting or {}).get("heap_owner")
+                    and (formal.accounting or {}).get("tensor_extent_for") is None
+                }
+                if table is not None:
+                    value_ids.update(int(identity) for identity, descriptor in table.tensors.items()
+                                     if descriptor.metadata_state == "dynamic")
+                for identity in sorted(value_ids):
+                    descriptor = None if table is None else table.by_id(identity)
+                    geometry.append(((name, identity), None if descriptor is None else (
                         descriptor.metadata_state, descriptor.shape,
                         descriptor.shape_value_id, descriptor.rank_value_id,
                         descriptor.element_count_value_id,
-                    ),
-                )
-                for name in sorted(late_tensor_names)
-                if name in lowered_module.functions
-                for formal in lowered_module.functions[name].args
-                if not (formal.accounting or {}).get('heap_owner')
-                and (formal.accounting or {}).get('tensor_extent_for') is None
-                for descriptor in (
-                    lowered_module.tensor_tables[name].by_id(int(formal.id))
-                    if name in lowered_module.tensor_tables else None,
-                )
-            )
+                    )))
+            return tuple(geometry)
 
         # The rank-two `(data * multiplier + index).sum().item()` region
         # receives its exact input shape/rank/count during this late pass,
         # after its raw sum was deferred on an unresolved descriptor. Retry
         # only the existing affected call closure when that booked formal
         # geometry changes; settle the private owner after it stops changing.
+        # A local Neg following a newly completed broadcast also waits for
+        # that exact geometry receipt. Include dynamic local identities in
+        # the same worklist; a formal-only view lost this dependency.
         pending_late_names = set(late_tensor_names)
         late_shortfalls_by_function = {}
         first_late_pass = True
         while first_late_pass or pending_late_names:
             first_late_pass = False
-            prior_formals = dict(_late_formal_geometry())
+            prior_geometry = dict(_late_value_geometry())
             late_tensor_module = IRModule(
                 {
                     name: lowered_module.functions[name]
@@ -62616,12 +62622,12 @@ def _class_surface_ssa_program(
                 lowered_module.tensor_tables.setdefault(name, table)
             propagate_repository_ssa_call_metadata(lowered_module)
             settle_repository_ssa_static_extent_operands(lowered_module)
-            revised_formals = dict(_late_formal_geometry())
-            changed_formal_names = {
-                name for (name, formal_id), geometry in revised_formals.items()
-                if geometry != prior_formals.get((name, formal_id))
+            revised_geometry = dict(_late_value_geometry())
+            changed_geometry_names = {
+                name for (name, value_id), geometry in revised_geometry.items()
+                if geometry != prior_geometry.get((name, value_id))
             }
-            pending_late_names = set(changed_formal_names)
+            pending_late_names = set(changed_geometry_names)
             changed = True
             while changed:
                 changed = False

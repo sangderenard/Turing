@@ -7026,7 +7026,7 @@ class CorrelationTable:
 
     @staticmethod
     def _tensor_elementwise_extent_binding_findings(module: Any) -> list[Finding]:
-        """A binary span result uses its exact input's transported extent."""
+        """An elementwise span result retains its exact input geometry."""
 
         from ..common.tensors.accelerator_backends.c_backend_llvm_ssa import c_tensor_opcode
         from .concordance_declarations import (
@@ -7039,7 +7039,7 @@ class CorrelationTable:
         )
         from .tensor_ssa_lowering import (
             _SHAPED_SSA_OPERATIONS, _dynamic_tensor_geometry_evidence,
-            _scalar_elementwise_execution,
+            _elementwise_extent_execution,
         )
 
         book = identity_book(module)
@@ -7051,12 +7051,14 @@ class CorrelationTable:
             function = module.functions.get(str(row[1])) if isinstance(row, tuple) and len(row) == 3 else None
             valid = (
                 function is not None and function_scope_of(function) == row[0]
-                and isinstance(fact, tuple) and len(fact) == 6
+                and isinstance(fact, tuple) and len(fact) in (5, 6)
                 and isinstance(fact[0], str)
                 and all(type(value_id) is int for value_id in fact[1:])
             )
             if valid:
-                operation, source_id, scalar_id, shape_id, rank_id, count_id = fact
+                operation, source_id = fact[:2]
+                scalar_id = fact[2] if len(fact) == 6 else None
+                shape_id, rank_id, count_id = fact[-3:]
                 signature = c_tensor_opcode(operation)
                 instructions = [instruction for block in function.blocks.values()
                                 for instruction in block.instrs
@@ -7066,16 +7068,17 @@ class CorrelationTable:
                 source = None if table is None else table.by_id(source_id)
                 result = None if table is None else table.by_id(row[2])
                 source_fact = posted_ssa_value_fact(function, source_id, book=book)
-                scalar_fact = posted_ssa_value_fact(function, scalar_id, book=book)
+                scalar_fact = (posted_ssa_value_fact(function, scalar_id, book=book)
+                               if scalar_id is not None else None)
                 result_fact = posted_ssa_value_fact(function, row[2], book=book)
                 ids = (shape_id, rank_id, count_id)
                 execution = (
-                    _scalar_elementwise_execution(
+                    _elementwise_extent_execution(
                         module, function, instructions[0], fact, book=book,
                     ) if len(instructions) == 1 else None
                 )
                 valid = (
-                    signature is not None and signature[0] == "binary"
+                    signature is not None and signature[0] == ("binary" if len(fact) == 6 else "unary")
                     and len(instructions) == 1
                     and execution is not None
                     and source is not None and result is not None
@@ -7086,8 +7089,8 @@ class CorrelationTable:
                         "shape_value_id", "rank_value_id", "element_count_value_id")) == ids
                     and source_fact is not None and source_fact.storage == "span"
                     and isinstance(source_fact.rank, int) and source_fact.rank > 0
-                    and scalar_fact is not None and scalar_fact.storage == "scalar"
-                    and scalar_fact.rank == 0
+                    and (scalar_id is None or scalar_fact is not None
+                         and scalar_fact.storage == "scalar" and scalar_fact.rank == 0)
                     and result_fact is not None and result_fact.storage == "span"
                     and result_fact.rank == source_fact.rank
                 )
@@ -7095,7 +7098,7 @@ class CorrelationTable:
                     causes = {cause for cause, _stage in book.edges_into(ref)}
                     value_cells = tuple(ssa_value_identity_cell(
                         function, value_id, book=book,
-                    ) for value_id in (source_id, scalar_id, row[2], *ids))
+                    ) for value_id in (source_id, row[2], *ids, *((scalar_id,) if scalar_id is not None else ())))
                     evidence = _dynamic_tensor_geometry_evidence(module, function, source_id)
                     valid = (
                         all(cell is not None and cell in causes for cell in value_cells)
@@ -7108,7 +7111,7 @@ class CorrelationTable:
                 found.append(Finding(
                     "tensor-elementwise-extent-binding", str(row[1]) if isinstance(row, tuple) and len(row) > 1 else str(row),
                     row[2] if isinstance(row, tuple) and len(row) == 3 else None,
-                    "binary span result lacks exact operand, descriptor, transported metadata, or direct SSA causes",
+                    "elementwise span result lacks exact operand, descriptor, geometry, or direct SSA causes",
                 ))
         # The bounded `reshape(-1, width) + 1` source used to return a scalar
         # `1` even though its Add consumed a rank-two span: no extent receipt
@@ -7119,13 +7122,14 @@ class CorrelationTable:
             scope = function_scope_of(function)
             for block in function.blocks.values():
                 for instruction in block.instrs:
-                    if instruction.res is None or len(instruction.args) != 2:
+                    if instruction.res is None or len(instruction.args) not in (1, 2):
                         continue
                     operation = _SHAPED_SSA_OPERATIONS.get(
                         instruction.op, str(instruction.op),
                     )
                     signature = c_tensor_opcode(operation)
-                    if signature is None or signature[0] != "binary":
+                    if (signature is None
+                            or signature[0] != ("unary" if len(instruction.args) == 1 else "binary")):
                         continue
                     operands = tuple(posted_ssa_value_fact(
                         function, int(arg.id), book=book,
@@ -7145,7 +7149,7 @@ class CorrelationTable:
                         found.append(Finding(
                             "tensor-elementwise-result-geometry",
                             function.name, result_id,
-                            "binary span input has no matching physical span result",
+                            "elementwise span input has no matching physical span result",
                         ))
                     table = module.tensor_tables.get(function.name)
                     source_descriptors = tuple(
@@ -7163,7 +7167,7 @@ class CorrelationTable:
                         found.append(Finding(
                             "tensor-elementwise-extent-missing",
                             function.name, result_id,
-                            "dynamic binary span result has no exact metadata binding",
+                            "dynamic elementwise span result has no exact metadata binding",
                         ))
         return found
 
