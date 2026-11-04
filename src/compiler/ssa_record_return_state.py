@@ -41,6 +41,7 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
     from .concordance_declarations import (
         CALL_RECORD, TENSOR_METADATA_RESULT_BINDING,
         TENSOR_OWNED_HEAP_BINDING, TENSOR_SOURCE_OWNED_RETURN,
+        TENSOR_RUNTIME_RESHAPE_VALIDITY, TENSOR_RUNTIME_VIEW_GEOMETRY,
     )
 
     book = identity_book(module) if book is None else book
@@ -77,6 +78,108 @@ def metadata_result_caller_value(module, caller, call, result_ref, *, book=None)
                 callee_outputs, caller_outputs, strict=True,
             ) if source_id == int(owned[0]))
             carrier_proofs = (owned_ref,)
+    if not matches:
+        # Run58 compact_codewords region0 returns physical tensor1 while
+        # semantic flatten view3 owns the dynamic output geometry.  The
+        # RESULT binding already cites the exact runtime-view receipt; that
+        # receipt, the callee descriptor and its Ret prove data3 aliases
+        # carrier1.  Keep the semantic Call output3 on the caller edge.
+        callee = module.functions.get(str(result_ref.row[2]))
+        table = module.tensor_tables.get(str(result_ref.row[2]))
+        descriptor = None if table is None else table.by_id(callee_id)
+        result_fact = book.page(TENSOR_METADATA_RESULT_BINDING).cell(
+            result_ref.row, result_ref.column,
+        )
+        view_row = (
+            function_scope_of(callee), callee.name, callee_id,
+        ) if callee is not None else None
+        view_refs = tuple(
+            parent for parent, _stage in book.edges_into(result_ref)
+            if parent.page in {
+                TENSOR_RUNTIME_RESHAPE_VALIDITY,
+                TENSOR_RUNTIME_VIEW_GEOMETRY,
+            } and parent.row == view_row
+        )
+        if len(view_refs) == 1 and descriptor is not None:
+            view_ref = view_refs[0]
+            view_page = book.page(view_ref.page)
+            view_fact = view_page.cell(view_ref.row, view_ref.column)
+            current_view = book.latest_ref(view_ref.page, view_ref.row)
+            # A later same-fact CONCORD revision may add direct SSA causes.
+            # A changed geometry fact cannot stand in for the cited proof.
+            ancestry = set()
+            pending = [current_view] if current_view is not None else []
+            while pending:
+                current = pending.pop()
+                if current in ancestry:
+                    continue
+                ancestry.add(current)
+                pending.extend(
+                    parent for parent, _stage in book.edges_into(current)
+                    if parent.page == view_ref.page and parent.row == view_ref.row
+                )
+            if (
+                view_ref in ancestry
+                and view_page.cell(current_view.row, current_view.column)
+                == view_fact
+                and isinstance(view_fact, tuple)
+            ):
+                if view_ref.page == TENSOR_RUNTIME_VIEW_GEOMETRY:
+                    if len(view_fact) == 7 and view_fact[0] == "flatten":
+                        source_id = int(view_fact[1])
+                        view_metadata = (
+                            int(view_fact[5]), int(view_fact[6]),
+                            int(view_fact[4]),
+                        )
+                    elif len(view_fact) == 9 and view_fact[0] == "unsqueeze":
+                        source_id = int(view_fact[1])
+                        view_metadata = (
+                            int(view_fact[7]), int(view_fact[8]),
+                            int(view_fact[6]),
+                        )
+                    else:
+                        return None
+                elif len(view_fact) == 12:
+                    source_id = int(view_fact[0])
+                    view_metadata = (
+                        int(view_fact[7]), int(view_fact[8]),
+                        int(view_fact[3]),
+                    )
+                else:
+                    return None
+                source_descriptor = table.by_id(source_id)
+                semantic_outputs = tuple(map(int, (
+                    (callee.metadata or {}).get("source_region_integral") or {}
+                ).get("output_value_ids", ())))
+                returns = tuple(
+                    instruction for block in callee.blocks.values()
+                    for instruction in block.instrs if instruction.op == "Ret"
+                )
+                if (
+                    len(result_fact) == 3
+                    and int(result_fact[0]) == callee_id
+                    and tuple(map(int, result_fact[1])) == view_metadata
+                    and (descriptor.shape_value_id,
+                         descriptor.rank_value_id,
+                         descriptor.element_count_value_id) == view_metadata
+                    and descriptor.storage == "view"
+                    and descriptor.metadata_state == "dynamic"
+                    and descriptor.alias_of == source_id
+                    and source_descriptor is not None
+                    and descriptor.dtype == source_descriptor.dtype
+                    and len(returns) == 1
+                    and semantic_outputs.count(callee_id) == 1
+                ):
+                    position = semantic_outputs.index(callee_id)
+                    if (
+                        position < len(returns[0].args)
+                        and position < len(callee_outputs)
+                        and descriptor.data_value_id == source_descriptor.data_value_id
+                        == int(returns[0].args[position].id)
+                        == callee_outputs[position]
+                    ):
+                        matches = (int(caller_outputs[position]),)
+                        carrier_proofs = (view_ref,)
     if not matches:
         # A source function can return a region-allocated tensor. Its outer
         # Call publishes the source's loaded pointer carrier, while the
