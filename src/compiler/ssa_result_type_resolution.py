@@ -49,7 +49,8 @@ def _row_physical(function, value):
     return dict(fields) if isinstance(fields, dict) else {}
 
 
-def _publish_type(function, value, winner, decision, carried=None):
+def _publish_type(function, value, winner, decision, carried=None,
+                  extra_sources=()):
     """Commit the retained decision before changing its resident SSA view.
 
     Rule: post first; accounting is a view.  The whole winner -- dtype, shape
@@ -74,7 +75,7 @@ def _publish_type(function, value, winner, decision, carried=None):
                    else {"physical_dtype": winner[3]}), **(carried or {})}
     publish_ssa_value_type(
         function, value, dtype=winner[0], shape=winner[1],
-        stage=FRAME_LINK, sources=(decision,),
+        stage=FRAME_LINK, sources=(decision, *extra_sources),
         physical=physical or KEEP_PHYSICAL,
     )
     value.device = winner[2]
@@ -174,9 +175,14 @@ def _refresh_scope_occurrences(functions):
 
 
 def settle_call_result_types(functions, emit_outputs, function_values):
-    from .concordance_declarations import PLANNING_VALUE
+    from .concordance_declarations import (
+        PLANNING_VALUE, TENSOR_RUNTIME_RESHAPE_VALIDITY,
+        TENSOR_RUNTIME_VIEW_GEOMETRY,
+    )
     from .identity_concordance import current_identity_book
-    from .ssa_record_return_state import accepted_ssa_component
+    from .ssa_record_return_state import (
+        accepted_ssa_component, function_scope_of,
+    )
 
     ledger = TransformationLedger((
         TransformationRule('provisional', 1),
@@ -235,6 +241,62 @@ def settle_call_result_types(functions, emit_outputs, function_values):
     # field would otherwise raise TransformationConflict.
     carried_physical = {}
 
+    def semantic_view_output(callee, caller_id, physical):
+        """Read a computed view's exact result, distinct from its Ret carrier."""
+        book = current_identity_book()
+        row = (function_scope_of(callee), callee.name, int(caller_id))
+        reshape = book.latest_ref(TENSOR_RUNTIME_RESHAPE_VALIDITY, row)
+        unsqueeze = book.latest_ref(TENSOR_RUNTIME_VIEW_GEOMETRY, row)
+        if reshape is not None and unsqueeze is not None:
+            raise ValueError("one call output has two runtime view geometries")
+        proof = reshape or unsqueeze
+        if proof is None:
+            return physical, None
+        source_id = int(book.page(proof.page).cell(
+            proof.row, proof.column,
+        )[1] if unsqueeze is not None else book.page(proof.page).cell(
+            proof.row, proof.column,
+        )[0])
+        seen = {int(caller_id)}
+        while source_id != int(physical.id):
+            if source_id in seen:
+                raise ValueError("cyclic runtime view source identity")
+            seen.add(source_id)
+            parent_row = (function_scope_of(callee), callee.name, source_id)
+            parent = (
+                book.latest_ref(TENSOR_RUNTIME_RESHAPE_VALIDITY, parent_row)
+                or book.latest_ref(TENSOR_RUNTIME_VIEW_GEOMETRY, parent_row)
+            )
+            if parent is None:
+                raise ValueError("runtime view has no exact physical Ret chain")
+            parent_fact = book.page(parent.page).cell(
+                parent.row, parent.column,
+            )
+            source_id = int(
+                parent_fact[1] if parent.page == TENSOR_RUNTIME_VIEW_GEOMETRY
+                else parent_fact[0]
+            )
+        return physical, proof
+
+    def source_record(callee, source, view_proof):
+        if view_proof is None:
+            return (_recorded_type(callee, source),
+                    _posted_physical(callee, source),
+                    _value_cells((callee, source))[0])
+        from .structural_concordance import function_value_structure
+        structure, cell = function_value_structure(
+            callee, int(view_proof.row[-1]),
+        )
+        physical = {}
+        if structure.declared_storage is not None:
+            physical['storage'] = structure.declared_storage
+        if structure.rank is not None:
+            physical['rank'] = structure.rank
+        if structure.arena:
+            physical['arena'] = True
+        return ((structure.dtype, structure.shape, source.device,
+                 structure.physical_dtype), physical, cell)
+
     def bindings():
         for caller in functions.values():
             if accepted_ssa_component(caller):
@@ -270,7 +332,7 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                             if callee is not None:
                                 outputs = tuple(emit_outputs(callee.name, callee))
                                 if len(outputs) == 1:
-                                    yield caller, instruction.res, callee, outputs[0]
+                                    yield caller, instruction.res, callee, outputs[0], None
                         continue
                     callee = functions.get(str(instruction.attributes.get('callee', '')))
                     ids = tuple(map(int, instruction.attributes.get('output_ids', ())))
@@ -309,30 +371,34 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                         outputs = tuple(by_id[value_id] for value_id in selected)
                     elif len(ids) != len(outputs):
                         continue
+                    output_pairs = tuple(
+                        semantic_view_output(callee, value_id, source)
+                        for value_id, source in zip(ids, outputs)
+                    )
                     # A per-arm region call (``union_arm_dispatch``) types
                     # its own loads; the joined id is the merge of every
                     # arm's, not this callee's output.
-                    for value_id, source in zip(ids, outputs):
+                    for value_id, (source, proof) in zip(ids, output_pairs):
                         if value_id in values and not instruction.attributes.get(
                             'union_arm_dispatch'
                         ):
-                            yield caller, values[value_id], callee, source
+                            yield caller, values[value_id], callee, source, proof
                     for position, target in projections.get(id(instruction.res), ()):
                         if isinstance(position, tuple):
                             # source_output_id names the caller's semantic
                             # output. Original aggregate indices may have gaps
                             # after dead output removal; the call's explicit
                             # caller/callee correspondence is authoritative.
-                            candidates = [source for value_id, source in zip(ids, outputs)
+                            candidates = [pair for value_id, pair in zip(ids, output_pairs)
                                           if value_id == position[1]]
                             if len(candidates) != 1:
                                 continue
-                            source = candidates[0]
-                        elif isinstance(position, int) and 0 <= position < len(outputs):
-                            source = outputs[position]
+                            source, proof = candidates[0]
+                        elif isinstance(position, int) and 0 <= position < len(output_pairs):
+                            source, proof = output_pairs[position]
                         else:
                             continue
-                        yield caller, target, callee, source
+                        yield caller, target, callee, source, proof
 
         # A planned numerical region is a separate repository function, but
         # its ``source_region_integral`` records each capture as the owner's
@@ -382,7 +448,7 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                 planning_cell = book.latest_ref(PLANNING_VALUE, row)
                 if planning_cell is not None:
                     capture_planning_cells[id(target)] = (planning_cell,)
-                yield region, target, owner, source
+                yield region, target, owner, source, None
 
     exact_values = set()
     changed = True
@@ -440,20 +506,29 @@ def settle_call_result_types(functions, emit_outputs, function_values):
                     target.accounting = {**dict(target.accounting or {}),
                         'physical_dtype': posted_target['physical_dtype'],
                         'physical_dtype_provenance': ('addressed_element', owner.name, int(base.id))}
-        for caller, target, callee, source in bindings():
+        for caller, target, callee, source, view_proof in bindings():
             # Imported bodies remain immutable. Their exact producer proof
             # crosses through the book's digest-qualified import edge; it is
             # now usable evidence for this caller, not a foreign local Ref.
-            source_type = _recorded_type(callee, source)
+            source_type, source_physical, source_cell = source_record(
+                callee, source, view_proof,
+            )
             if source_type[0] in {None, '', 'unknown'} and not source_type[1] and source_type[2] is None:
                 continue
-            source_cells = _value_cells((callee, source), (caller, target))
-            source_physical = _posted_physical(callee, source)
-            if _publish_type(caller, target, source_type, source_cells[0],
-                             source_physical):
+            if _publish_type(caller, target, source_type, source_cell,
+                             source_physical,
+                             () if view_proof is None else (view_proof,)):
                 changed = True
             target.accounting = {**dict(target.accounting or {}),
-                'ssa_call_result_from': (callee.name, int(source.id))}
+                'ssa_call_result_from': (
+                    callee.name,
+                    # The semantic view's type comes from view_proof above;
+                    # the call's physical storage origin is still its exact
+                    # Ret carrier. Root reshape output 5 aliases region 0
+                    # carrier 0; naming logical view 5 here made the C
+                    # origin walk cycle 5 -> 5 instead of reaching input 0.
+                    int(source.id),
+                )}
             # Rule: accounting is a view of the target's posted row; a
             # source's accounting dtype with no row behind it is not
             # copied onto the target.
@@ -461,7 +536,8 @@ def settle_call_result_types(functions, emit_outputs, function_values):
             if physical_dtype is not None:
                 target.accounting['physical_dtype'] = physical_dtype
                 target.accounting['physical_dtype_provenance'] = (
-                    'callee_output', callee.name, int(source.id))
+                    'callee_output', callee.name,
+                    int(source.id))
             exact_values.add(id(target))
 
     _refresh_scope_occurrences(functions)
@@ -473,15 +549,19 @@ def settle_call_result_types(functions, emit_outputs, function_values):
         proposed=_type(source)[:3], proposed_storage=_storage_type(source),
         proposed_recorded=_recorded_type(callee, source),
         proposed_physical=_row_physical(callee, source))
-        for caller, target, callee, source in bindings()
-        if _recorded_type(callee, source)[0] not in {None, '', 'unknown'}
+        for caller, target, callee, source, view_proof in bindings()
+        if source_record(callee, source, view_proof)[0][0]
+        not in {None, '', 'unknown'}
         and not equivalent_physical_layout(
-            _recorded_storage_type(callee, source),
+            ((source_record(callee, source, view_proof)[0][3]
+              or source_record(callee, source, view_proof)[0][0]),
+             source_record(callee, source, view_proof)[0][1],
+             source_record(callee, source, view_proof)[0][2]),
             _recorded_storage_type(caller, target),
         )
         and not (
-            _recorded_type(callee, source)[:3]
+            source_record(callee, source, view_proof)[0][:3]
             == _recorded_type(caller, target)[:3]
-            and _recorded_type(callee, source)[3] is None
+            and source_record(callee, source, view_proof)[0][3] is None
         ))
     return exact_values, ledger.events, conflicts, rounds

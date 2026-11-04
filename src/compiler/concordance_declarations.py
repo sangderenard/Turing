@@ -4598,6 +4598,27 @@ TENSOR_RUNTIME_RESHAPE_VALIDITY = declare_page("tensor_runtime_reshape_validity"
     RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
     RowField("result", K.VALUE_ID),
 ), tuple)                              # DERIVED(SSA values/control edges); CONCORD
+#: An axis-changing runtime view retains storage but owns its geometry.
+#: Unsqueeze fact: (operation, source, axis, normalized_axis, source_shape,
+#: source_rank, source_count, result_shape, result_rank). Flatten fact:
+#: (operation, source, source_shape, source_rank, source_count, result_shape,
+#: result_rank). Each law retains the source's element count.
+TENSOR_RUNTIME_VIEW_GEOMETRY = declare_page("tensor_runtime_view_geometry", (
+    RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
+    RowField("result", K.VALUE_ID),
+), tuple)                              # DERIVED(SSA values/axis transform); CONCORD
+#: A mixed binary result's rank-two runtime broadcast. Fact names the
+#: ordered data operands, their shape/rank/count IDs, the aligned right
+#: shape, output shape/rank/count, helper status, helper callee, and guarded
+#: fault/pass blocks. The helper is the accepted authored
+#: broadcast_shape_extents SSA, and a status-zero branch traps before any
+#: result storage is read. Every identity and control edge is a direct cause.
+TENSOR_RUNTIME_BROADCAST_VALIDITY = declare_page(
+    "tensor_runtime_broadcast_validity", (
+        RowField("function_scope", K.SCOPE), RowField("function", K.NAME),
+        RowField("result", K.VALUE_ID),
+    ), tuple,
+)                                    # DERIVED(imported helper/SSA/control); CONCORD
 #: A dynamic tensor's logical element identity, native data carrier, and
 #: allocation owner. Fact is (data id, owner id, count id, element dtype).
 #: The unique owned-heap Alloca defines the carrier from the exact count and

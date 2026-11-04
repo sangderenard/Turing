@@ -3534,6 +3534,29 @@ def emit_ssa_module_to_c(
                     # on demand, so an unreferenced descriptor owns nothing.
                     continue
                 producer = producers_by_id.get(value_id)
+                owned_carrier = owned_tensor_carriers.get((fn, value_id))
+                if owned_carrier is not None:
+                    # The broadcast temporary has a distinct logical tensor
+                    # and data carrier. Its audited owned-heap Alloca creates
+                    # the runtime arena; a static activation buffer would
+                    # duplicate that storage and a dynamic-buffer refusal
+                    # would ignore the actual producer.
+                    if (
+                        owned_carrier.tensor_id == int(descriptor.tensor_id)
+                        and descriptor.heap_owner_value_id
+                        == owned_carrier.owner_value_id
+                        and producer is not None
+                        and producer.op == "Alloca"
+                        and producer.attributes.get("allocation_kind")
+                        == "owned_heap"
+                        and len(producer.args) == 2
+                        and int(producer.args[0].id)
+                        == owned_carrier.count_value_id
+                        and int(producer.args[1].id)
+                        == owned_carrier.owner_value_id
+                    ):
+                        tensor_storage_cells.add(owned_carrier.cell)
+                        continue
                 if (
                     producer is not None
                     and str(
@@ -3945,11 +3968,206 @@ def emit_ssa_module_to_c(
 
         formals_by_id = {int(value.id): value for value in function.args}
 
+        def bound_tensor_extent_formals(source, descriptor, kind, result_id):
+            """Read the existing exact computed-tensor metadata Call binding."""
+            from .concordance_declarations import (
+                TENSOR_METADATA_CALL_BINDING,
+                TENSOR_METADATA_RESULT_BINDING,
+            )
+            extent_field = (
+                "element_count_value_id"
+                if kind in {"element_count", "numel"}
+                else "shape_value_id" if kind == "shape"
+                else "rank_value_id" if kind == "rank"
+                else None
+            )
+            bound_formals = set()
+            if (
+                extent_field is not None
+                and descriptor is not None
+                and getattr(descriptor, extent_field) == result_id
+                and physical_book is not None
+            ):
+                binding_page = physical_book.page(
+                    TENSOR_METADATA_CALL_BINDING
+                )
+                formal_positions = {
+                    int(formal.id): position
+                    for position, formal in enumerate(function.args)
+                }
+                for binding_row in binding_page.rows():
+                    if (
+                        not isinstance(binding_row, tuple)
+                        or len(binding_row) != 5
+                        or str(binding_row[4]) != str(fn)
+                    ):
+                        continue
+                    caller = module.functions.get(str(binding_row[1]))
+                    call_block = (
+                        caller.blocks.get(str(binding_row[2]))
+                        if caller is not None else None
+                    )
+                    if call_block is None:
+                        continue
+                    matching_calls = tuple(
+                        item for item in call_block.instrs
+                        if item.op in {"Call", "call"}
+                        and item.res is not None
+                        and int(item.res.id) == int(binding_row[3])
+                    )
+                    if len(matching_calls) != 1:
+                        continue
+                    bound_call = matching_calls[0]
+                    if (
+                        bound_call.op not in {"Call", "call"}
+                        or bound_call.attributes.get("callee") != fn
+                    ):
+                        continue
+                    binding = binding_page.latest(binding_row)
+                    if (
+                        not isinstance(binding, tuple)
+                        or len(binding) != 2
+                        or len(binding[0]) != len(binding[1])
+                    ):
+                        continue
+                    for actual_id, formal_id in zip(*binding):
+                        formal_position = formal_positions.get(
+                            int(formal_id)
+                        )
+                        if (
+                            formal_position is None
+                            or formal_position >= len(bound_call.args)
+                            or int(bound_call.args[formal_position].id)
+                            != int(actual_id)
+                        ):
+                            continue
+                        formal = function.args[formal_position]
+                        accounting = formal.accounting or {}
+                        if (
+                            int(accounting.get(
+                                "tensor_extent_for", -1
+                            )) == int(source.id)
+                            and accounting.get(
+                                "tensor_extent_kind"
+                            ) == (
+                                "element_count"
+                                if kind == "numel" else kind
+                            )
+                        ):
+                            # The metadata actual must be the
+                            # projection of this very tensor's
+                            # computed result, at the selected
+                            # shape/rank/count position. A call
+                            # binding alone permits two dynamic
+                            # inputs to swap their extent actuals.
+                            result_page = physical_book.page(
+                                TENSOR_METADATA_RESULT_BINDING
+                            )
+                            kind_index = {
+                                "shape": 0, "rank": 1,
+                                "element_count": 2, "numel": 2,
+                            }[kind]
+                            proven_actuals = tuple(
+                                physical_book.latest_ref(
+                                    TENSOR_METADATA_RESULT_BINDING, result_row,
+                                )
+                                for result_row in result_page.scope_rows(
+                                    binding_row[0]
+                                )
+                                for result_fact in (
+                                    result_page.latest(result_row),
+                                )
+                                if isinstance(result_row, tuple)
+                                and len(result_row) == 4
+                                and result_row[0] == binding_row[0]
+                                and int(result_row[3]) == int(source.id)
+                                and isinstance(result_fact, tuple)
+                                and len(result_fact) == 3
+                                and int(result_fact[0]) == int(source.id)
+                                and len(result_fact[2]) == 3
+                                and int(result_fact[2][kind_index])
+                                == int(actual_id)
+                            )
+                            if proven_actuals:
+                                bound_formals.add(int(formal_id))
+                                tensor_storage_cells.update(proven_actuals)
+                                tensor_storage_cells.add(physical_book.latest_ref(
+                                    TENSOR_METADATA_CALL_BINDING, binding_row,
+                                ))
+            return bound_formals
+
         def emit_elementwise_span(instruction, op: str) -> None:
             nonlocal needs_validation_runtime
             result = instruction.res
             result_id = int(result.id)
             result_type = buffer_type(result)
+            function_scope = function_scope_of(function)
+
+            def exact_layout(value):
+                if physical_book is not None:
+                    cell = physical_book.latest_ref(
+                        SSA_VALUE, (function_scope, int(value.id)),
+                    )
+                    if cell is not None:
+                        fact = physical_book.page(SSA_VALUE).cell(
+                            cell.row, cell.column,
+                        )
+                        if (
+                            isinstance(fact, SSAValueFact)
+                            and fact.physical_dtype is not None
+                            and fact.storage is not None
+                            and fact.rank is not None
+                        ):
+                            tensor_storage_cells.add(cell)
+                            return fact
+                return None
+
+            def exact_span_rank(value) -> int:
+                layout = exact_layout(value)
+                if isinstance(layout, SSAValueFact):
+                    return int(layout.rank) if layout.storage == "span" else 0
+                return _declared_span_rank(value)
+
+            owned_result = None
+            broadcast_geometry = None
+            if tensor_table is not None:
+                result_descriptor = tensor_table.by_id(result_id)
+                if result_descriptor is not None:
+                    if physical_book is not None:
+                        from .concordance_declarations import (
+                            TENSOR_RUNTIME_BROADCAST_VALIDITY,
+                        )
+                        geometry_cell = physical_book.latest_ref(
+                            TENSOR_RUNTIME_BROADCAST_VALIDITY,
+                            (function_scope, fn, result_id),
+                        )
+                        if geometry_cell is not None:
+                            geometry_fact = physical_book.page(
+                                TENSOR_RUNTIME_BROADCAST_VALIDITY
+                            ).cell(geometry_cell.row, geometry_cell.column)
+                            geometry_ids = tuple(map(int, geometry_fact[12:15]))
+                            descriptor_ids = tuple(map(int, (
+                                result_descriptor.shape_value_id,
+                                result_descriptor.rank_value_id,
+                                result_descriptor.element_count_value_id,
+                            ))) if all(value is not None for value in (
+                                result_descriptor.shape_value_id,
+                                result_descriptor.rank_value_id,
+                                result_descriptor.element_count_value_id,
+                            )) else ()
+                            if geometry_ids == descriptor_ids:
+                                broadcast_geometry = (geometry_ids, geometry_cell)
+                    candidate = owned_tensor_carriers.get((
+                        fn, int(result_descriptor.data_value_id),
+                    ))
+                    if (
+                        candidate is not None
+                        and candidate.tensor_id == result_id
+                        and result_descriptor.heap_owner_value_id
+                        == candidate.owner_value_id
+                        and candidate.data_value_id in heap_allocation_ids
+                    ):
+                        owned_result = candidate
             static = tuple(result.shape or ())
             if static and not all(isinstance(item, int) for item in static):
                 shortfalls.append(CEmissionShortfall(
@@ -3958,6 +4176,26 @@ def emit_ssa_module_to_c(
                 return
             if static:
                 count = str(math.prod(static))
+            elif owned_result is not None:
+                if broadcast_geometry is None:
+                    shortfalls.append(CEmissionShortfall(
+                        op, f"owned elementwise result %t{result_id} "
+                        f"lacks its exact broadcast geometry in {fn}",
+                    ))
+                    return
+                count_value = values_by_id.get(
+                    owned_result.count_value_id
+                )
+                count = (
+                    scalar_operand(count_value)
+                    if count_value is not None else None
+                )
+                if count is None:
+                    shortfalls.append(CEmissionShortfall(
+                        op, f"owned elementwise result %t{result_id} has "
+                        f"no live count in {fn}",
+                    ))
+                    return
             else:
                 slot = extent_slot(fn, result_id, "element_count", None)
                 if slot is None:
@@ -3972,7 +4210,16 @@ def emit_ssa_module_to_c(
             checks: list[str] = []
             for argument in instruction.args:
                 shape = tuple(argument.shape or ())
-                if _declared_span_rank(argument) == 0 and not shape:
+                argument_layout = exact_layout(argument)
+                if broadcast_geometry is not None and not isinstance(
+                    argument_layout, SSAValueFact,
+                ):
+                    shortfalls.append(CEmissionShortfall(
+                        op, f"owned elementwise operand %t{argument.id} "
+                        f"has no exact physical layout in {fn}",
+                    ))
+                    return
+                if exact_span_rank(argument) == 0 and not shape:
                     held = scalar_operand(argument)
                     if held is None:
                         return
@@ -3985,8 +4232,17 @@ def emit_ssa_module_to_c(
                             f"{static!r}; C spells only equal extents in {fn}",
                         ))
                         return
-                elif not _runtime_sized_span(argument) or (
-                    _declared_span_rank(argument) != _declared_span_rank(result)
+                elif not (
+                    _runtime_sized_span(argument)
+                    or (
+                        broadcast_geometry is not None
+                        and isinstance(
+                            argument_layout, SSAValueFact,
+                        )
+                        and argument_layout.storage == "span"
+                    )
+                ) or (
+                    exact_span_rank(argument) != exact_span_rank(result)
                 ):
                     shortfalls.append(CEmissionShortfall(
                         op, f"elementwise {op} mixes runtime-sized %t{result_id} "
@@ -3994,10 +4250,43 @@ def emit_ssa_module_to_c(
                     ))
                     return
                 else:
+                    if broadcast_geometry is not None:
+                        operand_descriptor = (
+                            tensor_table.by_id(int(argument.id))
+                            if tensor_table is not None else None
+                        )
+                        operand_ids = (
+                            tuple(map(int, (
+                                operand_descriptor.shape_value_id,
+                                operand_descriptor.rank_value_id,
+                                operand_descriptor.element_count_value_id,
+                            )))
+                            if operand_descriptor is not None
+                            and all(value is not None for value in (
+                                operand_descriptor.shape_value_id,
+                                operand_descriptor.rank_value_id,
+                                operand_descriptor.element_count_value_id,
+                            )) else ()
+                        )
+                        if operand_ids != broadcast_geometry[0]:
+                            shortfalls.append(CEmissionShortfall(
+                                op, f"runtime-sized operand %t{argument.id} "
+                                f"disagrees with owned broadcast geometry "
+                                f"of %t{result_id} in {fn}",
+                            ))
+                            return
+                        tensor_storage_cells.add(broadcast_geometry[1])
+                        source = address_operand(argument)
+                        if source is None:
+                            return
+                        elements.append(
+                            f"((const {buffer_type(argument)} *)({source}))[{index}]"
+                        )
+                        continue
                     # Axis by axis: equal element counts over different
                     # extents ((2, 3) against (3, 2)) are a broadcast error
                     # in Python, not a flat elementwise walk.
-                    for axis in range(_declared_span_rank(result)):
+                    for axis in range(exact_span_rank(result)):
                         operand_slot = extent_slot(
                             fn, int(argument.id), "dim", axis,
                         )
@@ -4165,12 +4454,25 @@ def emit_ssa_module_to_c(
                     f"spelling in {fn}",
                 ))
                 return
-            destination = output_destinations.get(result_id)
-            if destination is None or result_id in formals_by_id:
+            destination = (
+                addresses.get(owned_result.data_value_id)
+                if owned_result is not None else output_destinations.get(result_id)
+            )
+            if owned_result is not None and destination is None:
+                shortfalls.append(CEmissionShortfall(
+                    op, f"owned elementwise result %t{result_id} has "
+                    f"no live carrier in {fn}",
+                ))
+                return
+            if destination is None or (
+                owned_result is None and result_id in formals_by_id
+            ):
                 destination = (
                     activation_array(result_type, int(count)) if static
                     else runtime_activation_array(result_type, count)
                 )
+            if owned_result is not None:
+                tensor_storage_cells.add(owned_result.cell)
             store = (
                 f"(({result_type} *)({destination}))[{index}] = "
                 f"({result_type})({expression});"
@@ -4629,7 +4931,6 @@ def emit_ssa_module_to_c(
                     arena = heap_data(carrier)
                     if arena is None:
                         continue
-                    from .concordance_declarations import SSA_VALUE
                     from .identity_concordance import identity_book
 
                     book = identity_book(module)
@@ -4662,6 +4963,41 @@ def emit_ssa_module_to_c(
                 source = addresses.get(source_id)
                 if source is None:
                     source = addresses.get(output_id)
+                if (
+                    (source is None or source == destination)
+                    and destination is not None
+                    and physical_book is not None
+                ):
+                    # A dynamic extent is an exact scalar expression (for
+                    # example extents[slot]), so it has no address to copy.
+                    # Region 0's Ret carries count 3964 to the downstream
+                    # reduction. Publish that Ret value into its output cell
+                    # using the scoped SSA_VALUE physical scalar proof.
+                    source_cell = physical_book.latest_ref(
+                        SSA_VALUE,
+                        (function_scope_of(function), source_id),
+                    )
+                    source_fact = (
+                        physical_book.page(SSA_VALUE).cell(
+                            source_cell.row, source_cell.column,
+                        ) if source_cell is not None else None
+                    )
+                    expression = expressions.get(source_id)
+                    if (
+                        isinstance(source_fact, SSAValueFact)
+                        and source_fact.storage == "scalar"
+                        and source_fact.rank == 0
+                        and source_fact.physical_dtype is not None
+                        and expression is not None
+                        and expression != destination
+                    ):
+                        carried = carried_type(output)
+                        publications.append(
+                            f"        *(({carried} *)({destination})) = "
+                            f"({carried})({expression});"
+                        )
+                        owned_publication_causes.append(source_cell)
+                        continue
                 if source is None or destination is None or source == destination:
                     continue
 
@@ -5632,6 +5968,26 @@ def emit_ssa_module_to_c(
                             count = f"(ptrdiff_t)({parts[0]})"
                             if op in {"max", "min"}:
                                 empty_guard = count
+                    if (count is None and descriptor is not None
+                            and descriptor.metadata_state == "dynamic"
+                            and descriptor.element_count_value_id is not None):
+                        # Program: private mixed broadcast -> sum().item().
+                        # Region3 source8 has exact count formal4129 paired
+                        # with its producer's projected metadata. Requiring
+                        # a public input extent lost that private geometry.
+                        # Use the same concorded metadata reader as `extent`.
+                        bound = bound_tensor_extent_formals(
+                            source, descriptor, "element_count",
+                            int(descriptor.element_count_value_id),
+                        )
+                        if len(bound) == 1:
+                            formal = formals_by_id.get(next(iter(bound)))
+                            held = (scalar_operand(formal)
+                                    if formal is not None else None)
+                            if held is not None:
+                                count = f"(ptrdiff_t)({held})"
+                                if op in {"max", "min"}:
+                                    empty_guard = count
                     if count is None and _runtime_sized_span(source):
                         # Program: ``def f(x, y): return (x * y).sum()``
                         # over rank-1 spans of runtime length.  Rule: a
@@ -6021,123 +6377,9 @@ def emit_ssa_module_to_c(
                         # a read of that formal, not a new public extent
                         # slot.  Use the call binding and this descriptor's
                         # own extent identity before querying public storage.
-                        from .concordance_declarations import (
-                            TENSOR_METADATA_CALL_BINDING,
-                            TENSOR_METADATA_RESULT_BINDING,
+                        bound_formals = bound_tensor_extent_formals(
+                            source, descriptor, kind, result_id,
                         )
-                        extent_field = (
-                            "element_count_value_id"
-                            if kind in {"element_count", "numel"}
-                            else "shape_value_id" if kind == "shape"
-                            else "rank_value_id" if kind == "rank"
-                            else None
-                        )
-                        bound_formals = set()
-                        if (
-                            extent_field is not None
-                            and descriptor is not None
-                            and getattr(descriptor, extent_field) == result_id
-                            and physical_book is not None
-                        ):
-                            binding_page = physical_book.page(
-                                TENSOR_METADATA_CALL_BINDING
-                            )
-                            formal_positions = {
-                                int(formal.id): position
-                                for position, formal in enumerate(function.args)
-                            }
-                            for binding_row in binding_page.rows():
-                                if (
-                                    not isinstance(binding_row, tuple)
-                                    or len(binding_row) != 5
-                                    or str(binding_row[4]) != str(fn)
-                                ):
-                                    continue
-                                caller = module.functions.get(str(binding_row[1]))
-                                call_block = (
-                                    caller.blocks.get(str(binding_row[2]))
-                                    if caller is not None else None
-                                )
-                                if call_block is None:
-                                    continue
-                                matching_calls = tuple(
-                                    item for item in call_block.instrs
-                                    if item.op in {"Call", "call"}
-                                    and item.res is not None
-                                    and int(item.res.id) == int(binding_row[3])
-                                )
-                                if len(matching_calls) != 1:
-                                    continue
-                                bound_call = matching_calls[0]
-                                if (
-                                    bound_call.op not in {"Call", "call"}
-                                    or bound_call.attributes.get("callee") != fn
-                                ):
-                                    continue
-                                binding = binding_page.latest(binding_row)
-                                if (
-                                    not isinstance(binding, tuple)
-                                    or len(binding) != 2
-                                    or len(binding[0]) != len(binding[1])
-                                ):
-                                    continue
-                                for actual_id, formal_id in zip(*binding):
-                                    formal_position = formal_positions.get(
-                                        int(formal_id)
-                                    )
-                                    if (
-                                        formal_position is None
-                                        or formal_position >= len(bound_call.args)
-                                        or int(bound_call.args[formal_position].id)
-                                        != int(actual_id)
-                                    ):
-                                        continue
-                                    formal = function.args[formal_position]
-                                    accounting = formal.accounting or {}
-                                    if (
-                                        int(accounting.get(
-                                            "tensor_extent_for", -1
-                                        )) == int(source.id)
-                                        and accounting.get(
-                                            "tensor_extent_kind"
-                                        ) == (
-                                            "element_count"
-                                            if kind == "numel" else kind
-                                        )
-                                    ):
-                                        # The metadata actual must be the
-                                        # projection of this very tensor's
-                                        # computed result, at the selected
-                                        # shape/rank/count position. A call
-                                        # binding alone permits two dynamic
-                                        # inputs to swap their extent actuals.
-                                        result_page = physical_book.page(
-                                            TENSOR_METADATA_RESULT_BINDING
-                                        )
-                                        kind_index = {
-                                            "shape": 0, "rank": 1,
-                                            "element_count": 2, "numel": 2,
-                                        }[kind]
-                                        proven_actual = any(
-                                            isinstance(result_row, tuple)
-                                            and len(result_row) == 4
-                                            and result_row[0] == binding_row[0]
-                                            and int(result_row[3]) == int(source.id)
-                                            and isinstance(result_fact, tuple)
-                                            and len(result_fact) == 3
-                                            and int(result_fact[0]) == int(source.id)
-                                            and len(result_fact[2]) == 3
-                                            and int(result_fact[2][kind_index])
-                                            == int(actual_id)
-                                            for result_row in result_page.scope_rows(
-                                                binding_row[0]
-                                            )
-                                            for result_fact in (
-                                                result_page.latest(result_row),
-                                            )
-                                        )
-                                        if proven_actual:
-                                            bound_formals.add(int(formal_id))
                         if len(bound_formals) == 1:
                             formal_id = next(iter(bound_formals))
                             expressions[result_id] = expressions[formal_id]
@@ -7095,6 +7337,44 @@ def emit_ssa_module_to_c(
                             integer_ids.add(result_id)
                     else:
                         body.append(f"        {invocation};")
+                        if instruction.res is not None:
+                            output_position = instruction.attributes.get(
+                                "ssa_output_argument"
+                            )
+                            if (
+                                isinstance(output_position, int)
+                                and 0 <= output_position < len(instruction.args)
+                            ):
+                                carrier_id = int(instruction.args[
+                                    output_position
+                                ].id)
+                                binding = owned_tensor_carriers.get(
+                                    (fn, carrier_id)
+                                )
+                                result_id = int(instruction.res.id)
+                                descriptor = (
+                                    tensor_table.by_id(result_id)
+                                    if tensor_table is not None else None
+                                )
+                                if (
+                                    binding is not None
+                                    and binding.tensor_id == result_id
+                                    and descriptor is not None
+                                    and int(descriptor.data_value_id)
+                                    == carrier_id
+                                    and carrier_id in heap_allocation_ids
+                                    and carrier_id in expressions
+                                ):
+                                    # The void kernel wrote the owned carrier
+                                    # passed as its exact output argument.
+                                    # Its logical Call result views that arena.
+                                    expressions[result_id] = expressions[
+                                        carrier_id
+                                    ]
+                                    addresses[result_id] = addresses[
+                                        carrier_id
+                                    ]
+                                    call_tensor_storage_cells.add(binding.cell)
                     if call_tensor_storage_cells:
                         span.take(UnitKind.CALL, instruction=instruction,
                                   extra_cells=tuple(call_tensor_storage_cells))

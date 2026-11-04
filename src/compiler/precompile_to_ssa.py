@@ -25053,8 +25053,9 @@ def _post_ssa_block_geometry(book, scope, function):
     from .concordance_declarations import (
         CALL_BINDING_INPUT, LOOP_RESULT_USE_REBINDING, SSA_BLOCK_GEOMETRY,
         SSA_CONSTANT_HOIST, SSA_CONSTANT_MATERIALIZATION,
-        TENSOR_METADATA_CALL_BINDING,
+        TENSOR_HEAP_RELEASE_BINDING, TENSOR_METADATA_CALL_BINDING,
     )
+    from .ssa_heap_allocation import HEAP_RELEASE_SYMBOL
     result = {}
     moved = {}
     for row in book.page(SSA_CONSTANT_HOIST).scope_rows((scope, str(function.name))):
@@ -25097,6 +25098,27 @@ def _post_ssa_block_geometry(book, scope, function):
         if book.latest_ref(FUNCTION_OUTPUT, row) is not None
     )
     for label, block in function.blocks.items():
+        # Program: root arange -> cast -> sum. The owner release is a
+        # resultless Call inserted before Ret after the prior entry geometry
+        # was posted. Its SSA operands were already cited by that earlier
+        # geometry, so only the exact release decision receipt can justify
+        # the revised instruction order.
+        release_cells = []
+        for instruction in block.instrs:
+            if (instruction.op not in {"Call", "call"}
+                    or instruction.res is not None
+                    or instruction.attributes.get("callee") != HEAP_RELEASE_SYMBOL
+                    or instruction.attributes.get("native_heap_abi")
+                    != "release_owner" or len(instruction.args) != 1):
+                continue
+            release_row = (
+                scope, str(function.name), int(instruction.args[0].id),
+            )
+            release = book.latest_ref(TENSOR_HEAP_RELEASE_BINDING, release_row)
+            if release is not None and book.page(
+                TENSOR_HEAP_RELEASE_BINDING
+            ).cell(release.row, release.column)[2] == str(label):
+                release_cells.append(release)
         block_call_bindings = tuple(
             cell
             for instruction in block.instrs
@@ -25124,6 +25146,7 @@ def _post_ssa_block_geometry(book, scope, function):
             *rebound.get(str(label), ()),
             *materialized.get(str(label), ()),
             *metadata_bindings.get(str(label), ()),
+            *release_cells,
             *block_call_bindings,
             *(function_outputs if any(
                 instruction.op in {"Ret", "ret", "Return", "return"}

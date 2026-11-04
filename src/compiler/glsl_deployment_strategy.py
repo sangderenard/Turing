@@ -5377,7 +5377,14 @@ def _view_or_gather_extents(operation, node, declared, records, logical):
     for extent in source:
         count *= extent
     if operation == "flatten":
-        return (count,)
+        # Program: compact_codewords flattens runtime-sized rank-two
+        # destinations and contributions. Their source record has shape=()
+        # because the count arrives with the call, not because either is a
+        # one-element scalar. Multiplying an empty tuple into 1 previously
+        # posted a false static (1,) result. Only listed source extents can
+        # establish this static product; the runtime tensor descriptor
+        # carries the rank-one result when the extents are still open.
+        return (count,) if source else logical
 
     def literal(parent):
         record = declared(parent)

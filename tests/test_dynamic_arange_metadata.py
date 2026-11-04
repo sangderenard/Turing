@@ -139,8 +139,19 @@ def test_dynamic_arange_cast_and_sum_keep_runtime_count_across_regions(tmp_path)
     sum_input = module.tensor_tables[sum_region.name].by_id(8)
     assert sum_input.metadata_state == "dynamic"
     assert sum_call.args[1].id == sum_input.element_count_value_id
-    assert any(instruction.op == "extent" for instruction in cast_ops)
-    assert any(instruction.op == "extent" for instruction in sum_ops)
+    # The computed producer already returns this exact geometry. Its three
+    # local extent queries were promoted to bound input formals; retaining
+    # another query would give one tensor two shape/rank/count identities.
+    assert not any(instruction.op == "extent" for instruction in cast_ops)
+    assert not any(instruction.op == "extent" for instruction in sum_ops)
+    assert tuple(value.id for value in cast_region.args[1:4]) == (
+        cast_input.shape_value_id, cast_input.rank_value_id,
+        cast_input.element_count_value_id,
+    )
+    assert tuple(value.id for value in sum_region.args[1:4]) == (
+        sum_input.shape_value_id, sum_input.rank_value_id,
+        sum_input.element_count_value_id,
+    )
 
     rows = tuple(identity_book(module).page(TENSOR_METADATA_RESULT_BINDING).rows())
     assert len(rows) == 2
