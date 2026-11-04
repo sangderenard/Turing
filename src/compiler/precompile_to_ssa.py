@@ -2921,7 +2921,40 @@ class _ControlSSABuilder(TiledObject):
                     NAME_BINDING, (self.lexical_read_scope, str(name), 0),
                 )
             )
-            self._bind(value_id, value, BindingKind.PARAMETER_SEED, binding_cell)
+            seed_abi_cell = (
+                None if self.lexical_read_scope is None
+                else self._book().latest_ref(
+                    VALUE_TYPE_ABI, (self.lexical_read_scope, value_id),
+                )
+            )
+            seed_abi = (
+                None if seed_abi_cell is None else self._book().page(
+                    VALUE_TYPE_ABI
+                ).cell(seed_abi_cell.row, seed_abi_cell.column)
+            )
+            seed_arms = tuple(getattr(seed_abi, "physical_alternatives", ()))
+            seed_sources: tuple[Ref, ...] = ()
+            if (
+                str(value.dtype or "unknown") in {"", "unknown"}
+                and len(seed_arms) == 1
+                and seed_arms[0].storage == "span"
+                and seed_arms[0].rank >= 1
+                and str(seed_arms[0].dtype or "unknown") not in {"", "unknown"}
+                and tuple(value.shape or ()) == tuple(seed_arms[0].shape)
+            ):
+                # Program: bitstream.tensor_octets_to_bytes uses only
+                # octets.shape[0] before its optional-count branch. The
+                # control seed had unknown dtype and no physical fields,
+                # although its exact singleton VALUE_TYPE_ABI declares an
+                # int64 span/rank1. Adopt that declaration before the first
+                # SSA_VALUE post; _contract_physical then records its view.
+                value.dtype = str(seed_arms[0].dtype)
+                seed_sources = tuple(seed_arms[0].source_cells)
+                self._value_cell(value, seed_abi_cell, *seed_sources)
+            self._bind(
+                value_id, value, BindingKind.PARAMETER_SEED,
+                binding_cell, seed_abi_cell, *seed_sources,
+            )
             self.declared_parameter_only_ids.add(value_id)
             self._declare_parameter(
                 value_id, ParameterDeclaration.CALL_ONLY, binding_cell,
