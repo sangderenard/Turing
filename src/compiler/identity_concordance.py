@@ -1605,6 +1605,7 @@ class CorrelationTable:
         found.extend(self._runtime_result_abi_findings(module))
         found.extend(self._source_aggregate_layout_findings(module))
         found.extend(self._source_tensor_shape_dimension_findings(module))
+        found.extend(self._region_aggregate_capture_binding_findings(module))
         from .native_tensor_family import family_findings
         found.extend(family_findings(module))
         found.extend(self._source_closed_aggregate_length_findings(module))
@@ -1658,6 +1659,67 @@ class CorrelationTable:
         # per-page kinds first; ``concordance_report`` counts these two kinds
         # on their own line.
         found.extend(self._unsourced_findings(module))
+        return found
+
+    @staticmethod
+    def _region_aggregate_capture_binding_findings(module: Any) -> list[Finding]:
+        """An expanded region capture retains its actual aggregate read."""
+        from .concordance_declarations import (
+            CANONICAL_VALUE, LEXICAL_READ_BINDING, PROCESS_GRAPH_OPERANDS,
+            REGION_CAPTURE_BINDING, SOURCE_AGGREGATE_LAYOUT,
+        )
+        from ..common.tensors.topological_reducer import _operand_positions
+
+        book = identity_book(module)
+        found = []
+        for row in book.page(REGION_CAPTURE_BINDING).rows():
+            receipt = book.latest_ref(REGION_CAPTURE_BINDING, row)
+            causes = {source for source, _stage in book.edges_into(receipt)}
+            layouts = tuple(source for source in causes if source.page == SOURCE_AGGREGATE_LAYOUT)
+            if not layouts:
+                continue
+            value_id, binding = book.page(receipt.page).cell(receipt.row, receipt.column)
+            reads = tuple(source for source in causes if source.page == LEXICAL_READ_BINDING)
+            valid = bool(reads)
+            for read in reads:
+                matching = False
+                for layout in layouts:
+                    if layout.row != read.row[:2]:
+                        continue
+                    operand = next((source for source in causes
+                                    if source.page == PROCESS_GRAPH_OPERANDS
+                                    and source.row == layout.row), None)
+                    if operand is None:
+                        continue
+                    declaration = book.page(layout.page).cell(layout.row, layout.column)
+                    operands = book.page(operand.page).cell(operand.row, operand.column)
+                    positions = tuple(_operand_positions(operands))
+                    matches = tuple(index for index, (role, ordinal, _parent) in enumerate(positions)
+                                    if (role, ordinal) == read.row[2:])
+                    if len(matches) != 1 or matches[0] >= len(declaration.members):
+                        continue
+                    index = matches[0]
+                    parent = positions[index][2]
+                    matching = (
+                        declaration.aggregate_kind in {"tuple", "list"}
+                        and int(declaration.members[index].value_id) == value_id
+                        and parent.page == CANONICAL_VALUE and parent.row[-1] == value_id
+                        and book.page(read.page).cell(read.row, read.column) == binding
+                        and any(source.page == PROCESS_GRAPH_OPERANDS
+                                and source.row != layout.row
+                                and any(target.page == CANONICAL_VALUE and target.row == layout.row
+                                        for target, _role in book.page(source.page).cell(
+                                            source.row, source.column))
+                                for source in causes)
+                    )
+                    if matching:
+                        break
+                valid = valid and matching
+            if not valid:
+                found.append(Finding(
+                    "region-aggregate-capture-binding", str(row[0]), int(row[2]),
+                    "expanded capture lost its exact aggregate member, lexical binding or source edge",
+                ))
         return found
 
     @staticmethod

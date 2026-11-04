@@ -49,8 +49,10 @@ def _assert_family_audit_rejects_other_type_and_member(module):
         ((1, 2, 3, 4), False, False),
         ((1.9, 2.2, 3.8, 4.7), True, False),
         ((1, 2, 3, 4), False, True),
+        ((1.9, 2.2, 3.8, 4.7), True, True),
     ),
-    ids=("int64-direct", "float64-to-int64-weights", "runtime-count-negated-priority"),
+    ids=("int64-direct", "float64-to-int64-weights", "runtime-count-negated-priority",
+         "runtime-count-cast-weights-negated-priority"),
 )
 def test_topk_indices_ensure_tensor_gather_native(
     tmp_path, data_values, cast_weights, runtime_count,

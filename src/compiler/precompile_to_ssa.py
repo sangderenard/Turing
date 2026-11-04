@@ -29541,6 +29541,58 @@ def _region_arm_variant(
     )
 
 
+def _expanded_aggregate_read_binding(book, scope, instruction, argument, role):
+    """The authored read behind one explicitly expanded aggregate operand.
+
+    Huffman's current_weights starts as leaves; cat((leaves, package), ...)
+    must still read leaves after current_weights changes. The region expands
+    that tuple into SSA arguments, while the lexical read belongs to its
+    element, not to cat's synthetic flattened position. Follow that exact
+    declared path into the incumbent capture-binding protocol.
+    """
+    from .concordance_declarations import PROCESS_GRAPH_OPERANDS, SOURCE_AGGREGATE_LAYOUT
+    from ..common.tensors.topological_reducer import _operand_positions
+
+    path = str(role).rsplit(":element:", 1)
+    if len(path) != 2 or not path[1].isdigit() or instruction.res is None:
+        return None
+    call_operands = book.latest_ref(PROCESS_GRAPH_OPERANDS, (scope, int(instruction.res.id)))
+    if call_operands is None:
+        return None
+    parents = tuple(parent for parent, source_role in book.page(call_operands.page).cell(
+        call_operands.row, call_operands.column) if source_role == path[0])
+    if len(parents) != 1 or parents[0].page != CANONICAL_VALUE:
+        return None
+    aggregate_id = int(parents[0].row[-1])
+    layout = book.latest_ref(SOURCE_AGGREGATE_LAYOUT, (scope, aggregate_id))
+    aggregate_operands = book.latest_ref(PROCESS_GRAPH_OPERANDS, (scope, aggregate_id))
+    if layout is None or aggregate_operands is None:
+        return None
+    declaration = book.page(layout.page).cell(layout.row, layout.column)
+    position = int(path[1])
+    if (declaration.aggregate_kind not in {"tuple", "list"}
+            or position >= len(declaration.members)
+            or int(declaration.members[position].value_id) != int(argument.id)):
+        return None
+    operands = book.page(aggregate_operands.page).cell(
+        aggregate_operands.row, aggregate_operands.column)
+    positions = tuple(_operand_positions((parent, source_role)
+                      for parent, source_role in operands))
+    if position >= len(positions):
+        return None
+    source_role, ordinal, parent = positions[position]
+    if parent.page != CANONICAL_VALUE or int(parent.row[-1]) != int(argument.id):
+        return None
+    read = book.latest_ref(LEXICAL_READ_BINDING, (scope, aggregate_id, source_role, ordinal))
+    if read is None:
+        return None
+    binding = book.page(read.page).cell(read.row, read.column)
+    if binding is None or isinstance(binding, Unresolved):
+        return None
+    return str(binding), (call_operands, parents[0], layout, aggregate_operands, read,
+                          declaration.members[position].value_cell)
+
+
 def _split_region_captures_by_binding(
     lexical_read_scope: Any,
     control_scope: Any,
@@ -29583,6 +29635,7 @@ def _split_region_captures_by_binding(
     if not wanted:
         return captures
     slots: dict[int, list[tuple[Any, int, Any]]] = {}
+    expanded_read_sources = {}
     for instruction in instructions:
         if instruction.res is None:
             continue
@@ -29598,6 +29651,12 @@ def _split_region_captures_by_binding(
                 tuple(lexical_read_scope), int(instruction.res.id),
                 role, ordinal,
             ))
+            expanded_read = _expanded_aggregate_read_binding(
+                book, tuple(lexical_read_scope), instruction, argument, role,
+            )
+            if expanded_read is not None:
+                binding, proof = expanded_read
+                expanded_read_sources[(id(instruction), index)] = proof
             slots.setdefault(int(argument.id), []).append(
                 (instruction, index, binding)
             )
@@ -29609,11 +29668,10 @@ def _split_region_captures_by_binding(
         if not reads:
             continue
         bindings = list(dict.fromkeys(binding for *_slot, binding in reads))
-        if (
-            len(bindings) < 2
-            or None in bindings
-            or not set(bindings) & carried_initials[value_id]
-        ):
+        expanded_reads = any((id(instruction), index) in expanded_read_sources
+                             for instruction, index, _binding in reads)
+        if (None in bindings or (len(bindings) < 2 and not expanded_reads)
+                or (not set(bindings) & carried_initials[value_id] and not expanded_reads)):
             continue
         source_cell = book.latest_ref(CANONICAL_VALUE, (scope, value_id))
 
@@ -29624,6 +29682,10 @@ def _split_region_captures_by_binding(
             found = []
             for instruction, index, read in reads:
                 if read != binding:
+                    continue
+                expanded_sources = expanded_read_sources.get((id(instruction), index))
+                if expanded_sources is not None:
+                    found.extend(cell for cell in expanded_sources if cell not in found)
                     continue
                 roles = list(getattr(instruction, "arg_roles", ()) or ())
                 positions = list(_operand_positions(

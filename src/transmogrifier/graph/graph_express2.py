@@ -1294,7 +1294,14 @@ def _source_owner_annotation_declaration_shells(value, *, source_definition=None
             if not isinstance(expression, (ast.Name, ast.Attribute)):
                 continue
             referenced = _resolve_ast_parent_reference(expression, bindings)
-            if not inspect.isclass(referenced) or referenced is owner:
+            # weights.to_dtype declares -> AbstractTensor, its own class.
+            # Keep that whole return annotation. In AbstractTensor._TopKResult
+            # the owner is merely a qualification prefix, not another return
+            # class; admitting both prevents the ordered result layout join.
+            if (not inspect.isclass(referenced)
+                    or (referenced is owner and not (
+                        parameter == "return" and expression is annotation
+                    ))):
                 continue
             identity = f"{referenced.__module__}.{referenced.__qualname__}"
             # A retained callable's source-local return class is itself part

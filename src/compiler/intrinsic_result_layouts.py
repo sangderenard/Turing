@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+
 from .concordance_declarations import (
     CLASS_DECLARATION, FUNCTION_RETURN_ANNOTATION, INGESTION_VALUE,
     SOURCE_CALLABLE_SIGNATURE, SOURCE_INTRINSIC_ADMISSION,
@@ -9,6 +11,52 @@ from .concordance_declarations import (
 )
 from .concorded_literals import origin_cell
 from .identity_concordance import Ref, current_identity_book
+
+
+def intrinsic_return_class(graph, node_id: int):
+    """One declared class return, selected by the exact intrinsic admission.
+
+    Any, containers and unions are not singleton class declarations. This
+    reads source annotations only; no tensor storage or dtype proves class.
+    """
+    from ..common.tensors.topological_reducer import node_identity_cell
+
+    book = current_identity_book()
+    call = node_identity_cell(graph, int(node_id))
+    try:
+        origin = origin_cell(book, call)
+    except ValueError:
+        return None, ()
+    admission = book.latest_ref(SOURCE_INTRINSIC_ADMISSION, (origin,))
+    if admission is None:
+        return None, ()
+    signature = book.page(admission.page).cell(admission.row, admission.column)[2]
+    if not isinstance(signature, Ref) or signature.page != SOURCE_CALLABLE_SIGNATURE:
+        return None, ()
+    definition = book.page(signature.page).cell(signature.row, signature.column)[0]
+    annotation = book.latest_ref(FUNCTION_RETURN_ANNOTATION, definition.row[:2])
+    if annotation is None:
+        return None, ()
+    spelling = book.page(annotation.page).cell(annotation.row, annotation.column)
+    try:
+        expression = ast.parse(spelling, mode="eval").body
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            expression = ast.parse(expression.value, mode="eval").body
+    except SyntaxError:
+        return None, ()
+    if not isinstance(expression, (ast.Name, ast.Attribute)):
+        return None, ()
+    classes = tuple(source for source, _stage in book.edges_into(annotation)
+                    if source.page == CLASS_DECLARATION)
+    if len(classes) != 1:
+        return None, ()
+    declaration = classes[0]
+    declared = book.page(declaration.page).cell(declaration.row, declaration.column)
+    module, name = declaration.row
+    identity = name if name.startswith(module + ".") else module + "." + name
+    if ast.unparse(expression) not in {declared.class_name, name, identity}:
+        return None, ()
+    return identity, (call, origin, admission, signature, definition, annotation, declaration)
 
 
 def intrinsic_result_fields(graph, node_id: int):
