@@ -1880,9 +1880,10 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
     seed can consequently be rank-unknown when its Phi/Cast is created and
     become shaped only when the linked callee output is installed later.
     These operators are equality edges for extents: Cast changes dtype, and
-    Phi selects one of its incoming values.  Refine their result only when the
-    non-empty incoming shapes unanimously agree; disagreement remains
-    unresolved instead of selecting an encounter-order winner.
+    Phi selects one of its incoming values. A Phi refines tensor geometry
+    only when every arm has the same proven static tensor extent and its
+    incoming control edge is booked. Sequence carrier cell shapes are not
+    their logical lengths. Disagreement stays unresolved.
 
     This walks the SSA graph directly.  It creates no parallel identity map;
     the values on the instructions and the shared proven-shape page remain
@@ -1967,6 +1968,43 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
                         }
                     elif operation == "phi":
                         sources = tuple(instruction.args)
+                        # encode_octets' return Phi joins two byte-sequence
+                        # arenas.  One arm's ptr-cell shape (1,) is not the
+                        # logical extent of the other arena.  Only a closed
+                        # set of static tensor descriptors can establish a
+                        # tensor shape across a Phi; sequence return storage
+                        # is owned by its sequence merge protocol.
+                        sequence_table = getattr(
+                            module, "sequence_tables", {}
+                        ).get(function_name)
+                        if sequence_table is not None and any(
+                            sequence_table.by_id(int(source.id)) is not None
+                            for source in sources
+                        ):
+                            continue
+                        tensor_table = getattr(
+                            module, "tensor_tables", {}
+                        ).get(function_name)
+                        descriptors = tuple(
+                            None if tensor_table is None else tensor_table.by_id(
+                                int(source.id)
+                            ) for source in sources
+                        )
+                        if not sources or any(
+                            descriptor is None
+                            or descriptor.metadata_state != "static"
+                            or not tuple(source.shape or ())
+                            or tuple(descriptor.shape or ()) != tuple(source.shape)
+                            for source, descriptor in zip(
+                                sources, descriptors, strict=True,
+                            )
+                        ):
+                            continue
+                        arm_dtypes = {
+                            str(descriptor.dtype) for descriptor in descriptors
+                        }
+                        if len(arm_dtypes) != 1 or str(result.dtype) not in arm_dtypes:
+                            continue
                         shapes = {
                             tuple(source.shape)
                             for source in sources
@@ -1997,7 +2035,77 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
                     shape = next(iter(shapes))
                     if tuple(result.shape or ()) == shape:
                         continue
-                    result.shape = shape
+                    from .ssa_record_return_state import (
+                        posted_ssa_value_fact, publish_ssa_value_type,
+                        ssa_block_identity_cell, ssa_value_identity_cell,
+                    )
+                    from .concordance_declarations import TENSOR_SSA_LOWERING
+                    book = identity_book(module)
+                    source_cells = tuple(
+                        ssa_value_identity_cell(
+                            function, int(source.id), book=book,
+                        ) for source in sources
+                    )
+                    if not source_cells or any(cell is None for cell in source_cells):
+                        raise ValueError(
+                            "shape-preserving SSA edge has no exact operand cells"
+                        )
+                    if operation == "phi":
+                        # A Phi is control-owned: its operands alone do not
+                        # prove which arm reaches the result.  Each incoming
+                        # block must have its exact SSA control cell.
+                        incoming = tuple(instruction.attributes.get(
+                            "incoming_blocks", (),
+                        ))
+                        if len(incoming) != len(sources):
+                            raise ValueError(
+                                "tensor Phi shape has no complete incoming blocks"
+                            )
+                        block_cells = tuple(
+                            ssa_block_identity_cell(function, name, book=book)
+                            for name in incoming
+                        )
+                        if any(cell is None for cell in block_cells):
+                            raise ValueError(
+                                "tensor Phi shape has no exact control cells"
+                            )
+                        from .identity_concordance import (
+                            PROVEN_SHAPE_PAGE, shape_scope_of,
+                        )
+                        proof_cells = tuple(
+                            book.latest_ref(PROVEN_SHAPE_PAGE, (
+                                shape_scope_of(function), int(source.id),
+                            )) for source in sources
+                        )
+                        if any(cell is None for cell in proof_cells):
+                            continue
+                        if any(
+                            (proof := book.page(PROVEN_SHAPE_PAGE).cell(
+                                cell.row, cell.column,
+                            ))[0] != "proven"
+                            or tuple(proof[1]) != tuple(source.shape)
+                            or str(proof[2]) != str(source.dtype)
+                            for source, cell in zip(
+                                sources, proof_cells, strict=True,
+                            )
+                        ):
+                            continue
+                        if any(
+                            (fact := posted_ssa_value_fact(
+                                function, int(source.id), book=book,
+                            )) is None
+                            or fact.shape != tuple(source.shape)
+                            for source in sources
+                        ):
+                            continue
+                        source_cells = (
+                            *source_cells, *proof_cells, *block_cells,
+                        )
+                    publish_ssa_value_type(
+                        function, result, dtype=result.dtype,
+                        shape=shape, sources=source_cells,
+                        stage=TENSOR_SSA_LOWERING, book=book,
+                    )
                     result.accounting = {
                         **dict(result.accounting or {}),
                         "shape_settlement_provenance": (
@@ -2018,7 +2126,7 @@ def settle_shape_preserving_value_metadata(module: IRModule) -> bool:
                             source.dtype for source in sources
                             if source.dtype is not None
                         ), None),
-                        None,
+                        None, sources=source_cells,
                     )
                     table = getattr(module, "tensor_tables", {}).get(
                         function_name
