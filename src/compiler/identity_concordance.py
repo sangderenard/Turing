@@ -1582,6 +1582,7 @@ class CorrelationTable:
         found.extend(self._specialized_literal_materialized_row_findings(module))
         found.extend(self._annotation_class_admission_findings(module))
         found.extend(self._numerical_schema_operand_findings(module))
+        found.extend(self._numerical_constructor_dimension_findings(module))
         found.extend(self._numerical_dtype_operand_findings(module))
         found.extend(self._source_numeric_component_findings(module))
         found.extend(self._source_numeric_specialization_findings(module))
@@ -7973,6 +7974,103 @@ class CorrelationTable:
                     "numerical-schema-operand", str(row), None,
                     "numerical ABI exclusion lacks its exact source schema "
                     "identity and operand edge",
+                ))
+        return found
+
+    @staticmethod
+    def _numerical_constructor_dimension_findings(module: Any) -> list[Finding]:
+        """A constructor region captures the exact member of its shape tuple."""
+
+        from .concordance_declarations import (
+            CANONICAL_VALUE, INGESTION_VALUE, NUMERICAL_CONSTRUCTOR_DIMENSION,
+            PROCESS_GRAPH_OPERANDS, REGION_SIGNATURE, SOURCE_AGGREGATE_LAYOUT,
+        )
+        from .concorded_literals import origin_cell
+        from .source_evidence_resolver import MemberEvidence, require_member
+
+        book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+        if book is None:
+            return []
+        page = book.page(NUMERICAL_CONSTRUCTOR_DIMENSION)
+        found = []
+        for row in page.rows():
+            cell = book.latest_ref(NUMERICAL_CONSTRUCTOR_DIMENSION, row)
+            fact = page.cell(cell.row, cell.column) if cell is not None else None
+            valid = (
+                isinstance(row, tuple) and len(row) == 3
+                and row[1] == "arg:0"
+                and isinstance(fact, tuple) and len(fact) == 3
+            )
+            if valid:
+                consumer, _role, container = row
+                member, layout_cell, operand_cell = fact
+                valid = (
+                    all(isinstance(ref, Ref) for ref in (
+                        consumer, container, member, layout_cell, operand_cell,
+                    ))
+                    and consumer.page == CANONICAL_VALUE
+                    and container.page == CANONICAL_VALUE
+                    and member.page == CANONICAL_VALUE
+                    and consumer.row[0] == container.row[0] == member.row[0]
+                    and layout_cell.page == SOURCE_AGGREGATE_LAYOUT
+                    and layout_cell.row == container.row
+                    and operand_cell.page == PROCESS_GRAPH_OPERANDS
+                    and operand_cell.row == consumer.row
+                )
+            if valid:
+                try:
+                    operands = book.page(PROCESS_GRAPH_OPERANDS).cell(
+                        operand_cell.row, operand_cell.column,
+                    )
+                    selected = require_member(
+                        container.row[0], int(container.row[1]), 0,
+                        book=book,
+                    )
+                    causes = {
+                        source for source, _stage in book.edges_into(cell)
+                    }
+                    valid = (
+                        (container, "arg:0") in operands
+                        and isinstance(selected, MemberEvidence)
+                        and (member_origin := origin_cell(book, member)).page
+                        == INGESTION_VALUE
+                        and origin_cell(book, selected.member_cell)
+                        == member_origin
+                        and selected.member_value_id == int(member.row[1])
+                        and selected.layout_cell == layout_cell
+                        and len(book.page(SOURCE_AGGREGATE_LAYOUT).cell(
+                            layout_cell.row, layout_cell.column,
+                        ).members) == 1
+                        and {consumer, container, member, layout_cell,
+                             operand_cell, selected.member_cell,
+                             *selected.proof_cells} <= causes
+                        and any(
+                            int(member.row[1]) in tuple(
+                                book.page(REGION_SIGNATURE).cell(
+                                    signature.row, signature.column,
+                                ).feeds
+                            )
+                            and cell in {
+                                source for source, _stage in book.edges_into(
+                                    signature,
+                                )
+                            }
+                            for signature_row in book.page(REGION_SIGNATURE).rows()
+                            for signature in (
+                                book.latest_ref(REGION_SIGNATURE, signature_row),
+                            )
+                            if signature is not None
+                        )
+                    )
+                except (AttributeError, IndexError, KeyError, TypeError,
+                        ValueError):
+                    valid = False
+            if not valid:
+                found.append(Finding(
+                    "numerical-constructor-dimension", str(row[0]),
+                    int(row[0].row[1]) if isinstance(row[0], Ref) else None,
+                    "constructor dimension lacks exact tuple-member and "
+                    "region-feed proof",
                 ))
         return found
 

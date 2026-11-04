@@ -4915,6 +4915,18 @@ NUMERICAL_DTYPE_OPERAND = declare_page("numerical_dtype_operand", (
     RowField("parent", K.PAGE_REF),
 ), tuple)
 
+#: A rank-one tensor constructor's runtime shape tuple has one exact scalar
+#: member. Fact is (member canonical cell, tuple layout cell, operand snapshot
+#: cell); the numerical region consumes that member as its dimension. This
+#: is a derived view of SOURCE_AGGREGATE_LAYOUT and PROCESS_GRAPH_OPERANDS,
+#: not a second shape or class authority.
+NUMERICAL_CONSTRUCTOR_DIMENSION = declare_page(
+    "numerical_constructor_dimension", (
+        RowField("consumer", K.PAGE_REF), RowField("role", K.LABEL),
+        RowField("parent", K.PAGE_REF),
+    ), tuple,
+)
+
 # -- the reducer's numeric source facts, one row per (numeric scope, node) ---
 #: ``_concord_source_precision_boundary``: an authored Precision boundary,
 #: ``(numeric scope, value)`` -> ``(boundary kind, operand, limbs)``, CONCORD,
