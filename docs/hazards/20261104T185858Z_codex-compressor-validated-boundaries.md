@@ -1,0 +1,5 @@
+2026-11-04 Dynamic unary geometry and owned storage regression (MEASURED, validation checkout):
+
+- The bounded public-source suite `tests/test_dynamic_unary_extent.py` passed 3/3 in 59.42 seconds on the stable shared descriptor/geometry producer. It covers simple dynamic int64 Neg and computed-priority Neg/Abs, each with an empty input and exact values above 2**53. Each case completes final concordance audit, C emission and native execution with int64 output.
+- The test reads the five-field TENSOR_ELEMENTWISE_EXTENT_BINDING unary fact and requires the result descriptor's shape/rank/count IDs to match. It also requires TENSOR_OWNED_HEAP_BINDING's data carrier, owner, count and dtype to match that descriptor. On the already lowered module, forging the unary source operand, corrupting the result count identity, or removing the source's physical int64 dtype makes the targeted extent audit report a finding. Each mutation is restored before C emission.
+- This test task edited only its new test file and hazard receipt. The production descriptor, unary receipt and physical proof fixes were owned separately by the parent. No full compressor run was made.
