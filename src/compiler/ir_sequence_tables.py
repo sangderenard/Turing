@@ -1391,9 +1391,14 @@ def lower_sequence_insert(
             column_shapes,
         )
     )
-    columns = tuple(SSAValue(value_id, dtype=value.dtype) for value_id, value in zip(
-        descriptor.column_value_ids, row_values
-    ))
+    # _header's dynamic bytearray column 15 is an int64 element arena behind
+    # a ptr storage formal. Rebuilding that GEP base from the row element
+    # dtype made one SSA id both ptr and int64 in append__fixed. The storage
+    # formal is the exact carrier identity; the row value keeps its own dtype.
+    storage_by_id = {int(value.id): value for value in storage}
+    columns = tuple(
+        storage_by_id[int(value_id)] for value_id in descriptor.column_value_ids
+    )
     # Untouched LLVM insert stored double 1.0 into this int64 length cell
     # because the operand view called it merely "ptr". Derive the operand
     # from the same storage declaration as the helper's formal, not a weaker
