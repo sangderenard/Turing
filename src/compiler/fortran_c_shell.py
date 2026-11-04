@@ -62464,6 +62464,7 @@ def _class_surface_ssa_program(
         lower_tensor_calls_to_repository_ssa,
         propagate_repository_ssa_call_metadata,
         settle_repository_ssa_static_extent_operands,
+        publish_computed_region_result_metadata,
     )
     if tensor_ssa_reference is not None:
         # Projected sequence rows only acquire their physical element shape
@@ -62526,6 +62527,7 @@ def _class_surface_ssa_program(
         )
         late_tensor_shortfalls = lower_tensor_calls_to_repository_ssa(
             late_tensor_module, tensor_ssa_reference,
+            finalize_private_owners=False,
         )
         for name, function in late_tensor_module.functions.items():
             lowered_module.functions.setdefault(name, function)
@@ -62533,6 +62535,7 @@ def _class_surface_ssa_program(
             lowered_module.tensor_tables.setdefault(name, table)
         propagate_repository_ssa_call_metadata(lowered_module)
         settle_repository_ssa_static_extent_operands(lowered_module)
+        publish_computed_region_result_metadata(lowered_module)
         if late_tensor_shortfalls:
             lowered_module.metadata["late_tensor_lowering_shortfalls"] = tuple(
                 {

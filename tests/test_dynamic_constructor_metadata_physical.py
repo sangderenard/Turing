@@ -24,8 +24,8 @@ def test_dynamic_zeros_metadata_crosses_real_region_call(monkeypatch):
 
     original = tensor_ssa_lowering.publish_computed_region_result_metadata
 
-    def inspect(module):
-        changed = original(module)
+    def inspect(module, **options):
+        changed = original(module, **options)
         book = identity_book(module)
         rows = tuple(book.page(TENSOR_METADATA_RESULT_BINDING).rows())
         if not rows:

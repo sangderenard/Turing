@@ -61,7 +61,7 @@ def test_mixed_tensor_region_admission_uses_posted_scalar_receipts(
 
     observed = []
 
-    def observe_before_result_publication(module):
+    def observe_before_result_publication(module, **_options):
         # This checkpoint checks admission only. Dynamic result geometry is
         # a separate, still-audited obligation; do not bypass the final audit
         # and report this module as a completed source/native product.

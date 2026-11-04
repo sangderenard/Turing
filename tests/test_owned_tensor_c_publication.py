@@ -6,13 +6,36 @@ from src.common.tensors.accelerator_backends.c_backend_llvm_ssa import (
 )
 from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
-from src.compiler.identity_concordance import CorrelationTable
+from src.compiler.identity_concordance import CorrelationTable, identity_book
+from src.compiler import tensor_ssa_lowering
+from src.compiler.concordance_declarations import TENSOR_HEAP_RELEASE_BINDING
 from src.compiler.ssa_aggregate_abi import analyze_aggregate_abi
 from src.compiler.ssa_c_backend import emit_ssa_module_to_c
 from src.compiler.ssa_storage_requirements import owned_tensor_data_bindings
 
 
-def test_owned_dynamic_tensor_has_one_native_pointer_output():
+def test_owned_dynamic_tensor_has_one_native_pointer_output(monkeypatch):
+    publish = tensor_ssa_lowering.publish_computed_region_result_metadata
+    phases = []
+
+    def observe_publication(module, *, finalize_private_owners=True):
+        page = identity_book(module).page(TENSOR_HEAP_RELEASE_BINDING)
+        before = tuple(page.rows())
+        changed = (
+            publish(module) if finalize_private_owners else publish(
+                module, finalize_private_owners=False,
+            )
+        )
+        after = tuple(page.rows())
+        phases.append(finalize_private_owners)
+        if not finalize_private_owners:
+            assert after == before
+        return changed
+
+    monkeypatch.setattr(
+        tensor_ssa_lowering, "publish_computed_region_result_metadata",
+        observe_publication,
+    )
     source = '''def root(lengths: AbstractTensor, bit_count: int) -> AbstractTensor:
     return AbstractTensor.arange(bit_count, cls=type(lengths)).to_dtype("float64").sum().item()
 '''
@@ -36,6 +59,8 @@ def test_owned_dynamic_tensor_has_one_native_pointer_output():
         tensor_ssa_reference=c_backend_repository_ssa_reference(),
         progress=lambda _: None, progress_bars=False,
     )
+    assert False in phases and phases[-1] is True
+    assert tuple(identity_book(module).page(TENSOR_HEAP_RELEASE_BINDING).rows())
     first = analyze_aggregate_abi(module)
     second = analyze_aggregate_abi(module)
     seen_bindings = []
