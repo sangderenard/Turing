@@ -508,6 +508,14 @@ def module_storage_requirements(
         str(name): {} for name in functions
     }
     dynamic_ids: dict[str, set[int]] = {str(name): set() for name in functions}
+    from .concordance_declarations import SSA_VALUE, SSAValueFact
+    from .ssa_record_return_state import function_scope_of
+
+    storage_book = (getattr(module, "metadata", {}) or {}).get("identity_book")
+    storage_scopes = {
+        str(name): function_scope_of(function)
+        for name, function in functions.items()
+    } if storage_book is not None else {}
 
     def observe(function_name: str, value: Any) -> None:
         if value is None or not hasattr(value, "id"):
@@ -517,6 +525,22 @@ def module_storage_requirements(
         shape = _static_shape(value)
         if shape:
             shapes[function_name].setdefault(value_id, set()).add(shape)
+        if storage_book is not None:
+            fact = storage_book.page(SSA_VALUE).latest((
+                storage_scopes[function_name], value_id,
+            ))
+            # _ascending_order reads only weights.shape[0]. Its receiver
+            # therefore has no numerical-region tensor-table entry, but its
+            # exact SSA record is int64/span/rank1 with no static extent.
+            # Ignoring that record classified it as a scalar and C rejected
+            # axis0 of (). A positive-rank span whose recorded shape cannot
+            # state that rank requires runtime metadata in every backend.
+            if (isinstance(fact, SSAValueFact) and fact.storage == "span"
+                    and isinstance(fact.rank, int) and fact.rank > 0
+                    and (len(fact.shape) < fact.rank or any(
+                        not isinstance(extent, int) or extent < 0
+                        for extent in fact.shape))):
+                dynamic_ids[function_name].add(value_id)
 
     for function_name, function in functions.items():
         function_name = str(function_name)

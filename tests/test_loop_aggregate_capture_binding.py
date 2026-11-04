@@ -6,6 +6,7 @@ from src.compiler.extraction_contract import ExtractionContract
 from src.compiler.concordance_declarations import REGION_CAPTURE_BINDING
 from src.compiler.fortran_c_shell import lower_ast_source_to_ssa
 from src.compiler.identity_concordance import CorrelationTable
+from src.compiler.ssa_record_return_state import posted_ssa_value_fact
 
 
 def test_cat_keeps_stable_seed_beside_loop_carried_alias():
@@ -47,6 +48,11 @@ def test_cat_keeps_stable_seed_beside_loop_carried_alias():
     assert cat_call.args[0].id == parameters["data"]
     phi_ids = {instruction.res.id for block in function.blocks.values()
                for instruction in block.instrs if instruction.op == "Phi"}
+    for block in function.blocks.values():
+        for instruction in block.instrs:
+            if instruction.attributes.get("binding") == "loop_result_port":
+                fact = posted_ssa_value_fact(function, instruction.res.id, book=book)
+                assert (fact.physical_dtype, fact.storage, fact.rank) == ("int64", "span", 1)
     assert cat_call.args[0].id not in phi_ids
     assert any(instruction.args and instruction.args[0].id in phi_ids
                for instruction in calls
